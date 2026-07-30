@@ -1344,6 +1344,15 @@ impl Compiler<'_> {
                         // If the value was a closure lambda, record capture count for indirect call dispatch
                         if let Some(count) = self.registry.last_lambda_capture_count.take() {
                             self.registry.closure_info.insert(sym, count);
+                        } else {
+                            // closure_info is compiler-global and symbol-keyed
+                            // (#435 review LOW): a rebind to anything that is
+                            // NOT a capturing lambda must clear the stale
+                            // entry, or the call site reads the new bare
+                            // function pointer as a closure struct (probed:
+                            // silent death after a capturing `f` was rebound
+                            // to a non-capturing lambda).
+                            self.registry.closure_info.remove(&sym);
                         }
                     }
                     PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {

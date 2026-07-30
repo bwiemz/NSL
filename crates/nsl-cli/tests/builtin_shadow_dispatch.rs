@@ -38,7 +38,7 @@ fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-fn run_src(src: &str, tag: &str) -> String {
+fn run_nsl(src: &str, tag: &str) -> std::process::Output {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_shadow_{}_{tag}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -51,6 +51,12 @@ fn run_src(src: &str, tag: &str) -> String {
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .output()
         .expect("spawn nsl run");
+    std::fs::remove_dir_all(&tmp).ok();
+    out
+}
+
+fn run_src(src: &str, tag: &str) -> String {
+    let out = run_nsl(src, tag);
     assert!(
         out.status.success(),
         "[{tag}] run failed (the pre-guard failure mode is a runtime abort \
@@ -59,7 +65,6 @@ fn run_src(src: &str, tag: &str) -> String {
     );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(stdout.contains("DONE"), "[{tag}] incomplete:\n{stdout}");
-    std::fs::remove_dir_all(&tmp).ok();
     stdout
 }
 
@@ -297,6 +302,126 @@ print("DONE")
         printed_value(&stdout),
         "4",
         "post-grad-block builtin sum broke:\n{stdout}"
+    );
+}
+
+/// 2026-07-29 dispatch-arm audit: ~50 builtin arms carried NO
+/// `registry.functions` guard, so a MODULE-LEVEL user fn sharing the
+/// name silently misdispatched to the builtin — `fn sum(x: Tensor) ->
+/// float: return 42.0` printed the BUILTIN's sum (4.0 for ones([4])),
+/// exit 0. One hoisted registry check at the top of compile_call now
+/// makes codegen follow the checker for every arm at once.
+#[test]
+fn module_fn_shadowing_sum_dispatches_to_the_user_fn() {
+    let src = r#"
+fn sum(x: Tensor) -> float:
+    return 42.0
+
+let t = ones([4])
+print(sum(t))
+print("DONE")
+"#;
+    let stdout = run_src(src, "modsum");
+    assert_eq!(printed_value(&stdout), "42", "module fn sum lost:\n{stdout}");
+}
+
+/// Same class through the scalar-math arm (`abs`) — silently printed 5
+/// pre-hoist.
+#[test]
+fn module_fn_shadowing_abs_dispatches_to_the_user_fn() {
+    let src = r#"
+fn abs(x: int) -> int:
+    return x + 100
+
+print(abs(5))
+print("DONE")
+"#;
+    let stdout = run_src(src, "modabs");
+    assert_eq!(printed_value(&stdout), "105", "module fn abs lost:\n{stdout}");
+}
+
+/// The PR #435 documented gap verbatim: `fn reduce_max` hit the
+/// builtin arm's arity check — a compile error for a call the checker
+/// had already accepted against the USER fn.
+#[test]
+fn module_fn_shadowing_reduce_max_dispatches_to_the_user_fn() {
+    let src = r#"
+fn reduce_max(x: Tensor, d: int) -> float:
+    return 99.0
+
+let t = ones([4])
+print(reduce_max(t, 0))
+print("DONE")
+"#;
+    let stdout = run_src(src, "modrmax");
+    assert_eq!(
+        printed_value(&stdout),
+        "99",
+        "module fn reduce_max lost:\n{stdout}"
+    );
+}
+
+/// The hoist must not disturb arms for names nobody redefined: pin the
+/// BUILTIN results for the same three names, unshadowed.
+#[test]
+fn unshadowed_sum_abs_reduce_max_still_hit_builtins() {
+    let src = r#"
+let t = ones([4])
+print(sum(t).item())
+print(abs(0 - 7))
+print("DONE")
+"#;
+    let stdout = run_src(src, "unshadowed3");
+    let vals: Vec<&str> = stdout.lines().take_while(|l| *l != "DONE").collect();
+    assert_eq!(vals, ["4", "7"], "builtin arms disturbed:\n{stdout}");
+}
+
+/// `generate` is the ONE stdlib collision (stdlib/nsl/inference/
+/// generate.nsl): when NOT imported, the CFIE serve arm keeps the name
+/// and refuses outside serve — pin that refusal so the hoist provably
+/// leaves the unimported path alone.
+#[test]
+fn bare_generate_outside_serve_still_refused_by_the_cfie_arm() {
+    let src = r#"
+let t = ones([4])
+let r = generate("m", t, 0)
+print("DONE")
+"#;
+    let out = run_nsl(src, "baregen");
+    assert!(
+        !out.status.success(),
+        "bare generate outside serve must still refuse:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("serve"),
+        "refusal should still name the serve requirement:\n{stderr}"
+    );
+}
+
+/// closure_info is compiler-global and symbol-keyed (#435 review LOW):
+/// after `let f = |v| v + k` (capturing), a REBIND `let f = |v| v * 2`
+/// (non-capturing) left the stale capture count — the call site then
+/// read the bare function pointer as a closure struct: the program died
+/// silently after the first print (no DONE, probed pre-fix). VarDecl
+/// now clears the entry when the RHS is not a capturing lambda.
+#[test]
+fn non_capturing_rebind_clears_stale_closure_info() {
+    let src = r#"
+let k = 5
+let f = |v: int| v + k
+print(f(1))
+let f = |v: int| v * 2
+print(f(3))
+print("DONE")
+"#;
+    let stdout = run_src(src, "closrebind");
+    assert!(stdout.contains("6\n"), "capturing call broke:\n{stdout}");
+    assert_eq!(
+        printed_value(&stdout),
+        "6",
+        "post-rebind non-capturing call broke:\n{stdout}"
     );
 }
 

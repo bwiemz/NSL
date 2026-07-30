@@ -393,6 +393,32 @@ impl Compiler<'_> {
             // Fall through to normal call if fusion disabled or synthesis failed
         }
 
+        // Dispatch-arm audit (2026-07-29): the checker resolves a call to
+        // a registered fn (module-level user fn, imported stdlib fn,
+        // struct constructor) whenever one with this name exists — but
+        // the builtin dispatch arms below claimed the name first unless
+        // they carried an individual `!registry.functions.contains_key`
+        // guard. 37 arms did; the other ~50 silently misdispatched: a
+        // module-level `fn sum` printed the BUILTIN's result, exit 0.
+        // One hoisted check makes codegen follow the checker for every
+        // arm at once. Placement is load-bearing:
+        //   - AFTER the local-binding route (#435): locals shadow module
+        //     fns, matching checker scoping.
+        //   - AFTER the vmap matmul-rewrite (node-keyed — it IS this
+        //     call), the kernel dispatch (its own namespace), and the
+        //     @fuse arm (@fuse fns live in registry.functions; hoisting
+        //     above it would silently disable their fusion).
+        //   - The one stdlib collision is `generate`
+        //     (stdlib/nsl/inference/generate.nsl): UNIMPORTED, the CFIE
+        //     serve arm below still owns the name (registry miss);
+        //     imported, the user asked for the NSL loop and the checker
+        //     resolved to it — the import wins, including inside serve.
+        // The per-arm guards below are now redundant but harmless; they
+        // stay so each arm remains correct in isolation.
+        if self.registry.functions.contains_key(&func_name) {
+            return self.compile_registered_fn_call(builder, state, &func_name, args);
+        }
+
         if func_name == "print" {
             return self.compile_print_call(builder, state, args);
         }
@@ -3113,31 +3139,7 @@ impl Compiler<'_> {
         if self.registry.functions.contains_key(&func_name)
             || self.registry.runtime_fns.contains_key(&func_name)
         {
-            let mut arg_vals = Vec::new();
-            for (i, arg) in args.iter().enumerate() {
-                // A fresh argument may only be released at statement end when
-                // the callee's matching parameter is PROVEN not to escape —
-                // otherwise a member-assign / nsl_list_push inside the callee
-                // stores the raw pointer with no retain and the statement-end
-                // free becomes a use-after-free on the stored copy.
-                // `param_is_captive` is false for every unknown callee, so an
-                // un-analysed function keeps the historical blanket refusal.
-                let v = if self.escape.param_is_captive(&func_name, i) {
-                    self.compile_nested_expr(builder, state, &arg.value)?
-                } else {
-                    self.compile_expr(builder, state, &arg.value)?
-                };
-                arg_vals.push(v);
-            }
-            let result = self.compile_call_by_name(builder, &func_name, &arg_vals)?;
-            self.register_ffi_result_ownership(
-                builder,
-                state,
-                &func_name,
-                result,
-                &arg_vals,
-            );
-            return Ok(result);
+            return self.compile_registered_fn_call(builder, state, &func_name, args);
         }
 
         // Forward dispatch: if callee is a model instance, invoke its forward method
@@ -3446,6 +3448,39 @@ impl Compiler<'_> {
         let fref = self.module.declare_func_in_func(fid, builder.func);
         let call = builder.ins().call(fref, &[start, stop, step]);
         Ok(builder.inst_results(call)[0])
+    }
+
+    /// Compile a call to a name present in `registry.functions` (user
+    /// fns, imported stdlib fns, struct constructors, @vmap variants) or
+    /// `registry.runtime_fns` — escape-aware argument lowering + the
+    /// ffi_ownership registration. Extracted from compile_call's
+    /// fall-through so the dispatch-arm hoist can reach it from the top.
+    fn compile_registered_fn_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        func_name: &str,
+        args: &[nsl_ast::expr::Arg],
+    ) -> Result<Value, CodegenError> {
+        let mut arg_vals = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            // A fresh argument may only be released at statement end when
+            // the callee's matching parameter is PROVEN not to escape —
+            // otherwise a member-assign / nsl_list_push inside the callee
+            // stores the raw pointer with no retain and the statement-end
+            // free becomes a use-after-free on the stored copy.
+            // `param_is_captive` is false for every unknown callee, so an
+            // un-analysed function keeps the historical blanket refusal.
+            let v = if self.escape.param_is_captive(func_name, i) {
+                self.compile_nested_expr(builder, state, &arg.value)?
+            } else {
+                self.compile_expr(builder, state, &arg.value)?
+            };
+            arg_vals.push(v);
+        }
+        let result = self.compile_call_by_name(builder, func_name, &arg_vals)?;
+        self.register_ffi_result_ownership(builder, state, func_name, result, &arg_vals);
+        Ok(result)
     }
 
     /// Coerce one indirect-call argument to the declared Function param

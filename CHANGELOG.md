@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — module-level fns now win every builtin dispatch arm; stale closure info cleared
+
+- **~50 builtin dispatch arms carried no registry guard**, so a
+  module-level user fn sharing the name silently misdispatched to the
+  builtin: `fn sum(x: Tensor) -> float: return 42.0` printed the
+  BUILTIN's sum (4.0), exit 0; `fn abs` likewise; `fn reduce_max` hit
+  the builtin's arity check as a compile error (the gap documented in
+  PR #435). One hoisted `registry.functions` check at the top of
+  `compile_call` now routes to the registered fn before every arm —
+  placed after the local-binding route (#435), the vmap rewrite, kernel
+  dispatch, and the @fuse arm (whose fns live in the registry and must
+  keep fusion precedence). The 37 per-arm guards remain (redundant but
+  each arm stays correct in isolation).
+- **The checker had the same by-name claiming bug internally**: its
+  special-case typing for `sum`/`mean`/`reduce_max`/`gather`/`clamp`/
+  `neg`/math builtins fired regardless of user declarations, so after
+  the hoist a shadowed `sum(t)` was typed as the builtin (Tensor) while
+  codegen called the user fn (Float) — a verifier error. The whole
+  by-name special-case block in `check_call` now yields when the name
+  resolves to a USER declaration (real `def_span`; builtins carry DUMMY
+  spans). Checker and codegen now agree in both directions.
+- The one stdlib name collision is `generate`: unimported, the CFIE
+  serve arm still owns the name (pinned); imported, the user asked for
+  the stdlib loop and it now actually runs (previously the arm
+  intercepted and errored even with the import).
+- **`closure_info` staleness (#435 review LOW)**: the map is
+  compiler-global and symbol-keyed, so rebinding a captured-lambda name
+  to a NON-capturing lambda left the stale capture count — the call
+  site then read the bare function pointer as a closure struct (probed:
+  silent death mid-program). VarDecl now clears the entry on any
+  non-capturing rebind.
+- 6 new CPU gates in `builtin_shadow_dispatch.rs` (17 total).
+  Mutation-proven in three directions: hoist off → exactly the 3
+  module-fn shadow gates red; checker gating off → exactly the 2
+  tensor-arg shadow gates red (verifier disagreement); closure clear
+  off → exactly the rebind gate red.
+
+
 ### Fixed — container/field assignments no longer strand or dangle tensor temporaries
 
 - **`d["k"] = t * 2.0` left the stored tensor in the statement-
