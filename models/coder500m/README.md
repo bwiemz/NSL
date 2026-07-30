@@ -129,10 +129,12 @@ measurement, not absolute values.
   what it effectively used, so its numerics are unchanged by that fix —
   unlike `coder1b` / `coder7b`, whose declared `ROPE_THETA = 500000` was
   dead. `crates/nsl-cli/tests/model_config_drift.rs` gates the agreement.
-- `AdamW(weight_decay=...)` in a `train` block applies to **every**
-  trainable parameter, RMSNorm gains and the tied embedding included —
-  NSL has no optimizer parameter groups. See
-  `models/coder1b/README.md` for details.
+- `AdamW(weight_decay=...)` decays **every** trainable parameter by default,
+  RMSNorm gains and the tied embedding included. Pass
+  `no_decay=["vector"]` to exempt norms/biases (add `"embedding"` for the
+  tied embedding); `"vector"` is resolved from the runtime tensor rank. See
+  `models/coder1b/README.md` for the role table and the refused
+  compositions.
 - `model.nsl` also exposes `forward_train_packed(input_ids, segment_ids,
   position_ids, training)` for `DataLoader(..., packing=true)` streams;
   `pretrain_fase.nsl` uses the unpacked path because its synthetic corpus

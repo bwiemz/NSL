@@ -162,9 +162,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Command-line args
     ("nsl_args_init", &[types::I32, types::I64], None),
     ("nsl_args", &[], Some(types::I64)),
-    // Higher-order functions
-    ("nsl_map", &[types::I64, types::I64], Some(types::I64)),
-    ("nsl_filter", &[types::I64, types::I64], Some(types::I64)),
+    // Higher-order functions. Third arg = ret_is_bool: the function
+    // pointer is invoked as fn(i64)->i64, but a bool-returning NSL fn
+    // compiles to an I8 return whose upper register bits are undefined —
+    // the runtime masks to the low byte when this flag is set (hof.rs).
+    ("nsl_map", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    (
+        "nsl_filter",
+        &[types::I64, types::I64, types::I64],
+        Some(types::I64),
+    ),
     ("nsl_enumerate", &[types::I64], Some(types::I64)),
     ("nsl_zip", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_sorted", &[types::I64], Some(types::I64)),
@@ -245,26 +252,32 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_muon_prof_report", &[], None),
     // Fusion item 1: multi-tensor fused AdamW final step over the whole
     // param/m/v/m_partial lists (one pointer-table launch, bit-identical).
-    // Trailing F64 is mp_scale: the two-phase-clip factor folded into the
-    // m_partial read; 1.0 = unclipped (exact legacy behaviour, branched
-    // around in-kernel).
+    //
+    // The two trailing I64s are the AdamW parameter groups (0 = no no_decay);
+    // the final F64 is mp_scale, the two-phase-clip factor folded into the
+    // m_partial read, 1.0 = unclipped (exact legacy behaviour, branched around
+    // in-kernel). The two features are independent and BOTH are load-bearing —
+    // this list, the emission order in `stmt.rs`, and the Rust signature in
+    // `fase_step.rs` must stay in lockstep or arguments silently shift.
     (
         "nsl_fase_fused_adamw_step_multi",
         &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
+            types::I64, // params_list
+            types::I64, // m_list
+            types::I64, // v_list
+            types::I64, // mp_list
+            types::F64, // lr
+            types::F64, // beta1
+            types::F64, // one_minus_beta1
+            types::F64, // beta2
+            types::F64, // one_minus_beta2
+            types::F64, // eps
+            types::F64, // wd
+            types::F64, // bc1_inv
+            types::F64, // bc2_inv
+            types::I64, // wd_exempt_list (0 = no parameter groups)
+            types::I64, // wd_exempt_non_rank2
+            types::F64, // mp_scale (1.0 = unclipped)
         ],
         None,
     ),
@@ -336,6 +349,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_bias_correction_inv",
         &[types::F64, types::I64],
+        Some(types::F64),
+    ),
+    // AdamW parameter groups: resolve ONE param's weight decay from its
+    // compile-time role flag + its runtime rank.
+    // (param, static_exempt, exempt_non_rank2, wd) -> wd_for_this_param
+    (
+        "nsl_optim_param_wd",
+        &[types::I64, types::I64, types::I64, types::F64],
         Some(types::F64),
     ),
     // FASE Deferred two-phase grad clip: sum of squared elements, in-place scale.

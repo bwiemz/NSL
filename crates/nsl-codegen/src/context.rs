@@ -79,6 +79,19 @@ pub struct TensorCleanupState {
     /// ELTLS: per-function counter of consumer sites that hit Unknown.
     /// Goal: zero for hot-path functions after full rollout.
     pub unknown_ownership_count: usize,
+
+    /// ELTLS v2a (spec §6.2): Values born from a table-classified
+    /// OwnedNewResult FFI during the CURRENT statement, registered at the
+    /// dispatch boundary (`register_dispatch_result_ownership`). The
+    /// nested-expression tracker accepts membership here as proof the
+    /// value is an anonymous fresh temporary of this statement — WITHOUT
+    /// a per-name allowlist entry. Cleared at every `compile_stmt` entry:
+    /// the per-statement lifetime is what makes the check sound. A value
+    /// bound to a variable in an earlier statement can be the SAME
+    /// Cranelift Value a later identity-shaped dispatch returns (SSA
+    /// use_var in one block), and tracking it there would free the live
+    /// binding — clearing per statement makes that shape unmatchable.
+    pub dispatch_fresh: std::collections::HashSet<ir::Value>,
 }
 
 impl TensorCleanupState {
@@ -93,6 +106,7 @@ impl TensorCleanupState {
             owned_temporaries: Vec::new(),
             tape_held: Vec::new(),
             unknown_ownership_count: 0,
+            dispatch_fresh: std::collections::HashSet::new(),
         }
     }
 }
@@ -202,6 +216,39 @@ pub enum SelfResolution {
 /// Per-function compilation state (variables, loops).
 pub struct FuncState {
     pub variables: HashMap<Symbol, (Variable, cl_types::Type)>,
+    /// Scope-aware liveness for FUNCTION-VALUED local bindings (nested
+    /// `fn`s, lambda / fn-typed `let`s, params). `variables` is
+    /// function-flat by Cranelift-frontend design and NEVER unbinds, but
+    /// the CHECKER is block-scoped — a nested `fn sum` declared inside
+    /// an if-arm is out of scope after the arm, and a later `sum(t)`
+    /// resolves to the BUILTIN. The shadow-dispatch guard in
+    /// `compile_call` must therefore consult THIS map, not `variables`:
+    /// trusting the flat map rerouted post-scope builtin/module-fn
+    /// calls into a dead (undefined-on-path or stale) function pointer
+    /// — a runtime crash, review HIGH on 371ee02f. Keyed by symbol with
+    /// a liveness count so shadowing across nested scopes balances.
+    pub live_fn_bindings: HashMap<Symbol, u32>,
+    /// One entry per OPEN binding scope (if/elif/else arms, loop bodies,
+    /// match arms, block expressions), listing the symbols registered in
+    /// that scope. `pop_fn_binding_scope` decrements their liveness.
+    /// Registration with NO open scope is a function-root binding
+    /// (params, top-level nested fns) and stays live for the whole
+    /// function — which is exactly the checker's scoping for those.
+    pub fn_binding_scopes: Vec<Vec<Symbol>>,
+    /// Per-FUNCTION closure capture counts, moved off the compiler-global
+    /// Registry (review HIGHs on 44c011c1/cb1bd16f: global entries leaked
+    /// across nested-fn compiles and, with the block-scope-blind clear,
+    /// across if-arm/loop-body scopes — a dead if-arm's non-capturing
+    /// rebind deleted the outer closure's entry and the post-arm call
+    /// executed the closure struct as code). Mutate ONLY through
+    /// `set_closure_info`, which records an undo entry in the innermost
+    /// open fn-binding scope; `pop_fn_binding_scope` rolls the scope's
+    /// mutations back, mirroring the checker's block scoping exactly like
+    /// `live_fn_bindings` above.
+    pub closure_info: HashMap<Symbol, usize>,
+    /// Undo log per open fn-binding scope: symbol -> the closure_info
+    /// state BEFORE this scope's first mutation of it (None = absent).
+    closure_scope_undo: Vec<HashMap<Symbol, Option<usize>>>,
     pub param_symbols: HashSet<Symbol>,
     pub non_owning_symbols: HashSet<Symbol>,
     pub dataloader_symbols: HashSet<Symbol>,
@@ -289,6 +336,10 @@ impl FuncState {
     pub fn new() -> Self {
         FuncState {
             variables: HashMap::new(),
+            live_fn_bindings: HashMap::new(),
+            fn_binding_scopes: Vec::new(),
+            closure_info: HashMap::new(),
+            closure_scope_undo: Vec::new(),
             param_symbols: HashSet::new(),
             non_owning_symbols: HashSet::new(),
             dataloader_symbols: HashSet::new(),
@@ -319,5 +370,77 @@ impl FuncState {
         let var = Variable::from_u32(self.var_counter as u32);
         self.var_counter += 1;
         var
+    }
+
+    /// Open a binding scope for `live_fn_bindings`. Call at the start of
+    /// every lowering that compiles a checker-scoped statement list
+    /// (if/elif/else arms, loop bodies, match arms, block expressions);
+    /// pair with `pop_fn_binding_scope` at its end.
+    pub fn push_fn_binding_scope(&mut self) {
+        self.fn_binding_scopes.push(Vec::new());
+        self.closure_scope_undo.push(HashMap::new());
+    }
+
+    /// Close the innermost binding scope, retiring the fn-value bindings
+    /// it registered. Direction of failure, stated carefully (the first
+    /// draft of this comment had it BACKWARDS — review LOW on 682641ca):
+    /// a missed POP *widens* liveness, and because the flat `variables`
+    /// entry also persists, widened liveness is exactly the STALE-REROUTE
+    /// direction — the dangerous one. An EXTRA pop is the safe direction
+    /// (under-liveness falls back to builtin precedence, the pre-guard
+    /// behavior). Today every skipped-pop path is an `Err` propagation
+    /// that aborts the whole function compile, so no live window exists;
+    /// any future error-recovery path must keep the pairs balanced.
+    pub fn pop_fn_binding_scope(&mut self) {
+        if let Some(scope) = self.fn_binding_scopes.pop() {
+            for sym in scope {
+                if let Some(n) = self.live_fn_bindings.get_mut(&sym) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.live_fn_bindings.remove(&sym);
+                    }
+                }
+            }
+        }
+        // Roll back this scope's closure_info mutations to their
+        // pre-scope state — same safety direction as above: a missed
+        // pop widens the metadata's lifetime (stale-reroute), an extra
+        // pop merely restores earlier state.
+        if let Some(undo) = self.closure_scope_undo.pop() {
+            for (sym, prev) in undo {
+                match prev {
+                    Some(count) => {
+                        self.closure_info.insert(sym, count);
+                    }
+                    None => {
+                        self.closure_info.remove(&sym);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a function-valued binding (nested `fn`, lambda / fn-typed
+    /// `let`, fn-typed param) as live in the innermost open scope — or
+    /// for the whole function when no scope is open (params, top-level
+    /// nested fns), matching the checker's scoping.
+    /// Set (Some) or clear (None) a symbol's closure capture count,
+    /// recording the prior state in the innermost open fn-binding scope
+    /// so `pop_fn_binding_scope` can restore it.
+    pub fn set_closure_info(&mut self, sym: Symbol, count: Option<usize>) {
+        let prev = match count {
+            Some(c) => self.closure_info.insert(sym, c),
+            None => self.closure_info.remove(&sym),
+        };
+        if let Some(undo) = self.closure_scope_undo.last_mut() {
+            undo.entry(sym).or_insert(prev);
+        }
+    }
+
+    pub fn register_fn_binding(&mut self, sym: Symbol) {
+        *self.live_fn_bindings.entry(sym).or_insert(0) += 1;
+        if let Some(top) = self.fn_binding_scopes.last_mut() {
+            top.push(sym);
+        }
     }
 }

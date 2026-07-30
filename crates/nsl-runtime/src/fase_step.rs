@@ -298,6 +298,21 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     wd: f64,
     bc1_inv: f64,
     bc2_inv: f64,
+    // AdamW parameter groups.
+    //   wd_exempt_list       — NslList of per-param decay-exempt flags,
+    //                          parallel to `params_list`; 0 when `no_decay`
+    //                          was not configured, in which case every param
+    //                          takes `wd` and this is byte-identical to
+    //                          before the feature.
+    //   wd_exempt_non_rank2  — 1 when `no_decay` included "vector" → exempt
+    //                          anything not rank-2. Resolved per param by
+    //                          `nsl_optim_param_wd`, the single rule.
+    wd_exempt_list: i64,
+    wd_exempt_non_rank2: i64,
+    // Clip pre-scale, folded into the m_partial read. Independent of the two
+    // above: parameter groups decide each param's λ, this scales the gradient
+    // every param sees. Both must survive — dropping either compiles fine and
+    // silently disables a shipped feature.
     mp_scale: f64,
 ) {
     let params = crate::list::NslList::from_ptr(params_list);
@@ -309,6 +324,29 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
         ms.len as usize == count && vs.len as usize == count && mps.len as usize == count,
         "fase_fused_step_multi: list length mismatch"
     );
+    // AdamW parameter groups: the exempt flags are indexed positionally
+    // against `params_list`, so a length mismatch would silently shift every
+    // exemption onto the wrong parameter.
+    if wd_exempt_list != 0 {
+        let ex = crate::list::NslList::from_ptr(wd_exempt_list);
+        assert!(
+            ex.len as usize == count,
+            "fase_fused_step_multi: wd_exempt_list has {} entries for {} params — \
+             the decay-exempt flags must be parallel to the parameter list",
+            ex.len,
+            count
+        );
+    }
+    // Per-param λ, resolved by the one rule in optim_groups.rs. Empty list =>
+    // every param gets `wd`, so this collapses to the previous scalar.
+    let param_wd = |i: usize, tp: i64| -> f64 {
+        if wd_exempt_list == 0 {
+            return wd;
+        }
+        let ex = crate::list::NslList::from_ptr(wd_exempt_list);
+        let flag = unsafe { *ex.data.add(i) };
+        crate::optim_groups::nsl_optim_param_wd(tp, flag, wd_exempt_non_rank2, wd)
+    };
 
     // Item 8: collect eligible parameters as `UpdateDesc`s and bucket by
     // `UpdateKey` before launching, instead of accumulating one flat pointer
@@ -365,6 +403,7 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
                     key: UpdateKey {
                         device: th.device,
                         dtype: th.dtype,
+                        wd_bits: param_wd(i, tp).to_bits(),
                     },
                 });
                 continue;
@@ -379,8 +418,8 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
             crate::tensor::nsl_tensor_mul_scalar_inplace(ap, mp_scale);
         }
         nsl_fase_fused_adamw_step(
-            tp, mp_, vp, ap, lr, beta1, one_minus_beta1, beta2, one_minus_beta2, eps, wd,
-            bc1_inv, bc2_inv,
+            tp, mp_, vp, ap, lr, beta1, one_minus_beta1, beta2, one_minus_beta2, eps,
+            param_wd(i, tp), bc1_inv, bc2_inv,
         );
         crate::tensor::nsl_tensor_zero_inplace(ap);
     }
@@ -392,11 +431,15 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
         // bucket and this is byte-for-byte the previous behaviour.
         let buckets = bucket_updates(&descs);
         let n_buckets = buckets.len();
-        for (_key, members) in buckets {
+        for (key, members) in buckets {
             let k = members.len();
             if k == 0 {
                 continue;
             }
+            // Each bucket carries its OWN λ (AdamW parameter groups); with no
+            // `no_decay` every param shares one λ and there is one bucket, so
+            // this is the previous scalar exactly.
+            let bucket_wd = f64::from_bits(key.wd_bits);
             let thetas: Vec<u64> = members.iter().map(|d| d.theta).collect();
             let ms_p: Vec<u64> = members.iter().map(|d| d.m).collect();
             let vs_p: Vec<u64> = members.iter().map(|d| d.v).collect();
@@ -414,10 +457,13 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
                 one_minus_beta2 as f32,
                 eps as f32,
                 (-lr) as f32,
-                ((-lr) * wd) as f32,
+                ((-lr) * bucket_wd) as f32,
                 bc1_inv as f32,
                 bc2_inv as f32,
-                wd != 0.0,
+                // `bucket_wd`, not the flat `wd`: each bucket carries its own λ
+                // from the parameter groups, so testing the scalar would tell a
+                // decay-exempt bucket it still has weight decay.
+                bucket_wd != 0.0,
                 mp_scale as f32,
             );
             // Keep the fused-step counter's per-param semantics (gates read it).
@@ -700,6 +746,21 @@ pub(crate) struct UpdateKey {
     /// reach a bucket today, but the key carries the field so that adding a
     /// bf16 kernel is a new bucket rather than a new eligibility branch.
     pub dtype: u16,
+    /// Weight decay, as raw f64 bits so the key stays `Eq`/`Ord`.
+    ///
+    /// AdamW parameter groups (`no_decay=[...]`) give exempt parameters
+    /// λ = 0 while the rest keep the configured λ, and the flat-grid kernel
+    /// takes `neg_lr_wd`/`has_wd` as LAUNCH parameters — one value for the
+    /// whole grid. So λ has to partition the launches exactly as device and
+    /// dtype do. It takes at most two distinct values, so this adds at most
+    /// one extra launch, and each parameter still gets bit-identical
+    /// arithmetic to a scalar-λ launch at its own λ.
+    ///
+    /// Bits, not f64: `UpdateKey` derives `Eq`/`Ord` for sort/dedup in
+    /// `bucket_updates`, and f64 has neither. λ is only ever compared for
+    /// exact equality here, and it is copied from one source value rather
+    /// than computed per parameter, so bitwise identity is the right test.
+    pub wd_bits: u64,
 }
 
 /// Map CUDA blocks to (parameter, element offset) for a FLAT launch grid.
@@ -783,14 +844,63 @@ mod item8_tests {
     use super::*;
 
     fn desc(theta: u64, len: u32, device: u8, dtype: u16) -> UpdateDesc {
+        desc_wd(theta, len, device, dtype, 0.01)
+    }
+
+    fn desc_wd(theta: u64, len: u32, device: u8, dtype: u16, wd: f64) -> UpdateDesc {
         UpdateDesc {
             theta,
             m: theta + 1,
             v: theta + 2,
             mp: theta + 3,
             len,
-            key: UpdateKey { device, dtype },
+            key: UpdateKey {
+                device,
+                dtype,
+                wd_bits: wd.to_bits(),
+            },
         }
+    }
+
+    // ─── bucket_updates: weight decay is part of the key ───────────────────
+
+    /// AdamW parameter groups hand exempt params λ = 0 and the rest the
+    /// configured λ, but the flat-grid kernel takes `neg_lr_wd`/`has_wd` as
+    /// LAUNCH parameters. So λ must partition launches exactly as device and
+    /// dtype do — otherwise one bucket's λ would silently be applied to the
+    /// other's parameters.
+    #[test]
+    fn distinct_weight_decay_splits_into_separate_buckets() {
+        let descs = [
+            desc_wd(0x1000, 16, 0, 1, 0.1),
+            desc_wd(0x2000, 16, 0, 1, 0.0), // exempt (a norm gain)
+            desc_wd(0x3000, 16, 0, 1, 0.1),
+        ];
+        let buckets = bucket_updates(&descs);
+        assert_eq!(buckets.len(), 2, "λ must split the launch: {buckets:?}");
+        for (key, members) in &buckets {
+            let wd = f64::from_bits(key.wd_bits);
+            for m in members {
+                assert_eq!(
+                    f64::from_bits(m.key.wd_bits),
+                    wd,
+                    "a bucket member carries a different λ than its bucket key"
+                );
+            }
+        }
+        let total: usize = buckets.iter().map(|(_, m)| m.len()).sum();
+        assert_eq!(total, descs.len(), "bucketing dropped a parameter");
+    }
+
+    /// The common case must stay ONE launch: no `no_decay` means one λ.
+    #[test]
+    fn uniform_weight_decay_stays_a_single_bucket() {
+        let descs = [
+            desc_wd(0x1000, 16, 0, 1, 0.1),
+            desc_wd(0x2000, 32, 0, 1, 0.1),
+            desc_wd(0x3000, 64, 0, 1, 0.1),
+        ];
+        assert_eq!(bucket_updates(&descs).len(), 1);
     }
 
     // ─── build_block_tables ────────────────────────────────────────────────

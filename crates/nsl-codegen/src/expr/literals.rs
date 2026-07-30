@@ -53,6 +53,20 @@ impl Compiler<'_> {
                 val
             };
             builder.ins().call(push_ref, &[list_ptr, val]);
+            // An OWNED tensor element transfers INTO the list (review F1 on
+            // 67b9ba13): the element handle outlives this statement, but the
+            // statement-end sweep freed it under the list — reads then hit
+            // freed memory (silent wrong values, list reads being raw).
+            // Consume-only, deliberately NOT the tuple literal's
+            // retain-for-borrowed: nothing ever frees list-held elements, so
+            // a retain here would leak one reference per borrowed element;
+            // borrowed stores keep the pre-existing borrow semantics.
+            if self.node_type(elem.id).is_tensor() {
+                use crate::ownership_expr::Ownership;
+                if matches!(self.get_ownership(state, val), Ownership::Owned) {
+                    self.consume_ownership(state, val);
+                }
+            }
         }
         Ok(list_ptr)
     }
@@ -133,6 +147,18 @@ impl Compiler<'_> {
             };
             let val_val = self.compile_expr(builder, state, val_expr)?;
             builder.ins().call(set_ref, &[dict_ptr, key_val, val_val]);
+            // Same OWNED-element transfer as list literals above (review F1
+            // on 67b9ba13): pre-fix, `let d = {"a": t * 2.0}` left the temp
+            // in the sweep's reach and the next statement freed it — the
+            // read then CLONED reused memory, a silent wrong value. No
+            // retain for borrows: per the borrow-store convention
+            // (dict_lifetime.rs) nothing ever releases dict-held values.
+            if self.node_type(val_expr.id).is_tensor() {
+                use crate::ownership_expr::Ownership;
+                if matches!(self.get_ownership(state, val_val), Ownership::Owned) {
+                    self.consume_ownership(state, val_val);
+                }
+            }
         }
         Ok(dict_ptr)
     }

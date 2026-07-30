@@ -94,6 +94,14 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the Muon optimizer arm was lowered",
     ),
     m(
+        "[wd-groups]",
+        &[
+            "crates/nsl-codegen/src/stmt.rs",
+        ],
+        "AdamW parameter groups (`no_decay=[...]`) resolved a per-parameter \
+         weight decay; the table names every parameter it exempted",
+    ),
+    m(
         "[muon-state]",
         &[
             "crates/nsl-runtime/src/sr_bf16.rs",
@@ -254,6 +262,7 @@ pub mod tokens {
     pub const ZERO: &str = "[zero]";
     pub const ZERO3: &str = "[zero3]";
     pub const MUON: &str = "[muon]";
+    pub const WD_GROUPS: &str = "[wd-groups]";
     pub const MUON_STATE: &str = "[muon-state]";
     pub const FUSE: &str = "[fuse]";
     pub const CSHA: &str = "[csha]";

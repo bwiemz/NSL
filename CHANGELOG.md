@@ -6,6 +6,423 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — module-level fns now win every builtin dispatch arm; stale closure info cleared
+
+- **~50 builtin dispatch arms carried no registry guard**, so a
+  module-level user fn sharing the name silently misdispatched to the
+  builtin: `fn sum(x: Tensor) -> float: return 42.0` printed the
+  BUILTIN's sum (4.0), exit 0; `fn abs` likewise; `fn reduce_max` hit
+  the builtin's arity check as a compile error (the gap documented in
+  PR #435). One hoisted `registry.functions` check at the top of
+  `compile_call` now routes to the registered fn before every arm —
+  placed after the local-binding route (#435), the vmap rewrite, kernel
+  dispatch, and the @fuse arm (whose fns live in the registry and must
+  keep fusion precedence). The 37 per-arm guards remain (redundant but
+  each arm stays correct in isolation).
+- **The checker had the same by-name claiming bug internally**: its
+  special-case typing for `sum`/`mean`/`reduce_max`/`gather`/`clamp`/
+  `neg`/math builtins fired regardless of user declarations, so after
+  the hoist a shadowed `sum(t)` was typed as the builtin (Tensor) while
+  codegen called the user fn (Float) — a verifier error. The whole
+  by-name special-case block in `check_call` now yields when the name
+  resolves to a USER declaration (real `def_span`; builtins carry DUMMY
+  spans). Checker and codegen now agree in both directions.
+- The one stdlib name collision is `generate`: unimported, the CFIE
+  serve arm still owns the name (pinned); imported, the user asked for
+  the stdlib loop and it now actually runs (previously the arm
+  intercepted and errored even with the import).
+- **`closure_info` staleness (#435 review LOW)**: the map is
+  compiler-global and symbol-keyed, so rebinding a captured-lambda name
+  to a NON-capturing lambda left the stale capture count — the call
+  site then read the bare function pointer as a closure struct (probed:
+  silent death mid-program). VarDecl now clears the entry on any
+  non-capturing rebind.
+- Review fixes on the first cut, all gated: the closure_info CLEAR was
+  itself a regression — the map is compiler-global and a nested fn body
+  compiles mid-way through the outer body, so a nested non-capturing
+  `let f = ...` deleted the OUTER function's live closure entry (the
+  outer call then executed the closure struct as code). The FnDef arm
+  now snapshots/restores closure_info around the nested compile, which
+  also stops nested capture-counts leaking outward (pre-existing).
+  Plain-Assign rebinds (`f = <lambda>`, no let) get the same
+  transfer/clear as VarDecl (previously stale in both directions,
+  pre-existing death). The checker's user-vs-builtin distinguisher is
+  now an explicit `is_builtin` flag on SymbolInfo (only
+  register_builtins sets it; user redeclaration sheds it) — the interim
+  DUMMY-span heuristic mislabeled synthesized glob imports (train-block
+  auto-imports carry DUMMY spans). The `cumsum` arm arity-checks
+  instead of indexing args[1] (compiler panic → diagnosed refusal).
+- **Deliberate behavior change**: shadowing a builtin name with a
+  NON-Function value (`let sum = 5`) now makes calls of that name a
+  compile error ("not callable") — Python semantics — instead of the
+  silent fallback to the builtin. Pinned by a gate.
+- Second review pass found the clear was still BLOCK-scope-blind: a
+  dead if-arm's non-capturing rebind deleted the outer closure's entry
+  (the post-arm call executed the closure struct as code — a
+  regression over pre-audit behavior). `closure_info` now lives on
+  FuncState (per-function by construction — the nested-fn snapshot is
+  retired) with a per-scope undo log rolled back by
+  `pop_fn_binding_scope`, mirroring the checker's block scoping the
+  same way `live_fn_bindings` does.
+- Third review pass: the FuncState move itself broke closure
+  COMPOSITION — a lambda capturing a capturing closure and calling it
+  died (deferred lambda bodies compile with a fresh FuncState, losing
+  the definer's closure metadata). PendingLambda now records captured
+  closures' capture counts and compile_lambda_body seeds its state
+  from them.
+- 12 new CPU gates in `builtin_shadow_dispatch.rs` (23 total).
+  Mutation-proven in three directions: hoist off → exactly the 3
+  module-fn shadow gates red; checker gating off → exactly the 2
+  tensor-arg shadow gates red (verifier disagreement); closure clear
+  off → exactly the rebind gate red.
+
+
+### Fixed — container/field assignments no longer strand or dangle tensor temporaries
+
+- **`d["k"] = t * 2.0` left the stored tensor in the statement-
+  temporaries list** (PR #433 review LOW-2): the next statement's sweep
+  freed it while the container still held the raw handle — dict reads
+  cloned a freed tensor (bad-magic abort), list reads handed out the
+  dangling pointer itself, struct/model field loads read freed memory,
+  and the WRGA adapter side-table's free-on-overwrite became a double
+  free. `compile_assign`'s Ident arm has always ended with the
+  ownership-transfer + drain pair; the Subscript arms (dict/list set,
+  tensor multi-dim set) and every MemberAccess store path had neither.
+- All five store paths now share one exit
+  (`assign_container_store_tail`): `free_tensor_temporaries` with the
+  just-stored value as `keep` — the drain removes the handle from the
+  sweep's reach without freeing it, which IS the ownership transfer
+  into the container (per the dict_lifetime.rs borrow-store convention
+  nothing retains: no machinery ever releases a container-stored
+  borrow). Sub-expression temporaries (`d["k"] = t * 2.0 + 1.0` leaves
+  the inner product) are freed at the statement — previously they
+  straddled into any region that frees the list without draining it,
+  and the train-block step loop freed such a straddler once per step:
+  double free at step 2, the review's original scenario.
+- The review's residual pass found the SAME class in two adjacent
+  arms, both fixed here: **dict/list LITERALS stored owned-temp
+  elements raw** while the VarDecl statement-end sweep freed them —
+  `let d = {"a": t * 2.0}` then reading `d["a"]` SILENTLY returned the
+  reused header of the next allocation (printed 2 instead of 8; list
+  reads aborted on bad magic). Owned elements now transfer into the
+  container (consume-only — no retain for borrows, since nothing ever
+  frees container-held values, unlike the tuple literal's convention).
+  And **destructuring `let (a, b) = ...` arms had no statement-end
+  drain** — a sub-expression temp straddled into the train step loop
+  exactly like the assign case (double free at step 2, runtime-
+  confirmed); both destructure arms now drain with the destructured
+  value kept.
+- 10 CPU gates in `assign_temp_drain_gate.rs`: dict, list, and
+  struct-field stores of owned temps surviving later sweeps; the
+  sub-expression straddler crossing a real 2-epoch train block; a
+  borrow-store + source-variable-liveness pin; an int-list pin.
+  Mutation-proven in both directions: drain removed → exactly the 4
+  defect gates red (delayed-sweep use-after-free); keep dropped →
+  exactly the 4 defect gates red (immediate-free direction), pins
+  green both times.
+
+### Fixed — indirect calls no longer miscompile float arguments, returns, or captures
+
+- **`(|v: float| v * 2.0)(3.0)` returned 4** — silent wrong values,
+  exit 0 (bugs.md 2026-07-29). `compile_lambda` hardcoded every
+  parameter to I64 in the lambda's compiled signature while
+  `compile_indirect_call` builds the call-site signature from the
+  checker's `Type::Function` (F64 for float): the caller passed the
+  argument in an XMM register, the callee read an integer register, and
+  the value-type-keyed int→float promotion in `compile_binary_op`
+  laundered the garbage into a plausible float. Lambda signatures are
+  now derived from the checker's Function type — the same source every
+  call site lowers from. Int lambdas agreed by accident and are
+  unchanged.
+- **Float and bool captures had the mirror bug**: the lambda's
+  signature declared capture params with the captured variable's real
+  cl_type while the closure call site declares and loads every capture
+  slot as I64. Capture slots are now raw I64 bit-patterns on BOTH
+  sides — normalized at closure construction (floats bitcast, narrow
+  ints widened) and restored at lambda entry.
+- **`map()`/`filter()` refuse float-typed functions at compile time.**
+  The runtime invokes the passed pointer as `extern "C" fn(i64) -> i64`
+  (hof.rs) — a float parameter or return cannot survive that ABI and
+  produced silent garbage (the lambda wrote XMM0; the runtime read
+  RAX). Narrow-int returns (int8/16/32) are refused too (undefined
+  upper register bits). Int-typed functions work unchanged.
+- **`filter()` with a bool predicate kept garbage-dependent elements**
+  (pre-existing): a bool return lowers to I8 — only the low byte of the
+  return register is defined — but `nsl_filter` compared the full i64
+  against 0, seeing stale upper bits. `nsl_map`/`nsl_filter` now take a
+  codegen-supplied `ret_is_bool` flag and mask to the defined byte.
+- Two review follow-ups folded in: indirect call sites now COERCE
+  checker-legal numeric widenings to the declared param type (`f(3)` on
+  `(float) -> float` previously reached the Cranelift verifier as an
+  i64-vs-f64 arg mismatch — an ICE with a raw dump), and map()/filter()
+  refuse UNANNOTATED lambda params (Unknown-typed bodies lowered through
+  tensor ops and aborted at runtime; refusing is strictly an upgrade).
+- 16 CPU gates in `lambda_float_abi.rs`: the two bugs.md repros, float
+  through a fn-typed parameter, mixed float/int params, float + bool +
+  int captures, the nested-fn float route, int map/filter regression
+  pins, int→float widening (direct + via fn-typed param), and four
+  compile-time refusals. Mutation-proven in six independent directions:
+  param typing reverted → exactly the 5 float-param gates red; capture
+  convention reverted → exactly the 2 non-I64 capture gates red;
+  refusal guard off → exactly the 3 float-refusal gates red;
+  ret_is_bool flag off → exactly the filter gate red; arg coercion
+  off → exactly the 2 widening gates red; Unknown-param refusal off →
+  exactly the unannotated-map gate red.
+
+### Fixed — nested fns, lambdas, and fn-typed params now win builtin-name dispatch
+
+- **A local binding holding a function value lost dispatch to any
+  builtin arm sharing its name.** The registry guards from #429 cover
+  module-level user fns, but nested `fn`s are removed from
+  `registry.functions` right after their body compiles and lambdas
+  never enter it — so a nested `fn topk` hit the BUILTIN arm while the
+  checker had typed the user fn: a runtime magic-abort or a cranelift
+  ICE depending on arity (the bugs.md 2026-07-28 `fn topk` shadow ICE).
+  `compile_call` now routes any local binding whose checker type is
+  `Type::Function` straight to `compile_indirect_call` before every
+  builtin arm; non-Function locals (a tensor named `sum`) keep builtin
+  dispatch unchanged.
+- The guard's binding lookup is the new scope-aware `live_fn_bindings`
+  map, NOT the flat `state.variables`: the flat map never unbinds, but
+  the checker is block-scoped — the first cut trusted the flat map and
+  the independent review runtime-confirmed four crash shapes where a
+  call AFTER the shadowing arm exited (which the checker resolves to
+  the builtin or module fn) rerouted into a dead function pointer.
+  Every arm/body/match/block-expression lowering now pushes and pops a
+  binding scope mirroring the checker.
+- The review's residual-gap pass added grad-block bodies (runtime-
+  confirmed crash: a post-grad-block builtin call rerouted into the
+  grad body's dead nested fn) and both serve endpoint-body sites to the
+  scoped lowerings; the pop-direction safety comment was also inverted
+  and is now stated correctly (a MISSED pop is the dangerous direction —
+  balance is load-bearing).
+- Eight new CPU gates: nested fn, let-bound lambda, fn-typed parameter
+  (each value-pinned; mutation-proven red with the route disabled) plus
+  the reviewer's four post-scope repros — dead-arm nested fn, LIVE-arm
+  nested fn, dead-arm lambda, dead-arm module-fn shadow (mutation-proven
+  red with the scope pop disabled) — and the post-grad-block shape
+  (mutation-proven red with the grad scope removed). Module-level arms
+  WITHOUT a registry guard (e.g. `reduce_max`) remain a documented gap
+  for the dispatch-arm audit.
+- Discovered en route, filed in bugs.md, NOT fixed here: indirect calls
+  MISCOMPILE float arguments (`(|v: float| v * 2.0)(3.0)` returns 4,
+  silently) — pre-existing on the parent tree, int-typed indirect calls
+  are correct; the new gates use int lambdas deliberately and say why.
+
+### Fixed — while-condition temporaries no longer strand per evaluation
+
+- **A while loop's condition stranded its tensor temporaries once per
+  evaluation** (all but the final one): condition temps register below
+  the loop-scope mark, and the only free site was the While statement's
+  end-of-statement cleanup in the exit block — which frees exactly one
+  evaluation's values (the final one, whose SSA results dominate the
+  exit). `while sum(cumsum(g, -1)).item() * n > 0.0:` leaked 2 blocks
+  per iteration. This was the deliberately-pinned exact-6 residual in
+  `nested_arg_temporaries_gate` (documented as "needs a header/exit free
+  placement", PR #430).
+- Fix: `free_condition_temporaries` — the loop HEADER frees each
+  evaluation's temps right after the branch scalar is computed and
+  before the `brif`, and drains them from `tensor_temporaries` so the
+  exit-block cleanup cannot double-free. The header re-executes before
+  every body entry AND before the exit branch, so the final evaluation
+  is freed exactly once too; entries below the snapshot (an outer
+  statement's temps) stay listed and untouched. `while-let` routes
+  through the same helper with the bound expression value excluded (it
+  is read throughout the body — the exclusion is defensive today since
+  top-level expression results are not tracked, and stated as such).
+- Gate updated: the exact-6 pin is retired — zero strands at 4 AND 7
+  evaluations (two counts so per-evaluation frees can't be faked by a
+  constant offset), plus a new while-let shape (int-typed binding whose
+  expression carries nested tensor temps; 4 stranded pre-fix) with loop
+  value correctness pinned throughout.
+### Added — AdamW parameter groups: `no_decay=[...]`
+
+- `AdamW(weight_decay=λ)` in a `train` block applied λ to EVERY trainable
+  parameter — RMSNorm gains and the tied embedding included — because the
+  optimizer DSL had no parameter groups, so the conventional
+  decay-the-matrices-only recipe could not be expressed. `no_decay=[...]` now
+  names parameter ROLES to exempt, reusing the vocabulary `@param_role` and the
+  mixed Muon/AdamW router already share: `"vector"`, `"embedding"`, `"head"`,
+  `"hidden"`. `no_decay=["vector"]` is the usual norms-and-biases convention.
+- **`"vector"` is resolved at STEP time from the tensor's real rank, not at
+  compile time, and that is the load-bearing decision.** A model field only
+  gets a statically-known rank when its initializer is a direct
+  `zeros/ones/randn/rand/full/arange` call whose shape list is all integer
+  literals (`extract_shape_from_tensor_init`). Real models fail that on both
+  counts: `RMSNorm.weight = ones([dim])` passes an identifier, and
+  `wq = randn([...]) * sqrt(...)` is a multiply. Measured on `models/coder50m`
+  — 74 parameters classify as 1 `embedding` + 73 `hidden`, **zero** `vector`,
+  with both RMSNorm gains in that `hidden` bucket. A static-only "exempt
+  rank < 2" would have compiled, printed a plausible exemption table, and
+  decayed every norm in the model anyway.
+- Exemption is expressed as λ = 0, so it reuses each optimizer arm's EXISTING
+  no-decay branch rather than adding arithmetic: the stdlib `adamw_step` /
+  `muon_step` already guard `if weight_decay > 0.0`, the FASE update program
+  already elides its `wd·θ` term when `wd == 0.0`, and the fused kernels
+  already take `has_wd` as a launch parameter. A decayed parameter's numerics
+  are therefore bit-identical to a run without the feature.
+- The rule lives in ONE place, `nsl-runtime/src/optim_groups.rs`
+  (`nsl_optim_param_wd`). Codegen calls it per parameter inside the optimizer
+  loop and `nsl_fase_fused_adamw_step_multi` calls it while bucketing launches
+  — two copies of an eligibility predicate that had to agree exactly is the bug
+  pattern that module exists to avoid.
+- The flat-grid fused AdamW kernel takes `neg_lr_wd`/`has_wd` as LAUNCH
+  parameters, one value per grid, so λ is now part of `UpdateKey` alongside
+  device and dtype. λ takes at most two distinct values, so this costs at most
+  one extra launch and each parameter still gets bit-identical arithmetic to a
+  scalar-λ launch at its own λ.
+- Threaded through the FullBuffer per-param loop, both sub-arms of the unified
+  WGGO mode-table dispatch, and the two Deferred `fase_emit_final_step` sites.
+  The Deferred sites branch between two COMPILE-TIME recipes (the plan's, and a
+  λ = 0 clone) rather than handing the emitter a runtime λ: each arm is then
+  byte-identical to its pre-feature emission, and the exempt arm contains no
+  decay arithmetic at all. Multiplying θ by a runtime zero would have been the
+  smaller diff and is deliberately not used — the same file already documents
+  that mul-by-0.0 is not a zeroing idiom here because it keeps NaN/Inf alive.
+- Refused loudly, not silently ignored, where a single λ is hoisted out of the
+  per-parameter loop: `--muon-batch-ns`, `--layerwise-accum`,
+  `--optim-state-offload`, and the `@pipeline` train path.
+- Everything about this is loud. Every run prints a `[wd-groups]` table naming
+  the parameters it exempted; an unknown role name is a compile error; a scope
+  that matches no parameter is a compile error that points at
+  `no_decay=["vector"]`; and exempting every role a parameter can have refuses
+  in favour of writing `weight_decay=0.0`.
+- `crates/nsl-codegen/src/muon_roles.rs` is renamed `param_roles.rs`
+  (`classify_muon_param_roles` -> `classify_param_roles`) — it now has two
+  consumers, and the Muon-specific name would have implied weight-decay groups
+  only work under Muon.
+- Gates: `crates/nsl-cli/tests/weight_decay_groups_gate.rs` (12 tests). The two
+  load-bearing ones are exact equivalences rather than "the numbers moved" — an
+  all-rank-1 model under `no_decay=["vector"]` must be BIT-IDENTICAL to
+  `weight_decay=0.0`, and an all-rank-2 model must be BIT-IDENTICAL to plain
+  `weight_decay=λ` — each with an anti-vacuity assertion that λ affects the
+  fixture at all. Plus `optim_groups` unit tests and two `UpdateKey` bucketing
+  tests (λ splits launches; uniform λ stays one launch).
+
+### Fixed — dispatch results classify from the ffi_ownership table without allowlist entries (ELTLS v2a)
+
+- **A dispatch arm whose NSL-level name was missing from the
+  hand-maintained owning-ref allowlist stranded its fresh result** in
+  nested, receiver, and bare-statement position — the recurring leak
+  class behind three separate hand-patch cycles (#423 sdpa, #424
+  rmsnorm/dropout, #426 lt_scalar/multinomial). `reduce_max` and `clamp`
+  were live instances: `reduce_max(x, 0, 0).item()` stranded one block
+  per call.
+- Root closure at the dispatch boundary: `compile_call_by_name` records
+  its last non-void emission (the EFFECTIVE extern name — alias-resolved,
+  so alias-path calls are covered — plus the result Value), and the
+  `compile_expr` Call arm registers the dispatch result as Owned when it
+  is provably that emission's fresh output: the emission counter must
+  have advanced DURING the dispatch (stale records from earlier
+  statements or function bodies cannot match) and the recorded Value
+  must be identical to the value the arm returned. The nested tracker
+  accepts the per-statement `dispatch_fresh` set as an owning signal, so
+  any arm composing table-listed FFIs is tracked automatically — the
+  allowlist is no longer the single point of drift.
+- Deliberate refusals, documented in
+  `register_dispatch_result_ownership`: nothing registers inside tape
+  regions (the promote_to_tape_held retain balance stays byte-identical
+  to pre-v2a); an arm's own ownership claim always wins; and the
+  "thread `state` through all ~867 `compile_call_by_name` sites" v2
+  sketch was REJECTED as unsound — machinery-managed emissions (clone,
+  to_device in stmt.rs choreography) registered Owned would double-free
+  inside train regions.
+- Five new table classifications, each from a per-runtime freshness
+  read: `nsl_tensor_reduce_to_shape` and `nsl_tensor_gelu_backward`
+  (closing the drift-gate's STILL-UNCLASSIFIED note; the raw-call strand
+  that note predicted turned out to be unreachable — the semantic
+  checker refuses raw extern names, so these matter for machinery and
+  future arms), plus `nsl_tensor_clamp`, `nsl_tensor_conv2d`,
+  `nsl_tensor_maxpool2d` (live dispatch-arm terminals that stranded).
+- The method table's `.to()` comment claimed "no refcount bump" — stale:
+  `nsl_tensor_to_device` retains before returning the receiver on the
+  same-device path (a counted reference). The static entry stays false
+  (dtype-arg `.to()` forms route to unverified custom-dtype FFIs and
+  model `.to()` returns the model); the dynamic path classifies the
+  device-transfer form from the FFI actually emitted, fixing the
+  pre-existing `.to()` receiver-position strand as a side effect.
+- Gates (`dispatch_ownership_gate.rs`, both GPU): unallowlisted
+  dispatch results leave live_blocks == 0 at two round counts with
+  exact bound-vs-nested value parity (mutation-proven red at exactly
+  (6, 18) — 3 strands/round — with the wrapper disabled, and again with
+  only the tracking half disabled); an identity-shaped dispatch fixture
+  pins that `copy_data` never steals a live binding (defensive — no
+  current arm has the full dangerous shape, stated plainly in the gate
+  header).
+
+### Fixed — the three ownership authorities are now drift-gated against each other
+
+- The ownership campaign's recurring bug class was silent divergence
+  between the owning-ref Ident ALLOWLIST, the FFI ownership TABLE
+  (`ffi_ownership.rs`), and the runtime's actual extern inventory: three
+  leak cycles came from allowlist omissions, the allowlist carried a dead
+  `"slice"` entry, and the table carried a documented-wrong
+  `nsl_tensor_slice` borrow plus TWELVE entries naming FFIs that do not
+  exist (`nsl_tensor_concat` vs the real `nsl_tensor_cat`,
+  `nsl_tensor_tanh` vs `nsl_tensor_tanh_act`, `nsl_tensor_log_softmax`
+  vs `nsl_tensor_logsoftmax`, `nsl_tensor_max` vs
+  `nsl_tensor_reduce_max`, and eight keys with no counterpart at all —
+  min/argmin/permute/scatter/view/broadcast_to/sum_to_scalar/
+  mean_to_scalar).
+- New `ffi_ownership_drift.rs` (3 CPU gates, each mutation-proven red):
+  the allowlist parsed from source must equal the gate's classified map
+  exactly; every mapped FFI must be in the table as OwnedNewResult; and
+  every table key must name a real `pub extern "C"` fn.
+- Table corrections: dead keys renamed to the real externs or removed
+  (removal is behavior-neutral — absence takes the instrumented
+  fallback); `nsl_tensor_slice` flipped to OwnedNewResult (the runtime
+  allocates fresh on both paths — triple-re-verified across the
+  #423/#426/#427 cycles, and the owning classification has been live on
+  the method/free-fn paths with leak gates green throughout; the borrow
+  misfile governed only the two `register_ffi_result_ownership` sites,
+  where it under-freed); the Ident-allowlist family added with the
+  verifications those PRs recorded; `nsl_tensor_topk` classified
+  NotATensor (dict handle — `dict_lifetime.rs` owns its lifecycle).
+- The generic-dispatch `tensor_unary_runtime_alias` fallback mapped
+  `tanh` to the nonexistent bare spelling — an "undefined function"
+  error instead of a fallback; corrected to `nsl_tensor_tanh_act`.
+- Full emission-site registration (threading `state` through
+  `compile_call_by_name` so the table becomes the single runtime
+  authority) is the queued v2; these bindings close the drift class
+  first.
+
+### Fixed — nested builtin arguments no longer strand their results
+
+- **A builtin call nested as another builtin's argument stranded its
+  fresh output** — `sum(cumsum(g, -1))` leaked the inner cumsum result 1
+  block per call (device-independent) while the bound spelling was
+  clean. 184 argument-compilation sites across `compile_call`'s dispatch
+  arms used `compile_expr`, which never registers a nested call's result
+  as a statement temporary; all now use `compile_nested_expr`, whose
+  tracking predicate registers exactly fresh-owning tensor results
+  (idents, literals, and non-tensor arguments are untouched — the
+  tracking fires only for `expr_call_returns_owning_ref` + tensor-typed
+  results, so string/path/int arms are no-ops by construction).
+- Gate `nested_arg_temporaries_gate.rs` pins the sampling + norm +
+  reduction families incl. a double-nested shape at zero per-round
+  strand (red-proven at exactly 6/round pre-fix) with bound-vs-nested
+  VALUE parity folded in. Method-form receiver chains were already
+  tracked (PR #423); method-form ARGUMENTS stay as-is (lists/ints
+  today).
+- **A pre-existing loop-scope ICE became trivially reachable and is
+  fixed** (review HIGH): temps registered while compiling a WHILE
+  condition / FOR iterable predate the loop-scope mark, and
+  `free_tensor_temporaries`' whole-list drain stole them — leaving the
+  exit cleanup's `[scope_start..]` slice out of bounds, a COMPILE-TIME
+  panic (`while sum(cumsum(g,-1)).item() ...` — also reproducible on
+  main via method-form conditions). The drain now takes only entries
+  above the innermost scope mark, and both loop-exit slices clamp
+  defensively. Residuals pinned by the new loop-condition gate: a
+  for-iterable evaluates once and sweeps clean; a while condition's
+  per-evaluation temps still strand until condition temps get a
+  header/exit free placement (queued).
+- Sites deliberately NOT converted (differently-spelled or unsound to
+  convert): module-alias/agent/`@fuse`/kv-cache/kernel-launch argument
+  paths, DataLoader data/labels, the escape-gated generic-call path
+  (converting it unconditionally would be unsound), and indirect/lambda
+  calls (no escape info — a lambda can store the pointer). These keep
+  their status-quo strands.
+
 ### Fixed — dict-lifetime follow-ups: loop-local dicts, load_safetensors, builtin shadowing
 
 - **Loop-local dict bindings no longer strand per iteration** (the eltls
@@ -794,7 +1211,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   zeros output (now a real abort, `NSL_FLASH_ALLOW_FAILED=1` escape).
   The "v2 kernel produces ~zero output" residual noted here at the time
   was the missing f16→f32 output widen — fixed above.
-
 
 ### Added — `--grad-integrity` now covers the CSLA (`--layerwise-accum`) windowed backward
 

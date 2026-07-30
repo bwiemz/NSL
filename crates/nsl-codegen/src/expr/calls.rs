@@ -19,7 +19,11 @@ fn tensor_unary_runtime_alias(func_name: &str, arity: usize) -> Option<&'static 
     match func_name {
         "relu" => Some("nsl_tensor_relu"),
         "sigmoid" => Some("nsl_tensor_sigmoid"),
-        "tanh" => Some("nsl_tensor_tanh"),
+        // The extern's spelling carries an `_act` suffix — the bare name
+        // resolved to NOTHING here (runtime_fns lookup miss -> "undefined
+        // function" instead of the fallback), found by the
+        // ffi_ownership_drift extern binding, 2026-07-29.
+        "tanh" => Some("nsl_tensor_tanh_act"),
         "exp" => Some("nsl_tensor_exp"),
         "log" => Some("nsl_tensor_log"),
         "sqrt" => Some("nsl_tensor_sqrt"),
@@ -104,7 +108,7 @@ impl Compiler<'_> {
                 // m.to(device): transfer all tensor fields, recurse into sub-models
                 if member_name == "to" && args.len() == 1 {
                     let model_val = self.compile_expr(builder, state, object)?;
-                    let device_val = self.compile_expr(builder, state, &args[0].value)?;
+                    let device_val = self.compile_nested_expr(builder, state, &args[0].value)?;
                     // A1: model weights are allocated on the device here, OUTSIDE
                     // the train block's surface brackets, so without this they
                     // land in `other`. Tag the whole (recursive) transfer as
@@ -249,6 +253,40 @@ impl Compiler<'_> {
             }
         };
 
+        // A LOCAL binding holding a function value (nested `fn`, lambda
+        // `let f = |x| ...`, or a fn-typed parameter) shadows any builtin
+        // dispatch arm sharing its name. The registry guards added for
+        // the sampling arms (PR #429) cover MODULE-LEVEL user fns via
+        // `registry.functions`, but nested fns are REMOVED from the
+        // registry right after their body compiles (StmtKind::FnDef
+        // restores the previous entry) and lambdas never enter it — so a
+        // nested `fn topk` fell through to the BUILTIN arm while the
+        // checker had typed the user fn: a runtime magic-abort or a
+        // cranelift ICE ("declared type of variable doesn't match",
+        // bugs.md 2026-07-28), depending on arity.
+        //
+        // The binding lookup MUST be `live_fn_bindings`, not
+        // `state.variables`: the flat variables map never unbinds, but
+        // the CHECKER is block-scoped — after an if-arm that declared a
+        // nested `fn sum` exits, a later `sum(t)` resolves to the
+        // BUILTIN, and trusting the stale flat entry rerouted it into a
+        // dead function pointer (review HIGH on 371ee02f, four
+        // runtime-confirmed crashes). `live_fn_bindings` mirrors the
+        // checker's scoping via push/pop at every arm/body lowering.
+        //
+        // Route to the indirect call ONLY for Function-typed callees: a
+        // tensor local named `sum` keeps builtin dispatch exactly as
+        // before (rerouting it through an integer-as-pointer jump would
+        // be worse than the status quo in every way).
+        if let ExprKind::Ident(sym) = &callee.kind {
+            if state.live_fn_bindings.contains_key(sym)
+                && state.variables.contains_key(sym)
+                && matches!(self.node_type(callee.id), Type::Function { .. })
+            {
+                return self.compile_indirect_call(builder, state, callee, args);
+            }
+        }
+
         // M39b: matmul rewrite dispatch — VmapTransformer records (NodeId → target_name)
         // for matmul call sites that need batched semantics.  "batched_matmul" and
         // "batched_matmul_right" are logical names; both currently lower to
@@ -264,8 +302,8 @@ impl Compiler<'_> {
                     "matmul rewrite: expected at least 2 arguments",
                 ));
             }
-            let lhs = self.compile_expr(builder, state, &args[0].value)?;
-            let rhs = self.compile_expr(builder, state, &args[1].value)?;
+            let lhs = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let rhs = self.compile_nested_expr(builder, state, &args[1].value)?;
             // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
             let flags_zero = builder.ins().iconst(cl_types::I8, 0);
             return self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero]);
@@ -355,6 +393,32 @@ impl Compiler<'_> {
             // Fall through to normal call if fusion disabled or synthesis failed
         }
 
+        // Dispatch-arm audit (2026-07-29): the checker resolves a call to
+        // a registered fn (module-level user fn, imported stdlib fn,
+        // struct constructor) whenever one with this name exists — but
+        // the builtin dispatch arms below claimed the name first unless
+        // they carried an individual `!registry.functions.contains_key`
+        // guard. 37 arms did; the other ~50 silently misdispatched: a
+        // module-level `fn sum` printed the BUILTIN's result, exit 0.
+        // One hoisted check makes codegen follow the checker for every
+        // arm at once. Placement is load-bearing:
+        //   - AFTER the local-binding route (#435): locals shadow module
+        //     fns, matching checker scoping.
+        //   - AFTER the vmap matmul-rewrite (node-keyed — it IS this
+        //     call), the kernel dispatch (its own namespace), and the
+        //     @fuse arm (@fuse fns live in registry.functions; hoisting
+        //     above it would silently disable their fusion).
+        //   - The one stdlib collision is `generate`
+        //     (stdlib/nsl/inference/generate.nsl): UNIMPORTED, the CFIE
+        //     serve arm below still owns the name (registry miss);
+        //     imported, the user asked for the NSL loop and the checker
+        //     resolved to it — the import wins, including inside serve.
+        // The per-arm guards below are now redundant but harmless; they
+        // stay so each arm remains correct in isolation.
+        if self.registry.functions.contains_key(&func_name) {
+            return self.compile_registered_fn_call(builder, state, &func_name, args);
+        }
+
         if func_name == "print" {
             return self.compile_print_call(builder, state, args);
         }
@@ -404,20 +468,20 @@ impl Compiler<'_> {
         // fixtures assert the fused kernel actually fired instead of the
         // decomposed path.
         if func_name == "sdpa_fused_launch_count" && args.len() == 1 {
-            let variant = self.compile_expr(builder, state, &args[0].value)?;
+            let variant = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_sdpa_fused_launch_count", &[variant]);
         }
         // Fused-CE tape-carry twin: kind 0 = forward, 1 = forward_large,
         // 2 = backward.
         if func_name == "fused_lce_launch_count" && args.len() == 1 {
-            let kind = self.compile_expr(builder, state, &args[0].value)?;
+            let kind = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_fused_lce_launch_count", &[kind]);
         }
         if matches!(func_name.as_str(), "gpu_surface_peak_bytes" | "gpu_surface_at_peak_bytes")
             && args.len() == 1
         {
             // NSL Int arg (i64) → FFI u8 surface tag.
-            let tag = self.compile_expr(builder, state, &args[0].value)?;
+            let tag = self.compile_nested_expr(builder, state, &args[0].value)?;
             let tag_i8 = builder.ins().ireduce(cl_types::I8, tag);
             let ffi = if func_name == "gpu_surface_peak_bytes" {
                 "nsl_gpu_surface_peak_bytes"
@@ -508,7 +572,7 @@ impl Compiler<'_> {
             }
             let arg_type = self.node_type(args[0].value.id).clone();
             if is_float_type(&arg_type) || is_int_type(&arg_type) {
-                let val = self.compile_expr(builder, state, &args[0].value)?;
+                let val = self.compile_nested_expr(builder, state, &args[0].value)?;
                 let float_val = if is_float_type(&arg_type) {
                     if matches!(arg_type, Type::F32) {
                         builder.ins().fpromote(cl_types::F64, val)
@@ -537,7 +601,7 @@ impl Compiler<'_> {
             }
             let arg_type = self.node_type(args[0].value.id).clone();
             if is_float_type(&arg_type) || is_int_type(&arg_type) {
-                let val = self.compile_expr(builder, state, &args[0].value)?;
+                let val = self.compile_nested_expr(builder, state, &args[0].value)?;
                 let rt_name = if is_float_type(&arg_type) {
                     "nsl_abs_float"
                 } else {
@@ -578,8 +642,8 @@ impl Compiler<'_> {
                     "{func_name}() takes exactly 2 arguments"
                 )));
             }
-            let a = self.compile_expr(builder, state, &args[0].value)?;
-            let b = self.compile_expr(builder, state, &args[1].value)?;
+            let a = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let b = self.compile_nested_expr(builder, state, &args[1].value)?;
             let a_type = self.node_type(args[0].value.id).clone();
             let b_type = self.node_type(args[1].value.id).clone();
             let is_float = is_float_type(&a_type) || is_float_type(&b_type);
@@ -624,7 +688,7 @@ impl Compiler<'_> {
             if args.is_empty() {
                 return Err(CodegenError::new("assert() requires at least 1 argument"));
             }
-            let cond_val = self.compile_expr(builder, state, &args[0].value)?;
+            let cond_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let cond_type = self.node_type(args[0].value.id).clone();
             let cond_i8 = if crate::types::is_float_type(&cond_type) {
                 let zero = builder.ins().f64const(0.0);
@@ -633,7 +697,7 @@ impl Compiler<'_> {
                 builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 0)
             };
             let msg = if args.len() > 1 {
-                self.compile_expr(builder, state, &args[1].value)?
+                self.compile_nested_expr(builder, state, &args[1].value)?
             } else {
                 self.intern_string("assertion failed")?;
                 self.compile_string_literal(builder, "assertion failed")?
@@ -648,8 +712,8 @@ impl Compiler<'_> {
             if args.len() != 2 {
                 return Err(CodegenError::new("assert_eq() takes exactly 2 arguments"));
             }
-            let a = self.compile_expr(builder, state, &args[0].value)?;
-            let b = self.compile_expr(builder, state, &args[1].value)?;
+            let a = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let b = self.compile_nested_expr(builder, state, &args[1].value)?;
             let a_type = self.node_type(args[0].value.id).clone();
             let b_type = self.node_type(args[1].value.id).clone();
             let is_float = is_float_type(&a_type) || is_float_type(&b_type);
@@ -689,10 +753,10 @@ impl Compiler<'_> {
                     "assert_close() takes exactly 4 arguments (tensor, tensor, rtol, atol)",
                 ));
             }
-            let a = self.compile_expr(builder, state, &args[0].value)?;
-            let b = self.compile_expr(builder, state, &args[1].value)?;
-            let rtol = self.compile_expr(builder, state, &args[2].value)?;
-            let atol = self.compile_expr(builder, state, &args[3].value)?;
+            let a = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let b = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let rtol = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let atol = self.compile_nested_expr(builder, state, &args[3].value)?;
 
             // Coerce rtol/atol to f64 if they are int
             let rtol_type = self.node_type(args[2].value.id).clone();
@@ -724,7 +788,7 @@ impl Compiler<'_> {
             if args.len() != 1 {
                 return Err(CodegenError::new("exit() takes exactly 1 argument"));
             }
-            let code_val = self.compile_expr(builder, state, &args[0].value)?;
+            let code_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_exit", &[code_val]);
         }
         // Stdin I/O
@@ -760,7 +824,7 @@ impl Compiler<'_> {
                     "set_training_mode() takes exactly 1 argument (bool)",
                 ));
             }
-            let mode_val = self.compile_expr(builder, state, &args[0].value)?;
+            let mode_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_set_training_mode", &[mode_val]);
         }
         // Tensor creation builtins
@@ -770,7 +834,7 @@ impl Compiler<'_> {
                     "{func_name}() takes exactly 1 argument (shape list)"
                 )));
             }
-            let shape_val = self.compile_expr(builder, state, &args[0].value)?;
+            let shape_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let rt_name = format!("nsl_tensor_{func_name}");
             return self.compile_call_by_name(builder, &rt_name, &[shape_val]);
         }
@@ -780,8 +844,8 @@ impl Compiler<'_> {
                     "full() takes exactly 2 arguments (shape, value)",
                 ));
             }
-            let shape_val = self.compile_expr(builder, state, &args[0].value)?;
-            let fill_val = self.compile_expr(builder, state, &args[1].value)?;
+            let shape_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let fill_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             let arg_type = self.node_type(args[1].value.id).clone();
             let float_val = if is_float_type(&arg_type) {
                 fill_val
@@ -798,7 +862,7 @@ impl Compiler<'_> {
             }
             let (start, stop, step) = match args.len() {
                 1 => {
-                    let stop_val = self.compile_expr(builder, state, &args[0].value)?;
+                    let stop_val = self.compile_nested_expr(builder, state, &args[0].value)?;
                     let stop_type = self.node_type(args[0].value.id).clone();
                     let stop_f = if is_float_type(&stop_type) {
                         stop_val
@@ -810,14 +874,14 @@ impl Compiler<'_> {
                     (zero, stop_f, one)
                 }
                 2 => {
-                    let start_val = self.compile_expr(builder, state, &args[0].value)?;
+                    let start_val = self.compile_nested_expr(builder, state, &args[0].value)?;
                     let start_type = self.node_type(args[0].value.id).clone();
                     let start_f = if is_float_type(&start_type) {
                         start_val
                     } else {
                         builder.ins().fcvt_from_sint(cl_types::F64, start_val)
                     };
-                    let stop_val = self.compile_expr(builder, state, &args[1].value)?;
+                    let stop_val = self.compile_nested_expr(builder, state, &args[1].value)?;
                     let stop_type = self.node_type(args[1].value.id).clone();
                     let stop_f = if is_float_type(&stop_type) {
                         stop_val
@@ -828,21 +892,21 @@ impl Compiler<'_> {
                     (start_f, stop_f, one)
                 }
                 3 => {
-                    let start_val = self.compile_expr(builder, state, &args[0].value)?;
+                    let start_val = self.compile_nested_expr(builder, state, &args[0].value)?;
                     let start_type = self.node_type(args[0].value.id).clone();
                     let start_f = if is_float_type(&start_type) {
                         start_val
                     } else {
                         builder.ins().fcvt_from_sint(cl_types::F64, start_val)
                     };
-                    let stop_val = self.compile_expr(builder, state, &args[1].value)?;
+                    let stop_val = self.compile_nested_expr(builder, state, &args[1].value)?;
                     let stop_type = self.node_type(args[1].value.id).clone();
                     let stop_f = if is_float_type(&stop_type) {
                         stop_val
                     } else {
                         builder.ins().fcvt_from_sint(cl_types::F64, stop_val)
                     };
-                    let step_val = self.compile_expr(builder, state, &args[2].value)?;
+                    let step_val = self.compile_nested_expr(builder, state, &args[2].value)?;
                     let step_type = self.node_type(args[2].value.id).clone();
                     let step_f = if is_float_type(&step_type) {
                         step_val
@@ -905,7 +969,7 @@ impl Compiler<'_> {
             if args.len() != 1 {
                 return Err(CodegenError::new("rotate_half() takes exactly 1 argument"));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_traced_call(builder, "nsl_tensor_rotate_half", &[val]);
         }
         // tanh activation: maps NSL name "tanh" to runtime "nsl_tensor_tanh_act"
@@ -913,7 +977,7 @@ impl Compiler<'_> {
             if args.len() != 1 {
                 return Err(CodegenError::new("tanh() takes exactly 1 argument"));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_tanh_act", &[val]);
         }
         // softmax(tensor, dim) -- two args
@@ -924,7 +988,7 @@ impl Compiler<'_> {
                 ));
             }
             let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
-            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            let dim_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_traced_call(builder, "nsl_tensor_softmax", &[tensor_val, dim_val]);
         }
         // log_softmax(tensor, dim) -- two args
@@ -935,7 +999,7 @@ impl Compiler<'_> {
                 ));
             }
             let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
-            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            let dim_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_traced_call(
                 builder,
                 "nsl_tensor_logsoftmax",
@@ -949,8 +1013,8 @@ impl Compiler<'_> {
                 ));
             }
             let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
-            let min_val = self.compile_expr(builder, state, &args[1].value)?;
-            let max_val = self.compile_expr(builder, state, &args[2].value)?;
+            let min_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let max_val = self.compile_nested_expr(builder, state, &args[2].value)?;
             // Ensure min/max are f64
             let min_type = self.node_type(args[1].value.id).clone();
             let min_f = if is_float_type(&min_type) {
@@ -976,8 +1040,8 @@ impl Compiler<'_> {
                     "copy_data() takes exactly 2 arguments (dest, src)",
                 ));
             }
-            let dest = self.compile_expr(builder, state, &args[0].value)?;
-            let src = self.compile_expr(builder, state, &args[1].value)?;
+            let dest = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let src = self.compile_nested_expr(builder, state, &args[1].value)?;
             self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dest, src])?;
             return Ok(dest);
         }
@@ -987,8 +1051,8 @@ impl Compiler<'_> {
                     "add_inplace() takes exactly 2 arguments (dest, src)",
                 ));
             }
-            let dest = self.compile_expr(builder, state, &args[0].value)?;
-            let src = self.compile_expr(builder, state, &args[1].value)?;
+            let dest = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let src = self.compile_nested_expr(builder, state, &args[1].value)?;
             self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dest, src])?;
             return Ok(dest);
         }
@@ -996,7 +1060,7 @@ impl Compiler<'_> {
             if args.len() != 1 {
                 return Err(CodegenError::new("zero_inplace() takes exactly 1 argument"));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[val])?;
             return Ok(val);
         }
@@ -1004,7 +1068,7 @@ impl Compiler<'_> {
             if args.len() != 1 {
                 return Err(CodegenError::new("zeros_like() takes exactly 1 argument"));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[val]);
         }
         if func_name == "reduce_max" {
@@ -1013,9 +1077,9 @@ impl Compiler<'_> {
                     "reduce_max() takes exactly 3 arguments (tensor, dim, keepdim)",
                 ));
             }
-            let t = self.compile_expr(builder, state, &args[0].value)?;
-            let dim = self.compile_expr(builder, state, &args[1].value)?;
-            let keepdim = self.compile_expr(builder, state, &args[2].value)?;
+            let t = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let keepdim = self.compile_nested_expr(builder, state, &args[2].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_reduce_max", &[t, dim, keepdim]);
         }
         if func_name == "gather" {
@@ -1024,9 +1088,9 @@ impl Compiler<'_> {
                     "gather() takes exactly 3 arguments (tensor, dim, indices)",
                 ));
             }
-            let t = self.compile_expr(builder, state, &args[0].value)?;
-            let dim = self.compile_expr(builder, state, &args[1].value)?;
-            let indices = self.compile_expr(builder, state, &args[2].value)?;
+            let t = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let indices = self.compile_nested_expr(builder, state, &args[2].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_gather", &[t, dim, indices]);
         }
         // layernorm(input, weight, bias, eps) -> tensor
@@ -1036,10 +1100,10 @@ impl Compiler<'_> {
                     "layernorm() takes exactly 4 arguments (input, weight, bias, eps)",
                 ));
             }
-            let input_val = self.compile_expr(builder, state, &args[0].value)?;
-            let weight_val = self.compile_expr(builder, state, &args[1].value)?;
-            let bias_val = self.compile_expr(builder, state, &args[2].value)?;
-            let eps_val = self.compile_expr(builder, state, &args[3].value)?;
+            let input_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let weight_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let bias_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let eps_val = self.compile_nested_expr(builder, state, &args[3].value)?;
             // Ensure eps is f64
             let eps_type = self.node_type(args[3].value.id).clone();
             let eps_f = if is_float_type(&eps_type) {
@@ -1060,9 +1124,9 @@ impl Compiler<'_> {
                     "rmsnorm() takes exactly 3 arguments (input, weight, eps)",
                 ));
             }
-            let input_val = self.compile_expr(builder, state, &args[0].value)?;
-            let weight_val = self.compile_expr(builder, state, &args[1].value)?;
-            let eps_val = self.compile_expr(builder, state, &args[2].value)?;
+            let input_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let weight_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let eps_val = self.compile_nested_expr(builder, state, &args[2].value)?;
             let eps_type = self.node_type(args[2].value.id).clone();
             let eps_f = if is_float_type(&eps_type) {
                 eps_val
@@ -1082,15 +1146,15 @@ impl Compiler<'_> {
                     "dropout() takes exactly 3 arguments (tensor, p, training)",
                 ));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let p_val = self.compile_expr(builder, state, &args[1].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let p_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             let p_type = self.node_type(args[1].value.id).clone();
             let p_f = if is_float_type(&p_type) {
                 p_val
             } else {
                 builder.ins().fcvt_from_sint(cl_types::F64, p_val)
             };
-            let training_val = self.compile_expr(builder, state, &args[2].value)?;
+            let training_val = self.compile_nested_expr(builder, state, &args[2].value)?;
             let training_i8 = {
                 let vt = builder.func.dfg.value_type(training_val);
                 if vt == cl_types::I8 {
@@ -1110,13 +1174,13 @@ impl Compiler<'_> {
             if args.len() != 7 {
                 return Err(CodegenError::new("conv2d() takes exactly 7 arguments (input, weight, bias, stride_h, stride_w, pad_h, pad_w)"));
             }
-            let input_val = self.compile_expr(builder, state, &args[0].value)?;
-            let weight_val = self.compile_expr(builder, state, &args[1].value)?;
-            let bias_val = self.compile_expr(builder, state, &args[2].value)?;
-            let stride_h = self.compile_expr(builder, state, &args[3].value)?;
-            let stride_w = self.compile_expr(builder, state, &args[4].value)?;
-            let pad_h = self.compile_expr(builder, state, &args[5].value)?;
-            let pad_w = self.compile_expr(builder, state, &args[6].value)?;
+            let input_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let weight_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let bias_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let stride_h = self.compile_nested_expr(builder, state, &args[3].value)?;
+            let stride_w = self.compile_nested_expr(builder, state, &args[4].value)?;
+            let pad_h = self.compile_nested_expr(builder, state, &args[5].value)?;
+            let pad_w = self.compile_nested_expr(builder, state, &args[6].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tensor_conv2d",
@@ -1130,11 +1194,11 @@ impl Compiler<'_> {
             if args.len() != 5 {
                 return Err(CodegenError::new("maxpool2d() takes exactly 5 arguments (input, kernel_h, kernel_w, stride, padding)"));
             }
-            let input_val = self.compile_expr(builder, state, &args[0].value)?;
-            let kernel_h = self.compile_expr(builder, state, &args[1].value)?;
-            let kernel_w = self.compile_expr(builder, state, &args[2].value)?;
-            let stride_val = self.compile_expr(builder, state, &args[3].value)?;
-            let padding_val = self.compile_expr(builder, state, &args[4].value)?;
+            let input_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let kernel_h = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let kernel_w = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let stride_val = self.compile_nested_expr(builder, state, &args[3].value)?;
+            let padding_val = self.compile_nested_expr(builder, state, &args[4].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tensor_maxpool2d",
@@ -1153,8 +1217,8 @@ impl Compiler<'_> {
                     "muon_orthogonalize_fast() takes exactly 2 arguments (g, ns_steps)",
                 ));
             }
-            let g_val = self.compile_expr(builder, state, &args[0].value)?;
-            let steps_val = self.compile_expr(builder, state, &args[1].value)?;
+            let g_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let steps_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tensor_muon_orthogonalize",
@@ -1168,8 +1232,8 @@ impl Compiler<'_> {
                     "embedding_lookup() takes exactly 2 arguments (weight, indices)",
                 ));
             }
-            let weight_val = self.compile_expr(builder, state, &args[0].value)?;
-            let indices_val = self.compile_expr(builder, state, &args[1].value)?;
+            let weight_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let indices_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tensor_embedding_lookup",
@@ -1183,8 +1247,8 @@ impl Compiler<'_> {
                     "bias_add() takes exactly 2 arguments (tensor, bias)",
                 ));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let bias_val = self.compile_expr(builder, state, &args[1].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let bias_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tensor_bias_add",
@@ -1198,10 +1262,10 @@ impl Compiler<'_> {
                     "tensor_slice() takes exactly 4 arguments (tensor, dim, start, end)",
                 ));
             }
-            let t = self.compile_expr(builder, state, &args[0].value)?;
-            let dim = self.compile_expr(builder, state, &args[1].value)?;
-            let start = self.compile_expr(builder, state, &args[2].value)?;
-            let end = self.compile_expr(builder, state, &args[3].value)?;
+            let t = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let start = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let end = self.compile_nested_expr(builder, state, &args[3].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_slice", &[t, dim, start, end]);
         }
         // tensor_cat(list_of_tensors, dim) -> tensor
@@ -1211,8 +1275,8 @@ impl Compiler<'_> {
                     "tensor_cat() takes exactly 2 arguments (tensor_list, dim)",
                 ));
             }
-            let list = self.compile_expr(builder, state, &args[0].value)?;
-            let dim = self.compile_expr(builder, state, &args[1].value)?;
+            let list = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_cat", &[list, dim]);
         }
         // M18a: unsqueeze(tensor, dim) -- free function form
@@ -1222,8 +1286,8 @@ impl Compiler<'_> {
                     "unsqueeze() takes exactly 2 arguments (tensor, dim)",
                 ));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tensor_unsqueeze",
@@ -1237,8 +1301,8 @@ impl Compiler<'_> {
                     "stack() takes exactly 2 arguments (tensor_list, dim)",
                 ));
             }
-            let list_val = self.compile_expr(builder, state, &args[0].value)?;
-            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            let list_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_stack", &[list_val, dim_val]);
         }
         // contiguous(tensor) -> tensor — materialize non-contiguous views
@@ -1248,7 +1312,7 @@ impl Compiler<'_> {
                     "contiguous() takes exactly 1 argument (tensor)",
                 ));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[tensor_val]);
         }
         // M18a: causal_mask(seq_len) -> tensor
@@ -1258,7 +1322,7 @@ impl Compiler<'_> {
                     "causal_mask() takes exactly 1 argument (seq_len)",
                 ));
             }
-            let seq_len_val = self.compile_expr(builder, state, &args[0].value)?;
+            let seq_len_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len_val]);
         }
         // PCA Stage B: scaled_dot_product_attention_masked(Q, K, V, scale, mask)
@@ -1285,11 +1349,11 @@ impl Compiler<'_> {
                      planned work)."
                 );
             }
-            let q_val = self.compile_expr(builder, state, &args[0].value)?;
-            let k_val = self.compile_expr(builder, state, &args[1].value)?;
-            let v_val = self.compile_expr(builder, state, &args[2].value)?;
-            let scale_val = self.compile_expr(builder, state, &args[3].value)?;
-            let mask_val = self.compile_expr(builder, state, &args[4].value)?;
+            let q_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let k_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let v_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let scale_val = self.compile_nested_expr(builder, state, &args[3].value)?;
+            let mask_val = self.compile_nested_expr(builder, state, &args[4].value)?;
 
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
@@ -1343,11 +1407,11 @@ impl Compiler<'_> {
                      (Q, K, V, scale, segment_ids)",
                 ));
             }
-            let q_val = self.compile_expr(builder, state, &args[0].value)?;
-            let k_val = self.compile_expr(builder, state, &args[1].value)?;
-            let v_val = self.compile_expr(builder, state, &args[2].value)?;
-            let scale_val = self.compile_expr(builder, state, &args[3].value)?;
-            let seg_val = self.compile_expr(builder, state, &args[4].value)?;
+            let q_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let k_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let v_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let scale_val = self.compile_nested_expr(builder, state, &args[3].value)?;
+            let seg_val = self.compile_nested_expr(builder, state, &args[4].value)?;
             let mask_val = self.compile_call_by_name(
                 builder,
                 "nsl_packed_mask_from_segment_ids",
@@ -1405,10 +1469,10 @@ impl Compiler<'_> {
                 ));
             }
 
-            let q_val = self.compile_expr(builder, state, &args[0].value)?;
-            let k_val = self.compile_expr(builder, state, &args[1].value)?;
-            let v_val = self.compile_expr(builder, state, &args[2].value)?;
-            let scale_val = self.compile_expr(builder, state, &args[3].value)?;
+            let q_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let k_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let v_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let scale_val = self.compile_nested_expr(builder, state, &args[3].value)?;
 
             // Check for causal named arg
             let mut causal = false;
@@ -1558,13 +1622,13 @@ impl Compiler<'_> {
             if args.len() == 1 {
                 // M46: Full reductions (no dim arg) don't have 1-arg deterministic variants;
                 // deterministic swap only applies to the 3-arg sum_dim/mean_dim below.
-                let val = self.compile_expr(builder, state, &args[0].value)?;
+                let val = self.compile_nested_expr(builder, state, &args[0].value)?;
                 let rt_name = format!("nsl_tensor_{func_name}");
                 return self.compile_traced_call(builder, &rt_name, &[val]);
             } else if args.len() == 3 {
-                let t = self.compile_expr(builder, state, &args[0].value)?;
-                let dim = self.compile_expr(builder, state, &args[1].value)?;
-                let keepdim = self.compile_expr(builder, state, &args[2].value)?;
+                let t = self.compile_nested_expr(builder, state, &args[0].value)?;
+                let dim = self.compile_nested_expr(builder, state, &args[1].value)?;
+                let keepdim = self.compile_nested_expr(builder, state, &args[2].value)?;
                 // M46: Swap to deterministic kernel variants when deterministic mode is active
                 let rt_name = if self.compile_options.deterministic {
                     match func_name.as_str() {
@@ -1591,10 +1655,10 @@ impl Compiler<'_> {
             if args.len() != 4 {
                 return Err(CodegenError::new("bpe_train() takes exactly 4 arguments (corpus_path, vocab_size, min_freq, special_tokens)"));
             }
-            let path_val = self.compile_expr(builder, state, &args[0].value)?;
-            let vocab_size = self.compile_expr(builder, state, &args[1].value)?;
-            let min_freq = self.compile_expr(builder, state, &args[2].value)?;
-            let special_tokens = self.compile_expr(builder, state, &args[3].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let vocab_size = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let min_freq = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let special_tokens = self.compile_nested_expr(builder, state, &args[3].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_bpe_train",
@@ -1607,7 +1671,7 @@ impl Compiler<'_> {
                     "tokenizer_load() takes exactly 1 argument (path)",
                 ));
             }
-            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tokenizer_load", &[path_val]);
         }
         if func_name == "tokenizer_save" {
@@ -1616,8 +1680,8 @@ impl Compiler<'_> {
                     "tokenizer_save() takes exactly 2 arguments (handle, path)",
                 ));
             }
-            let handle = self.compile_expr(builder, state, &args[0].value)?;
-            let path_val = self.compile_expr(builder, state, &args[1].value)?;
+            let handle = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tokenizer_save", &[handle, path_val]);
         }
         if func_name == "tokenizer_encode" {
@@ -1626,8 +1690,8 @@ impl Compiler<'_> {
                     "tokenizer_encode() takes exactly 2 arguments (handle, text)",
                 ));
             }
-            let handle = self.compile_expr(builder, state, &args[0].value)?;
-            let text_val = self.compile_expr(builder, state, &args[1].value)?;
+            let handle = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let text_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tokenizer_encode", &[handle, text_val]);
         }
         if func_name == "tokenizer_decode" {
@@ -1636,8 +1700,8 @@ impl Compiler<'_> {
                     "tokenizer_decode() takes exactly 2 arguments (handle, tensor)",
                 ));
             }
-            let handle = self.compile_expr(builder, state, &args[0].value)?;
-            let tensor_val = self.compile_expr(builder, state, &args[1].value)?;
+            let handle = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tokenizer_decode",
@@ -1650,28 +1714,28 @@ impl Compiler<'_> {
                     "tokenizer_vocab_size() takes exactly 1 argument (handle)",
                 ));
             }
-            let handle = self.compile_expr(builder, state, &args[0].value)?;
+            let handle = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tokenizer_vocab_size", &[handle]);
         }
         if func_name == "tokenizer_encode_batch" {
             if args.len() != 5 {
                 return Err(CodegenError::new("tokenizer_encode_batch() takes exactly 5 arguments (handle, texts, padding, truncation, max_len)"));
             }
-            let handle = self.compile_expr(builder, state, &args[0].value)?;
-            let texts = self.compile_expr(builder, state, &args[1].value)?;
-            let padding = self.compile_expr(builder, state, &args[2].value)?;
+            let handle = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let texts = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let padding = self.compile_nested_expr(builder, state, &args[2].value)?;
             let padding_i8 = if builder.func.dfg.value_type(padding) == cl_types::I8 {
                 padding
             } else {
                 builder.ins().ireduce(cl_types::I8, padding)
             };
-            let truncation = self.compile_expr(builder, state, &args[3].value)?;
+            let truncation = self.compile_nested_expr(builder, state, &args[3].value)?;
             let truncation_i8 = if builder.func.dfg.value_type(truncation) == cl_types::I8 {
                 truncation
             } else {
                 builder.ins().ireduce(cl_types::I8, truncation)
             };
-            let max_len = self.compile_expr(builder, state, &args[4].value)?;
+            let max_len = self.compile_nested_expr(builder, state, &args[4].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tokenizer_encode_batch",
@@ -1685,11 +1749,11 @@ impl Compiler<'_> {
             if args.len() != 5 {
                 return Err(CodegenError::new("nsl_qtensor_quantize() takes exactly 5 arguments (tensor, dtype, granularity, axis, group_size)"));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let dtype_val = self.compile_expr(builder, state, &args[1].value)?;
-            let gran_val = self.compile_expr(builder, state, &args[2].value)?;
-            let axis_val = self.compile_expr(builder, state, &args[3].value)?;
-            let group_val = self.compile_expr(builder, state, &args[4].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dtype_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let gran_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let axis_val = self.compile_nested_expr(builder, state, &args[3].value)?;
+            let group_val = self.compile_nested_expr(builder, state, &args[4].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_qtensor_quantize",
@@ -1704,7 +1768,7 @@ impl Compiler<'_> {
                     "nsl_qtensor_dequantize() takes exactly 1 argument (qtensor)",
                 ));
             }
-            let qt_val = self.compile_expr(builder, state, &args[0].value)?;
+            let qt_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt_val]);
         }
         if func_name == "nsl_qtensor_matmul_mixed"
@@ -1715,8 +1779,8 @@ impl Compiler<'_> {
                     "nsl_qtensor_matmul_mixed() takes exactly 2 arguments (tensor, qtensor)",
                 ));
             }
-            let x_val = self.compile_expr(builder, state, &args[0].value)?;
-            let qw_val = self.compile_expr(builder, state, &args[1].value)?;
+            let x_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let qw_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_qtensor_matmul_mixed",
@@ -1729,7 +1793,7 @@ impl Compiler<'_> {
                     "nsl_qtensor_dtype() takes exactly 1 argument (qtensor)",
                 ));
             }
-            let qt_val = self.compile_expr(builder, state, &args[0].value)?;
+            let qt_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_dtype", &[qt_val]);
         }
         if func_name == "nsl_qtensor_shape" && !self.registry.functions.contains_key(&func_name) {
@@ -1738,7 +1802,7 @@ impl Compiler<'_> {
                     "nsl_qtensor_shape() takes exactly 1 argument (qtensor)",
                 ));
             }
-            let qt_val = self.compile_expr(builder, state, &args[0].value)?;
+            let qt_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_shape", &[qt_val]);
         }
 
@@ -1770,7 +1834,7 @@ impl Compiler<'_> {
                     "load_safetensors() takes 1-2 arguments (path, device=0)",
                 ));
             }
-            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let path_str = match &args[0].value.kind {
                 ExprKind::StringLiteral(s) => s.clone(),
                 _ => {
@@ -1781,7 +1845,7 @@ impl Compiler<'_> {
             };
             let path_len = builder.ins().iconst(cl_types::I64, path_str.len() as i64);
             let device_val = if args.len() > 1 {
-                self.compile_expr(builder, state, &args[1].value)?
+                self.compile_nested_expr(builder, state, &args[1].value)?
             } else {
                 builder.ins().iconst(cl_types::I64, 0)
             };
@@ -1799,8 +1863,8 @@ impl Compiler<'_> {
                     "save_safetensors() takes exactly 2 arguments (weights_dict, path)",
                 ));
             }
-            let dict_val = self.compile_expr(builder, state, &args[0].value)?;
-            let path_val = self.compile_expr(builder, state, &args[1].value)?;
+            let dict_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             let path_str = match &args[1].value.kind {
                 ExprKind::StringLiteral(s) => s.clone(),
                 _ => {
@@ -1854,19 +1918,19 @@ impl Compiler<'_> {
                      for the Mixtral / DeepSeek convention which omits FFN bias.",
                 ));
             }
-            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
-            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
-            let experts_gate_val = self.compile_expr(builder, state, &args[2].value)?;
-            let experts_up_val = self.compile_expr(builder, state, &args[3].value)?;
-            let experts_down_val = self.compile_expr(builder, state, &args[4].value)?;
+            let tokens_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let logits_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let experts_gate_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let experts_up_val = self.compile_nested_expr(builder, state, &args[3].value)?;
+            let experts_down_val = self.compile_nested_expr(builder, state, &args[4].value)?;
             // v2.14: 8-arg form compiles 3 bias expressions; 5-arg
             // leaves bias_vals = None and emits iconst(0)/iconst(0)/
             // iconst(0) at the call site (preserves v2.5/v2.7 v4
             // emission byte-identical for bias-free MoE).
             let bias_vals: Option<(_, _, _)> = if args.len() == 8 {
-                let g = self.compile_expr(builder, state, &args[5].value)?;
-                let u = self.compile_expr(builder, state, &args[6].value)?;
-                let d = self.compile_expr(builder, state, &args[7].value)?;
+                let g = self.compile_nested_expr(builder, state, &args[5].value)?;
+                let u = self.compile_nested_expr(builder, state, &args[6].value)?;
+                let d = self.compile_nested_expr(builder, state, &args[7].value)?;
                 Some((g, u, d))
             } else {
                 None
@@ -2136,17 +2200,17 @@ impl Compiler<'_> {
                      form is required when it does not (Llama-1+ / Mixtral).",
                 ));
             }
-            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
-            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
-            let experts_up_val = self.compile_expr(builder, state, &args[2].value)?;
-            let experts_down_val = self.compile_expr(builder, state, &args[3].value)?;
+            let tokens_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let logits_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let experts_up_val = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let experts_down_val = self.compile_nested_expr(builder, state, &args[3].value)?;
             // v2.12: 6-arg form compiles the bias expressions. The
             // 4-arg form leaves these as None and emits `iconst(0)` at
             // the call site below (preserves v2.5/v2.7 byte-identical
             // emission for bias-free MoE).
             let bias_vals: Option<(_, _)> = if args.len() == 6 {
-                let bias_up_val = self.compile_expr(builder, state, &args[4].value)?;
-                let bias_down_val = self.compile_expr(builder, state, &args[5].value)?;
+                let bias_up_val = self.compile_nested_expr(builder, state, &args[4].value)?;
+                let bias_down_val = self.compile_nested_expr(builder, state, &args[5].value)?;
                 Some((bias_up_val, bias_down_val))
             } else {
                 None
@@ -2390,9 +2454,9 @@ impl Compiler<'_> {
                     "moe_dispatch() takes 3 arguments (tokens, router_logits, experts)",
                 ));
             }
-            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
-            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
-            let experts_val = self.compile_expr(builder, state, &args[2].value)?;
+            let tokens_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let logits_val = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let experts_val = self.compile_nested_expr(builder, state, &args[2].value)?;
 
             // CPDT Part III v2.19 — multi-model `@moe` composition.
             // The helper picks the call site's MoE config under the
@@ -2514,10 +2578,10 @@ impl Compiler<'_> {
                     "speculative_decode() takes 4 arguments (draft_tokens, draft_logits, verifier_logits, vocab_size)",
                 ));
             }
-            let draft_tokens = self.compile_expr(builder, state, &args[0].value)?;
-            let draft_logits = self.compile_expr(builder, state, &args[1].value)?;
-            let verifier_logits = self.compile_expr(builder, state, &args[2].value)?;
-            let vocab_size = self.compile_expr(builder, state, &args[3].value)?;
+            let draft_tokens = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let draft_logits = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let verifier_logits = self.compile_nested_expr(builder, state, &args[2].value)?;
+            let vocab_size = self.compile_nested_expr(builder, state, &args[3].value)?;
 
             // CPDT Part III v2.20 — multi-model `@speculative`
             // composition. Pre-v2.20 used the same broken
@@ -2593,16 +2657,16 @@ impl Compiler<'_> {
 
         // manual_seed(seed)
         if func_name == "manual_seed" && !self.registry.functions.contains_key(&func_name) {
-            let seed_val = self.compile_expr(builder, state, &args[0].value)?;
+            let seed_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_manual_seed", &[seed_val]);
         }
 
         // topk(tensor, k, dim=-1)
         if func_name == "topk" && !self.registry.functions.contains_key(&func_name) {
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let k_val = self.compile_expr(builder, state, &args[1].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let k_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             let dim_val = if args.len() > 2 {
-                self.compile_expr(builder, state, &args[2].value)?
+                self.compile_nested_expr(builder, state, &args[2].value)?
             } else {
                 builder.ins().iconst(cl_types::I64, -1_i64)
             };
@@ -2615,8 +2679,8 @@ impl Compiler<'_> {
 
         // multinomial(tensor, num_samples)
         if func_name == "multinomial" && !self.registry.functions.contains_key(&func_name) {
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let n_val = self.compile_expr(builder, state, &args[1].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let n_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_tensor_multinomial",
@@ -2692,10 +2756,10 @@ impl Compiler<'_> {
             // target_model (arg 0) is accepted for source compatibility;
             // compile it so any side effects hold, but the value is unused
             // (the served model is the serve-init-bound one).
-            let _model_val = self.compile_expr(builder, state, &args[0].value)?;
+            let _model_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             // prompt (arg 1) resolves to the baked prompt host i64 array
             // pointer bound at serve init.
-            let prompt_ptr = self.compile_expr(builder, state, &args[1].value)?;
+            let prompt_ptr = self.compile_nested_expr(builder, state, &args[1].value)?;
 
             // Allocate the output host i64 buffer (capacity = max_new_tokens).
             let out_cap = builder.ins().iconst(cl_types::I64, max_new_tokens);
@@ -2804,9 +2868,9 @@ impl Compiler<'_> {
 
         // argmax(tensor, dim=-1)
         if func_name == "argmax" && !self.registry.functions.contains_key(&func_name) {
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let dim_val = if args.len() > 1 {
-                self.compile_expr(builder, state, &args[1].value)?
+                self.compile_nested_expr(builder, state, &args[1].value)?
             } else {
                 builder.ins().iconst(cl_types::I64, -1_i64)
             };
@@ -2815,15 +2879,27 @@ impl Compiler<'_> {
 
         // cumsum(tensor, dim)
         if func_name == "cumsum" && !self.registry.functions.contains_key(&func_name) {
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            // Arity-check instead of indexing: a module-level `let cumsum =
+            // <lambda>` is checker-visible inside a fn body but not in this
+            // FuncState's bindings, so the call lands here — args[1] then
+            // panicked the compiler (review LOW on 44c011c1). Refusing is
+            // still a checker/codegen visibility gap, but a diagnosed one.
+            if args.len() < 2 {
+                return Err(CodegenError::new(
+                    "cumsum() takes 2 arguments (tensor, dim); if you meant a \
+                     module-level binding named `cumsum`, it is not reachable \
+                     from inside a function body",
+                ));
+            }
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_cumsum", &[tensor_val, dim_val]);
         }
 
         // lt_scalar(tensor, scalar)
         if func_name == "lt_scalar" && !self.registry.functions.contains_key(&func_name) {
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
-            let scalar_val = self.compile_expr(builder, state, &args[1].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let scalar_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             // Ensure scalar is f64
             let scalar_ty = builder.func.dfg.value_type(scalar_val);
             let scalar_f64 = if scalar_ty == cl_types::F64 {
@@ -2842,13 +2918,13 @@ impl Compiler<'_> {
 
         // load_jsonl("path", "field")
         if func_name == "load_jsonl" {
-            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let path_len = if let ExprKind::StringLiteral(s) = &args[0].value.kind {
                 builder.ins().iconst(cl_types::I64, s.len() as i64)
             } else {
                 self.compile_call_by_name(builder, "nsl_str_len", &[path_val])?
             };
-            let field_val = self.compile_expr(builder, state, &args[1].value)?;
+            let field_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             let field_len = if let ExprKind::StringLiteral(s) = &args[1].value.kind {
                 builder.ins().iconst(cl_types::I64, s.len() as i64)
             } else {
@@ -2863,15 +2939,15 @@ impl Compiler<'_> {
 
         // load_csv("path", col_idx, has_header=1)
         if func_name == "load_csv" {
-            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let path_len = if let ExprKind::StringLiteral(s) = &args[0].value.kind {
                 builder.ins().iconst(cl_types::I64, s.len() as i64)
             } else {
                 self.compile_call_by_name(builder, "nsl_str_len", &[path_val])?
             };
-            let col_val = self.compile_expr(builder, state, &args[1].value)?;
+            let col_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             let header_val = if args.len() > 2 {
-                self.compile_expr(builder, state, &args[2].value)?
+                self.compile_nested_expr(builder, state, &args[2].value)?
             } else {
                 builder.ins().iconst(cl_types::I64, 1)
             };
@@ -2884,13 +2960,13 @@ impl Compiler<'_> {
 
         // load_mmap("path", dtype)
         if func_name == "load_mmap" {
-            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let path_len = if let ExprKind::StringLiteral(s) = &args[0].value.kind {
                 builder.ins().iconst(cl_types::I64, s.len() as i64)
             } else {
                 self.compile_call_by_name(builder, "nsl_str_len", &[path_val])?
             };
-            let dtype_val = self.compile_expr(builder, state, &args[1].value)?;
+            let dtype_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
                 builder,
                 "nsl_load_mmap",
@@ -3075,31 +3151,7 @@ impl Compiler<'_> {
         if self.registry.functions.contains_key(&func_name)
             || self.registry.runtime_fns.contains_key(&func_name)
         {
-            let mut arg_vals = Vec::new();
-            for (i, arg) in args.iter().enumerate() {
-                // A fresh argument may only be released at statement end when
-                // the callee's matching parameter is PROVEN not to escape —
-                // otherwise a member-assign / nsl_list_push inside the callee
-                // stores the raw pointer with no retain and the statement-end
-                // free becomes a use-after-free on the stored copy.
-                // `param_is_captive` is false for every unknown callee, so an
-                // un-analysed function keeps the historical blanket refusal.
-                let v = if self.escape.param_is_captive(&func_name, i) {
-                    self.compile_nested_expr(builder, state, &arg.value)?
-                } else {
-                    self.compile_expr(builder, state, &arg.value)?
-                };
-                arg_vals.push(v);
-            }
-            let result = self.compile_call_by_name(builder, &func_name, &arg_vals)?;
-            self.register_ffi_result_ownership(
-                builder,
-                state,
-                &func_name,
-                result,
-                &arg_vals,
-            );
-            return Ok(result);
+            return self.compile_registered_fn_call(builder, state, &func_name, args);
         }
 
         // Forward dispatch: if callee is a model instance, invoke its forward method
@@ -3145,28 +3197,47 @@ impl Compiler<'_> {
                 func_name
             };
 
-        let (func_id, sig) = if let Some(e) = self.registry.functions.get(effective_name) {
-            e.clone()
-        } else if let Some(e) = self.registry.runtime_fns.get(effective_name) {
-            e.clone()
-        } else if let Some(alias) = tensor_unary_runtime_alias(effective_name, arg_vals.len()) {
-            self.registry
-                .runtime_fns
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| CodegenError::new(format!("undefined function '{effective_name}'")))?
-        } else {
-            return Err(CodegenError::new(format!(
-                "undefined function '{effective_name}'"
-            )));
-        };
+        // `emitted_name` is the symbol actually called — for the unary alias
+        // fallback that is the runtime EXTERN (`tanh` emits
+        // `nsl_tensor_tanh_act`), which is also the name the ffi_ownership
+        // table classifies, so the dispatch-boundary registration below
+        // covers alias-path calls for free.
+        let (func_id, sig, emitted_name) =
+            if let Some(e) = self.registry.functions.get(effective_name) {
+                let (id, sig) = e.clone();
+                (id, sig, effective_name)
+            } else if let Some(e) = self.registry.runtime_fns.get(effective_name) {
+                let (id, sig) = e.clone();
+                (id, sig, effective_name)
+            } else if let Some(alias) = tensor_unary_runtime_alias(effective_name, arg_vals.len()) {
+                let (id, sig) = self
+                    .registry
+                    .runtime_fns
+                    .get(alias)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodegenError::new(format!("undefined function '{effective_name}'"))
+                    })?;
+                (id, sig, alias)
+            } else {
+                return Err(CodegenError::new(format!(
+                    "undefined function '{effective_name}'"
+                )));
+            };
 
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
         let call = builder.ins().call(func_ref, arg_vals);
         if sig.returns.is_empty() {
             Ok(builder.ins().iconst(cl_types::I64, 0))
         } else {
-            Ok(builder.inst_results(call)[0])
+            let result = builder.inst_results(call)[0];
+            // ELTLS v2a: note the emission so the dispatch boundary can
+            // classify the arm's result from the ffi_ownership table.
+            // Non-void calls only — a void call's synthesized iconst 0
+            // must never be classifiable.
+            self.last_ffi_emission = Some((emitted_name.to_string(), result));
+            self.ffi_emission_counter += 1;
+            Ok(result)
         }
     }
 
@@ -3214,6 +3285,83 @@ impl Compiler<'_> {
                 // instrumentation counter surfaces migration gaps.
                 self.note_unknown_fallback(state, result);
             }
+        }
+    }
+
+    /// ELTLS v2a (spec §6.2): dispatch-boundary ownership registration.
+    /// Called once, at the `compile_expr` Call arm, after `compile_call`
+    /// returns. Classifies the dispatch result from the ffi_ownership
+    /// table when — and only when — the returned value is PROVABLY the
+    /// fresh output of the FFI the dispatch just emitted:
+    ///
+    ///   - the emission counter advanced during this dispatch (so
+    ///     `last_ffi_emission` was written during it — stale records
+    ///     from earlier statements or earlier function bodies cannot
+    ///     match), AND
+    ///   - the recorded result Value is identical to the value the arm
+    ///     returned (an arm that post-processes, frees temps last, or
+    ///     returns an input unchanged simply misses — status quo, in the
+    ///     leak-not-crash direction).
+    ///
+    /// This closes the recurring allowlist-drift leak class at its root
+    /// for every arm whose terminal call is a table-classified FFI: the
+    /// arm no longer needs a hand-added entry in
+    /// `expr_result_is_owned_temporary` for its result to be tracked
+    /// (see `dispatch_fresh` in TensorCleanupState).
+    ///
+    /// Deliberate refusals:
+    ///   - inside tape regions nothing registers: promote_to_tape_held
+    ///     retains None-entry values and free_tensor_temporaries frees
+    ///     tracked ones unconditionally — an Owned entry here would skip
+    ///     that retain while the statement-end free still runs, a double
+    ///     free. Tape choreography stays byte-identical to pre-v2a.
+    ///   - an existing expr_ownership entry wins (arms that classify
+    ///     their own results — set_ownership_from_op, Borrowed
+    ///     propagation — are never second-guessed; this also keeps the
+    ///     TapeHeld→Owned debug_assert unreachable).
+    ///   - blanket registration inside `compile_call_by_name` itself
+    ///     (the "thread state through all 867 sites" v2 sketch) is
+    ///     UNSOUND and was rejected: stmt.rs/func.rs machinery emits
+    ///     table-listed FFIs (clone, to_device) whose lifetimes it
+    ///     manages manually, and registering those Owned flips the
+    ///     promote-retain balance inside train regions into double
+    ///     frees. The dispatch boundary is exactly the layer whose
+    ///     results are handed to expression consumers, so ownership
+    ///     claims here are safe by construction.
+    pub(crate) fn register_dispatch_result_ownership(
+        &self,
+        builder: &FunctionBuilder,
+        state: &mut FuncState,
+        result: Value,
+        counter_before: u64,
+    ) {
+        use crate::ffi_ownership::{ffi_ownership_kind, FfiOwnershipKind};
+        use crate::ownership_expr::Ownership;
+
+        if builder.func.dfg.value_type(result) != cl_types::I64 {
+            return;
+        }
+        if state.flags.in_tape_region {
+            return;
+        }
+        if state.cleanup.expr_ownership.contains_key(&result) {
+            return;
+        }
+        if self.ffi_emission_counter == counter_before {
+            return;
+        }
+        let Some((emitted_name, emitted_val)) = &self.last_ffi_emission else {
+            return;
+        };
+        if *emitted_val != result {
+            return;
+        }
+        if matches!(
+            ffi_ownership_kind(emitted_name),
+            Some(FfiOwnershipKind::OwnedNewResult)
+        ) {
+            self.set_ownership(builder, state, result, Ownership::Owned);
+            state.cleanup.dispatch_fresh.insert(result);
         }
     }
 
@@ -3289,21 +3437,21 @@ impl Compiler<'_> {
     ) -> Result<Value, CodegenError> {
         let (start, stop, step) = match args.len() {
             1 => {
-                let stop = self.compile_expr(builder, state, &args[0].value)?;
+                let stop = self.compile_nested_expr(builder, state, &args[0].value)?;
                 let start = builder.ins().iconst(cl_types::I64, 0);
                 let step = builder.ins().iconst(cl_types::I64, 1);
                 (start, stop, step)
             }
             2 => {
-                let start = self.compile_expr(builder, state, &args[0].value)?;
-                let stop = self.compile_expr(builder, state, &args[1].value)?;
+                let start = self.compile_nested_expr(builder, state, &args[0].value)?;
+                let stop = self.compile_nested_expr(builder, state, &args[1].value)?;
                 let step = builder.ins().iconst(cl_types::I64, 1);
                 (start, stop, step)
             }
             3 => {
-                let start = self.compile_expr(builder, state, &args[0].value)?;
-                let stop = self.compile_expr(builder, state, &args[1].value)?;
-                let step = self.compile_expr(builder, state, &args[2].value)?;
+                let start = self.compile_nested_expr(builder, state, &args[0].value)?;
+                let stop = self.compile_nested_expr(builder, state, &args[1].value)?;
+                let step = self.compile_nested_expr(builder, state, &args[2].value)?;
                 (start, stop, step)
             }
             _ => return Err(CodegenError::new("range() takes 1-3 arguments")),
@@ -3312,6 +3460,73 @@ impl Compiler<'_> {
         let fref = self.module.declare_func_in_func(fid, builder.func);
         let call = builder.ins().call(fref, &[start, stop, step]);
         Ok(builder.inst_results(call)[0])
+    }
+
+    /// Compile a call to a name present in `registry.functions` (user
+    /// fns, imported stdlib fns, struct constructors, @vmap variants) or
+    /// `registry.runtime_fns` — escape-aware argument lowering + the
+    /// ffi_ownership registration. Extracted from compile_call's
+    /// fall-through so the dispatch-arm hoist can reach it from the top.
+    fn compile_registered_fn_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        func_name: &str,
+        args: &[nsl_ast::expr::Arg],
+    ) -> Result<Value, CodegenError> {
+        let mut arg_vals = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            // A fresh argument may only be released at statement end when
+            // the callee's matching parameter is PROVEN not to escape —
+            // otherwise a member-assign / nsl_list_push inside the callee
+            // stores the raw pointer with no retain and the statement-end
+            // free becomes a use-after-free on the stored copy.
+            // `param_is_captive` is false for every unknown callee, so an
+            // un-analysed function keeps the historical blanket refusal.
+            let v = if self.escape.param_is_captive(func_name, i) {
+                self.compile_nested_expr(builder, state, &arg.value)?
+            } else {
+                self.compile_expr(builder, state, &arg.value)?
+            };
+            arg_vals.push(v);
+        }
+        let result = self.compile_call_by_name(builder, func_name, &arg_vals)?;
+        self.register_ffi_result_ownership(builder, state, func_name, result, &arg_vals);
+        Ok(result)
+    }
+
+    /// Coerce one indirect-call argument to the declared Function param
+    /// type. The checker accepts int→float widening at call sites
+    /// (`f(3)` on `(float) -> float`), but the callee's signature — and
+    /// the call-site signature built right above — declare F64, so the
+    /// raw I64 value previously reached the Cranelift verifier as an
+    /// arg-type mismatch: an ICE with a raw dump (review MEDIUM on
+    /// 01bb85aa). Narrow ints are widened for the same reason. Anything
+    /// this doesn't handle still fails loudly in the verifier — the
+    /// silent direction is never taken.
+    fn coerce_indirect_arg(
+        builder: &mut FunctionBuilder,
+        param_ty: Option<&Type>,
+        val: Value,
+    ) -> Value {
+        let Some(pt) = param_ty else { return val };
+        let want = nsl_type_to_cl(pt);
+        let got = builder.func.dfg.value_type(val);
+        if want == got {
+            return val;
+        }
+        if want.is_float() && got.is_int() {
+            let wide = if got.bits() < 64 {
+                builder.ins().sextend(cl_types::I64, val)
+            } else {
+                val
+            };
+            return builder.ins().fcvt_from_sint(want, wide);
+        }
+        if want == cl_types::I64 && got.is_int() && got.bits() < 64 {
+            return builder.ins().sextend(cl_types::I64, val);
+        }
+        val
     }
 
     pub(crate) fn compile_indirect_call(
@@ -3325,7 +3540,7 @@ impl Compiler<'_> {
 
         // Check if callee is a closure variable (has captures)
         let closure_captures = if let ExprKind::Ident(sym) = &callee.kind {
-            self.registry.closure_info.get(sym).copied()
+            state.closure_info.get(sym).copied()
         } else {
             None
         };
@@ -3362,10 +3577,11 @@ impl Compiler<'_> {
                 }
                 let sig_ref = builder.import_signature(sig);
 
-                // Compile normal args
+                // Compile normal args, coerced to the declared param types
                 let mut arg_vals = Vec::new();
-                for arg in args {
-                    arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                for (i, arg) in args.iter().enumerate() {
+                    let v = self.compile_expr(builder, state, &arg.value)?;
+                    arg_vals.push(Self::coerce_indirect_arg(builder, param_types.get(i), v));
                 }
                 // Load captured values from closure struct
                 for i in 0..num_captures {
@@ -3397,8 +3613,9 @@ impl Compiler<'_> {
                 let sig_ref = builder.import_signature(sig);
 
                 let mut arg_vals = Vec::new();
-                for arg in args {
-                    arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                for (i, arg) in args.iter().enumerate() {
+                    let v = self.compile_expr(builder, state, &arg.value)?;
+                    arg_vals.push(Self::coerce_indirect_arg(builder, param_types.get(i), v));
                 }
                 let call = builder.ins().call_indirect(sig_ref, fn_ptr, &arg_vals);
                 if is_void {

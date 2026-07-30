@@ -116,6 +116,14 @@ pub struct PendingLambda {
     /// Captured variables from outer scope (name, cranelift type). These become extra params
     /// after the normal params in the lambda's Cranelift function signature.
     pub captures: Vec<(Symbol, cl_types::Type)>,
+    /// Captures that are themselves CLOSURES (symbol, capture count),
+    /// recorded from the definer's FuncState at capture time. Lambda
+    /// bodies compile deferred with a FRESH FuncState — without seeding
+    /// its closure_info from this list, a captured capturing closure
+    /// called inside the body compiled as a bare-pointer call and
+    /// executed the closure struct as code (review HIGH on the
+    /// FuncState move, closure-composition repro p26).
+    pub capture_closure_info: Vec<(Symbol, usize)>,
 }
 
 /// Sub-struct grouping all type-system registration state out of the `Compiler` god-object.
@@ -142,7 +150,6 @@ pub struct FunctionRegistry {
     pub functions: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
     pub runtime_fns: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
     pub pending_lambdas: Vec<PendingLambda>,
-    pub closure_info: HashMap<Symbol, usize>,
     pub last_lambda_capture_count: Option<usize>,
     pub no_grad_fns: HashSet<String>,
     pub test_fns: Vec<String>,
@@ -154,7 +161,6 @@ impl FunctionRegistry {
             functions: HashMap::new(),
             runtime_fns: HashMap::new(),
             pending_lambdas: Vec::new(),
-            closure_info: HashMap::new(),
             last_lambda_capture_count: None,
             no_grad_fns: HashSet::new(),
             test_fns: Vec::new(),
@@ -194,7 +200,7 @@ pub struct ModelMetadata {
     /// decorators on model tensor fields, keyed `model_name -> field_name
     /// -> role`. The authoritative override for mixed Muon/AdamW routing
     /// (embedding/head route to AdamW, hidden to Muon); undecorated fields
-    /// fall back to structural inference (`muon_roles.rs`). Populated by
+    /// fall back to structural inference (`param_roles.rs`). Populated by
     /// `collection.rs`; an unknown role string is a hard compile error.
     pub model_field_roles: HashMap<String, HashMap<String, String>>,
     /// M62 Task 5: impl FuncId + signature for @export model methods.
@@ -607,6 +613,27 @@ pub struct Compiler<'a> {
     /// `nsl_fase_param_modes_*` rodata symbols when multiple `@train`
     /// blocks exist in a single compile unit.
     pub fase_table_counter: u32,
+
+    // ── ELTLS dispatch-boundary ownership registration (spec §6.2 v2a) ─
+    /// The most recent tensor-FFI emission from `compile_call_by_name`:
+    /// the EFFECTIVE extern name actually called (alias-resolved, so
+    /// `tanh` records `nsl_tensor_tanh_act`) and its Cranelift result
+    /// Value. Only non-void calls record. Consulted by
+    /// `register_dispatch_result_ownership` at the `compile_expr` Call
+    /// arm: when a dispatch arm's returned value IS this recorded result
+    /// and the emission happened DURING that dispatch (see the counter
+    /// below), the arm's result is provably the fresh output of that
+    /// extern and can be classified from the ffi_ownership table without
+    /// a per-arm allowlist entry.
+    pub last_ffi_emission: Option<(String, Value)>,
+    /// Monotonic count of `compile_call_by_name` emissions that recorded
+    /// into `last_ffi_emission`. A dispatch wrapper snapshots it before
+    /// delegating and trusts `last_ffi_emission` only if it advanced —
+    /// which forces the record to have been written during THAT dispatch.
+    /// This makes stale matches impossible across statements AND across
+    /// function bodies (Cranelift Value indices restart per function, so
+    /// a stale record could otherwise collide with an unrelated value).
+    pub ffi_emission_counter: u64,
 
     // ── FlashAttention backward side-channel ────────────────────────
     /// Maps the Cranelift Value of a forward SDPA output to (out_val, lse_val)
@@ -1074,6 +1101,8 @@ impl<'a> Compiler<'a> {
             vmap: VmapState::new(),
             features: FeatureConfigs::new(options),
             fase_table_counter: 0,
+            last_ffi_emission: None,
+            ffi_emission_counter: 0,
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             sdpa_extra_owned: Vec::new(),

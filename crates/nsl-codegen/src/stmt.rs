@@ -1201,6 +1201,13 @@ impl Compiler<'_> {
         // (only VarDecl should consume this; if it leaks past a statement boundary it's a bug)
         self.registry.last_lambda_capture_count = None;
 
+        // ELTLS v2a: dispatch-fresh membership is a PER-STATEMENT fact
+        // (see TensorCleanupState::dispatch_fresh) — a value that survives
+        // into the next statement is variable-bound, and SSA use_var can
+        // hand a later dispatch that very Value; tracking it there would
+        // free the live binding.
+        state.cleanup.dispatch_fresh.clear();
+
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value, .. } => {
                 match &pattern.kind {
@@ -1288,6 +1295,15 @@ impl Compiler<'_> {
                             state
                                 .variable_types
                                 .insert(sym, self.node_type(expr.id).clone());
+                            // Function-valued binding (lambda, fn alias,
+                            // call returning a fn): register scoped
+                            // liveness for the shadow-dispatch guard.
+                            if matches!(
+                                self.node_type(expr.id),
+                                nsl_semantic::types::Type::Function { .. }
+                            ) {
+                                state.register_fn_binding(sym);
+                            }
                             if self.expr_is_dataloader_handle(state, expr) {
                                 state.dataloader_symbols.insert(sym);
                             } else {
@@ -1327,7 +1343,17 @@ impl Compiler<'_> {
 
                         // If the value was a closure lambda, record capture count for indirect call dispatch
                         if let Some(count) = self.registry.last_lambda_capture_count.take() {
-                            self.registry.closure_info.insert(sym, count);
+                            state.set_closure_info(sym, Some(count));
+                        } else {
+                            // A rebind to anything that is NOT a capturing
+                            // lambda must clear the stale entry, or the call
+                            // site reads the new bare function pointer as a
+                            // closure struct (probed: silent death). The
+                            // scoped setter records an undo entry so a
+                            // block-local rebind cannot outlive its scope
+                            // (review HIGH on cb1bd16f: a dead if-arm's
+                            // rebind deleted the outer closure's entry).
+                            state.set_closure_info(sym, None);
                         }
                     }
                     PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
@@ -1347,6 +1373,17 @@ impl Compiler<'_> {
                             tuple_val,
                             tuple_ty.as_ref(),
                         )?;
+                        // Review F2 on 67b9ba13: destructuring arms had no
+                        // statement-end drain — a sub-expression temp (the
+                        // inner `t * 2.0` of a tuple element `t * 2.0 + 1.0`;
+                        // the element itself transfers into the tuple)
+                        // straddled into the train step loop and was freed
+                        // once per step. The destructured value is kept
+                        // defensively: if an indeterminate-typed RHS ever
+                        // lands it in the list, freeing a list pointer via
+                        // nsl_tensor_free would abort on the magic probe.
+                        self.free_tensor_temporaries(builder, state, Some(tuple_val));
+                        self.free_linear_consumes(builder, state, Some(tuple_val));
                     }
                     PatternKind::Struct { fields, .. } => {
                         // Top-level struct destructuring: let { x, y } = expr
@@ -1414,6 +1451,12 @@ impl Compiler<'_> {
                                 }
                             }
                         }
+                        // Review F2 on 67b9ba13 — same statement-end drain as
+                        // the tuple/list destructure arm above; the bound
+                        // field values are clones (never listed) and the
+                        // struct value itself is kept defensively.
+                        self.free_tensor_temporaries(builder, state, Some(struct_val));
+                        self.free_linear_consumes(builder, state, Some(struct_val));
                     }
                     _ => {
                         return Err(CodegenError::new(
@@ -1656,7 +1699,11 @@ impl Compiler<'_> {
                     .functions
                     .insert(base_name.clone(), (func_id, sig.clone()));
 
-                // Compile the nested function body
+                // Compile the nested function body. closure_info now lives
+                // on FuncState (per-function), so the nested body's own
+                // closure metadata cannot touch this function's — the
+                // earlier compiler-global map needed a snapshot here
+                // (review HIGH on 44c011c1).
                 self.compile_fn_def(fn_def)?;
 
                 // Remove temp entry and restore any previous function with the same name
@@ -1674,6 +1721,10 @@ impl Compiler<'_> {
                 builder.declare_var(var, cl_types::I64);
                 builder.def_var(var, addr);
                 state.variables.insert(fn_def.name, (var, cl_types::I64));
+                // Scoped liveness for the shadow-dispatch guard — the
+                // flat `variables` entry above never unbinds, but the
+                // checker scopes this fn to the enclosing block.
+                state.register_fn_binding(fn_def.name);
             }
 
             StmtKind::GradBlock(grad) => {
@@ -1898,6 +1949,41 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Shared exit for every non-Ident assignment target (dict/list set,
+    /// tensor multi-dim set, struct/model field stores, adapter
+    /// side-table stores): drain the statement's temporaries with the
+    /// just-stored value excluded, mirroring the Ident arm's tail.
+    /// These arms previously had NO drain at all (PR #433 review LOW-2),
+    /// which broke in two ways:
+    ///
+    /// - The stored value: an OWNED temp (`d["k"] = t * 2.0`) stayed in
+    ///   `tensor_temporaries`, so the NEXT statement's sweep freed it
+    ///   while the container still held the raw handle — dict reads
+    ///   cloned a freed tensor, list reads handed out the dangling
+    ///   pointer itself, and the adapter side-table's free-on-overwrite
+    ///   became a double free. `free_tensor_temporaries` DRAINS the
+    ///   list (`split_off`) and skips freeing `keep`, so passing the
+    ///   stored value as `keep` IS the ownership transfer into the
+    ///   container: the handle leaves the sweep's reach unfree'd.
+    ///   Nothing is retained for borrowed stores — per the borrow-store
+    ///   convention (dict_lifetime.rs) no machinery ever releases a
+    ///   container-stored borrow, so a retain would strand one
+    ///   reference per store.
+    /// - Sub-expression temporaries (`d["k"] = t * 2.0 + 1.0` leaves
+    ///   the inner `t * 2.0`) otherwise straddle past the statement;
+    ///   a region that frees the temporaries list without draining it —
+    ///   the train-block step loop — then freed the straddler once per
+    ///   step: double free at step 2.
+    fn assign_container_store_tail(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        stored_val: Value,
+    ) {
+        self.free_tensor_temporaries(builder, state, Some(stored_val));
+        self.free_linear_consumes(builder, state, Some(stored_val));
+    }
+
     fn compile_assign(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2038,6 +2124,18 @@ impl Compiler<'_> {
                         state.dataloader_symbols.remove(sym);
                     }
                     self.update_non_owning_binding(state, *sym, Some(value));
+                    // Same capture-count transfer/clear as the VarDecl arm
+                    // (review MEDIUM-1 on 44c011c1): a plain `f = <lambda>`
+                    // rebind previously left closure_info stale in BOTH
+                    // directions — a non-capturing rebind after a capturing
+                    // one made the call site read the bare fn pointer as a
+                    // closure struct (silent death), and a capturing rebind
+                    // was never recorded at all.
+                    if let Some(count) = self.registry.last_lambda_capture_count.take() {
+                        state.set_closure_info(*sym, Some(count));
+                    } else {
+                        state.set_closure_info(*sym, None);
+                    }
                 }
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
                 self.free_tensor_temporaries(builder, state, Some(final_val));
@@ -2091,6 +2189,7 @@ impl Compiler<'_> {
                         let set_id = self.registry.runtime_fns[set_fn].0;
                         let set_ref = self.module.declare_func_in_func(set_id, builder.func);
                         builder.ins().call(set_ref, &[obj_val, idx_val, final_val]);
+                        self.assign_container_store_tail(builder, state, final_val);
                     }
                     SubscriptKind::MultiDim(dims) => {
                         // Tensor element write: t[i, j, ...] = v (and compound
@@ -2157,6 +2256,9 @@ impl Compiler<'_> {
                             &[obj_val, indices_list, final_val],
                         )?;
                         self.compile_call_by_name(builder, "nsl_list_free", &[indices_list])?;
+                        // Stored value is a scalar; the drain covers
+                        // index-expression and RHS temporaries.
+                        self.assign_container_store_tail(builder, state, final_val);
                     }
                     _ => return Err(CodegenError::new("only simple index assignment supported")),
                 }
@@ -2229,6 +2331,7 @@ impl Compiler<'_> {
                                     obj_val,
                                     field.offset as i32,
                                 );
+                                self.assign_container_store_tail(builder, state, final_val);
                                 return Ok(());
                             }
                         }
@@ -2285,6 +2388,11 @@ impl Compiler<'_> {
                                         table_ptr,
                                         byte_off,
                                     );
+                                    // The side-table owns its tensors and
+                                    // frees the old slot on overwrite — a
+                                    // swept owned temp here became a later
+                                    // double free.
+                                    self.assign_container_store_tail(builder, state, new_val);
                                     return Ok(());
                                 }
                             }
@@ -2356,6 +2464,7 @@ impl Compiler<'_> {
                                     obj_val,
                                     field.offset as i32,
                                 );
+                                self.assign_container_store_tail(builder, state, final_val);
                                 return Ok(());
                             }
                         }
@@ -2820,7 +2929,27 @@ impl Compiler<'_> {
         state: &mut FuncState,
         keep: Option<Value>,
     ) {
-        let temps = std::mem::take(&mut state.cleanup.tensor_temporaries);
+        // Drain only the temporaries registered ABOVE the innermost loop-scope
+        // mark. A `mem::take` of the whole list here stole entries that a loop
+        // CONDITION / for-ITERABLE registered before `temp_scope_stack` pushed
+        // its mark: the first body statement drained them (emitting their
+        // frees INSIDE the body = once per iteration), left `scope_start`
+        // pointing past the now-empty list, and the loop-exit cleanups'
+        // `[scope_start..]` slices panicked at compile time — a pre-existing
+        // ICE (method-form condition temps hit it on main) made trivially
+        // reachable once nested-arg tracking covered every dispatch arm
+        // (review HIGH on 3b7f085f, red-proven with a 6-line while loop).
+        // Below-mark entries stay listed; the loop statement's own
+        // statement-end cleanup frees the final condition evaluation's temp
+        // after the loop exits.
+        let start = state
+            .cleanup
+            .temp_scope_stack
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .min(state.cleanup.tensor_temporaries.len());
+        let temps = state.cleanup.tensor_temporaries.split_off(start);
         // Tape ID identity: intermediates can now be safely freed during tape recording
         // because TapeOps use monotonic tape_ids as identity keys (not raw pointers).
         for temp in &temps {
@@ -2828,6 +2957,44 @@ impl Compiler<'_> {
                 continue;
             }
             // Emit nsl_tensor_free(temp) — but only if block is not already filled
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*temp]);
+        }
+    }
+
+    /// Free the tensor temporaries a loop CONDITION registered during one
+    /// evaluation, inside the block that evaluates it (the loop header),
+    /// and drain them from `tensor_temporaries` so the loop statement's
+    /// end-of-statement cleanup does not free them a second time.
+    ///
+    /// `base` is the list length snapshotted immediately before the
+    /// condition compiled — everything at or above it was registered by
+    /// this evaluation. `keep` is the condition's own result value
+    /// (while-let binds it into the body; excluded defensively — a
+    /// tracked keep would otherwise become freed-then-read).
+    ///
+    /// Emitting the frees in the HEADER is what makes this per-iteration:
+    /// the header re-executes before every body entry AND before the
+    /// exit branch, so the final evaluation's temps are freed exactly
+    /// once too. Entries BELOW `base` (an outer statement's temps) stay
+    /// listed and untouched.
+    pub(crate) fn free_condition_temporaries(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        base: usize,
+        keep: Value,
+    ) {
+        let base = base.min(state.cleanup.tensor_temporaries.len());
+        let temps = state.cleanup.tensor_temporaries.split_off(base);
+        for temp in &temps {
+            if *temp == keep {
+                continue;
+            }
             if let Some(block) = state.current_block {
                 if is_block_filled(builder, block) {
                     break;
@@ -2898,6 +3065,10 @@ impl Compiler<'_> {
     /// CRITICAL: Does NOT truncate tensor_temporaries — that only happens at natural scope exit.
     fn emit_loop_scope_cleanup(&mut self, builder: &mut FunctionBuilder, state: &mut FuncState) {
         if let Some(&scope_start) = state.cleanup.temp_scope_stack.last() {
+            // Clamp defensively: the statement-end drain above now preserves
+            // below-mark entries, but a stale mark must degrade to a no-op,
+            // never a slice panic.
+            let scope_start = scope_start.min(state.cleanup.tensor_temporaries.len());
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
                     if is_block_filled(builder, block) {
@@ -2912,6 +3083,8 @@ impl Compiler<'_> {
     /// Emit cleanup AND truncate temporaries at natural loop exit.
     fn cleanup_loop_scope(&mut self, builder: &mut FunctionBuilder, state: &mut FuncState) {
         if let Some(scope_start) = state.cleanup.temp_scope_stack.pop() {
+            // Clamp defensively — see emit_loop_scope_cleanup.
+            let scope_start = scope_start.min(state.cleanup.tensor_temporaries.len());
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
                     if is_block_filled(builder, block) {
@@ -3012,9 +3185,11 @@ impl Compiler<'_> {
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.flags.conditional_depth += 1;
+        state.push_fn_binding_scope();
         for s in &then_block.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.flags.conditional_depth -= 1;
         let current = state.current_block.unwrap_or(then_bb);
         if !is_block_filled(builder, current) {
@@ -3046,9 +3221,11 @@ impl Compiler<'_> {
             state.dataloader_symbols = incoming_loader_symbols.clone();
             state.cleanup.dataloader_vars = incoming_loader_vars.clone();
             state.flags.conditional_depth += 1;
+            state.push_fn_binding_scope();
             for s in &elif_body.stmts {
                 self.compile_stmt(builder, state, s)?;
             }
+            state.pop_fn_binding_scope();
             state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(elif_then);
             if !is_block_filled(builder, current) {
@@ -3067,9 +3244,11 @@ impl Compiler<'_> {
             state.dataloader_symbols = incoming_loader_symbols.clone();
             state.cleanup.dataloader_vars = incoming_loader_vars.clone();
             state.flags.conditional_depth += 1;
+            state.push_fn_binding_scope();
             for s in &else_body.stmts {
                 self.compile_stmt(builder, state, s)?;
             }
+            state.pop_fn_binding_scope();
             state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(current_else);
             if !is_block_filled(builder, current) {
@@ -3146,7 +3325,23 @@ impl Compiler<'_> {
 
         builder.switch_to_block(header_block);
         state.current_block = Some(header_block);
+        let cond_base = state.cleanup.tensor_temporaries.len();
         let cond_val = self.compile_expr(builder, state, condition)?;
+        // Free per-evaluation condition temporaries INSIDE the header
+        // block, after the branch scalar is computed and before the brif.
+        // The condition re-evaluates every iteration, but until now its
+        // temps sat in tensor_temporaries below the loop-scope mark and
+        // only the While STATEMENT's end-of-statement cleanup (in the
+        // exit block) ever freed them — which frees exactly ONE
+        // evaluation's values (the final one, whose SSA results dominate
+        // the exit); every earlier iteration's condition temps stranded,
+        // one block per tracked temp per evaluation (the deliberate
+        // exact-6 pin in nested_arg_temporaries_gate, now retired).
+        // Draining here means the header frees each evaluation's temps —
+        // including the final one — and the exit-block cleanup no longer
+        // sees them, so nothing double-frees. The brif consumes only the
+        // extracted scalar, never the freed handles.
+        self.free_condition_temporaries(builder, state, cond_base, cond_val);
         builder
             .ins()
             .brif(cond_val, body_block, &[], exit_block, &[]);
@@ -3164,9 +3359,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3232,7 +3429,16 @@ impl Compiler<'_> {
         // Header: evaluate expression, check truthiness (non-zero = continue)
         builder.switch_to_block(header_block);
         state.current_block = Some(header_block);
+        let expr_base = state.cleanup.tensor_temporaries.len();
         let val = self.compile_expr(builder, state, expr)?;
+        // Per-evaluation sub-temporaries of the while-let expression free
+        // in the header, same as compile_while. `val` itself is excluded
+        // by free_condition_temporaries' keep parameter — it is bound to
+        // the pattern variable and read throughout the body (top-level
+        // compile_expr results are not tracked today, so the exclusion is
+        // defensive, but a tracked `val` would otherwise be a
+        // freed-then-read bug, not a leak).
+        self.free_condition_temporaries(builder, state, expr_base, val);
         let cond = builder.ins().icmp_imm(IntCC::NotEqual, val, 0);
         builder.ins().brif(cond, body_block, &[], exit_block, &[]);
 
@@ -3255,9 +3461,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3493,9 +3701,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3613,9 +3823,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3784,9 +3996,11 @@ impl Compiler<'_> {
             exit_block: break_exit_block,
             batch_var: Some(batch_var),
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         state.borrowed_batch_symbols.remove(&loop_var_sym);
         for sym in &predecl_syms {
@@ -3875,9 +4089,11 @@ impl Compiler<'_> {
                 PatternKind::Wildcard => {
                     // Default arm — always taken
                     state.flags.conditional_depth += 1;
+                    state.push_fn_binding_scope();
                     for s in &arm.body.stmts {
                         self.compile_stmt(builder, state, s)?;
                     }
+                    state.pop_fn_binding_scope();
                     state.flags.conditional_depth -= 1;
                     if let Some(block) = state.current_block {
                         if !is_block_filled(builder, block) {
@@ -3905,9 +4121,11 @@ impl Compiler<'_> {
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         state.flags.conditional_depth += 1;
+                        state.push_fn_binding_scope();
                         for s in &arm.body.stmts {
                             self.compile_stmt(builder, state, s)?;
                         }
+                        state.pop_fn_binding_scope();
                         state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
@@ -3926,9 +4144,11 @@ impl Compiler<'_> {
                         builder.def_var(var, subject_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
                         state.flags.conditional_depth += 1;
+                        state.push_fn_binding_scope();
                         for s in &arm.body.stmts {
                             self.compile_stmt(builder, state, s)?;
                         }
+                        state.pop_fn_binding_scope();
                         state.flags.conditional_depth -= 1;
                         if let Some(block) = state.current_block {
                             if !is_block_filled(builder, block) {
@@ -3962,9 +4182,11 @@ impl Compiler<'_> {
                     builder.seal_block(arm_block);
                     state.current_block = Some(arm_block);
                     state.flags.conditional_depth += 1;
+                    state.push_fn_binding_scope();
                     for s in &arm.body.stmts {
                         self.compile_stmt(builder, state, s)?;
                     }
+                    state.pop_fn_binding_scope();
                     state.flags.conditional_depth -= 1;
                     let current = state.current_block.unwrap_or(arm_block);
                     if !is_block_filled(builder, current) {
@@ -3999,9 +4221,11 @@ impl Compiler<'_> {
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         state.flags.conditional_depth += 1;
+                        state.push_fn_binding_scope();
                         for s in &arm.body.stmts {
                             self.compile_stmt(builder, state, s)?;
                         }
+                        state.pop_fn_binding_scope();
                         state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
@@ -4900,6 +5124,9 @@ impl Compiler<'_> {
         let mut momentum_value: f64 = 0.0;
         let mut dampening_value: f64 = 0.0;
         let mut weight_decay_value: f64 = 0.0;
+        // AdamW parameter groups (`no_decay=[...]`). Empty = every param
+        // decays, bit-identical to before this existed.
+        let mut no_decay_scope = crate::param_roles::NoDecayScope::default();
         let mut nesterov_value: bool = false;
         let mut beta1_value: f64 = 0.9;
         let mut beta2_value: f64 = 0.999;
@@ -4997,6 +5224,64 @@ impl Compiler<'_> {
                                     "weight_decay" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             weight_decay_value = *f;
+                                        }
+                                    }
+                                    // AdamW parameter groups: role names whose
+                                    // params are EXEMPT from weight decay. An
+                                    // unknown name is a compile error, not a
+                                    // silently-dropped entry — a typo'd
+                                    // "vectors" would otherwise read as
+                                    // "exclusion configured" while decaying
+                                    // every norm in the model.
+                                    "no_decay" => {
+                                        let ExprKind::ListLiteral(items) = &arg.value.kind else {
+                                            return Err(CodegenError::new(
+                                                "no_decay must be a list of role-name strings, \
+                                                 e.g. no_decay=[\"vector\"] (norms/biases) or \
+                                                 no_decay=[\"vector\", \"embedding\"]",
+                                            ));
+                                        };
+                                        for item in items {
+                                            let ExprKind::StringLiteral(s) = &item.kind else {
+                                                return Err(CodegenError::new(
+                                                    "no_decay entries must be string literals \
+                                                     naming a parameter role",
+                                                ));
+                                            };
+                                            if !crate::param_roles::VALID_ROLES.contains(&s.as_str()) {
+                                                return Err(CodegenError::new(format!(
+                                                    "no_decay: unknown parameter role {s:?}. \
+                                                     Valid roles are {:?}. \"vector\" covers \
+                                                     anything not rank-2 at runtime (norms, \
+                                                     biases); \"embedding\"/\"head\" come from \
+                                                     @param_role or embedding_lookup usage",
+                                                    crate::param_roles::VALID_ROLES,
+                                                )));
+                                            }
+                                            if s == "vector" {
+                                                no_decay_scope.exempt_non_rank2 = true;
+                                            } else if !no_decay_scope.exempts_role(s) {
+                                                no_decay_scope.static_roles.push(s.clone());
+                                            }
+                                        }
+                                        // Every param's role is exactly one of
+                                        // embedding/head/hidden/vector, so exempting
+                                        // the three non-vector roles exempts
+                                        // everything (a "vector"-role param needs a
+                                        // statically-derivable rank, which real
+                                        // models do not have). That is
+                                        // weight_decay=0.0 spelled obscurely.
+                                        if ["embedding", "head", "hidden"]
+                                            .iter()
+                                            .all(|r| no_decay_scope.exempts_role(r))
+                                        {
+                                            return Err(CodegenError::new(
+                                                "no_decay exempts every role that a parameter \
+                                                 can have (embedding, head, hidden), which \
+                                                 disables weight decay entirely — set \
+                                                 weight_decay=0.0 instead so the intent is \
+                                                 visible at the call site",
+                                            ));
                                         }
                                     }
                                     "nesterov" => {
@@ -6041,7 +6326,7 @@ impl Compiler<'_> {
         // ── 4a. P1 Muon item 6: parameter-ROLE routing flags ────────────
         // Mixed Muon/AdamW routes by parameter ROLE — explicit @param_role
         // decorator > embedding_lookup-usage inference > declared rank >
-        // default hidden (see muon_roles.rs). The name-substring exclusion
+        // default hidden (see param_roles.rs). The name-substring exclusion
         // list is gone. Flags ride in an i64 NslList parallel to param_list
         // (1 = force-AdamW); the rank-2 structural check remains the runtime
         // backstop inside muon_step. Built BEFORE the optimizer state
@@ -6049,7 +6334,7 @@ impl Compiler<'_> {
         // params (item 9). The routing table prints loudly so a misrouted
         // param is never silent.
         let muon_route_list = if optimizer_name == "muon" {
-            let table = self.classify_muon_param_roles(&model_type_name, &param_paths);
+            let table = self.classify_param_roles(&model_type_name, &param_paths);
             let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
             for e in &table.entries {
                 let flag = builder.ins().iconst(cl_types::I64, e.adamw as i64);
@@ -6090,6 +6375,116 @@ impl Compiler<'_> {
             Some(list)
         } else {
             None
+        };
+
+        // AdamW parameter groups: refuse the compositions that hoist ONE
+        // weight-decay scalar out of the per-parameter loop. Each of these
+        // would compile and train — decaying the parameters the user asked to
+        // exempt — so they must refuse rather than silently ignore no_decay.
+        if !no_decay_scope.is_empty() {
+            if self.compile_options.muon_batch_ns {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --muon-batch-ns: the \
+                     batched Newton-Schulz pre-loop takes one weight_decay \
+                     scalar for the whole batch, so per-parameter exemption \
+                     cannot be expressed there. Drop one",
+                ));
+            }
+            if csla_active {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --layerwise-accum: the \
+                     window-buffered group update hoists weight_decay out of \
+                     the per-parameter loop. Drop one",
+                ));
+            }
+            if self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --optim-state-offload \
+                     yet (the staged host/device envelope is untested against \
+                     per-parameter decay). Drop one",
+                ));
+            }
+        }
+
+        // ── 4a-bis. AdamW parameter groups: per-param decay-exempt flags ──
+        // `no_decay=[...]` names ROLES to exempt from weight decay. The
+        // static half of the decision (embedding / head / hidden) is decided
+        // here from the same role table Muon routes on; the `"vector"` half
+        // is NOT, because a model field only has a statically-derivable rank
+        // when its initializer is a direct zeros/ones/randn/... call over
+        // integer literals — which real models are not. Both halves meet in
+        // `nsl_optim_param_wd`, the single runtime rule.
+        //
+        // Flags ride in an i64 NslList parallel to param_list (1 = exempt),
+        // exactly like the Muon route flags. The table prints loudly: a
+        // parameter group that silently exempted nothing (or everything) is
+        // the failure this feature is supposed to remove, not add.
+        let decay_exempt_list = if no_decay_scope.is_empty() {
+            None
+        } else {
+            if weight_decay_value == 0.0 {
+                eprintln!(
+                    "[wd-groups] warning: no_decay=[...] was given but \
+                     weight_decay is 0.0 — nothing is being decayed, so the \
+                     exemption has no effect."
+                );
+            }
+            let table = self.classify_param_roles(&model_type_name, &param_paths);
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let mut static_exempt = 0usize;
+            for e in &table.entries {
+                let exempt = no_decay_scope.exempts_role(e.role);
+                static_exempt += usize::from(exempt);
+                let flag = builder.ins().iconst(cl_types::I64, i64::from(exempt));
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
+            }
+            let mut scope_desc = no_decay_scope.static_roles.clone();
+            if no_decay_scope.exempt_non_rank2 {
+                scope_desc.push("vector (runtime rank != 2)".to_string());
+            }
+            eprintln!(
+                "[wd-groups] weight_decay={} exempting roles [{}] over {} params: \
+                 {} exempt by role at compile time{}",
+                weight_decay_value,
+                scope_desc.join(", "),
+                table.entries.len(),
+                static_exempt,
+                if no_decay_scope.exempt_non_rank2 {
+                    ", plus every param that is not rank-2 at step time"
+                } else {
+                    ""
+                },
+            );
+            for e in &table.entries {
+                if no_decay_scope.exempts_role(e.role) {
+                    eprintln!(
+                        "[wd-groups]   {} role={} ({}) -> NO decay",
+                        e.path, e.role, e.source
+                    );
+                }
+            }
+            // Anti-vacuity: a scope that exempts nothing statically AND does
+            // not ask for the runtime rank check cannot ever fire. That is a
+            // configuration error, not a no-op to shrug at.
+            if static_exempt == 0 && !no_decay_scope.exempt_non_rank2 {
+                return Err(CodegenError::new(format!(
+                    "no_decay=[{}] matches no parameter in this model — every \
+                     param classified as one of the roles it does NOT name. \
+                     Roles present: {}. Note that norms and biases usually \
+                     classify as role `hidden` (their rank is not derivable \
+                     from the field initializer), so use no_decay=[\"vector\"] \
+                     to exempt them by runtime rank",
+                    no_decay_scope.static_roles.join(", "),
+                    {
+                        let mut roles: Vec<&str> =
+                            table.entries.iter().map(|e| e.role).collect();
+                        roles.sort_unstable();
+                        roles.dedup();
+                        roles.join(", ")
+                    },
+                )));
+            }
+            Some(list)
         };
 
         // ── 4. Create optimizer state buffers ─────────────────────────
@@ -12423,6 +12818,7 @@ impl Compiler<'_> {
                 grad_accumulation_steps,
                 grad_clip,
                 cpdt_precision_dtypes,
+                decay_exempt_list.map(|l| (l, no_decay_scope.exempt_non_rank2)),
             )?;
 
             // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
@@ -12626,6 +13022,18 @@ impl Compiler<'_> {
                         let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
                         let eps_v = builder.ins().f64const(sc.eps);
                         let wd_v = builder.ins().f64const(sc.wd);
+                        // The parameter-group arguments are as load-bearing here
+                        // as in the unclipped arm below. Omitting them does not
+                        // fail to compile — it shifts `clip_factor` into the
+                        // `wd_exempt_list` slot, so the runtime would read a
+                        // float bit-pattern as an NslList pointer while the clip
+                        // silently stopped being applied.
+                        let exempt_list_v = decay_exempt_list
+                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                        let exempt_nr2_v = builder.ins().iconst(
+                            cl_types::I64,
+                            i64::from(no_decay_scope.exempt_non_rank2),
+                        );
                         self.compile_call_by_name(
                             builder,
                             "nsl_fase_fused_adamw_step_multi",
@@ -12643,6 +13051,10 @@ impl Compiler<'_> {
                                 wd_v,
                                 bc1_inv,
                                 bc2_inv,
+                                exempt_list_v,
+                                exempt_nr2_v,
+                                // mp_scale: the clip factor, folded into the
+                                // m_partial read in-kernel.
                                 clip_factor,
                             ],
                         )?;
@@ -12774,6 +13186,12 @@ impl Compiler<'_> {
                         let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
                         let eps_v = builder.ins().f64const(sc.eps);
                         let wd_v = builder.ins().f64const(sc.wd);
+                        let exempt_list_v = decay_exempt_list
+                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                        let exempt_nr2_v = builder.ins().iconst(
+                            cl_types::I64,
+                            i64::from(no_decay_scope.exempt_non_rank2),
+                        );
                         // mp_scale = 1.0: unclipped path (the kernel branches
                         // around the multiply, keeping exact bit-identity).
                         let one_scale = builder.ins().f64const(1.0);
@@ -12794,6 +13212,11 @@ impl Compiler<'_> {
                                 wd_v,
                                 bc1_inv,
                                 bc2_inv,
+                                // AdamW parameter groups. 0 = no no_decay,
+                                // in which case the runtime takes wd_v for
+                                // every param exactly as before.
+                                exempt_list_v,
+                                exempt_nr2_v,
                                 one_scale,
                             ],
                         )?;
@@ -12855,18 +13278,34 @@ impl Compiler<'_> {
                         m
                     };
                     let wrap_precision = cpdt_precision_dtypes.is_some();
-                    self.fase_emit_final_step(
+                    // AdamW parameter groups. `fase_emit_final_step` bakes λ
+                    // into the emitted update program at COMPILE time (it
+                    // elides the `wd·θ` term entirely when λ == 0), so a
+                    // runtime λ cannot be handed to it. Branch between two
+                    // compile-time recipes instead: each arm is then
+                    // byte-identical to what this site emitted before the
+                    // feature, at its own λ. Multiplying θ by a runtime 0
+                    // would have been the smaller diff and is NOT used —
+                    // this file already documents why mul-by-0.0 is not a
+                    // zeroing idiom here (it keeps NaN/Inf alive).
+                    let fs_wd_join = self.emit_deferred_step_with_groups(
                         builder,
+                        decay_exempt_list.map(|l| (l, no_decay_scope.exempt_non_rank2)),
+                        fs_i,
                         theta,
                         m,
                         m_partial,
                         v,
                         &fase_plan.recipe,
-                        Some((bc1_inv, bc2_inv)),
+                        (bc1_inv, bc2_inv),
                         wrap_precision,
-                        self.compile_options.optim_state_offload,
                         Some(opt_step),
                     )?;
+                    if let Some(join) = fs_wd_join {
+                        builder.ins().jump(join, &[]);
+                        builder.switch_to_block(join);
+                        builder.seal_block(join);
+                    }
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     if let Some(fs_join) = fs_zero_blocks {
                         builder.ins().jump(fs_join, &[]);
@@ -13018,7 +13457,7 @@ impl Compiler<'_> {
                 s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
             };
             // P5 Muon: per-param routing flag (parameter-role classification,
-            // see 4a / muon_roles.rs) + Newton-Schulz depth + the AdamW-arm
+            // see 4a / param_roles.rs) + Newton-Schulz depth + the AdamW-arm
             // lr as a fixed ratio of the (possibly scheduled) lr.
             let muon_extra = if let Some(route_list) = muon_route_list {
                 let flag_i =
@@ -13063,6 +13502,16 @@ impl Compiler<'_> {
             // construction here, so wrap_precision is always structurally
             // false at this call site. Threaded through for signature
             // uniformity with the unified-dispatch site.
+            // AdamW parameter groups: per-param decay. Identity (no emitted
+            // IR) when no_decay was not configured.
+            let param_wd = self.emit_param_wd(
+                builder,
+                decay_exempt_list.map(|l| (l, no_decay_scope.exempt_non_rank2)),
+                idx,
+                param_val,
+                weight_decay_const,
+            )?;
+
             self.emit_stdlib_optim_call(
                 builder,
                 optimizer_name.as_str(),
@@ -13074,7 +13523,7 @@ impl Compiler<'_> {
                 lr,
                 momentum_const,
                 dampening_const,
-                weight_decay_const,
+                param_wd,
                 nesterov_const,
                 beta1_const,
                 beta2_const,
@@ -14288,6 +14737,9 @@ impl Compiler<'_> {
         let mut momentum_value: f64 = 0.0;
         let mut dampening_value: f64 = 0.0;
         let mut weight_decay_value: f64 = 0.0;
+        // AdamW parameter groups (`no_decay=[...]`). Empty = every param
+        // decays, bit-identical to before this existed.
+        let mut no_decay_scope = crate::param_roles::NoDecayScope::default();
         let mut nesterov_value: bool = false;
         let mut beta1_value: f64 = 0.9;
         let mut beta2_value: f64 = 0.999;
@@ -14336,6 +14788,64 @@ impl Compiler<'_> {
                                     "weight_decay" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             weight_decay_value = *f;
+                                        }
+                                    }
+                                    // AdamW parameter groups: role names whose
+                                    // params are EXEMPT from weight decay. An
+                                    // unknown name is a compile error, not a
+                                    // silently-dropped entry — a typo'd
+                                    // "vectors" would otherwise read as
+                                    // "exclusion configured" while decaying
+                                    // every norm in the model.
+                                    "no_decay" => {
+                                        let ExprKind::ListLiteral(items) = &arg.value.kind else {
+                                            return Err(CodegenError::new(
+                                                "no_decay must be a list of role-name strings, \
+                                                 e.g. no_decay=[\"vector\"] (norms/biases) or \
+                                                 no_decay=[\"vector\", \"embedding\"]",
+                                            ));
+                                        };
+                                        for item in items {
+                                            let ExprKind::StringLiteral(s) = &item.kind else {
+                                                return Err(CodegenError::new(
+                                                    "no_decay entries must be string literals \
+                                                     naming a parameter role",
+                                                ));
+                                            };
+                                            if !crate::param_roles::VALID_ROLES.contains(&s.as_str()) {
+                                                return Err(CodegenError::new(format!(
+                                                    "no_decay: unknown parameter role {s:?}. \
+                                                     Valid roles are {:?}. \"vector\" covers \
+                                                     anything not rank-2 at runtime (norms, \
+                                                     biases); \"embedding\"/\"head\" come from \
+                                                     @param_role or embedding_lookup usage",
+                                                    crate::param_roles::VALID_ROLES,
+                                                )));
+                                            }
+                                            if s == "vector" {
+                                                no_decay_scope.exempt_non_rank2 = true;
+                                            } else if !no_decay_scope.exempts_role(s) {
+                                                no_decay_scope.static_roles.push(s.clone());
+                                            }
+                                        }
+                                        // Every param's role is exactly one of
+                                        // embedding/head/hidden/vector, so exempting
+                                        // the three non-vector roles exempts
+                                        // everything (a "vector"-role param needs a
+                                        // statically-derivable rank, which real
+                                        // models do not have). That is
+                                        // weight_decay=0.0 spelled obscurely.
+                                        if ["embedding", "head", "hidden"]
+                                            .iter()
+                                            .all(|r| no_decay_scope.exempts_role(r))
+                                        {
+                                            return Err(CodegenError::new(
+                                                "no_decay exempts every role that a parameter \
+                                                 can have (embedding, head, hidden), which \
+                                                 disables weight decay entirely — set \
+                                                 weight_decay=0.0 instead so the intent is \
+                                                 visible at the call site",
+                                            ));
                                         }
                                     }
                                     "nesterov" => {
@@ -14680,6 +15190,19 @@ impl Compiler<'_> {
                 optimizer_fn_name.to_string()
             }
         };
+
+        // AdamW parameter groups are not wired through the @pipeline path:
+        // its optimizer step is emitted per pipeline stage rather than over
+        // the model's flat param list, so the role table's positional flags
+        // have no list to be parallel to here. Refuse rather than decay the
+        // parameters the user asked to exempt.
+        if !no_decay_scope.is_empty() {
+            return Err(CodegenError::new(
+                "no_decay=[...] is not supported on the @pipeline train path \
+                 yet: its optimizer step is emitted per stage rather than over \
+                 the flat parameter list the role flags index. Drop one",
+            ));
+        }
 
         let lr = builder.use_var(lr_var);
         let momentum_const = builder.ins().f64const(momentum_value);
@@ -15191,6 +15714,13 @@ impl Compiler<'_> {
         //    The last expression is the loss (a scalar tensor).
         state.flags.in_tape_region = true;
         let mut loss_val = None;
+        // The grad body is checker-scoped (check_block ScopeKind::Block)
+        // but compiles in the SAME FuncState with no variables restore —
+        // a nested fn declared here must not stay a live fn-binding
+        // after the block (review MEDIUM on 682641ca: a post-block call
+        // the checker resolved to the builtin rerouted into the grad
+        // body's dead nested fn — misaligned-deref abort).
+        state.push_fn_binding_scope();
         for (i, stmt) in grad.body.stmts.iter().enumerate() {
             if i == grad.body.stmts.len() - 1 {
                 if let StmtKind::Expr(ref expr) = stmt.kind {
@@ -15202,6 +15732,7 @@ impl Compiler<'_> {
                 self.compile_stmt(builder, state, stmt)?;
             }
         }
+        state.pop_fn_binding_scope();
         // ELTLS: free tape-held tensors before clearing the tape flag.
         self.free_tape_held_tensors(builder, state);
         state.flags.in_tape_region = false;
