@@ -239,6 +239,13 @@ impl Compiler<'_> {
                 state.variables.insert(*sym, (var, *cl_type));
             }
 
+            // Seed closure metadata for captured closures (see
+            // PendingLambda::capture_closure_info) — the fresh FuncState
+            // otherwise compiles calls to them as bare-pointer calls.
+            for &(sym, count) in &lambda.capture_closure_info {
+                state.set_closure_info(sym, Some(count));
+            }
+
             // Compile body expression
             let result = self.compile_expr(&mut builder, &mut state, &lambda.body)?;
             let current = state.current_block.unwrap_or(entry);

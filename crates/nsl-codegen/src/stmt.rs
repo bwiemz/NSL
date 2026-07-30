@@ -1343,7 +1343,17 @@ impl Compiler<'_> {
 
                         // If the value was a closure lambda, record capture count for indirect call dispatch
                         if let Some(count) = self.registry.last_lambda_capture_count.take() {
-                            self.registry.closure_info.insert(sym, count);
+                            state.set_closure_info(sym, Some(count));
+                        } else {
+                            // A rebind to anything that is NOT a capturing
+                            // lambda must clear the stale entry, or the call
+                            // site reads the new bare function pointer as a
+                            // closure struct (probed: silent death). The
+                            // scoped setter records an undo entry so a
+                            // block-local rebind cannot outlive its scope
+                            // (review HIGH on cb1bd16f: a dead if-arm's
+                            // rebind deleted the outer closure's entry).
+                            state.set_closure_info(sym, None);
                         }
                     }
                     PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
@@ -1689,7 +1699,11 @@ impl Compiler<'_> {
                     .functions
                     .insert(base_name.clone(), (func_id, sig.clone()));
 
-                // Compile the nested function body
+                // Compile the nested function body. closure_info now lives
+                // on FuncState (per-function), so the nested body's own
+                // closure metadata cannot touch this function's — the
+                // earlier compiler-global map needed a snapshot here
+                // (review HIGH on 44c011c1).
                 self.compile_fn_def(fn_def)?;
 
                 // Remove temp entry and restore any previous function with the same name
@@ -2110,6 +2124,18 @@ impl Compiler<'_> {
                         state.dataloader_symbols.remove(sym);
                     }
                     self.update_non_owning_binding(state, *sym, Some(value));
+                    // Same capture-count transfer/clear as the VarDecl arm
+                    // (review MEDIUM-1 on 44c011c1): a plain `f = <lambda>`
+                    // rebind previously left closure_info stale in BOTH
+                    // directions — a non-capturing rebind after a capturing
+                    // one made the call site read the bare fn pointer as a
+                    // closure struct (silent death), and a capturing rebind
+                    // was never recorded at all.
+                    if let Some(count) = self.registry.last_lambda_capture_count.take() {
+                        state.set_closure_info(*sym, Some(count));
+                    } else {
+                        state.set_closure_info(*sym, None);
+                    }
                 }
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
                 self.free_tensor_temporaries(builder, state, Some(final_val));

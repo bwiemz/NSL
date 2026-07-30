@@ -235,6 +235,20 @@ pub struct FuncState {
     /// (params, top-level nested fns) and stays live for the whole
     /// function — which is exactly the checker's scoping for those.
     pub fn_binding_scopes: Vec<Vec<Symbol>>,
+    /// Per-FUNCTION closure capture counts, moved off the compiler-global
+    /// Registry (review HIGHs on 44c011c1/cb1bd16f: global entries leaked
+    /// across nested-fn compiles and, with the block-scope-blind clear,
+    /// across if-arm/loop-body scopes — a dead if-arm's non-capturing
+    /// rebind deleted the outer closure's entry and the post-arm call
+    /// executed the closure struct as code). Mutate ONLY through
+    /// `set_closure_info`, which records an undo entry in the innermost
+    /// open fn-binding scope; `pop_fn_binding_scope` rolls the scope's
+    /// mutations back, mirroring the checker's block scoping exactly like
+    /// `live_fn_bindings` above.
+    pub closure_info: HashMap<Symbol, usize>,
+    /// Undo log per open fn-binding scope: symbol -> the closure_info
+    /// state BEFORE this scope's first mutation of it (None = absent).
+    closure_scope_undo: Vec<HashMap<Symbol, Option<usize>>>,
     pub param_symbols: HashSet<Symbol>,
     pub non_owning_symbols: HashSet<Symbol>,
     pub dataloader_symbols: HashSet<Symbol>,
@@ -324,6 +338,8 @@ impl FuncState {
             variables: HashMap::new(),
             live_fn_bindings: HashMap::new(),
             fn_binding_scopes: Vec::new(),
+            closure_info: HashMap::new(),
+            closure_scope_undo: Vec::new(),
             param_symbols: HashSet::new(),
             non_owning_symbols: HashSet::new(),
             dataloader_symbols: HashSet::new(),
@@ -362,6 +378,7 @@ impl FuncState {
     /// pair with `pop_fn_binding_scope` at its end.
     pub fn push_fn_binding_scope(&mut self) {
         self.fn_binding_scopes.push(Vec::new());
+        self.closure_scope_undo.push(HashMap::new());
     }
 
     /// Close the innermost binding scope, retiring the fn-value bindings
@@ -385,12 +402,41 @@ impl FuncState {
                 }
             }
         }
+        // Roll back this scope's closure_info mutations to their
+        // pre-scope state — same safety direction as above: a missed
+        // pop widens the metadata's lifetime (stale-reroute), an extra
+        // pop merely restores earlier state.
+        if let Some(undo) = self.closure_scope_undo.pop() {
+            for (sym, prev) in undo {
+                match prev {
+                    Some(count) => {
+                        self.closure_info.insert(sym, count);
+                    }
+                    None => {
+                        self.closure_info.remove(&sym);
+                    }
+                }
+            }
+        }
     }
 
     /// Record a function-valued binding (nested `fn`, lambda / fn-typed
     /// `let`, fn-typed param) as live in the innermost open scope — or
     /// for the whole function when no scope is open (params, top-level
     /// nested fns), matching the checker's scoping.
+    /// Set (Some) or clear (None) a symbol's closure capture count,
+    /// recording the prior state in the innermost open fn-binding scope
+    /// so `pop_fn_binding_scope` can restore it.
+    pub fn set_closure_info(&mut self, sym: Symbol, count: Option<usize>) {
+        let prev = match count {
+            Some(c) => self.closure_info.insert(sym, c),
+            None => self.closure_info.remove(&sym),
+        };
+        if let Some(undo) = self.closure_scope_undo.last_mut() {
+            undo.entry(sym).or_insert(prev);
+        }
+    }
+
     pub fn register_fn_binding(&mut self, sym: Symbol) {
         *self.live_fn_bindings.entry(sym).or_insert(0) += 1;
         if let Some(top) = self.fn_binding_scopes.last_mut() {

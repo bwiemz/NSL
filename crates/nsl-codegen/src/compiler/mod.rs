@@ -116,6 +116,14 @@ pub struct PendingLambda {
     /// Captured variables from outer scope (name, cranelift type). These become extra params
     /// after the normal params in the lambda's Cranelift function signature.
     pub captures: Vec<(Symbol, cl_types::Type)>,
+    /// Captures that are themselves CLOSURES (symbol, capture count),
+    /// recorded from the definer's FuncState at capture time. Lambda
+    /// bodies compile deferred with a FRESH FuncState — without seeding
+    /// its closure_info from this list, a captured capturing closure
+    /// called inside the body compiled as a bare-pointer call and
+    /// executed the closure struct as code (review HIGH on the
+    /// FuncState move, closure-composition repro p26).
+    pub capture_closure_info: Vec<(Symbol, usize)>,
 }
 
 /// Sub-struct grouping all type-system registration state out of the `Compiler` god-object.
@@ -142,7 +150,6 @@ pub struct FunctionRegistry {
     pub functions: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
     pub runtime_fns: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
     pub pending_lambdas: Vec<PendingLambda>,
-    pub closure_info: HashMap<Symbol, usize>,
     pub last_lambda_capture_count: Option<usize>,
     pub no_grad_fns: HashSet<String>,
     pub test_fns: Vec<String>,
@@ -154,7 +161,6 @@ impl FunctionRegistry {
             functions: HashMap::new(),
             runtime_fns: HashMap::new(),
             pending_lambdas: Vec::new(),
-            closure_info: HashMap::new(),
             last_lambda_capture_count: None,
             no_grad_fns: HashSet::new(),
             test_fns: Vec::new(),

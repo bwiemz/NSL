@@ -335,6 +335,7 @@ impl<'a> TypeChecker<'a> {
             is_const,
             is_param,
             is_used: false,
+            is_builtin: false,
         };
         if self.scopes.declare(self.current_scope, name, info.clone()).is_err() {
             // NSL allows rebinding (Python-like semantics), so update the existing binding
@@ -342,6 +343,9 @@ impl<'a> TypeChecker<'a> {
                 existing.ty = info.ty;
                 existing.is_const = info.is_const;
                 existing.def_span = info.def_span;
+                // A user declaration overwriting a builtin sheds the flag —
+                // from here on the name resolves as user code everywhere.
+                existing.is_builtin = false;
             }
         }
     }

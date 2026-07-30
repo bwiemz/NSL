@@ -161,6 +161,25 @@ impl<'a> TypeChecker<'a> {
 
         // Special type inference for enumerate(list) -> List(Tuple(Int, T))
         if let ExprKind::Ident(sym) = &callee.kind {
+            // A USER declaration of this name (module fn, import, let)
+            // must win over every by-name special case below: the codegen
+            // dispatch hoist (compile_call, 2026-07-29) routes such calls
+            // to the registered fn, and the two resolutions have to agree
+            // — pre-hoist, `fn sum(x: Tensor) -> float` was typed by the
+            // BUILTIN reduction case here while codegen ran the builtin
+            // too (silent misdispatch); post-hoist, disagreeing typings
+            // became verifier errors. The distinguisher is the explicit
+            // `is_builtin` flag (only register_builtins sets it, and a
+            // user redeclaration sheds it) — NOT a span heuristic:
+            // synthesized glob imports carry DUMMY spans and would be
+            // mislabeled as builtins. The generic Function-type path
+            // below types user calls from the resolved declaration.
+            let user_declared = self
+                .scopes
+                .lookup(self.current_scope, *sym)
+                .map(|(_, info)| !info.is_builtin)
+                .unwrap_or(false);
+            if !user_declared {
             let name = self.interner.resolve(sym.0).unwrap_or("").to_string();
             if name == "enumerate" {
                 if let Some(Type::List(elem_ty)) = arg_types.first() {
@@ -222,6 +241,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
+            } // end !user_declared — by-name special cases yield to user declarations
         }
 
         // Tensor method shape inference (reshape, transpose)

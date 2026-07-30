@@ -21,6 +21,13 @@ pub struct SymbolInfo {
     pub is_const: bool,
     pub is_param: bool,
     pub is_used: bool,
+    /// True only for the language builtins installed by
+    /// `register_builtins`. `check_call`'s by-name special cases key on
+    /// this — a DUMMY-span heuristic was tried first and has a real
+    /// hole: glob imports synthesized by `inject_train_block_imports`
+    /// carry DUMMY spans too, which mislabeled auto-imported stdlib fns
+    /// as builtins (review MEDIUM-3 on 44c011c1).
+    pub is_builtin: bool,
 }
 
 /// A single lexical scope.
@@ -166,6 +173,7 @@ mod tests {
             is_const: false,
             is_param: false,
             is_used: false,
+            is_builtin: false,
         }
     }
 

@@ -372,6 +372,14 @@ impl Compiler<'_> {
                 CodegenError::new(format!("failed to declare lambda '{lambda_name}': {e}"))
             })?;
 
+        // Captured closures: the deferred body compiles with a fresh
+        // FuncState, so the definer's closure metadata for any captured
+        // capturing closure must travel with the pending lambda.
+        let capture_closure_info: Vec<(nsl_ast::Symbol, usize)> = capture_info
+            .iter()
+            .filter_map(|&(sym, _)| state.closure_info.get(&sym).map(|&c| (sym, c)))
+            .collect();
+
         // Store for compilation and in functions table
         self.registry
             .functions
@@ -385,6 +393,7 @@ impl Compiler<'_> {
                 params: param_info,
                 body: body.clone(),
                 captures: capture_info,
+                capture_closure_info,
             });
 
         // Get function address
@@ -794,7 +803,7 @@ impl Compiler<'_> {
         }
         // Error if first arg is a closure (captures variables) -- HOFs in C runtime expect bare fn ptrs
         if let ExprKind::Ident(sym) = &args[0].value.kind {
-            if self.registry.closure_info.contains_key(sym) {
+            if state.closure_info.contains_key(sym) {
                 let name = self.resolve_sym(*sym).to_string();
                 return Err(CodegenError::new(format!(
                     "cannot pass closure '{name}' to {func_name}() -- closures with captured variables \
