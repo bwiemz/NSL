@@ -237,6 +237,9 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
         eprintln!("nsl_fused_lce_targets_i64_alloc: null tensor");
         std::process::abort();
     }
+    // The length pin is a device-path guard; the no-cuda build never stages.
+    #[cfg(not(feature = "cuda"))]
+    let _ = expected_rows;
     #[cfg(feature = "cuda")]
     {
         let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
