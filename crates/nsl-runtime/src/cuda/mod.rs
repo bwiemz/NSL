@@ -3576,6 +3576,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     t_ptrs: &[u64], m_ptrs: &[u64], v_ptrs: &[u64], mp_ptrs: &[u64], lens: &[u32],
     b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
     neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+    mp_scale: f32,
 ) {
     let k = t_ptrs.len();
     if k == 0 {
@@ -3744,6 +3745,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     let mut has_wd_val: u32 = u32::from(has_wd);
     let mut a5 = ws.blk_param;
     let mut a6 = ws.blk_base;
+    let mut mp_scale_val = mp_scale;
     let args = [
         &mut a0 as *mut _ as *mut c_void,
         &mut a1 as *mut _ as *mut c_void,
@@ -3762,6 +3764,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         &mut has_wd_val as *mut _ as *mut c_void,
         &mut a5 as *mut _ as *mut c_void,
         &mut a6 as *mut _ as *mut c_void,
+        &mut mp_scale_val as *mut _ as *mut c_void,
     ];
     let grid_x = ws.blk_count as i64;
     let result = inner::kernel_launch(
@@ -5954,24 +5957,41 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
         return 0.0;
     }
 
-    // One f64 slot per tensor so the whole set costs one drain.
-    //
     // `nsl_sum_sq_f64_acc_f32`, not slot 3 of `nsl_tensor_stats_f32`: the stats
     // kernel accumulates in f32, and the clip decision is a comparison against
     // `max_norm`, so its drift is not confined to the low digits of the result —
-    // it can flip whether clipping happens at all. See the kernel's own comment.
+    // it can flip whether clipping happens at all.
     //
-    // A grid-strided variant with atomic accumulation was tried, on the theory
-    // that a single 256-thread block cannot saturate the device for a 25M-element
-    // gradient. It measured SLOWER end to end (80 -> 83..85 ms per micro-batch at
-    // grid caps of both 96 and 1024 blocks), because the reduction is not on the
-    // critical path here and the atomics add contention. Kept simple.
-    let out_data = inner::alloc_managed(live.len() * 8);
+    // Every tensor gets `MAX_BLOCKS` f64 slots and the whole set costs ONE drain.
+    // The kernel is grid-strided with one partial per block because f64 is 1/64
+    // rate on GeForce: a single 256-thread block over the 25M-element embedding
+    // gradient measured 80 -> 112 ms per micro-batch. Per-block slots rather than
+    // atomics — an atomic variant was tried earlier and measured slower (80 ->
+    // 83..85 ms) on top of making the summation order nondeterministic.
+    //
+    // The grid is derived from `len` alone, so a given shape always produces the
+    // same number of partials summed in the same order: reproducible run to run.
+    // NSL_SUM_SQ_BLOCKS overrides the block cap; 1 reproduces the single-block
+    // version, which is the bisection point if a norm ever looks wrong. It is
+    // also the measurement: 1 block costs 80 -> 112 ms per micro-batch, 256
+    // costs nothing detectable, and both accumulate in f64.
+    const BLOCK: i64 = 256;
+    static MAX_BLOCKS_ENV: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let max_blocks = *MAX_BLOCKS_ENV.get_or_init(|| {
+        std::env::var("NSL_SUM_SQ_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(256)
+    });
+    let grid_for = |len: i64| -> i64 { ((len + BLOCK - 1) / BLOCK).clamp(1, max_blocks) };
+
+    let out_data = inner::alloc_managed(live.len() * max_blocks as usize * 8);
 
     for (i, &ptr) in live.iter().enumerate() {
         let t = NslTensor::from_ptr(ptr);
         let mut in_data = t.data as u64;
-        let mut out_slot = (out_data as u64) + (i * 8) as u64;
+        let mut out_slot = (out_data as u64) + (i * max_blocks as usize * 8) as u64;
         let mut n_val = t.len as u64;
         let args: [*mut std::ffi::c_void; 3] = [
             &mut in_data as *mut _ as *mut std::ffi::c_void,
@@ -5981,10 +6001,10 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
         let rc = inner::kernel_launch(
             SUM_SQ_F64_ACC_F32_PTX.as_ptr(),
             b"nsl_sum_sq_f64_acc_f32\0".as_ptr(),
-            [1, 1, 1],
-            [256, 1, 1],
+            [grid_for(t.len), 1, 1],
+            [BLOCK, 1, 1],
             &args,
-            256 * 8,
+            (BLOCK * 8) as u32,
         );
         assert_eq!(rc as u32, 0, "GPU sum_sq kernel failed: {:?}", rc);
     }
@@ -5992,7 +6012,7 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
     unsafe {
         cudarc::driver::sys::cuCtxSynchronize();
     }
-    let mut raw = vec![0f64; live.len()];
+    let mut raw = vec![0f64; live.len() * max_blocks as usize];
     inner::memcpy_dtoh(
         raw.as_mut_ptr() as *mut std::ffi::c_void,
         out_data as *const std::ffi::c_void,
@@ -6000,7 +6020,15 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
     );
     inner::free_managed(out_data);
 
-    raw.iter().sum()
+    // Sum only the slots the launch actually wrote; the rest are uninitialized.
+    live.iter()
+        .enumerate()
+        .map(|(i, &ptr)| {
+            let used = grid_for(NslTensor::from_ptr(ptr).len) as usize;
+            let base = i * max_blocks as usize;
+            raw[base..base + used].iter().sum::<f64>()
+        })
+        .sum()
 }
 
 /// GPU sum of squares (Σx²) for an f32 tensor — the RAW `sum_sq` accumulator
