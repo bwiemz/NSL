@@ -39,6 +39,8 @@ struct Geom {
     causal: bool,
     gpu_sm: u32,
     expect_mma: bool,
+    block_q: i64,
+    block_kv: i64,
 }
 
 fn cuda_available() -> bool {
@@ -63,8 +65,8 @@ fn det_seq(seed: u32, n: usize) -> Vec<f32> {
 
 fn config_for(g: &Geom) -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 64,
-        block_kv: 64,
+        block_q: g.block_q,
+        block_kv: g.block_kv,
         head_dim: g.d as i64,
         causal: g.causal,
         paged: false,
@@ -260,6 +262,7 @@ fn run_case(name: &str, g: Geom) {
 fn mma_multitile_hd64_causal() {
     run_case("mma_hd64_causal", Geom {
         b: 2, h: 2, s: 128, d: 64, causal: true, gpu_sm: 90, expect_mma: true,
+        block_q: 64, block_kv: 64,
     });
 }
 
@@ -269,6 +272,7 @@ fn mma_multitile_hd64_causal() {
 fn mma_multitile_hd64_noncausal() {
     run_case("mma_hd64_noncausal", Geom {
         b: 2, h: 2, s: 128, d: 64, causal: false, gpu_sm: 90, expect_mma: true,
+        block_q: 64, block_kv: 64,
     });
 }
 
@@ -279,6 +283,7 @@ fn mma_multitile_hd64_noncausal() {
 fn scalar_pinned_multitile_hd64_causal() {
     run_case("scalar_hd64_causal", Geom {
         b: 2, h: 2, s: 128, d: 64, causal: true, gpu_sm: 75, expect_mma: false,
+        block_q: 64, block_kv: 64,
     });
 }
 
@@ -290,6 +295,7 @@ fn scalar_pinned_multitile_hd64_causal() {
 fn mma_multitile_hd128_causal() {
     run_case("mma_hd128_causal", Geom {
         b: 1, h: 2, s: 192, d: 128, causal: true, gpu_sm: 90, expect_mma: true,
+        block_q: 64, block_kv: 64,
     });
 }
 
@@ -300,5 +306,18 @@ fn mma_multitile_hd128_causal() {
 fn mma_multitile_hd32_causal() {
     run_case("mma_hd32_causal", Geom {
         b: 2, h: 2, s: 128, d: 32, causal: true, gpu_sm: 90, expect_mma: true,
+        block_q: 64, block_kv: 64,
+    });
+}
+
+/// block_q=32: m_tiles=2, so warps 2/3 redundantly recompute m-tiles 0/1
+/// and are excluded from stores by %fm_pstore. The only GPU coverage of
+/// the redundant-warp arm (the table picks (32,32) for short sequences).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn mma_multitile_bq32_redundant_warps_causal() {
+    run_case("mma_bq32_causal", Geom {
+        b: 2, h: 2, s: 96, d: 64, causal: true, gpu_sm: 90, expect_mma: true,
+        block_q: 32, block_kv: 32,
     });
 }

@@ -96,15 +96,24 @@ pub fn admits_shape(config: &FlashAttentionConfig) -> bool {
         && config.num_sink_tokens == 0
         && config.gqa_group_size == 1
         // block_q rows split into 16-row m-tiles owned by the 4 warps.
+        // m_tiles must itself be a power of two (1/2/4) — the warp->m-tile
+        // map is `warp_id & (m_tiles-1)`, so bq=48 (m_tiles=3) would leave
+        // rows 16..31 never computed. bq in {16, 32, 64} exactly.
         && bq.is_multiple_of(16)
         && bq <= 64
+        && (bq / 16).is_power_of_two()
         // block_kv is the S n-dim (%8) AND the PV reduction dim (%16).
+        // Bounded at 64: bkv=128 is emitter-legal on paper (the SMEM math
+        // holds) but sits outside every ptxas/parity gate — widen only
+        // together with coverage.
         && bkv.is_multiple_of(16)
+        && bkv <= 64
         // head_dim is the QK reduction dim (%16) and the PV n-dim (%8);
         // power-of-two lets the V^T store use shifts instead of divides.
+        // 32..128 is the validated ALLOWED_HEAD_DIM intersection.
         && hd.is_multiple_of(16)
         && hd.is_power_of_two()
-        && hd <= 128
+        && (32..=128).contains(&hd)
 }
 
 /// Full dispatch decision: config shape + the codegen-side kill switch.

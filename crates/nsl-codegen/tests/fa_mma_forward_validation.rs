@@ -82,9 +82,23 @@ fn non_admissible_shapes_refuse() {
     seg.segment_masked = true;
     assert!(!mma_forward::admits_shape(&seg), "segment masking not wired in v1");
 
-    let mut paged = base;
+    let mut paged = base.clone();
     paged.paged = true;
     assert!(!mma_forward::admits_shape(&paged), "paged KV not wired in v1");
+
+    // Review findings 1/2: shapes the emitter would miscompile or that
+    // carry zero gate coverage must refuse, not panic-or-corrupt later.
+    let mut bq48 = base.clone();
+    bq48.block_q = 48;
+    assert!(!mma_forward::admits_shape(&bq48), "bq=48: m_tiles=3 breaks warp&(m_tiles-1)");
+
+    let mut hd16 = base.clone();
+    hd16.head_dim = 16;
+    assert!(!mma_forward::admits_shape(&hd16), "hd=16 is outside ALLOWED_HEAD_DIM");
+
+    let mut bkv128 = base;
+    bkv128.block_kv = 128;
+    assert!(!mma_forward::admits_shape(&bkv128), "bkv=128 has no gate coverage yet");
 }
 
 // ── kernel name + body coherence ────────────────────────────────────────

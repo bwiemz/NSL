@@ -52,6 +52,8 @@ PEAK_TFLOPS_BY_DEVICE = {
     },
 }
 PRECISIONS = sorted(PEAK_TFLOPS_BY_DEVICE["NVIDIA GeForce RTX 5070 Ti"])
+assert all(sorted(v) == PRECISIONS for v in PEAK_TFLOPS_BY_DEVICE.values()), \
+    "every device entry must cover the same precision set"
 
 MEMORY_BW_GB_S = 896.0  # 256-bit GDDR7 @ 28 Gbps — same on both GB203 cards
 
@@ -244,7 +246,7 @@ def main() -> None:
     parser.add_argument("--gpu-name", default=None,
                         help="device key for PEAK_TFLOPS_BY_DEVICE (default: auto-detect\n"
                              "via nvidia-smi; the run refuses an unknown device rather than\n"
-                             "report an MFU%% against the wrong roofline)")
+                             "report an MFU% against the wrong roofline)")
     parser.add_argument("--extra-train-args", default="")
     parser.add_argument("--env", action="append", default=[], help="KEY=VALUE passed to the run")
     parser.add_argument("--max-steps", type=int, default=25)
@@ -270,7 +272,7 @@ def main() -> None:
     if gpu_name not in PEAK_TFLOPS_BY_DEVICE:
         known = "\n  ".join(sorted(PEAK_TFLOPS_BY_DEVICE))
         sys.exit(
-            f"no peak-TFLOPS entry for GPU {gpu_name!r} — an MFU%% against the wrong\n"
+            f"no peak-TFLOPS entry for GPU {gpu_name!r} — an MFU% against the wrong\n"
             f"roofline is worse than none. Add the device to PEAK_TFLOPS_BY_DEVICE\n"
             f"(measure with a cuBLAS GemmEx probe, not the marketing number) or pass\n"
             f"--gpu-name. Known devices:\n  {known}"

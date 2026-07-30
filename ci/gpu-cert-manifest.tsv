@@ -275,6 +275,7 @@ crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_nonca
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	scalar_pinned_multitile_hd64_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd128_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd32_causal	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_bq32_redundant_warps_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_csha_ffi_e2e.rs	tier_b1_through_csha_ffi_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_full_kernel_e2e.rs	tier_b1_full_kernel_e2e_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_kernel_ptxas_validation.rs	tier_b1_full_kernel_assembles_on_sm_80	toolchain	requires ptxas on PATH; lift in CI with CUDA toolchain
