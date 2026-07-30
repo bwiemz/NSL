@@ -119,6 +119,8 @@ pub use fused_linear_ce::{
     nsl_fused_linear_ce_forward,
     nsl_fused_linear_ce_forward_large,
     nsl_fused_linear_ce_backward,
+    nsl_fused_linear_ce_forward_gemm,
+    nsl_fused_linear_ce_backward_gemm,
 };
 
 // CPKD fused KL-CE FFIs exposed for the GPU numerical validation test
