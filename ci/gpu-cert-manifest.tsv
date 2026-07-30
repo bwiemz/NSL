@@ -204,6 +204,8 @@ crates/nsl-codegen/tests/csha_dx_norm_readback_diag.rs	dx_norm_hbm_buffer_is_pop
 crates/nsl-codegen/tests/csha_forward_saves_diag.rs	forward_saves_match_cpu_reference	gpu-inferred	
 crates/nsl-codegen/tests/csha_fused_forward_under_source_ad.rs	fused_forward_populates_save_buffers_gpu	gpu	requires a CUDA-capable GPU and an end-to-end launch
 crates/nsl-codegen/tests/csha_ptx_ptxas_validation.rs	v2_kernel_assembles_on_sm75_full_matrix	toolchain	requires ptxas in PATH
+crates/nsl-codegen/tests/fa_mma_forward_validation.rs	mma_forward_assembles_on_sm_80_all_table_shapes	toolchain	requires ptxas on PATH; lift in CI with CUDA toolchain
+crates/nsl-codegen/tests/fa_mma_forward_validation.rs	mma_forward_assembles_on_sm_120_production_shape	toolchain	requires ptxas on PATH; lift in CI with CUDA toolchain
 crates/nsl-codegen/tests/flash_attention_backward_gpu.rs	diag_phase2_jit_log	diagnostic	diagnostic: prints backward PTX JIT log
 crates/nsl-codegen/tests/flash_attention_backward_gpu.rs	diag_block_size_sweep	diagnostic	diagnostic: sweeps backward block sizes for correctness
 crates/nsl-codegen/tests/flash_attention_backward_gpu.rs	diag_mma_localize	diagnostic	diagnostic: localizes MMA backward numerical bug
@@ -268,6 +270,11 @@ crates/nsl-codegen/tests/pca_tier_b_sass_baselines.rs	regenerate_baseline_32_32_
 crates/nsl-codegen/tests/pca_tier_b_sass_baselines.rs	regenerate_baseline_64_64_64	generator	baseline generator — run with --ignored to regenerate
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_unmasked_matches_oracle	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_segment_masked_matches_oracle	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_causal	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_noncausal	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	scalar_pinned_multitile_hd64_causal	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd128_causal	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd32_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_csha_ffi_e2e.rs	tier_b1_through_csha_ffi_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_full_kernel_e2e.rs	tier_b1_full_kernel_e2e_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_kernel_ptxas_validation.rs	tier_b1_full_kernel_assembles_on_sm_80	toolchain	requires ptxas on PATH; lift in CI with CUDA toolchain
