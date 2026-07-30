@@ -3448,6 +3448,40 @@ impl Compiler<'_> {
         Ok(builder.inst_results(call)[0])
     }
 
+    /// Coerce one indirect-call argument to the declared Function param
+    /// type. The checker accepts int→float widening at call sites
+    /// (`f(3)` on `(float) -> float`), but the callee's signature — and
+    /// the call-site signature built right above — declare F64, so the
+    /// raw I64 value previously reached the Cranelift verifier as an
+    /// arg-type mismatch: an ICE with a raw dump (review MEDIUM on
+    /// 01bb85aa). Narrow ints are widened for the same reason. Anything
+    /// this doesn't handle still fails loudly in the verifier — the
+    /// silent direction is never taken.
+    fn coerce_indirect_arg(
+        builder: &mut FunctionBuilder,
+        param_ty: Option<&Type>,
+        val: Value,
+    ) -> Value {
+        let Some(pt) = param_ty else { return val };
+        let want = nsl_type_to_cl(pt);
+        let got = builder.func.dfg.value_type(val);
+        if want == got {
+            return val;
+        }
+        if want.is_float() && got.is_int() {
+            let wide = if got.bits() < 64 {
+                builder.ins().sextend(cl_types::I64, val)
+            } else {
+                val
+            };
+            return builder.ins().fcvt_from_sint(want, wide);
+        }
+        if want == cl_types::I64 && got.is_int() && got.bits() < 64 {
+            return builder.ins().sextend(cl_types::I64, val);
+        }
+        val
+    }
+
     pub(crate) fn compile_indirect_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -3496,10 +3530,11 @@ impl Compiler<'_> {
                 }
                 let sig_ref = builder.import_signature(sig);
 
-                // Compile normal args
+                // Compile normal args, coerced to the declared param types
                 let mut arg_vals = Vec::new();
-                for arg in args {
-                    arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                for (i, arg) in args.iter().enumerate() {
+                    let v = self.compile_expr(builder, state, &arg.value)?;
+                    arg_vals.push(Self::coerce_indirect_arg(builder, param_types.get(i), v));
                 }
                 // Load captured values from closure struct
                 for i in 0..num_captures {
@@ -3531,8 +3566,9 @@ impl Compiler<'_> {
                 let sig_ref = builder.import_signature(sig);
 
                 let mut arg_vals = Vec::new();
-                for arg in args {
-                    arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                for (i, arg) in args.iter().enumerate() {
+                    let v = self.compile_expr(builder, state, &arg.value)?;
+                    arg_vals.push(Self::coerce_indirect_arg(builder, param_types.get(i), v));
                 }
                 let call = builder.ins().call_indirect(sig_ref, fn_ptr, &arg_vals);
                 if is_void {

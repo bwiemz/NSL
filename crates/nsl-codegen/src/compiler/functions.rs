@@ -213,13 +213,29 @@ impl Compiler<'_> {
                 state.variables.insert(*sym, (var, *cl_type));
             }
 
-            // Bind captured variables (come after normal params in the signature)
+            // Bind captured variables (come after normal params in the
+            // signature). They arrive as raw I64 slots — the closure call
+            // site loads every 8-byte capture slot as I64 without knowing
+            // its type — so the real type is restored here, mirroring the
+            // normalization at closure construction (compile_lambda).
             let capture_offset = lambda.params.len();
             for (i, (sym, cl_type)) in lambda.captures.iter().enumerate() {
                 let param_val = builder.block_params(entry)[capture_offset + i];
+                let bound = if *cl_type == cl_types::F64 {
+                    builder
+                        .ins()
+                        .bitcast(cl_types::F64, MemFlags::new(), param_val)
+                } else if *cl_type == cl_types::F32 {
+                    let bits32 = builder.ins().ireduce(cl_types::I32, param_val);
+                    builder.ins().bitcast(cl_types::F32, MemFlags::new(), bits32)
+                } else if cl_type.is_int() && *cl_type != cl_types::I64 {
+                    builder.ins().ireduce(*cl_type, param_val)
+                } else {
+                    param_val
+                };
                 let var = state.new_variable();
                 builder.declare_var(var, *cl_type);
-                builder.def_var(var, param_val);
+                builder.def_var(var, bound);
                 state.variables.insert(*sym, (var, *cl_type));
             }
 
@@ -227,6 +243,20 @@ impl Compiler<'_> {
             let result = self.compile_expr(&mut builder, &mut state, &lambda.body)?;
             let current = state.current_block.unwrap_or(entry);
             if !crate::types::is_block_filled(&builder, current) {
+                // Defensive width/class coercion: the checker derives the
+                // signature's return type from the body, so these fire only
+                // when an indeterminate-typed body lowered to a different
+                // Cranelift type than the signature promised. Any mismatch
+                // not handled here still fails loudly in the verifier.
+                let want = lambda.sig.returns[0].value_type;
+                let got = builder.func.dfg.value_type(result);
+                let result = if want == cl_types::F64 && got == cl_types::I64 {
+                    builder.ins().fcvt_from_sint(cl_types::F64, result)
+                } else if want == cl_types::I64 && got == cl_types::F64 {
+                    builder.ins().fcvt_to_sint_sat(cl_types::I64, result)
+                } else {
+                    result
+                };
                 builder.ins().return_(&[result]);
             }
             builder.finalize();

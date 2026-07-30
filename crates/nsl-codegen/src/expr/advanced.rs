@@ -308,6 +308,7 @@ impl Compiler<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
+        lambda_id: nsl_ast::NodeId,
         params: &[nsl_ast::expr::LambdaParam],
         body: &Expr,
     ) -> Result<Value, CodegenError> {
@@ -318,26 +319,49 @@ impl Compiler<'_> {
             params.iter().map(|p| p.name).collect();
         let captures = self.find_free_variables(body, &param_syms, state);
 
-        // Build the Cranelift signature: normal params + capture params
+        // Build the Cranelift signature from the checker's Function type —
+        // the SAME source compile_indirect_call lowers every call site
+        // from. Hardcoding I64 here (the pre-2026-07-29 behavior) put
+        // float parameters in the wrong register class: the call site
+        // passed F64 in an XMM register while this function read an
+        // integer register — silent wrong values (bugs.md).
+        let fn_ty = self.node_type(lambda_id).clone();
+        let checker_params: &[Type] = match &fn_ty {
+            Type::Function { params: pts, .. } => pts.as_slice(),
+            _ => &[],
+        };
         let mut sig = self.module.make_signature();
         sig.call_conv = self.call_conv;
 
         let mut param_info = Vec::new();
-        for param in params {
-            let cl_type = cl_types::I64; // Default to I64 for all params
+        for (i, param) in params.iter().enumerate() {
+            let cl_type = checker_params
+                .get(i)
+                .map(nsl_type_to_cl)
+                .unwrap_or(cl_types::I64);
             sig.params.push(AbiParam::new(cl_type));
             param_info.push((param.name, cl_type));
         }
 
-        // Add capture params to signature (all I64 -- pointers or ints)
+        // Capture params cross as raw I64 slots on BOTH sides: the closure
+        // call site loads each 8-byte struct slot as I64 and cannot know
+        // the captured variable's type. capture_info keeps the real
+        // cl_type so compile_lambda_body can restore it (bitcast /
+        // narrow) at entry. Declaring the real type HERE while the call
+        // site passed I64 (the pre-2026-07-29 behavior) broke float
+        // captures the same way as params.
         let mut capture_info = Vec::new();
         for &(sym, cl_type) in &captures {
-            sig.params.push(AbiParam::new(cl_type));
+            sig.params.push(AbiParam::new(cl_types::I64));
             capture_info.push((sym, cl_type));
         }
 
-        // Return type from type map
-        let ret_type = nsl_type_to_cl(&self.node_type(body.id).clone());
+        // Return type: the checker derives the Function ret from the body,
+        // so this matches what indirect call sites expect.
+        let ret_type = match &fn_ty {
+            Type::Function { ret, .. } => nsl_type_to_cl(ret),
+            _ => nsl_type_to_cl(&self.node_type(body.id).clone()),
+        };
         sig.returns.push(AbiParam::new(ret_type));
 
         // Declare the function in the module
@@ -388,7 +412,11 @@ impl Compiler<'_> {
             builder
                 .ins()
                 .store(MemFlags::trusted(), num_cap, closure_ptr, 8);
-            // Store each captured variable at offset 16 + i*8
+            // Store each captured variable at offset 16 + i*8, normalized
+            // to a raw I64 slot (floats as bit patterns, narrow ints
+            // widened) — compile_lambda_body reverses this exactly. A
+            // typed store would under-fill the 8-byte slot the call site
+            // reads back as I64.
             for (i, (sym, _cl_type)) in captures.iter().enumerate() {
                 let (var, _) = *state.variables.get(sym).ok_or_else(|| {
                     CodegenError::new(format!(
@@ -397,10 +425,21 @@ impl Compiler<'_> {
                     ))
                 })?;
                 let val = builder.use_var(var);
+                let vty = builder.func.dfg.value_type(val);
+                let slot_val = if vty == cl_types::F64 {
+                    builder.ins().bitcast(cl_types::I64, MemFlags::new(), val)
+                } else if vty == cl_types::F32 {
+                    let bits32 = builder.ins().bitcast(cl_types::I32, MemFlags::new(), val);
+                    builder.ins().uextend(cl_types::I64, bits32)
+                } else if vty.is_int() && vty != cl_types::I64 {
+                    builder.ins().uextend(cl_types::I64, val)
+                } else {
+                    val
+                };
                 let offset = (16 + i * 8) as i32;
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), val, closure_ptr, offset);
+                    .store(MemFlags::trusted(), slot_val, closure_ptr, offset);
             }
 
             // NOTE: nsl_closure_free is now implemented in the runtime (memory.rs).
@@ -692,6 +731,67 @@ impl Compiler<'_> {
                 "{func_name}() takes exactly 2 arguments"
             )));
         }
+        // The runtime invokes the pointer as extern "C" fn(i64) -> i64
+        // (hof.rs) — float parameters/returns cannot survive that ABI
+        // (the value crosses in the wrong register class), and narrow-int
+        // returns leave the upper return-register bits undefined. Before
+        // 2026-07-29 both produced silent garbage; refuse instead. The
+        // one narrow return with a real use case — a bool filter
+        // predicate — is carried soundly via the ret_is_bool flag below.
+        let mut ret_is_bool = false;
+        if let Type::Function {
+            params: pts, ret, ..
+        } = self.node_type(args[0].value.id)
+        {
+            let is_float = |t: &Type| {
+                matches!(
+                    t,
+                    Type::Float
+                        | Type::F64
+                        | Type::F32
+                        | Type::Fp16
+                        | Type::Bf16
+                        | Type::Fp8E4m3
+                        | Type::Fp8E5m2
+                )
+            };
+            if pts.iter().any(is_float) || is_float(ret) {
+                return Err(CodegenError::new(format!(
+                    "{func_name}() supports int-typed functions only: the runtime \
+                     calls the function as fn(i64) -> i64, which cannot carry float \
+                     parameters or returns. Convert at the boundaries (int(...)) or \
+                     use an explicit loop."
+                )));
+            }
+            ret_is_bool = matches!(ret.as_ref(), Type::Bool);
+            if !ret_is_bool
+                && matches!(
+                    ret.as_ref(),
+                    Type::Int8 | Type::Int16 | Type::Int32 | Type::Int4 | Type::Uint8
+                )
+            {
+                return Err(CodegenError::new(format!(
+                    "{func_name}() cannot take a function returning a narrow integer \
+                     type: the runtime reads a full 64-bit return and the upper bits \
+                     are undefined. Return int (or bool) instead."
+                )));
+            }
+            // An unannotated lambda param is Unknown — the body then lowers
+            // through tensor ops and aborts at runtime on the int list
+            // slots (review LOW on 01bb85aa, misaligned-deref probe).
+            // Nothing Unknown-typed ever worked here, so refusing is
+            // strictly an upgrade.
+            if pts
+                .iter()
+                .any(|t| matches!(t, Type::Unknown | Type::Error))
+            {
+                return Err(CodegenError::new(format!(
+                    "{func_name}() requires annotated function parameter types \
+                     (e.g. `|x: int| ...`) — an unannotated parameter compiles \
+                     as Unknown and cannot dispatch correctly."
+                )));
+            }
+        }
         // Error if first arg is a closure (captures variables) -- HOFs in C runtime expect bare fn ptrs
         if let ExprKind::Ident(sym) = &args[0].value.kind {
             if self.registry.closure_info.contains_key(sym) {
@@ -711,8 +811,9 @@ impl Compiler<'_> {
             )));
         }
         let list_val = self.compile_expr(builder, state, &args[1].value)?;
+        let ret_is_bool_val = builder.ins().iconst(cl_types::I64, ret_is_bool as i64);
         let rt_name = format!("nsl_{func_name}");
-        self.compile_call_by_name(builder, &rt_name, &[fn_val, list_val])
+        self.compile_call_by_name(builder, &rt_name, &[fn_val, list_val, ret_is_bool_val])
     }
 
     #[allow(clippy::too_many_arguments)]
