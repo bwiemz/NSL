@@ -802,8 +802,12 @@ mod tests {
         let plan = plan_layer("blocks.0", shape, gpu, FusionLevel::Pipeline);
         match plan.backward_tier {
             BackwardTierReport::TierB2 { bq, bkv, chunk } => {
-                assert_eq!(bq, 64, "hd=128 ladder pins bq=64");
-                assert_eq!(bkv, 64, "hd=128 ladder pins bkv=64");
+                // 32, matching tier_b2_effective_bq's hd>=128 clamp — the
+                // ladder now reports the tiling the emitters actually run
+                // (spec §5.2's Path-A schedule; the old bq=64 row was
+                // unreachable and mislabeled every hd=128 plan report).
+                assert_eq!(bq, 32, "hd=128 ladder pins bq=32");
+                assert_eq!(bkv, 32, "hd=128 ladder pins bkv=32");
                 assert_eq!(chunk, 4, "hd=128 ladder pins chunk=4");
             }
             BackwardTierReport::Scalar => {
