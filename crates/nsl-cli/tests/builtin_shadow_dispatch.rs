@@ -531,6 +531,49 @@ print("DONE")
     );
 }
 
+/// Review HIGH on the FuncState move: a lambda capturing a CAPTURING
+/// closure and calling it died silently — lambda bodies compile
+/// deferred with a fresh FuncState, so the definer's closure metadata
+/// for the captured closure was lost and the call compiled as a
+/// bare-pointer call (the closure struct executed as code).
+/// PendingLambda now carries the captured closures' capture counts and
+/// compile_lambda_body seeds its state from them.
+#[test]
+fn lambda_capturing_a_capturing_closure_calls_it_correctly() {
+    let src = r#"
+let k = 5
+let f = |v: int| v + k
+let g = |v: int| f(v) + 1
+print(g(2))
+print("DONE")
+"#;
+    let stdout = run_src(src, "closcompose");
+    assert_eq!(
+        printed_value(&stdout),
+        "8",
+        "captured capturing closure broke:\n{stdout}"
+    );
+}
+
+/// Control: a NON-capturing callee captured by a capturing lambda uses
+/// the bare-pointer path — no metadata needed, must stay untouched.
+#[test]
+fn lambda_capturing_a_bare_fn_pointer_still_works() {
+    let src = r#"
+let m = 100
+let f = |v: int| v * 2
+let g = |v: int| f(v) + m
+print(g(3))
+print("DONE")
+"#;
+    let stdout = run_src(src, "closcomposectl");
+    assert_eq!(
+        printed_value(&stdout),
+        "106",
+        "bare-fn capture control broke:\n{stdout}"
+    );
+}
+
 /// The guard must not disturb the unshadowed builtins.
 #[test]
 fn unshadowed_sampling_builtins_still_dispatch_to_the_runtime() {

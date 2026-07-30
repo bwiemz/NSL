@@ -64,7 +64,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   retired) with a per-scope undo log rolled back by
   `pop_fn_binding_scope`, mirroring the checker's block scoping the
   same way `live_fn_bindings` does.
-- 10 new CPU gates in `builtin_shadow_dispatch.rs` (21 total).
+- Third review pass: the FuncState move itself broke closure
+  COMPOSITION — a lambda capturing a capturing closure and calling it
+  died (deferred lambda bodies compile with a fresh FuncState, losing
+  the definer's closure metadata). PendingLambda now records captured
+  closures' capture counts and compile_lambda_body seeds its state
+  from them.
+- 12 new CPU gates in `builtin_shadow_dispatch.rs` (23 total).
   Mutation-proven in three directions: hoist off → exactly the 3
   module-fn shadow gates red; checker gating off → exactly the 2
   tensor-arg shadow gates red (verifier disagreement); closure clear

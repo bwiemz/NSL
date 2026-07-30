@@ -372,6 +372,14 @@ impl Compiler<'_> {
                 CodegenError::new(format!("failed to declare lambda '{lambda_name}': {e}"))
             })?;
 
+        // Captured closures: the deferred body compiles with a fresh
+        // FuncState, so the definer's closure metadata for any captured
+        // capturing closure must travel with the pending lambda.
+        let capture_closure_info: Vec<(nsl_ast::Symbol, usize)> = capture_info
+            .iter()
+            .filter_map(|&(sym, _)| state.closure_info.get(&sym).map(|&c| (sym, c)))
+            .collect();
+
         // Store for compilation and in functions table
         self.registry
             .functions
@@ -385,6 +393,7 @@ impl Compiler<'_> {
                 params: param_info,
                 body: body.clone(),
                 captures: capture_info,
+                capture_closure_info,
             });
 
         // Get function address

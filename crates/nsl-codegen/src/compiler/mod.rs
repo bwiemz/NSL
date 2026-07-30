@@ -116,6 +116,14 @@ pub struct PendingLambda {
     /// Captured variables from outer scope (name, cranelift type). These become extra params
     /// after the normal params in the lambda's Cranelift function signature.
     pub captures: Vec<(Symbol, cl_types::Type)>,
+    /// Captures that are themselves CLOSURES (symbol, capture count),
+    /// recorded from the definer's FuncState at capture time. Lambda
+    /// bodies compile deferred with a FRESH FuncState — without seeding
+    /// its closure_info from this list, a captured capturing closure
+    /// called inside the body compiled as a bare-pointer call and
+    /// executed the closure struct as code (review HIGH on the
+    /// FuncState move, closure-composition repro p26).
+    pub capture_closure_info: Vec<(Symbol, usize)>,
 }
 
 /// Sub-struct grouping all type-system registration state out of the `Compiler` god-object.
