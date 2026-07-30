@@ -408,7 +408,7 @@ where
         // Split on original text, not on `relaxed_pre` output: that already
         // carries the byte-level mapping, and stage one must not encode twice.
         for piece in split_relaxed(chunk.as_ref()) {
-            let words = chunk_to_surfaces(&stage1_pre, &piece);
+            let words = chunk_to_surfaces(&stage1_pre, piece);
             if words.is_empty() {
                 continue;
             }
