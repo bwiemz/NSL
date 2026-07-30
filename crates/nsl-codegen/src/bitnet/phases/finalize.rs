@@ -50,6 +50,7 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     if config.fused_bias_add {
         ptx.push_str("// Bias add: load bias[col_id] from global and add to accumulator.\n");
         ptx.push_str("cvt.u64.u32 %rd_bias_off, %r_col_id;\n");
+        // %rd_bias is already a .global address (cvta'd in mod.rs::emit_prologue).
         // Bias is FP32 in this draft. (BitNet b1.58 Llama-style layers don't
         // use bias on attention/FFN projections, so this path is unused in
         // standard models; included for the optional spec-§4.4 capability.)
@@ -97,8 +98,10 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
         elem_bytes.trailing_zeros()
     ));
     ptx.push_str("cvt.u64.u32 %rd_yoff, %r_yoff;\n");
-    ptx.push_str("cvta.to.global.u64 %rd_y_global, %rd_y_out;\n");
-    ptx.push_str("add.s64 %rd_y_addr, %rd_y_global, %rd_yoff;\n");
+    // %rd_y_out is already a .global address (cvta'd in mod.rs::emit_prologue);
+    // re-applying cvta.to.global here would be a second translation of an
+    // already-translated pointer.
+    ptx.push_str("add.s64 %rd_y_addr, %rd_y_out, %rd_yoff;\n");
     ptx.push_str(&format!("st.global.{store_ty} [%rd_y_addr], %h_y;\n"));
 
     ptx.push_str("// === end BitNet finalize ===\n");
