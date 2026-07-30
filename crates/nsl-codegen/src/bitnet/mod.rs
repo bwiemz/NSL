@@ -132,13 +132,13 @@ impl BitNetKernelConfig {
 /// correctness and a numerical oracle come first.
 pub fn synthesize_kernel(config: &BitNetKernelConfig) -> Vec<u8> {
     assert!(
-        config.hidden_dim % 4 == 0,
+        config.hidden_dim.is_multiple_of(4),
         "BitNet synthesize_kernel: hidden_dim must be a multiple of 4 (4 trits per \
          packed byte), got {}",
         config.hidden_dim
     );
     assert!(
-        config.block_n > 0 && config.block_n % 32 == 0 && config.block_n <= 1024,
+        config.block_n > 0 && config.block_n.is_multiple_of(32) && config.block_n <= 1024,
         "BitNet synthesize_kernel: block_n is the CTA width and must be a positive \
          multiple of 32 no greater than 1024, got {}",
         config.block_n
