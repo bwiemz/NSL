@@ -8,7 +8,7 @@ crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_production_gpu_tolerance	gpu	r
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	dp_stride_activation_peak_not_worse_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	periodic_stride_reduces_activation_peak_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csha_fused_dgamma_runtime.rs	compile_time_emits_fused_dgamma_for_csha_chain	toolchain	requires `nsl` binary built + CUDA toolchain available for the build link step
-crates/nsl-cli/tests/csha_fused_dgamma_runtime.rs	runtime_executes_fused_dgamma	gpu	requires CUDA toolchain + GPU; runs the full CSHA fused-backward pipeline end-to-end including SGD writeback on f16 grads.
+crates/nsl-cli/tests/csha_fused_dgamma_runtime.rs	runtime_executes_fused_dgamma	gpu-inferred	
 crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_weights_change_after_one_step	gpu	requires a CUDA-capable GPU
 crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_csha_fused_path	gpu	requires a CUDA-capable GPU; runs the full CSHA fused-backward pipeline end-to-end including SGD writeback on f16 grads.
 crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_fused_vs_baseline_parity	gpu	requires a CUDA-capable GPU; runs the toy train twice (baseline + --csha auto) and compares per-param movements.
@@ -52,6 +52,8 @@ crates/nsl-cli/tests/mem_accounting_gpu_gate.rs	mem_accounting_weights_attributi
 crates/nsl-cli/tests/mse_leak_gate.rs	mse_loss_source_ad_live_blocks_exactly_flat	gpu	requires CUDA GPU
 crates/nsl-cli/tests/mse_leak_gate.rs	mse_loss_tape_ad_live_blocks_flat_and_grads_flow	gpu	requires CUDA GPU
 crates/nsl-cli/tests/multi_adamw_gate.rs	multi_adamw_gpu_bit_identical_and_fires	gpu	requires CUDA GPU
+crates/nsl-cli/tests/multi_adamw_gate.rs	multi_adamw_clip_gpu_bit_identical_and_fires	gpu	requires CUDA GPU
+crates/nsl-cli/tests/multi_adamw_gate.rs	batched_phase_a_sumsq_gpu_close_to_per_param	gpu	requires CUDA GPU
 crates/nsl-cli/tests/muon_batch_gate.rs	batch_ns_tracks_sequential_and_trains	gpu	requires CUDA GPU
 crates/nsl-cli/tests/muon_batch_gate.rs	batch_ns_is_bit_deterministic	gpu	requires CUDA GPU
 crates/nsl-cli/tests/muon_batch_gate.rs	resident_momentum_bit_identical_to_offload	gpu	requires CUDA GPU
@@ -86,7 +88,7 @@ crates/nsl-cli/tests/view_chain_leak_gate.rs	unknown_typed_receiver_chains_do_no
 crates/nsl-cli/tests/view_chain_leak_gate.rs	view_chain_results_are_numerically_unchanged	gpu	requires CUDA GPU
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_identity_reduce_chain_uses_the_fused_gemm	gpu	requires a CUDA GPU
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_fused_wgrad_matches_the_unfused_chain_within_f32_tolerance	gpu	requires a CUDA GPU (2 FASE training runs)
-crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs	cranelift_and_source_ad_see_same_rewritten_ast	broken	Pre-existing inference-path segfault when adapter synth fields (m.gate_...) are overwritten at top-level after the train block — verified failing at HEAD by both Commit A and Commit B subagents without any option-3 changes to the segfaulting path. The anti-drift intent of this test still has value: if the shared rewrite_stmts_for_model helper were ever forked, Cranelift's and source-AD's AST copies would diverge in a runnable way. Unblock when the top-level synth-field-read / inference-path lowering bug lands as a separate milestone; see the synth-field-read follow-up in project_wrga_b32_measurement.md.
+crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs	cranelift_and_source_ad_see_same_rewritten_ast	gpu-inferred	
 crates/nsl-cli/tests/wrga_b32_per_op_breakdown.rs	b32_per_op_breakdown_prescribed_shape	gpu-inferred	
 crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_trigger_measurement	gpu-inferred	
 crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_trigger_measurement_requires_cuda	cpu-stub	
@@ -224,10 +226,14 @@ crates/nsl-codegen/tests/fused_linear_ce_fp16_numerical.rs	fp16_forward_backward
 crates/nsl-codegen/tests/fused_linear_ce_fp16_numerical.rs	fp16_forward_backward_at_v8192_boundary	gpu-inferred	
 crates/nsl-codegen/tests/fused_linear_ce_fp16_numerical.rs	fp16_large_vocab_non_divisor_no_tail_zero_corruption	gpu-inferred	
 crates/nsl-codegen/tests/fused_linear_ce_fp16_v49152_numerical.rs	fp16_forward_backward_at_v49152_production_scale	gpu-inferred	
+crates/nsl-codegen/tests/fused_linear_ce_gemm_numerical.rs	gemm_path_matches_cpu_f64_with_bias	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/fused_linear_ce_gemm_numerical.rs	gemm_path_matches_cpu_f64_biasless	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/fused_linear_ce_large_vocab_numerical.rs	large_vocab_forward_at_production_scale_v49152	gpu-inferred	
 crates/nsl-codegen/tests/fused_linear_ce_large_vocab_numerical.rs	large_vocab_forward_at_production_hidden_v49152_h2048	gpu-inferred	
 crates/nsl-codegen/tests/fused_linear_ce_large_vocab_numerical.rs	large_vocab_forward_at_intermediate_scale_v16384	gpu-inferred	
 crates/nsl-codegen/tests/fused_linear_ce_numerical.rs	fused_linear_ce_gpu_forward_and_backward	gpu-inferred	
+crates/nsl-codegen/tests/fused_linear_ce_perf_probe.rs	v1_kernels_at_production_shape	gpu	requires CUDA GPU; perf probe, prints timings
+crates/nsl-codegen/tests/fused_linear_ce_perf_probe.rs	gemm_path_at_production_shape	gpu	requires CUDA GPU; perf probe, prints timings
 crates/nsl-codegen/tests/fused_lm_ce_decorator_vs_explicit_call_equivalence.rs	ffi_is_deterministic_under_fp16_dispatch	gpu-inferred	
 crates/nsl-codegen/tests/fused_lm_ce_e2e_bf16_activation.rs	bf16_decorator_e2e_loss_matches_cpu_f64_reference	gpu-inferred	
 crates/nsl-codegen/tests/fused_lm_ce_e2e_fp16_activation.rs	fp16_decorator_e2e_loss_matches_cpu_f64_reference	gpu-inferred	
@@ -329,6 +335,9 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	a_broadcast_operand_uses_a_zer
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	zz_partial_broadcast_child	unclassified	spawned by partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_slower_than_its_2d_form	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_is_faster_than_f32_and_less_accurate_than_tf32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_zero_is_a_no_op_and_the_default_stays_tf32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_bf16_mode.rs	precedence_pedantic_beats_bf16_and_bf16_beats_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_cublas_equivalence.rs	matmul_cublas_pedantic_equivalence_llama	gpu-inferred	
 crates/nsl-runtime/tests/matmul_cublas_tf32_default_sanity.rs	matmul_cublas_tf32_default_sanity_llama	gpu-inferred	
 crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	dispatch_paths_are_correct_under_the_shipped_defaults	gpu	requires CUDA GPU

@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,26 +91,37 @@ m.to(cuda)
 let tokens = load_mmap("{tokens_path}", 3)
 let loader = DataLoader(tokens, batch_size={batch_size}, seq_len={seq_len}, shuffle=false, drop_last=true)
 
-train(model=m, epochs=1, grad_clip={grad_clip}{accum_arg}{extra_train_args}):
+{decorator}train(model=m, epochs=1, grad_clip={grad_clip}{accum_arg}{extra_train_args}):
     optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95)
     scheduler: warmup_cosine(warmup_steps=100, total_steps=100000, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
-        let ls = logits.shape
-        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
-        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let flat_logits = logits.reshape([{rows}, {vocab}])
+        let flat_labels = batch.labels.reshape([{rows}])
         let loss = cross_entropy(flat_logits, flat_labels)
     callbacks:
         on_step(step, loss):
             print(step)
 """
+# NOTE: the flatten uses COMPILE-TIME dims, not `logits.shape`. Under
+# @fused_lm_ce a runtime `.shape` read of the logits is a live consumer of
+# the composite chain and the compiler (correctly) hard-refuses: it would
+# force the [rows, vocab] logits to materialize every step, defeating the
+# fusion. The dims are known here anyway — the decorator requires them.
 
 
 def build_program(
     out_dir: Path, tokens_path: Path, batch_size: int, seq_len: int, grad_clip: float, extra: str,
-    grad_accum: int,
+    grad_accum: int, fused_ce: bool, shape: "ModelShape",
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    decorator = ""
+    if fused_ce:
+        decorator = (
+            f"@fused_lm_ce(enabled=true, vocab_size={shape.vocab_size}, "
+            f"hidden_size={shape.d_model}, batch_size={batch_size}, "
+            f"seq_len={seq_len})\n"
+        )
     # The program imports `model`, so it has to sit beside model.nsl.
     src = TEMPLATE.format(
         tokens_path=tokens_path.as_posix(),
@@ -117,6 +130,9 @@ def build_program(
         grad_clip=grad_clip,
         accum_arg=f", grad_accumulation={grad_accum}" if grad_accum > 1 else "",
         extra_train_args=extra,
+        decorator=decorator,
+        rows=batch_size * seq_len,
+        vocab=shape.vocab_size,
     )
     path = out_dir / "mfu_generated.nsl"
     path.write_text(src, encoding="utf-8")
@@ -131,8 +147,6 @@ def run_once(
     flags: list[str],
 ) -> tuple[list[float], str]:
     """Run the program, timing the interval between step callbacks."""
-    import os
-
     env = dict(os.environ)
     env.update(env_extra)
     env.setdefault("NSL_STDLIB_PATH", str(Path(__file__).resolve().parents[2] / "stdlib"))
@@ -151,21 +165,37 @@ def run_once(
     stamps: list[float] = []
     output: list[str] = []
     assert proc.stdout is not None
-    try:
+
+    # The reader runs on a thread so the timeout is enforced by the main thread.
+    # Checking the deadline inside `for line in proc.stdout` only works while the
+    # child keeps talking: the iterator blocks in read(), so a run that hangs
+    # before its first step callback — an OOM retry loop, a cuCtxSynchronize
+    # deadlock, a compile that never finishes — never evaluated the check and
+    # blocked forever instead of reporting a FAILED row.
+    def reader() -> None:
+        assert proc.stdout is not None
         for line in proc.stdout:
             output.append(line)
             if STEP_RE.match(line):
                 stamps.append(time.monotonic())
                 if len(stamps) >= max_steps:
                     break
+
+    pump = threading.Thread(target=reader, daemon=True)
+    pump.start()
+    try:
+        while pump.is_alive():
             if time.monotonic() - started > timeout:
                 break
+            pump.join(timeout=0.5)
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             proc.kill()
+        # Terminating the child closes the pipe, which ends the reader.
+        pump.join(timeout=10)
 
     deltas = [b - a for a, b in zip(stamps, stamps[1:])]
     return deltas, "".join(output)
@@ -190,6 +220,10 @@ def main() -> None:
     parser.add_argument("--label", default="baseline")
     parser.add_argument("--flags", default="--source-ad",
                         help="flags passed to `nsl run` (default: --source-ad, which is the\nonly path with flash attention and fused cross-entropy)")
+    parser.add_argument("--fused-ce", action="store_true",
+                        help="add @fused_lm_ce(enabled=true, ...) to the train block — the\n"
+                             "[rows, vocab] logits are then never materialized (GEMM-chunked\n"
+                             "fused loss)")
     args = parser.parse_args()
 
     if not args.nsl.exists():
@@ -210,7 +244,7 @@ def main() -> None:
     for batch_size in args.batch_sizes:
         program = build_program(
             args.model_dir, args.tokens.resolve(), batch_size, args.seq_len, args.grad_clip,
-            args.extra_train_args, args.grad_accum,
+            args.extra_train_args, args.grad_accum, args.fused_ce, shape,
         )
         deltas, output = run_once(args.nsl, program, env_extra, args.timeout,
                                   args.max_steps, args.flags.split())
