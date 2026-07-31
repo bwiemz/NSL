@@ -63,6 +63,7 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
         process::exit(1);
     }
 
+    crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link(&obj_path, &exe_path) {
         Ok(()) => {
             let _ = std::fs::remove_file(&obj_path);

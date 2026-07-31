@@ -113,7 +113,6 @@ pub fn detect(
     detect_cfg: &PcaDetectConfig,
     attention_dtype_bytes: u64,
 ) -> PcaDetection {
-    crate::pass_trace::record("PCA");
     if !cfg.enabled || cfg.max_sequence_length == 0 {
         return PcaDetection {
             strategy: PcaStrategy::NoPacking,
@@ -123,6 +122,12 @@ pub fn detect(
             eliminated_mask_bytes_per_batch: 0,
         };
     }
+    // Item 2: recorded AFTER the disabled-guard. `detect` is also reached as a
+    // pure predicate from `pca_activation::check_train_packs` (three times per
+    // compile, just to compute `segment_masked`), so recording at entry
+    // reported PCA as having run on every model with a dataset block — even
+    // with packing switched off.
+    crate::pass_trace::record("PCA");
 
     let seq = cfg.max_sequence_length;
     let mean = cfg.mean_doc_length.unwrap_or(seq);

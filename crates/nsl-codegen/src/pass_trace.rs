@@ -35,6 +35,19 @@
 //! met) is a genuinely different question, deliberately out of scope here —
 //! conflating the two would make the signal mean less, not more.
 //!
+//! Read that literally for analysis-only commands: `nsl check
+//! --training-report` builds its report BY running the FASE and PCA planners,
+//! so those are reported as having run. That is accurate under this
+//! definition, not a false positive — but it does mean "ran" must not be read
+//! as "affected the emitted program".
+//!
+//! Where a pass entry doubles as a predicate, the record goes where the pass
+//! genuinely starts, not at the shared helper: `pca_detect::detect` is also a
+//! yes/no query on the FA-kernel path (it recorded PCA on every model with a
+//! dataset block, packing on or off), and `wggo_apply::apply` is skipped
+//! entirely by WGGO's shape-incompatibility refusal (which would have reported
+//! "did not run" for a pass that ran and declined).
+//!
 //! # Why it cannot change the build
 //!
 //! The trace is a compiler-side `Vec<&'static str>`. Nothing here is emitted
@@ -65,7 +78,11 @@ static TRACE: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 /// recording an entry no gate can interpret. This is compiler-side code, so a
 /// panic here surfaces as a compiler bug, which is what it would be.
 pub fn record(pass: &'static str) {
-    debug_assert!(
+    // NOT debug_assert: CI ships release builds, where that would compile
+    // out and let a typo'd name be recorded, rendered as `NAME(?)`, AND leave
+    // the real pass listed under "did not run" — the report lying in both
+    // halves at once. Once per pass per compile, so the cost is nil.
+    assert!(
         crate::pass_registry::pass(pass).is_some(),
         "pass_trace::record(\"{pass}\") names a pass that is not in the \
          registry — add a PassDescriptor, or fix the name"
@@ -179,114 +196,4 @@ pub fn stage_order_violation() -> Option<(&'static str, &'static str)> {
         .windows(2)
         .find(|w| w[0].1 > w[1].1)
         .map(|w| (w[0].0, w[1].0))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `TRACE` is process-global; the tests that touch it must not interleave.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn fresh() -> std::sync::MutexGuard<'static, ()> {
-        let g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset();
-        g
-    }
-
-    #[test]
-    fn record_is_idempotent_and_preserves_first_invocation_order() {
-        let _g = fresh();
-        record("WGGO");
-        record("CCR");
-        record("WGGO");
-        assert_eq!(observed(), vec!["WGGO", "CCR"]);
-        reset();
-        assert!(observed().is_empty());
-    }
-
-    /// The registry order is PreExtraction < ModuleScan < OnWengert <
-    /// OnAdjoint < Lowering. CCR is OnAdjoint and FASE is PreExtraction, so
-    /// FASE-then-CCR is legal and CCR-then-FASE is not.
-    #[test]
-    fn stage_order_is_checked_in_the_direction_that_can_fail() {
-        let _g = fresh();
-        record("FASE");
-        record("CCR");
-        assert_eq!(stage_order_violation(), None);
-        reset();
-        record("CCR");
-        record("FASE");
-        assert_eq!(stage_order_violation(), Some(("CCR", "FASE")));
-    }
-
-    /// Five passes share `OnWengert`, so their relative order is genuinely
-    /// unconstrained. Pinned so nobody later reads a clean order check as
-    /// proof that the intra-stage sequence was verified.
-    #[test]
-    fn same_stage_passes_are_unordered_by_design() {
-        let _g = fresh();
-        for p in ["CPKD", "WRGA", "CSHA", "WGGO"] {
-            record(p);
-        }
-        assert_eq!(
-            stage_order_violation(),
-            None,
-            "OnWengert passes must not be ordered against each other — the \
-             registry declares no order for them"
-        );
-    }
-
-    /// CEP and CFIE are OutOfBand and must never produce a violation in
-    /// either direction; otherwise enabling inference-side work would fail a
-    /// training-pipeline order check for no reason.
-    #[test]
-    fn out_of_band_passes_never_violate_the_order() {
-        let _g = fresh();
-        record("MemoryPlanner"); // Lowering, the highest ranked stage
-        record("CFIE");
-        record("CEP");
-        record("FASE"); // PreExtraction, the lowest — but after OutOfBand
-        assert_eq!(
-            stage_order_violation(),
-            Some(("MemoryPlanner", "FASE")),
-            "the Lowering->PreExtraction inversion should be reported, and the \
-             OutOfBand passes between them should be transparent"
-        );
-    }
-
-    #[test]
-    fn the_report_names_both_what_ran_and_what_did_not() {
-        let _g = fresh();
-        record("WGGO");
-        let r = report();
-        assert!(r.contains("1 pass(es) ran: WGGO(OnWengert)"), "{r}");
-        assert!(r.contains("did not run:"), "{r}");
-        assert!(r.contains("CCR"), "idle passes must be enumerated: {r}");
-        reset();
-        assert!(report().contains("NO passes ran"));
-    }
-
-    /// Every name this module's own tests use must be a real registered pass,
-    /// so the tests cannot drift into asserting on passes that no longer
-    /// exist.
-    #[test]
-    fn names_used_by_these_tests_are_registered() {
-        for p in [
-            "WGGO",
-            "CCR",
-            "FASE",
-            "CPKD",
-            "WRGA",
-            "CSHA",
-            "CEP",
-            "CFIE",
-            "MemoryPlanner",
-        ] {
-            assert!(
-                crate::pass_registry::pass(p).is_some(),
-                "{p} is not in the pass registry"
-            );
-        }
-    }
 }

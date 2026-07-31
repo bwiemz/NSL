@@ -136,6 +136,7 @@ pub(crate) fn run_build_standalone(
     }
 
     // 9. Link all objects
+    crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link_multi(&obj_paths, &output_path) {
         Ok(()) => {
             // 10. Clean up temp object files

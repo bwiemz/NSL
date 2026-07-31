@@ -162,7 +162,13 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     ),
     m(
         "[pass-trace]",
-        &["crates/nsl-codegen/src/pass_trace.rs"],
+        &[
+            // The report text is built here...
+            "crates/nsl-codegen/src/pass_trace.rs",
+            // ...and printed here. Pinning only the builder would let the
+            // eprint! be deleted with the marker gate still green.
+            "crates/nsl-cli/src/commands/build/mod.rs",
+        ],
         "the registered compiler passes that actually ran this compile, in \
          first-invocation order (roadmap item 2)",
     ),
