@@ -113,6 +113,7 @@ pub fn detect(
     detect_cfg: &PcaDetectConfig,
     attention_dtype_bytes: u64,
 ) -> PcaDetection {
+    crate::pass_trace::record("PCA");
     if !cfg.enabled || cfg.max_sequence_length == 0 {
         return PcaDetection {
             strategy: PcaStrategy::NoPacking,

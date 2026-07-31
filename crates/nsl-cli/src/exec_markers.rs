@@ -161,6 +161,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "stochastic-rounding bf16 parameter storage engaged",
     ),
     m(
+        "[pass-trace]",
+        &["crates/nsl-codegen/src/pass_trace.rs"],
+        "the registered compiler passes that actually ran this compile, in \
+         first-invocation order (roadmap item 2)",
+    ),
+    m(
         "[param-plan]",
         &[
             // The compile-time report...
@@ -284,6 +290,7 @@ pub mod tokens {
     pub const TAPE_AD: &str = "[tape-ad]";
     pub const SR_BF16: &str = "[sr-bf16]";
     pub const PARAM_PLAN: &str = "[param-plan]";
+    pub const PASS_TRACE: &str = "[pass-trace]";
     pub const FLASH_BWD: &str = "[flash-bwd]";
     pub const ARENA: &str = "[arena]";
     pub const GPU_MEM: &str = "[gpu-mem]";
@@ -337,6 +344,14 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         test: "crates/nsl-cli/tests/mse_leak_gate.rs",
         asserts: "the tape backward did not hit a FATAL disconnection",
         parts: &[("[tape-ad] FATAL", "crates/nsl-runtime/src/autodiff/backward.rs")],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/pass_trace_gate.rs",
+        asserts: "the pass trace stayed silent without NSL_PASS_TRACE=1",
+        // The bare token is the whole needle (the test asserts no
+        // `[pass-trace]` line at all), and it is emitted from exactly one
+        // place: the report builder.
+        parts: &[("[pass-trace]", "crates/nsl-codegen/src/pass_trace.rs")],
     },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/param_plan_gate.rs",

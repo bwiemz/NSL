@@ -735,6 +735,7 @@ fn group_thousands(n: u64) -> String {
 }
 
 pub fn run(input: CfieInput) -> CfiePlan {
+    crate::pass_trace::record("CFIE");
     let t0 = std::time::Instant::now();
 
     if input.mode == CfieMode::Off {

@@ -187,6 +187,16 @@ fn run_build_single(
         nsl_codegen::linker::default_output_path(file)
     };
 
+    // Item 2: every pass that ran during this compilation, printed once
+    // under NSL_PASS_TRACE=1. Emitted HERE, after the last module is
+    // compiled and before linking, because that is the only point at which
+    // "compilation is finished" is unambiguous — codegen has several entry
+    // points and a program compiles its imported modules through a different
+    // one than its own entry.
+    if nsl_codegen::pass_trace::enabled() {
+        eprint!("{}", nsl_codegen::pass_trace::report());
+    }
+
     match nsl_codegen::linker::link(&obj_path, &exe_path) {
         Ok(()) => {
             // Clean up .o file after successful link
@@ -568,6 +578,16 @@ fn run_build_multi(
     } else {
         nsl_codegen::linker::default_output_path(file)
     };
+
+    // Item 2: every pass that ran during this compilation, printed once
+    // under NSL_PASS_TRACE=1. Emitted HERE, after the last module is
+    // compiled and before linking, because that is the only point at which
+    // "compilation is finished" is unambiguous — codegen has several entry
+    // points and a program compiles its imported modules through a different
+    // one than its own entry.
+    if nsl_codegen::pass_trace::enabled() {
+        eprint!("{}", nsl_codegen::pass_trace::report());
+    }
 
     match nsl_codegen::linker::link_multi(&obj_files, &exe_path) {
         Ok(()) => {

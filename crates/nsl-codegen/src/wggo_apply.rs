@@ -82,6 +82,7 @@ impl AppliedPlan {
 /// Combine a [`InterLayerPlan`] with per-layer ILP solutions into a
 /// single [`AppliedPlan`].
 pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
+    crate::pass_trace::record("WGGO");
     assert_eq!(
         inter.layers.len(),
         ilp.len(),

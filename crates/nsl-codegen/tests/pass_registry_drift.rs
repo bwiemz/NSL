@@ -673,6 +673,11 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          consumed by the registration sites, not a tree-transforming pass",
     ),
     ("pass_registry", "this registry"),
+    (
+        "pass_trace",
+        "records which registered passes ran (roadmap item 2) — observes the \
+         pipeline, is not a stage in it",
+    ),
     ("pipeline", "pipeline-parallel scheduling"),
     ("precision_cast_ptx", "precision-cast PTX emitter"),
     ("profiling", "dev-tools capture"),

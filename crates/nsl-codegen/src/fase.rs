@@ -195,6 +195,7 @@ impl FasePlan {
 
 /// Run the FASE planner.
 pub fn plan(cfg: &FaseConfig) -> FasePlan {
+    crate::pass_trace::record("FASE");
     let accumulation = cfg.accumulation.max(1);
 
     // Accumulation count of 1 → no rewrite.
