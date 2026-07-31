@@ -137,6 +137,7 @@ pub(crate) fn run_build_zk(
         nsl_codegen::linker::default_output_path(file)
     };
 
+    crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link(&obj_path, &exe_path) {
         Ok(()) => {
             let _ = std::fs::remove_file(&obj_path);

@@ -482,6 +482,7 @@ fn plan_impl(
     compress_saves: bool,
     selection: AnchorSelection,
 ) -> Option<CcrPlan> {
+    crate::pass_trace::record("CCR");
     // ---- 1. Param vars per block key --------------------------------
     let mut param_block: HashMap<VarId, String> = HashMap::new();
     let mut block_keys: Vec<String> = Vec::new();

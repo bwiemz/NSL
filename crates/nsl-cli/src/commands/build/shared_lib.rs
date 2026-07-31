@@ -160,6 +160,7 @@ fn run_build_shared_single(
     export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);
 
+    crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link_shared_with_exports(
         std::slice::from_ref(&obj_path),
         &lib_path,
@@ -487,6 +488,7 @@ fn run_build_shared_multi(
     export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);
 
+    crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {
         Ok(()) => {
             // Whole scratch directory — see normal.rs.

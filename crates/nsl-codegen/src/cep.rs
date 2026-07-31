@@ -257,6 +257,7 @@ fn slack_from_profile(p: &CompilationProfile) -> RooflineSlackTable {
 
 /// Run compilation-verified pruning.
 pub fn run_prune(input: CepPruneInput) -> CepPlan {
+    crate::pass_trace::record("CEP");
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
     // 1. Baseline compile (for slack estimates + importance context).
     let baseline = evaluate(&input.spec, gpu).expect("base spec must validate");
@@ -297,6 +298,7 @@ pub fn run_prune(input: CepPruneInput) -> CepPlan {
 /// required for non-synthetic importance), but `joint_prune_search` extends the action
 /// space with layer drops on top of head + FFN pruning.
 pub fn run_joint(input: CepPruneInput) -> CepPlan {
+    crate::pass_trace::record("CEP");
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
     let baseline = evaluate(&input.spec, gpu).expect("base spec must validate");
     let slacks = if input.roofline_slack.per_layer.is_empty() {
@@ -326,6 +328,7 @@ pub fn run_joint(input: CepPruneInput) -> CepPlan {
 
 /// Run hardware-aware architecture search.
 pub fn run_search(input: CepSearchInput) -> CepPlan {
+    crate::pass_trace::record("CEP");
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
     let outcome = architecture_search(&input.axes, gpu, &input.constraints, input.objective);
     CepPlan {

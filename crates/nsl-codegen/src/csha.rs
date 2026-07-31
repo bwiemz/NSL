@@ -521,6 +521,7 @@ fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
 
 /// Run the CSHA driver.
 pub fn run(input: CshaInput) -> CshaPlan {
+    crate::pass_trace::record("CSHA");
     let t0 = std::time::Instant::now();
     let gpu: &'static GpuSpec = resolve_gpu_spec(input.target);
 

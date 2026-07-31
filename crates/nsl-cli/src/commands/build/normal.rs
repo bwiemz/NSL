@@ -175,6 +175,7 @@ fn run_build_single(
         process::exit(1);
     }
 
+    crate::commands::build::emit_pass_trace();
     if emit_obj {
         if !quiet { println!("Wrote {}", obj_path.display()); }
         return;
@@ -187,6 +188,7 @@ fn run_build_single(
         nsl_codegen::linker::default_output_path(file)
     };
 
+    crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link(&obj_path, &exe_path) {
         Ok(()) => {
             // Clean up .o file after successful link
@@ -553,6 +555,7 @@ fn run_build_multi(
         }
     }
 
+    crate::commands::build::emit_pass_trace();
     if emit_obj {
         if !quiet {
             for obj in &obj_files {
@@ -569,6 +572,7 @@ fn run_build_multi(
         nsl_codegen::linker::default_output_path(file)
     };
 
+    crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link_multi(&obj_files, &exe_path) {
         Ok(()) => {
             // Remove the whole scratch directory, not just the .o files it

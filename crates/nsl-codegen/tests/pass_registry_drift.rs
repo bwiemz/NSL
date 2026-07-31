@@ -673,6 +673,11 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          consumed by the registration sites, not a tree-transforming pass",
     ),
     ("pass_registry", "this registry"),
+    (
+        "pass_trace",
+        "records which registered passes ran (roadmap item 2) — observes the \
+         pipeline, is not a stage in it",
+    ),
     ("pipeline", "pipeline-parallel scheduling"),
     ("precision_cast_ptx", "precision-cast PTX emitter"),
     ("profiling", "dev-tools capture"),
@@ -885,5 +890,63 @@ fn every_pass_has_at_least_one_trigger() {
         "these passes have neither a CLI flag nor a decorator, so nothing \
          documented can turn them on: {:?}",
         untriggered.iter().map(|p| p.name).collect::<Vec<_>>()
+    );
+}
+
+/// Roadmap item 2: every `pass_trace::record("NAME")` in the tree must name a
+/// REGISTERED pass.
+///
+/// `record` asserts this at run time, but that only fires on a path some test
+/// actually exercises — coverage of the twelve call sites is incidental, and a
+/// typo in a rarely-taken pass would ship. A typo is doubly bad: the bogus
+/// name is rendered `NAME(?)` in the report while the real pass stays listed
+/// under "did not run", so the report lies in both halves at once.
+///
+/// Statically enumerating the call sites removes the dependence on runtime
+/// coverage entirely.
+#[test]
+fn every_pass_trace_record_names_a_registered_pass() {
+    let root = repo_root();
+    let mut sites = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    // Same recursive walk idiom as the module-completeness gate above.
+    let mut stack: Vec<PathBuf> = vec![
+        root.join("crates/nsl-codegen/src"),
+        root.join("crates/nsl-cli/src"),
+    ];
+    let mut files: Vec<PathBuf> = Vec::new();
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                files.push(p);
+            }
+        }
+    }
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        for line in strip_line_comments(&text).lines() {
+            let Some(rest) = line.split("pass_trace::record(\"").nth(1) else { continue };
+            let Some(name) = rest.split('"').next() else { continue };
+            sites += 1;
+            if nsl_codegen::pass_registry::pass(name).is_none() {
+                bad.push(format!("{}: record(\"{name}\")", f.display()));
+            }
+        }
+    }
+    // Anti-vacuity: a refactor that renames the call or moves every pass out
+    // of these trees would otherwise leave this test passing over zero sites.
+    assert!(
+        sites >= 10,
+        "found only {sites} pass_trace::record call sites — the scan is not \
+         finding them, so this gate proves nothing"
+    );
+    assert!(
+        bad.is_empty(),
+        "pass_trace::record calls naming unregistered passes:\n  {}",
+        bad.join("\n  ")
     );
 }

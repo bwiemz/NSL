@@ -386,6 +386,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     cep_emit_weights: None,
                     cep_emit_source: None,
                 };
+                crate::commands::build::emit_pass_trace();
                 std::process::exit(crate::commands::cep::run_cep_search(&file, &ov));
             }
             if cep_profile {
@@ -396,6 +397,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     cep_emit_weights: None,
                     cep_emit_source: None,
                 };
+                crate::commands::build::emit_pass_trace();
                 std::process::exit(crate::commands::cep::run_cep_profile(&file, weights.as_deref(), &ov));
             }
             // CPKD Innovation 5: CEP-guided student design under a parameter
@@ -579,4 +581,8 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     }
                 }
             }
+    // Item 2: `check` runs real codegen (e.g. `--csha auto` plans CSHA) but
+    // never links, so without this the trace is silent on a path where passes
+    // demonstrably ran.
+    crate::commands::build::emit_pass_trace();
 }

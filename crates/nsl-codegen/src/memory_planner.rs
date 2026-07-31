@@ -612,6 +612,7 @@ pub fn rematerialize(
 ///
 /// Tensors with SizeKind::Dynamic are skipped.
 pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> SlabPlan {
+    crate::pass_trace::record("MemoryPlanner");
     // Sort tensor IDs by size (largest first) for decreasing order
     let mut sorted: Vec<TensorAllocId> = allocs
         .iter()

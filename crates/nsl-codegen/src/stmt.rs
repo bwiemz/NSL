@@ -7608,6 +7608,13 @@ impl Compiler<'_> {
                     let logit_bytes_eliminated = fused_op
                         .map(|(v, _, _, rows)| 2 * (v as u64) * (rows as u64) * 4)
                         .unwrap_or(0);
+                    // Item 2: CPKD is the one registered pass with no module
+                    // entry point to instrument — the driver builds its plan
+                    // inline here rather than calling into `cpkd.rs`, which is
+                    // itself an instance of the pass-bus tangle this roadmap
+                    // item exists to unpick. Recorded at the point the plan is
+                    // produced, which is what "CPKD ran" means today.
+                    crate::pass_trace::record("CPKD");
                     self.last_cpkd_plan = Some(crate::cpkd::CpkdPlan {
                         teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
                         student_name: self.resolve_sym(distill.student_sym).to_string(),

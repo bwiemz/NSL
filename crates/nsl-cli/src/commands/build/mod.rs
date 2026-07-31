@@ -53,3 +53,25 @@ pub(crate) use shared_lib::run_build_shared;
 pub(crate) use standalone::run_build_standalone;
 pub(crate) use wrga_check::{run_check_wrga_analyze, run_check_wrga_compare};
 pub(crate) use zk::{run_build_zk, run_zk_cmd};
+
+/// Item 2: print the pass execution trace, once, at a point where compilation
+/// has finished.
+///
+/// Idempotent — the first call prints, later ones are silent — so it can be
+/// placed at EVERY terminal point without a build that passes through two of
+/// them reporting twice. That matters: there are seven of them (six link
+/// flavours plus `--emit-obj`, which returns before any link), and `check`
+/// and `test` compile without linking at all. An emitter wired to only some
+/// of them reports nothing on the others, which is precisely the
+/// "silently inert" failure the trace exists to detect.
+pub fn emit_pass_trace() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !nsl_codegen::pass_trace::enabled() {
+        return;
+    }
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eprint!("{}", nsl_codegen::pass_trace::report());
+}

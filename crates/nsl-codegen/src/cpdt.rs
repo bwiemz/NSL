@@ -166,6 +166,7 @@ impl CpdtPlan {
 
 /// Run the driver.
 pub fn run(input: CpdtInput) -> CpdtPlan {
+    crate::pass_trace::record("CPDT");
     let t0 = std::time::Instant::now();
 
     if input.mode == CpdtMode::Off {

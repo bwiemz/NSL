@@ -679,6 +679,7 @@ fn memory_noop(activation_live: &BTreeSet<VarId>) -> MemoryPlan {
 /// independent (running with only `skip_fusion_integration=true` does NOT
 /// disturb the prune or placement stages).
 pub fn run(input: WrgaInput) -> WrgaPlan {
+    crate::pass_trace::record("WRGA");
     let abl = input.ablation;
 
     // ── Stage 1: PEFT topology extraction (not an Innovation; always runs)

@@ -172,6 +172,8 @@ pub mod fusion_report;
 pub mod inspect;
 pub mod memory_planner;
 pub mod pass_registry;
+/// Item 2 step 1: records which registered passes actually ran, in order.
+pub mod pass_trace;
 pub mod profiling;
 pub mod serve;
 pub mod wcet;

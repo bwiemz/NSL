@@ -160,6 +160,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     cep_emit_weights,
                     cep_emit_source,
                 };
+                crate::commands::build::emit_pass_trace();
                 std::process::exit(crate::commands::cep::run_cep_prune(&file, weights.as_deref(), &ov));
             }
 
@@ -171,6 +172,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     cep_emit_weights,
                     cep_emit_source,
                 };
+                crate::commands::build::emit_pass_trace();
                 std::process::exit(crate::commands::cep::run_cep_joint(&file, weights.as_deref(), &ov));
             }
 

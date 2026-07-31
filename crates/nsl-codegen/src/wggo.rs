@@ -497,6 +497,12 @@ fn per_layer_ilp_budget(model_budget: Option<u64>, n_layers: usize) -> Option<u6
 
 /// Run the WGGO driver.
 pub fn run(mut input: WggoInput) -> WggoPlan {
+    // Item 2: recorded at the PASS entry, not at `wggo_apply::apply`. The
+    // §2.4 shape-incompatibility refusal below returns an empty plan inline
+    // without ever calling `apply`, so instrumenting `apply` would report
+    // "WGGO did not run" on a path where WGGO ran and deliberately declined —
+    // indistinguishable from the flag never being passed.
+    crate::pass_trace::record("WGGO");
     let t0 = std::time::Instant::now();
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
 
