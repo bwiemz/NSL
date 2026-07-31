@@ -125,7 +125,7 @@ is `rel err / rel tol`, so lower is more headroom.
 |---|---|---|
 | head_dim | dK/dV: 32, 64, 128 — full backward: **64, 128 only** | 16, 256; hd=32 in the full backward |
 | seq_len | 32, 64, 128 | anything not equal to a whole number of tiles |
-| block_q | 32, 64 | **bq=64 at hd=128** — the dispatch ladder pins bq=64 for hd 32/64/128, but every hd=128 row here was measured at bq=32, so the tiling production would pick for hd=128 is NOT in this set |
+| block_q | 32, 64 | — (resolved 2026-07-30: the ladder previously ADVERTISED bq=64 at hd=128 while `tier_b2_effective_bq` clamps to 32 for hd>=128, so bq=64 was unreachable through the emitters. The ladder now pins hd=128 to bq=32 — exactly the tiling every hd=128 row here was measured at. Real bq=64@hd=128 support would be emitter work: lift the smem_layout clamp and re-certify.) |
 | causal | yes and no | — |
 | forward source | `B1Forward` (real Tier B.1 kernel) and `CpuNaive` | — |
 | gradients | dQ, dK, dV, dWq, dWk, dWv, dx | — |
@@ -138,13 +138,23 @@ Recorded here rather than left implicit, because an uncertified regime that
 still dispatches is worse than one that refuses.
 
 1. **Grouped-query attention (`gqa_group_size > 1`).** The zero-copy stride
-   pattern is implemented (`backward/hbm_addr.rs` divides the head register by
-   the group size for K/V/dK/dV addressing), but every Tier B.2 numerical sweep
-   fixes `gqa_group_size: 1`, so **the Tier B.2 grouped addressing** has never
-   been compared against a reference. (A different path IS covered:
-   `gqa_backward_matches_cpu_reference` exercises the runtime expand-KV
-   envelope green across five GQA ratios, and is in the canary. It does not
-   touch Tier B.2.)
+   pattern is only HALF-implemented (corrected 2026-07-30 — this doc
+   previously over-claimed it as done): `backward/hbm_addr.rs` divides the
+   head register for the K/V **loads** (four sites in dkdv.rs/dq.rs), but
+   `emit_dkdv_finalize` still passes the raw Q-head register into both
+   dK/dV **stores** — at group size g > 1 the kernel would read K/V at
+   `head/g` yet scatter dK/dV per Q-head instead of summing each group
+   into its kv-head slot (the contract the runtime oracle
+   `flash_attention_backward_cpu_gqa` defines). That store-side reduction
+   also needs cross-CTA accumulation, which the
+   `tier_b2_no_atomic_in_dkdv` gate currently forbids — an open design
+   decision, not a sweep away. Every Tier B.2 numerical sweep fixes
+   `gqa_group_size: 1`, and the sweep harness pins heads=1, at which the
+   divisor is a numerical no-op — so no sweep written against today's
+   harness could validate grouped addressing even if it dispatched.
+   (A different path IS covered: `gqa_backward_matches_cpu_reference`
+   exercises the runtime expand-KV envelope green across five GQA ratios,
+   and is in the canary. It does not touch Tier B.2.)
 
    Item 15 added `DispatchReject::GqaUnvalidated` plus a loud
    `UnsupportedConfig` refusal in `synthesize_tier_b2_backward`. Note this does

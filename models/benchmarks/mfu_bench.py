@@ -5,11 +5,14 @@ Generates a small NSL training program per configuration, runs it, and converts
 the observed step time into tokens/s and MFU.
 
 MFU is reported against the *dense* tensor throughput of the device for the
-precision actually in use. On GeForce Blackwell (RTX 5070 Ti, GB203) the TF32
-tensor rate equals the FP32 vector rate, so running matmuls in TF32 buys no
-headroom at all against the roofline — only BF16/FP16 with FP32 accumulate
-doubles it. Reporting against the marketed "AI TOPS" figure would understate
-utilisation by 16x, since that number is FP4 with 2:4 sparsity.
+precision actually in use, selected per device from PEAK_TFLOPS_BY_DEVICE
+(auto-detected via nvidia-smi; override with --gpu-name). The table matters:
+on GeForce Blackwell (RTX 5070 Ti) the TF32 tensor rate is capped at the FP32
+vector rate, while the workstation RTX PRO 4500 (same GB203 silicon) runs
+TF32 at 2.4x and BF16 at 2.8x the GeForce figures — measured, not whitepaper.
+An MFU% computed against the wrong card's peak is off by that same factor.
+Reporting against the marketed "AI TOPS" figure would understate utilisation
+by 16x, since that number is FP4 with 2:4 sparsity.
 """
 
 from __future__ import annotations
@@ -27,16 +30,44 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# RTX 5070 Ti (GB203), dense TFLOPS, from the RTX Blackwell whitepaper App. B.
-PEAK_TFLOPS = {
-    "fp32": 43.9,
-    "tf32": 43.9,  # equal to FP32 vector on GeForce — TF32 is not a free 2x
-    "bf16": 87.9,
-    "fp16": 87.9,
-    "fp8": 175.8,
+# Dense TFLOPS per device. Keys must match `nvidia-smi --query-gpu=name` output.
+# 5070 Ti: RTX Blackwell whitepaper App. B. RTX PRO 4500: measured 2026-07-30
+# with a cuBLAS GemmEx probe at N=8192 (fp32/tf32/bf16/fp16 sustained at the
+# 200 W limit, 2535 MHz); its fp8 entry is the 2x-of-BF16 dense ratio the
+# whitepaper gives for every Blackwell part, not a direct measurement.
+PEAK_TFLOPS_BY_DEVICE = {
+    "NVIDIA GeForce RTX 5070 Ti": {
+        "fp32": 43.9,
+        "tf32": 43.9,  # equal to FP32 vector on GeForce — TF32 is not a free 2x
+        "bf16": 87.9,
+        "fp16": 87.9,
+        "fp8": 175.8,
+    },
+    "NVIDIA RTX PRO 4500 Blackwell": {
+        "fp32": 36.5,
+        "tf32": 87.6,  # workstation GB203 is NOT GeForce-capped
+        "bf16": 200.3,
+        "fp16": 199.8,
+        "fp8": 400.6,  # 2x bf16 dense ratio, unmeasured
+    },
 }
+PRECISIONS = sorted(PEAK_TFLOPS_BY_DEVICE["NVIDIA GeForce RTX 5070 Ti"])
+assert all(sorted(v) == PRECISIONS for v in PEAK_TFLOPS_BY_DEVICE.values()), \
+    "every device entry must cover the same precision set"
 
-MEMORY_BW_GB_S = 896.0
+MEMORY_BW_GB_S = 896.0  # 256-bit GDDR7 @ 28 Gbps — same on both GB203 cards
+
+
+def detect_gpu_name() -> str:
+    """First GPU name from nvidia-smi, or empty string if unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+        return out.strip().splitlines()[0].strip() if out.strip() else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 @dataclass(frozen=True)
@@ -211,7 +242,11 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--precision", default="tf32", choices=sorted(PEAK_TFLOPS))
+    parser.add_argument("--precision", default="tf32", choices=PRECISIONS)
+    parser.add_argument("--gpu-name", default=None,
+                        help="device key for PEAK_TFLOPS_BY_DEVICE (default: auto-detect\n"
+                             "via nvidia-smi; the run refuses an unknown device rather than\n"
+                             "report an MFU% against the wrong roofline)")
     parser.add_argument("--extra-train-args", default="")
     parser.add_argument("--env", action="append", default=[], help="KEY=VALUE passed to the run")
     parser.add_argument("--max-steps", type=int, default=25)
@@ -233,11 +268,21 @@ def main() -> None:
 
     env_extra = dict(kv.split("=", 1) for kv in args.env)
     shape = ModelShape()
-    peak = PEAK_TFLOPS[args.precision] * 1e12
+    gpu_name = args.gpu_name or detect_gpu_name()
+    if gpu_name not in PEAK_TFLOPS_BY_DEVICE:
+        known = "\n  ".join(sorted(PEAK_TFLOPS_BY_DEVICE))
+        sys.exit(
+            f"no peak-TFLOPS entry for GPU {gpu_name!r} — an MFU% against the wrong\n"
+            f"roofline is worse than none. Add the device to PEAK_TFLOPS_BY_DEVICE\n"
+            f"(measure with a cuBLAS GemmEx probe, not the marketing number) or pass\n"
+            f"--gpu-name. Known devices:\n  {known}"
+        )
+    peak = PEAK_TFLOPS_BY_DEVICE[gpu_name][args.precision] * 1e12
     results = []
 
     print(f"model: {shape.matmul_params() / 1e6:.2f}M matmul params, "
           f"{shape.flops_per_token(args.seq_len) / 1e6:.1f} MFLOP/token (fwd+bwd, seq={args.seq_len})")
+    print(f"device: {gpu_name}")
     print(f"device peak ({args.precision}): {peak / 1e12:.1f} TFLOPS dense\n")
     print(f"{'batch':>6} {'tok/cb':>9} {'ms/cb':>9} {'tok/s':>10} {'TFLOPS':>8} {'MFU':>7}")
 
@@ -281,6 +326,8 @@ def main() -> None:
             "achieved_tflops": achieved / 1e12,
             "mfu": mfu,
             "precision": args.precision,
+            "gpu": gpu_name,
+            "peak_tflops": peak / 1e12,
             "ok": True,
         })
 

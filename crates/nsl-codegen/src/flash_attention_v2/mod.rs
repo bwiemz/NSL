@@ -16,6 +16,7 @@ pub mod sinks;
 pub mod tier_b1;
 pub mod tier_b2;
 pub mod per_doc_cta;
+pub mod mma_forward;
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_segment::SegmentResidency;
@@ -101,6 +102,16 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
                 // any inadvertent fall-through in CI-monitored variants.
             }
         }
+    }
+
+    // Tensor-core forward for the plain (non-CSHA) SDPA path. Admission
+    // refuses segment_masked, so a PCA Tier B range table can never be
+    // live here — the `tier_b` parameter is deliberately not forwarded.
+    // `NSL_FA_FWD_MMA=0` at codegen time restores the scalar body below.
+    if mma_forward::is_mma_forward_dispatch(config) {
+        smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward)
+            .expect("mma forward called with unsupported config -- admission must gate this");
+        return mma_forward::synthesize(config);
     }
 
     smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward)
@@ -495,7 +506,7 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
 /// projected K into SMEM at kv_offset — skip the HBM load to avoid
 /// overwriting the fused result.  When `csha_wk_ptr` is null (caller
 /// pre-projected K/V via classic k_ptr) the load runs normally.
-fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
+pub(crate) fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
     // §4.3 attention sinks (Sprint 1a precursor): the rolling load covers
     // `block_kv` rows; when sinks are enabled the sink pre-load below
     // covers an additional `num_sink_tokens` rows so the K SMEM slab
@@ -895,6 +906,12 @@ pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
             Ok(chunk) => format!("{}_tier_b1_chunk{}", base, chunk),
             Err(_) => base, // fell through to Tier A v2 path
         }
+    } else if mma_forward::is_mma_forward_dispatch(config) {
+        // Tensor-core forward body (see mma_forward.rs). Distinct name so
+        // compiler-side rodata keys and profiler output can never confuse
+        // the two bodies (`_rope_reset_max{N}` precedent); mutually
+        // exclusive with tier_b1 (csha None vs csha level >= 2).
+        format!("{}_mma", base)
     } else {
         base
     }

@@ -1818,6 +1818,15 @@ fn emit_dkdv_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
                 "%g1_d_tmp".to_string()
             };
 
+            // GROUPED-KV CAVEAT (2026-07-30): this store addresses by the RAW
+            // Q-head register while the K/V loads above address by
+            // %c12_kv_head (= head / gqa_group_size). At group size > 1 that
+            // is the WRONG contract — each group's q-heads must SUM into one
+            // kv-head slot of a [B, H_kv, S, D] buffer (see the runtime
+            // oracle flash_attention_backward_cpu_gqa), which also needs
+            // cross-CTA accumulation the no-atomics gate currently forbids.
+            // Safe today only because GQA > 1 is refused at dispatch AND
+            // synthesis; fix BOTH stores before lifting either refusal.
             emit_4d_byte_offset(
                 ptx,
                 "%g1_dv_byte_off",
@@ -1880,6 +1889,9 @@ fn emit_dkdv_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
                 "%g2_d_tmp".to_string()
             };
 
+            // GROUPED-KV CAVEAT: raw %head — see the dV store above; the
+            // same store-side head division + group reduction is missing
+            // here. Fix both together.
             emit_4d_byte_offset(
                 ptx,
                 "%g2_dk_byte_off",

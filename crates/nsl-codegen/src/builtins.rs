@@ -281,6 +281,34 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         None,
     ),
+    // Item 8, CSLA half: subset variant — same contract with an extra NslList
+    // of i64 param indices (arg 5) selecting which parameters to step. The
+    // CSLA layerwise window emits one call per layer group. Same lockstep
+    // warning as above: this list, the `stmt.rs` emission order, and the Rust
+    // signature in `fase_step.rs` must not drift.
+    (
+        "nsl_fase_fused_adamw_step_multi_idx",
+        &[
+            types::I64, // params_list
+            types::I64, // m_list
+            types::I64, // v_list
+            types::I64, // mp_list
+            types::I64, // idx_list (NslList of i64 param indices)
+            types::F64, // lr
+            types::F64, // beta1
+            types::F64, // one_minus_beta1
+            types::F64, // beta2
+            types::F64, // one_minus_beta2
+            types::F64, // eps
+            types::F64, // wd
+            types::F64, // bc1_inv
+            types::F64, // bc2_inv
+            types::I64, // wd_exempt_list (0 = flat wd; CSLA passes 0)
+            types::I64, // wd_exempt_non_rank2
+            types::F64, // mp_scale (1.0 = unclipped; CSLA refuses grad_clip)
+        ],
+        None,
+    ),
     // FASE two-phase-clip Phase A: global sum-of-squares over an NslList of
     // m_partial tensors with ONE pipeline drain (batched device reduction).
     ("nsl_fase_sum_sq_list", &[types::I64], Some(types::F64)),
@@ -2651,6 +2679,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_cuda_graph_region_begin", &[types::I64], None), // (region_id)
     ("nsl_cuda_graph_region_end", &[types::I64], None), // (region_id)
     ("nsl_cuda_graphs_report", &[], None),
+    // Item 3: the compiled ParameterPlan, cross-checked against the three
+    // residency tables at run time. LOCKSTEP: the flag bits are
+    // `nsl_runtime::param_plan::PLAN_*`, re-exported by
+    // `crate::parameter_plan` — there is no second copy to keep in sync.
+    ("nsl_param_plan_declare", &[types::I64, types::I64, types::I64], Some(types::I64)), // (tensor, idx, flags)
+    ("nsl_param_plan_verify", &[], Some(types::I64)),
+    ("nsl_param_plan_teardown", &[], Some(types::I64)),
     // P4 item 17: SR-BF16 authoritative weights
     ("nsl_sr_bf16_enable", &[], None),
     ("nsl_sr_bf16_note_param", &[types::I64, types::I64], None), // (tensor, idx)

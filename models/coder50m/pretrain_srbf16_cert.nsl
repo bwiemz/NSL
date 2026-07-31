@@ -1,0 +1,45 @@
+# models/coder50m/pretrain_srbf16_cert.nsl
+#
+# Item-16 SR-BF16 trajectory-certification arm — 50M on the CSLA + weight-
+# stream residency stack (the composition --param-dtype bf16-sr requires).
+# Differences from pretrain_cert.nsl, all deliberate:
+#   - grad_accumulation=2: bf16-sr requires the FASE-Deferred fused AdamW
+#     window schedule (the sr_bf16_gate fixture trains with the same window);
+#   - no grad_clip: --layerwise-accum refuses two-phase clipping (the global
+#     L2 norm is never materialized on the layerwise schedule);
+#   - model_save at the end: feeds the reload-continuation arm.
+# Fixed-lr AdamW (no scheduler) so curves are comparable across seeds/arms,
+# matching the banked P0 certification convention.
+#
+# Harness markers (exact string rewrites):
+#   CERT_TOKENS_PATH -> the u16 tokens.bin path
+#   CERT_SAVE_PATH   -> the .nslm checkpoint path
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+print("CERT_MODEL_READY")
+
+let tokens = load_mmap("CERT_TOKENS_PATH", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("LOSS_STREAM_END")
+model_save(m, "CERT_SAVE_PATH")
+print("CERT_COMPLETE")

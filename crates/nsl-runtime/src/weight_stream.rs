@@ -1094,6 +1094,31 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
     }
 }
 
+/// Item 3 (`param_plan`): does `tensor_ptr` have a HOST MIRROR — i.e. did it
+/// land in `MIRRORS` specifically?
+///
+/// Deliberately *not* `nsl_weight_stream_is_registered`, which answers the
+/// different question "is this param registered with whichever residency
+/// backend is active" by short-circuiting through zero3/sr-bf16 first. The
+/// plan cross-check needs per-table membership precisely so it can catch a
+/// param landing in the wrong one of the three.
+pub(crate) fn mirror_is_registered(tensor_ptr: i64) -> bool {
+    if tensor_ptr == 0 {
+        return false;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let guard = MIRRORS.lock().unwrap();
+        guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr))
+    }
+    // Host mirrors are a CUDA-only backend: `register` aborts before any
+    // entry can exist in a non-CUDA build.
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
 /// Is `tensor_ptr` a currently-registered streamed parameter? Used by
 /// `nsl_model_save` to materialize an evicted param from its mirror for the
 /// duration of the serialization read (Item 12: mid-loop model_save no

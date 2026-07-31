@@ -70,7 +70,15 @@ fn ladder_row(head_dim: u32) -> Option<(u32, u32)> {
     match head_dim {
         32  => Some((64, 4)),
         64  => Some((64, 4)),
-        128 => Some((64, 4)),
+        // hd=128 previously advertised bq=64, but `tier_b2_effective_bq`
+        // (smem_layout.rs) CLAMPS to 32 for hd in {128, 256} — bq=64 was
+        // unreachable through the emitters, so the planner priced SMEM and
+        // labeled reports for a tiling the kernel never ran, and the
+        // certification doc's hd=128 rows (measured at bq=32) looked like a
+        // coverage gap when they were in fact exactly production. The row
+        // now states what executes. Lifting the clamp (real bq=64 at
+        // hd=128) is emitter work gated on the real-layout SMEM check.
+        128 => Some((32, 4)),
         256 => Some((32, 4)),
         _ => None,
     }
@@ -381,10 +389,13 @@ mod tests {
 
     #[test]
     fn dispatches_at_canonical_hd128_sm80_level2() {
+        // bq/bkv = 32, matching `tier_b2_effective_bq`'s hd>=128 clamp — the
+        // ladder must advertise the tiling the emitters actually run (and
+        // the tiling every banked hd=128 certification row was measured at).
         let result = tier_b2_can_dispatch(&cfg(128, 80, 2));
         assert_eq!(
             result,
-            Ok(BackwardTier::TierB2 { bq: 64, bkv: 64, chunk: 4 })
+            Ok(BackwardTier::TierB2 { bq: 32, bkv: 32, chunk: 4 })
         );
     }
 

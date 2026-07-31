@@ -161,6 +161,18 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "stochastic-rounding bf16 parameter storage engaged",
     ),
     m(
+        "[param-plan]",
+        &[
+            // The compile-time report...
+            "crates/nsl-codegen/src/parameter_plan.rs",
+            // ...and the runtime cross-check that confirms each parameter
+            // landed in the backend the plan named.
+            "crates/nsl-runtime/src/param_plan.rs",
+        ],
+        "the compiled ParameterPlan was verified against the residency tables \
+         (or, with FATAL, a parameter landed in the wrong backend)",
+    ),
+    m(
         "[flash-bwd]",
         &[
             "crates/nsl-runtime/src/flash_attention.rs",
@@ -271,6 +283,7 @@ pub mod tokens {
     pub const FASE_MULTI: &str = "[fase-multi]";
     pub const TAPE_AD: &str = "[tape-ad]";
     pub const SR_BF16: &str = "[sr-bf16]";
+    pub const PARAM_PLAN: &str = "[param-plan]";
     pub const FLASH_BWD: &str = "[flash-bwd]";
     pub const ARENA: &str = "[arena]";
     pub const GPU_MEM: &str = "[gpu-mem]";
@@ -324,6 +337,19 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         test: "crates/nsl-cli/tests/mse_leak_gate.rs",
         asserts: "the tape backward did not hit a FATAL disconnection",
         parts: &[("[tape-ad] FATAL", "crates/nsl-runtime/src/autodiff/backward.rs")],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/param_plan_gate.rs",
+        asserts: "the per-parameter plan listing stayed OFF without \
+                  NSL_PARAM_PLAN_REPORT=1 (the one-line summary still prints)",
+        // The listing's own prefix, which is why it is `param[` and not an
+        // indent: a needle made of whitespace would go always-true the first
+        // time the report is reformatted, and the paired positive assertion
+        // in the same test would keep passing.
+        parts: &[(
+            "[param-plan] param[",
+            "crates/nsl-codegen/src/parameter_plan.rs",
+        )],
     },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/rmsnorm_residual_fold_gate.rs",

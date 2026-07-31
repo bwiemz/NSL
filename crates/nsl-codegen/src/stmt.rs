@@ -7171,6 +7171,14 @@ impl Compiler<'_> {
             /// (GPU f32) drive the prefetch overlap gate's transfer-time
             /// estimate against the target GpuSpec.
             range_pack_elems: Vec<u64>,
+            /// Item 3: the single ParameterPlan — per-param residency,
+            /// storage dtype and sharding — derived once from `ws_streamed`
+            /// plus the storage flags. Both registration sites (the
+            /// pre-forward belt and this window's belt) read their
+            /// `nsl_sr_bf16_note_param` / `nsl_weight_stream_register`
+            /// decisions from it instead of re-spelling the flag conditions,
+            /// and it is baked into the binary for the runtime cross-check.
+            plan: crate::parameter_plan::ParameterPlan,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -9054,16 +9062,93 @@ impl Compiler<'_> {
                 // surface the M36 slab planner (AST, forward-only) never sees.
                 // Pure analysis; no codegen change. Gated by --memory-report or
                 // NSL_ARENA_REPORT=1.
-                if self.compile_options.memory_report
-                    || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1")
-                {
-                    // Transients are runtime-shaped here, so element counts are
-                    // unquantified (|_| None) and the headline is peak
-                    // concurrency (the arena slot count). Stage-2 wires shapes.
+                // Stage-2A shape hints, shared by the arena report and the
+                // CSLA layerwise calibration below. Three SOUND layers, in
+                // priority order:
+                //   1. semantic-typed shapes (annotated Tensor<[..]> values
+                //      — near-empty on today's corpus since model fields are
+                //      typed from annotations only);
+                //   2. initializer-derived model-field dims for trainable
+                //      params (the unique-field-name bridge; covers the
+                //      dominant `randn([64, 128]) * 0.15` idiom);
+                //   3. each sized primal mirrored onto its adjoint
+                //      accumulator (an adjoint has its primal's shape by
+                //      construction) — this is what sizes the backward's
+                //      gradient transients, the surface the arena exists
+                //      to place.
+                // Symbolic/computed dims stay unsized; nothing is guessed.
+                let arena_report_on = self.compile_options.memory_report
+                    || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1");
+                let elem_hints: std::collections::HashMap<crate::wengert::VarId, u64> =
+                    if arena_report_on || csla_active {
+                        let mut hints = crate::profiling::captures::elem_hints_from_var_nodes(
+                            extractor.var_nodes(),
+                            self.type_map,
+                        );
+                        let field_elems = self.models.unique_field_elems();
+                        for (name, vid) in extractor.named_param_var_ids() {
+                            if hints.contains_key(vid) {
+                                continue;
+                            }
+                            let leaf = name.rsplit('.').next().unwrap_or(name);
+                            if let Some(&e) = field_elems.get(leaf) {
+                                hints.insert(*vid, e);
+                            }
+                        }
+                        // Mirror ONLY adjoint accumulators with a UNIQUE
+                        // primal preimage. Add/Sub rules alias the OUTPUT's
+                        // adjoint onto both operands (Identity — no reduce
+                        // op), so a shared accumulator carries the OUTPUT's
+                        // shape and mirroring it would mis-size a broadcast
+                        // operand's grad. Reducing rules emit a dedicated
+                        // reduce_to_shape var per operand, which is exactly
+                        // what a unique preimage certifies.
+                        let mut preimage: std::collections::HashMap<crate::wengert::VarId, u32> =
+                            Default::default();
+                        for a in gen.adjoint_vars_map().values() {
+                            *preimage.entry(*a).or_default() += 1;
+                        }
+                        let mirrored: Vec<(crate::wengert::VarId, u64)> = gen
+                            .adjoint_vars_map()
+                            .iter()
+                            .filter(|(_, a)| preimage.get(a) == Some(&1))
+                            .filter_map(|(p, a)| hints.get(p).map(|&e| (*a, e)))
+                            .collect();
+                        for (a, e) in mirrored {
+                            hints.entry(a).or_insert(e);
+                        }
+                        hints
+                    } else {
+                        Default::default()
+                    };
+
+                if arena_report_on {
+                    // Stage-2A: partially quantified — sized transients get
+                    // real bytes (a lower bound on the full arena), the rest
+                    // still report as concurrency-only. Param-gradient
+                    // accumulators and the loss ESCAPE the tape (read by the
+                    // optimizer emission / callbacks, never by a tape op) —
+                    // without the escape pin, last-use liveness gives them
+                    // point intervals and BFD time-shares every gradient in
+                    // one slot, an illegal aliasing that fakes the savings.
+                    // Stage-2B assigns offsets.
+                    let param_vids: std::collections::HashSet<crate::wengert::VarId> = extractor
+                        .named_param_var_ids()
+                        .iter()
+                        .map(|(_, v)| *v)
+                        .collect();
+                    let mut tape_escaping: std::collections::HashSet<crate::wengert::VarId> = gen
+                        .adjoint_vars_map()
+                        .iter()
+                        .filter(|(p, _)| param_vids.contains(p))
+                        .map(|(_, a)| *a)
+                        .collect();
+                    tape_escaping.insert(effective_primal.output);
                     let arena = crate::transient_arena::analyze(
                         &effective_primal,
                         &adjoint,
-                        &|_| None,
+                        &|v| elem_hints.get(&v).copied(),
+                        &tape_escaping,
                         4, // GPU f32 training dtype width
                     );
                     eprintln!("[arena]\n{}", arena.render_report("  "));
@@ -9111,16 +9196,15 @@ impl Compiler<'_> {
                             .filter(|(name, _)| self.is_trainable_param_name(name))
                             .map(|(n, v)| (n.clone(), *v))
                             .collect();
-                        // Item 11 calibration (review M3 follow-through): wire
-                        // REAL element counts into the layerwise plan — this
-                        // call site passed `|_| None` since D1, leaving every
-                        // ParamInfo::elems empty and the prefetch gate's pack
-                        // pricing blind. Static param shapes resolve here;
-                        // symbolic ones stay None and decline their edges.
-                        let elem_hints = crate::profiling::captures::elem_hints_from_var_nodes(
-                            extractor.var_nodes(),
-                            self.type_map,
-                        );
+                        // Item 11 calibration (review M3 follow-through):
+                        // REAL element counts for the layerwise plan, now
+                        // from the SHARED Stage-2A hint map above — which
+                        // adds the initializer-derived field dims the pure
+                        // semantic map lacked (model fields are typed from
+                        // annotations only, so the old binding here was
+                        // empty for every unannotated real model and the
+                        // prefetch pack pricing stayed blind). Symbolic
+                        // shapes remain None and decline their edges.
                         let vid_by_pname: std::collections::HashMap<&str, crate::wengert::VarId> =
                             csla_trainable
                                 .iter()
@@ -9462,6 +9546,31 @@ impl Compiler<'_> {
                                 }
                             })
                             .collect();
+                        // Item 3: derive the ParameterPlan ONCE, here, where
+                        // the streaming schedule is final. Everything
+                        // downstream (both registration belts, the runtime
+                        // cross-check) reads it rather than re-deriving
+                        // "streamed && bf16sr" / "zero3 ? streamed : {}" from
+                        // the flags — the duplication that let the three
+                        // residency tables be populated from three separate
+                        // spellings of the same intent.
+                        let plan = crate::parameter_plan::ParameterPlan::derive(
+                            &param_paths,
+                            &ws_streamed_sorted,
+                            &crate::parameter_plan::PlanFeatures {
+                                weight_stream: self.compile_options.weight_stream,
+                                param_dtype_bf16sr: self.features.param_dtype_bf16sr,
+                                zero_stage: self.features.zero_stage,
+                            },
+                        )
+                        .map_err(|e| {
+                            CodegenError::new(format!("parameter plan: {e}"))
+                        })?;
+                        if std::env::var("NSL_PARAM_PLAN_REPORT").ok().as_deref()
+                            == Some("1")
+                        {
+                            eprint!("{}", plan.report());
+                        }
                         (
                             Some(CslaPre {
                                 params: csla_params,
@@ -9473,6 +9582,7 @@ impl Compiler<'_> {
                                     global_group,
                                     ws_streamed: ws_streamed_sorted,
                                     range_pack_elems,
+                                    plan,
                                 },
                             }),
                             ws_plan,
@@ -9511,14 +9621,39 @@ impl Compiler<'_> {
                 // without it the first window's forward peak would still be
                 // the full-residency wall the flag exists to remove.
                 if let Some(wsplan) = &ws_fwd_plan {
-                    if self.features.param_dtype_bf16sr {
+                    // Item 3: the plan, not the raw flag, decides who gets an
+                    // SR counter block. Its entries are indexed by param_list
+                    // position, so a schedule index the plan did not mark
+                    // streamed cannot silently pick up (or lose) a storage
+                    // mode here.
+                    let plan = csla_pre
+                        .as_ref()
+                        .map(|p| &p.schedule.plan)
+                        .expect("ws_fwd_plan and csla_pre are built in the same branch");
+                    // The backend is armed iff some parameter's plan entry
+                    // needs it. `srbf16_register` aborts on a parameter that
+                    // reaches it without a prior `note_param`, so "enable is
+                    // on" and "this parameter gets a note" must come from the
+                    // SAME source — spelling one from the flag and the other
+                    // from the plan is exactly the split this item removes.
+                    if plan.needs_sr_backend() {
                         self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
                     }
                     for &idx in &wsplan.register_idxs {
+                        let entry = usize::try_from(idx)
+                            .ok()
+                            .and_then(|u| plan.entries().get(u))
+                            .ok_or_else(|| {
+                                CodegenError::new(format!(
+                                    "parameter plan: forward streaming schedule \
+                                     registers parameter {idx}, which the plan \
+                                     does not cover"
+                                ))
+                            })?;
                         let iv = builder.ins().iconst(cl_types::I64, idx);
                         let pw = self
                             .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                        if self.features.param_dtype_bf16sr {
+                        if entry.needs_sr_note() {
                             self.compile_call_by_name(
                                 builder,
                                 "nsl_sr_bf16_note_param",
@@ -9531,6 +9666,14 @@ impl Compiler<'_> {
                             &[pw],
                         )?;
                     }
+                    // Bake the plan in and confirm the runtime realized it:
+                    // every declared param must be in the ONE residency table
+                    // its plan entry names. `register` dispatches on global
+                    // flags, so a mode that failed to activate would otherwise
+                    // train the wrong storage silently. Emitted here, after
+                    // the first belt, so the check covers the earliest moment
+                    // the tables are populated.
+                    self.emit_param_plan_check(builder, plan, param_list)?;
                 }
                 self.emit_inplace_suppress(builder, true)?;
                 let full_lowered = if let Some(wsplan) = &ws_fwd_plan {
@@ -11556,8 +11699,101 @@ impl Compiler<'_> {
                 zero3: Option<&std::collections::HashSet<i64>>,
                 // P4 item 17: Some(opt_step) under --param-dtype bf16-sr.
                 sr_step: Option<Value>,
+                // Item 8: Some(recipe scalars) admits collapsing this group
+                // into one nsl_fase_fused_adamw_step_multi_idx launch. The
+                // arm below re-checks the envelope booleans as a belt — a
+                // future call site passing scalars alongside an envelope
+                // falls through to the per-param loop instead of
+                // mis-batching.
+                multi: Option<&crate::stmt_fase::FusedAdamwScalars>,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
+                if let Some(sc) = multi {
+                    // bf16-sr must be re-checked here too: the closure cannot
+                    // infer it from sr_step (both call sites thread Some
+                    // unconditionally), and batching under bf16-sr would
+                    // bypass the authoritative-mirror SR step silently — the
+                    // exact divergence class fase_emit_final_step refuses
+                    // loudly.
+                    if muon.is_none()
+                        && zero3.is_none()
+                        && !wrap_precision
+                        && !wrap_offload
+                        && !c.features.param_dtype_bf16sr
+                    {
+                        if idxs.is_empty() {
+                            return Ok(());
+                        }
+                        let il = c.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                        for &i in idxs {
+                            let iv = builder.ins().iconst(cl_types::I64, i);
+                            c.compile_call_by_name(builder, "nsl_list_push", &[il, iv])?;
+                        }
+                        let lr_v = builder.ins().f64const(sc.lr);
+                        let b1_v = builder.ins().f64const(sc.beta1);
+                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+                        let b2_v = builder.ins().f64const(sc.beta2);
+                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+                        let eps_v = builder.ins().f64const(sc.eps);
+                        let wd_v = builder.ins().f64const(sc.wd);
+                        // CSLA has no AdamW parameter-group plumbing (the
+                        // group update has always applied the recipe's flat
+                        // λ) — 0/0 makes the runtime resolve every member to
+                        // `wd`, exactly the per-param loop's behavior.
+                        // mp_scale = 1.0: the layerwise schedule refuses
+                        // grad_clip, so a clip factor can never exist here.
+                        let zero_i = builder.ins().iconst(cl_types::I64, 0);
+                        let one_scale = builder.ins().f64const(1.0);
+                        c.compile_call_by_name(
+                            builder,
+                            "nsl_fase_fused_adamw_step_multi_idx",
+                            &[
+                                param_list,
+                                state_list_1,
+                                state_list_2,
+                                accum_val,
+                                il,
+                                lr_v,
+                                b1_v,
+                                omb1_v,
+                                b2_v,
+                                omb2_v,
+                                eps_v,
+                                wd_v,
+                                bc.0,
+                                bc.1,
+                                zero_i,
+                                zero_i,
+                                one_scale,
+                            ],
+                        )?;
+                        c.compile_call_by_name(builder, "nsl_list_free", &[il])?;
+                        // The CSLA tail, unchanged: free the group's
+                        // accumulators (fresh zeros next window). The
+                        // in-kernel m_partial zero is redundant before a
+                        // free, and harmless.
+                        for &i in idxs {
+                            let iv = builder.ins().iconst(cl_types::I64, i);
+                            let m_partial = c.compile_call_by_name(
+                                builder,
+                                "nsl_list_get",
+                                &[accum_val, iv],
+                            )?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_free",
+                                &[m_partial],
+                            )?;
+                            let z = builder.ins().iconst(cl_types::I64, 0);
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_list_set",
+                                &[accum_val, iv, z],
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                }
                 if zero3.is_some() {
                     for &i in idxs {
                         let iv = builder.ins().iconst(cl_types::I64, i);
@@ -11760,23 +11996,56 @@ impl Compiler<'_> {
             let ws_active = self.compile_options.weight_stream;
             let ws_streamed: std::collections::HashSet<i64> =
                 pending.schedule.ws_streamed.iter().copied().collect();
-            // P3 ZeRO-3: the sharded set == the streamed set (view-rooted /
-            // resident params stay Replicated). Passed into every group
-            // update for the per-layer reduce + owner gating.
-            let zero3_streamed: Option<std::collections::HashSet<i64>> =
-                (self.features.zero_stage == Some(3)).then(|| ws_streamed.clone());
+            // P3 ZeRO-3: the sharded set is READ FROM THE PLAN rather than
+            // re-derived as `(zero_stage == 3).then(|| ws_streamed.clone())`.
+            // The two are equal by construction — `derive` marks exactly the
+            // streamed set Sharded under stage 3 — but sourcing it here is
+            // what makes the plan the single definition of "sharded" instead
+            // of one of two independent spellings that merely agree.
+            let zero3_streamed: Option<std::collections::HashSet<i64>> = self
+                .features
+                .zero_stage
+                .filter(|&s| s == 3)
+                .map(|_| {
+                    pending
+                        .schedule
+                        .plan
+                        .entries()
+                        .iter()
+                        .filter(|e| {
+                            e.sharding == crate::parameter_plan::ParamSharding::Sharded
+                        })
+                        .map(|e| e.idx)
+                        .collect()
+                });
             if ws_active {
                 // P4 item 17: activate the bf16 mirror backend and assign
                 // each streamed param its stable SR counter block BEFORE the
                 // first registration (register aborts on an un-noted param).
-                if self.features.param_dtype_bf16sr {
+                // Armed from the plan, for the same reason as the pre-forward
+                // belt: enable and note must not be spelled from two sources.
+                if pending.schedule.plan.needs_sr_backend() {
                     self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
                 }
                 for &idx in &pending.schedule.ws_streamed {
+                    // Item 3: same plan, same decision as the pre-forward
+                    // belt — the two sites can no longer disagree about who
+                    // gets an SR counter block.
+                    let entry = usize::try_from(idx)
+                        .ok()
+                        .and_then(|u| pending.schedule.plan.entries().get(u))
+                        .ok_or_else(|| {
+                            CodegenError::new(format!(
+                                "parameter plan: window streaming schedule \
+                                 registers parameter {idx}, which the plan does \
+                                 not cover"
+                            ))
+                        })?;
+                    let needs_sr_note = entry.needs_sr_note();
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                    if self.features.param_dtype_bf16sr {
+                    if needs_sr_note {
                         self.compile_call_by_name(
                             builder,
                             "nsl_sr_bf16_note_param",
@@ -11865,6 +12134,36 @@ impl Compiler<'_> {
             } else {
                 None
             };
+
+            // Item 8, CSLA half: when every group member takes the PLAIN
+            // fused AdamW step — no muon routing, no ZeRO-3 owner gates, no
+            // CPDT precision or offload envelope, no bf16-sr mirror step —
+            // each layer-group update collapses into ONE pointer-table
+            // launch over the group's indices
+            // (nsl_fase_fused_adamw_step_multi_idx), bit-identical per
+            // element to the per-param loop (same kernel body, table
+            // addressing). Admission mirrors the FullBuffer multi arm and
+            // shares its kill-switches; the runtime still falls back
+            // per-param for non-uniform members (CPU tensors, tied-θ
+            // aliases), so this admits TRYING to batch, never a numeric
+            // fork.
+            let csla_multi_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
+                if muon_csla_ctx.is_none()
+                    && !wrap_precision
+                    && !self.compile_options.optim_state_offload
+                    && !self.features.param_dtype_bf16sr
+                    && zero3_streamed.is_none()
+                    && two_state
+                    && !self.compile_options.training_reference
+                    && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
+                    && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
+                {
+                    Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
+                        &fase_plan.recipe,
+                    ))
+                } else {
+                    None
+                };
 
             // Global/epilogue accumulators live for the whole window (their
             // grads may come from any range).
@@ -12531,6 +12830,7 @@ impl Compiler<'_> {
                     muon_csla_ctx.as_ref(),
                     zero3_streamed.as_ref(),
                     Some(opt_step),
+                    csla_multi_scalars.as_ref(),
                     &layer_group[ri],
                 )?;
                 // D2b: this layer's θ is final for the window — write back
@@ -12605,6 +12905,7 @@ impl Compiler<'_> {
                 muon_csla_ctx.as_ref(),
                 zero3_streamed.as_ref(),
                 Some(opt_step),
+                csla_multi_scalars.as_ref(),
                 global_group,
             )?;
             // P0.3: close the window-scoped grad-integrity step — every
@@ -14252,6 +14553,12 @@ impl Compiler<'_> {
         // null data pointers.
         if csla_active && self.compile_options.weight_stream {
             self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
+            // Item 3: drop this block's declared plan in the same breath.
+            // The residency tables are cleared above, so leaving the plan
+            // behind would make a SECOND train block in the same program
+            // verify its predecessor's (now unregistered, possibly freed)
+            // pointers and abort on a mismatch that is really just staleness.
+            self.compile_call_by_name(builder, "nsl_param_plan_teardown", &[])?;
         }
 
         // P5 item 19: capture/replay counter banner (anti-vacuity evidence
@@ -15498,6 +15805,61 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         let v = builder.ins().iconst(cl_types::I64, i64::from(on));
         self.compile_call_by_name(builder, "nsl_set_inplace_suppressed", &[v])?;
+        Ok(())
+    }
+
+    /// Item 3: bake the derived [`crate::parameter_plan::ParameterPlan`] into
+    /// the binary and assert the runtime realized it.
+    ///
+    /// `nsl_weight_stream_register` chooses a parameter's residency backend
+    /// from *global* flags (`zero3_active()` > `srbf16_active()` > host
+    /// mirrors) while the plan is per-parameter and compile-time. Nothing
+    /// otherwise connects the two, and a mismatch is silent: a parameter that
+    /// reached `register` before its mode was enabled lands in the host-mirror
+    /// table, trains in f32, and the run exits 0 with a plausible loss curve.
+    /// One `declare` per parameter plus one `verify` closes that gap. Both
+    /// are emitted inside the per-micro-batch registration region, so the
+    /// check re-runs every micro-batch (catching drift, not just the first
+    /// step).
+    ///
+    /// Cost, stated precisely because the two populations differ: the belt
+    /// above emits `2s` calls per micro-batch (a `nsl_list_get` + a
+    /// `register` for each of the `s` STREAMED parameters); this adds
+    /// `2p + 1`, where `p` is ALL parameters — `p >= s`, since residents are
+    /// declared too (see below). Measured as no wall-clock change on the
+    /// CSLA FFN fixture.
+    ///
+    /// EVERY parameter is declared, not only the streamed ones. A resident
+    /// parameter expects "registered with no backend", which is falsifiable
+    /// and worth checking: the streaming schedule deliberately excludes
+    /// view-rooted parameters (a buffered `transpose(w)` caches a pointer
+    /// into θ's storage, so registering θ would free it under the live view —
+    /// the #397 corruption hazard). If such a parameter ever leaks back into
+    /// a registration belt, this is what says so.
+    pub(crate) fn emit_param_plan_check(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        plan: &crate::parameter_plan::ParameterPlan,
+        param_list: Value,
+    ) -> Result<(), CodegenError> {
+        // Nothing is registered anywhere, so there is no cross-check to make
+        // and no call is emitted at all.
+        if !plan.has_streamed() {
+            return Ok(());
+        }
+        // Collected first so `plan` is not borrowed across the &mut self calls.
+        let declares: Vec<(i64, i64)> = plan
+            .entries()
+            .iter()
+            .map(|e| (e.idx, e.runtime_flags()))
+            .collect();
+        for (idx, flags) in declares {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let fv = builder.ins().iconst(cl_types::I64, flags);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_param_plan_declare", &[pw, iv, fv])?;
+        }
+        self.compile_call_by_name(builder, "nsl_param_plan_verify", &[])?;
         Ok(())
     }
 

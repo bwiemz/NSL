@@ -99,6 +99,8 @@ pub use cuda::{
     nsl_test_cuda_h2d, nsl_test_cuda_d2h,
     nsl_test_cuda_jit_log,
 };
+#[doc(hidden)]
+pub use cuda::strided_copy::nsl_test_strided_copy_arm_launches;
 
 // CFTP v7 follow-on (findings 3/11/13): expose the runtime-embedded PTX
 // cast constants and kernel-name C strings to the byte-for-byte parity
@@ -199,6 +201,9 @@ pub mod sr_bf16;
 pub mod csla_stat;
 pub mod grad_integrity;
 pub mod weight_stream;
+/// Item 3: cross-checks the compiled ParameterPlan against the three
+/// residency tables (`weight_stream` / `zero` / `sr_bf16`) at run time.
+pub mod param_plan;
 #[allow(deprecated)]
 pub use awq::{
     nsl_awq_write_sidecar,  // deprecated; kept as the rename shim during transition

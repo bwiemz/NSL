@@ -209,3 +209,117 @@ fn multi_adamw_cpu_bit_identical() {
     assert!(ls_on.len() >= 8, "expected >=8 losses, got {}", ls_on.len());
     assert_eq!(ls_on, ls_off, "CPU fallback arm diverged from the legacy loop");
 }
+
+// ── Item 8, CSLA half ──────────────────────────────────────────────────────
+// The layerwise (`--layerwise-accum`) window updates one layer GROUP at a
+// time; `emit_csla_group_update`'s per-param loop collapses into one
+// `nsl_fase_fused_adamw_step_multi_idx` launch per group under the same
+// admission (and the same kill-switches) as the FullBuffer arm. Contract:
+// bit-identical loss stream + saved model vs the per-param loop, marker
+// anti-vacuity, and envelope configurations (offload) fall back silently.
+
+fn run_csla_ffn_env(tag: &str, gpu: bool, extra_flags: &[&str], envs: &[(&str, &str)]) -> RunOut {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_cslamulti_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("out.nslm");
+    let mut src = std::fs::read_to_string(
+        root.join("crates/nsl-cli/tests/fixtures/csla_layerwise_ffn.nsl"),
+    )
+    .unwrap();
+    src = src.replace(
+        "CSLA_SAVE_PATH",
+        &save.display().to_string().replace('\\', "/"),
+    );
+    if gpu {
+        src = src.replace("# GPU_PLACEMENT", "m.to(cuda)");
+    }
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
+    cmd.args(["run", "--deterministic", "--source-ad", "--checkpoint-blocks", "--layerwise-accum"])
+        .args(extra_flags)
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn nsl run");
+    assert!(
+        out.status.success(),
+        "run failed (tag={tag}):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let model_bytes = std::fs::read(&save).expect("model_save produced no file");
+    // Whole-file hash, not a prefix: divergence anywhere in the saved
+    // θ/m/v payload must fail the comparison.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    model_bytes.hash(&mut h);
+    RunOut {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: format!(
+            "{}\nMODEL_BYTES {:x} len {}",
+            String::from_utf8_lossy(&out.stderr),
+            h.finish(),
+            model_bytes.len()
+        ),
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_multi_adamw_gpu_bit_identical_and_fires() {
+    let on = run_csla_ffn_env("csla_gpu_on", true, &[], &[]);
+    let off = run_csla_ffn_env("csla_gpu_off", true, &[], &[("NSL_FASE_MULTI_STEP", "0")]);
+    let (ls_on, ls_off) = (loss_stream(&on.stdout), loss_stream(&off.stdout));
+    assert!(ls_on.len() >= 10, "expected >=10 losses, got {}", ls_on.len());
+    assert_eq!(
+        ls_on, ls_off,
+        "CSLA group multi-step diverged from the per-param loop (must be bit-identical)"
+    );
+    // The saved models must be byte-identical too (θ/m/v all touched by the
+    // group updates; the stderr carries a byte-prefix dump of each).
+    let model_on = on.stderr.split("MODEL_BYTES").nth(1).unwrap();
+    let model_off = off.stderr.split("MODEL_BYTES").nth(1).unwrap();
+    assert_eq!(model_on, model_off, "saved .nslm diverged between arms");
+    assert!(
+        on.stderr.contains("[fase-multi] batched "),
+        "batch marker missing — CSLA group multi path did not fire:\n{}",
+        on.stderr
+    );
+    assert!(
+        !off.stderr.contains("[fase-multi]"),
+        "kill-switch NSL_FASE_MULTI_STEP=0 did not disable the CSLA group multi path"
+    );
+}
+
+#[test]
+fn csla_multi_adamw_cpu_bit_identical() {
+    // CPU members take the idx variant's per-param fallback arm; the loss
+    // stream and saved model must match the legacy group loop bit-for-bit.
+    let on = run_csla_ffn_env("csla_cpu_on", false, &[], &[]);
+    let off = run_csla_ffn_env("csla_cpu_off", false, &[], &[("NSL_FASE_MULTI_STEP", "0")]);
+    let (ls_on, ls_off) = (loss_stream(&on.stdout), loss_stream(&off.stdout));
+    assert!(ls_on.len() >= 10, "expected >=10 losses, got {}", ls_on.len());
+    assert_eq!(ls_on, ls_off, "CPU CSLA fallback diverged from the legacy loop");
+}
+
+/// Envelope exclusion: plain CSLA × `--optim-state-offload` is a supported
+/// composition whose group update stages host-resident m/v through the
+/// offload envelope — the multi arm must NOT admit it (host moments cannot
+/// ride a device pointer table). The run must succeed with the per-param
+/// loop and never print the batch marker.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_multi_adamw_offload_falls_back_gpu() {
+    let out = run_csla_ffn_env("csla_gpu_offload", true, &["--optim-state-offload"], &[]);
+    let ls = loss_stream(&out.stdout);
+    assert!(ls.len() >= 10, "expected >=10 losses, got {}", ls.len());
+    assert!(
+        !out.stderr.contains("[fase-multi]"),
+        "offload envelope must exclude the CSLA multi arm:\n{}",
+        out.stderr
+    );
+}

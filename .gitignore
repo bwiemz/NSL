@@ -70,3 +70,4 @@ models/*/*_probe.nsl
 kernel_profile.json
 memory_profile.json
 profile.json
+models/benchmarks/srbf16_logs/
