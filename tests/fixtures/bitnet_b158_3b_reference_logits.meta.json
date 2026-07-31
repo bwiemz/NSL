@@ -1,0 +1,483 @@
+{
+  "generator": "gen_ref_logits_hf_v2.py (HF-transformers anchor)",
+  "model_id": "1bitLLM/bitnet_b1_58-3B",
+  "revision": "af89e318d78a70802061246bf037199d2fb97020",
+  "modeling_code": "checkpoint-vendored modeling_bitnet.py + configuration_bitnet.py + utils_quant.py",
+  "python": "3.14.6",
+  "torch": "2.13.0+cu130",
+  "transformers": "5.14.1",
+  "cuda": "13.0",
+  "gpu": "NVIDIA RTX PRO 4500 Blackwell",
+  "device": "cuda",
+  "dtype": "float16",
+  "attn_implementation": "eager",
+  "tf32": {
+    "matmul.allow_tf32": false,
+    "cudnn.allow_tf32": false
+  },
+  "batch_size": 1,
+  "padding": "none",
+  "use_cache": false,
+  "tokenizer": {
+    "requested": "AutoTokenizer.from_pretrained(D, use_fast=False)",
+    "actual_class": "TokenizersBackend",
+    "add_bos_token_attr": false,
+    "note": "transformers 5 hands back a TokenizersBackend even for use_fast=False (tokenizer.json is present) and its add_bos_token attribute reads False, which is MISLEADING: the tokenizer.json post-processor does prepend <s>. Verified equivalent: for all 32 prompts the ids are bit-identical to [1] + sentencepiece(tokenizer.model).encode(prompt), i.e. the exact slow sentencepiece path eval_ppl.py's BitnetTokenizer(use_fast=False) uses.",
+    "sentencepiece_equivalence_verified": true,
+    "sentencepiece_vocab_size": 32000
+  },
+  "bos": {
+    "prepended": true,
+    "bos_token_id": 1,
+    "note": "YES -- BOS (<s>, id 1) IS prepended to every one of the 32 prompts; verified per-prompt, not assumed (see per_prompt[*].first_token_id). tokenizer_config.json sets add_bos_token=true and the tokenizer.json post-processor applies it. LOAD-BEARING: an NSL harness that does NOT prepend BOS will differ in EVERY logit of this artifact.",
+    "prompt0_text": "What is the capital of France?",
+    "prompt0_token_ids": [
+      1,
+      1724,
+      338,
+      278,
+      7483,
+      310,
+      3444,
+      29973
+    ],
+    "prompt0_token_pieces": [
+      "<s>",
+      "\u2581What",
+      "\u2581is",
+      "\u2581the",
+      "\u2581capital",
+      "\u2581of",
+      "\u2581France",
+      "?"
+    ]
+  },
+  "shims": [
+    {
+      "id": 1,
+      "what": "Import BitnetConfig/BitnetForCausalLM from the checkpoint dir BY FILE PATH (PEP-420 namespace package) and instantiate BitnetForCausalLM explicitly.",
+      "why": "config.json says \"model_type\": \"llama\" and the checkpoint has no auto_map, so AutoConfig/AutoModelForCausalLM resolve to the BUILT-IN LlamaForCausalLM. That fallback drops all 52 BitNet-only sub-layernorms (mlp.ffn_layernorm, self_attn.inner_attn_ln) as UNEXPECTED and never instantiates BitLinear, so weight/activation quantization is skipped entirely. v1 of this script hit exactly that and emitted an all-NaN artifact."
+    },
+    {
+      "id": 2,
+      "what": "Patch BitnetAttention._init_rope to unconditionally build the default BitnetRotaryEmbedding(head_dim, max_position_embeddings, base=rope_theta).",
+      "why": "transformers 5 aliases PretrainedConfig.rope_scaling to rope_parameters, which returns {'rope_theta': 10000.0, 'rope_type': 'default'} instead of the None stored in config.json, so modeling_bitnet.py:~272 took the `raise NotImplementedError` branch. Semantics-preserving: config.json really is rope_scaling=null / rope_theta=10000.0, and the patch builds the identical module the None branch built."
+    },
+    {
+      "id": 3,
+      "what": "BitnetForCausalLM._tied_weights_keys = {\"lm_head.weight\": \"model.embed_tokens.weight\"}",
+      "why": "transformers 5 modeling_utils.py:2704 calls _tied_weights_keys.keys(); the vendored 4.x list form [\"lm_head.weight\"] raised AttributeError. The dict is the v5 spelling of the same tie (config tie_word_embeddings=true)."
+    },
+    {
+      "id": 4,
+      "what": "from_pretrained(dtype=torch.float16) instead of torch_dtype=.",
+      "why": "torch_dtype= is deprecated in transformers 5."
+    },
+    {
+      "id": 5,
+      "what": "attn_implementation=\"eager\" forced on both the config and from_pretrained.",
+      "why": "modeling_bitnet's LLAMA_ATTENTION_CLASSES only contains {eager, flash_attention_2}; transformers 5 defaults _attn_implementation to \"sdpa\", which KeyErrors. eager is also the arithmetically reference path."
+    }
+  ],
+  "validation": {
+    "model_class": "BitnetForCausalLM",
+    "missing_keys": [],
+    "unexpected_keys": [],
+    "bitwise_probed_keys": [
+      "model.layers.0.mlp.ffn_layernorm.weight",
+      "model.layers.0.self_attn.inner_attn_ln.weight",
+      "model.layers.0.self_attn.q_proj.weight",
+      "model.layers.0.self_attn.rotary_emb.inv_freq",
+      "model.layers.13.mlp.ffn_layernorm.weight",
+      "model.layers.13.self_attn.inner_attn_ln.weight",
+      "model.layers.13.self_attn.q_proj.weight",
+      "model.layers.13.self_attn.rotary_emb.inv_freq",
+      "model.layers.25.mlp.ffn_layernorm.weight",
+      "model.layers.25.self_attn.inner_attn_ln.weight",
+      "model.layers.25.self_attn.q_proj.weight",
+      "model.layers.25.self_attn.rotary_emb.inv_freq"
+    ],
+    "checkpoint_key_count": 314,
+    "ffn_layernorm_count": 26,
+    "inner_attn_ln_count": 26,
+    "bitlinear_count": 182,
+    "bitlinear_class": "bitnet_b158_3b.utils_quant.BitLinear",
+    "lm_head_class": "Linear",
+    "all_finite": true,
+    "smoke": {
+      "text": "The capital of France is",
+      "ids": [
+        1,
+        450,
+        7483,
+        310,
+        3444,
+        338
+      ],
+      "argmax_id": 3681,
+      "argmax_piece": "\u2581Paris",
+      "expected_argmax_id": 3681
+    }
+  },
+  "prompts": 32,
+  "vocab": 32002,
+  "layout": "prompt-major, final-token-position logits, row-major little-endian FP16, no header",
+  "bytes": 2048128,
+  "sha256": "1065a23b0f94f3dc5ab2af3d2ec8667f04a4677c295fa357c6649714d889b974",
+  "argmax_per_prompt": [
+    13,
+    13,
+    13,
+    13,
+    13,
+    13,
+    13,
+    13,
+    18755,
+    3948,
+    7329,
+    13,
+    3948,
+    29871,
+    1057,
+    263,
+    13,
+    2,
+    13,
+    13,
+    512,
+    13,
+    13,
+    2,
+    29889,
+    29871,
+    29896,
+    29929,
+    13,
+    591,
+    450,
+    338
+  ],
+  "per_prompt": [
+    {
+      "index": 0,
+      "prompt_head": "What is the capital of France?",
+      "n_tokens": 8,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 14.0078125
+    },
+    {
+      "index": 1,
+      "prompt_head": "Who wrote the play Hamlet?",
+      "n_tokens": 8,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.296875
+    },
+    {
+      "index": 2,
+      "prompt_head": "What year did the Apollo 11 mission land on the moon?",
+      "n_tokens": 16,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 14.3203125
+    },
+    {
+      "index": 3,
+      "prompt_head": "What is the chemical symbol for gold?",
+      "n_tokens": 9,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.328125
+    },
+    {
+      "index": 4,
+      "prompt_head": "Name the largest planet in our solar system.",
+      "n_tokens": 10,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.6328125
+    },
+    {
+      "index": 5,
+      "prompt_head": "What language is spoken in Brazil?",
+      "n_tokens": 8,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.9765625
+    },
+    {
+      "index": 6,
+      "prompt_head": "Who painted the Mona Lisa?",
+      "n_tokens": 8,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 12.6796875
+    },
+    {
+      "index": 7,
+      "prompt_head": "What is the longest river in the world?",
+      "n_tokens": 10,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 14.0390625
+    },
+    {
+      "index": 8,
+      "prompt_head": "def fibonacci(n):\n    if n <= 1:\n        return n\n    else:\n",
+      "n_tokens": 27,
+      "first_token_id": 1,
+      "argmax_id": 18755,
+      "argmax_piece": "\u2581fib",
+      "argmax_decoded": "fib",
+      "max_logit": 13.8203125
+    },
+    {
+      "index": 9,
+      "prompt_head": "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr",
+      "n_tokens": 26,
+      "first_token_id": 1,
+      "argmax_id": 3948,
+      "argmax_piece": "\u2581arr",
+      "argmax_decoded": "arr",
+      "max_logit": 14.09375
+    },
+    {
+      "index": 10,
+      "prompt_head": "def factorial(n):\n    if n == 0:\n        return 1\n    return",
+      "n_tokens": 25,
+      "first_token_id": 1,
+      "argmax_id": 7329,
+      "argmax_piece": "\u2581factor",
+      "argmax_decoded": "factor",
+      "max_logit": 14.359375
+    },
+    {
+      "index": 11,
+      "prompt_head": "def is_prime(n):\n    if n < 2:\n        return False\n    for ",
+      "n_tokens": 52,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 18.8125
+    },
+    {
+      "index": 12,
+      "prompt_head": "def merge_sort(arr):\n    if len(arr) <= 1:\n        return ar",
+      "n_tokens": 27,
+      "first_token_id": 1,
+      "argmax_id": 3948,
+      "argmax_piece": "\u2581arr",
+      "argmax_decoded": "arr",
+      "max_logit": 13.953125
+    },
+    {
+      "index": 13,
+      "prompt_head": "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1",
+      "n_tokens": 43,
+      "first_token_id": 1,
+      "argmax_id": 29871,
+      "argmax_piece": "\u2581",
+      "argmax_decoded": "",
+      "max_logit": 16.84375
+    },
+    {
+      "index": 14,
+      "prompt_head": "def reverse_string(s):\n    return s[",
+      "n_tokens": 13,
+      "first_token_id": 1,
+      "argmax_id": 1057,
+      "argmax_piece": "::",
+      "argmax_decoded": "::",
+      "max_logit": 15.734375
+    },
+    {
+      "index": 15,
+      "prompt_head": "def fibonacci_iter(n):\n    a, b = 0, 1\n    for _ in range(n)",
+      "n_tokens": 36,
+      "first_token_id": 1,
+      "argmax_id": 263,
+      "argmax_piece": "\u2581a",
+      "argmax_decoded": "a",
+      "max_logit": 14.7421875
+    },
+    {
+      "index": 16,
+      "prompt_head": "The transformer architecture, introduced by Vaswani et al. i",
+      "n_tokens": 238,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.578125
+    },
+    {
+      "index": 17,
+      "prompt_head": "Quantization in deep neural networks is the process of reduc",
+      "n_tokens": 255,
+      "first_token_id": 1,
+      "argmax_id": 2,
+      "argmax_piece": "</s>",
+      "argmax_decoded": "</s>",
+      "max_logit": 14.6953125
+    },
+    {
+      "index": 18,
+      "prompt_head": "Modern compiler infrastructure for machine learning workload",
+      "n_tokens": 240,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.3828125
+    },
+    {
+      "index": 19,
+      "prompt_head": "The development of large language models has been driven by ",
+      "n_tokens": 216,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.5703125
+    },
+    {
+      "index": 20,
+      "prompt_head": "Attention mechanisms in deep learning compute weighted combi",
+      "n_tokens": 196,
+      "first_token_id": 1,
+      "argmax_id": 512,
+      "argmax_piece": "\u2581In",
+      "argmax_decoded": "In",
+      "max_logit": 13.1328125
+    },
+    {
+      "index": 21,
+      "prompt_head": "Memory allocation in GPU computing involves careful manageme",
+      "n_tokens": 245,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.453125
+    },
+    {
+      "index": 22,
+      "prompt_head": "Open-source language models have transformed the research la",
+      "n_tokens": 251,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 13.6171875
+    },
+    {
+      "index": 23,
+      "prompt_head": "Software engineering for machine learning systems combines t",
+      "n_tokens": 208,
+      "first_token_id": 1,
+      "argmax_id": 2,
+      "argmax_piece": "</s>",
+      "argmax_decoded": "</s>",
+      "max_logit": 15.125
+    },
+    {
+      "index": 24,
+      "prompt_head": "a",
+      "n_tokens": 2,
+      "first_token_id": 1,
+      "argmax_id": 29889,
+      "argmax_piece": ".",
+      "argmax_decoded": ".",
+      "max_logit": 7.484375
+    },
+    {
+      "index": 25,
+      "prompt_head": "The",
+      "n_tokens": 2,
+      "first_token_id": 1,
+      "argmax_id": 29871,
+      "argmax_piece": "\u2581",
+      "argmax_decoded": "",
+      "max_logit": 7.07421875
+    },
+    {
+      "index": 26,
+      "prompt_head": "0",
+      "n_tokens": 3,
+      "first_token_id": 1,
+      "argmax_id": 29896,
+      "argmax_piece": "1",
+      "argmax_decoded": "1",
+      "max_logit": 9.9765625
+    },
+    {
+      "index": 27,
+      "prompt_head": "1",
+      "n_tokens": 3,
+      "first_token_id": 1,
+      "argmax_id": 29929,
+      "argmax_piece": "9",
+      "argmax_decoded": "9",
+      "max_logit": 11.7890625
+    },
+    {
+      "index": 28,
+      "prompt_head": ".",
+      "n_tokens": 2,
+      "first_token_id": 1,
+      "argmax_id": 13,
+      "argmax_piece": "<0x0A>",
+      "argmax_decoded": "\n",
+      "max_logit": 8.7578125
+    },
+    {
+      "index": 29,
+      "prompt_head": ",",
+      "n_tokens": 2,
+      "first_token_id": 1,
+      "argmax_id": 591,
+      "argmax_piece": "\u2581we",
+      "argmax_decoded": "we",
+      "max_logit": 8.25
+    },
+    {
+      "index": 30,
+      "prompt_head": "True or False:",
+      "n_tokens": 5,
+      "first_token_id": 1,
+      "argmax_id": 450,
+      "argmax_piece": "\u2581The",
+      "argmax_decoded": "The",
+      "max_logit": 9.359375
+    },
+    {
+      "index": 31,
+      "prompt_head": "\"Hello, world!\"",
+      "n_tokens": 6,
+      "first_token_id": 1,
+      "argmax_id": 338,
+      "argmax_piece": "\u2581is",
+      "argmax_decoded": "is",
+      "max_logit": 9.59375
+    }
+  ]
+}

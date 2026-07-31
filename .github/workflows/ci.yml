@@ -311,6 +311,10 @@ jobs:
           cargo test -p nsl-codegen --test fused_linear_ce_bf16_ptxas
           cargo test -p nsl-codegen --test fused_linear_ce_fp16_ptxas
           cargo test -p nsl-codegen --test fused_linear_ce_large_vocab_ptxas
+          # M35.1: the BitNet forward emitter shipped producing PTX that ptxas
+          # rejected at essentially every instruction, while its structural
+          # snapshot tests stayed green. This is the gate that catches that.
+          cargo test -p nsl-codegen --test bitnet_gpu_correctness
 
       # Guard the blind spot itself: assert ptxas was actually found, so these
       # gates can never silently degrade to no-ops on a misconfigured runner.
@@ -319,6 +323,9 @@ jobs:
           out=$(cargo test -p nsl-codegen --test fused_linear_ce_bf16_ptxas -- --nocapture 2>&1)
           echo "$out" | grep -q "ptxas accepted" \
             || (echo "::error::ptxas gate skipped -- toolkit not visible to the tests" && exit 1)
+          bn=$(cargo test -p nsl-codegen --test bitnet_gpu_correctness -- --nocapture 2>&1)
+          echo "$bn" | grep -q "ptxas OK" \
+            || (echo "::error::BitNet ptxas gate skipped -- toolkit not visible to the tests" && exit 1)
 
   # Cheap, build-free gate: the version string lives in root Cargo.toml
   # ([workspace.package].version); every hand-duplicated copy (spec header,

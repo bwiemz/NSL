@@ -131,7 +131,12 @@ crates/nsl-cli/tests/zero_spmd_gate.rs	zero_stage1_rank_aware_dp_parity	multipro
 crates/nsl-cli/tests/zero_spmd_gate.rs	zero_stage2_rank_aware_dp_parity	multiproc	spawns 3 nsl processes; ~2 min. Run: cargo test --test zero_spmd_gate -- --ignored
 crates/nsl-cli/tests/zero_spmd_gate.rs	zero_stage2_two_rank_parity_reduce_scatter	multiproc	spawns 3 nsl processes; ~2 min. Run: cargo test --test zero_spmd_gate -- --ignored
 crates/nsl-cli/tests/zero_spmd_gate.rs	zero_stage2_chunked_subgroups_parity	multiproc	spawns 3 nsl processes; ~2 min. Run: cargo test --test zero_spmd_gate -- --ignored
-crates/nsl-codegen/tests/bitnet_logit_match.rs	end_to_end_logit_match_against_hf_b158_3b	broken	requires fetched HF checkpoint + reference logits binary; run `bash scripts/fetch_bitnet_b158_3b.sh` then `cargo test -p nsl-codegen --test bitnet_logit_match -- --ignored` on Linux
+crates/nsl-codegen/tests/bitnet_gpu_correctness.rs	gpu_matches_reference_on_committed_fixtures	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/bitnet_gpu_correctness.rs	rounding_is_half_away_from_zero_not_half_even	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/bitnet_gpu_correctness.rs	gpu_matches_reference_random	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/bitnet_gpu_correctness.rs	output_addressing_does_not_wrap_at_4gib	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/bitnet_gpu_correctness.rs	weight_scale_is_applied_multiplicatively	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/bitnet_logit_match.rs	end_to_end_logit_match_against_hf_b158_3b	broken	requires fetched HF checkpoint; run `bash scripts/fetch_bitnet_b158_3b.sh` then `cargo test -p nsl-codegen --test bitnet_logit_match -- --ignored` on Linux
 crates/nsl-codegen/tests/bitnet_reference.rs	generate_fixtures	generator	fixture generator — run manually when regenerating after deliberate ref-impl changes
 crates/nsl-codegen/tests/cfie_decode_attn_gpu_parity.rs	decode_attn_layer0_slot0_partial_tile_matches_cpu	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_decode_attn_gpu_parity.rs	decode_attn_mid_pool_layer1_slot1_ignores_decoy_regions	gpu	requires CUDA GPU

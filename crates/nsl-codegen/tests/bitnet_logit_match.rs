@@ -3,26 +3,57 @@
 //! Spec: docs/superpowers/specs/2026-05-11-m35-1-bitnet-ternary-design.md §6.6.
 //! Tolerance: FP16 ULP (1e-3 relative) on all 32 reference prompts.
 //!
-//! ## Status: #[ignore]'d pending one remaining Linux follow-on artifact
+//! ## Status: #[ignore]'d — the artifact has LANDED; the comparison has not
 //!
-//! This test is the merge gate for M35.1 inference correctness. It requires:
+//! Both historical Linux follow-ons are now DONE:
 //!
-//! 1. The HF checkpoint cached at `~/.cache/nsl-tests/bitnet_b158_3b/`,
-//!    fetched via `bash scripts/fetch_bitnet_b158_3b.sh` (Linux/macOS only
-//!    per spec §7.3; ~13 GB across 3 safetensors shards).
+//! 1. `weight_scale` wiring through `phases/finalize.rs::emit` (M35.1 PR #172).
 //!
-//! 2. The reference logits binary at
-//!    `tests/fixtures/bitnet_b158_3b_reference_logits.bin` (~2 MB; FP16
-//!    logits captured from bitnet.cpp running the pinned checkpoint on
-//!    the 32 prompt set). bitnet.cpp does not build on Windows MSVC; this
-//!    artifact is deferred to a Linux follow-on (parallel to the AWQ
-//!    PR #134 pattern where merge-gate work was deferred via #[ignore]).
+//! 2. `tests/fixtures/bitnet_b158_3b_reference_logits.bin` — generated on
+//!    Linux and committed. See the sibling `.meta.json` for full provenance.
 //!
-//! The `weight_scale` wiring through `phases/finalize.rs::emit` (the other
-//! historical Linux follow-on) is COMPLETE — the synthesized kernel now
-//! receives the per-tensor BitLinear absmean scale as `.param .f32
-//! weight_scale` and applies it before bias/residual. Only the reference
-//! logits artifact remains.
+//! ### Reference anchor provenance (spec §6.5 deviation — READ THIS)
+//!
+//! Spec §6.5 names bitnet.cpp as the generator. The committed artifact is
+//! instead produced by the **checkpoint's own vendored reference
+//! implementation** (`modeling_bitnet.py` + `utils_quant.BitLinear` at the
+//! pinned revision), via `scripts/gen_bitnet_reference_logits.py`. That is
+//! the same source of record M35.1 already used for the "activations are
+//! absmax, not absmean" correction.
+//!
+//! This was not a convenience substitution — bitnet.cpp WAS built and run as
+//! a cross-check, and its ternary (`i2_s`) path proved to be broken in that
+//! fork: its logits correlate with the HF anchor (mean Pearson 0.498) *below*
+//! the noise floor of comparing two DIFFERENT prompts of the same model
+//! (0.538), and a retrieval test recovers the correct prompt only 3/32 times
+//! versus 3.1% chance. Committing it would have made this gate demand that
+//! NSL reproduce a bug.
+//!
+//! bitnet.cpp's **f32** control path, however, independently corroborates the
+//! HF anchor at 96.9% top-1, Pearson 0.99948, Spearman 0.9926 over the top
+//! 100 logits, with 32/32 prompt retrieval — validating the GGUF conversion,
+//! the 52 BitNet-only sub-layernorms, BOS handling, and the checkpoint pin
+//! through a completely separate C++ implementation.
+//!
+//! ### BOS is load-bearing
+//!
+//! Every prompt is tokenized WITH a prepended `<s>` (id 1), verified per
+//! prompt against the slow sentencepiece path. A harness that omits BOS
+//! differs in EVERY logit.
+//!
+//! ### Why this test is still `#[ignore]`'d
+//!
+//! The artifact is present, but the per-prompt comparison below is still a
+//! TODO, because there is no end-to-end NSL BitNet inference path to compare
+//! against: no runtime ternary dtype, no kernel dispatch, and no
+//! `nsl.quant.ternary` stdlib module. The forward *kernel* is now real and
+//! GPU-validated (see `bitnet_gpu_correctness.rs`), but nothing yet composes
+//! it into a 3B forward pass. Un-ignoring this test is gated on that work,
+//! not on the fixture.
+//!
+//! Running it also requires the HF checkpoint cached at
+//! `~/.cache/nsl-tests/bitnet_b158_3b/` via `bash scripts/fetch_bitnet_b158_3b.sh`
+//! (Linux/macOS only per spec §7.3; ~13 GB across 3 safetensors shards).
 //!
 //! Run with: `cargo test -p nsl-codegen --test bitnet_logit_match -- --ignored`.
 //! On a fresh machine, first run `bash scripts/fetch_bitnet_b158_3b.sh`.
@@ -116,7 +147,7 @@ fn parse_phase1_prompts(text: &str) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "requires fetched HF checkpoint + reference logits binary; \
+#[ignore = "requires fetched HF checkpoint; \
             run `bash scripts/fetch_bitnet_b158_3b.sh` then \
             `cargo test -p nsl-codegen --test bitnet_logit_match -- --ignored` on Linux"]
 fn end_to_end_logit_match_against_hf_b158_3b() {
@@ -171,10 +202,9 @@ fn end_to_end_logit_match_against_hf_b158_3b() {
     let ref_logits_path = repo_root().join("tests/fixtures/bitnet_b158_3b_reference_logits.bin");
     assert!(
         ref_logits_path.exists(),
-        "Reference logits not found at {}. \
-         This artifact requires bitnet.cpp running on the pinned checkpoint; \
-         see spec §6.5 and Task 9 commit message. Bitnet.cpp does not build on \
-         Windows MSVC; the artifact is deferred to a Linux follow-on.",
+        "Reference logits not found at {}. This artifact is COMMITTED; \
+         regenerate with `python scripts/gen_bitnet_reference_logits.py` \
+         (see the sibling .meta.json for provenance).",
         ref_logits_path.display()
     );
     let ref_bytes = std::fs::read(&ref_logits_path).expect("read reference logits");
