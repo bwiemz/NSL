@@ -4,7 +4,17 @@
 //! (mandatory — WGGO/CSHA/FASE planning all live in the source-AD branch of
 //! train-block lowering, and tape AD leaves GPU params frozen), `--wggo greedy`
 //! (the ~500ms planner, within a few percent of `full` per its docs — `full`
-//! remains an explicit opt-in), and `--csha auto`.
+//! remains an explicit opt-in), `--csha auto`, and both backward fusions
+//! (`--fuse-rmsnorm-backward`, `--fuse-wgrad-accum`).
+//!
+//! The two fusions change the ARITHMETIC, not just the schedule, which is why
+//! they are opt-in everywhere else. They belong here because this bundle IS the
+//! "I want pretraining throughput" request: measured +14% tok/s on Coder-50M at
+//! a max relative loss divergence of 1.2e-5 over 24 micro-batches, identical
+//! trend. `--training-reference` strips both back out. Because the bundle sets
+//! them AFTER clap has finished validating, clap can no longer enforce
+//! `--fuse-wgrad-accum`'s conflicts — [`WgradFusionBlockers`] is what replaces
+//! that enforcement, with a matching hard error in `stmt.rs` as the backstop.
 //!
 //! Fill-None semantics: explicit user values always win — the bundle only
 //! fills flags the user left unset, mirroring the `--cpdt-report`→`--cpdt`
@@ -68,9 +78,28 @@ mod stride_tests {
 }
 
 /// Everything `--fuse-wgrad-accum` refuses (`FEATURE_RULES`), as a single
-/// predicate. The bundle must not fill the flag when any of these is present:
-/// clap would then reject an invocation whose conflicting flag the user never
-/// paired with a fusion flag themselves.
+/// predicate.
+///
+/// This list is LOAD-BEARING, and not for the reason it looks like. clap
+/// conflicts `--fuse-wgrad-accum` with all three at parse time — but the bundle
+/// enables the fusion from `expand_pretrain_optimized`, which runs inside
+/// `dispatch()`, long after parsing. Setting a local `bool` here is invisible to
+/// clap, so clap can no longer refuse these compositions: this list is the ONLY
+/// thing standing between `--pretrain-optimized --grad-integrity` and a fused
+/// chain that never materializes a gradient tensor.
+///
+/// What that would cost, if the list ever lapsed:
+///   - `--grad-integrity`: the P0.3 report attests parameters whose gradients it
+///     never observed — a silently-passing integrity gate, exactly the failure
+///     that gate exists to catch.
+///   - `--optim-state-offload`: `m_partial` is host-resident; the fused device
+///     GEMM cannot write it.
+///   - `--layerwise-accum`: pre-sliced tapes defeat the fusion's single-reader
+///     proof.
+///
+/// `stmt.rs` carries a matching hard error (not a `debug_assert!`, which is a
+/// no-op in this workspace's release profile) so a gap here fails loudly at
+/// compile time rather than mis-training silently.
 pub(crate) struct WgradFusionBlockers {
     pub grad_integrity: bool,
     pub optim_state_offload: bool,
@@ -121,8 +150,9 @@ pub(crate) fn expand_pretrain_optimized(
         None => *fuse_wgrad_accum = true,
         Some(flag) => eprintln!(
             "note: --pretrain-optimized bundle partially disabled: \
-             --fuse-wgrad-accum not enabled because {flag} is set (they are \
-             mutually exclusive; the rest of the bundle still applies)"
+             --fuse-wgrad-accum not enabled because {flag} is set ({flag} needs \
+             the raw gradient this fusion never materializes; the rest of the \
+             bundle still applies)"
         ),
     }
     match wggo.as_deref() {

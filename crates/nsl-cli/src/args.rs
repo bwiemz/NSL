@@ -815,7 +815,8 @@ pub(crate) struct BuildArgs {
         /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
         /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
         /// of the ~11-op / 7-op decompositions — fewer launches, no
-        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// [rows, cols] temporaries, less HBM traffic. Requires source-AD
+        /// (`--source-ad`, or `--pretrain-optimized`, which enables this too).
         /// Matches the decomposition to an f32 tolerance (opt-in speedup);
         /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad_mode")]
@@ -826,7 +827,8 @@ pub(crate) struct BuildArgs {
         /// accumulate into ONE cuBLAS call, writing straight into m_partial.
         /// Removes the [B, d, o] raw-gradient temporary — B times the size of
         /// the parameter — and the reduce's full read-back over it.
-        /// Requires --source-ad and a FASE-Deferred plan.
+        /// Requires source-AD (`--source-ad`, or `--pretrain-optimized`, which
+        /// enables this too) and a FASE-Deferred plan.
         ///
         /// NOT bit-exact: products are summed in cuBLAS's order rather than
         /// rounding each per-batch partial first. Measured against an f64
@@ -1355,7 +1357,8 @@ pub(crate) struct RunArgs {
         /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
         /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
         /// of the ~11-op / 7-op decompositions — fewer launches, no
-        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// [rows, cols] temporaries, less HBM traffic. Requires source-AD
+        /// (`--source-ad`, or `--pretrain-optimized`, which enables this too).
         /// Matches the decomposition to an f32 tolerance (opt-in speedup);
         /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad_mode")]
@@ -1366,7 +1369,8 @@ pub(crate) struct RunArgs {
         /// accumulate into ONE cuBLAS call, writing straight into m_partial.
         /// Removes the [B, d, o] raw-gradient temporary — B times the size of
         /// the parameter — and the reduce's full read-back over it.
-        /// Requires --source-ad and a FASE-Deferred plan.
+        /// Requires source-AD (`--source-ad`, or `--pretrain-optimized`, which
+        /// enables this too) and a FASE-Deferred plan.
         ///
         /// NOT bit-exact: products are summed in cuBLAS's order rather than
         /// rounding each per-batch partial first. Measured against an f64
@@ -1550,7 +1554,34 @@ mod source_ad_mode_tests {
     /// every flag (the historical drift failure mode these structs have).
     #[test]
     fn build_declares_the_same_group() {
-        assert!(parses(&["nsl", "build", "--pretrain-optimized", "--fuse-wgrad-accum", "m.nsl"]).is_ok());
-        assert!(parses(&["nsl", "build", "--fuse-wgrad-accum", "m.nsl"]).is_err());
+        for flag in ["--fuse-wgrad-accum", "--fuse-rmsnorm-backward"] {
+            assert!(
+                parses(&["nsl", "build", "--pretrain-optimized", flag, "m.nsl"]).is_ok(),
+                "build: bundle should satisfy source-AD for {flag}"
+            );
+            assert!(
+                parses(&["nsl", "build", flag, "m.nsl"]).is_err(),
+                "build: {flag} must still require source-AD from somewhere"
+            );
+        }
+        assert!(
+            parses(&["nsl", "build", "--source-ad", "--pretrain-optimized", "m.nsl"]).is_ok(),
+            "build: multiple(true) must keep both group members combinable"
+        );
+    }
+
+    /// The group must not become a back door around the bundle's own conflict:
+    /// `--pretrain-optimized` conflicts with `--tape-ad`, and tape-AD cannot
+    /// satisfy a fusion's source-AD requirement.
+    #[test]
+    fn tape_ad_still_cannot_reach_the_fusions() {
+        assert!(
+            parses(&["nsl", "run", "--tape-ad", "--fuse-wgrad-accum", "m.nsl"]).is_err(),
+            "--tape-ad must not satisfy the source-AD requirement"
+        );
+        assert!(
+            parses(&["nsl", "run", "--tape-ad", "--pretrain-optimized", "m.nsl"]).is_err(),
+            "--pretrain-optimized still conflicts with --tape-ad"
+        );
     }
 }

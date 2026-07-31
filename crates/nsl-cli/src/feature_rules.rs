@@ -74,8 +74,11 @@ pub struct FeatureRule {
     /// The flag the rule is about, as the user types it (`--weight-stream`).
     pub flag: &'static str,
     pub kind: RuleKind,
-    /// The partner flag. For clap rules this is the clap FIELD name
-    /// (`weight_stream`), because that is what the attribute contains.
+    /// The partner flag. For clap rules this is whatever the attribute
+    /// contains: usually the clap FIELD name (`weight_stream`), but it may also
+    /// be an ArgGroup id (`source_ad_mode`) when the requirement is satisfiable
+    /// by more than one flag. `flag_to_field` therefore does not necessarily
+    /// map it to a real field.
     pub other: &'static str,
     pub enforcement: Enforcement,
 }
