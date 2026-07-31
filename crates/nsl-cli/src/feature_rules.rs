@@ -129,10 +129,16 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
     clap_rule("--stream-arena", RuleKind::Requires, "weight_stream"),
     clap_rule("--stream-prefetch", RuleKind::Requires, "stream_arena"),
     clap_rule("--stream-async-writeback", RuleKind::Requires, "stream_arena"),
-    clap_rule("--fuse-rmsnorm-backward", RuleKind::Requires, "source_ad"),
+    // `source_ad_mode`, not `source_ad`: the group is satisfied by EITHER
+    // `--source-ad` or `--pretrain-optimized`, because the bundle expands to
+    // include source-AD long after clap has finished validating. Requiring the
+    // bare field rejected `--pretrain-optimized --fuse-wgrad-accum` outright —
+    // the pretraining bundle could not be combined with the two fusions it
+    // exists to complement. See `source_ad_mode_group!` in args.rs.
+    clap_rule("--fuse-rmsnorm-backward", RuleKind::Requires, "source_ad_mode"),
     clap_rule("--pretrain-optimized", RuleKind::Conflicts, "tape_ad"),
     // Item 7 (`--fuse-wgrad-accum`) — added 2026-07-26.
-    clap_rule("--fuse-wgrad-accum", RuleKind::Requires, "source_ad"),
+    clap_rule("--fuse-wgrad-accum", RuleKind::Requires, "source_ad_mode"),
     clap_rule("--fuse-wgrad-accum", RuleKind::Conflicts, "grad_integrity"),
     clap_rule("--fuse-wgrad-accum", RuleKind::Conflicts, "optim_state_offload"),
     clap_rule("--fuse-wgrad-accum", RuleKind::Conflicts, "layerwise_accum"),

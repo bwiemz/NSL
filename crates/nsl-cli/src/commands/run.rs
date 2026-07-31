@@ -100,11 +100,20 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     let mut wggo = wggo;
     let mut csha = csha;
     let mut source_ad = source_ad;
+    let mut fuse_rmsnorm_backward = fuse_rmsnorm_backward;
+    let mut fuse_wgrad_accum = fuse_wgrad_accum;
     crate::meta_flags::expand_pretrain_optimized(
         pretrain_optimized,
         &mut wggo,
         &mut csha,
         &mut source_ad,
+        &mut fuse_rmsnorm_backward,
+        &mut fuse_wgrad_accum,
+        &crate::meta_flags::WgradFusionBlockers {
+            grad_integrity,
+            optim_state_offload,
+            layerwise_accum,
+        },
     );
 
     // Dev Tools paper completion (PDF section 4.3): --health-interval

@@ -67,16 +67,64 @@ mod stride_tests {
     }
 }
 
+/// Everything `--fuse-wgrad-accum` refuses (`FEATURE_RULES`), as a single
+/// predicate. The bundle must not fill the flag when any of these is present:
+/// clap would then reject an invocation whose conflicting flag the user never
+/// paired with a fusion flag themselves.
+pub(crate) struct WgradFusionBlockers {
+    pub grad_integrity: bool,
+    pub optim_state_offload: bool,
+    pub layerwise_accum: bool,
+}
+
+impl WgradFusionBlockers {
+    fn first(&self) -> Option<&'static str> {
+        if self.grad_integrity {
+            Some("--grad-integrity")
+        } else if self.optim_state_offload {
+            Some("--optim-state-offload")
+        } else if self.layerwise_accum {
+            Some("--layerwise-accum")
+        } else {
+            None
+        }
+    }
+}
+
 pub(crate) fn expand_pretrain_optimized(
     pretrain_optimized: bool,
     wggo: &mut Option<String>,
     csha: &mut Option<String>,
     source_ad: &mut bool,
+    fuse_rmsnorm_backward: &mut bool,
+    fuse_wgrad_accum: &mut bool,
+    blockers: &WgradFusionBlockers,
 ) {
     if !pretrain_optimized {
         return;
     }
     *source_ad = true;
+
+    // The two backward fusions. Both are opt-in elsewhere because they change
+    // the ARITHMETIC, not just the schedule — but "pretraining, optimized" is
+    // exactly the context where that trade is intended, `--training-reference`
+    // strips them back out for a reference run, and an explicit flag still
+    // wins. Measured on Coder-50M (batch 4, seq 1024, RTX PRO 4500):
+    // 32,925 -> 36,662 tok/s, max relative loss divergence 1.2e-5 over 24
+    // steps with an identical trend.
+    //
+    // Neither is filled destructively: they are already `false` unless the user
+    // asked for them, so setting them here cannot override an explicit choice
+    // (there is no `--no-fuse-*` to lose).
+    *fuse_rmsnorm_backward = true;
+    match blockers.first() {
+        None => *fuse_wgrad_accum = true,
+        Some(flag) => eprintln!(
+            "note: --pretrain-optimized bundle partially disabled: \
+             --fuse-wgrad-accum not enabled because {flag} is set (they are \
+             mutually exclusive; the rest of the bundle still applies)"
+        ),
+    }
     match wggo.as_deref() {
         None => *wggo = Some("greedy".to_string()),
         Some("off") => eprintln!(
@@ -232,20 +280,40 @@ mod tests {
         assert!(opts.checkpoint_blocks, "no override without the flag");
     }
 
+    /// No blockers: the bundle may fill both fusions.
+    fn clear() -> WgradFusionBlockers {
+        WgradFusionBlockers {
+            grad_integrity: false,
+            optim_state_offload: false,
+            layerwise_accum: false,
+        }
+    }
+
+    /// `(wggo, csha, source_ad, fuse_rmsnorm, fuse_wgrad)` after expansion.
+    fn expand(
+        on: bool,
+        w: Option<&str>,
+        c: Option<&str>,
+        blockers: WgradFusionBlockers,
+    ) -> (Option<String>, Option<String>, bool, bool, bool) {
+        let (mut w, mut c) = (w.map(str::to_string), c.map(str::to_string));
+        let (mut s, mut fr, mut fw) = (false, false, false);
+        expand_pretrain_optimized(on, &mut w, &mut c, &mut s, &mut fr, &mut fw, &blockers);
+        (w, c, s, fr, fw)
+    }
+
     #[test]
     fn fills_unset_members() {
-        let (mut w, mut c, mut s) = (None, None, false);
-        expand_pretrain_optimized(true, &mut w, &mut c, &mut s);
+        let (w, c, s, fr, fw) = expand(true, None, None, clear());
         assert_eq!(w.as_deref(), Some("greedy"));
         assert_eq!(c.as_deref(), Some("auto"));
         assert!(s);
+        assert!(fr && fw, "the bundle enables both backward fusions");
     }
 
     #[test]
     fn explicit_values_win() {
-        let (mut w, mut c, mut s) =
-            (Some("full".to_string()), Some("boundary".to_string()), false);
-        expand_pretrain_optimized(true, &mut w, &mut c, &mut s);
+        let (w, c, s, _, _) = expand(true, Some("full"), Some("boundary"), clear());
         assert_eq!(w.as_deref(), Some("full"));
         assert_eq!(c.as_deref(), Some("boundary"));
         assert!(s, "source_ad is always forced on (planning needs it)");
@@ -253,9 +321,7 @@ mod tests {
 
     #[test]
     fn explicit_off_respected() {
-        let (mut w, mut c, mut s) =
-            (Some("off".to_string()), Some("off".to_string()), false);
-        expand_pretrain_optimized(true, &mut w, &mut c, &mut s);
+        let (w, c, s, _, _) = expand(true, Some("off"), Some("off"), clear());
         assert_eq!(w.as_deref(), Some("off"));
         assert_eq!(c.as_deref(), Some("off"));
         assert!(s);
@@ -263,8 +329,44 @@ mod tests {
 
     #[test]
     fn noop_without_the_flag() {
-        let (mut w, mut c, mut s) = (None, None, false);
-        expand_pretrain_optimized(false, &mut w, &mut c, &mut s);
+        let (w, c, s, fr, fw) = expand(false, None, None, clear());
         assert!(w.is_none() && c.is_none() && !s);
+        assert!(!fr && !fw, "no bundle, no fusions");
+    }
+
+    /// Each blocker suppresses ONLY `--fuse-wgrad-accum`. Filling it anyway
+    /// would make clap reject an invocation whose conflicting flag the user
+    /// never paired with a fusion flag themselves.
+    #[test]
+    fn wgrad_fusion_suppressed_by_each_blocker() {
+        for (name, b) in [
+            ("grad_integrity", WgradFusionBlockers { grad_integrity: true, ..clear() }),
+            ("optim_state_offload", WgradFusionBlockers { optim_state_offload: true, ..clear() }),
+            ("layerwise_accum", WgradFusionBlockers { layerwise_accum: true, ..clear() }),
+        ] {
+            let (_, _, s, fr, fw) = expand(true, None, None, b);
+            assert!(s, "{name}: the rest of the bundle still applies");
+            assert!(fr, "{name}: only the wgrad fusion is blocked");
+            assert!(!fw, "{name}: must not enable a fusion clap will reject");
+        }
+    }
+
+    /// `--training-reference` has to strip what the bundle adds, or a reference
+    /// run silently keeps a non-bit-exact fusion it never asked for.
+    #[test]
+    fn training_reference_strips_the_bundle_fusions() {
+        let (_, _, _, fr, fw) = expand(true, None, None, clear());
+        assert!(fr && fw);
+        let mut opts = nsl_codegen::CompileOptions {
+            training_reference: true,
+            fuse_rmsnorm_backward: fr,
+            fuse_wgrad_accum: fw,
+            ..Default::default()
+        };
+        apply_training_reference(&mut opts);
+        assert!(
+            !opts.fuse_rmsnorm_backward && !opts.fuse_wgrad_accum,
+            "reference mode must disable both bundle-enabled fusions"
+        );
     }
 }
