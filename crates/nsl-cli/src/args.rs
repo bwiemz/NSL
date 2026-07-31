@@ -466,7 +466,25 @@ pub(crate) struct CheckArgs {
         pub(crate) wrga_ablate: Option<String>,
 }
 
+/// Source-AD is in effect if EITHER `--source-ad` is given explicitly or
+/// `--pretrain-optimized` is, since the bundle expands to include it.
+///
+/// Flags that need source-AD must require THIS GROUP, not `source_ad`:
+/// `expand_pretrain_optimized` sets `source_ad` long after clap has finished
+/// validating, so a bare `requires = "source_ad"` rejects
+/// `--pretrain-optimized --fuse-wgrad-accum` even though the bundle would have
+/// satisfied it. `multiple(true)` keeps `--source-ad --pretrain-optimized`
+/// legal (an auto-created group would make them conflict).
+macro_rules! source_ad_mode_group {
+    () => {
+        clap::ArgGroup::new("source_ad_mode")
+            .args(["source_ad", "pretrain_optimized"])
+            .multiple(true)
+    };
+}
+
 #[derive(clap::Args)]
+#[command(group(source_ad_mode_group!()))]
 pub(crate) struct BuildArgs {
         /// Path to the .nsl file
         pub(crate) file: PathBuf,
@@ -543,10 +561,20 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) source_ad: bool,
 
-        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto`
-        /// so one invocation runs WGGO planning and applies CSHA + FASE per the
-        /// plan. Explicit flags win (only unset values are filled); conflicts
-        /// with `--tape-ad` (the planning stack lives in the source-AD path).
+        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto
+        /// --fuse-rmsnorm-backward --fuse-wgrad-accum` so one invocation runs
+        /// WGGO planning, applies CSHA + FASE per the plan, and takes both
+        /// backward fusions. Explicit flags win (only unset values are filled);
+        /// conflicts with `--tape-ad` (the planning stack lives in the
+        /// source-AD path).
+        ///
+        /// The two fusions change the ARITHMETIC, not just the schedule — that
+        /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
+        /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
+        /// steps with an identical trend. `--training-reference` strips them
+        /// back out for a reference run, and `--fuse-wgrad-accum` is skipped
+        /// (with a note) when `--grad-integrity`, `--optim-state-offload` or
+        /// `--layerwise-accum` is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 
@@ -787,10 +815,11 @@ pub(crate) struct BuildArgs {
         /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
         /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
         /// of the ~11-op / 7-op decompositions — fewer launches, no
-        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// [rows, cols] temporaries, less HBM traffic. Requires source-AD
+        /// (`--source-ad`, or `--pretrain-optimized`, which enables this too).
         /// Matches the decomposition to an f32 tolerance (opt-in speedup);
         /// the fused paths are bit-deterministic run-to-run.
-        #[arg(long, requires = "source_ad")]
+        #[arg(long, requires = "source_ad_mode")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
         /// Item 7: collapse the source-AD weight-gradient chain
@@ -798,7 +827,8 @@ pub(crate) struct BuildArgs {
         /// accumulate into ONE cuBLAS call, writing straight into m_partial.
         /// Removes the [B, d, o] raw-gradient temporary — B times the size of
         /// the parameter — and the reduce's full read-back over it.
-        /// Requires --source-ad and a FASE-Deferred plan.
+        /// Requires source-AD (`--source-ad`, or `--pretrain-optimized`, which
+        /// enables this too) and a FASE-Deferred plan.
         ///
         /// NOT bit-exact: products are summed in cuBLAS's order rather than
         /// rounding each per-batch partial first. Measured against an f64
@@ -812,7 +842,7 @@ pub(crate) struct BuildArgs {
         /// (pre-sliced tapes defeat the fusion's single-reader proof).
         #[arg(
             long,
-            requires = "source_ad",
+            requires = "source_ad_mode",
             conflicts_with_all = ["grad_integrity", "optim_state_offload", "layerwise_accum"]
         )]
         pub(crate) fuse_wgrad_accum: bool,
@@ -1020,6 +1050,7 @@ pub(crate) struct BuildArgs {
 }
 
 #[derive(clap::Args)]
+#[command(group(source_ad_mode_group!()))]
 pub(crate) struct RunArgs {
         /// Path to the .nsl file
         pub(crate) file: PathBuf,
@@ -1072,10 +1103,20 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) source_ad: bool,
 
-        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto`
-        /// so one invocation runs WGGO planning and applies CSHA + FASE per the
-        /// plan. Explicit flags win (only unset values are filled); conflicts
-        /// with `--tape-ad` (the planning stack lives in the source-AD path).
+        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto
+        /// --fuse-rmsnorm-backward --fuse-wgrad-accum` so one invocation runs
+        /// WGGO planning, applies CSHA + FASE per the plan, and takes both
+        /// backward fusions. Explicit flags win (only unset values are filled);
+        /// conflicts with `--tape-ad` (the planning stack lives in the
+        /// source-AD path).
+        ///
+        /// The two fusions change the ARITHMETIC, not just the schedule — that
+        /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
+        /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
+        /// steps with an identical trend. `--training-reference` strips them
+        /// back out for a reference run, and `--fuse-wgrad-accum` is skipped
+        /// (with a note) when `--grad-integrity`, `--optim-state-offload` or
+        /// `--layerwise-accum` is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 
@@ -1316,10 +1357,11 @@ pub(crate) struct RunArgs {
         /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
         /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
         /// of the ~11-op / 7-op decompositions — fewer launches, no
-        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// [rows, cols] temporaries, less HBM traffic. Requires source-AD
+        /// (`--source-ad`, or `--pretrain-optimized`, which enables this too).
         /// Matches the decomposition to an f32 tolerance (opt-in speedup);
         /// the fused paths are bit-deterministic run-to-run.
-        #[arg(long, requires = "source_ad")]
+        #[arg(long, requires = "source_ad_mode")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
         /// Item 7: collapse the source-AD weight-gradient chain
@@ -1327,7 +1369,8 @@ pub(crate) struct RunArgs {
         /// accumulate into ONE cuBLAS call, writing straight into m_partial.
         /// Removes the [B, d, o] raw-gradient temporary — B times the size of
         /// the parameter — and the reduce's full read-back over it.
-        /// Requires --source-ad and a FASE-Deferred plan.
+        /// Requires source-AD (`--source-ad`, or `--pretrain-optimized`, which
+        /// enables this too) and a FASE-Deferred plan.
         ///
         /// NOT bit-exact: products are summed in cuBLAS's order rather than
         /// rounding each per-batch partial first. Measured against an f64
@@ -1341,7 +1384,7 @@ pub(crate) struct RunArgs {
         /// (pre-sliced tapes defeat the fusion's single-reader proof).
         #[arg(
             long,
-            requires = "source_ad",
+            requires = "source_ad_mode",
             conflicts_with_all = ["grad_integrity", "optim_state_offload", "layerwise_accum"]
         )]
         pub(crate) fuse_wgrad_accum: bool,
@@ -1451,4 +1494,94 @@ pub(crate) struct RunArgs {
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         pub(crate) args: Vec<String>,
+}
+
+#[cfg(test)]
+mod source_ad_mode_tests {
+    use super::Cli;
+    use clap::Parser as _;
+
+    fn parses(args: &[&str]) -> Result<(), String> {
+        Cli::try_parse_from(args).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// The bug this group exists to fix: `--pretrain-optimized` expands to
+    /// include `--source-ad`, but that happens in `expand_pretrain_optimized`,
+    /// long after clap has validated. While the fusion flags required the bare
+    /// `source_ad` field, the pretraining bundle could not be combined with
+    /// either of them — clap rejected the invocation with "the following
+    /// required arguments were not provided: --source-ad".
+    #[test]
+    fn pretrain_optimized_satisfies_the_fusion_flags_source_ad_requirement() {
+        for extra in [
+            vec!["--fuse-rmsnorm-backward"],
+            vec!["--fuse-wgrad-accum"],
+            vec!["--fuse-rmsnorm-backward", "--fuse-wgrad-accum"],
+        ] {
+            let mut args = vec!["nsl", "run", "--pretrain-optimized"];
+            args.extend(&extra);
+            args.push("m.nsl");
+            assert!(
+                parses(&args).is_ok(),
+                "--pretrain-optimized should satisfy source-AD for {extra:?}, got: {:?}",
+                parses(&args).unwrap_err()
+            );
+        }
+    }
+
+    /// The requirement must still BITE: neither fusion may be used without
+    /// source-AD arriving from somewhere.
+    #[test]
+    fn fusion_flags_still_require_source_ad_from_somewhere() {
+        for flag in ["--fuse-rmsnorm-backward", "--fuse-wgrad-accum"] {
+            let err = parses(&["nsl", "run", flag, "m.nsl"])
+                .expect_err("must be rejected without source-AD");
+            assert!(
+                err.contains("--source-ad") || err.contains("source_ad"),
+                "{flag}: error should name the missing requirement, got: {err}"
+            );
+        }
+    }
+
+    /// `multiple(true)` on the group — an auto-created clap group would make
+    /// these two mutually exclusive, breaking a combination that is legal today.
+    #[test]
+    fn source_ad_and_pretrain_optimized_remain_combinable() {
+        assert!(parses(&["nsl", "run", "--source-ad", "--pretrain-optimized", "m.nsl"]).is_ok());
+    }
+
+    /// The same rules must hold for `nsl build`, which declares its own copy of
+    /// every flag (the historical drift failure mode these structs have).
+    #[test]
+    fn build_declares_the_same_group() {
+        for flag in ["--fuse-wgrad-accum", "--fuse-rmsnorm-backward"] {
+            assert!(
+                parses(&["nsl", "build", "--pretrain-optimized", flag, "m.nsl"]).is_ok(),
+                "build: bundle should satisfy source-AD for {flag}"
+            );
+            assert!(
+                parses(&["nsl", "build", flag, "m.nsl"]).is_err(),
+                "build: {flag} must still require source-AD from somewhere"
+            );
+        }
+        assert!(
+            parses(&["nsl", "build", "--source-ad", "--pretrain-optimized", "m.nsl"]).is_ok(),
+            "build: multiple(true) must keep both group members combinable"
+        );
+    }
+
+    /// The group must not become a back door around the bundle's own conflict:
+    /// `--pretrain-optimized` conflicts with `--tape-ad`, and tape-AD cannot
+    /// satisfy a fusion's source-AD requirement.
+    #[test]
+    fn tape_ad_still_cannot_reach_the_fusions() {
+        assert!(
+            parses(&["nsl", "run", "--tape-ad", "--fuse-wgrad-accum", "m.nsl"]).is_err(),
+            "--tape-ad must not satisfy the source-AD requirement"
+        );
+        assert!(
+            parses(&["nsl", "run", "--tape-ad", "--pretrain-optimized", "m.nsl"]).is_err(),
+            "--pretrain-optimized still conflicts with --tape-ad"
+        );
+    }
 }

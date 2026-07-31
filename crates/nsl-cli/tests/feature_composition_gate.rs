@@ -1030,6 +1030,21 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
     ("cannot determine export format", "diagnostic listing ways to supply a format"),
     ("usage: cpdt_", "usage banner for a dev-tool binary"),
     ("not found at {}. Run cpdt_fixture_generate", "missing-input diagnostic, not a flag composition"),
+    // Unreachable-by-construction backstops, not user-facing refusals. clap
+    // already conflicts `--fuse-wgrad-accum` with both partners at parse time,
+    // and `--pretrain-optimized` (which sets the flag AFTER parsing, where clap
+    // cannot enforce anything) suppresses it for exactly these — see
+    // `WgradFusionBlockers`, gated by `both_dispatchers_pass_the_same_wgrad_blockers`.
+    // These messages fire only if that enforcement develops a gap; registering
+    // them as composition rules would claim a refusal a user can actually reach.
+    (
+        "--fuse-wgrad-accum reached lowering with --grad-integrity",
+        "internal backstop for a state the CLI makes unreachable",
+    ),
+    (
+        "--fuse-wgrad-accum reached lowering with --optim-state-offload",
+        "internal backstop for a state the CLI makes unreachable",
+    ),
 ];
 
 /// Two-flag refusals present in the source but absent from the registry.
@@ -1355,5 +1370,107 @@ fn every_negative_marker_assertion_in_the_suite_is_pinned() {
          exec_markers::NEGATIVE_NEEDLES. Each can silently become \
          always-true:\n{}",
         unpinned.join("\n")
+    );
+}
+
+/// `#[command(group(...))]` declarations must match between the two structs.
+///
+/// `parse_arg_struct` walks `#[arg(...)]` attributes only, so a struct-level
+/// `#[command(group(...))]` is invisible to the drift gate above. That matters
+/// because clap resolves `requires = "<id>"` at RUNTIME: it looks the id up as
+/// an arg, then as a group, and if NEITHER matches it drops the requirement
+/// silently. So losing the group line from one struct would not error — it
+/// would make `nsl build --fuse-wgrad-accum m.nsl` (no source-AD anywhere)
+/// quietly accepted, with the fusion then inert. clap's own debug asserts catch
+/// this in a debug build; nothing catches it in release.
+#[test]
+fn run_and_build_declare_identical_arg_groups() {
+    let src = args_src();
+
+    fn groups_before(src: &str, struct_name: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains(&format!("struct {struct_name} {{")))
+            .unwrap_or_else(|| panic!("{struct_name} not found in args.rs"));
+        // Attributes sit immediately above the struct, after `#[derive(...)]`.
+        let mut found = Vec::new();
+        for l in lines[..at].iter().rev() {
+            let t = l.trim();
+            if t.starts_with("#[command(group(") {
+                found.push(t.to_string());
+            } else if !t.starts_with("#[") && !t.starts_with("///") && !t.is_empty() {
+                break;
+            }
+        }
+        found.sort();
+        found
+    }
+
+    let build = groups_before(&src, "BuildArgs");
+    let run = groups_before(&src, "RunArgs");
+    assert_eq!(
+        build, run,
+        "`nsl run` and `nsl build` declare different #[command(group(...))] sets. \
+         A group present on one and not the other makes a `requires = \"<group>\"` \
+         silently unenforced on the other in release builds."
+    );
+    assert!(
+        !build.is_empty(),
+        "expected at least the source_ad_mode group; if groups moved out of \
+         args.rs this gate has gone vacuous"
+    );
+}
+
+/// The `--pretrain-optimized` blocker list must be identical at both dispatchers.
+///
+/// `meta_flags::expand_pretrain_optimized` is a shared helper precisely so `nsl
+/// run` and `nsl build` cannot drift, but its `WgradFusionBlockers` argument is
+/// constructed separately at each call site. A blocker added to one only would
+/// let `nsl build --pretrain-optimized --<blocker>` keep a fusion that `nsl run`
+/// drops — with both subcommands' own tests still green.
+#[test]
+fn both_dispatchers_pass_the_same_wgrad_blockers() {
+    fn blocker_fields(path: &str) -> Vec<String> {
+        let src = std::fs::read_to_string(repo_root().join(path))
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let at = src
+            .find("WgradFusionBlockers {")
+            .unwrap_or_else(|| panic!("{path} does not construct WgradFusionBlockers"));
+        let body = &src[at + "WgradFusionBlockers {".len()..];
+        let end = body.find('}').expect("unterminated struct literal");
+        let mut fields: Vec<String> = body[..end]
+            .split(',')
+            .map(|f| f.trim().trim_end_matches(':').trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+        fields.sort();
+        fields
+    }
+
+    let run = blocker_fields("crates/nsl-cli/src/commands/run.rs");
+    let build = blocker_fields("crates/nsl-cli/src/commands/build/options.rs");
+    assert_eq!(
+        run, build,
+        "nsl run and nsl build pass different --pretrain-optimized blocker sets"
+    );
+    // Anti-vacuity + completeness: these are exactly `--fuse-wgrad-accum`'s
+    // clap conflicts, which the bundle can no longer rely on clap to enforce.
+    // CLAP-enforced conflicts specifically: those are the ones the bundle
+    // disarms by setting the flag after parsing. The two source-level refusals
+    // are separately safe — the CSLA window replay requires `--layerwise-accum`
+    // (already in this list) and calibration-binary emission compiles with
+    // `CompileOptions::default()`, so neither is reachable through the bundle.
+    let expected: Vec<String> = clap_rules()
+        .filter(|r| r.flag == "--fuse-wgrad-accum" && matches!(r.kind, RuleKind::Conflicts))
+        .map(|r| r.other.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        run, expected,
+        "the bundle's blocker list must equal --fuse-wgrad-accum's clap-enforced \
+         conflicts: the bundle sets the flag after clap has validated, so this \
+         list is the only enforcement left"
     );
 }

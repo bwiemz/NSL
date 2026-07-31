@@ -117,11 +117,20 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
     let mut wggo = wggo;
     let mut csha = csha;
     let mut _source_ad = _source_ad;
+    let mut fuse_rmsnorm_backward = fuse_rmsnorm_backward;
+    let mut fuse_wgrad_accum = fuse_wgrad_accum;
     crate::meta_flags::expand_pretrain_optimized(
         pretrain_optimized,
         &mut wggo,
         &mut csha,
         &mut _source_ad,
+        &mut fuse_rmsnorm_backward,
+        &mut fuse_wgrad_accum,
+        &crate::meta_flags::WgradFusionBlockers {
+            grad_integrity,
+            optim_state_offload,
+            layerwise_accum,
+        },
     );
 
             // M62a: shared_lib flag is threaded through compile_opts and handled

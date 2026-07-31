@@ -10360,12 +10360,48 @@ impl Compiler<'_> {
                         // gradient tensor — emit the accumulating GEMM over
                         // the chain's operands and we are done. There is
                         // nothing to note for grad-integrity and nothing to
-                        // free; both compositions are refused at option
-                        // validation so neither can be silently skipped here.
+                        // free.
+                        //
+                        // These used to be `debug_assert!`s justified by "both
+                        // compositions are refused at option validation". That
+                        // held only while clap was the sole route here: clap
+                        // conflicts `--fuse-wgrad-accum` with both flags at
+                        // PARSE time. `--pretrain-optimized` now enables the
+                        // fusion from `expand_pretrain_optimized`, which runs
+                        // after parsing and is therefore invisible to clap, so
+                        // the bundle's own blocker list is the only thing
+                        // keeping this state unreachable. A debug_assert is a
+                        // no-op in release (the workspace sets no
+                        // `[profile.release] debug-assertions`), so a lapse in
+                        // that list would not abort — it would silently emit a
+                        // grad-integrity report attesting parameters whose
+                        // gradients were never observed, or aim the device GEMM
+                        // at a host-resident `m_partial`. Fail loudly instead;
+                        // this is unreachable by construction, so the cost is
+                        // zero and the value is that it stays that way.
                         let grad_ptr = match grad_src {
                             crate::wengert_lower::ParamGradSource::FusedWgrad { x, g } => {
-                                debug_assert!(!c.compile_options.grad_integrity);
-                                debug_assert!(!off);
+                                if c.compile_options.grad_integrity {
+                                    return Err(CodegenError::new(
+                                        "internal: --fuse-wgrad-accum reached lowering with \
+                                         --grad-integrity active. The fused chain never \
+                                         materializes a gradient tensor, so the integrity gate \
+                                         would attest parameters it never observed. Whatever \
+                                         enabled the fusion (clap conflict, or the \
+                                         --pretrain-optimized blocker list in \
+                                         crates/nsl-cli/src/meta_flags.rs) has a gap.",
+                                    ));
+                                }
+                                if off {
+                                    return Err(CodegenError::new(
+                                        "internal: --fuse-wgrad-accum reached lowering with \
+                                         --optim-state-offload active. `m_partial` is \
+                                         host-resident under offload and the fused device GEMM \
+                                         cannot write it. Whatever enabled the fusion (clap \
+                                         conflict, or the --pretrain-optimized blocker list in \
+                                         crates/nsl-cli/src/meta_flags.rs) has a gap.",
+                                    ));
+                                }
                                 let scale_val = b.ins().f64const(accum_scale);
                                 c.compile_call_by_name(
                                     b,
