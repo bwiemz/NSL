@@ -54,8 +54,23 @@ fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// Run a whole program and return (exit live_blocks, stdout, stderr).
-fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String, String) {
+/// A persistent-pool population that grows with call count is a leak wearing a
+/// cache's tag — and this gate SUBTRACTS persistent blocks, so it would
+/// otherwise vanish from the number the test asserts on.
+fn assert_persistent_stable(tag: &str, p1: i64, p3: i64) {
+    assert_eq!(
+        p1, p3,
+        "[{tag}] persistent blocks grew {p1} -> {p3} over 2 extra calls. \
+         Persistent caches are content-keyed, so their population depends on \
+         the distinct shapes touched, never on the call count. Growth means \
+         either a genuine per-call leak allocated under AllocPool::Persistent, \
+         or a transient block mis-tagged by the allocator's any-pool reuse \
+         fallback."
+    );
+}
+
+/// Run a whole program and return (leak blocks, persistent blocks, stdout, stderr).
+fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, i64, String, String) {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_viewchain_{}_{tag}_{n}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -81,23 +96,45 @@ fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String, String) {
         stdout.contains("DONE"),
         "[{tag}/{n}] fixture did not complete:\n{stdout}"
     );
-    let live_blocks = stderr
-        .lines()
-        .filter_map(|l| {
-            l.split("live_blocks=")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .and_then(|s| s.parse::<i64>().ok())
-        })
-        .last()
+    let field = |key: &str| -> Option<i64> {
+        stderr
+            .lines()
+            .filter_map(|l| {
+                l.split(key)
+                    .nth(1)
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+            .last()
+    };
+    let raw = field("live_blocks=")
         .unwrap_or_else(|| panic!("[{tag}/{n}] no [gpu-mem] live_blocks report:\n{stderr}"));
+    // Subtract the blocks that are never freed BY DESIGN: `AllocPool::Persistent`
+    // holds the content-keyed shape/stride metadata (`upload_meta_i64_cached`) and
+    // the strided-copy planner's offset tables, which are process-lifetime caches.
+    // Counting them made this gate read 3 stranded blocks for a fixture that
+    // strands nothing — the three 16-byte metadata vectors of its one transpose.
+    let persistent = field("persistent_blocks=").unwrap_or_else(|| {
+        panic!("[{tag}/{n}] no persistent_blocks in the [gpu-mem] report — the \
+                runtime and this gate disagree about the report format:\n{stderr}")
+    });
+    // Persistent blocks are CONTENT-keyed caches: their population is a function
+    // of the distinct shapes/strides a fixture touches, never of how many times
+    // it touches them. So the meaningful check is neither an absolute constant
+    // (it differs per fixture) nor `persistent <= raw` (that holds by
+    // construction — both counters key off one immutable per-block tag — and so
+    // could never fire). It is that this number does not GROW with call count.
+    // The callers assert exactly that via `assert_persistent_stable`, which is
+    // what would catch a real per-call strand being mis-tagged persistent by the
+    // allocator's any-pool reuse fallback and then silently subtracted here.
+    let live_blocks = raw - persistent;
     // Remove the scratch dir. `nsl run` links ~140 MB of objects per invocation
     // into the system temp dir, which here is a 31 GB tmpfs — leaving these
     // behind across a full test run fills it, and the resulting
     // "ld: final link failed: No space left on device" surfaces as failures in
     // whatever unrelated suite happens to run next.
     std::fs::remove_dir_all(&tmp).ok();
-    (live_blocks, stdout, stderr)
+    (live_blocks, persistent, stdout, stderr)
 }
 
 /// The real `nsl.nn.gqa` forward, which is where this was found and where the
@@ -130,8 +167,9 @@ let x = full([2, 1024, 512], 1.0).to(cuda)
 
 /// Per-call retained blocks, from two call counts.
 fn blocks_per_call(tag: &str) -> f64 {
-    let (lb1, _, _) = run_fixture(&gqa_src(1), tag, 1);
-    let (lb3, _, _) = run_fixture(&gqa_src(3), tag, 3);
+    let (lb1, p1, _, _) = run_fixture(&gqa_src(1), tag, 1);
+    let (lb3, p3, _, _) = run_fixture(&gqa_src(3), tag, 3);
+    assert_persistent_stable(tag, p1, p3);
     assert!(
         lb1 > 0,
         "[{tag}] the fixture retained no GPU blocks at all — it is not \
@@ -258,8 +296,9 @@ let x = full([2, 256, 512], 1.0).to(cuda)
         s.push_str("print(\"DONE\")\n");
         s
     };
-    let (lb1, _, _) = run_fixture(&src(1), "composition", 1);
-    let (lb3, _, _) = run_fixture(&src(3), "composition", 3);
+    let (lb1, p1, _, _) = run_fixture(&src(1), "composition", 1);
+    let (lb3, p3, _, _) = run_fixture(&src(3), "composition", 3);
+    assert_persistent_stable("composition", p1, p3);
     assert!(
         lb1 > 0,
         "[composition] fixture retained no GPU blocks at all — not \
@@ -320,8 +359,9 @@ fn free_function_chain_links_do_not_strand_per_call() {
         s.push_str("print(\"DONE\")\n");
         s
     };
-    let (lb1, _, stderr1) = run_fixture(&src(1), "freefn", 1);
-    let (lb3, _, _) = run_fixture(&src(3), "freefn", 3);
+    let (lb1, p1, _, stderr1) = run_fixture(&src(1), "freefn", 1);
+    let (lb3, p3, _, _) = run_fixture(&src(3), "freefn", 3);
+    assert_persistent_stable("freefn", p1, p3);
     // Anti-vacuity: prove the fixture exercised the device via the driver
     // allocation counter, NOT via retained blocks. This gate originally
     // required lb1 > 0 — valid while the chains stranded a documented
@@ -357,7 +397,10 @@ fn free_function_chain_links_do_not_strand_per_call() {
         (lb1, lb3),
         (0, 0),
         "the chains now free every link (nested-arg conversion) — a nonzero \
-         count here is a strand returning"
+         count here is a strand returning. NOTE this counts live blocks MINUS \
+         the persistent-pool caches (see run_fixture): a process-lifetime \
+         metadata cache is not a strand, and conflating the two is what made \
+         this assertion read (3, 3) on a fixture that leaks nothing."
     );
 }
 
@@ -455,8 +498,9 @@ fn unknown_typed_receiver_chains_do_not_strand_per_call() {
         s.push_str("print(\"DONE\")\n");
         s
     };
-    let (lb1, _, err1) = run_fixture(&src(1), "unkrecv", 1);
-    let (lb3, _, _) = run_fixture(&src(3), "unkrecv", 3);
+    let (lb1, p1, _, err1) = run_fixture(&src(1), "unkrecv", 1);
+    let (lb3, p3, _, _) = run_fixture(&src(3), "unkrecv", 3);
+    assert_persistent_stable("unkrecv", p1, p3);
     assert!(
         err1.contains("defaulting to tensor dispatch"),
         "fixture no longer exercises the Unknown-receiver dispatch path (no \
@@ -513,7 +557,7 @@ print(a.sum().item())
 print(b.sum().item())
 print("DONE")
 "#;
-    let (_, out, _) = run_fixture(src, "viewnum", 1);
+    let (_, _, out, _) = run_fixture(src, "viewnum", 1);
     let nums: Vec<f64> = out
         .lines()
         .filter_map(|l| l.trim().parse::<f64>().ok())

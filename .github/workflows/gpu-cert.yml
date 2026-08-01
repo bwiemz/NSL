@@ -40,7 +40,7 @@ concurrency:
 jobs:
   run-lane:
     runs-on: [self-hosted, linux, gpu]
-    timeout-minutes: 360
+    timeout-minutes: 450
     steps:
       - uses: actions/checkout@v4
 

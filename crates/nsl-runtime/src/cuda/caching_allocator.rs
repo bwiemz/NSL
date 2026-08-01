@@ -218,6 +218,17 @@ struct Block {
     /// Surface tag captured from the thread-local at hand-out (P0.1
     /// per-surface VRAM accounting). Meaningful only while `allocated`.
     surface: SurfaceTag,
+    /// Pool REQUESTED at hand-out, for accounting only.
+    ///
+    /// Distinct from `pool` above, which identifies the parent SEGMENT and must
+    /// not be reassigned — the free-list search matches on it, and every block
+    /// in a segment shares it. But the best-fit search falls back to any pool
+    /// when the same-pool free list is exhausted, so a Transient request can be
+    /// served out of a Persistent segment. Keying accounting off `pool` would
+    /// then tag a transient block persistent, and `num_allocs_persistent` would
+    /// subtract a real strand — under memory pressure, which is exactly when a
+    /// leak matters. Refreshed on every hand-out, like `surface`.
+    alloc_pool: AllocPool,
 }
 
 /// SAFETY: Block contains raw pointers to GPU memory and sibling Blocks.
@@ -266,6 +277,32 @@ impl PartialOrd for FreeBlockKey {
 #[derive(Clone, Debug, Default)]
 pub struct AllocStats {
     pub num_allocs: usize,
+    /// Of `num_allocs`, how many live blocks were requested while the
+    /// thread-local pool was `AllocPool::Persistent`.
+    ///
+    /// READ THE CAVEAT BEFORE USING THIS TO EXCUSE A LEAK. Persistent is not a
+    /// synonym for "benign cache". It is a mode flip, and codegen leaves it set
+    /// across far more than the caches:
+    ///   - `stmt.rs` sets Persistent before the epoch loop, Transient at the top
+    ///     of each step body, and Persistent again at the END of every step —
+    ///     so the back-edge re-enters the batch loop with it still set, and
+    ///     DataLoader batch tensors are allocated Persistent every step;
+    ///   - epoch callbacks run under it;
+    ///   - there is no reset after the train block, so EVERYTHING afterwards
+    ///     (eval, generation, a second model) is Persistent;
+    ///   - optimizer m/v moments, `m_partial` and grad-accum buffers are
+    ///     Persistent by design, and their teardown walks index lists — a buffer
+    ///     allocated but never pushed leaks param-sized VRAM.
+    /// Genuinely-never-freed caches (`upload_meta_i64_cached`, the strided-copy
+    /// planner's offset tables, CFIE's KV and weight pools) are a SUBSET.
+    ///
+    /// So subtracting this is sound only for a fixture that never enters a train
+    /// block. `view_chain_leak_gate` qualifies (its models are constructed and
+    /// called, never trained) and its absolute pin was reading three 16-byte
+    /// metadata vectors as a strand. Do NOT copy that subtraction into a gate
+    /// whose fixture trains: there it would drive the leak count toward zero by
+    /// construction and the gate would go permanently, silently green.
+    pub num_allocs_persistent: usize,
     pub num_free_blocks: usize,
     pub allocated_bytes: usize,
     pub reserved_bytes: usize,
@@ -483,6 +520,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         block.requested_size = size_bytes;
         block.context = super::inner::current_oom_context();
         block.surface = get_alloc_surface();
+        block.alloc_pool = current_pool;
 
         // Update segment
         let seg = &mut self.segments[block.segment_idx];
@@ -492,6 +530,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.allocated_blocks.insert(block.ptr as usize, block_ptr);
         self.total_allocated += block.size;
         self.stats.num_allocs += 1;
+        if block.alloc_pool == AllocPool::Persistent {
+            self.stats.num_allocs_persistent += 1;
+        }
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.num_cache_hits += 1;
         self.stats.internal_fragmentation_bytes += block.size - size_bytes;
@@ -533,6 +574,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             context: String::new(),
             pool,
             surface: SurfaceTag::Other,
+            alloc_pool: AllocPool::Transient,
         }));
 
         self.segments.push(Segment {
@@ -567,6 +609,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         blk.requested_size = size_bytes;
         blk.context = super::inner::current_oom_context();
         blk.surface = get_alloc_surface();
+        blk.alloc_pool = get_alloc_pool();
 
         let seg = &mut self.segments[seg_idx];
         seg.allocated_count += 1;
@@ -574,6 +617,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.allocated_blocks.insert(base_ptr as usize, block);
         self.total_allocated += blk.size;
         self.stats.num_allocs += 1;
+        if blk.alloc_pool == AllocPool::Persistent {
+            self.stats.num_allocs_persistent += 1;
+        }
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes += blk.size - size_bytes;
         self.stats.cumulative_allocs += 1;
@@ -603,6 +649,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             context: String::new(),
             pool: block.pool,
             surface: SurfaceTag::Other,
+            alloc_pool: AllocPool::Transient,
         }));
 
         // Update next block's prev pointer
@@ -649,6 +696,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let old_size = block.size;
         let old_requested = block.requested_size;
         let old_surface = block.surface;
+        let old_pool = block.alloc_pool;
         if mem_trace_on() {
             eprintln!("[mem-trace] F ptr={:p} size={} ctx={}", ptr, old_size, block.context);
         }
@@ -664,6 +712,10 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
         self.total_allocated -= old_size;
         self.stats.num_allocs -= 1;
+        if old_pool == AllocPool::Persistent {
+            self.stats.num_allocs_persistent =
+                self.stats.num_allocs_persistent.saturating_sub(1);
+        }
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes = self.stats.internal_fragmentation_bytes
             .saturating_sub(old_size - old_requested);
