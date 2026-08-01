@@ -56,6 +56,40 @@
 // is not reintroduced here. Maturity lives in STATUS.md, which is prose
 // because the judgement is a human one.
 
+/// WHICH PHASE of the compiler driver invokes this pass.
+///
+/// Distinct from [`PipelineStage`], and the distinction is the point.
+/// `PipelineStage` says where a pass conceptually *acts* on the IR;
+/// `CompilePhase` says when the driver actually *calls* it. Roadmap item 2
+/// step 1 showed those are not the same axis, and that conflating them
+/// misleads: under `--wggo full` the observed order is
+/// `WGGO(OnWengert) -> FASE(PreExtraction)`, which reads as an inversion until
+/// you know WGGO is invoked from `compile_flash_attention_kernels` — a phase
+/// that runs before any train block is compiled at all.
+///
+/// `compile_entry_returning_plan` is the de-facto pass manager today: a
+/// hand-written sequence of ~20 statements, of which exactly two reach a
+/// registered pass. Naming those phases is what lets the trace check that a
+/// pass ran where the registry says it does and — more importantly — notice
+/// when a pass starts running somewhere new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilePhase {
+    /// `compiler.compile_flash_attention_kernels(...)` — runs BEFORE any
+    /// train block. WGGO's prepass and PCA's packing detection live here.
+    KernelPrepass,
+    /// `compiler.compile_main(...)` -> `compile_train_block_inner`.
+    TrainBlock,
+    /// Slab planning over already-lowered bodies. Declared for
+    /// `MemoryPlanner`; its call sites are not yet wrapped in a scope, so the
+    /// unit test pins it as the sole such pass rather than letting the
+    /// unverified set grow quietly.
+    Lowering,
+    /// NOT part of the compile pipeline: driven by a CLI subcommand or the
+    /// serve path, which terminate the process themselves. Expected to be
+    /// unattributed in the trace.
+    OutOfBand,
+}
+
 /// Where a pass sits relative to source-AD extraction. This is the axis that
 /// actually constrains ordering: a pass that consumes the `WengertList` cannot
 /// run before it exists, and a pass that rewrites the adjoint cannot run
@@ -160,6 +194,9 @@ pub struct PassDescriptor {
     /// is recorded here, which is the drift signal that matters.
     pub cli_flags: &'static [CliFlag],
     pub stage: PipelineStage,
+    /// Which driver phase invokes it. VERIFIED against the execution trace
+    /// for every pass a gate can drive; see `pass_trace_gate.rs`.
+    pub phase: CompilePhase,
     /// Source-level decorators that activate the pass, without the `@`.
     pub decorator_triggers: &'static [&'static str],
     pub wiki: WikiCoverage,
@@ -194,6 +231,7 @@ pub const PASSES: &[PassDescriptor] = &[
         // (~8408-8460) touch the adjoint. Recorded as OnAdjoint because that
         // is the half that REWRITES; the planning half only reads.
         stage: PipelineStage::OnAdjoint,
+        phase: CompilePhase::TrainBlock,
         decorator_triggers: &["checkpoint"],
         wiki: WikiCoverage::Documented("CCR — Compiler-Chosen Recomputation"),
     },
@@ -209,6 +247,7 @@ pub const PASSES: &[PassDescriptor] = &[
         ],
         cli_flags: &[],
         stage: PipelineStage::PreExtraction,
+        phase: CompilePhase::TrainBlock,
         decorator_triggers: &["fase"],
         wiki: WikiCoverage::Documented("FASE — Fused Accumulation + Step + Epilogue"),
     },
@@ -235,6 +274,7 @@ pub const PASSES: &[PassDescriptor] = &[
             f("wggo-weights", BR),
         ],
         stage: PipelineStage::OnWengert,
+        phase: CompilePhase::KernelPrepass,
         decorator_triggers: &["wggo", "wggo_target"],
         wiki: WikiCoverage::Documented("WGGO — Wengert Graph Global Optimization"),
     },
@@ -251,6 +291,7 @@ pub const PASSES: &[PassDescriptor] = &[
         ],
         cli_flags: &[f("csha", CBR), f("csha-report", CBR)],
         stage: PipelineStage::OnWengert,
+        phase: CompilePhase::TrainBlock,
         decorator_triggers: &["csha"],
         wiki: WikiCoverage::Documented("CSHA — Compiler-Synthesized Holistic Attention"),
     },
@@ -275,6 +316,7 @@ pub const PASSES: &[PassDescriptor] = &[
             f("wrga-fold-allocations", B_ONLY),
         ],
         stage: PipelineStage::OnWengert,
+        phase: CompilePhase::TrainBlock,
         decorator_triggers: &["wrga"],
         wiki: WikiCoverage::Documented("WRGA — Wengert-Pruned Roofline-Guided Adaptation"),
     },
@@ -297,6 +339,7 @@ pub const PASSES: &[PassDescriptor] = &[
             f("cpdt-intra-bw", BR),
         ],
         stage: PipelineStage::OnWengert,
+        phase: CompilePhase::TrainBlock,
         decorator_triggers: &["cpdt"],
         wiki: WikiCoverage::Documented("CPDT — Compile-time Parallelism & Distributed Training"),
     },
@@ -318,6 +361,7 @@ pub const PASSES: &[PassDescriptor] = &[
         // this entry said OnWengert, which would have told a reader PCA can
         // consume WGGO's AppliedPlan. It cannot.
         stage: PipelineStage::ModuleScan,
+        phase: CompilePhase::KernelPrepass,
         decorator_triggers: &["pca"],
         wiki: WikiCoverage::Documented("PCA — Packed Causal Attention"),
     },
@@ -334,6 +378,7 @@ pub const PASSES: &[PassDescriptor] = &[
         // `@fused_kl_ce` decorator on a distill block, not by a flag.
         cli_flags: &[f("cpkd-target", C_ONLY), f("cpkd-design-student", C_ONLY)],
         stage: PipelineStage::OnWengert,
+        phase: CompilePhase::TrainBlock,
         decorator_triggers: &["fused_kl_ce"],
         wiki: WikiCoverage::Documented("CPKD — Compiler-Planned Knowledge Distillation"),
     },
@@ -362,6 +407,7 @@ pub const PASSES: &[PassDescriptor] = &[
         // Structured pruning rewrites the model OFFLINE and emits new weights;
         // it is not part of the train-block pass sequence.
         stage: PipelineStage::OutOfBand,
+        phase: CompilePhase::OutOfBand,
         decorator_triggers: &["cep_prune", "cep_search"],
         wiki: WikiCoverage::Documented("CEP — Compilation-Evaluated Pruning"),
     },
@@ -378,6 +424,7 @@ pub const PASSES: &[PassDescriptor] = &[
         cli_flags: &[f("cfie", B_ONLY), f("cfie-report", B_ONLY)],
         // Inference serving, not training — a separate driver entry point.
         stage: PipelineStage::OutOfBand,
+        phase: CompilePhase::OutOfBand,
         decorator_triggers: &["cfie"],
         wiki: WikiCoverage::Documented("CFIE — Compiler-Fused Inference Engine"),
     },
@@ -389,6 +436,7 @@ pub const PASSES: &[PassDescriptor] = &[
         // that is deliberate or an oversight is recorded, not asserted.
         cli_flags: &[f("memory", B_ONLY), f("memory-report", B_ONLY)],
         stage: PipelineStage::Lowering,
+        phase: CompilePhase::Lowering,
         decorator_triggers: &[],
         // Documented under its own top-level heading rather than in the
         // per-pass list, because it does not operate on the WengertList — it

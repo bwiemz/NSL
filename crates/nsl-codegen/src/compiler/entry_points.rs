@@ -601,7 +601,12 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.compile_kernels(&ast.stmts)?;
     crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    }
     // Swallow the result intentionally.  The splice runs BEFORE
     // `compile_call_by_name` inside `ExprKind::Pipe` lowering, so the counter
     // is valid even if a later pipe target's function-call lookup fails — a
@@ -735,7 +740,12 @@ fn compile_returning_plan_impl(
     // call is visible in the code path source-AD traverses during train
     // blocks. Mirrors the rewrite inside `compile_user_functions`.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    }
     compiler.compile_user_functions(&ast.stmts)?;
     // M56 Task 17: compile agent method bodies.
     compiler.compile_agent_methods(&ast.stmts)?;
@@ -783,7 +793,12 @@ fn compile_returning_plan_impl(
         }
     }
 
-    compiler.compile_main(&ast.stmts)?;
+    {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::TrainBlock,
+        );
+        compiler.compile_main(&ast.stmts)?;
+    }
     compiler.compile_pending_lambdas()?;
 
     // M53: Run WCET analysis for @real_time functions (after codegen, before finalize)
@@ -903,12 +918,22 @@ fn compile_with_zk_info_best_effort_plan(
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+        {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
         compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    }
         compiler.compile_user_functions(&ast.stmts)?;
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
+        {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::TrainBlock,
+        );
         compiler.compile_main(&ast.stmts)?;
+    }
         compiler.compile_pending_lambdas()?;
 
         if let Some(budget) = options.vram_budget {
@@ -1079,7 +1104,12 @@ fn compile_standalone_best_effort_plan(
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+        {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
         compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    }
         compiler.compile_user_functions(&ast.stmts)?;
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&ast.stmts)?;
@@ -1139,7 +1169,12 @@ pub fn compile_test(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    }
     compiler.compile_user_functions(&ast.stmts)?;
     // M56 Task 17: compile agent method bodies.
     compiler.compile_agent_methods(&ast.stmts)?;
@@ -1374,7 +1409,12 @@ pub fn compile_module_with_imports_best_effort_plans(
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+        {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
         compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    }
         compiler.compile_user_functions(&ast.stmts)?;
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&ast.stmts)?;
@@ -1527,13 +1567,23 @@ pub fn compile_entry_returning_plan(
     // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
     // so source-AD's inline expansion sees the fused FFI call.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    }
     compiler.compile_user_functions(&ast.stmts)?;
     // M56 Task 17: compile agent method bodies.
     compiler.compile_agent_methods(&ast.stmts)?;
     // M39c: Compile batched function bodies
     compiler.compile_batched_functions(&vmap_results)?;
-    compiler.compile_main(&ast.stmts)?;
+    {
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::TrainBlock,
+        );
+        compiler.compile_main(&ast.stmts)?;
+    }
     compiler.compile_pending_lambdas()?;
     // M53: Run WCET analysis for @real_time functions
     if compiler.compile_options.wcet.enabled {
