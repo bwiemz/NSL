@@ -30,7 +30,7 @@
 #
 # --run honours:
 #   NSL_CERT_TIER      gpu | toolchain | multiproc | isolate | all  (default: gpu)
-#   NSL_CERT_TIMEOUT   PER-GATE timeout in seconds (default: 1800)
+#   NSL_CERT_TIMEOUT   PER-GATE timeout in seconds (default: 1200)
 #   NSL_CERT_BATCH_TIMEOUT
 #                      ceiling for a target's batched run, which carries ALL of
 #                      that target's gates in one `cargo test` (default: 5400).
@@ -275,8 +275,9 @@ preflight() {
 
 cmd_run() {
     local tier="${NSL_CERT_TIER:-gpu}"
-    local timeout_s="${NSL_CERT_TIMEOUT:-1800}"
-    local batch_cap="${NSL_CERT_BATCH_TIMEOUT:-5400}"
+    local t0=0 t1=0   # hoisted: read by the report rows in both run paths
+    local timeout_s="${NSL_CERT_TIMEOUT:-1200}"
+    local batch_cap="${NSL_CERT_BATCH_TIMEOUT:-3600}"
     local out="${NSL_CERT_OUT:-${CARGO_TARGET_DIR:-target}/gpu-cert-report.tsv}"
     mkdir -p "$(dirname "${out}")"
 
@@ -398,7 +399,7 @@ cmd_run() {
         if (( batch_to > batch_cap )); then batch_to="${batch_cap}"; fi
         echo "  [${key}] ${nsel} gate(s) (budget ${batch_to}s)"
         set +e
-        local t0=${SECONDS}
+        t0=${SECONDS}
         timeout --signal=KILL "${batch_to}" \
             cargo test "${args[@]}" "${featarg[@]}" -- \
             --ignored --exact "${selected[@]}" "${threads[@]}" \
@@ -439,7 +440,7 @@ cmd_run() {
         local fn rc1 st1
         for fn in "${selected[@]}"; do
             set +e
-            local t1=${SECONDS}
+            t1=${SECONDS}
             timeout --signal=KILL "${timeout_s}" \
                 cargo test "${args[@]}" "${featarg[@]}" -- \
                 --ignored --exact "${fn}" --test-threads=1 \
