@@ -41,7 +41,15 @@ fn repo_root() -> PathBuf {
 fn nsl_binary() -> PathBuf {
     let root = repo_root();
     for profile in ["release", "debug"] {
-        let p = root.join("target").join(profile).join("nsl");
+        let mut p = root.join("target").join(profile).join("nsl");
+        // Windows names it `nsl.exe`; without this the probe never finds the
+        // binary and every test in this file panics with
+        // "no nsl binary in target/{release,debug} — build it first".
+        // This helper was copied from rope_cache_gate.rs, which HAS the branch —
+        // it was dropped in the copy, which is why only this gate failed.
+        if cfg!(windows) {
+            p.set_extension("exe");
+        }
         if p.exists() {
             return p;
         }
