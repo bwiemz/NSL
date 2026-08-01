@@ -87,6 +87,12 @@ MANIFEST="ci/gpu-cert-manifest.tsv"
 KNOWN_RED="ci/gpu-cert-known-red.txt"
 LONG_ARMS="ci/gpu-cert-long-arms.txt"
 
+# The per-gate default, in ONE place. `--check-long-arms` rejects any override
+# at or below it (such a row is inert, since the budget is a max), and cmd_run
+# uses it as the fallback -- two literals would let the validator bless rows
+# that do nothing.
+DEFAULT_PER_GATE_TIMEOUT=1200
+
 # `cuda` alone is NOT enough to reach every gate. Seven gates live in files
 # whose whole module is cfg'd on an extra feature — `test-hooks` (cuBLAS
 # equivalence, FP8 dispatcher) or `test-helpers` (the fused-LM-CE e2e set,
@@ -312,9 +318,10 @@ cmd_check_long_arms() {
             echo "gpu-cert: ${LONG_ARMS}:${lineno}: '${secs}' is not an integer" >&2
             bad=1; continue
         fi
-        if [[ "${secs}" -le 900 || "${secs}" -gt 7200 ]]; then
-            echo "gpu-cert: ${LONG_ARMS}:${lineno}: ${secs}s outside (900, 7200] — at or below" >&2
-            echo "          900 the default already applies and the row is noise." >&2
+        if [[ "${secs}" -le "${DEFAULT_PER_GATE_TIMEOUT}" || "${secs}" -gt 7200 ]]; then
+            echo "gpu-cert: ${LONG_ARMS}:${lineno}: ${secs}s outside (${DEFAULT_PER_GATE_TIMEOUT}, 7200]." >&2
+            echo "          The budget is a MAX, so at or below ${DEFAULT_PER_GATE_TIMEOUT}s the" >&2
+            echo "          default already wins and the row is inert." >&2
             bad=1; continue
         fi
         if ! grep -qxF "${file}" <<< "${runnable}"; then
@@ -381,7 +388,7 @@ preflight() {
 cmd_run() {
     local tier="${NSL_CERT_TIER:-gpu}"
     local t0=0 t1=0   # hoisted: read by the report rows in both run paths
-    local timeout_s="${NSL_CERT_TIMEOUT:-1200}"
+    local timeout_s="${NSL_CERT_TIMEOUT:-${DEFAULT_PER_GATE_TIMEOUT}}"
     local batch_cap="${NSL_CERT_BATCH_TIMEOUT:-3600}"
     local out="${NSL_CERT_OUT:-${CARGO_TARGET_DIR:-target}/gpu-cert-report.tsv}"
     mkdir -p "$(dirname "${out}")"
@@ -594,7 +601,7 @@ cmd_run() {
                 grep -E "^(thread .* panicked|assertion|error)" "${tmpdir}/one.txt" \
                     | head -3 | sed 's/^/           | /' || true
                 tail -c 200000 "${tmpdir}/one.txt" \
-                    > "${logdir}/$(slugify "${key}")__${fn}.log" 2>/dev/null || true
+                    > "${logdir}/$(slugify "${key}__${fn}").log" 2>/dev/null || true
             fi
         done
     done <<< "${targets}"

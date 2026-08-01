@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `AdvisoryOnly` — with a `DeclineReason` of five structural categories
   (`ModeOff`, `NoCandidates`, `PreconditionViolated`, `FeatureDisabled`,
   `BudgetInfeasible`) carrying `&'static str` detail. All eleven registered
-  passes report at every exit, 46 sites. Under `NSL_PASS_TRACE=1`:
+  passes report at every exit, 36 sites. Under `NSL_PASS_TRACE=1`:
 
   ```text
   [pass-trace] 3 pass(es) ran: WGGO(OnWengert)@KernelPrepass -> FASE(PreExtraction)@TrainBlock -> CSHA(OnWengert)@TrainBlock
@@ -69,7 +69,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `--checkpoint-compress bf16` publishes bf16 halves. Each is kept away from
   these kernels today only by a widen the compiler happens to emit.
 
-- `assert_gpu_f32` at 66 call sites across 46 functions. The two highest-reach
+- `assert_gpu_f32` at 68 call sites across 47 functions in `cuda/mod.rs`,
+  plus 3 more in its callers. The two highest-reach
   are in `shape_ops`: `nsl_tensor_contiguous` and `nsl_tensor_slice` have
   dtype-correct CPU arms that were simply unreachable for a device tensor.
   Falling through to them is not an option — that arm allocates HOST memory, so

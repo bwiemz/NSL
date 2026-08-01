@@ -358,15 +358,21 @@ pub fn plan_with_overrides(
         per_layer.push(applied);
     }
 
-    // Supersedes the inner `plan` call's window count with the per-LAYER one:
-    // on this path FASE emits a mode table and the accumulation loop
-    // dispatches per parameter, so the number of layers whose mode was decided
-    // is the larger and more honest statement of what the pass did. Last-wins
-    // in `record_disposition` is what makes the ordering work — the inner call
-    // has already recorded by the time control reaches here.
-    crate::pass_trace::record_disposition("FASE", PassDisposition::Applied {
-        rewrites: per_layer.len(),
-    });
+    // NO disposition recorded here, deliberately. An earlier version reported
+    // `Applied { rewrites: per_layer.len() }` on the reasoning that the
+    // per-LAYER count is the more honest statement of what this path did. It
+    // was a dead store: the sole production caller (`stmt.rs`, the train-block
+    // driver) records FASE's disposition unconditionally ~70 straight-line
+    // lines later, with no intervening return, so last-wins discarded this
+    // value on every real build. Worse than useless — a maintainer correcting
+    // the number here would see the report not move.
+    //
+    // The driver's count is also the one that is true of the BUILD rather than
+    // of the pass: `stmt.rs` rewrites FASE's mode after `plan` returns (muon,
+    // `--layerwise-accum`), which this function cannot see. Where a driver
+    // genuinely refines a pass's self-report the supersede is GUARDED — see
+    // WGGO's in `stmt.rs`, which only overwrites when `wggo_prune` actually
+    // rewrote the tape.
     p.per_layer_mode = Some(per_layer);
     p.override_diagnostics = diagnostics;
     p

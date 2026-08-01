@@ -146,7 +146,7 @@ not running at all.
 not mechanically gated, so treat them as indicative; `scripts/gpu-cert.sh
 --list | cut -f3 | sort | uniq -c` is the authority.
 
-Every cargo invocation gets `NSL_CERT_TIMEOUT` seconds (default 900). The
+Every gate gets `NSL_CERT_TIMEOUT` seconds (default 1200), and a target's batched run gets that times its gate count, clamped to `NSL_CERT_BATCH_TIMEOUT` (default 3600). The
 handful of gates that drive a full training run to convergence need longer, and
 when the budget is too short the gate is reported `TIMEOUT` — which reads
 identically to a hung kernel. `ci/gpu-cert-long-arms.txt` raises the budget for

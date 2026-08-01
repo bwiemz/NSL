@@ -3258,6 +3258,18 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
     let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
     assert!(tensor.device > 0, "gpu_rotate_half_f32 requires a CUDA tensor");
 
+    // BEFORE the materialization below, not after. This function's contract is
+    // to DEGRADE on a non-f32 tensor, not to refuse one — the arm further down
+    // hands it to the CPU implementation and returns. But `nsl_tensor_contiguous`
+    // now refuses a non-f32 device tensor outright (its GPU arm is
+    // `gpu_strided_copy_f32`), so leaving the check where it was would turn a
+    // NON-CONTIGUOUS bf16 input into an abort while a contiguous one still
+    // degraded — the same input taking two different paths depending on a
+    // stride. Checking first makes the degrade unconditional again.
+    if tensor.dtype != crate::tensor::DTYPE_F32 {
+        return cpu_fallback_rotate_half(tensor_ptr, tensor.device as i32);
+    }
+
     let contiguous_ptr = if tensor.is_contiguous() {
         tensor_ptr
     } else {
@@ -3275,13 +3287,10 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
         last_dim
     );
 
-    if contiguous.dtype != 1 {
-        let result = cpu_fallback_rotate_half(contiguous_ptr, tensor.device as i32);
-        if contiguous_ptr != tensor_ptr {
-            crate::tensor::nsl_tensor_free(contiguous_ptr);
-        }
-        return result;
-    }
+    // Unreachable now that the dtype is checked above the materialization —
+    // kept as a belt, since `contiguous` is a different tensor than `tensor`
+    // and nothing else here re-establishes the invariant locally.
+    debug_assert_eq!(contiguous.dtype, crate::tensor::DTYPE_F32);
 
     let n = contiguous.len as usize;
     let out_data = match inner::try_alloc_managed(n * 4) {
@@ -4293,7 +4302,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     // bullet is exactly the work that would make this dispatch real; until
     // then, saying so is the only honest option.
     assert!(
-        a.dtype == 1 && b.dtype == 1,
+        a.dtype == crate::tensor::DTYPE_F32 && b.dtype == crate::tensor::DTYPE_F32,
         "GPU matmul is f32-only (dtype 1); got dtype {} @ dtype {}. A non-f32 \
          tensor here would be read as f32 — for a 2-byte dtype that is a \
          read of twice the allocation, returning plausible wrong numbers. \
@@ -6350,7 +6359,7 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     // custom-dtype tensor (1 byte/elem) reached via the direct builtin
     // would be read len*4 bytes OOB. Refuse anything but f32 loudly (the
     // CPU arm has the equivalent dtype match).
-    if a.dtype != 1 {
+    if a.dtype != crate::tensor::DTYPE_F32 {
         eprintln!(
             "nsl: muon_orthogonalize GPU path requires an f32 tensor (got dtype {})",
             a.dtype
@@ -8994,11 +9003,28 @@ mod dtype_guard_drift {
         sizes_at_four || names_an_f32_kernel || launches_a_kernel
     }
 
-    /// Accepts either the shared helper or a hand-rolled dtype comparison —
-    /// the point is that the function looked at the dtype at all, not which
-    /// spelling it used.
+    /// Accepts the shared helper, or a hand-rolled comparison against
+    /// `DTYPE_F32` specifically.
+    ///
+    /// NOT any `.dtype ==` / `.dtype !=`. That was the first spelling, and it
+    /// was too loose to do its job: several functions here dispatch on an
+    /// INDEX operand's dtype (`idx.dtype == DTYPE_I32` in
+    /// `gpu_embedding_lookup`, `gpu_gather_f32`,
+    /// `gpu_cross_entropy_backward_f32`), which says nothing at all about
+    /// whether the f32 DATA operand beside it was checked. Under the loose
+    /// rule those three would have satisfied the gate with their real guards
+    /// deleted — i.e. the gate would not have caught the very bug class it
+    /// was added for, in three of the functions this commit fixed.
+    ///
+    /// Requiring `DTYPE_F32` by name also enforces the convention the helper's
+    /// own docs argue for: `dtype == 1` greps as nothing, so a reader auditing
+    /// "which paths assume f32" cannot find it.
+    /// Path-agnostic on purpose: the constant is spelled both `DTYPE_F32` and
+    /// `crate::tensor::DTYPE_F32` in this file, and a matcher that pinned one
+    /// spelling would fail the honest sites while still passing the loose
+    /// ones.
     fn has_dtype_guard(body: &str) -> bool {
-        body.contains("assert_gpu_f32(") || body.contains(".dtype ==") || body.contains(".dtype !=")
+        body.contains("assert_gpu_f32(") || (body.contains(".dtype") && body.contains("DTYPE_F32"))
     }
 
     /// Every f32-assuming function in this module either checks the dtype it

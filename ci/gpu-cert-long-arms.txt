@@ -1,20 +1,32 @@
 # GPU certification lane — per-target timeout overrides
 # ======================================================
 #
-# `scripts/gpu-cert.sh --run` gives every cargo invocation the same budget:
-# NSL_CERT_TIMEOUT, default 900s. That default is right for the ~350 gates
-# that launch a handful of kernels and exit. It is wrong for the handful that
-# train a real model end to end, and when it is wrong the gate is reported
-# TIMEOUT — indistinguishable, in the report, from a kernel that hung.
+# `scripts/gpu-cert.sh --run` gives every gate NSL_CERT_TIMEOUT seconds,
+# default 1200. That is right for the ~350 gates that launch a handful of
+# kernels and exit. It is wrong for the handful that train a real model end to
+# end, and when it is wrong the gate is reported TIMEOUT — indistinguishable,
+# in the report, from a kernel that hung.
 #
-# A gate listed here gets `max(NSL_CERT_TIMEOUT, <seconds>)` instead. MAX, not
-# override: `NSL_CERT_TIMEOUT=3600 ./scripts/gpu-cert.sh --run` for a debugging
-# sweep must never be silently shortened back down by this file.
+# A target listed here gets `max(NSL_CERT_TIMEOUT, <seconds>)` instead. MAX,
+# not override: `NSL_CERT_TIMEOUT=3600 ./scripts/gpu-cert.sh --run` for a
+# debugging sweep must never be silently shortened back down by this file.
 #
-# The budget is PER CARGO INVOCATION, and gpu-cert.sh makes up to two per
-# target: one batched run of all the target's gates, then — only if that run
-# goes red — one run per gate in its own process. Both get the same budget, on
-# the reasoning that a gate slow enough to need it is slow in either mode.
+# WHERE IT ACTUALLY BITES. gpu-cert.sh makes up to two cargo invocations per
+# target: one BATCHED run carrying all of that target's gates, then — only if
+# that run goes red — one run per gate in its own process. The per-gate rerun
+# gets this value directly. The batch gets `per_gate x gate_count`, CLAMPED to
+# NSL_CERT_BATCH_TIMEOUT (default 3600), so raising the per-gate value only
+# moves the batch while the product is still under that ceiling:
+#
+#   long_run_drift_gpu_gate   1 gate   1200 -> 1800   batch 1200 -> 1800   raised
+#   pretrain_loss_decrease..  2 gates  2400 -> 3600   batch 2400 -> 3600   raised
+#   csla_layerwise_gate      11 gates 13200 ->19800   batch 3600 -> 3600   CLAMPED
+#
+# So the csla row buys nothing on the batched run — it is there for the
+# per-gate rerun, which is the pass that has to succeed for the lane to report
+# a real verdict on that target. Raise NSL_CERT_BATCH_TIMEOUT if the batch
+# itself needs more, and check the arithmetic against gpu-cert.yml's
+# timeout-minutes before doing so.
 #
 # WHY A SEPARATE FILE and not a fifth column in ci/gpu-cert-manifest.tsv:
 # `--write-manifest` dumps `inventory()` verbatim and `gpu-gate-inventory.awk`

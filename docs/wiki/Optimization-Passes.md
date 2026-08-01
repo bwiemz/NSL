@@ -83,7 +83,7 @@ Set `NSL_PASS_TRACE=1` on any `nsl build` / `nsl run` / `nsl check` / `nsl test`
 
 ```
 $ NSL_PASS_TRACE=1 nsl run --source-ad --wggo full model.nsl
-[pass-trace] 2 pass(es) ran: WGGO(OnWengert) -> FASE(PreExtraction)
+[pass-trace] 2 pass(es) ran: WGGO(OnWengert)@KernelPrepass -> FASE(PreExtraction)@TrainBlock
 [pass-trace] did not run: CCR, CSHA, WRGA, CPDT, PCA, CPKD, CEP, CFIE, MemoryPlanner
 [pass-trace] WGGO: applied, 3 rewrite(s)
 [pass-trace] FASE: applied, 2 rewrite(s)
@@ -91,7 +91,7 @@ $ NSL_PASS_TRACE=1 nsl run --source-ad --wggo full model.nsl
 
 The three kinds of line, and why each exists:
 
-- **`N pass(es) ran: …`** — the passes actually reached, in first-invocation order, each tagged with its declared `PipelineStage`. A flag that enables a pass which never runs produces a clean, plausible, wrong build; this line is what makes that visible.
+- **`N pass(es) ran: …`** — the passes actually reached, in first-invocation order, each tagged `NAME(DeclaredStage)@ObservedPhase`. A flag that enables a pass which never runs produces a clean, plausible, wrong build; this line is what makes that visible. The `@Phase` half is the driver scope the pass was reached from, and is `unattributed` for a pass that ran outside every declared scope — which is how a NEW driver announces itself instead of being discovered months later.
 - **`did not run: …`** — the registered passes that were never reached. The absence is the interesting half: a report showing only what happened would make "nothing ran" indistinguishable from "the trace is broken".
 - **`NAME: <disposition>`** — one line per pass that reported an *effect*. `applied, N rewrite(s)`; `declined, <category> - <detail>` where the category is one of `mode off` / `no candidates` / `precondition violated` / `feature disabled` / `budget infeasible`; or `advisory only` for a pass that produces a report nothing consumes (CEP's architecture search, CPKD's build report).
 
