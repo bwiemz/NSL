@@ -5653,6 +5653,27 @@ impl Compiler<'_> {
             );
         }
         let fase_plan = fase_plan;
+        // Item 3: re-record FASE's disposition AFTER the driver's own rewrite
+        // above. `fase::plan` is accurate about the pass and can be wrong
+        // about the build: the muon x --layerwise-accum arm overwrites `mode`
+        // and `rationale` here, and a `Passthrough` plan flipped to `Deferred`
+        // would otherwise leave the report saying "declined, mode off" for a
+        // build in which FASE is active. Last-wins in `record_disposition` is
+        // what makes the later, build-truthful statement the one that shows.
+        //
+        // The disposition payload deliberately carries no mode string
+        // (`&'static str` only, and `rationale` is a runtime `String`), so the
+        // phase count is what is reported; the mode itself stays visible in
+        // the existing `[fase]` diagnostics.
+        if fase_plan.mode == crate::fase::FaseMode::Passthrough {
+            crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::ModeOff,
+            });
+        } else {
+            crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Applied {
+                rewrites: fase_plan.backward_phases.len(),
+            });
+        }
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── CSLA Stage-2 (`--layerwise-accum`) admission ────────────────
@@ -7615,6 +7636,12 @@ impl Compiler<'_> {
                     // item exists to unpick. Recorded at the point the plan is
                     // produced, which is what "CPKD ran" means today.
                     crate::pass_trace::record("CPKD");
+                    // AdvisoryOnly, and not a hedge: the plan built here is
+                    // consumed by exactly one thing, `render_report` (see
+                    // `compile_distill_block`). The fusion it reports on was
+                    // performed by the `@fused_kl_ce` decorator during
+                    // extraction, not by this code — CPKD rewrites nothing.
+                    crate::pass_trace::record_disposition("CPKD", crate::pass_trace::PassDisposition::AdvisoryOnly);
                     self.last_cpkd_plan = Some(crate::cpkd::CpkdPlan {
                         teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
                         student_name: self.resolve_sym(distill.student_sym).to_string(),
@@ -8214,6 +8241,24 @@ impl Compiler<'_> {
                         return Err(crate::error::CodegenError::new(
                             "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
                         ));
+                    }
+                    // Item 3: supersede WGGO's own layer-decision count with
+                    // the number of layers whose ops this prune actually
+                    // deleted. This is the ONLY place WGGO mutates the tape,
+                    // so it is the honest answer to "what did WGGO do".
+                    //
+                    // Guarded on non-empty on purpose. A plan with no `Prune`
+                    // decisions reaches here with zero rewrites, and recording
+                    // that would erase the true statement that N per-layer
+                    // decisions were applied (which CSHA / WRGA / FASE then
+                    // read) in exchange for a zero that is already implied by
+                    // the absence of `[prune]` lines. The refusal path above
+                    // needs no disposition: it returns a `CodegenError`, so
+                    // there is no build left to report on.
+                    if !wggo_prune_result.rewrites.is_empty() {
+                        crate::pass_trace::record_disposition("WGGO", crate::pass_trace::PassDisposition::Applied {
+                            rewrites: wggo_prune_result.rewrites.len(),
+                        });
                     }
                     // Success path: spec §6.1 format per rewrite.
                     // layer_index is looked up from applied_plan.layers by name match

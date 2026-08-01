@@ -19,6 +19,8 @@
 
 use serde::Serialize;
 
+use crate::pass_trace::{DeclineReason, PassDisposition};
+
 /// Supported optimizer algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum FaseOptimizer {
@@ -200,6 +202,11 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
 
     // Accumulation count of 1 → no rewrite.
     if accumulation == 1 {
+        // `Passthrough` IS the off state: there is no separate FASE flag, the
+        // accumulation count in the train block is the switch.
+        crate::pass_trace::record_disposition("FASE", PassDisposition::Declined {
+            reason: DeclineReason::ModeOff,
+        });
         return FasePlan {
             mode: FaseMode::Passthrough,
             accumulation: 1,
@@ -274,6 +281,14 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         }
     }
 
+    // One rewrite per micro-batch in the accumulation window: each phase is a
+    // distinct backward the caller must emit (`AccumulateOnly` x n-1 plus a
+    // `FinalFused` / `FinalTwoPhase`), and that vector IS what stmt.rs
+    // consumes. `mode` is the other half of the answer and the payload cannot
+    // carry it — see the note at the driver's post-mutation record in stmt.rs.
+    crate::pass_trace::record_disposition("FASE", PassDisposition::Applied {
+        rewrites: phases.len(),
+    });
     FasePlan {
         mode,
         accumulation,
@@ -343,6 +358,21 @@ pub fn plan_with_overrides(
         per_layer.push(applied);
     }
 
+    // NO disposition recorded here, deliberately. An earlier version reported
+    // `Applied { rewrites: per_layer.len() }` on the reasoning that the
+    // per-LAYER count is the more honest statement of what this path did. It
+    // was a dead store: the sole production caller (`stmt.rs`, the train-block
+    // driver) records FASE's disposition unconditionally ~70 straight-line
+    // lines later, with no intervening return, so last-wins discarded this
+    // value on every real build. Worse than useless — a maintainer correcting
+    // the number here would see the report not move.
+    //
+    // The driver's count is also the one that is true of the BUILD rather than
+    // of the pass: `stmt.rs` rewrites FASE's mode after `plan` returns (muon,
+    // `--layerwise-accum`), which this function cannot see. Where a driver
+    // genuinely refines a pass's self-report the supersede is GUARDED — see
+    // WGGO's in `stmt.rs`, which only overwrites when `wggo_prune` actually
+    // rewrote the tape.
     p.per_layer_mode = Some(per_layer);
     p.override_diagnostics = diagnostics;
     p

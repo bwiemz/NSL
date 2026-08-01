@@ -1,6 +1,6 @@
 # GPU certification lane — the hardware half of roadmap item 19.
 #
-# ci.yml's `gpu-gate-inventory` job keeps the 380-gate manifest from rotting
+# ci.yml's `gpu-gate-inventory` job keeps the gate manifest from rotting
 # and `cuda-feature` proves PTX assembles, but neither executes a kernel.
 # This workflow runs `scripts/gpu-cert.sh --run` on a real device: the
 # self-hosted runner registered on the RTX PRO 4500 Blackwell box (sm_120).
@@ -40,6 +40,14 @@ concurrency:
 jobs:
   run-lane:
     runs-on: [self-hosted, linux, gpu]
+    # Worst case is batch_cap + gates x per_gate, per target. The largest
+    # target carries 17 gates at the 1200s per-gate default; the three named
+    # in ci/gpu-cert-long-arms.txt get 1800s instead, and the largest of those
+    # (csla_layerwise_gate, 11 gates) is 3600 + 11*1800 = 6.5h on its own. That
+    # only materialises if the lane is comprehensively broken, but a runner
+    # killed mid-sweep uploads a TRUNCATED report and never reaches the
+    # reconcile check that exists to catch exactly that — so the cap has to
+    # clear the arithmetic, not the typical run.
     timeout-minutes: 450
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +55,17 @@ jobs:
       - name: Preflight — device, disk, stale-scratch sweep
         run: |
           set -euo pipefail
+          mkdir -p cert-artifacts
+          # Tee'd: a lane that refuses at the preflight stage leaves nothing in
+          # the artifact otherwise, and "why did the nightly do nothing" is
+          # then unanswerable once the Actions log expires.
+          exec > >(tee -a cert-artifacts/preflight.txt) 2>&1
           nvidia-smi -L
+          # ptxas must be reachable from a NON-LOGIN shell: gpu-cert.sh REFUSES
+          # outright without it on the toolchain tier, and the runner service
+          # does not source ~/.cargo/env or a login profile.
+          command -v ptxas || echo "WARNING: ptxas not on PATH for this step"
+          command -v cargo || echo "WARNING: cargo not on PATH for this step"
           df -h /tmp
           # /tmp is a 31G tmpfs and `nsl run` leaves ~130MB scratch dirs
           # nothing cleans; a full tmpfs surfaces as linker "No space left"
@@ -91,6 +109,12 @@ jobs:
           /opt/cuda/bin/ptxas --version > cert-artifacts/ptxas-version.txt || true
           rustc --version > cert-artifacts/rustc-version.txt || true
           git rev-parse HEAD > cert-artifacts/commit.txt
+          # The three inputs that decide what a report row MEANS. Without them
+          # a 90-day-old artifact is only interpretable by checking out
+          # commit.txt — and a row's status depends on the known-red list and
+          # the timeout in force when it ran, not just on the code.
+          cp ci/gpu-cert-manifest.tsv ci/gpu-cert-known-red.txt \
+             ci/gpu-cert-long-arms.txt cert-artifacts/ || true
 
       - name: Upload certification artifacts
         if: always()

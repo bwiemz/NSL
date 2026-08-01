@@ -16,6 +16,7 @@ use crate::cpdt_joint::{solve as solve_joint, JointConfig, JointInput, JointPlan
 use crate::cpdt_optim::{emit_plan, AdamWHyperparams, QuantizedOptimProgram};
 use crate::cpdt_tier_apply::{plan_map, PrecisionConfig, PrecisionPlan};
 use crate::cpdt_zero::{ClusterSpec, ModelSize, ZeroEvaluation};
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::weight_aware::{WeightEntry, WeightMap};
 
 /// User-visible CPDT mode.
@@ -170,6 +171,9 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
     let t0 = std::time::Instant::now();
 
     if input.mode == CpdtMode::Off {
+        crate::pass_trace::record_disposition("CPDT", PassDisposition::Declined {
+            reason: DeclineReason::ModeOff,
+        });
         return CpdtPlan {
             mode: CpdtMode::Off,
             zero: None,
@@ -312,6 +316,19 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         None
     };
 
+    // The collective schedule is CPDT's product: every entry is one comm op
+    // the lowerer must emit. A ZeRO search that lands on plain DDP produces an
+    // empty schedule — the pass ran, found the cluster gave it nothing to
+    // shard, and changed nothing.
+    if comm_schedule.total_ops() == 0 {
+        crate::pass_trace::record_disposition("CPDT", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("no feasible ZeRO config shards anything"),
+        });
+    } else {
+        crate::pass_trace::record_disposition("CPDT", PassDisposition::Applied {
+            rewrites: comm_schedule.total_ops(),
+        });
+    }
     CpdtPlan {
         mode: input.mode,
         zero,

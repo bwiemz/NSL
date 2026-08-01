@@ -924,6 +924,15 @@ fn expand_kv_heads_device(
     kv_ptr: i64, b: usize, kv_h: usize, groups: usize, s: usize, d: usize,
 ) -> i64 {
     let src = NslTensor::from_ptr(kv_ptr);
+    // `total * 4` below and the `s * d * 4` block stride are the only places
+    // this function speaks about element width, and both hardcode f32. A
+    // 16-bit K/V would have every block copy read past its source block and
+    // land at twice the right destination offset — a silent scramble, not a
+    // fault, because the destination allocation is the larger of the two.
+    // This is the CSHA backward's expand-KV envelope, which sits one call
+    // away from the f16 dq/dk/dv buffers `nsl_tensor_zeros_f16_on` allocates,
+    // so the operands are genuinely mixed in this neighbourhood.
+    crate::cuda::assert_gpu_f32(src, "flash_attention expand_kv_heads_device", "K/V");
     let h = kv_h * groups;
     let total = b * h * s * d;
     // P0.1 VRAM accounting: the expanded-KV envelope is attention workspace.

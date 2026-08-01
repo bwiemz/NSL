@@ -313,6 +313,16 @@ const LCE_GEMM_CHUNK: u64 = 4096;
 /// `bias [v]` (read only when `has_bias`), `targets [rows]` i64,
 /// `loss_out`/`lse_out [rows]` f32 (pre-allocated; fully overwritten).
 /// Returns 0 on success.
+///
+/// PRECONDITION (unenforceable here): `x`, `w` and `bias` must be f32
+/// storage. Unlike `nsl_fused_linear_ce_forward`, the `_gemm` FFI pair has no
+/// `dtype_tag` parameter at all — there is no 16-bit variant of this path and
+/// no `NslTensor` in the signature to read a dtype from, so nothing can
+/// refuse a narrower operand. The GEMMs are issued with f32 leading
+/// dimensions and the logits scratch is sized `rows * chunk * 4`; a 16-bit
+/// operand would be read at twice its allocated length. The check belongs at
+/// `nsl_fused_linear_ce_{forward,backward}_gemm`'s caller, which is the last
+/// frame that still holds tensors.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_forward(
@@ -456,6 +466,10 @@ pub(crate) fn gemm_forward(
 /// `grad_output / num_valid`, folded on the host. Recomputes each logits
 /// chunk (one extra GEMM pass) instead of caching them — trading ~1.4 ms for
 /// never holding more than one [rows, chunk] scratch.
+///
+/// PRECONDITION (unenforceable here): as `gemm_forward` — every pointer is a
+/// bare device address and every buffer is sized at 4 bytes per element, so
+/// f32 storage is required and cannot be checked from this frame.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_backward(

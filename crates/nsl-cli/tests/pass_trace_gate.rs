@@ -126,6 +126,28 @@ fn ran_with_phases(stderr: &str) -> Vec<(String, Option<String>)> {
         .unwrap_or_default()
 }
 
+/// The disposition line for `pass`, without the `[pass-trace] NAME: ` prefix,
+/// e.g. `applied, 12 rewrite(s)`. `None` when the pass reported no effect —
+/// which, because a disposition presupposes an entry record, also covers
+/// "the pass never ran".
+fn disposition(stderr: &str, pass: &str) -> Option<String> {
+    let needle = format!("[pass-trace] {pass}: ");
+    stderr
+        .lines()
+        .find(|l| l.starts_with(&needle))
+        .map(|l| l[needle.len()..].trim().to_string())
+}
+
+/// The rewrite count out of an `applied, N rewrite(s)` disposition.
+///
+/// Returns `None` for a decline, so a caller asserting on the number cannot
+/// accidentally accept a decline as a zero.
+fn applied_count(stderr: &str, pass: &str) -> Option<usize> {
+    let d = disposition(stderr, pass)?;
+    let rest = d.strip_prefix("applied, ")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
 fn loss_stream(stdout: &str) -> String {
     stdout
         .split_once("LOSS_STREAM_BEGIN")
@@ -287,6 +309,106 @@ fn wggo_is_invoked_before_the_train_block_driver_despite_its_declared_stage() {
         "WGGO no longer precedes FASE (got {seq:?}). If this changed \
          deliberately, update the item-2 notes: the conclusion that \
          PipelineStage is not a scheduling key rests on this observation."
+    );
+}
+
+/// Roadmap item 3, both directions on the EFFECT half: with the flag set the
+/// pass must report a NON-ZERO applied count; without it the pass must report
+/// no disposition at all.
+///
+/// The non-zero half is the anti-vacuity half, and it is not a formality. The
+/// closest precedent in this tree is the wgrad-fusion parity check, which was
+/// satisfied by a printed line carrying a hard-coded zero for months: "the
+/// report printed something" and "the pass did something" are different
+/// claims, and only the second one is worth a gate.
+#[test]
+fn an_applied_pass_reports_a_non_zero_effect_only_when_its_flag_is_set() {
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("dccr", &["--checkpoint-blocks", "--layerwise-accum"], "CCR"),
+        ("dwggo", &["--wggo", "full"], "WGGO"),
+    ];
+    let base = run("dbase", &[], true);
+    assert!(base.ok, "baseline run failed:\n{}", base.stderr);
+    // FASE is planned on every source-AD compile, so its disposition is the
+    // proof that the effect block is being emitted at all — without it, every
+    // "absent" assertion below would hold for the wrong reason.
+    let fase = applied_count(&base.stderr, "FASE");
+    assert!(
+        fase.is_some_and(|n| n > 0),
+        "FASE reported no applied effect on a plain --source-ad compile, so \
+         the disposition block is not being emitted and the assertions below \
+         prove nothing:\n{}",
+        base.stderr
+    );
+
+    for (tag, flags, pass) in cases {
+        assert!(
+            disposition(&base.stderr, pass).is_none(),
+            "{pass} reported an effect with no flag set:\n{}",
+            base.stderr
+        );
+
+        let on = run(tag, flags, true);
+        assert!(on.ok, "{tag} run failed:\n{}", on.stderr);
+        let n = applied_count(&on.stderr, pass).unwrap_or_else(|| {
+            panic!(
+                "{flags:?} produced no `applied` disposition for {pass} (got \
+                 {:?}) — either the flag did not reach the pass, or an exit is \
+                 missing its record_disposition:\n{}",
+                disposition(&on.stderr, pass),
+                on.stderr
+            )
+        });
+        assert!(
+            n > 0,
+            "{pass} reported `applied, {n} rewrite(s)` — a zero here is what a \
+             hard-coded line looks like, and the pass must report a decline \
+             instead when it changed nothing:\n{}",
+            on.stderr
+        );
+    }
+}
+
+/// A pass that RAN and declined must be distinguishable from a pass that
+/// never ran, and must say why.
+///
+/// That distinction is the reason the disposition exists: before it, "CSHA
+/// did not run" and "CSHA ran and found no attention chain it could fuse"
+/// were the same report line, and only one of them is a bug.
+///
+/// `--csha auto` on the FFN fixture is the honest fixture for this: the model
+/// has no attention sublayer at all, so CSHA is reached, scans, and admits no
+/// kernel. A CCR decline needs a different program — this fixture satisfies
+/// CCR, as `an_applied_pass_reports_a_non_zero_effect_only_when_its_flag_is_set`
+/// above relies on.
+#[test]
+fn a_pass_that_declines_is_distinguishable_from_a_pass_that_never_ran() {
+    let r = run("declined", &["--csha", "auto"], true);
+    assert!(r.ok, "run failed:\n{}", r.stderr);
+
+    assert!(
+        ran(&r.stderr).iter().any(|p| p == "CSHA"),
+        "CSHA must appear in the ran list — a decline is not an absence:\n{}",
+        r.stderr
+    );
+    assert!(
+        !idle(&r.stderr).iter().any(|p| p == "CSHA"),
+        "CSHA was listed as not-run despite having been reached:\n{}",
+        r.stderr
+    );
+
+    let d = disposition(&r.stderr, "CSHA")
+        .unwrap_or_else(|| panic!("CSHA ran but reported no disposition:\n{}", r.stderr));
+    assert!(
+        d.starts_with("declined, "),
+        "CSHA found no attention chain in an FFN-only model, so it must \
+         DECLINE rather than report an applied effect; got {d:?}:\n{}",
+        r.stderr
+    );
+    // The category alone would let any two declines collapse into one signal.
+    assert!(
+        d.len() > "declined, ".len() + 8,
+        "the decline carries no usable reason: {d:?}"
     );
 }
 

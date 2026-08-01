@@ -22,6 +22,7 @@ use crate::wrga_fusion::{
 };
 use crate::wrga_memory::{plan_memory_with_pin, MemoryPlan, SizeHints};
 use crate::wrga_prune::{prune, PruneResult};
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::wrga_roofline::{place_adapters, AdapterPlacement, AdapterSite, SiteKind};
 use crate::wrga_spectral::{allocate_ranks, analyse_weight_map, RankAllocation, SpectralAnalysis};
 
@@ -747,6 +748,39 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
         )
     };
 
+    // WRGA's five Innovations all feed one deliverable: the set of sites that
+    // get an adapter. `Skip` placements are the roofline analysis declining a
+    // site, so they are candidates considered, not rewrites made.
+    //
+    // `--wrga-ablate=wengert,roofline,spectral,fusion,memory` replaces every
+    // stage with its no-op, which is a user-reachable way to make the pass run
+    // and do nothing on purpose (paper §9.3's ablation harness). That is a
+    // different fact from "no site was worth adapting", so it gets its own
+    // reason rather than being folded into the placement count.
+    let adapted_sites = placements
+        .iter()
+        .filter(|p| !matches!(p.adapter, crate::wrga_roofline::AdapterKind::Skip))
+        .count();
+    if abl.skip_wengert_pruning
+        && abl.skip_roofline_placement
+        && abl.skip_spectral_allocation
+        && abl.skip_fusion_integration
+        && abl.skip_memory_planning
+    {
+        crate::pass_trace::record_disposition("WRGA", PassDisposition::Declined {
+            reason: DeclineReason::FeatureDisabled(
+                "every Innovation ablated via --wrga-ablate",
+            ),
+        });
+    } else if adapted_sites == 0 {
+        crate::pass_trace::record_disposition("WRGA", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("no adapter site survived roofline placement"),
+        });
+    } else {
+        crate::pass_trace::record_disposition("WRGA", PassDisposition::Applied {
+            rewrites: adapted_sites,
+        });
+    }
     WrgaPlan {
         mode: input.mode,
         target_gpu: gpu.name.to_string(),

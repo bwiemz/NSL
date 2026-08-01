@@ -24,6 +24,7 @@ use crate::csha_pipeline::{
 };
 use crate::csha_specialize::{analyze as analyze_spec, SpecConfig, SpecializationPlan};
 use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::weight_aware::WeightMap;
 use crate::wengert::WengertList;
 use crate::wggo_cost::LayerShape;
@@ -528,6 +529,9 @@ pub fn run(input: CshaInput) -> CshaPlan {
     // Off mode: produce an empty plan so callers can uniformly serialize
     // the result.
     if input.mode == CshaMode::Off {
+        crate::pass_trace::record_disposition("CSHA", PassDisposition::Declined {
+            reason: DeclineReason::ModeOff,
+        });
         return CshaPlan {
             mode: CshaMode::Off,
             target_gpu: gpu.name.to_string(),
@@ -705,6 +709,22 @@ pub fn run(input: CshaInput) -> CshaPlan {
     );
     for d in diags { eprintln!("warning: {d}"); }
 
+    // The rewrite unit is the per-layer KERNEL SPEC the apply-bridge produced,
+    // not the number of boundary chains scanned: a chain that no fusion level
+    // fits (smem budget, unsupported head configuration) is scanned, planned,
+    // and then yields no kernel — which is exactly the "the flag was on and
+    // nothing happened" case the disposition exists to make visible.
+    if bridge.kernels.is_empty() {
+        crate::pass_trace::record_disposition("CSHA", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates(
+                "no attention boundary chain admitted a fused kernel",
+            ),
+        });
+    } else {
+        crate::pass_trace::record_disposition("CSHA", PassDisposition::Applied {
+            rewrites: bridge.kernels.len(),
+        });
+    }
     CshaPlan {
         mode: input.mode,
         target_gpu: gpu.name.to_string(),

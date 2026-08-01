@@ -35,6 +35,7 @@ use crate::cfie_kv_plan::{plan as plan_kv, KvBudget, KvLayoutPlan, KvShape};
 use crate::cfie_kv_quant::{plan as plan_kv_quant, KvQuantConfig, KvQuantPlan};
 use crate::cfie_persistent::{plan as plan_persistent, GpuBudget, PersistentModel, PersistentPlan};
 use crate::cfie_speculative::{emit_program as emit_spec, SpeculativeConfig, SpeculativeProgram};
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::weight_aware::WeightMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -739,6 +740,9 @@ pub fn run(input: CfieInput) -> CfiePlan {
     let t0 = std::time::Instant::now();
 
     if input.mode == CfieMode::Off {
+        crate::pass_trace::record_disposition("CFIE", PassDisposition::Declined {
+            reason: DeclineReason::ModeOff,
+        });
         return CfiePlan {
             mode: CfieMode::Off,
             target_gpu: input.target_gpu.to_string(),
@@ -843,6 +847,23 @@ pub fn run(input: CfieInput) -> CfiePlan {
     let saved_sampling = if sampling.is_fused() { 5 } else { 0 };
     let cfie_launches = baseline.saturating_sub(saved_persistent + saved_sampling);
 
+    // CFIE's product is launch collapse — it fuses the per-token decode into
+    // persistent kernels — so the honest rewrite count is the number of
+    // per-token launches it removed, not a count of IR nodes it touched
+    // (there are none; CFIE never sees a WengertList, which is why the
+    // registry files it as OutOfBand).
+    let launches_eliminated = baseline.saturating_sub(cfie_launches) as usize;
+    if launches_eliminated == 0 {
+        crate::pass_trace::record_disposition("CFIE", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates(
+                "neither the persistent decode nor the fused sampler removed a launch",
+            ),
+        });
+    } else {
+        crate::pass_trace::record_disposition("CFIE", PassDisposition::Applied {
+            rewrites: launches_eliminated,
+        });
+    }
     CfiePlan {
         mode: input.mode,
         target_gpu: input.target_gpu.to_string(),

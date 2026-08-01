@@ -29,11 +29,20 @@
 //!
 //! # What it records
 //!
-//! **Invocation**, not effect: `record` is called at a pass's entry point, so
-//! the trace answers "was this pass reached", not "did it change anything". A
-//! pass that is reached and then declines (no candidate ops, budget already
-//! met) is a genuinely different question, deliberately out of scope here —
-//! conflating the two would make the signal mean less, not more.
+//! Two separate facts, recorded by two separate calls.
+//!
+//! **Invocation** — `record` is called at a pass's entry point, so it answers
+//! "was this pass reached". Conflating that with effect would make the signal
+//! mean less, not more, so the two are never merged into one call.
+//!
+//! **Effect** — `record_disposition` is called at each of a pass's exits with
+//! a [`PassDisposition`]: applied (and how many rewrites), declined (and why),
+//! or advisory-only. It *presupposes* invocation — it asserts that `record`
+//! already ran for the same pass — so it can never be mistaken for a cheaper
+//! replacement, and a pass that declines stays clearly distinguishable from a
+//! pass whose flag never arrived. That distinction is the whole point: "WGGO
+//! did not run" and "WGGO ran and refused on a shape incompatibility" are the
+//! same line in an invocation-only trace, and only one of them is a bug.
 //!
 //! Read that literally for analysis-only commands: `nsl check
 //! --training-report` builds its report BY running the FASE and PCA planners,
@@ -50,10 +59,17 @@
 //!
 //! # Why it cannot change the build
 //!
-//! The trace is a compiler-side `Vec<&'static str>`. Nothing here is emitted
-//! into the compiled program, so enabling it cannot move a loss curve. The
-//! gate in `crates/nsl-cli/tests/pass_trace_gate.rs` asserts exactly that by
-//! comparing loss streams with the trace on and off.
+//! The trace is two compiler-side vectors of `Copy` data. Nothing here is
+//! emitted into the compiled program, so enabling it cannot move a loss curve.
+//! The gate in `crates/nsl-cli/tests/pass_trace_gate.rs` asserts exactly that
+//! by comparing loss streams with the trace on and off.
+//!
+//! Both `record` and `record_disposition` run UNCONDITIONALLY — neither is
+//! gated on [`enabled`]. Gating would mean the assertions inside them only
+//! ever execute under `NSL_PASS_TRACE=1`, and the purity gate would then be
+//! comparing two different code paths instead of proving one path pure. Every
+//! disposition payload is `usize` / `&'static str` / a `Copy` enum precisely
+//! so that "always on" costs an integer store and never an allocation.
 //!
 //! # Toward a pass manager
 //!
@@ -131,6 +147,69 @@ pub fn phase_mismatches(
         .collect()
 }
 
+/// What a pass DID once it was reached.
+///
+/// Deliberately three variants, and deliberately NOT four. There is no
+/// `Failed`: no registered pass returns an error. Every refusal in the tree is
+/// either a `None`/empty-plan return (CCR's four exits, WGGO's §2.4 shape
+/// refusal) or a diagnostic the *driver* turns into a `CodegenError`
+/// (`stmt.rs` ~8842). A `Failed` variant would therefore have zero producers —
+/// an enum implying a distinction the compiler does not actually make, which
+/// is exactly the decorative-metadata defect `pass_registry.rs` deleted its
+/// `status` field to avoid. Do not add it speculatively; add it in the same
+/// commit as its first real producer, or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassDisposition {
+    /// The pass transformed something. `rewrites` is the pass's OWN unit of
+    /// work and its meaning is per-pass (layer decisions for WGGO, block
+    /// segments for CCR, backward phases for FASE, ...); each call site
+    /// documents which quantity it is reporting. A pass that would report
+    /// `rewrites: 0` should report a `Declined` with a reason instead — zero
+    /// is exactly the number a hard-coded stub produces, so it must never be
+    /// the way "nothing happened" is spelled.
+    Applied { rewrites: usize },
+    /// The pass ran, decided not to transform anything, and said why.
+    Declined { reason: DeclineReason },
+    /// The pass produced a report or a recommendation that no codegen stage
+    /// consumes. Distinct from `Applied { rewrites: 0 }` because it is not a
+    /// disappointment: it is what the pass is *for* on that path.
+    AdvisoryOnly,
+}
+
+/// Why a pass declined.
+///
+/// Structural categories carrying a `&'static str` detail, not a fully-typed
+/// enum. That is a considered limit, not laziness: every typed refusal enum in
+/// the tree is PER-SITE rather than per-pass (`wggo_prune::PruneRefusal`,
+/// `wggo_overrides::OverrideRejectReason`, `pca_per_doc::RejectReason`,
+/// `cpdt_expert_prune::ExpertPruneRefusal`), and the genuine pass-level
+/// declines — CCR's four — exist today only as `eprintln!` strings, one of
+/// which interpolates runtime op indices. Categorising them buys the thing a
+/// gate can assert on; spelling out every detail as a variant would buy a
+/// second enum to keep in sync with the strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The pass's own mode selector is off (`--csha off`, `WggoMode::Off`,
+    /// `FaseMode::Passthrough`). Nothing is wrong; the user asked for this.
+    ModeOff,
+    /// The pass is on, but the program contains nothing it can work on.
+    NoCandidates(&'static str),
+    /// The pass is on and had candidates, but a precondition it must not
+    /// weaken does not hold, so it refused rather than transforming anyway.
+    PreconditionViolated(&'static str),
+    /// A capability the pass needs was switched off underneath it (an
+    /// ablation flag, a disabled decorator), so its stages became no-ops.
+    FeatureDisabled(&'static str),
+    /// A memory/parameter budget cannot be met even at the pass's floor.
+    BudgetInfeasible,
+}
+
+/// Effects observed this compile, keyed by pass, in first-DISPOSITION order.
+///
+/// A `Vec` rather than a map so the render order is deterministic without
+/// pulling in an ordered map for eleven entries.
+static DISPOSITION: Mutex<Vec<(&'static str, PassDisposition)>> = Mutex::new(Vec::new());
+
 /// Record that `pass` was reached. Idempotent per compile: a pass invoked
 /// once per layer would otherwise swamp the sequence, and the question this
 /// answers ("was it reached at all") is already settled by the first call.
@@ -157,6 +236,57 @@ pub fn record(pass: &'static str) {
     }
 }
 
+/// Record what `pass` DID. Call at every exit of the pass, including the ones
+/// that decline.
+///
+/// This is a SECOND function, not a wider `record`, and it asserts that
+/// `record(pass)` already happened. Disposition therefore structurally
+/// presupposes entry: there is no way to spell "WGGO applied 12 rewrites"
+/// without also having said "WGGO was reached", so a future refactor cannot
+/// quietly swap the cheap call for the informative one and lose the
+/// invocation half of the trace. It also means a bogus name is caught by
+/// `record`'s registry assert rather than needing a second copy of it here.
+///
+/// NOT debug_assert: CI ships release builds, where that compiles out — the
+/// same reasoning written out at [`record`], and the reason `assert!` is used
+/// for every production invariant in this crate.
+///
+/// # Merge rule: LAST WINS
+///
+/// A pass may be entered several times in one compile and may reach different
+/// exits each time. The worked example is CCR under `--checkpoint-stride
+/// auto`: `stmt.rs` calls `ccr::plan` once per candidate stride, so a single
+/// build produces a whole sequence of dispositions — some declining, the
+/// winner applying — and only the FINAL call corresponds to the plan the build
+/// actually used. Keeping the last one is therefore the answer to "what did
+/// this pass do to THIS build"; keeping the first would report a discarded
+/// search step, and keeping all of them would turn an eleven-line report into
+/// a log.
+///
+/// The same rule is what lets a driver refine a pass's own self-report with
+/// something the pass could not know — see `stmt.rs`, where WGGO's
+/// layer-decision count is superseded by `wggo_prune`'s tape-rewrite count.
+pub fn record_disposition(pass: &'static str, d: PassDisposition) {
+    let entered = {
+        // TRACE holds (name, phase) pairs — match on the name only; the phase
+        // a pass was entered in has no bearing on whether it may report one.
+        let t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        t.iter().any(|(p, _)| *p == pass)
+    };
+    assert!(
+        entered,
+        "pass_trace::record_disposition(\"{pass}\") without a prior \
+         record(\"{pass}\") — a disposition presupposes entry, so this is \
+         either a missing record at the pass's entry point or a disposition \
+         attributed to the wrong pass"
+    );
+    let mut t = DISPOSITION.lock().unwrap_or_else(|e| e.into_inner());
+    match t.iter_mut().find(|(p, _)| *p == pass) {
+        Some(slot) => slot.1 = d,
+        None => t.push((pass, d)),
+    }
+}
+
 /// The passes reached this compile, in first-invocation order.
 pub fn observed() -> Vec<&'static str> {
     TRACE
@@ -165,6 +295,11 @@ pub fn observed() -> Vec<&'static str> {
         .iter()
         .map(|(p, _)| *p)
         .collect()
+}
+
+/// What each pass that reported a disposition did, in first-disposition order.
+pub fn dispositions() -> Vec<(&'static str, PassDisposition)> {
+    DISPOSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Clear the trace.
@@ -181,6 +316,10 @@ pub fn observed() -> Vec<&'static str> {
 pub fn reset() {
     TRACE.lock().unwrap_or_else(|e| e.into_inner()).clear();
     CURRENT_PHASE.with(|c| c.set(None));
+    // Dispositions too, or `record_disposition`'s entry assert fires on the
+    // next compile in the same process: the disposition would still be there
+    // while the entry it presupposes had been wiped.
+    DISPOSITION.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Is `NSL_PASS_TRACE=1` set? Read per call rather than cached so a test can
@@ -197,15 +336,51 @@ fn phase_of(pass: &str) -> Option<CompilePhase> {
         .and_then(|(_, c)| c)
 }
 
-/// Render the observed sequence with each pass's declared stage, e.g.
+/// One disposition, as it appears in the report — without the pass name or
+/// the `[pass-trace]` prefix, so that every category's wording lives in one
+/// `match` and two variants cannot quietly come to render the same text.
+/// `pass_trace_unit.rs` pins that distinctness directly.
+fn render_disposition(d: PassDisposition) -> String {
+    match d {
+        PassDisposition::Applied { rewrites } => format!("applied, {rewrites} rewrite(s)"),
+        PassDisposition::Declined { reason } => match reason {
+            DeclineReason::ModeOff => "declined, mode off".to_string(),
+            DeclineReason::NoCandidates(d) => format!("declined, no candidates - {d}"),
+            DeclineReason::PreconditionViolated(d) => {
+                format!("declined, precondition violated - {d}")
+            }
+            DeclineReason::FeatureDisabled(d) => format!("declined, feature disabled - {d}"),
+            DeclineReason::BudgetInfeasible => "declined, budget infeasible".to_string(),
+        },
+        PassDisposition::AdvisoryOnly => "advisory only".to_string(),
+    }
+}
+
+/// Render the observed sequence with each pass's declared stage and the driver
+/// phase it actually ran in, then one line per pass that reported an effect:
 ///
 /// ```text
 /// [pass-trace] 3 pass(es) ran: WGGO(OnWengert)@KernelPrepass -> FASE(PreExtraction)@TrainBlock -> CCR(OnAdjoint)@TrainBlock
+/// [pass-trace] WGGO: applied, 12 rewrite(s)
+/// [pass-trace] FASE: applied, 4 rewrite(s)
+/// [pass-trace] CCR: declined, no candidates - the tape has no blocks.N-style parameters
 /// ```
 ///
 /// Registered passes that did NOT run are listed too — the absence is the
 /// interesting half, and a report that only showed what happened would make
 /// "nothing ran" indistinguishable from "the trace is broken".
+///
+/// Dispositions go on their OWN lines rather than being folded into the
+/// sequence: the gates in `crates/nsl-cli/tests/pass_trace_gate.rs` and
+/// `crates/nsl-codegen/tests/pass_trace_unit.rs` parse the `ran:` and
+/// `did not run:` lines positionally, by splitting on `ran:` / `->` / `(` /
+/// `@` and on `did not run:` / `,`, so anything added INSIDE them breaks a
+/// parser while a new line with a distinct shape does not.
+///
+/// They also reuse the `[pass-trace]` prefix rather than introducing a second
+/// bracketed token — a new banner prefix would need an `EXEC_MARKERS` entry
+/// and a `tokens::` constant in `crates/nsl-cli/src/exec_markers.rs`, or
+/// `feature_composition_gate.rs` fails the moment a test asserts on it.
 pub fn report() -> String {
     let seen = observed();
     let mut s = if seen.is_empty() {
@@ -238,6 +413,18 @@ pub fn report() -> String {
         .collect();
     if !idle.is_empty() {
         s.push_str(&format!("[pass-trace] did not run: {}\n", idle.join(", ")));
+    }
+    // Effects, in INVOCATION order rather than disposition order, so the
+    // effect block reads down in the same sequence as the `ran:` line above
+    // it. A pass that was reached but reported no disposition is simply
+    // absent here; that gap is itself a finding (an exit with no
+    // `record_disposition`), and hiding it behind a placeholder would make it
+    // unfindable.
+    let d = dispositions();
+    for p in &seen {
+        if let Some((_, disp)) = d.iter().find(|(name, _)| name == p) {
+            s.push_str(&format!("[pass-trace] {p}: {}\n", render_disposition(*disp)));
+        }
     }
     // A detector nobody calls is decoration. Surfacing mismatches in the
     // report itself is what makes a wrong declaration visible from one run,

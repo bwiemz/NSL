@@ -6,6 +6,137 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — pass EFFECT dispositions: `applied` / `declined, <reason>` / `advisory only`
+
+- **The trace could say a pass was REACHED; it could not say whether anything
+  happened.** "CSHA did not run" and "CSHA ran and found no attention chain it
+  could fuse" were the same line, and only one of them is a bug. A flag that
+  enables a pass which then declines produces a clean, plausible, wrong build
+  exactly like a flag that enables a pass which never runs.
+
+  `PassDisposition` — `Applied { rewrites }` / `Declined { reason }` /
+  `AdvisoryOnly` — with a `DeclineReason` of five structural categories
+  (`ModeOff`, `NoCandidates`, `PreconditionViolated`, `FeatureDisabled`,
+  `BudgetInfeasible`) carrying `&'static str` detail. All eleven registered
+  passes report at every exit, 36 sites. Under `NSL_PASS_TRACE=1`:
+
+  ```text
+  [pass-trace] 3 pass(es) ran: WGGO(OnWengert)@KernelPrepass -> FASE(PreExtraction)@TrainBlock -> CSHA(OnWengert)@TrainBlock
+  [pass-trace] WGGO: applied, 3 rewrite(s)
+  [pass-trace] FASE: applied, 2 rewrite(s)
+  [pass-trace] CSHA: declined, no candidates - no attention boundary chain admitted a fused kernel
+  ```
+
+- **Disposition is recorded through a SECOND function that asserts a prior
+  entry record.** `record` stays exactly as it was; `record_disposition`
+  panics unless the pass is already in the trace. That is what makes
+  disposition structurally presuppose invocation, so it can never quietly
+  become a replacement for the entry instrumentation — the property the
+  original module was built to protect.
+
+- **`Applied { rewrites: 0 }` is not how "nothing happened" is spelled.** Zero
+  is exactly what a hard-coded stub produces, so a pass that changed nothing
+  reports a `Declined` with a reason instead. There is deliberately **no
+  `Failed` variant**: no registered pass returns an error — the driver raises
+  `CodegenError` — so it would have zero producers, which is the
+  decorative-metadata defect `pass_registry.rs` deleted its `status` field to
+  avoid.
+
+- **FASE reports from the driver, not from inside the pass.** `stmt.rs`
+  rewrites FASE's mode after `plan` returns (muon, `--layerwise-accum`), so a
+  disposition recorded inside would be accurate about the pass and wrong about
+  the build.
+
+- `pass_registry_drift`'s static scan matched the literal
+  `pass_trace::record("`, which `record_disposition(` does not contain — the
+  new sites would have had strictly WEAKER coverage than the ones they extend.
+  Extended to both spellings, with a subset assertion (every disposition name
+  must be an entry name) and raised floors. `wgrad_fusion` stays out of the
+  registry: it is invoked from the Cranelift lowerer rather than
+  `compile_train_block` and already prints its own banner; its `NOT_A_PASS`
+  reason now states that boundary instead of merely asserting it.
+
+### Added — GPU kernel paths refuse a non-f32 tensor instead of misreading it
+
+- **~45 wrappers in `cuda/mod.rs` size buffers at `n * 4`, publish dtype 1, and
+  cast `t.data as *const f32` — while the dispatchers reaching them branched on
+  `device > 0` alone.** Feed a bf16 or fp16 device tensor in and the kernel
+  reads twice its allocation: not a fault, a plausible wrong answer, published
+  as f32 and believed. Device-resident non-f32 tensors are not hypothetical —
+  `nsl_tensor_to_device` carries any dtype outside {f64, f32} to the GPU
+  verbatim, `nsl_tensor_zeros_like_dtype` allocates 2-byte device buffers,
+  `nsl_tensor_zeros_f16_on` is emitted six times per CSHA fused backward, and
+  `--checkpoint-compress bf16` publishes bf16 halves. Each is kept away from
+  these kernels today only by a widen the compiler happens to emit.
+
+- `assert_gpu_f32` at 68 call sites across 47 functions in `cuda/mod.rs`,
+  plus 3 more in its callers. The two highest-reach
+  are in `shape_ops`: `nsl_tensor_contiguous` and `nsl_tensor_slice` have
+  dtype-correct CPU arms that were simply unreachable for a device tensor.
+  Falling through to them is not an option — that arm allocates HOST memory, so
+  a per-element copy would read a device address from the host.
+
+- **A static drift gate keeps it from rotting.** It reads `cuda/mod.rs` as
+  text, finds every function that sizes a buffer at 4 bytes per element or
+  launches an `*_f32` kernel, and requires either a guard or an allowlist entry
+  with a stated reason — checked in both directions, so a stale exemption fails
+  too. It runs under `cargo test --lib` with no GPU, which means a new
+  unguarded path reddens the ordinary CPU lane on the commit that introduces
+  it rather than a day later in the nightly.
+
+- `assert!`, never `debug_assert!` — CI ships release and there is no
+  `[profile.release]` override. One consequence worth recording: an assert
+  reached through a `pub extern "C"` frame **aborts** rather than panicking
+  (`panic_cannot_unwind`, Rust >= 1.81), so `#[should_panic]` cannot observe
+  any of these. The new `gpu_dtype_refusal` gate re-execs itself and checks the
+  child's exit status and stderr, which also pins the operand name and the
+  offending dtype tag rather than substring-matching a payload.
+
+### Fixed — three GPU-cert lane defects that only running the lane could find
+
+- **`tf32_is_faster_and_less_accurate_than_full_f32` took ONE timing sample per
+  arm.** Run ~340 targets deep on a GPU saturated for the better part of an
+  hour, both arms dilated ~5x (2.79 / 2.48 ms against the 0.583 / 0.365 ms
+  reference) and the ratio fell under the 1.35x floor — while the error ratio
+  stayed at 402x, which is proof TF32 *was* reaching cuBLAS. The same binary
+  passed in isolation. Now best-of-3 INTERLEAVED: a stall can only make a
+  sample slower, so the fastest sample measures the throughput ceiling the
+  assertion is actually about, and alternating keeps a drifting clock off one
+  arm. It does not weaken the gate — if the mode never reached cuBLAS the two
+  arms would be the same code and no round would be fast. Verified green idle
+  and under deliberate contention. The failure message now says to read the
+  error ratio first, since that is what separates "timing" from "dispatch".
+
+- **The self-hosted runner was never registered, and the script said it was.**
+  `setup-gpu-runner.sh` aborted at `config.sh` under `set -e` and then printed
+  "registered and running" unconditionally — which is why the box sat
+  unregistered while the script reported success. It now verifies against the
+  GitHub API before claiming anything, treats a linger failure as fatal
+  (without it the 09:00 UTC schedule silently never fires), passes `--replace`
+  and `curl --fail`, and stops truncating a hand-edited systemd unit on every
+  run. The unit gained an explicit `PATH`: Actions steps are non-login shells
+  that never source `~/.cargo/env`, and a missing `ptxas` makes `gpu-cert.sh`
+  refuse outright rather than merely run slower.
+
+- **A failing gate left no durable diagnostic.** Every log lived in a `mktemp`
+  dir the EXIT trap deleted, so a red gate left three grep'd lines in an
+  Actions log that expires long before the 90-day artifact — and a target whose
+  `--ignored --list` failed to build produced silent mass-`NOTFOUND` with no
+  error text anywhere. The lane now banks per-gate logs, the batch log, the
+  listing stderr and a `run-metadata.tsv` recording tier, features and the
+  timeout actually in force; the workflow copies the manifest, known-red list
+  and long-arms table beside them, and tees the preflight.
+
+- `ci/gpu-cert-long-arms.txt` raises the per-gate budget to 1800s for the three
+  full-training targets, as `max(NSL_CERT_TIMEOUT, entry)` so a deliberately
+  raised global is never shortened back. It is a separate file rather than a
+  fifth manifest column because `--write-manifest` regenerates the manifest
+  verbatim from a four-field scanner and `--check-inventory` diffs it
+  byte-exactly — a fifth column would go permanently red and then be erased.
+  The new GPU-free `--check-long-arms` validates the format and cross-checks
+  every path against the manifest, so a test-file rename fails CI instead of
+  silently reverting the gate to the default.
+
 ### Fixed — module-level fns now win every builtin dispatch arm; stale closure info cleared
 
 - **~50 builtin dispatch arms carried no registry guard**, so a

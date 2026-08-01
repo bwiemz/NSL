@@ -154,9 +154,13 @@ fn zero_stats() -> TensorStats {
 /// Compute stats from an `NslTensor` pointer.
 ///
 /// # Safety
-/// `ptr` must point to a valid `NslTensor` on the current device. Currently
-/// only CPU tensors (device == 0) are summarized — GPU tensors get zero stats
-/// (GPU reduction kernel deferred to M45b).
+/// `ptr` must point to a valid `NslTensor` on the current device.
+///
+/// Coverage: CPU tensors of any supported dtype, and device tensors that are
+/// f32 (via the single-pass reduction kernel). Device tensors of any other
+/// dtype get zero stats — the reduction kernel and the strided copy feeding it
+/// are both f32-only. The "GPU tensors get zero stats (deferred to M45b)"
+/// this comment used to claim stopped being true when the GPU arm landed.
 unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     if ptr.is_null() {
         return zero_stats();
@@ -180,8 +184,17 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     }
 
     // GPU f32 tensors — use single-pass reduction kernel.
+    //
+    // The dtype half of that sentence used to be a comment only: the
+    // condition tested `device` alone while `dtype` was read into a local at
+    // the top of this function and never looked at again. Both
+    // `nsl_tensor_contiguous` and `gpu_tensor_stats_f32` read 4 bytes per
+    // element, so tracing an fp16/bf16 device tensor read twice its buffer.
+    // That is the worst place for it: a diagnostic path misbehaves exactly
+    // when someone is already debugging, and it would have reported the
+    // garbage as the tensor's min/max/mean.
     #[cfg(feature = "cuda")]
-    if device != 0 {
+    if device != 0 && t.dtype == crate::tensor::DTYPE_F32 {
         let c_ptr = crate::tensor::nsl_tensor_contiguous(ptr as i64);
         let [min_val, max_val, mean_val, std_val] =
             crate::cuda::gpu_tensor_stats_f32(c_ptr);
@@ -189,6 +202,19 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
         return TensorStats {
             ndim, dtype, device, _pad: 0, shape,
             min: min_val, max: max_val, mean: mean_val, std: std_val,
+        };
+    }
+
+    // Non-f32 device tensors: zero stats, dtype preserved. Degrading is right
+    // here where refusing is right in the kernel wrappers — a trace is
+    // advisory, and aborting the program because a debugging aid met an fp16
+    // buffer would be a worse outcome than reporting nothing about it. The
+    // `dtype` field the record carries says which tensor was skipped.
+    #[cfg(feature = "cuda")]
+    if device != 0 {
+        return TensorStats {
+            ndim, dtype, device, _pad: 0, shape,
+            min: 0.0, max: 0.0, mean: 0.0, std: 0.0,
         };
     }
 
