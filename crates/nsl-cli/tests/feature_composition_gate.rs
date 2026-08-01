@@ -911,8 +911,18 @@ fn materialize_csla_fixture(tag: &str, gpu: bool) -> PathBuf {
     let pid = std::process::id();
     let out = tmp.join(format!("nsl_featcomp_csla_{tag}_{pid}.nsl"));
     let save = tmp.join(format!("nsl_featcomp_csla_{tag}_{pid}.nslm"));
+    // The path is substituted into an NSL *string literal*, so backslashes must
+    // be escaped. On Windows `save` is `C:\Users\RUNNER~1\AppData\...`, and
+    // pasting that in raw made the lexer read `\U`, `\R`, `\A` … as escape
+    // sequences: the fixture failed to compile with "unknown escape sequence",
+    // which this gate reports as `CONTROL FAILED ... the fixture must compile in
+    // this SUPPORTED configuration`. `\\` is a supported NSL escape
+    // (nsl-lexer/src/strings.rs), so escaping is the faithful fix — the program
+    // still receives the original path. Never triggered on Unix, where temp
+    // paths contain no backslashes.
+    let save_literal = save.to_str().expect("utf-8 temp path").replace('\\', "\\\\");
     let body = src
-        .replace("CSLA_SAVE_PATH", save.to_str().expect("utf-8 temp path"))
+        .replace("CSLA_SAVE_PATH", &save_literal)
         .replace("# GPU_PLACEMENT", if gpu { "m.to(cuda)" } else { "" });
     std::fs::write(&out, body).expect("write temp fixture");
     out
@@ -995,6 +1005,25 @@ const SWEEP_DIRS: &[&str] = &[
     "crates/nsl-codegen/src",
 ];
 
+/// Repo-relative path as a registry key, with `/` separators on every platform.
+///
+/// The registries in `nsl_cli::exec_markers` spell their paths with forward
+/// slashes (`crates/nsl-codegen/src/stmt.rs`). On Windows a scanned path comes
+/// back as `crates/nsl-cli/tests\foo.rs` — the literal `join("crates/...")`
+/// segment keeps its slashes while the OS appends the file name with a
+/// backslash — so a raw `to_string_lossy()` never matches a registered entry.
+///
+/// Every registered file then looked UNREGISTERED, which is why
+/// `every_negative_marker_assertion_in_the_suite_is_pinned` failed on
+/// windows-latest listing a dozen files that are in fact pinned. Normalise at
+/// the single point where the key is built.
+fn repo_rel_key(path: &std::path::Path, root: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 /// Recursively collect `.rs` files under `dir` as repo-relative paths.
 fn collect_rs_files(dir: &std::path::Path, out: &mut BTreeSet<String>, root: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1005,8 +1034,8 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut BTreeSet<String>, root: &st
         if path.is_dir() {
             collect_rs_files(&path, out, root);
         } else if path.extension().is_some_and(|e| e == "rs") {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.insert(rel.to_string_lossy().into_owned());
+            if path.starts_with(root) {
+                out.insert(repo_rel_key(&path, root));
             }
         }
     }
@@ -1314,11 +1343,7 @@ fn every_negative_marker_assertion_in_the_suite_is_pinned() {
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
+        let rel = repo_rel_key(&path, &root);
         if registered.contains(rel.as_str()) {
             continue;
         }
