@@ -82,6 +82,16 @@ impl Compiler<'_> {
     /// - Initialises the weight provider (embedded data or sidecar file)
     /// - Calls `nsl_standalone_args_finish()` before returning
     pub fn compile_standalone_main(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        // Item 2 step 2: the phase scope lives at the CALLEE, not at each call
+        // site. A SECOND train-block driver: `--standalone` does not filter TrainBlock
+        // statements, so passes reach it through here too.
+        // Scoping here means every caller — including ones added later — is
+        // covered by construction; the call-site approach left 16 of 26 sites
+        // unscoped, which is how `nsl check --training-report` silently
+        // reported an unattributed pass.
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::TrainBlock,
+        );
         // ── Filter top-level statements (same rules as compile_main) ───
         let top_level: Vec<_> = stmts
             .iter()

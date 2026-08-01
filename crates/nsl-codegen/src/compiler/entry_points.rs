@@ -753,6 +753,12 @@ fn compile_returning_plan_impl(
                 .cloned()
                 .collect();
             if !plannable.is_empty() {
+                // Item 2 step 2: the whole-program memory plan runs BETWEEN the
+                // two compile phases, so without this scope MemoryPlanner is
+                // recorded unattributed here (and TrainBlock via the arena).
+                let _phase = crate::pass_trace::enter_phase(
+                    crate::pass_registry::CompilePhase::Lowering,
+                );
                 let graph = InterferenceGraph::build(&plannable);
                 let plan = plan_slab(&plannable, &graph);
 

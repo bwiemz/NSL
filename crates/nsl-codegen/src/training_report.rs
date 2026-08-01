@@ -65,6 +65,11 @@ pub struct PcaSection {
 /// requires a `ModelFootprint` that cannot be cheaply derived from the AST
 /// without running semantic analysis; this is deferred to a later task.
 pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &std::path::Path) -> TrainingReport {
+    // Item 2 step 2: this is a real pass driver — it produces the report BY
+    // running the FASE and PCA planners — but it is not the compile pipeline.
+    // Naming it is what stops `nsl check --training-report` reporting an
+    // unattributed pass.
+    let _phase = crate::pass_trace::enter_phase(crate::pass_registry::CompilePhase::Analysis);
     let dataset_configs = collect_dataset_configs(&ast.stmts, interner);
     let mut blocks = Vec::new();
     for stmt in &ast.stmts {

@@ -950,3 +950,71 @@ fn every_pass_trace_record_names_a_registered_pass() {
         bad.join("\n  ")
     );
 }
+
+/// Roadmap item 2 step 2: every function that OWNS a driver phase must
+/// establish it with `pass_trace::enter_phase`.
+///
+/// The first attempt scoped phases at each CALL SITE, which left 16 of 26
+/// sites unscoped — `nsl check --training-report`, `--standalone`,
+/// `compile_and_calibrate` and the calibration sub-compile all recorded
+/// passes with no phase, while the commit claimed the set was complete.
+/// Scoping at the CALLEE fixes that by construction, and this gate is what
+/// keeps it fixed: a new phase-owning function, or a deleted scope, fails
+/// here rather than being discovered by backtrace months later.
+#[test]
+fn every_phase_owning_function_establishes_its_scope() {
+    // (file, function signature fragment, expected phase)
+    const OWNERS: &[(&str, &str, &str)] = &[
+        ("crates/nsl-codegen/src/compiler/kernel.rs",
+         "pub fn compile_flash_attention_kernels", "KernelPrepass"),
+        ("crates/nsl-codegen/src/compiler/main_entry.rs",
+         "pub fn compile_main", "TrainBlock"),
+        ("crates/nsl-codegen/src/standalone.rs",
+         "pub fn compile_standalone_main", "TrainBlock"),
+        ("crates/nsl-codegen/src/training_report.rs",
+         "pub fn build_report", "Analysis"),
+    ];
+    for (file, sig, phase) in OWNERS {
+        let src = read(file);
+        let at = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("{file}: `{sig}` not found — renamed?"));
+        // The scope must be established in the function's opening lines, not
+        // buried after arbitrary work that could itself reach a pass.
+        let head: String = src[at..].lines().take(24).collect::<Vec<_>>().join("\n");
+        assert!(
+            head.contains("enter_phase"),
+            "{file}: `{sig}` owns CompilePhase::{phase} but does not call \
+             pass_trace::enter_phase in its first 24 lines"
+        );
+        assert!(
+            head.contains(&format!("CompilePhase::{phase}")),
+            "{file}: `{sig}` should establish CompilePhase::{phase}"
+        );
+    }
+    // Anti-vacuity: every phase variant that a pass declares must be owned by
+    // one of the functions above, so a declared phase can always be reached.
+    use nsl_codegen::pass_registry::{CompilePhase as P, PASSES};
+    for d in PASSES {
+        for ph in d.phases {
+            let owned = match ph {
+                P::KernelPrepass | P::TrainBlock | P::Analysis => true,
+                // Established inline in compile_entry's memory-plan block.
+                P::Lowering => read("crates/nsl-codegen/src/compiler/entry_points.rs")
+                    .contains("CompilePhase::Lowering"),
+                P::OutOfBand => false,
+            };
+            assert!(
+                owned,
+                "{} declares {ph:?}, which no enter_phase scope establishes",
+                d.name
+            );
+        }
+        // OutOfBand is expressed as an EMPTY set, never as a variant in one.
+        assert!(
+            !d.phases.contains(&P::OutOfBand),
+            "{}: OutOfBand means an empty `phases` set, not a member",
+            d.name
+        );
+    }
+}

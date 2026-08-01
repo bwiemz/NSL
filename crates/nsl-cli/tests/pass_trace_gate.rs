@@ -102,6 +102,30 @@ fn idle(stderr: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `NAME(Stage)@Phase` -> (name, phase-or-None-if-unattributed), in order.
+fn ran_with_phases(stderr: &str) -> Vec<(String, Option<String>)> {
+    stderr
+        .lines()
+        .find(|l| l.contains("[pass-trace]") && l.contains("pass(es) ran:"))
+        .map(|l| {
+            l.split("ran:")
+                .nth(1)
+                .unwrap_or("")
+                .split("->")
+                .filter_map(|tok| {
+                    let tok = tok.trim();
+                    let name = tok.split('(').next()?.trim().to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let phase = tok.split('@').nth(1).map(|p| p.trim().to_string());
+                    Some((name, phase))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn loss_stream(stdout: &str) -> String {
     stdout
         .split_once("LOSS_STREAM_BEGIN")
@@ -275,5 +299,83 @@ fn the_fixture_these_gates_use_exists() {
     assert!(
         std::fs::read_to_string(&p).unwrap().contains("CSLA_SAVE_PATH"),
         "fixture lost its save marker"
+    );
+}
+
+/// **Item 2 step 2.** Every pass must run in the driver phase the registry
+/// declares, checked against `pass_registry` itself rather than a literal
+/// copied into the test.
+///
+/// This is what turns the step-1 finding into an enforced contract. The
+/// apparent stage inversion (`WGGO(OnWengert)` before `FASE(PreExtraction)`)
+/// is not an inversion at all — WGGO runs in `KernelPrepass`, which precedes
+/// every train block — and now the report says so on its face.
+///
+/// The `unattributed` case is the load-bearing one: a pass reached from a
+/// driver nobody wrapped in `enter_phase` has no phase, and that is exactly
+/// how a THIRD driver would announce itself. Discovering the second one cost
+/// a backtrace hunt; this makes the next one fail a test instead.
+#[test]
+fn every_pass_runs_in_the_compile_phase_the_registry_declares() {
+    use nsl_codegen::pass_registry::CompilePhase;
+    let cases: &[(&str, &[&str])] = &[
+        ("p_wggo", &["--wggo", "full", "--csha", "auto"]),
+        ("p_ccr", &["--checkpoint-blocks", "--layerwise-accum", "--csha", "auto"]),
+        ("p_bare", &[]),
+    ];
+    let mut checked = 0usize;
+    let mut phases_seen = std::collections::HashSet::new();
+    for (tag, flags) in cases {
+        let r = run(tag, flags, true);
+        assert!(r.ok, "{tag} run failed:\n{}", r.stderr);
+        let observed = ran_with_phases(&r.stderr);
+        assert!(
+            !observed.is_empty(),
+            "{tag}: no passes parsed from the trace line:\n{}",
+            r.stderr
+        );
+        for (name, phase) in observed {
+            let d = nsl_codegen::pass_registry::pass(&name)
+                .unwrap_or_else(|| panic!("{name} ran but is not registered"));
+            // `report()` always emits an `@token`, so an unattributed pass
+            // reads as the literal "unattributed" — NOT as a missing field.
+            // Mapping OutOfBand to None here made the arm fail on correct
+            // behaviour; it is only latent because no gate config runs CEP.
+            let observed = phase.as_deref().unwrap_or("unattributed");
+            assert_ne!(
+                observed, "unattributed",
+                "{tag}: {name} ran outside every declared phase — some driver \
+                 is missing an enter_phase scope. Finding the SECOND driver \
+                 cost a backtrace hunt; this is how the next one surfaces.\n{}",
+                r.stderr
+            );
+            let allowed: Vec<String> =
+                d.phases.iter().map(|p| format!("{p:?}")).collect();
+            assert!(
+                allowed.iter().any(|a| a == observed),
+                "{tag}: {name} ran in phase {observed} but the registry declares \
+                 {allowed:?}. Either the pass moved, or a driver needs an \
+                 enter_phase scope.\n{}",
+                r.stderr
+            );
+            // Nothing in the pipeline may declare an empty (OutOfBand) set and
+            // still run here.
+            assert!(
+                !d.phases.is_empty(),
+                "{tag}: {name} declares no phases (OutOfBand) but ran inside \
+                 the compile pipeline:\n{}",
+                r.stderr
+            );
+            phases_seen.insert(observed.to_string());
+            checked += 1;
+        }
+    }
+    assert!(checked >= 5, "only {checked} pass/phase pairs checked — too thin");
+    // Anti-vacuity: if every pass reported the same phase, the check could not
+    // distinguish a correct attribution from a constant.
+    assert!(
+        phases_seen.len() >= 2,
+        "all observed passes shared one phase ({phases_seen:?}); the check \
+         cannot tell attribution from a constant"
     );
 }

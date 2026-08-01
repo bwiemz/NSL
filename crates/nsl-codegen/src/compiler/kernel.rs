@@ -569,6 +569,17 @@ impl Compiler<'_> {
     /// Walk function definitions for `@flash_attention` decorator, synthesize PTX,
     /// embed it in .rodata, and store the `FlashAttentionCompileContext`.
     pub fn compile_flash_attention_kernels(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        // Item 2 step 2: the phase scope lives at the CALLEE, not at each call
+        // site. WGGO's prepass and PCA's packing detection run inside this call, before
+        // any train block exists — which is why WGGO precedes FASE in the trace
+        // despite its later PipelineStage.
+        // Scoping here means every caller — including ones added later — is
+        // covered by construction; the call-site approach left 16 of 26 sites
+        // unscoped, which is how `nsl check --training-report` silently
+        // reported an unattributed pass.
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::KernelPrepass,
+        );
         // WGGO-before-kernel-synthesis: solve the per-train-block plans NOW,
         // before any kernel decision, so `maybe_synthesize_csha_training_ptx`
         // (per-doc admission, packing fork) can consume them and the train
