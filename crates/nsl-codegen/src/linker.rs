@@ -522,9 +522,26 @@ fn link_msvc_multi(
             // .status() used to STREAM link.exe's output; .output() captures it,
             // so re-emit on the happy path to preserve linker warnings
             // (LNK4098 defaultlib conflict, LNK4099 missing PDB, …) that would
-            // otherwise be silently swallowed. Route stdout→stdout, stderr→stderr.
+            // otherwise be silently swallowed.
+            //
+            // BOTH streams go to STDERR. link.exe writes informational text to
+            // its stdout — notably `   Creating library X.lib and object X.exp`
+            // whenever it emits an import library — and `nsl run` shares this
+            // process's stdout with the program it then executes. Re-emitting
+            // link.exe's stdout onto our stdout therefore injected build chatter
+            // into PROGRAM OUTPUT on Windows: `nsl run prog.nsl > out.txt` got a
+            // linker line prepended to the user's data. Linker diagnostics are
+            // build output, not program output, and stderr is where the gcc/clang
+            // paths already put theirs — so this is also the cross-platform
+            // consistent behaviour.
+            //
+            // The symptom had been papered over test-by-test (e2e.rs's `strip`,
+            // ccr_checkpoint_activation_parity.rs, fused_lm_ce_e2e_nsl_source.rs
+            // all filter the line locally); builtin_shadow_dispatch.rs did not,
+            // which is why `unshadowed_sum_abs_reduce_max_still_hit_builtins`
+            // was the standing windows-latest CI failure.
             if !out.stdout.is_empty() {
-                print!("{}", String::from_utf8_lossy(&out.stdout));
+                eprint!("{}", String::from_utf8_lossy(&out.stdout));
             }
             if !out.stderr.is_empty() {
                 eprint!("{}", String::from_utf8_lossy(&out.stderr));
@@ -1165,17 +1182,45 @@ fn link_shared_msvc(
         cmd.arg("/EXPORT:nsl_cpu_peak_bytes");
     }
 
-    let status = cmd
-        .status()
+    // `.output()` rather than `.status()`, for the same reason as
+    // `link_msvc_multi`: `.status()` lets link.exe stream straight to this
+    // process's stdout, and its `   Creating library X.lib and object X.exp`
+    // line then contaminates program output. Capturing also means a failure can
+    // report WHAT link.exe said instead of just an exit code.
+    let out = cmd
+        .output()
         .map_err(|e| CodegenError::new(format!("failed to run link.exe: {e}")))?;
 
-    if !status.success() {
+    if !out.status.success() {
         return Err(CodegenError::new(format!(
-            "link.exe failed (exit: {status})"
+            "link.exe failed (exit: {}){}{}",
+            out.status,
+            format_link_stream("stdout", &out.stdout),
+            format_link_stream("stderr", &out.stderr),
         )));
     }
 
+    // Preserve linker warnings, on stderr — build output, never program output.
+    if !out.stdout.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&out.stdout));
+    }
+    if !out.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     Ok(())
+}
+
+/// Render a captured link.exe stream for inclusion in an error message.
+/// Empty streams contribute nothing so the message stays on one line.
+fn format_link_stream(label: &str, bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("\n  {label}: {text}")
+    }
 }
 
 /// M62a: Determine default shared library output path from input .nsl path.
