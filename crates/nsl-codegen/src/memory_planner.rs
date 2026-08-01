@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::wengert::VarId;
 
 // ---------------------------------------------------------------------------
@@ -689,6 +690,30 @@ pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> Sl
         }
     }
 
+    // One assignment = one tensor whose allocation the emitted code replaces
+    // with a slab offset, so that is the count of rewrites the planner caused.
+    // `slots.len()` would be the count of distinct buffers, which is the
+    // planner's *quality* measure, not its reach.
+    //
+    // Dynamic-sized tensors are filtered out by `is_plannable` above, so a
+    // fully dynamic function reaches here with nothing assigned. That is a
+    // decline, not a zero-effect apply: the planner ran and had nothing it
+    // could statically place.
+    //
+    // The production driver (`compiler/entry_points.rs`) applies the same
+    // filter BEFORE calling, so on that path the decline arm is unreachable —
+    // "no plannable allocations" shows up as MemoryPlanner never being entered
+    // at all. The arm is still correct for the direct callers, and writing it
+    // is what keeps the empty case from silently rendering as `applied, 0`.
+    if assignments.is_empty() {
+        crate::pass_trace::record_disposition("MemoryPlanner", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("no statically-sized tensor allocation to place"),
+        });
+    } else {
+        crate::pass_trace::record_disposition("MemoryPlanner", PassDisposition::Applied {
+            rewrites: assignments.len(),
+        });
+    }
     SlabPlan {
         total_bytes: current_offset,
         slots,

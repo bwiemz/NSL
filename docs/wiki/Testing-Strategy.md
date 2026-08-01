@@ -116,8 +116,9 @@ the tree, classifies each one, and runs the classes that need a device.
 
 ```bash
 scripts/gpu-cert.sh --list             # inventory as TSV, no build
-scripts/gpu-cert.sh --run --tier gpu   # the ~292 device-requiring gates
+scripts/gpu-cert.sh --run --tier gpu   # the device-requiring gates
 scripts/gpu-cert.sh --check-inventory  # drift gate (GPU-free; runs in CI)
+scripts/gpu-cert.sh --check-long-arms  # timeout-override gate (GPU-free; CI)
 ```
 
 Classification is what makes the sweep safe to automate. Four `#[ignore]`
@@ -139,9 +140,29 @@ GPU tests early-return as a *pass* when no device is available, so a sweep
 under those conditions would report green having executed nothing — worse than
 not running at all.
 
-`--tier gpu` is the default and covers the ~292 device-requiring gates. It does
-**not** include the `toolchain` (11), `multiproc` (6), or `isolate` (1) tiers;
-run those separately.
+`--tier gpu` is the default and covers the `gpu` and `gpu-inferred` classes —
+360 gates as of this writing. It does **not** include the `toolchain` (13),
+`multiproc` (6), or `isolate` (1) tiers; run those separately. These counts are
+not mechanically gated, so treat them as indicative; `scripts/gpu-cert.sh
+--list | cut -f3 | sort | uniq -c` is the authority.
+
+Every cargo invocation gets `NSL_CERT_TIMEOUT` seconds (default 900). The
+handful of gates that drive a full training run to convergence need longer, and
+when the budget is too short the gate is reported `TIMEOUT` — which reads
+identically to a hung kernel. `ci/gpu-cert-long-arms.txt` raises the budget for
+named targets, as `max(NSL_CERT_TIMEOUT, entry)` so a deliberately raised
+global is never shortened back. It is a separate file rather than a manifest
+column because `--write-manifest` regenerates the manifest verbatim from a
+four-field scanner and `--check-inventory` diffs it byte-exactly; a fifth
+column would go permanently red and then be erased. `--check-long-arms`
+validates the format and cross-checks every path against the manifest, so a
+test-file rename fails CI instead of silently reverting the gate to 900s.
+
+A red gate's full output is written to `logs/` beside the report, along with
+`run-metadata.tsv` (tier, features, and the timeout actually in force) — the
+nightly workflow uploads all of it, plus the manifest, known-red list and
+long-arms table, so an artifact stays interpretable without checking out the
+commit it was produced from.
 
 Set `TMPDIR` to a disk-backed path before a full run. Many gates spawn `nsl`
 builds, and on a machine where `/tmp` is tmpfs the sweep can exhaust it — the

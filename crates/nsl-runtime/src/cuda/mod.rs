@@ -3016,6 +3016,54 @@ fn gpu_prepare_binary_operands(a_ptr: i64, b_ptr: i64) -> Option<(i64, i64, bool
     Some((a_prepared, b_prepared, free_a, free_b))
 }
 
+/// Refuse a non-f32 operand at the head of an f32-only GPU kernel path.
+///
+/// Most of the kernels below are f32-only in fact and said so nowhere: they
+/// size their output with `alloc_managed(n * 4)`, hardcode `1` in the dtype
+/// slot of the tensor they publish, and hand `t.data` to a `.f32` PTX kernel.
+/// Every dispatcher that reaches them branches on `device` alone. A 2-byte
+/// dtype (fp16, bf16) carries the same element COUNT in half the bytes, so
+/// such a kernel reads twice its operand's allocation — an out-of-bounds
+/// device read that returns plausible numbers instead of faulting, and whose
+/// result is then published as f32 and believed. `gpu_matmul_f32` has carried
+/// exactly this check since item 9; this generalises it to the other 40-odd
+/// sites, which had none.
+///
+/// `assert!`, never `debug_assert!`: this workspace has no `[profile.release]`
+/// section and no `debug-assertions` key anywhere, and CI ships release — a
+/// `debug_assert!` here would be a no-op in precisely the builds that matter.
+/// That trap was hit twice independently on 2026-07-30 (PRs #453 and #454).
+/// Panicking rather than the `eprintln! + process::abort()` idiom used
+/// elsewhere in this module is also what makes the refusal observable from a
+/// `#[should_panic]` test (`crates/nsl-runtime/tests/gpu_dtype_refusal.rs`);
+/// an `abort()` cannot be caught.
+///
+/// Compares against `DTYPE_F32`, never the literal `1`. The literal is what
+/// let the drift go unnoticed: `dtype == 1` reads as a magic number and greps
+/// as nothing, so nobody auditing "which paths assume f32" could find them.
+///
+/// `op` names the kernel or entry point (a trailing NUL from a PTX kernel-name
+/// literal is trimmed, so `kernel_name` can be passed through verbatim) and
+/// `role` names the operand's position, so a multi-operand kernel says which
+/// one is wrong instead of just that something is.
+#[cfg(feature = "cuda")]
+#[inline]
+pub(crate) fn assert_gpu_f32(t: &crate::tensor::NslTensor, op: &str, role: &str) {
+    assert!(
+        t.dtype == crate::tensor::DTYPE_F32,
+        "{}: {role} is f32-only (dtype {}); got dtype {}. This path sizes its \
+         buffers at 4 bytes per element and reads the operand as `*const f32`, \
+         so a narrower dtype would be read past the end of its allocation and \
+         returned as plausible wrong numbers rather than faulting. Widen the \
+         operand first (`nsl_tensor_to_f32`, or `.to(f32)` at NSL level); \
+         mixed-precision kernel dispatch is roadmap item 9 and is not \
+         implemented.",
+        op.trim_end_matches('\0'),
+        crate::tensor::DTYPE_F32,
+        t.dtype,
+    );
+}
+
 /// GPU elementwise binary op.
 /// Falls back to CPU on GPU OOM (transfers to CPU, computes, transfers back).
 #[cfg(feature = "cuda")]
@@ -3024,6 +3072,8 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
+    assert_gpu_f32(a, kernel_name, "lhs");
+    assert_gpu_f32(b, kernel_name, "rhs");
     if a.len != b.len || !a.is_contiguous() || !b.is_contiguous() {
         if let Some((prepared_a, prepared_b, free_a, free_b)) = gpu_prepare_binary_operands(a_ptr, b_ptr) {
             if prepared_a != a_ptr || prepared_b != b_ptr {
@@ -3134,6 +3184,7 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    assert_gpu_f32(a, kernel_name, "input");
     // The kernels index flat row-major; a zero-copy view (transpose/expand)
     // would be read as if contiguous — same stride-blindness class as the
     // tied-embedding matmul bug. Materialize first (on-device strided copy;
@@ -3303,6 +3354,13 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
 pub(crate) fn gpu_elementwise_unary_inplace(a_ptr: i64, ptx: &str, kernel_name: &str) {
     use crate::tensor::NslTensor;
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    // The FBIP arms that reach here (`nsl_tensor_relu` and its ~10 siblings in
+    // activation.rs) branch on `can_mutate_inplace_gpu()` alone, so the guard
+    // in the non-FBIP twin `gpu_elementwise_unary` does not cover them — and
+    // the in-place path is the one a freshly produced fp16/bf16 tensor takes,
+    // because a fresh tensor is uniquely owned. Every caller passes an
+    // `*_f32` kernel, which would overwrite twice the buffer in place.
+    assert_gpu_f32(a, kernel_name, "input");
     let n = a.len as usize;
 
     let mut a_data = a.data as u64;
@@ -3331,6 +3389,8 @@ pub(crate) fn gpu_elementwise_binary_inplace(a_ptr: i64, b_ptr: i64, ptx: &str, 
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
     assert_eq!(a.len, b.len, "GPU inplace elementwise: length mismatch");
+    assert_gpu_f32(a, kernel_name, "destination");
+    assert_gpu_f32(b, kernel_name, "rhs");
 
     let n = a.len as usize;
     let mut a_data = a.data as u64;
@@ -3358,6 +3418,7 @@ pub(crate) fn gpu_elementwise_binary_inplace(a_ptr: i64, b_ptr: i64, ptx: &str, 
 pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &str) {
     use crate::tensor::NslTensor;
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    assert_gpu_f32(a, kernel_name, "destination");
     let n = a.len as usize;
 
     let mut a_data = a.data as u64;
@@ -3384,6 +3445,11 @@ pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_n
 /// wrapper) — the ZeRO stage-2 scatter averages its staging buffer before
 /// unpacking, so byte-range CHUNKS of a tensor scale exactly once. Same
 /// kernel as `nsl_tensor_mul_scalar_inplace`'s device path (bit-exact).
+///
+/// PRECONDITION (unenforceable here): `dev` must address f32 elements.
+/// There is no `NslTensor` in this signature, so `assert_gpu_f32` cannot
+/// apply — the kernel reads `n` * 4 bytes from `dev` and the caller owns
+/// that guarantee.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_scale_raw_f32(dev: *mut std::ffi::c_void, n: usize, scalar: f32) {
     let mut a_data = dev as u64;
@@ -4640,6 +4706,7 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    assert_gpu_f32(a, kernel_name, "input");
     // Flat row-major kernel — materialize strided views first (see
     // gpu_elementwise_unary; same stride-blindness class as the
     // tied-embedding matmul bug).
@@ -4706,6 +4773,9 @@ pub(crate) fn gpu_backward_ternary(
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
     let c = unsafe { &*(c_ptr as *const NslTensor) };
+    assert_gpu_f32(a, kernel_name, "operand 0");
+    assert_gpu_f32(b, kernel_name, "operand 1");
+    assert_gpu_f32(c, kernel_name, "operand 2");
     assert!(
         a.len == b.len && a.len == c.len,
         "GPU ternary backward: length mismatch ({}, {}, {})",
@@ -4756,6 +4826,8 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
+    assert_gpu_f32(a, kernel_name, "grad");
+    assert_gpu_f32(b, kernel_name, "saved tensor");
     assert_eq!(a.len, b.len, "GPU backward: length mismatch between grad and saved tensors");
 
     let n = a.len as usize;
@@ -4849,6 +4921,7 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context("clamp_f32");
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    assert_gpu_f32(a, "clamp_f32", "input");
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4);
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
@@ -4896,6 +4969,7 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
 pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
     use crate::tensor::NslTensor;
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    assert_gpu_f32(a, "clamp_f32_inplace", "input");
     let n = a.len as usize;
 
     let mut a_data = a.data as u64;
@@ -4926,6 +5000,8 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     use crate::tensor::NslTensor;
     let a = unsafe { &*(grad as *const NslTensor) };
     let b = unsafe { &*(input as *const NslTensor) };
+    assert_gpu_f32(a, "clamp_backward_f32", "grad");
+    assert_gpu_f32(b, "clamp_backward_f32", "input");
     assert_eq!(a.len, b.len, "GPU clamp_backward: length mismatch");
 
     let n = a.len as usize;
@@ -4982,6 +5058,7 @@ pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
     use fused_kernels::LOG_SOFTMAX_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "log_softmax_f32", "input");
     let ndim = t.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
     let cols = shape_slice[ndim - 1] as u64;
@@ -5333,6 +5410,10 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 
     let weight = unsafe { &*(weight_ptr as *const NslTensor) };
     let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    // Weight only. `indices` is dtype-dispatched on its own further down
+    // (DTYPE_I32 vs the i64 default), so it is deliberately not routed
+    // through the f32 guard.
+    assert_gpu_f32(weight, "embedding_lookup", "weight");
 
     let vocab_size = unsafe { *weight.shape.add(0) } as u64;
     let embed_dim = unsafe { *weight.shape.add(1) } as u64;
@@ -5442,6 +5523,7 @@ pub(crate) fn gpu_embedding_backward(
 
     let grad = unsafe { &*(grad_ptr as *const NslTensor) };
     let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    assert_gpu_f32(grad, "embedding_backward", "grad");
 
     // A2 / M46: under deterministic mode, use the per-output-row kernel
     // (no atomics -> bit-identical to the CPU reference, run-to-run stable).
@@ -5538,6 +5620,7 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 
     let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
     let bias_ref = unsafe { &*(bias_ptr as *const NslTensor) };
+    assert_gpu_f32(tensor, "bias_add", "input");
 
     let rows = unsafe { *tensor.shape.add(0) } as u64;
     let cols = unsafe { *tensor.shape.add(1) } as u64;
@@ -5554,6 +5637,12 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         bias_ptr
     };
     let bias_gpu = unsafe { &*(bias_on_gpu as *const NslTensor) };
+    // Guarded AFTER the transfer, not before: a host-resident bias is
+    // legitimately f64 (CPU model params are f64) and
+    // `nsl_tensor_to_device` converts f64 -> f32 on the way to the
+    // device. It is the buffer the kernel actually reads that must be
+    // f32, and a 16-bit dtype survives that transfer verbatim.
+    assert_gpu_f32(bias_gpu, "bias_add", "bias");
 
     let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
@@ -5611,6 +5700,7 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
     use fused_kernels::SOFTMAX_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "softmax_f32", "input");
     let ndim = t.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
@@ -5669,6 +5759,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     use fused_kernels::SUM_DIM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "sum_dim_f32", "input");
     let ndim = t.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
@@ -5853,6 +5944,7 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
     use fused_kernels::GLOBAL_SUM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "global_sum_f32", "input");
     let n = t.len as u64;
 
     let out_data = inner::alloc_managed(4); // single f32
@@ -5907,6 +5999,7 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     use fused_kernels::TENSOR_STATS_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "tensor_stats_f32", "input");
     let n = t.len as u64;
     if n == 0 {
         return [0.0; 4];
@@ -5977,6 +6070,9 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
         .collect();
     if live.is_empty() {
         return 0.0;
+    }
+    for &p in &live {
+        assert_gpu_f32(NslTensor::from_ptr(p), "sum_sq_many_f32", "grad tensor");
     }
 
     // `nsl_sum_sq_f64_acc_f32`, not slot 3 of `nsl_tensor_stats_f32`: the stats
@@ -6071,6 +6167,7 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     use fused_kernels::TENSOR_STATS_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "tensor_sum_sq_f32", "input");
     let n = t.len as u64;
     if n == 0 {
         return 0.0;
@@ -6123,6 +6220,14 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
     use fused_kernels::{CE_BWD_COUNT_F32_PTX, CE_BWD_FINISH_F32_PTX};
 
     inner::set_oom_context("ce_backward_f32");
+    // Logits only. `targets_ptr` is an index tensor and `grad_out_ptr` is
+    // read through an explicit dtype match below, so both are deliberately
+    // outside the f32 guard.
+    assert_gpu_f32(
+        unsafe { &*(logits_ptr as *const NslTensor) },
+        "cross_entropy_backward_f32",
+        "logits",
+    );
     let sm = gpu_softmax_f32(logits_ptr);
     let smt = unsafe { &*(sm as *const NslTensor) };
     let ndim = smt.ndim as usize;
@@ -6340,6 +6445,10 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
 /// `scales_ptr`: device pointer to f32 scales array (num_heads entries)
 /// `n`: total number of elements
 /// `head_stride`: block_size * head_dim (elements per head)
+/// PRECONDITION (unenforceable here): every pointer argument is a bare
+/// device address with no `NslTensor` wrapper, so there is no dtype to
+/// check — `out_ptr` must address `n` f32 elements and `scales_ptr` f32
+/// scales. The check belongs at the NslTensor-holding caller.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_dequant_int8_per_head_f32(
     data_ptr: *const std::ffi::c_void,
@@ -6375,6 +6484,9 @@ pub(crate) fn gpu_dequant_int8_per_head_f32(
 }
 
 /// Dequantize INT8 per-token data on GPU.
+///
+/// PRECONDITION: as `gpu_dequant_int8_per_head_f32` — raw device pointers,
+/// f32 output and scales, no dtype available to assert on.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_dequant_int8_per_token_f32(
     data_ptr: *const std::ffi::c_void,
@@ -6413,6 +6525,9 @@ pub(crate) fn gpu_dequant_int8_per_token_f32(
 }
 
 /// Dequantize INT4 per-group data on GPU.
+///
+/// PRECONDITION: as `gpu_dequant_int8_per_head_f32` — raw device pointers,
+/// f32 output, scales and zero-points, no dtype available to assert on.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_dequant_int4_per_group_f32(
     data_ptr: *const std::ffi::c_void,
@@ -6451,6 +6566,9 @@ pub(crate) fn gpu_dequant_int4_per_group_f32(
 }
 
 /// Dequantize FP8 E4M3 data on GPU: bit-manipulation u8 → f32.
+///
+/// PRECONDITION: as `gpu_dequant_int8_per_head_f32` — raw device pointers,
+/// f32 output, no dtype available to assert on.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_dequant_fp8_e4m3_f32(
     data_ptr: *const std::ffi::c_void,
@@ -6492,6 +6610,7 @@ pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
     use fused_kernels::DET_GLOBAL_SUM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "det_global_sum_f32", "input");
     let n = t.len as u64;
 
     let out_data = inner::alloc_managed(4); // single f32
@@ -6545,6 +6664,7 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
     use fused_kernels::DET_SUM_DIM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "det_sum_dim_f32", "input");
     let ndim = t.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
@@ -6631,6 +6751,8 @@ pub(crate) fn gpu_det_scatter_add_f32(
     let input = NslTensor::from_ptr(input_ptr);
     let src = unsafe { &*(src_ptr as *const NslTensor) };
     let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    assert_gpu_f32(input, "det_scatter_add_f32", "destination");
+    assert_gpu_f32(src, "det_scatter_add_f32", "source");
 
     let input_ndim = input.ndim as usize;
     let input_shape = unsafe { std::slice::from_raw_parts(input.shape, input_ndim) };
@@ -6717,6 +6839,7 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     use fused_kernels::MAX_DIM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
+    assert_gpu_f32(t, "max_dim_f32", "input");
     let ndim = t.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
@@ -6793,6 +6916,7 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
     use fused_kernels::LAYERNORM_F32_PTX;
 
     let t = NslTensor::from_ptr(input_ptr);
+    assert_gpu_f32(t, "layernorm_f32", "input");
     let ndim = t.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
@@ -6806,6 +6930,8 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
 
     let g = NslTensor::from_ptr(gamma_ptr);
     let b = NslTensor::from_ptr(beta_ptr);
+    assert_gpu_f32(g, "layernorm_f32", "gamma");
+    assert_gpu_f32(b, "layernorm_f32", "beta");
 
     let mut in_data = t.data as u64;
     let mut out_data_u64 = out_data as u64;
@@ -6859,6 +6985,7 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
     use fused_kernels::RMSNORM_F32_PTX;
 
     let t = NslTensor::from_ptr(input_ptr);
+    assert_gpu_f32(t, "rmsnorm_f32", "input");
     let ndim = t.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
@@ -6871,6 +6998,7 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
     let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
 
     let g = NslTensor::from_ptr(gamma_ptr);
+    assert_gpu_f32(g, "rmsnorm_f32", "gamma");
 
     let mut in_data = t.data as u64;
     let mut out_data_u64 = out_data as u64;
@@ -6934,12 +7062,14 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     use fused_kernels::{RMSNORM_DGAMMA_F32_PTX, RMSNORM_RINV_ROWS_F32_PTX};
 
     let x = NslTensor::from_ptr(x_ptr);
+    assert_gpu_f32(x, "rmsnorm_dgamma_backward_f32", "x");
     let ndim = x.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
     let cols = shape_slice[ndim - 1] as u64;
     let rows = (x.len as u64) / cols;
 
     let g = NslTensor::from_ptr(gamma_ptr);
+    assert_gpu_f32(g, "rmsnorm_dgamma_backward_f32", "gamma");
     assert_eq!(
         g.len as u64, cols,
         "rmsnorm dgamma: gamma len {} != last dim {}",
@@ -6959,6 +7089,7 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     let rinv = inner::alloc_managed(rows as usize * 4);
 
     let dy = NslTensor::from_ptr(dy_ptr);
+    assert_gpu_f32(dy, "rmsnorm_dgamma_backward_f32", "dy");
     let mut dy_data = dy.data as u64;
     let mut x_data = x.data as u64;
     let mut rinv_u64 = rinv as u64;
@@ -7033,6 +7164,7 @@ pub(crate) fn gpu_rmsnorm_dx_backward_add_f32(
     use fused_kernels::RMSNORM_DX_BWD_ADD_F32_PTX;
 
     let x = NslTensor::from_ptr(x_ptr);
+    assert_gpu_f32(x, "rmsnorm_dx_backward_add_f32", "x");
     let ndim = x.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
     let cols = shape_slice[ndim - 1] as u64;
@@ -7056,6 +7188,9 @@ pub(crate) fn gpu_rmsnorm_dx_backward_add_f32(
     let dy = NslTensor::from_ptr(dy_ptr);
     let g = NslTensor::from_ptr(gamma_ptr);
     let r = NslTensor::from_ptr(res_ptr);
+    assert_gpu_f32(dy, "rmsnorm_dx_backward_add_f32", "dy");
+    assert_gpu_f32(g, "rmsnorm_dx_backward_add_f32", "gamma");
+    assert_gpu_f32(r, "rmsnorm_dx_backward_add_f32", "residual");
 
     let mut dy_data = dy.data as u64;
     let mut x_data = x.data as u64;
@@ -7106,6 +7241,7 @@ pub(crate) fn gpu_rmsnorm_dx_backward_f32(
     use fused_kernels::RMSNORM_DX_BWD_F32_PTX;
 
     let x = NslTensor::from_ptr(x_ptr);
+    assert_gpu_f32(x, "rmsnorm_dx_backward_f32", "x");
     let ndim = x.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
     let cols = shape_slice[ndim - 1] as u64;
@@ -7118,6 +7254,8 @@ pub(crate) fn gpu_rmsnorm_dx_backward_f32(
 
     let dy = NslTensor::from_ptr(dy_ptr);
     let g = NslTensor::from_ptr(gamma_ptr);
+    assert_gpu_f32(dy, "rmsnorm_dx_backward_f32", "dy");
+    assert_gpu_f32(g, "rmsnorm_dx_backward_f32", "gamma");
 
     let mut dy_data = dy.data as u64;
     let mut x_data = x.data as u64;
@@ -7173,6 +7311,7 @@ pub(crate) fn gpu_scatter_add_f32(
 
     let src = unsafe { &*(src_ptr as *const NslTensor) };
     let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    assert_gpu_f32(src, "scatter_add_f32", "source");
 
     let num_indices = unsafe { *indices.shape.add(0) } as u64;
     let embed_dim = unsafe { *src.shape.add(src.ndim as usize - 1) } as u64;
@@ -7335,6 +7474,7 @@ pub(crate) fn gpu_gather_dim_f32(
     use crate::tensor::NslTensor;
 
     let input = unsafe { &*(input_ptr as *const NslTensor) };
+    assert_gpu_f32(input, "gather_dim_f32", "input");
     let out_elems = (outer * inner_size) as usize;
     if out_elems == 0 {
         return std::ptr::null_mut();
@@ -7391,6 +7531,7 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
 
     let input = unsafe { &*(input_ptr as *const NslTensor) };
     let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    assert_gpu_f32(input, "gather_f32", "input");
 
     let input_rows = unsafe { *input.shape.add(0) } as u64;
     let inner_dim: u64 = if input.ndim >= 2 {
@@ -7493,6 +7634,7 @@ pub(crate) fn gpu_conv2d_f32(
 
     let input = unsafe { &*(input_ptr as *const NslTensor) };
     let weight = unsafe { &*(weight_ptr as *const NslTensor) };
+    assert_gpu_f32(input, "conv2d_f32", "input");
 
     let n = unsafe { *input.shape.add(0) } as u64;
     let c_in = unsafe { *input.shape.add(1) } as u64;
@@ -7526,6 +7668,11 @@ pub(crate) fn gpu_conv2d_f32(
         weight_ptr
     };
     let weight_gpu = unsafe { &*(weight_on_gpu as *const NslTensor) };
+    // weight/bias are guarded AFTER their transfer for the same reason as
+    // `gpu_bias_add`: a host-resident parameter is legitimately f64 and
+    // `nsl_tensor_to_device` narrows it to f32 in flight, while a 16-bit
+    // dtype survives verbatim and is what would be misread.
+    assert_gpu_f32(weight_gpu, "conv2d_f32", "weight");
 
     // Bias pointer (0 if no bias)
     let bias_data: u64 = if bias_ptr != 0 {
@@ -7533,10 +7680,12 @@ pub(crate) fn gpu_conv2d_f32(
         if bias.device == 0 {
             let bp = crate::tensor::nsl_tensor_to_device(bias_ptr, input.device as i64);
             let b = unsafe { &*(bp as *const NslTensor) };
+            assert_gpu_f32(b, "conv2d_f32", "bias");
             let d = b.data as u64;
             // We leak the bias transfer — acceptable for now
             d
         } else {
+            assert_gpu_f32(bias, "conv2d_f32", "bias");
             bias.data as u64
         }
     } else {
@@ -7607,6 +7756,7 @@ pub(crate) fn gpu_maxpool2d_f32(
     use fused_kernels::MAXPOOL2D_F32_PTX;
 
     let input = unsafe { &*(input_ptr as *const NslTensor) };
+    assert_gpu_f32(input, "maxpool2d_f32", "input");
 
     let n = unsafe { *input.shape.add(0) } as u64;
     let c = unsafe { *input.shape.add(1) } as u64;
@@ -7705,6 +7855,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     static DROPOUT_SEED: AtomicU64 = AtomicU64::new(42);
 
     let input = unsafe { &*(input_ptr as *const NslTensor) };
+    assert_gpu_f32(input, "dropout_f32", "input");
     let len = input.len as u64;
     let ndim = input.ndim;
 
@@ -7809,6 +7960,7 @@ pub(crate) fn gpu_slice_f32_with_shape(
     use fused_kernels::GPU_SLICE_F32_PTX;
 
     let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    assert_gpu_f32(t, "slice_f32_with_shape", "input");
     let ndim = t.ndim as usize;
 
     // Build output shape (same as source except dim has slice_len)
@@ -7886,6 +8038,7 @@ pub(crate) fn gpu_slice_f32_with_shape(
 pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    assert_gpu_f32(b, "csr_spmm_f32", "dense operand");
     let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
@@ -7968,6 +8121,7 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
 pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    assert_gpu_f32(b, "coo_spmm_f32", "dense operand");
     let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
@@ -8038,6 +8192,7 @@ pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
 pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let x = unsafe { &*(vec_ptr as *const NslTensor) };
+    assert_gpu_f32(x, "csr_spmv_f32", "dense vector");
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
 
@@ -8113,6 +8268,7 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
 pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    assert_gpu_f32(b, "bsr_spmm_f32", "dense operand");
     let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
     let m = sparse.rows as usize;
     let br = sparse.block_rows as usize;
@@ -8204,6 +8360,7 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
 pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let x = unsafe { &*(vec_ptr as *const NslTensor) };
+    assert_gpu_f32(x, "coo_spmv_f32", "dense vector");
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
 
@@ -8287,6 +8444,7 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
     use fused_kernels::CSR_SPMM_F32_PTX;
 
     let b = unsafe { &*(b_ptr as *const NslTensor) };
+    assert_gpu_f32(b, "sparse_matmul_csr_f32", "dense operand");
     // B must be 2D: [K, N]
     let last_dim = if b.ndim >= 2 {
         unsafe { *b.shape.add(b.ndim as usize - 1) }
@@ -8371,6 +8529,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     use fused_kernels::STRIDED_COPY_F32_PTX;
 
     let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    assert_gpu_f32(t, "strided_copy_f32", "input");
     let ndim = t.ndim as usize;
     let total = t.len as u64;
 
@@ -8651,6 +8810,300 @@ pub extern "C" fn test_detect_sm_version() -> u32 {
 #[no_mangle]
 pub extern "C" fn test_detect_sm_version() -> u32 {
     0
+}
+
+/// Static drift gate for the f32-only assumption in this module.
+///
+/// Deliberately NOT `#[cfg(feature = "cuda")]`, unlike the `mod tests` below.
+/// `mod cuda` itself is compiled unconditionally (`lib.rs:90`) — only its
+/// items are feature-gated — so a plain `#[cfg(test)]` module here runs under
+/// `cargo test -p nsl-runtime --lib`, i.e. inside `cargo test --workspace`
+/// (`.github/workflows/ci.yml:59`), on a machine with no GPU and no CUDA
+/// toolkit. That is the whole point: every other check in this area needs
+/// hardware, so it only runs in the nightly cert lane, and a regression is
+/// invisible for a day. This one reddens the ordinary CPU lane on the commit
+/// that introduces it.
+///
+/// It reads this file as text rather than inspecting behaviour because the
+/// sites are enumerable — ~45 functions in one file — and #453's lesson was
+/// to prefer a static drift gate over a runtime assert when they are.
+#[cfg(test)]
+mod dtype_guard_drift {
+    /// Functions this gate deliberately does not require a guard in, each
+    /// with the reason.
+    ///
+    /// An entry is a CLAIM that gets re-checked below, not a suppression: if
+    /// the function is renamed or deleted, stops looking f32-shaped, or grows
+    /// a dtype guard of its own, the entry goes stale and the gate fails
+    /// until it is removed. Without that reverse check an allowlist only ever
+    /// grows, and a line added to silence one refactor keeps silencing every
+    /// later one — which is how an exemption table stops being a record of
+    /// decisions and becomes a place bugs hide.
+    const NO_DTYPE_TENSOR: &[(&str, &str)] = &[
+        (
+            "gpu_scale_raw_f32",
+            "bare *mut c_void device buffer, no NslTensor and so no dtype to read; \
+             the ZeRO scatter caller owns the precondition",
+        ),
+        (
+            "gpu_scalar_mul_add_inplace_f32",
+            "operands validated by the caller at arithmetic.rs:906 before the \
+             device dispatch",
+        ),
+        (
+            "gpu_fase_fused_adamw_step",
+            "theta/m/v/mp validated f32 by the caller at fase_step.rs:137-141",
+        ),
+        (
+            "gpu_fase_fused_adamw_step_multi",
+            "bucket members are admitted only when dtype == DTYPE_F32 \
+             (fase_step.rs:76 and :471), so a non-f32 parameter never reaches a bucket",
+        ),
+        (
+            "gpu_relu_backward",
+            "three-line delegator to gpu_backward_binary, which guards both operands \
+             and names this kernel in the message",
+        ),
+        (
+            "gpu_sigmoid_backward",
+            "delegator to gpu_backward_binary, guarded there",
+        ),
+        (
+            "gpu_tanh_backward",
+            "delegator to gpu_backward_binary, guarded there",
+        ),
+        (
+            "gpu_gelu_backward",
+            "delegator to gpu_backward_binary, guarded there",
+        ),
+        (
+            "gpu_silu_backward",
+            "delegator to gpu_backward_binary, guarded there",
+        ),
+        (
+            "gpu_dequant_int8_per_head_f32",
+            "raw device pointers only; the dtype belongs to the quantized source \
+             and is checked at the NslTensor-holding caller",
+        ),
+        (
+            "gpu_dequant_int8_per_token_f32",
+            "raw device pointers only, as gpu_dequant_int8_per_head_f32",
+        ),
+        (
+            "gpu_dequant_int4_per_group_f32",
+            "raw device pointers only, as gpu_dequant_int8_per_head_f32",
+        ),
+        (
+            "gpu_dequant_fp8_e4m3_f32",
+            "raw device pointers only, as gpu_dequant_int8_per_head_f32",
+        ),
+        (
+            "gpu_fase_fused_adamw_step_bf16sr",
+            "the BF16 stochastic-rounding step: its parameter buffer is bf16 BY \
+             DESIGN and the kernel reads it as such",
+        ),
+        (
+            "gpu_sr_bf16_round_probe",
+            "bf16 rounding probe — bf16 input is the subject of the test, not a bug",
+        ),
+        (
+            "gpu_cast_raw",
+            "the precision-cast launcher: raw src/dst device addresses whose widths \
+             are the cast's two endpoints, so f32 on both sides would be the bug",
+        ),
+        (
+            "nsl_kernel_launch",
+            "user-supplied PTX with user-supplied arguments; NSL has no way to know \
+             what element width the caller's kernel reads",
+        ),
+        (
+            "nsl_kernel_launch_tensors",
+            "as nsl_kernel_launch — the tensors are marshalled as opaque device \
+             pointers into a kernel this runtime did not write",
+        ),
+    ];
+
+    /// Split this file into top-level function items.
+    ///
+    /// Column-0 anchored, and the body ends at the first column-0 `}` — the
+    /// same brace-free heuristic the sibling PTX-registration gates use.
+    /// Functions nested inside `mod inner` are therefore NOT scanned, which
+    /// is correct: `inner` is the raw driver-API layer and holds no
+    /// `NslTensor`, so it has no dtype to assert on in the first place.
+    fn top_level_fns(source: &str) -> Vec<(&str, usize, String)> {
+        let lines: Vec<&str> = source.lines().collect();
+        // Stop before the test modules so this gate does not scan itself.
+        let end = lines
+            .iter()
+            .position(|l| l.starts_with("#[cfg(test)]") || l.starts_with("#[cfg(all(test"))
+            .unwrap_or(lines.len());
+
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < end {
+            let line = lines[i];
+            let rest = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let rest = rest.strip_prefix("unsafe ").unwrap_or(rest);
+            let rest = rest.strip_prefix("extern \"C\" ").unwrap_or(rest);
+            let Some(after) = rest.strip_prefix("fn ") else {
+                i += 1;
+                continue;
+            };
+            let name_len = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(after.len());
+            if name_len == 0 {
+                i += 1;
+                continue;
+            }
+            let name = &after[..name_len];
+            let mut j = i;
+            while j < end && lines[j] != "}" {
+                j += 1;
+            }
+            out.push((name, i + 1, lines[i..=j.min(end - 1)].join("\n")));
+            i = j + 1;
+        }
+        out
+    }
+
+    /// A function is "f32-shaped" if its body sizes a device allocation at 4
+    /// bytes per element, names an `*_f32` PTX kernel, or launches a kernel
+    /// at all.
+    ///
+    /// The third rule is not redundant. `gpu_elementwise_unary_inplace` and
+    /// its two siblings take the kernel name as a PARAMETER, so the `_f32`
+    /// literal lives at ~25 call sites in activation.rs / arithmetic.rs and
+    /// not in the function that reads the tensor. The first draft of this
+    /// gate missed exactly those three, which are the FBIP arms — the ones a
+    /// freshly produced (and therefore uniquely owned) fp16/bf16 tensor
+    /// actually takes.
+    ///
+    /// Loose on purpose: a false positive costs one allowlist line with a
+    /// reason, a false negative costs an out-of-bounds device read that
+    /// returns plausible numbers.
+    fn is_f32_shaped(body: &str) -> bool {
+        let sizes_at_four =
+            (body.contains("alloc_managed(") || body.contains("try_alloc_managed("))
+                && body.contains("* 4");
+        let names_an_f32_kernel = body.contains("_f32\\0");
+        let launches_a_kernel = body.contains("kernel_launch(");
+        sizes_at_four || names_an_f32_kernel || launches_a_kernel
+    }
+
+    /// Accepts either the shared helper or a hand-rolled dtype comparison —
+    /// the point is that the function looked at the dtype at all, not which
+    /// spelling it used.
+    fn has_dtype_guard(body: &str) -> bool {
+        body.contains("assert_gpu_f32(") || body.contains(".dtype ==") || body.contains(".dtype !=")
+    }
+
+    /// Every f32-assuming function in this module either checks the dtype it
+    /// is about to read as f32, or is listed above with a reason.
+    ///
+    /// The bug this exists for: `nsl_tensor_contiguous` and `nsl_tensor_slice`
+    /// routed EVERY device tensor to an f32 kernel on `device > 0` alone,
+    /// while their own CPU arms had been dtype-correct for years. Nothing
+    /// caught it because there is no build in CI that both compiles this
+    /// module and runs a non-f32 GPU tensor through it — `cargo clippy
+    /// --workspace` has no `--features cuda`, and `cargo build --workspace
+    /// --features cuda` compiles no test target. A text scan is the only
+    /// check that survives that gap.
+    #[test]
+    fn every_f32_assuming_fn_checks_its_operand_dtype() {
+        let source = include_str!("mod.rs");
+        let fns = top_level_fns(source);
+
+        assert!(
+            fns.len() > 80,
+            "the top-level fn parser found only {} functions in cuda/mod.rs; the \
+             declaration style must have changed and this gate is now scanning \
+             almost nothing",
+            fns.len()
+        );
+
+        // The reason column is the only thing that makes an exemption
+        // reviewable, so it has to be load-bearing rather than a field nobody
+        // reads: an entry added with `""` to make this test go green would
+        // otherwise be indistinguishable from a considered decision.
+        for (name, reason) in NO_DTYPE_TENSOR {
+            assert!(
+                reason.len() >= 30,
+                "NO_DTYPE_TENSOR entry for `{name}` has no real reason \
+                 ({reason:?}); say WHY the f32 assumption is safe or where the \
+                 check actually lives"
+            );
+        }
+
+        let allowed: std::collections::HashMap<&str, &str> =
+            NO_DTYPE_TENSOR.iter().copied().collect();
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut guarded = 0usize;
+        let mut exempt_and_still_shaped: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+
+        for (name, line, body) in &fns {
+            if !is_f32_shaped(body) {
+                continue;
+            }
+            if has_dtype_guard(body) {
+                guarded += 1;
+                continue;
+            }
+            if allowed.contains_key(name) {
+                exempt_and_still_shaped.insert(name);
+                continue;
+            }
+            missing.push(format!(
+                "  {name} (cuda/mod.rs:{line}) — add `crate::cuda::assert_gpu_f32(t, \
+                 \"{name}\", \"<operand>\")` at the head of the function, or add\n        \
+                 (\"{name}\", \"<one-line reason>\"),\n      to NO_DTYPE_TENSOR"
+            ));
+        }
+
+        assert!(
+            missing.is_empty(),
+            "{} function(s) in cuda/mod.rs size buffers at 4 bytes per element or launch \
+             an *_f32 kernel without ever looking at the operand's dtype. A 2-byte dtype \
+             (fp16/bf16) there is read past the end of its allocation and returns \
+             plausible wrong numbers:\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+
+        // Anti-vacuity. A gate whose detector silently stops matching passes
+        // just as quietly as one whose subject is correct, and the failure
+        // mode of a renamed helper is exactly that. 48 of the 66 f32-shaped
+        // functions carried a guard when this was written; the floor is set
+        // below that with room for a few to be refactored away, and is meant
+        // to be RAISED, never lowered.
+        assert!(
+            guarded >= 40,
+            "only {guarded} f32-assuming functions carry a dtype guard, out of {} \
+             that look f32-shaped; the guard helper or one of the detection \
+             needles must have been renamed, because 48 were guarded when this \
+             gate was written",
+            fns.iter().filter(|(_, _, b)| is_f32_shaped(b)).count()
+        );
+
+        // Reverse direction: an allowlist entry that no longer describes a
+        // real, still-unguarded, still-f32-shaped function is a stale claim.
+        let stale: Vec<&str> = NO_DTYPE_TENSOR
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !exempt_and_still_shaped.contains(name))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "NO_DTYPE_TENSOR entries that no longer apply — the function was renamed \
+             or deleted, stopped being f32-shaped, or grew a dtype guard of its own. \
+             Delete them: {stale:?}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]

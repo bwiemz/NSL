@@ -25,16 +25,21 @@
 # Usage:
 #   scripts/gpu-cert.sh --list                  inventory as TSV, no build
 #   scripts/gpu-cert.sh --check-inventory       drift gate (GPU-free, for CI)
+#   scripts/gpu-cert.sh --check-long-arms       timeout-override gate (GPU-free)
 #   scripts/gpu-cert.sh --write-manifest        refresh the committed manifest
 #   scripts/gpu-cert.sh --run [--tier TIER]     build + execute the lane
 #
 # --run honours:
 #   NSL_CERT_TIER      gpu | toolchain | multiproc | isolate | all  (default: gpu)
-#   NSL_CERT_TIMEOUT   PER-GATE timeout in seconds (default: 1200)
+#   NSL_CERT_TIMEOUT   PER-GATE timeout in seconds (default: 1200). Targets
+#                      named in ci/gpu-cert-long-arms.txt get the LARGER of
+#                      this and their entry -- the full-training gates need
+#                      ~1800s, and when the budget is short the gate reports
+#                      TIMEOUT, which reads identically to a hung kernel.
 #   NSL_CERT_BATCH_TIMEOUT
 #                      ceiling for a target's batched run, which carries ALL of
-#                      that target's gates in one `cargo test` (default: 5400).
-#                      The batched budget is NSL_CERT_TIMEOUT x gate-count,
+#                      that target's gates in one `cargo test` (default: 3600).
+#                      The batched budget is the per-gate value x gate-count,
 #                      clamped to this. One shared number served both roles,
 #                      which is wrong in principle -- a target's batch has to
 #                      fit every gate it carries, a single rerun only one -- and
@@ -80,6 +85,7 @@ cd "${ROOT}"
 AWK_RULES="scripts/gpu-gate-inventory.awk"
 MANIFEST="ci/gpu-cert-manifest.tsv"
 KNOWN_RED="ci/gpu-cert-known-red.txt"
+LONG_ARMS="ci/gpu-cert-long-arms.txt"
 
 # `cuda` alone is NOT enough to reach every gate. Seven gates live in files
 # whose whole module is cfg'd on an extra feature — `test-hooks` (cuBLAS
@@ -224,6 +230,105 @@ cmd_check_inventory() {
     echo "gpu-cert: inventory agrees with source ($(grep -cv '^#' "${MANIFEST}") gates)"
 }
 
+# ---------------------------------------------------------------------------
+# Per-target timeout overrides (ci/gpu-cert-long-arms.txt)
+# ---------------------------------------------------------------------------
+
+# Populate LONG_ARM, keyed by the same target key `cmd_run` groups gates under
+# (the newline-joined `target_args` output), so the lookup at launch time is a
+# plain array hit with no path handling.
+#
+# Several source files collapse onto one `--lib` target, so the entries are
+# unioned with max() rather than last-wins: a target inherits the longest
+# budget any of its files asked for. Silently taking the last would make the
+# effective value depend on file order in the data file.
+# A target key ("-p nsl-cli --test foo ") as a filename. Kept to [A-Za-z0-9._-]
+# so the result is safe on every filesystem the artifact is unpacked on.
+slugify() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | sed 's/__*/_/g; s/^_//; s/_$//'
+}
+
+declare -A LONG_ARM=()
+load_long_arms() {
+    LONG_ARM=()
+    [[ -f "${LONG_ARMS}" ]] || return 0
+    local file secs key cur
+    while IFS=$'\t' read -r file secs; do
+        case "${file}" in ''|'#'*) continue ;; esac
+        [[ -n "${secs}" ]] || continue
+        key="$(target_args "${file}" | tr '\n' ' ')"
+        cur="${LONG_ARM[${key}]:-0}"
+        if [[ "${secs}" -gt "${cur}" ]]; then
+            LONG_ARM["${key}"]="${secs}"
+        fi
+    done < "${LONG_ARMS}"
+}
+
+# Effective budget for a target: MAX of the global setting and any override.
+# Max, not override — see the file header. An operator raising
+# NSL_CERT_TIMEOUT for a debugging sweep must not be shortened by this table.
+timeout_for() {
+    local key="$1" base="$2" over
+    over="${LONG_ARM[${key}]:-0}"
+    if [[ "${over}" -gt "${base}" ]]; then printf '%s' "${over}"; else printf '%s' "${base}"; fi
+}
+
+# GPU-FREE validation of ci/gpu-cert-long-arms.txt, for the CI inventory job.
+#
+# Without this the file goes inert on the first test-file rename: the key stops
+# matching any target, the override silently stops applying, and the gate
+# starts reporting TIMEOUT again with nothing pointing at the cause. Checking
+# column 1 against the manifest is the same trick `--check-inventory` uses to
+# keep the manifest honest, applied one file over.
+cmd_check_long_arms() {
+    if [[ ! -f "${LONG_ARMS}" ]]; then
+        echo "gpu-cert: ${LONG_ARMS} is missing" >&2
+        exit 1
+    fi
+    if [[ ! -f "${MANIFEST}" ]]; then
+        echo "gpu-cert: ${MANIFEST} is missing — run --write-manifest" >&2
+        exit 1
+    fi
+    # Paths the lane actually executes. A path in a non-run class (broken,
+    # diagnostic, unclassified) would never be launched, so an override on it
+    # is dead weight that reads as coverage.
+    local runnable
+    runnable="$(awk -F'\t' '
+        $3 ~ /^(gpu|gpu-inferred|toolchain|multiproc|isolate)$/ { print $1 }
+    ' "${MANIFEST}" | sort -u)"
+
+    local n=0 lineno=0 file secs bad=0
+    while IFS= read -r raw; do
+        lineno=$((lineno + 1))
+        case "${raw}" in ''|'#'*) continue ;; esac
+        # Exactly two tab-separated fields, no more.
+        if [[ "$(awk -F'\t' '{print NF}' <<< "${raw}")" != "2" ]]; then
+            echo "gpu-cert: ${LONG_ARMS}:${lineno}: expected 2 tab-separated fields: ${raw}" >&2
+            bad=1; continue
+        fi
+        file="$(cut -f1 <<< "${raw}")"
+        secs="$(cut -f2 <<< "${raw}")"
+        if ! [[ "${secs}" =~ ^[0-9]+$ ]]; then
+            echo "gpu-cert: ${LONG_ARMS}:${lineno}: '${secs}' is not an integer" >&2
+            bad=1; continue
+        fi
+        if [[ "${secs}" -le 900 || "${secs}" -gt 7200 ]]; then
+            echo "gpu-cert: ${LONG_ARMS}:${lineno}: ${secs}s outside (900, 7200] — at or below" >&2
+            echo "          900 the default already applies and the row is noise." >&2
+            bad=1; continue
+        fi
+        if ! grep -qxF "${file}" <<< "${runnable}"; then
+            echo "gpu-cert: ${LONG_ARMS}:${lineno}: '${file}' is not a run-class row in" >&2
+            echo "          ${MANIFEST} — renamed, deleted, or never executed. The" >&2
+            echo "          override is inert; fix the path or drop the line." >&2
+            bad=1; continue
+        fi
+        n=$((n + 1))
+    done < "${LONG_ARMS}"
+    [[ "${bad}" -eq 0 ]] || exit 1
+    echo "gpu-cert: ${n} long-arm timeout override(s) valid"
+}
+
 # PREFLIGHT — the lane's most important guard.
 #
 # 55 of the run-class test files gate their body on a `cuda_available()` helper
@@ -280,6 +385,18 @@ cmd_run() {
     local batch_cap="${NSL_CERT_BATCH_TIMEOUT:-3600}"
     local out="${NSL_CERT_OUT:-${CARGO_TARGET_DIR:-target}/gpu-cert-report.tsv}"
     mkdir -p "$(dirname "${out}")"
+
+    # Durable per-gate logs beside the report. Everything the run produced used
+    # to live in a mktemp dir that the EXIT trap deleted, so a failing gate left
+    # exactly the three grep'd lines below in an Actions log that expires long
+    # before the 90-day artifact — and a target that listed ZERO gates left no
+    # diagnostic anywhere at all. Written only for non-PASS outcomes, so a green
+    # sweep costs nothing.
+    local logdir
+    logdir="$(dirname "${out}")/logs"
+    mkdir -p "${logdir}"
+
+    load_long_arms
 
     local wanted
     wanted="$(classes_for_tier "${tier}")"
@@ -381,7 +498,20 @@ cmd_run() {
 
         if [[ "${nsel}" -eq 0 ]]; then
             echo "  [${key}] 0 of ${#wanted_fns[@]} gate(s) listed — NOTFOUND"
+            # A target listing nothing is usually a BUILD failure in the
+            # `--ignored --list` step, not an absent gate — and that error text
+            # was previously discarded, so the whole target arrived as silent
+            # mass-NOTFOUND. Keep it.
+            if [[ -s "${tmpdir}/list.err" ]]; then
+                tail -c 200000 "${tmpdir}/list.err" > "${logdir}/$(slugify "${key}").list.err"
+            fi
             continue
+        fi
+
+        local tmo
+        tmo="$(timeout_for "${key}" "${timeout_s}")"
+        if [[ "${tmo}" != "${timeout_s}" ]]; then
+            echo "      timeout ${tmo}s (long-arm override; default ${timeout_s}s)"
         fi
 
         # A target holding an `isolate` gate skips batching entirely and goes
@@ -395,7 +525,7 @@ cmd_run() {
         # The batched run carries EVERY gate of this target, so its budget is
         # per-gate x count (clamped): a single per-gate number applied here
         # silently caps the whole target.
-        local batch_to=$(( timeout_s * nsel ))
+        local batch_to=$(( tmo * nsel ))
         if (( batch_to > batch_cap )); then batch_to="${batch_cap}"; fi
         echo "  [${key}] ${nsel} gate(s) (budget ${batch_to}s)"
         set +e
@@ -437,11 +567,17 @@ cmd_run() {
         # Only failing targets pay this cost, so a green sweep stays fast.
         # (An isolate-class target arrives here unconditionally — by design.)
         echo "      running ${nsel} gate(s) individually (one process each)"
+        # The batch output is the only record of a failure that does NOT
+        # reproduce in isolation (a gate poisoned by an earlier crash in the
+        # same process). Keep it before the per-gate loop overwrites nothing —
+        # `one.txt` is a different file, but the batch log was previously
+        # discarded with the scratch dir either way.
+        tail -c 200000 "${tmpdir}/out.txt" > "${logdir}/$(slugify "${key}").batch.log" 2>/dev/null || true
         local fn rc1 st1
         for fn in "${selected[@]}"; do
             set +e
             t1=${SECONDS}
-            timeout --signal=KILL "${timeout_s}" \
+            timeout --signal=KILL "${tmo}" \
                 cargo test "${args[@]}" "${featarg[@]}" -- \
                 --ignored --exact "${fn}" --test-threads=1 \
                 < /dev/null > "${tmpdir}/one.txt" 2>&1
@@ -457,12 +593,29 @@ cmd_run() {
                 echo "      FAIL ${fn}"
                 grep -E "^(thread .* panicked|assertion|error)" "${tmpdir}/one.txt" \
                     | head -3 | sed 's/^/           | /' || true
+                tail -c 200000 "${tmpdir}/one.txt" \
+                    > "${logdir}/$(slugify "${key}")__${fn}.log" 2>/dev/null || true
             fi
         done
     done <<< "${targets}"
 
     echo ""
+    # Bank the resolved configuration next to the report. Reading a 90-day-old
+    # artifact otherwise leaves no way to tell whether a gate ran at 900s or
+    # 1800s, or under which feature set — both of which change what a TIMEOUT
+    # or NOTFOUND row means.
+    {
+        echo "tier	${tier}"
+        echo "default_timeout_s	${timeout_s}"
+        echo "features	${CERT_FEATURES}"
+        local k
+        for k in "${!LONG_ARM[@]}"; do
+            echo "long_arm	${k}	${LONG_ARM[${k}]}"
+        done
+    } > "$(dirname "${out}")/run-metadata.tsv"
+
     echo "gpu-cert: report -> ${out}"
+    echo "gpu-cert: per-gate logs -> ${logdir}"
     awk -F'\t' '{ c[$3]++ } END { for (k in c) printf "  %-8s %d\n", k, c[k] }' "${out}"
 
     # RECONCILE (review finding F6). Every selected gate must appear in the
@@ -512,6 +665,7 @@ case "$1" in
     --list)            cmd_list ;;
     --write-manifest)  cmd_write_manifest ;;
     --check-inventory) cmd_check_inventory ;;
+    --check-long-arms) cmd_check_long_arms ;;
     --run)
         shift
         if [[ "${1:-}" == "--tier" ]]; then

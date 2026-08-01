@@ -33,6 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::wengert::{PrimalOp, VarId, WengertList, WengertOp, WengertType, type_for_op};
 use crate::CodegenError;
 
@@ -503,6 +504,9 @@ fn plan_impl(
             "[ccr] --checkpoint-blocks requested but the tape has no \
              `blocks.N`-style parameters; running without checkpointing"
         );
+        crate::pass_trace::record_disposition("CCR", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("the tape has no blocks.N-style parameters"),
+        });
         return None;
     }
     block_keys.sort_by_key(|k| block_ordinal(k).unwrap_or(u64::MAX));
@@ -529,6 +533,9 @@ fn plan_impl(
     }
     if anchors.is_empty() {
         eprintln!("[ccr] no block params are consumed; running without checkpointing");
+        crate::pass_trace::record_disposition("CCR", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("no block params are consumed"),
+        });
         return None;
     }
     for w in anchors.windows(2) {
@@ -539,6 +546,15 @@ fn plan_impl(
                  expected; refusing to checkpoint (running unchanged)",
                 w[0].0, w[0].1, w[1].0, w[1].1
             );
+            // Not `NoCandidates`: there ARE candidates, and the refusal is
+            // the repo's transformation-precondition rule doing its job. The
+            // stderr line above carries the offending pair; the disposition
+            // carries the category a gate can assert on.
+            crate::pass_trace::record_disposition("CCR", PassDisposition::Declined {
+                reason: DeclineReason::PreconditionViolated(
+                    "block anchors are not strictly increasing",
+                ),
+            });
             return None;
         }
     }
@@ -701,6 +717,9 @@ fn plan_impl(
 
     if recompute.is_empty() && compress.is_empty() {
         eprintln!("[ccr] nothing recomputable found; running without checkpointing");
+        crate::pass_trace::record_disposition("CCR", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("nothing recomputable in any block segment"),
+        });
         return None;
     }
     let free_eligible = recompute
@@ -713,6 +732,18 @@ fn plan_impl(
                 .unwrap_or(false)
         })
         .collect();
+    // `segments.len()` is the number of block spans that will actually be
+    // checkpointed — post-thinning, so under `--checkpoint-stride 3` on a
+    // 16-block model this is 6, not 16. The full anchor count (the "of 16"
+    // denominator) is deliberately not carried: `Applied` holds one scalar,
+    // and the number worth having is the one that says what the build does.
+    //
+    // Under `--checkpoint-stride auto` this runs once per candidate stride,
+    // so the last-wins merge in `record_disposition` is load-bearing here —
+    // the reported count belongs to the stride the search settled on.
+    crate::pass_trace::record_disposition("CCR", PassDisposition::Applied {
+        rewrites: segments.len(),
+    });
     Some(CcrPlan {
         segments,
         recompute,

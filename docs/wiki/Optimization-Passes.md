@@ -77,6 +77,33 @@ The optimization passes that operate on the `WengertList` run inside `compile_tr
 
 **Pass ordering is load-bearing.** FASE planning reads `wggo_overrides` from the compiler state, which is set by a prior WGGO run — on a fresh first-pass compile, FASE falls back to `fase::plan` (no overrides). CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT hard-depends on WGGO: if `--wggo` is absent, `cpdt_plan` remains `None`. The memory planner (M36) must run after `compile_user_functions` and before `compile_main`; reversing this order means the slab-initialization call is emitted before the plan is computed.
 
+## Observing which passes ran (`NSL_PASS_TRACE`)
+
+Set `NSL_PASS_TRACE=1` on any `nsl build` / `nsl run` / `nsl check` / `nsl test` and the compiler prints a `[pass-trace]` report to **stderr** just before it exits. It answers two questions the pass registry cannot: *was this pass reached*, and *what did it do*.
+
+```
+$ NSL_PASS_TRACE=1 nsl run --source-ad --wggo full model.nsl
+[pass-trace] 2 pass(es) ran: WGGO(OnWengert) -> FASE(PreExtraction)
+[pass-trace] did not run: CCR, CSHA, WRGA, CPDT, PCA, CPKD, CEP, CFIE, MemoryPlanner
+[pass-trace] WGGO: applied, 3 rewrite(s)
+[pass-trace] FASE: applied, 2 rewrite(s)
+```
+
+The three kinds of line, and why each exists:
+
+- **`N pass(es) ran: …`** — the passes actually reached, in first-invocation order, each tagged with its declared `PipelineStage`. A flag that enables a pass which never runs produces a clean, plausible, wrong build; this line is what makes that visible.
+- **`did not run: …`** — the registered passes that were never reached. The absence is the interesting half: a report showing only what happened would make "nothing ran" indistinguishable from "the trace is broken".
+- **`NAME: <disposition>`** — one line per pass that reported an *effect*. `applied, N rewrite(s)`; `declined, <category> - <detail>` where the category is one of `mode off` / `no candidates` / `precondition violated` / `feature disabled` / `budget infeasible`; or `advisory only` for a pass that produces a report nothing consumes (CEP's architecture search, CPKD's build report).
+
+The distinction between the second and third kinds is the point of the disposition. Before it, "CSHA did not run" and "CSHA ran and found no attention chain it could fuse" were the same line, and only one of them is a bug. A pass that changed nothing reports a **decline with a reason**, never `applied, 0` — a hard-coded zero is exactly what a broken counter looks like, so zero is not how "nothing happened" is spelled.
+
+Two things the trace deliberately does not do:
+
+- It does **not** infer effect from invocation. `nsl check --training-report` builds its report BY running the FASE and PCA planners, so those are reported as having run — accurate under this definition, but "ran" must not be read as "affected the emitted program". The disposition line is what says that.
+- It does **not** change the build. The whole mechanism is two compiler-side vectors of `Copy` data; nothing is emitted into the compiled program. `crates/nsl-cli/tests/pass_trace_gate.rs` pins that by comparing loss streams with the trace on and off.
+
+Implementation: [`crates/nsl-codegen/src/pass_trace.rs`](../../crates/nsl-codegen/src/pass_trace.rs), printed from `emit_pass_trace` in [`crates/nsl-cli/src/commands/build/mod.rs`](../../crates/nsl-cli/src/commands/build/mod.rs).
+
 ## Per-pass descriptions
 
 ### CCR — Compiler-Chosen Recomputation
@@ -242,7 +269,9 @@ Promoted from internal engineering notes. Violations of any of these have caused
 6. Register the pass invocation in the correct sequence inside `compile_train_block` in [`crates/nsl-codegen/src/stmt.rs`](../../crates/nsl-codegen/src/stmt.rs), following the ordering above.
 7. If the pass interacts with memory planning, re-verify the 0 MB/step target using [`memory_timeline.rs`](../../crates/nsl-codegen/src/profiling/memory_timeline.rs) and the `--memory-report` flag.
 8. Surface diagnostic output via a `[<passname>]` prefix on stderr (matching the `[wggo]`, `[csha]`, `[wrga]`, `[cpdt]`, `[fase]` conventions already established) gated behind `--<passname>-report`.
+9. Add a `PassDescriptor` to [`crates/nsl-codegen/src/pass_registry.rs`](../../crates/nsl-codegen/src/pass_registry.rs) and a `### ` section under "Per-pass descriptions" above. The drift gates in `pass_registry_drift.rs` check both directions, so a pass that skips this fails CI rather than going undocumented.
+10. Call `pass_trace::record("NAME")` at the pass's **entry** and `pass_trace::record_disposition("NAME", …)` at **every exit**, including the ones that decline. Both are required and neither substitutes for the other: `record` answers "was it reached", the disposition answers "what did it do", and a decline that reports nothing is indistinguishable from a flag that never arrived. Keep the name argument on the same line as the call — the static scan in `pass_registry_drift.rs` is line-based, and both its site-count floors will fail if an exit loses its disposition.
 
 ---
 
-*Last structurally verified against commit `9a1b512e` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
+*Last structurally verified against commit `1d348624` on 2026-07-31. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*

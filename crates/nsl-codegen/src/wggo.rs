@@ -20,6 +20,7 @@
 use serde::Serialize;
 
 use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::wengert::WengertList;
 use crate::wggo_apply::{apply, AppliedPlan};
 use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
@@ -551,6 +552,15 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
             peak_memory_bytes: 0,
         };
         let schedule = build_schedule(&empty_inter, &empty_applied);
+        // The refusal returns a deliberately EMPTY AppliedPlan, so the
+        // rewrite count on this path is indistinguishable from "a graph with
+        // no layers". Only the disposition separates the two, which is why it
+        // is recorded here rather than left to the exit below.
+        crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
+            reason: DeclineReason::PreconditionViolated(
+                "inter-layer activation widths are shape-incompatible",
+            ),
+        });
         return WggoPlan {
             mode: WggoMode::Off,
             target_gpu: gpu.name.to_string(),
@@ -614,6 +624,13 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         let cpkd_distill = cpkd_surface_from_plan(&inter, &cpkd_choices, &ilp_defaults);
         let applied = apply(&inter, &per_layer);
         let schedule = build_schedule(&inter, &applied);
+        // `--wggo off` still solves a passthrough plan so downstream passes
+        // have decisions to read, but it applies no optimization; reporting
+        // that as `Applied` would make "the user turned it off" look like
+        // "the pass did work".
+        crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
+            reason: DeclineReason::ModeOff,
+        });
         return WggoPlan {
             mode: WggoMode::Off,
             target_gpu: gpu.name.to_string(),
@@ -886,6 +903,25 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         })
     });
 
+    // `applied.layers.len()` is the count of per-layer decisions WGGO
+    // produced — the overrides CSHA / WRGA / FASE / CPDT then read. It is NOT
+    // the number of layers WGGO deleted from the tape: WGGO's only tape
+    // mutation happens later, in `wggo_prune::run`, driven from `stmt.rs`,
+    // which supersedes this with the tape-rewrite count when it rewrites
+    // anything.
+    if budget_infeasible.is_some() {
+        crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
+            reason: DeclineReason::BudgetInfeasible,
+        });
+    } else if applied.layers.is_empty() {
+        crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("the tape has no layer-shaped parameter groups"),
+        });
+    } else {
+        crate::pass_trace::record_disposition("WGGO", PassDisposition::Applied {
+            rewrites: applied.layers.len(),
+        });
+    }
     WggoPlan {
         mode: effective_mode,
         target_gpu: gpu.name.to_string(),

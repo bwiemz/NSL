@@ -98,6 +98,197 @@ fn the_report_names_both_what_ran_and_what_did_not() {
     assert!(report().contains("NO passes ran"));
 }
 
+// ─── Dispositions (roadmap item 3) ─────────────────────────────────────────
+
+/// A disposition presupposes an entry. Pinned as a PANIC rather than a
+/// silently-dropped record: the whole point of the two-call shape is that
+/// `record_disposition` cannot be used as a cheaper stand-in for `record`, and
+/// a soft failure would let exactly that happen on any path a test does not
+/// drive.
+#[test]
+#[should_panic(expected = "without a prior")]
+fn a_disposition_without_an_entry_is_a_hard_error() {
+    let _g = fresh();
+    record_disposition("WGGO", PassDisposition::Applied { rewrites: 3 });
+}
+
+/// Repeat dispositions merge LAST-WINS. The production case is CCR under
+/// `--checkpoint-stride auto`, where `ccr::plan` runs once per candidate
+/// stride and only the final call describes the plan the build used.
+#[test]
+fn a_repeated_disposition_keeps_the_last_one() {
+    let _g = fresh();
+    record("CCR");
+    record_disposition("CCR", PassDisposition::Declined {
+        reason: DeclineReason::NoCandidates("nothing recomputable in any block segment"),
+    });
+    record_disposition("CCR", PassDisposition::Applied { rewrites: 6 });
+    assert_eq!(
+        dispositions(),
+        vec![("CCR", PassDisposition::Applied { rewrites: 6 })],
+        "the later disposition must replace the earlier one, not append"
+    );
+}
+
+/// `reset` must clear BOTH halves. Clearing only the entry trace would leave
+/// a disposition whose entry had been wiped, and the next
+/// `record_disposition` in the same process would fire the entry assert on a
+/// pass that had done nothing wrong.
+#[test]
+fn reset_clears_dispositions_as_well_as_entries() {
+    let _g = fresh();
+    record("FASE");
+    record_disposition("FASE", PassDisposition::AdvisoryOnly);
+    reset();
+    assert!(dispositions().is_empty());
+    assert!(observed().is_empty());
+}
+
+/// The `ran:` and `did not run:` lines must survive the addition of the
+/// disposition block UNCHANGED — three gates parse them positionally by
+/// splitting on `ran:` / `->` / `(` / `@` and on `did not run:` / `,`.
+/// Dispositions therefore go on their own lines, under the same
+/// `[pass-trace]` prefix so no new exec-marker token is introduced.
+///
+/// The `@Phase` suffix here is the phase-attribution layer's, not this one's:
+/// nothing calls `enter_phase` in a unit test, so every pass is
+/// `unattributed`. Pinning that spelling too is deliberate — it is what makes
+/// this test fail if the disposition block ever starts writing INTO the
+/// sequence line rather than after it.
+#[test]
+fn dispositions_render_on_new_lines_and_leave_the_sequence_lines_alone() {
+    let _g = fresh();
+    record("WGGO");
+    record_disposition("WGGO", PassDisposition::Applied { rewrites: 12 });
+    record("CSHA");
+    record_disposition("CSHA", PassDisposition::Declined {
+        reason: DeclineReason::NoCandidates("no attention boundary chain admitted a fused kernel"),
+    });
+    record("CPKD");
+    record_disposition("CPKD", PassDisposition::AdvisoryOnly);
+    let r = report();
+    assert!(
+        r.contains(
+            "3 pass(es) ran: WGGO(OnWengert)@unattributed -> \
+             CSHA(OnWengert)@unattributed -> CPKD(OnWengert)@unattributed"
+        ),
+        "the sequence line changed shape: {r}"
+    );
+    assert!(r.contains("\n[pass-trace] WGGO: applied, 12 rewrite(s)\n"), "{r}");
+    assert!(
+        r.contains(
+            "\n[pass-trace] CSHA: declined, no candidates - no attention boundary \
+             chain admitted a fused kernel\n"
+        ),
+        "a decline must name its category AND its detail: {r}"
+    );
+    assert!(r.contains("\n[pass-trace] CPKD: advisory only\n"), "{r}");
+    // The disposition block is keyed off the entry trace, so a pass that was
+    // never reached cannot appear in it.
+    assert!(!r.contains("CCR: "), "an idle pass must not get a disposition line: {r}");
+}
+
+/// Every `DeclineReason` variant must render distinguishably. A category
+/// whose text collides with another's is worse than no category: a gate
+/// asserting on the collided text would pass for the wrong reason.
+#[test]
+fn every_decline_reason_renders_distinctly() {
+    let _g = fresh();
+    record("WGGO");
+    let mut seen: Vec<String> = Vec::new();
+    for reason in [
+        DeclineReason::ModeOff,
+        DeclineReason::NoCandidates("detail-a"),
+        DeclineReason::PreconditionViolated("detail-b"),
+        DeclineReason::FeatureDisabled("detail-c"),
+        DeclineReason::BudgetInfeasible,
+    ] {
+        record_disposition("WGGO", PassDisposition::Declined { reason });
+        let line = report()
+            .lines()
+            .find(|l| l.starts_with("[pass-trace] WGGO: "))
+            .expect("WGGO disposition line")
+            .to_string();
+        assert!(!seen.contains(&line), "two DeclineReasons render identically: {line}");
+        seen.push(line);
+    }
+    assert_eq!(seen.len(), 5, "a variant was added without a rendering");
+}
+
+/// End-to-end through REAL pass entry points, not just the recorder.
+///
+/// `fase::plan` is the cheapest registered pass to drive from a test, and it
+/// exercises both halves: `accumulation == 1` is `FaseMode::Passthrough`,
+/// which is FASE's off state (there is no separate flag), and anything above
+/// that rewrites the backward into one phase per micro-batch.
+///
+/// This is the coverage the disposition arms would otherwise not have: the
+/// production driver short-circuits `--csha off` / `--wggo off` BEFORE
+/// invoking the pass, so several `ModeOff` arms are reachable only from
+/// direct callers like this one.
+#[test]
+fn a_real_pass_reports_its_own_disposition() {
+    use nsl_codegen::fase::{FaseConfig, FaseOptimizer};
+
+    let _g = fresh();
+    let _ = nsl_codegen::fase::plan(&FaseConfig {
+        accumulation: 1,
+        ..Default::default()
+    });
+    assert_eq!(
+        dispositions(),
+        vec![(
+            "FASE",
+            PassDisposition::Declined {
+                reason: DeclineReason::ModeOff
+            }
+        )],
+        "accumulation=1 is FASE declining, not FASE applying zero rewrites"
+    );
+
+    reset();
+    let plan = nsl_codegen::fase::plan(&FaseConfig {
+        accumulation: 4,
+        optimizer: FaseOptimizer::AdamW,
+        ..Default::default()
+    });
+    assert_eq!(plan.backward_phases.len(), 4, "fixture assumption");
+    assert_eq!(
+        dispositions(),
+        vec![("FASE", PassDisposition::Applied { rewrites: 4 })],
+        "the reported count must be the pass's real unit of work, not a constant"
+    );
+}
+
+/// The same, through a pass whose `Off` arm the production driver never
+/// reaches — `stmt.rs` tests `mode_str == \"off\"` and skips the call, so
+/// `--csha off` renders as CSHA under "did not run". Driving `csha::run`
+/// directly is what keeps that arm from being written-and-never-executed.
+#[test]
+fn csha_off_mode_declines_rather_than_applying_nothing() {
+    use nsl_codegen::wengert::WengertList;
+
+    let _g = fresh();
+    let empty = WengertList {
+        ops: Vec::new(),
+        output: 0,
+        var_names: std::collections::HashMap::new(),
+        var_types: std::collections::HashMap::new(),
+    };
+    let plan = nsl_codegen::csha::run_on_wengert(&empty, "A100", "off", None, None, 8, None)
+        .expect("\"off\" is a valid CshaMode");
+    assert_eq!(plan.mode.as_str(), "off", "fixture assumption");
+    assert_eq!(
+        dispositions(),
+        vec![(
+            "CSHA",
+            PassDisposition::Declined {
+                reason: DeclineReason::ModeOff
+            }
+        )]
+    );
+}
+
 /// Every name this module's own tests use must be a real registered pass,
 /// so the tests cannot drift into asserting on passes that no longer
 /// exist.

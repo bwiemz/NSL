@@ -84,6 +84,7 @@ fn cpu_ref_row(a: &[f32], b: &[f32], i: usize, n: usize) -> Vec<f64> {
 }
 
 /// Result of one in-process measurement, printed by the child for the parent.
+#[derive(Clone, Copy)]
 struct Probe {
     secs_per_call: f64,
     max_rel_err: f64,
@@ -197,6 +198,9 @@ fn zz_probe_child() {
     println!("PROBE {} {}", p.secs_per_call, p.max_rel_err);
 }
 
+/// How many times each arm is measured. See `tf32_is_faster_...` for why.
+const ROUNDS: usize = 3;
+
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn tf32_is_faster_and_less_accurate_than_full_f32() {
@@ -204,14 +208,43 @@ fn tf32_is_faster_and_less_accurate_than_full_f32() {
     // so comparing `probe_with(&[])` against `NSL_MATMUL_TF32=1` would be
     // TF32 against itself — a ~1.0x speedup and a ~1.0x error ratio, which
     // would fail this gate for entirely the wrong reason.
-    let base = probe_with(&[("NSL_MATMUL_TF32", "0")]);
-    let tf32 = probe_with(&[]);
+    //
+    // BEST-OF-N, INTERLEAVED. A single sample per arm is not a safe way to
+    // measure a ratio in this suite: the certification lane runs this gate
+    // ~340 targets deep, and on a GPU that has been saturated for the better
+    // part of an hour BOTH arms dilate. Observed on an RTX PRO 4500 mid-lane:
+    // 2.79 ms / 2.48 ms against the 0.583 / 0.365 reference — every arm ~5x
+    // slower, the ratio squeezed to 1.12x, and the gate red for a reason that
+    // has nothing to do with TF32. In isolation the same binary passes.
+    //
+    // Taking the FASTEST sample per arm measures the throughput ceiling,
+    // which is the quantity the assertion is actually about, and a transient
+    // stall can only ever make a sample slower — never faster. It does not
+    // weaken the check: if the mode never reaches cuBLAS the arms are the
+    // same code and no number of rounds produces a fast one.
+    //
+    // INTERLEAVED, because alternating is what keeps a drifting clock from
+    // landing on one arm. The inverse of this mistake is already recorded in
+    // this tree: a "40% sgemm speedup" that turned out to be a cold clock,
+    // whose tell was that kernels the flag could not touch also got faster.
+    let (mut base, mut tf32) = (None::<Probe>, None::<Probe>);
+    let faster = |acc: Option<Probe>, p: Probe| -> Option<Probe> {
+        match acc {
+            Some(a) if a.secs_per_call <= p.secs_per_call => Some(a),
+            _ => Some(p),
+        }
+    };
+    for _ in 0..ROUNDS {
+        base = faster(base, probe_with(&[("NSL_MATMUL_TF32", "0")]));
+        tf32 = faster(tf32, probe_with(&[]));
+    }
+    let (base, tf32) = (base.unwrap(), tf32.unwrap());
 
     let speedup = base.secs_per_call / tf32.secs_per_call;
     let accuracy_ratio = tf32.max_rel_err / base.max_rel_err;
     eprintln!(
-        "f32 (opt-out): {:.4} ms, err {:e} | tf32 (default): {:.4} ms, err {:e} | \
-         speedup {speedup:.2}x, error x{accuracy_ratio:.1}",
+        "best of {ROUNDS} — f32 (opt-out): {:.4} ms, err {:e} | tf32 (default): {:.4} ms, \
+         err {:e} | speedup {speedup:.2}x, error x{accuracy_ratio:.1}",
         base.secs_per_call * 1e3,
         base.max_rel_err,
         tf32.secs_per_call * 1e3,
@@ -237,11 +270,14 @@ fn tf32_is_faster_and_less_accurate_than_full_f32() {
     // contrast, is bit-deterministic across every run.
     assert!(
         speedup > 1.35,
-        "the TF32 default gave only {speedup:.2}x over NSL_MATMUL_TF32=0. Either the mode is not \
-         reaching cuBLAS (CUBLAS_TF32_TENSOR_OP_MATH is deprecated — check \
-         whether this CUDA version still honours it for cublasSgemm, and move \
-         to cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 if not), or this \
-         GPU has no TF32 path."
+        "the TF32 default gave only {speedup:.2}x over NSL_MATMUL_TF32=0, best of {ROUNDS} \
+         interleaved rounds. Check the error ratio printed above FIRST: if it is still ~400-700x \
+         then TF32 IS reaching cuBLAS and this is a timing problem, not a dispatch one — compare \
+         the absolute milliseconds against the 0.583/0.365 reference, and if BOTH arms are \
+         dilated the GPU was contended (re-run the gate alone). If the error ratio is ~1x the \
+         mode genuinely is not reaching cuBLAS: CUBLAS_TF32_TENSOR_OP_MATH is deprecated, so \
+         check whether this CUDA version still honours it for cublasSgemm and move to \
+         cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 if not."
     );
     assert!(
         accuracy_ratio > 20.0,

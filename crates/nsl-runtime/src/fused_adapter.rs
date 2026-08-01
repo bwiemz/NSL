@@ -185,6 +185,22 @@ fn real_cuda_path_enabled() -> bool {
     std::env::var("NSL_WRGA_FUSED_CUDA").ok().as_deref() == Some("1")
 }
 
+/// Every operand of a synthesized WRGA fused kernel must be f32-STORED.
+///
+/// The kernels take f16 MMA fragments but build them in registers from
+/// `ld.global.f32` loads, so "it's an f16 kernel" does not make an f16 buffer
+/// acceptable — it makes it a read of twice the allocation. Kept as a named
+/// predicate so the three launch paths cannot drift apart on which operands
+/// they check, which is how the device-only check ended up covering the
+/// `lora`/`ia3` paths but the dtype nothing.
+#[cfg(feature = "cuda")]
+#[inline]
+fn all_f32(operands: &[&crate::tensor::NslTensor]) -> bool {
+    operands
+        .iter()
+        .all(|t| t.dtype == crate::tensor::DTYPE_F32)
+}
+
 /// Attempt a real cudarc-based launch for the LoRA kernel identified by
 /// `handle`.  Returns `Some(out_ptr)` on success, `None` on any failure
 /// (missing PTX, non-GPU tensors, launch error, etc.) — the caller then
@@ -210,8 +226,22 @@ fn try_cuda_launch_fused_lora(
         (entry.ptx.clone(), entry.kernel_name.clone())
     };
 
-    // 2. All inputs must be on GPU and f16/f32-compatible.  We do not
-    //    perform dtype conversion here; that's a synthesizer concern.
+    // 2. All inputs must be on GPU and f32-STORED.  We do not perform dtype
+    //    conversion here; that's a synthesizer concern.
+    //
+    //    This check used to read `device` only, under a comment claiming the
+    //    inputs merely had to be "f16/f32-compatible".  They do not: the
+    //    synthesized kernel loads every operand with `ld.global.f32` and
+    //    converts to f16 in REGISTERS for the m16n8k16 MMA
+    //    (`crates/nsl-codegen/src/wrga_kernel_helpers.rs:247-445`), and the
+    //    output is allocated at `out_elems * 4` below.  A 2-byte operand
+    //    would be read at twice its allocated length.
+    //
+    //    Declining (rather than asserting as `cuda::assert_gpu_f32` does) is
+    //    this function's established contract: every other refusal here
+    //    returns `None` and the caller takes the CPU-math path, which is
+    //    correct for any dtype.  A hard abort would be a regression against
+    //    an opt-in (`NSL_WRGA_FUSED_CUDA=1`) fast path.
     let xt = unsafe { &*(x as *const NslTensor) };
     let wt = unsafe { &*(w as *const NslTensor) };
     let at = unsafe { &*(lora_a as *const NslTensor) };
@@ -220,6 +250,14 @@ fn try_cuda_launch_fused_lora(
         eprintln!(
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but inputs not on GPU — \
              falling back to CPU math"
+        );
+        return None;
+    }
+    if !all_f32(&[xt, wt, at, bt]) {
+        eprintln!(
+            "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but fused LoRA inputs are not \
+             f32-only storage (dtypes {}/{}/{}/{}) — falling back to CPU math",
+            xt.dtype, wt.dtype, at.dtype, bt.dtype
         );
         return None;
     }
@@ -358,6 +396,17 @@ fn try_cuda_launch_fused_ia3(
         eprintln!(
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but inputs not on GPU — \
              falling back to CPU math"
+        );
+        return None;
+    }
+    // f32 storage, same reason as `try_cuda_launch_fused_lora`: the kernel
+    // reads every operand with `ld.global.f32` and the output is sized at
+    // 4 bytes per element.
+    if !all_f32(&[xt, wt, gt]) {
+        eprintln!(
+            "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but fused IA3 inputs are not \
+             f32-only storage (dtypes {}/{}/{}) — falling back to CPU math",
+            xt.dtype, wt.dtype, gt.dtype
         );
         return None;
     }
@@ -637,6 +686,16 @@ fn try_cuda_launch_fused_gatedlora(
         eprintln!(
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but GatedLoRA inputs not on GPU - \
              falling back to CPU math"
+        );
+        return None;
+    }
+    // f32 storage, same reason as `try_cuda_launch_fused_lora`; the gate is
+    // read by two more `ld.global.f32` (`wrga_kernel_helpers.rs:796-799`).
+    if !all_f32(&[xt, wt, at, bt, gat]) {
+        eprintln!(
+            "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but GatedLoRA inputs are not \
+             f32-only storage (dtypes {}/{}/{}/{}/{}) - falling back to CPU math",
+            xt.dtype, wt.dtype, at.dtype, bt.dtype, gat.dtype
         );
         return None;
     }

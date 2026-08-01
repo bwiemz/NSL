@@ -59,11 +59,18 @@ pub(crate) use zk::{run_build_zk, run_zk_cmd};
 ///
 /// Idempotent — the first call prints, later ones are silent — so it can be
 /// placed at EVERY terminal point without a build that passes through two of
-/// them reporting twice. That matters: there are seven of them (six link
-/// flavours plus `--emit-obj`, which returns before any link), and `check`
-/// and `test` compile without linking at all. An emitter wired to only some
-/// of them reports nothing on the others, which is precisely the
-/// "silently inert" failure the trace exists to detect.
+/// them reporting twice. That matters: there are **14 call sites across 7
+/// files** (`check.rs` x3, `test.rs`, `build/normal.rs` x4,
+/// `build/options.rs` x2, `build/shared_lib.rs` x2, `build/zk.rs`,
+/// `build/standalone.rs`), because "compilation finished" is not one place —
+/// the link flavours, `--emit-obj` (which returns before any link), and
+/// `check`/`test` (which never link at all) are all separate exits. An
+/// emitter wired to only some of them reports nothing on the others, which is
+/// precisely the "silently inert" failure the trace exists to detect.
+///
+/// The count was written as "seven" here from the first commit and was wrong
+/// on the day it was written; it is spelled out per file above so the next
+/// reader can check it in one `grep` rather than trusting the number.
 pub fn emit_pass_trace() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);

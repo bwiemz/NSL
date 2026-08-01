@@ -11,8 +11,29 @@
 //!     length; each CTA processes one complete document instead of one
 //!     Q-tile of a packed sequence.
 //!   * **NoPacking** — packing disabled; standard FlashAttention.
+//!
+//! # Documented omission: the `NoPacking` decline never reaches the trace
+//!
+//! [`detect`]'s `!cfg.enabled` guard returns BEFORE `pass_trace::record`, so
+//! that path reports neither an invocation nor a disposition. That ordering is
+//! deliberate and load-bearing — `detect` doubles as a pure predicate, called
+//! three times per compile from `pca_activation::check_train_packs` just to
+//! compute `segment_masked`, so recording at true entry reported PCA as having
+//! run on every model with a dataset block, packing on or off. Moving the
+//! record back up to catch the decline would reintroduce exactly that false
+//! positive, in exchange for a decline nobody is confused about (packing off
+//! is a user's explicit choice, not a silent refusal).
+//!
+//! Revisit only if the disposition API grows an "invoked as a predicate"
+//! distinction; until then, `PCA` appearing under "did not run" means either
+//! no dataset block or packing disabled, and both are visible in the source.
+//! `memory_planner::plan_slab` has the same shape for the same reason — its
+//! driver in `compiler/entry_points.rs` pre-filters the unplannable
+//! allocations, so the pass is never entered on the empty case.
 
 use serde::Serialize;
+
+use crate::pass_trace::PassDisposition;
 
 /// Parsed packing configuration from a `dataset` block.
 #[derive(Debug, Clone, Serialize)]
@@ -128,6 +149,13 @@ pub fn detect(
     // reported PCA as having run on every model with a dataset block — even
     // with packing switched off.
     crate::pass_trace::record("PCA");
+    // Item 3: PCA selects ONE strategy for the model's attention sublayer —
+    // there is no per-site rewrite to count, so `rewrites: 1` is the honest
+    // cardinality of the decision, not a placeholder. Recorded before the
+    // branch because both surviving arms (`PerDocumentCta`, `SegmentIdMasked`)
+    // are real strategies; the only `NoPacking` return sits ABOVE the entry
+    // record and is a documented omission (see the module header).
+    crate::pass_trace::record_disposition("PCA", PassDisposition::Applied { rewrites: 1 });
 
     let seq = cfg.max_sequence_length;
     let mean = cfg.mean_doc_length.unwrap_or(seq);

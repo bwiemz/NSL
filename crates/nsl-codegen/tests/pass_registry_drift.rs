@@ -702,7 +702,19 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("wcet", "M53 worst-case execution time"),
     ("weight_aware", "M52 weight-aware invariants"),
     ("wengert", "the IR itself, and its Cranelift lowering"),
-    ("wgrad_fusion", "roadmap item 7 weight-gradient GEMM fusion peephole"),
+    (
+        "wgrad_fusion",
+        "roadmap item 7 weight-gradient GEMM fusion peephole — a LOWERING \
+         peephole, not a registered pass, and the boundary is where it is \
+         invoked from: `wengert_lower.rs` calls it while emitting Cranelift \
+         IR, not `compile_train_block`. It already reports its own effect \
+         (`[wgrad-fusion] N chain(s) fused out of M adjoint ops`, pinned by an \
+         exec-marker), which is why item 3 extended `pass_trace` rather than \
+         admitting it: registering it would put `fusion`, `fused_linear_ce`, \
+         `matmul_mma` and `flash_attention` — structurally identical peepholes \
+         excluded on identical grounds — on the wrong side of a considered \
+         line, by accident",
+    ),
     ("zk", "M55 zero-knowledge proofs"),
 ];
 
@@ -893,21 +905,34 @@ fn every_pass_has_at_least_one_trigger() {
     );
 }
 
-/// Roadmap item 2: every `pass_trace::record("NAME")` in the tree must name a
-/// REGISTERED pass.
+/// Roadmap item 2/3: every `pass_trace::record("NAME")` AND every
+/// `pass_trace::record_disposition("NAME", ...)` in the tree must name a
+/// REGISTERED pass, and every name that reports an effect must also record an
+/// entry.
 ///
-/// `record` asserts this at run time, but that only fires on a path some test
-/// actually exercises — coverage of the twelve call sites is incidental, and a
-/// typo in a rarely-taken pass would ship. A typo is doubly bad: the bogus
-/// name is rendered `NAME(?)` in the report while the real pass stays listed
-/// under "did not run", so the report lies in both halves at once.
+/// Both functions assert this at run time, but that only fires on a path some
+/// test actually exercises — coverage of the thirteen entry call sites is
+/// incidental, and a typo in a rarely-taken pass would ship. A typo is doubly
+/// bad: the bogus name is rendered `NAME(?)` in the report while the real pass
+/// stays listed under "did not run", so the report lies in both halves at
+/// once.
 ///
 /// Statically enumerating the call sites removes the dependence on runtime
 /// coverage entirely.
+///
+/// The two needles are DISJOINT — `pass_trace::record(` requires the `(`
+/// immediately after `record`, which `record_disposition(` does not have — so
+/// scanning for the entry literal alone gave the disposition sites strictly
+/// WEAKER static coverage than the entry sites they extend. Both are scanned
+/// here for exactly that reason; adding a third recorder means adding a third
+/// needle, and the floors below are what make the omission visible.
 #[test]
 fn every_pass_trace_record_names_a_registered_pass() {
     let root = repo_root();
     let mut sites = 0usize;
+    let mut disposition_sites = 0usize;
+    let mut entry_names: BTreeSet<String> = BTreeSet::new();
+    let mut disposition_names: BTreeSet<String> = BTreeSet::new();
     let mut bad: Vec<String> = Vec::new();
     // Same recursive walk idiom as the module-completeness gate above.
     let mut stack: Vec<PathBuf> = vec![
@@ -929,25 +954,73 @@ fn every_pass_trace_record_names_a_registered_pass() {
     for f in files {
         let Ok(text) = std::fs::read_to_string(&f) else { continue };
         for line in strip_line_comments(&text).lines() {
-            let Some(rest) = line.split("pass_trace::record(\"").nth(1) else { continue };
-            let Some(name) = rest.split('"').next() else { continue };
-            sites += 1;
-            if nsl_codegen::pass_registry::pass(name).is_none() {
-                bad.push(format!("{}: record(\"{name}\")", f.display()));
+            if let Some(rest) = line.split("pass_trace::record(\"").nth(1) {
+                if let Some(name) = rest.split('"').next() {
+                    sites += 1;
+                    entry_names.insert(name.to_string());
+                    if nsl_codegen::pass_registry::pass(name).is_none() {
+                        bad.push(format!("{}: record(\"{name}\")", f.display()));
+                    }
+                }
+            }
+            // A call whose name argument wraps onto the next line is invisible
+            // to this scan. That is a deliberate constraint on the call sites,
+            // not an oversight: every site is written with the name on the
+            // same line as the call, and the floors below fail if one drifts.
+            if let Some(rest) = line.split("pass_trace::record_disposition(\"").nth(1) {
+                if let Some(name) = rest.split('"').next() {
+                    disposition_sites += 1;
+                    disposition_names.insert(name.to_string());
+                    if nsl_codegen::pass_registry::pass(name).is_none() {
+                        bad.push(format!("{}: record_disposition(\"{name}\")", f.display()));
+                    }
+                }
             }
         }
     }
     // Anti-vacuity: a refactor that renames the call or moves every pass out
     // of these trees would otherwise leave this test passing over zero sites.
+    // Both floors are AT today's counts, not comfortably below them: a
+    // deleted exit is exactly the drift worth catching, and the cost of
+    // noticing a deliberate deletion is editing one number.
     assert!(
-        sites >= 10,
+        sites >= 13,
         "found only {sites} pass_trace::record call sites — the scan is not \
          finding them, so this gate proves nothing"
     );
     assert!(
+        disposition_sites >= 37,
+        "found only {disposition_sites} pass_trace::record_disposition call \
+         sites — a pass exit lost its disposition, or the scan is not finding \
+         them (the name must be on the same line as the call)"
+    );
+    assert!(
         bad.is_empty(),
-        "pass_trace::record calls naming unregistered passes:\n  {}",
+        "pass_trace::record / record_disposition calls naming unregistered \
+         passes:\n  {}",
         bad.join("\n  ")
+    );
+    // Effect presupposes invocation. `record_disposition` asserts this at run
+    // time per compile; asserting the SET relation statically catches the case
+    // where a pass reports an effect on a path no test drives — which would
+    // panic in front of a user rather than in CI.
+    //
+    // Tree-wide, NOT per file. Two passes have their disposition recorded by
+    // the DRIVER in `stmt.rs` — FASE's post-mutation mode and WGGO's
+    // tape-rewrite count from `wggo_prune` — while their entry records live in
+    // `fase.rs` / `wggo.rs`. A per-file subset check would fail on exactly the
+    // sites where the driver knows something the pass cannot.
+    let orphans: Vec<&String> = disposition_names
+        .iter()
+        .filter(|n| !entry_names.contains(*n))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "these passes record a disposition but never record an entry: \
+         {orphans:?}\n\
+         A disposition presupposes invocation — add the `pass_trace::record` \
+         at the pass's entry point, or the run-time assert inside \
+         `record_disposition` will fire in front of a user."
     );
 }
 

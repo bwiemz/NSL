@@ -19,6 +19,8 @@
 
 use serde::Serialize;
 
+use crate::pass_trace::{DeclineReason, PassDisposition};
+
 /// Supported optimizer algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum FaseOptimizer {
@@ -200,6 +202,11 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
 
     // Accumulation count of 1 → no rewrite.
     if accumulation == 1 {
+        // `Passthrough` IS the off state: there is no separate FASE flag, the
+        // accumulation count in the train block is the switch.
+        crate::pass_trace::record_disposition("FASE", PassDisposition::Declined {
+            reason: DeclineReason::ModeOff,
+        });
         return FasePlan {
             mode: FaseMode::Passthrough,
             accumulation: 1,
@@ -274,6 +281,14 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         }
     }
 
+    // One rewrite per micro-batch in the accumulation window: each phase is a
+    // distinct backward the caller must emit (`AccumulateOnly` x n-1 plus a
+    // `FinalFused` / `FinalTwoPhase`), and that vector IS what stmt.rs
+    // consumes. `mode` is the other half of the answer and the payload cannot
+    // carry it — see the note at the driver's post-mutation record in stmt.rs.
+    crate::pass_trace::record_disposition("FASE", PassDisposition::Applied {
+        rewrites: phases.len(),
+    });
     FasePlan {
         mode,
         accumulation,
@@ -343,6 +358,15 @@ pub fn plan_with_overrides(
         per_layer.push(applied);
     }
 
+    // Supersedes the inner `plan` call's window count with the per-LAYER one:
+    // on this path FASE emits a mode table and the accumulation loop
+    // dispatches per parameter, so the number of layers whose mode was decided
+    // is the larger and more honest statement of what the pass did. Last-wins
+    // in `record_disposition` is what makes the ordering work — the inner call
+    // has already recorded by the time control reaches here.
+    crate::pass_trace::record_disposition("FASE", PassDisposition::Applied {
+        rewrites: per_layer.len(),
+    });
     p.per_layer_mode = Some(per_layer);
     p.override_diagnostics = diagnostics;
     p

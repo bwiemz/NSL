@@ -23,6 +23,7 @@ use crate::cep_search::{
     SearchOutcome,
 };
 use crate::gpu_specs::{default_gpu, find_gpu, GPU_DATABASE};
+use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::weight_aware::WeightMap;
 
 /// Input for [`run_prune`].
@@ -286,6 +287,19 @@ pub fn run_prune(input: CepPruneInput) -> CepPlan {
         input.granularity,
     );
 
+    // One prune step = one structural edit to the model spec, and the log is
+    // the authoritative record of them (the rewrite + weight emission
+    // downstream replay exactly this list). An empty log means the greedy
+    // search could not take a single step inside the accuracy constraints.
+    if outcome.prune_log.is_empty() {
+        crate::pass_trace::record_disposition("CEP", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("no prune step fits the accuracy constraints"),
+        });
+    } else {
+        crate::pass_trace::record_disposition("CEP", PassDisposition::Applied {
+            rewrites: outcome.prune_log.len(),
+        });
+    }
     CepPlan {
         mode: CepMode::Prune,
         target_gpu: gpu.name.to_string(),
@@ -318,6 +332,17 @@ pub fn run_joint(input: CepPruneInput) -> CepPlan {
         &input.constraints,
         input.granularity,
     );
+    if outcome.prune_log.is_empty() {
+        crate::pass_trace::record_disposition("CEP", PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates(
+                "no head / FFN / layer-drop action fits the accuracy constraints",
+            ),
+        });
+    } else {
+        crate::pass_trace::record_disposition("CEP", PassDisposition::Applied {
+            rewrites: outcome.prune_log.len(),
+        });
+    }
     CepPlan {
         mode: CepMode::Joint,
         target_gpu: gpu.name.to_string(),
@@ -331,6 +356,12 @@ pub fn run_search(input: CepSearchInput) -> CepPlan {
     crate::pass_trace::record("CEP");
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
     let outcome = architecture_search(&input.axes, gpu, &input.constraints, input.objective);
+    // Architecture search RECOMMENDS a spec; it rewrites nothing. Its flag
+    // (`--cep-search`) lives on `nsl check` only, and the result is printed
+    // for a human to act on. This is the difference `AdvisoryOnly` exists to
+    // record: reporting `Applied { rewrites: 0 }` here would read as a failed
+    // prune rather than as a search that did exactly its job.
+    crate::pass_trace::record_disposition("CEP", PassDisposition::AdvisoryOnly);
     CepPlan {
         mode: CepMode::Search,
         target_gpu: gpu.name.to_string(),

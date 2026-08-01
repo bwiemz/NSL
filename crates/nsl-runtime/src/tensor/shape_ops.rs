@@ -768,6 +768,15 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
                 super::nsl_tensor_free(result);
                 return gpu_result;
             }
+            // Same asymmetry as `nsl_tensor_contiguous`: the CPU arm below is
+            // already dtype-aware (`assert_elementwise_byte_copy` +
+            // `alloc_preserved_dtype_buffer`) but is unreachable for a device
+            // tensor, so `device > 0` alone routed fp16/bf16 into a kernel
+            // that reads 4 bytes per element. Refuse here rather than at the
+            // top of the GPU arm: the zero-length branch above round-trips
+            // through the host and is dtype-correct for any dtype, and there
+            // is no reason to reject an empty bf16 slice.
+            crate::cuda::assert_gpu_f32(t, "nsl_tensor_slice", "input");
             let result = crate::cuda::gpu_slice_f32_with_shape(tensor_ptr, d, s, slice_len);
             // Tape record on the GPU arm — mirrors the CPU record site
             // (identity-only fields, normalized start, raw dim).
@@ -1185,6 +1194,23 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
     if t.device > 0 {
         #[cfg(feature = "cuda")]
         {
+            // Refuse rather than fall through to the CPU arm below. That arm
+            // IS dtype-correct (`alloc_preserved_dtype_buffer` +
+            // `copy_preserved_dtype_element`), which reads as though a
+            // non-f32 GPU tensor could simply take it — it cannot. The buffer
+            // it allocates is HOST memory (`checked_alloc`) while device
+            // memory here is plain `cuMemAlloc_v2`, not managed: the
+            // per-element `copy_nonoverlapping` would read a device address
+            // from the host and segfault, and the tensor it publishes carries
+            // `t.device` over host storage. So the honest options are refuse
+            // or add a real strided-copy kernel for 16-bit dtypes; this is
+            // the former.
+            //
+            // Only NON-contiguous GPU tensors reach here — the contiguous
+            // fast path returned above with a refcount bump — so this refuses
+            // exactly the cases `gpu_strided_copy_f32` would have read at
+            // 4 bytes per element out of a 2-byte-per-element allocation.
+            crate::cuda::assert_gpu_f32(t, "nsl_tensor_contiguous", "input");
             return crate::cuda::gpu_strided_copy_f32(tensor_ptr);
         }
         #[cfg(not(feature = "cuda"))]
