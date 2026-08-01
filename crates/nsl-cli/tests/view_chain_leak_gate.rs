@@ -81,16 +81,35 @@ fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String, String) {
         stdout.contains("DONE"),
         "[{tag}/{n}] fixture did not complete:\n{stdout}"
     );
-    let live_blocks = stderr
-        .lines()
-        .filter_map(|l| {
-            l.split("live_blocks=")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .and_then(|s| s.parse::<i64>().ok())
-        })
-        .last()
+    let field = |key: &str| -> Option<i64> {
+        stderr
+            .lines()
+            .filter_map(|l| {
+                l.split(key)
+                    .nth(1)
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+            .last()
+    };
+    let raw = field("live_blocks=")
         .unwrap_or_else(|| panic!("[{tag}/{n}] no [gpu-mem] live_blocks report:\n{stderr}"));
+    // Subtract the blocks that are never freed BY DESIGN: `AllocPool::Persistent`
+    // holds the content-keyed shape/stride metadata (`upload_meta_i64_cached`) and
+    // the strided-copy planner's offset tables, which are process-lifetime caches.
+    // Counting them made this gate read 3 stranded blocks for a fixture that
+    // strands nothing — the three 16-byte metadata vectors of its one transpose.
+    let persistent = field("persistent_blocks=").unwrap_or_else(|| {
+        panic!("[{tag}/{n}] no persistent_blocks in the [gpu-mem] report — the \
+                runtime and this gate disagree about the report format:\n{stderr}")
+    });
+    assert!(
+        persistent <= raw,
+        "[{tag}/{n}] persistent_blocks={persistent} exceeds live_blocks={raw}; the \
+         allocator's persistent counter has drifted from its total (an alloc site \
+         that increments one and not the other, or a double decrement)"
+    );
+    let live_blocks = raw - persistent;
     // Remove the scratch dir. `nsl run` links ~140 MB of objects per invocation
     // into the system temp dir, which here is a 31 GB tmpfs — leaving these
     // behind across a full test run fills it, and the resulting
@@ -357,7 +376,10 @@ fn free_function_chain_links_do_not_strand_per_call() {
         (lb1, lb3),
         (0, 0),
         "the chains now free every link (nested-arg conversion) — a nonzero \
-         count here is a strand returning"
+         count here is a strand returning. NOTE this counts live blocks MINUS \
+         the persistent-pool caches (see run_fixture): a process-lifetime \
+         metadata cache is not a strand, and conflating the two is what made \
+         this assertion read (3, 3) on a fixture that leaks nothing."
     );
 }
 

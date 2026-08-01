@@ -6,9 +6,11 @@
 //!      `captured>0` and `replays>0` on a readback-free fixture.
 //!   2. BIT-EXACTNESS: the loss stream with graphs on is byte-identical to
 //!      the same run with graphs off, and reruns reproduce bit-identically.
-//!   3. SELF-HEALING: a fixture whose lowered regions perform per-step host
-//!      readbacks (embedding/CE backward bounces) still trains bit-exactly —
-//!      the affected regions taint and stay eager instead of corrupting.
+//!   3. SELF-HEALING: a region that performs a per-step host readback still
+//!      trains bit-exactly — it taints and stays eager instead of corrupting.
+//!      The readback is forced with a kill switch: the default path no longer
+//!      has one, because the fixture's three original bounces were each
+//!      device-driven away as perf work.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -30,6 +32,21 @@ struct RunOut {
 }
 
 fn run_fixture(fixture: &str, tag: &str, rewrites: &[(&str, &str)], extra: &[&str]) -> RunOut {
+    run_fixture_env(fixture, tag, rewrites, extra, &[])
+}
+
+/// `run_fixture` plus environment overrides for the child `nsl run`.
+///
+/// Needed by the self-heal gate, which has to FORCE a host readback back into a
+/// lowered region: the fixture's three original in-region bounces were all
+/// device-driven away by later perf work (see that test's comment).
+fn run_fixture_env(
+    fixture: &str,
+    tag: &str,
+    rewrites: &[(&str, &str)],
+    extra: &[&str],
+    envs: &[(&str, &str)],
+) -> RunOut {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_cudagraph_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -47,6 +64,7 @@ fn run_fixture(fixture: &str, tag: &str, rewrites: &[(&str, &str)], extra: &[&st
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -226,23 +244,46 @@ fn cuda_graph_capture_replay_bitexact_gpu() {
     }
 }
 
-/// Self-healing e2e: the embedding+DataLoader fixture performs real host
-/// readbacks inside its lowered regions every step (embedding/CE backward
-/// device bounces). Those regions must taint and stay eager — and the run
-/// must remain bit-identical to the eager path.
+/// Self-healing e2e: a lowered region that performs a host readback must taint
+/// and stay eager instead of capturing — and the run must stay bit-identical to
+/// the fully eager path.
+///
+/// The readback is FORCED, via `NSL_GPU_CE_BACKWARD=0`, and that is the point of
+/// this comment. This fixture used to bounce to the host three times per
+/// micro-batch all by itself — the CE-composite gather, `nsl_cross_entropy_backward`
+/// (which declined because the DataLoader emits host-resident i32 labels), and
+/// `nsl_embedding_backward` (same shape of decline). `ea5ee585` and `4326ae7f`
+/// device-drove all three; removing them was the explicit GOAL of that work,
+/// since they were what kept loss-epilogue regions eager.
+///
+/// So by 2026-07-30 this gate was asserting `taints > 0` on a property the
+/// fixture no longer had, and it sat red on main — invisibly, because the same
+/// PR that removed the last bounce also broke the workspace test build that the
+/// GPU certification lane runs before any gate. Restoring the property by
+/// construction keeps the taint -> stay-eager -> bit-exact path covered; the
+/// alternative (asserting `taints == 0`) would have retired the only e2e
+/// coverage of a mechanism that exists to prevent silent corruption.
+///
+/// Both arms get the same env so the bit-exactness comparison stays meaningful.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn cuda_graph_self_heals_on_host_readbacks_gpu() {
     let gpu = ("# GPU_PLACEMENT", "m.to(cuda)");
     let base: &[&str] = &["--checkpoint-blocks", "--layerwise-accum", "--seed", "777"];
 
+    // Documented kill switch (crates/nsl-runtime/src/tensor/ad_ops.rs): routes the
+    // cross-entropy backward through the host path, which DtoHs the [N, C] logits
+    // inside the loss-epilogue region.
+    let force_readback: &[(&str, &str)] = &[("NSL_GPU_CE_BACKWARD", "0")];
+
     let mut on_args: Vec<&str> = base.to_vec();
     on_args.push("--cuda-graphs");
-    let on = run_fixture(
+    let on = run_fixture_env(
         "csla_layerwise_ffn.nsl",
         "heal_on",
         &[gpu, ("CSLA_SAVE_PATH", "h1.nslm")],
         &on_args,
+        force_readback,
     );
     assert!(
         on.success,
@@ -255,11 +296,12 @@ fn cuda_graph_self_heals_on_host_readbacks_gpu() {
         "expected host-readback regions to taint (fixture changed?): {c:?}"
     );
 
-    let off = run_fixture(
+    let off = run_fixture_env(
         "csla_layerwise_ffn.nsl",
         "heal_off",
         &[gpu, ("CSLA_SAVE_PATH", "h2.nslm")],
         base,
+        force_readback,
     );
     assert!(off.success, "graphs-off run failed:\n{}", off.stderr);
     assert!(!on.losses.is_empty(), "no losses parsed:\n{}", on.stdout);

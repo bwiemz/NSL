@@ -30,10 +30,27 @@
 #
 # --run honours:
 #   NSL_CERT_TIER      gpu | toolchain | multiproc | isolate | all  (default: gpu)
-#   NSL_CERT_TIMEOUT   per-target timeout in seconds (default: 900)
+#   NSL_CERT_TIMEOUT   PER-GATE timeout in seconds (default: 1800)
+#   NSL_CERT_BATCH_TIMEOUT
+#                      ceiling for a target's batched run, which carries ALL of
+#                      that target's gates in one `cargo test` (default: 5400).
+#                      The batched budget is NSL_CERT_TIMEOUT x gate-count,
+#                      clamped to this. One shared number served both roles,
+#                      which is wrong in principle -- a target's batch has to
+#                      fit every gate it carries, a single rerun only one -- and
+#                      leaves very little headroom in practice: measured on an
+#                      RTX PRO 4500, `pretrain_loss_decrease_gpu_e2e` takes 530s
+#                      of the old 900s, and `matmul_cublas_tf32_default_sanity`
+#                      384s. Neither had room for a slower machine or a colder
+#                      cache.
 #   NSL_CERT_OUT       report path (default: target/gpu-cert-report.tsv)
 #   NSL_CERT_FEATURES  cargo features (default: cuda,test-hooks,test-helpers)
 #   CARGO_TARGET_DIR   respected as usual
+#
+# Report columns: file<TAB>test<TAB>status<TAB>elapsed. A '~' prefix on elapsed
+# means the value is the whole TARGET's wall time, shared by every gate of a
+# batched run; bare values come from the per-gate rerun path and are that gate's
+# own time.
 #
 # Set TMPDIR to a DISK-backed path before a full run. Many gates spawn `nsl`
 # builds; where /tmp is tmpfs the sweep exhausts it, and the resulting linker
@@ -258,7 +275,8 @@ preflight() {
 
 cmd_run() {
     local tier="${NSL_CERT_TIER:-gpu}"
-    local timeout_s="${NSL_CERT_TIMEOUT:-900}"
+    local timeout_s="${NSL_CERT_TIMEOUT:-1800}"
+    local batch_cap="${NSL_CERT_BATCH_TIMEOUT:-5400}"
     local out="${NSL_CERT_OUT:-${CARGO_TARGET_DIR:-target}/gpu-cert-report.tsv}"
     mkdir -p "$(dirname "${out}")"
 
@@ -373,9 +391,15 @@ cmd_run() {
             rc=1
             status=FAIL
         else
-        echo "  [${key}] ${nsel} gate(s)"
+        # The batched run carries EVERY gate of this target, so its budget is
+        # per-gate x count (clamped): a single per-gate number applied here
+        # silently caps the whole target.
+        local batch_to=$(( timeout_s * nsel ))
+        if (( batch_to > batch_cap )); then batch_to="${batch_cap}"; fi
+        echo "  [${key}] ${nsel} gate(s) (budget ${batch_to}s)"
         set +e
-        timeout --signal=KILL "${timeout_s}" \
+        local t0=${SECONDS}
+        timeout --signal=KILL "${batch_to}" \
             cargo test "${args[@]}" "${featarg[@]}" -- \
             --ignored --exact "${selected[@]}" "${threads[@]}" \
             < /dev/null > "${tmpdir}/out.txt" 2>&1
@@ -392,7 +416,11 @@ cmd_run() {
         if [[ "${status}" == "PASS" ]]; then
             local fn
             for fn in "${selected[@]}"; do
-                printf '%s\t%s\tPASS\n' "${key}" "${fn}" >> "${out}"
+                # '~' = this is the TARGET's elapsed, shared by every gate in
+                # the batched run (they execute concurrently inside one cargo
+                # test). Only the per-gate rerun path below can attribute time
+                # to a single gate.
+                printf '%s\t%s\tPASS\t~%ss\n' "${key}" "${fn}" "$(( SECONDS - t0 ))" >> "${out}"
             done
             continue
         fi
@@ -411,6 +439,7 @@ cmd_run() {
         local fn rc1 st1
         for fn in "${selected[@]}"; do
             set +e
+            local t1=${SECONDS}
             timeout --signal=KILL "${timeout_s}" \
                 cargo test "${args[@]}" "${featarg[@]}" -- \
                 --ignored --exact "${fn}" --test-threads=1 \
@@ -422,7 +451,7 @@ cmd_run() {
                 137) st1=TIMEOUT ;;
                 *)   st1=FAIL ;;
             esac
-            printf '%s\t%s\t%s\n' "${key}" "${fn}" "${st1}" >> "${out}"
+            printf '%s\t%s\t%s\t%ss\n' "${key}" "${fn}" "${st1}" "$(( SECONDS - t1 ))" >> "${out}"
             if [[ "${st1}" != "PASS" ]]; then
                 echo "      FAIL ${fn}"
                 grep -E "^(thread .* panicked|assertion|error)" "${tmpdir}/one.txt" \

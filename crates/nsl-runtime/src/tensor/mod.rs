@@ -6054,11 +6054,12 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             let stats = alloc.stats();
             let mb = |b: usize| b / (1024 * 1024);
             eprintln!(
-                "[gpu-mem] step={} driver={}MB alloc={}MB reserved={}MB live_blocks={} drv_allocs={} drv_frees={}",
+                "[gpu-mem] step={} driver={}MB alloc={}MB reserved={}MB live_blocks={} persistent_blocks={} drv_allocs={} drv_frees={}",
                 step, used_mb,
                 mb(stats.allocated_bytes),
                 mb(stats.reserved_bytes),
-                stats.num_allocs, stats.num_driver_allocs, stats.num_driver_frees,
+                stats.num_allocs, stats.num_allocs_persistent,
+                stats.num_driver_allocs, stats.num_driver_frees,
             );
             let (p_b, p_s, t_b, t_s) = alloc.pool_breakdown();
             eprintln!(

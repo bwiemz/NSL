@@ -266,6 +266,16 @@ impl PartialOrd for FreeBlockKey {
 #[derive(Clone, Debug, Default)]
 pub struct AllocStats {
     pub num_allocs: usize,
+    /// Of `num_allocs`, how many live blocks came from `AllocPool::Persistent`.
+    ///
+    /// Those are caches that deliberately outlive every tensor — the content-keyed
+    /// shape/stride metadata in `upload_meta_i64_cached`, the strided-copy run
+    /// planner's offset tables. Counting them in a LEAK signal conflates
+    /// "never freed" with "never freed ON PURPOSE": the `view_chain_leak_gate`
+    /// absolute pin read 3 and called it a strand returning, when it was three
+    /// 16-byte metadata vectors for the fixture's one transpose. Subtract this
+    /// from `num_allocs` to get the number that means what a leak gate wants.
+    pub num_allocs_persistent: usize,
     pub num_free_blocks: usize,
     pub allocated_bytes: usize,
     pub reserved_bytes: usize,
@@ -492,6 +502,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.allocated_blocks.insert(block.ptr as usize, block_ptr);
         self.total_allocated += block.size;
         self.stats.num_allocs += 1;
+        if block.pool == AllocPool::Persistent {
+            self.stats.num_allocs_persistent += 1;
+        }
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.num_cache_hits += 1;
         self.stats.internal_fragmentation_bytes += block.size - size_bytes;
@@ -574,6 +587,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.allocated_blocks.insert(base_ptr as usize, block);
         self.total_allocated += blk.size;
         self.stats.num_allocs += 1;
+        if blk.pool == AllocPool::Persistent {
+            self.stats.num_allocs_persistent += 1;
+        }
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes += blk.size - size_bytes;
         self.stats.cumulative_allocs += 1;
@@ -649,6 +665,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let old_size = block.size;
         let old_requested = block.requested_size;
         let old_surface = block.surface;
+        let old_pool = block.pool;
         if mem_trace_on() {
             eprintln!("[mem-trace] F ptr={:p} size={} ctx={}", ptr, old_size, block.context);
         }
@@ -664,6 +681,10 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
         self.total_allocated -= old_size;
         self.stats.num_allocs -= 1;
+        if old_pool == AllocPool::Persistent {
+            self.stats.num_allocs_persistent =
+                self.stats.num_allocs_persistent.saturating_sub(1);
+        }
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes = self.stats.internal_fragmentation_bytes
             .saturating_sub(old_size - old_requested);
