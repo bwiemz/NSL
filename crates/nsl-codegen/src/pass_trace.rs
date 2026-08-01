@@ -71,18 +71,25 @@ use std::sync::Mutex;
 /// outside every declared phase — see [`enter_phase`]).
 static TRACE: Mutex<Vec<(&'static str, Option<CompilePhase>)>> = Mutex::new(Vec::new());
 
-/// The phase currently executing. A plain global rather than a thread-local:
-/// codegen is single-threaded, and a thread-local would silently report
-/// `None` if that ever changed, which is the failure mode this is meant to
-/// surface loudly.
-static CURRENT_PHASE: Mutex<Option<CompilePhase>> = Mutex::new(None);
+// The phase currently executing, per THREAD.
+// 
+// A process-global would be wrong: `enter_phase` saves and restores the
+// previous value, and two threads compiling concurrently (15 integration-test
+// binaries drive full compiles, and libtest runs them in parallel) can
+// interleave so that one guard's restore leaks the other's phase for the rest
+// of the process. This repo has already shipped that exact bug class once.
+// A compile never spans threads, so thread-local is also the accurate scope.
+thread_local! {
+    static CURRENT_PHASE: std::cell::Cell<Option<CompilePhase>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// RAII guard restoring the previously-active phase on drop.
 pub struct PhaseGuard(Option<CompilePhase>);
 
 impl Drop for PhaseGuard {
     fn drop(&mut self) {
-        *CURRENT_PHASE.lock().unwrap_or_else(|e| e.into_inner()) = self.0;
+        CURRENT_PHASE.with(|c| c.set(self.0));
     }
 }
 
@@ -95,10 +102,7 @@ impl Drop for PhaseGuard {
 /// itself instead of being discovered by backtrace months later.
 #[must_use = "the phase ends when the guard drops; binding to `_` ends it immediately"]
 pub fn enter_phase(phase: CompilePhase) -> PhaseGuard {
-    let mut cur = CURRENT_PHASE.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = *cur;
-    *cur = Some(phase);
-    PhaseGuard(prev)
+    PhaseGuard(CURRENT_PHASE.with(|c| c.replace(Some(phase))))
 }
 
 /// The phase each observed pass ran in.
@@ -110,14 +114,17 @@ pub fn observed_phases() -> Vec<(&'static str, Option<CompilePhase>)> {
 /// `(pass, declared, observed)`. A pass declared [`CompilePhase::OutOfBand`]
 /// is expected to be unattributed, since those drivers are CLI subcommands
 /// outside the compile pipeline.
-pub fn phase_mismatches() -> Vec<(&'static str, CompilePhase, Option<CompilePhase>)> {
+pub fn phase_mismatches(
+) -> Vec<(&'static str, &'static [CompilePhase], Option<CompilePhase>)> {
     observed_phases()
         .into_iter()
         .filter_map(|(name, got)| {
-            let want = crate::pass_registry::pass(name)?.phase;
-            let ok = match want {
-                CompilePhase::OutOfBand => got.is_none(),
-                w => got == Some(w),
+            let want = crate::pass_registry::pass(name)?.phases;
+            // Empty declaration == "expected unattributed" (an OutOfBand
+            // subcommand). Otherwise the observed phase must be one of them.
+            let ok = match got {
+                None => want.is_empty(),
+                Some(g) => want.contains(&g),
             };
             (!ok).then_some((name, want, got))
         })
@@ -143,7 +150,7 @@ pub fn record(pass: &'static str) {
         "pass_trace::record(\"{pass}\") names a pass that is not in the \
          registry — add a PassDescriptor, or fix the name"
     );
-    let phase = *CURRENT_PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    let phase = CURRENT_PHASE.with(|c| c.get());
     let mut t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
     if !t.iter().any(|(p, _)| *p == pass) {
         t.push((pass, phase));
@@ -173,7 +180,7 @@ pub fn observed() -> Vec<&'static str> {
 /// clean slate between them.
 pub fn reset() {
     TRACE.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    *CURRENT_PHASE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    CURRENT_PHASE.with(|c| c.set(None));
 }
 
 /// Is `NSL_PASS_TRACE=1` set? Read per call rather than cached so a test can
@@ -231,6 +238,23 @@ pub fn report() -> String {
         .collect();
     if !idle.is_empty() {
         s.push_str(&format!("[pass-trace] did not run: {}\n", idle.join(", ")));
+    }
+    // A detector nobody calls is decoration. Surfacing mismatches in the
+    // report itself is what makes a wrong declaration visible from one run,
+    // rather than only from a test that happens to cover that configuration.
+    for (name, want, got) in phase_mismatches() {
+        s.push_str(&format!(
+            "[pass-trace] PHASE MISMATCH: {name} ran in {} but the registry \
+             declares {want:?}\n",
+            got.map(|c| format!("{c:?}")).unwrap_or_else(|| "no phase".into()),
+        ));
+    }
+    if let Some((a, b)) = stage_order_violation() {
+        s.push_str(&format!(
+            "[pass-trace] STAGE ORDER: {a} ran before {b}, inverting their \
+             declared PipelineStage (see each pass's CompilePhase above — a \
+             cross-phase inversion is expected, not a defect)\n"
+        ));
     }
     s
 }

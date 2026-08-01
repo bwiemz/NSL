@@ -122,9 +122,14 @@ fn names_used_by_these_tests_are_registered() {
 }
 
 /// The phase scope is RAII and must NEST correctly: an inner phase restores
-/// the outer one on drop, not `None`. `compile_main` sits inside a caller
-/// that may itself be scoped, so a guard that reset to `None` would silently
-/// unattribute every pass after the first nested phase closed.
+/// the outer one on drop, not `None`.
+///
+/// No path in the tree nests two phases TODAY — `compile_flash_attention_
+/// kernels` closes before `compile_main` opens, and neither calls the other —
+/// so save/restore is currently indistinguishable from set/clear. It is
+/// pinned anyway because the scopes now live at the CALLEE, where a future
+/// caller could nest them, and the failure would be silent: every pass after
+/// the inner scope closed would be attributed `None`.
 #[test]
 fn phase_scopes_nest_and_restore_the_previous_phase() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -177,7 +182,7 @@ fn a_pass_running_in_the_wrong_phase_is_reported() {
     let m = phase_mismatches();
     assert_eq!(m.len(), 1, "expected exactly one mismatch, got {m:?}");
     assert_eq!(m[0].0, "WGGO");
-    assert_eq!(m[0].1, CompilePhase::KernelPrepass, "declared");
+    assert_eq!(m[0].1, &[CompilePhase::KernelPrepass][..], "declared");
     assert_eq!(m[0].2, Some(CompilePhase::TrainBlock), "observed");
     reset();
 }
@@ -210,23 +215,17 @@ fn out_of_band_passes_are_expected_to_be_unattributed() {
 #[test]
 fn every_declared_in_pipeline_phase_is_one_the_driver_scopes() {
     use nsl_codegen::pass_registry::{CompilePhase as P, PASSES};
-    let scoped = [P::KernelPrepass, P::TrainBlock];
+    let scoped = [P::KernelPrepass, P::TrainBlock, P::Analysis, P::Lowering];
     for d in PASSES {
-        match d.phase {
-            P::OutOfBand => {}
-            // Lowering is declared for MemoryPlanner, whose call sites are
-            // not yet wrapped; assert it stays the ONLY such pass so the
-            // exemption cannot quietly grow.
-            P::Lowering => assert_eq!(
-                d.name, "MemoryPlanner",
-                "{} declares Lowering, which the driver does not scope yet",
-                d.name
-            ),
-            p => assert!(
-                scoped.contains(&p),
-                "{} declares {p:?}, which no enter_phase scope establishes",
-                d.name
-            ),
+        for &ph in d.phases {
+            match ph {
+                P::OutOfBand => unreachable!("OutOfBand is an empty set"),
+                p => assert!(
+                    scoped.contains(&p),
+                    "{} declares {p:?}, which no enter_phase scope establishes",
+                    d.name
+                ),
+            }
         }
     }
 }

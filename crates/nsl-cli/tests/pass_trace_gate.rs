@@ -337,33 +337,36 @@ fn every_pass_runs_in_the_compile_phase_the_registry_declares() {
         for (name, phase) in observed {
             let d = nsl_codegen::pass_registry::pass(&name)
                 .unwrap_or_else(|| panic!("{name} ran but is not registered"));
-            let want = match d.phase {
-                CompilePhase::KernelPrepass => Some("KernelPrepass"),
-                CompilePhase::TrainBlock => Some("TrainBlock"),
-                CompilePhase::Lowering => Some("Lowering"),
-                // Driven by a CLI subcommand outside the pipeline; if one of
-                // these ever shows up here it is a real surprise.
-                CompilePhase::OutOfBand => None,
-            };
-            assert_eq!(
-                phase.as_deref(),
-                want,
-                "{tag}: {name} ran in phase {phase:?} but the registry declares \
-                 {:?}. Either the pass moved, or a new driver phase needs an \
-                 enter_phase scope.\n{}",
-                d.phase,
-                r.stderr
-            );
+            // `report()` always emits an `@token`, so an unattributed pass
+            // reads as the literal "unattributed" — NOT as a missing field.
+            // Mapping OutOfBand to None here made the arm fail on correct
+            // behaviour; it is only latent because no gate config runs CEP.
+            let observed = phase.as_deref().unwrap_or("unattributed");
             assert_ne!(
-                phase.as_deref(),
-                Some("unattributed"),
-                "{tag}: {name} ran outside every declared phase — a driver is \
-                 missing an enter_phase scope:\n{}",
+                observed, "unattributed",
+                "{tag}: {name} ran outside every declared phase — some driver \
+                 is missing an enter_phase scope. Finding the SECOND driver \
+                 cost a backtrace hunt; this is how the next one surfaces.\n{}",
                 r.stderr
             );
-            if let Some(p) = phase {
-                phases_seen.insert(p);
-            }
+            let allowed: Vec<String> =
+                d.phases.iter().map(|p| format!("{p:?}")).collect();
+            assert!(
+                allowed.iter().any(|a| a == observed),
+                "{tag}: {name} ran in phase {observed} but the registry declares \
+                 {allowed:?}. Either the pass moved, or a driver needs an \
+                 enter_phase scope.\n{}",
+                r.stderr
+            );
+            // Nothing in the pipeline may declare an empty (OutOfBand) set and
+            // still run here.
+            assert!(
+                !d.phases.is_empty(),
+                "{tag}: {name} declares no phases (OutOfBand) but ran inside \
+                 the compile pipeline:\n{}",
+                r.stderr
+            );
+            phases_seen.insert(observed.to_string());
             checked += 1;
         }
     }
