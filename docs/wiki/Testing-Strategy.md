@@ -199,10 +199,20 @@ The CI workflow (`.github/workflows/ci.yml`) runs on a matrix of `ubuntu-latest`
 | Step | Command |
 |------|---------|
 | Build | `cargo build --workspace` |
-| Unit + integration tests (no GPU) | `cargo test --workspace -- --skip e2e_` |
+| Unit + integration tests (no GPU) | `cargo test --workspace --no-fail-fast -- --skip e2e_` |
 | Lint | `cargo clippy --workspace -- -D warnings` |
 | E2E smoke (Linux + Windows, blocking) | `cargo test -p nsl-cli --test e2e -- --test-threads=1` |
 | E2E smoke (macOS, non-blocking) | same command with `continue-on-error: true` |
+
+The unit-test step carries `--no-fail-fast` deliberately. Without it `cargo
+test` stops at the first failing test *binary* and never builds or runs the
+rest, so a red run names exactly one broken target however many are broken —
+PR #455 hit four independent `windows-latest` failures and paid four serial
+~25-minute round-trips to see them, one per run. A green run is unaffected
+(nothing aborts early, so there is nothing to skip) and any failing target
+still fails the job. The cost is paid only by red runs, which now run to
+completion instead of aborting — one longer red run in exchange for not
+rediscovering the next failure a round-trip later.
 
 CI additionally runs two build-free agreement gates: `doc-agreement`
 (`scripts/check-doc-agreement.sh`) and `gpu-gate-inventory`

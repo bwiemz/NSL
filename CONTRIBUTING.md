@@ -37,7 +37,7 @@ source of truth):**
 ```bash
 cargo build --workspace                              # zero errors, zero warnings
 cargo clippy --workspace -- -D warnings              # zero warnings
-cargo test --workspace -- --skip e2e_                # workspace unit/integration tests
+cargo test --workspace --no-fail-fast -- --skip e2e_ # workspace unit/integration tests
 cargo test -p nsl-cli --test e2e -- --test-threads=1 # CLI smoke/e2e (Linux + Windows)
 ```
 

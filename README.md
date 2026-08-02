@@ -258,7 +258,7 @@ source of truth. Read local results against the tier a command belongs to.
 **CI merge gates (must be green to merge — blocking on Linux + Windows):**
 
 - `cargo build --workspace`
-- `cargo test --workspace -- --skip e2e_`
+- `cargo test --workspace --no-fail-fast -- --skip e2e_`
 - `cargo clippy --workspace -- -D warnings`
 - `cargo test -p nsl-cli --test e2e -- --test-threads=1` (CLI smoke/e2e)
 - the ONNX Runtime integration job (`test-onnx-rt`) and the FPGA
@@ -296,7 +296,7 @@ const PRETRAIN_GRAD_CLIP = 1.0
 
 ```bash
 cargo test --workspace              # Run the workspace unit and integration tests
-cargo test --workspace -- --skip e2e_  # Match the main CI unit-test step
+cargo test --workspace --no-fail-fast -- --skip e2e_  # Match the main CI unit-test step
 cargo test -p nsl-cli --test e2e -- --test-threads=1  # Run the CLI smoke/e2e suite
 cargo run -p nsl-cli -- run examples/m14_sgd_basic.nsl  # Training demo
 cargo run -p nsl-cli -- test tests/m15_test.nsl          # NSL test suite
