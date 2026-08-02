@@ -85,7 +85,12 @@ mod tests {
 
     fn echo_binary_that_exits(code: i32) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("nsl-calib-subproc-{code}.{}", std::process::id()));
+        // `-` before the pid, not `.`: the Windows arm calls `set_extension`,
+        // which REPLACES everything after the last dot. With `.{pid}` the pid
+        // IS the extension, so `.cmd` overwrote it and every concurrent process
+        // raced on one file name — defeating the uniqueness `serial_lock`'s
+        // comment claims. With no dot in the stem, `set_extension` appends.
+        p.push(format!("nsl-calib-subproc-{code}-{}", std::process::id()));
         #[cfg(windows)]
         {
             p.set_extension("cmd");
@@ -133,7 +138,8 @@ mod tests {
     fn timeout_maps_to_infrastructure() {
         let _g = serial_lock();
         let mut p = std::env::temp_dir();
-        p.push(format!("nsl-calib-sleep.{}", std::process::id()));
+        // `-` before the pid, not `.` — see `echo_binary_that_exits`.
+        p.push(format!("nsl-calib-sleep-{}", std::process::id()));
         #[cfg(windows)]
         {
             p.set_extension("cmd");

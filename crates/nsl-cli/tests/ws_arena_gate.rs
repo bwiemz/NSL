@@ -110,7 +110,10 @@ fn run_gpu(fixture: &str, tag: &str, arena: bool) -> GpuRun {
     let ckpt = tmp.join("out.nslm");
     let src = fixture_src(fixture)
         .replace("# GPU_PLACEMENT", "m.to(cuda)")
-        .replace("CSLA_SAVE_PATH", ckpt.to_str().unwrap());
+        .replace(
+            "CSLA_SAVE_PATH",
+            &ckpt.display().to_string().replace('\\', "/"),
+        );
     let prog = tmp.join("prog.nsl");
     std::fs::write(&prog, &src).unwrap();
 

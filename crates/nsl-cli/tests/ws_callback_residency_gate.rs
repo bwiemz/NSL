@@ -147,7 +147,10 @@ fn callback_model_read_runs_on_gpu_without_crash() {
     let ckpt = tmp.join("mid_loop.nslm");
     let src = fixture_src("csla_ws_callback_model_read.nsl")
         .replace("# GPU_PLACEMENT", "m.to(cuda)")
-        .replace("CKPT_PATH", ckpt.to_str().unwrap());
+        .replace(
+            "CKPT_PATH",
+            &ckpt.display().to_string().replace('\\', "/"),
+        );
     let prog = tmp.join("prog.nsl");
     std::fs::write(&prog, &src).unwrap();
 
