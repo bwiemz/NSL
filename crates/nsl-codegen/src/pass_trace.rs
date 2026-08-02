@@ -320,6 +320,12 @@ pub fn reset() {
     // next compile in the same process: the disposition would still be there
     // while the entry it presupposes had been wiped.
     DISPOSITION.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // And the bus (step 4). Its `SILENT DEFAULT` finding asks whether the
+    // producing pass ran, which it answers from TRACE — so bus traffic that
+    // outlived a trace reset would be judged against the wrong compile. There
+    // is no case for clearing one and not the other, so this is not left to a
+    // caller to remember.
+    crate::pass_bus::reset();
 }
 
 /// Is `NSL_PASS_TRACE=1` set? Read per call rather than cached so a test can

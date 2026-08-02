@@ -167,7 +167,7 @@ impl AdjointGenerator {
     /// CSLA D2b part 2: hand the claims back after `generate()`. The
     /// hoisted pipeline runs adjoint generation BEFORE the forward
     /// lowering, but the forward's fused-SDPA claim dispatch still needs
-    /// the table (`compiler.csha_backward_claims`); the compiler restores
+    /// the table (`bus.csha_backward_claims`); the compiler restores
     /// it from here and clears its slot after the forward, preserving the
     /// old invariant that the ADJOINT lowering never sees claims. The
     /// forward reads only `op_to_chain` / `chain_marks` metadata — never

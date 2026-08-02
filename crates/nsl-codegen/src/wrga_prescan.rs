@@ -7,7 +7,7 @@
 //! `invoke_wrga_if_enabled`. So `compiler.adapter_sites` was empty when
 //! `forward` compiled, and the rewrite fell through silently.
 //!
-//! Fix: derive `adapter_sites` (and a minimal `last_wrga_plan`) purely from
+//! Fix: derive `adapter_sites` (and a minimal `bus.wrga_plan`) purely from
 //! the user-facing `@adapter(target=..., type=..., rank=..., alpha=...)`
 //! decorator configs (`compiler.wrga_inputs.adapter`) — no Wengert list,
 //! no roofline analysis, no spectral pass. Just enough so:
@@ -17,7 +17,7 @@
 //!     side-table slots.
 //!
 //! `invoke_wrga_if_enabled` still runs later inside the train block; it will
-//! overwrite `last_wrga_plan` / `adapter_sites` with the real plan. The
+//! overwrite `bus.wrga_plan` / `adapter_sites` with the real plan. The
 //! pre-scan is transparent to that path.
 
 use std::collections::BTreeSet;
@@ -197,8 +197,8 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
     }
 
     compiler.adapter_sites = sites;
-    compiler.last_wrga_plan = Some(plan.clone());
-    compiler.adapter_prescan_plan = Some(plan);
+    compiler.bus.publish_wrga_plan(plan.clone());
+    compiler.bus.publish_adapter_prescan_plan(plan);
 }
 
 /// WRGA B.3.2 Option 3 phase 3e: apply the adapter rewrite to

@@ -131,7 +131,7 @@ fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> b
 /// callers fall back to the unpruned primal/adjoint lists — this matches the
 /// Task 5 sanity expectation that an empty `WrgaInputs` is a no-op.
 ///
-/// When a plan is produced, it is stashed on `compiler.last_wrga_plan` for
+/// When a plan is produced, it is published to `compiler.bus.wrga_plan` for
 /// later observability (`nsl check --wrga-report`).
 /// CPDT driver bridge — mirrors `invoke_wrga_if_enabled`. Builds a `CpdtInput`
 /// from the WGGO `AppliedPlan`, the optional `@train` block (for AdamW hyper-
@@ -299,7 +299,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
             *guard = Some(plan.clone());
         }
     }
-    compiler.cpdt_plan = Some(plan);
+    compiler.bus.publish_cpdt_plan(plan);
 }
 
 pub(crate) fn invoke_wrga_if_enabled(
@@ -465,7 +465,7 @@ pub(crate) fn invoke_wrga_if_enabled(
     // (which runs before user-function compilation) when a target pattern
     // like "Toy.w" doesn't match any placement name emitted by
     // `infer_sites_from_wengert` (which uses bare "w"-style names).
-    // `last_wrga_plan` is always overwritten — the train-block plan is
+    // `bus.wrga_plan` is always overwritten — the train-block plan is
     // strictly more informative (real Wengert list, real placements).
     if !inject.sites.is_empty() {
         // B.3 Task 4: wire fusion decisions onto each newly-injected site.
@@ -480,7 +480,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         }
         compiler.adapter_sites = sites;
     }
-    compiler.last_wrga_plan = Some(plan.clone());
+    compiler.bus.publish_wrga_plan(plan.clone());
     Some(plan)
 }
 
@@ -4417,7 +4417,7 @@ impl Compiler<'_> {
         // source-AD extraction inside the inner lowering). Stderr, CFIE
         // convention for in-codegen build reports.
         if result.is_ok() {
-            if let Some(plan) = self.last_cpkd_plan.take() {
+            if let Some(plan) = self.bus.take_cpkd_plan() {
                 eprint!("{}", plan.render_report());
             }
         }
@@ -6062,7 +6062,7 @@ impl Compiler<'_> {
                     None
                 };
 
-                let plan = self.cpdt_plan.as_ref();
+                let plan = self.bus.cpdt_plan();
                 let active = plan
                     .map(|p| {
                         crate::cpdt_precision_exec::precision_active(
@@ -7642,7 +7642,7 @@ impl Compiler<'_> {
                     // performed by the `@fused_kl_ce` decorator during
                     // extraction, not by this code — CPKD rewrites nothing.
                     crate::pass_trace::record_disposition("CPKD", crate::pass_trace::PassDisposition::AdvisoryOnly);
-                    self.last_cpkd_plan = Some(crate::cpkd::CpkdPlan {
+                    self.bus.publish_cpkd_plan(crate::cpkd::CpkdPlan {
                         teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
                         student_name: self.resolve_sym(distill.student_sym).to_string(),
                         epochs: distill.epochs,
@@ -8137,7 +8137,7 @@ impl Compiler<'_> {
                             for extras in bridge_out.extras.values_mut() {
                                 extras.save_activations_for_backward = true;
                             }
-                            self.last_csha_bridge = Some(bridge_out);
+                            self.bus.publish_csha_bridge(bridge_out);
                             for d in diags { eprintln!("warning: {d}"); }
                             // A.2.1d: record the Wengert op indices CSHA
                             // has claimed across all boundary chains so
@@ -8145,8 +8145,9 @@ impl Compiler<'_> {
                             // A.2.3 matmul projection, A.2.4 RoPE
                             // epilogue) can ask `is_csha_claimed(op)`
                             // before emitting a redundant launch.
-                            self.csha_claimed_ops =
-                                crate::csha_apply::collect_claimed_ops(&plan);
+                            self.bus.publish_csha_claimed_ops(
+                                crate::csha_apply::collect_claimed_ops(&plan),
+                            );
                             // T7.1 / Gap D.1: build the chain-level dispatch
                             // map for the AD reverse walk. Gap D.1 passes the
                             // Wengert list so the dispatcher can resolve
@@ -8154,7 +8155,15 @@ impl Compiler<'_> {
                             // RMSNorm-out) and detect the shared SDPA op —
                             // which is the correct primary claim site for
                             // `EmitFused`.
-                            if let Some(ref bridge) = self.last_csha_bridge {
+                            // Computed into a local FIRST so the read borrow of
+                            // `self.bus` ends before the publish below takes it
+                            // mutably. Both values used to be separate public
+                            // fields, which let the read and the write overlap;
+                            // they are one struct now, so the sequence has to be
+                            // written out. Same values, same order.
+                            let backward_claims = if let Some(bridge) =
+                                self.bus.csha_bridge()
+                            {
                                 // Gap I.1: pass the TRAINING config (clamped, no
                                 // fusion flags) so the dispatcher's backward SMEM
                                 // validator sees the same geometry the real
@@ -8173,13 +8182,17 @@ impl Compiler<'_> {
                                         Some(extractor.wengert_list()),
                                         training_config,
                                     );
-                                if !chain_marks.is_empty() {
-                                    self.csha_backward_claims =
-                                        Some(crate::source_ad::CshaBackwardClaims {
-                                            op_to_chain,
-                                            chain_marks,
-                                        });
-                                }
+                                (!chain_marks.is_empty()).then_some(
+                                    crate::source_ad::CshaBackwardClaims {
+                                        op_to_chain,
+                                        chain_marks,
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                            if let Some(claims) = backward_claims {
+                                self.bus.publish_csha_backward_claims(claims);
                             }
                         }
                     }
@@ -8349,7 +8362,7 @@ impl Compiler<'_> {
                     if train_has_decorated {
                         wrga_plan.clone()
                     } else {
-                        self.adapter_prescan_plan.clone()
+                        self.bus.adapter_prescan_plan().cloned()
                     }
                 };
                 if let Some(plan_ref) = init_plan.as_ref() {
@@ -8525,7 +8538,7 @@ impl Compiler<'_> {
                     || ccr_selective_decorated
                 {
                     let claimed_ids: Option<std::collections::HashSet<u32>> =
-                        self.csha_backward_claims.as_ref().map(|claims| {
+                        self.bus.csha_backward_claims().map(|claims| {
                             claims.op_to_chain.keys().copied().collect()
                         });
                     let policy = if self.compile_options.checkpoint_selective
@@ -8900,7 +8913,7 @@ impl Compiler<'_> {
                 // T7.1: thread CSHA backward claims into the generator so
                 // the reverse walk can route claimed ops through the fused
                 // backward dispatcher instead of per-op AD rules.
-                if let Some(claims) = self.csha_backward_claims.take() {
+                if let Some(claims) = self.bus.take_csha_backward_claims() {
                     gen.set_csha_claims(claims);
                 }
                 // Item 9: opt-in fused RMSNorm input-gradient lowering.
@@ -8944,7 +8957,7 @@ impl Compiler<'_> {
                 // compiler slot is cleared again right after the forward, so
                 // the ADJOINT lowering still never sees claims — the same
                 // invariant the old post-forward `take()` enforced.
-                self.csha_backward_claims = gen.take_csha_claims();
+                self.bus.restore_csha_backward_claims(gen.take_csha_claims());
                 // T7.1: surface any CSHA fallback diagnostics.
                 for diag in gen.csha_diagnostics() {
                     eprintln!("[nsl] {diag}");
@@ -9873,7 +9886,7 @@ impl Compiler<'_> {
                 // pre-forward and handed them back for the forward's fused
                 // dispatch — clear them NOW so the adjoint/window lowering
                 // never sees claims (the old post-forward `take()` contract).
-                self.csha_backward_claims = None;
+                self.bus.clear_csha_backward_claims();
                 let full_vars = &full_lowered.var_map;
 
                 // D2b part 2: the plan restriction above consumed

@@ -628,6 +628,18 @@ pub struct Compiler<'a> {
     // ── Function registry ────────────────────────────────────────────
     pub registry: FunctionRegistry,
 
+    // ── Inter-pass channels (roadmap item 2, step 4) ─────────────────
+    /// The pass bus: every value one pass produces for another to consume.
+    ///
+    /// These were eight public fields here — `last_wrga_plan`,
+    /// `last_csha_bridge`, `cpdt_plan` and friends — indistinguishable among 74
+    /// others from scratch counters and emission caches. They are now
+    /// [`crate::pass_bus::PassBus`], whose fields are private to that module,
+    /// so the only way to reach one is an accessor that counts the access. See
+    /// its header for why privacy rather than convention, and for what the
+    /// counters catch.
+    pub bus: crate::pass_bus::PassBus,
+
     // ── Interprocedural analyses ─────────────────────────────────────
     /// Parameter escape facts for every function and model method with a
     /// visible body. Computed once, before any body is compiled, and read at
@@ -786,20 +798,12 @@ pub struct Compiler<'a> {
     /// components; last component (2) evicts (mirrors
     /// `fused_ce_bwd_cache`).
     pub fused_kl_ce_bwd_cache: HashMap<Value, [Value; 3]>,
-    /// Build-report facts collected while lowering the most recent distill
-    /// block (trainable/frozen counts, fused KL-CE status); rendered to
-    /// stderr by `compile_distill_block` after a successful lowering.
-    pub last_cpkd_plan: Option<crate::cpkd::CpkdPlan>,
 
     // ── WRGA side-channel (Milestone A) ─────────────────────────────
     /// WRGA decorator configs for this compile, forwarded from `CompileOptions`.
     /// Consumed inside `compile_train_step_with_source_ad` when a `@train` block
     /// is lowered.  `None` means WRGA is disabled for this build.
     pub wrga_inputs: Option<crate::WrgaInputs>,
-    /// The most recent `WrgaPlan` produced during this compile, kept for
-    /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
-    /// compiled, or if WRGA was disabled.
-    pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
 
     // ── CFIE side-channel (Tier-A wiring) ────────────────────────────
     /// `@cfie(mode=..., target=...)` decorator values captured in the
@@ -809,10 +813,6 @@ pub struct Compiler<'a> {
     /// `@cfie(target=h100)` GPU-name override, same lifecycle as
     /// `cfie_decorator_mode`.
     pub cfie_decorator_target: Option<String>,
-    /// The most recent `CfiePlan` produced while compiling a serve
-    /// block, kept for observability (build report / future `nsl
-    /// check` surface).  `None` when no serve block opted into CFIE.
-    pub last_cfie_plan: Option<crate::cfie::CfiePlan>,
     /// CFIE Cycle 11: the `generate()` intrinsic's driver parameters,
     /// set by `run_cfie_for_serve` while a CFIE-active serve block
     /// compiles and consulted by the `generate()` rewrite in
@@ -875,8 +875,6 @@ pub struct Compiler<'a> {
     /// Cluster topology supplied via `--cpdt-num-gpus` / `--cpdt-intra-bw` / `--cpdt-inter-bw`.
     /// `None` when CPDT is off.
     pub cpdt_cluster: Option<crate::cpdt_zero::ClusterSpec>,
-    /// Resulting plan after `invoke_cpdt_if_enabled` runs.
-    pub cpdt_plan: Option<crate::cpdt::CpdtPlan>,
     /// Whether `--cpdt-report` was requested.
     pub cpdt_report_requested: bool,
     /// CPDT §4.1 roofline slack ratio for the MoE capacity-factor override.
@@ -916,14 +914,6 @@ pub struct Compiler<'a> {
     pub adapter_sites: Vec<crate::wrga_adapter_inject::AdapterSite>,
     pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
     pub current_method_model_name: Option<String>,
-    pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
-    /// CSHA Tier A.1: bridge result from the most recent CSHA planner run.
-    /// Populated by the CSHA hook in `stmt.rs` when
-    /// `CompileOptions.csha.mode` is set to a non-off mode. Consumed by
-    /// `compile_flash_attention_call` to route FA launches through the
-    /// CSHA-aware FFI when per-layer extras are available. `None` when
-    /// CSHA is disabled or when no `@train` block compiled.
-    pub last_csha_bridge: Option<crate::csha_apply::BridgeResult>,
     /// CSHA Tier A.2.0: ordinal of the next FlashAttention call lowered
     /// during this compile. Incremented each time
     /// `compile_flash_attention_call` runs, so that successive SDPA
@@ -935,20 +925,9 @@ pub struct Compiler<'a> {
     /// for the whole stack. A.2.1 replaces this positional match with a
     /// proper layer-name resolver.
     pub csha_fa_call_ordinal: usize,
-    /// CSHA Tier A.2.1d: side-table of Wengert op indices claimed by the
-    /// current CSHA plan — the RMSNorm prologue, the Q/K/V projection
-    /// matmuls, and (where present) the RoPE epilogue op per boundary
-    /// chain. Populated at the same hook that sets `last_csha_bridge`
-    /// (stmt.rs), from `plan.boundary.chains`.
-    pub csha_claimed_ops: std::collections::HashSet<u32>,
-    /// T7.1: CSHA backward dispatch map — maps Wengert op indices to
-    /// chain-level FusionMarks for the AD reverse walk.  Populated at
-    /// the same hook that sets `last_csha_bridge`.  `None` when CSHA
-    /// is off or no boundary chains exist.
-    pub csha_backward_claims: Option<crate::source_ad::CshaBackwardClaims>,
     /// Gap A: per-layer CSHA activation-save pointers emitted by the
     /// forward FA call site. Keyed by layer name (matching
-    /// `BridgeResult.extras` / `csha_backward_claims.chain_marks[_].layer`).
+    /// `BridgeResult.extras` / the bus's `csha_backward_claims`).
     /// The fused source-AD backward emission consumes this map to
     /// thread `q_proj` / `k_proj` / `v_proj` / `row_max` / `row_sum` /
     /// `x_raw` device pointers into `nsl_flash_attention_csha_backward`.
@@ -1145,6 +1124,7 @@ impl<'a> Compiler<'a> {
             dump_ir: false,
             func_index: 0,
             next_cuda_graph_region_id: 0,
+            bus: crate::pass_bus::PassBus::default(),
             registry: FunctionRegistry::new(),
             escape: crate::escape::EscapeAnalysis::disabled(),
             types: TypeRegistry::new(),
@@ -1170,12 +1150,9 @@ impl<'a> Compiler<'a> {
             fused_ce_bwd_cache: HashMap::new(),
             fused_kl_ce_fwd_saves: HashMap::new(),
             fused_kl_ce_bwd_cache: HashMap::new(),
-            last_cpkd_plan: None,
             wrga_inputs: options.wrga_inputs.clone(),
-            last_wrga_plan: None,
             cfie_decorator_mode: None,
             cfie_decorator_target: None,
-            last_cfie_plan: None,
             cfie_serve_gen: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
             fused_kl_ce_configs: options.fused_kl_ce_configs.clone(),
@@ -1184,7 +1161,6 @@ impl<'a> Compiler<'a> {
             pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
             cpdt_cluster: options.cpdt.cluster.clone(),
-            cpdt_plan: None,
             cpdt_report_requested: options.cpdt.report_requested,
             cpdt_moe_roofline_slack: options.cpdt.moe_roofline_slack,
             cpdt_weight_aware: true,
@@ -1199,11 +1175,7 @@ impl<'a> Compiler<'a> {
             adapter_sites: Vec::new(),
             synth_member_names: std::collections::HashMap::new(),
             current_method_model_name: None,
-            adapter_prescan_plan: None,
-            last_csha_bridge: None,
             csha_fa_call_ordinal: 0,
-            csha_claimed_ops: std::collections::HashSet::new(),
-            csha_backward_claims: None,
             csha_forward_saves: std::collections::HashMap::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             fused_gatedlora_ptx_kernels: std::collections::HashMap::new(),
@@ -1280,7 +1252,7 @@ impl<'a> Compiler<'a> {
     /// projection matmul, or RoPE epilogue). Returns false when CSHA
     /// is off or no plan has been run this compile.
     pub fn is_csha_claimed(&self, op_idx: u32) -> bool {
-        self.csha_claimed_ops.contains(&op_idx)
+        self.bus.is_csha_claimed(op_idx)
     }
 
     /// Gap I.B: clear CSHA per-function caches at function-compile

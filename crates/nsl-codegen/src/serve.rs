@@ -768,7 +768,7 @@ impl Compiler<'_> {
     /// CFIE Tier-A wiring: extract serve-block CFIE config, resolve the
     /// mode, run the six-pass orchestrator against real inputs (GPU
     /// database + `--weights` WeightMap + serve config keys), print the
-    /// build report, and stash the plan on `self.last_cfie_plan`.
+    /// build report, and publish the plan on `bus.cfie_plan`.
     ///
     /// Returns the runtime-init values the compiled binary must pass to
     /// the `nsl_cfie_*` init FFIs, or `None` when CFIE is not active.
@@ -1506,7 +1506,7 @@ impl Compiler<'_> {
         };
 
         let capacity = plan.persistent.scheduler.ring_buffer.capacity as i64;
-        self.last_cfie_plan = Some(plan);
+        self.bus.publish_cfie_plan(plan);
         Ok(Some(CfieRuntimeInit {
             ring_capacity: capacity,
             kv_slots,

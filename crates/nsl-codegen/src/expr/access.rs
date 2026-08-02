@@ -158,7 +158,7 @@ impl Compiler<'_> {
             // `layout.adapter_sidetable_offset`. The index used here must
             // match the insertion order used by the init pass, i.e. the
             // flattened `synthesized_fields` sequence across all sites
-            // targeting this model in `last_wrga_plan`.
+            // targeting this model in `bus.wrga_plan`.
             if is_synthesized_adapter_field_name(&member_name) {
                 if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
                     if let Some(slot_off) = layout.adapter_sidetable_offset {
@@ -568,7 +568,7 @@ impl Compiler<'_> {
         field_name: &str,
     ) -> Option<usize> {
         // B.2.1 Task 5.5: read directly from `adapter_sites` (set by the
-        // pre-scan pass) rather than `last_wrga_plan` — the latter is
+        // pre-scan pass) rather than `bus.wrga_plan` — the latter is
         // overwritten inside @train-block lowering with a real Wengert plan
         // that has no decorated placements when its placement names don't
         // syntactically match the @adapter target pattern.

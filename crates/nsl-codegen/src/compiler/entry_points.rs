@@ -96,8 +96,8 @@ fn run_profile_pre_pass(
             // launch-emit time. Copy WRGA-level adapter-fusion groups if a
             // recent @train compile produced them; otherwise start empty.
             let seeded = compiler
-                .last_wrga_plan
-                .as_ref()
+                .bus
+                .wrga_plan()
                 .map(|p| p.fusion.clone())
                 .unwrap_or_default();
             compiler.fusion_plan_for_profile = Some(seeded);
@@ -724,7 +724,7 @@ fn compile_returning_plan_impl(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    // B.2.1 Task 5.5: pre-populate adapter_sites + last_wrga_plan from the
+    // B.2.1 Task 5.5: pre-populate adapter_sites + bus.wrga_plan from the
     // user-facing @adapter decorators BEFORE model methods (e.g. `forward`)
     // are compiled. Without this, the Task 3 LoRA AST rewrite never fires
     // because adapter_sites is empty at that point (train-block WRGA
@@ -799,7 +799,7 @@ fn compile_returning_plan_impl(
 
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
-    let plan = compiler.last_wrga_plan.clone();
+    let plan = compiler.bus.wrga_plan().cloned();
     // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
     compiler.emit_export_wrappers()?;
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize
@@ -879,7 +879,7 @@ fn compile_with_zk_info_best_effort_plan(
     compiler.dump_ir = dump_ir;
 
     // Run every pass up to (but not including) finalize so we can observe
-    // `last_wrga_plan` even on an error path before consuming the compiler.
+    // `bus.wrga_plan` even on an error path before consuming the compiler.
     let pre_finalize = (|| -> Result<(), CodegenError> {
         // M52: load weights if --weights was provided.
         load_and_register_weights_if_needed(&mut compiler, options)?;
@@ -939,7 +939,7 @@ fn compile_with_zk_info_best_effort_plan(
         Ok(())
     })();
 
-    let plan = compiler.last_wrga_plan.clone();
+    let plan = compiler.bus.wrga_plan().cloned();
 
     // Capture ZK fn map before finalize() consumes the compiler.
     let zk_proof_fns = compiler.features.zk_proof_fns.clone();
@@ -1099,7 +1099,7 @@ fn compile_standalone_best_effort_plan(
         compiler.emit_export_wrappers()?;
         Ok(())
     })();
-    let plan = compiler.last_wrga_plan.clone();
+    let plan = compiler.bus.wrga_plan().cloned();
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
     if pre_finalize.is_ok() {
         write_manifest_if_needed(&mut compiler, options);
@@ -1352,7 +1352,7 @@ pub fn compile_module_with_imports_best_effort_plans(
     }
 
     // Run every pass up to (but not including) `finalize`, so we can observe
-    // `last_wrga_plan` even on an error path before consuming the compiler.
+    // `bus.wrga_plan` even on an error path before consuming the compiler.
     let pre_finalize = (|| -> Result<(), CodegenError> {
         compiler.intern_string("")?;
         compiler.collect_strings(&ast.stmts)?;
@@ -1390,8 +1390,8 @@ pub fn compile_module_with_imports_best_effort_plans(
         compiler.emit_export_wrappers()?;
         Ok(())
     })();
-    let plan = compiler.last_wrga_plan.clone();
-    let cfie_plan = compiler.last_cfie_plan.clone();
+    let plan = compiler.bus.wrga_plan().cloned();
+    let cfie_plan = compiler.bus.cfie_plan().cloned();
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
     if pre_finalize.is_ok() {
         write_manifest_if_needed(&mut compiler, options);
@@ -1553,11 +1553,11 @@ pub fn compile_entry_returning_plan(
         );
     }
     // M52: embed weight hash if weights were loaded (parity with single-file
-    // `compile_returning_plan`).  Called before the `last_wrga_plan` clone so
+    // `compile_returning_plan`).  Called before the `bus.wrga_plan` clone so
     // that if a future change makes `embed_weight_hash` stash anything into
     // the plan, the returned plan reflects it — matches the single-file path.
     compiler.embed_weight_hash()?;
-    let plan = compiler.last_wrga_plan.clone();
+    let plan = compiler.bus.wrga_plan().cloned();
     // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
     compiler.emit_export_wrappers()?;
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.

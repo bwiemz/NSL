@@ -1653,7 +1653,7 @@ impl Compiler<'_> {
         // misses — e.g. single-layer toy models whose function name
         // doesn't carry a `blocks.N` prefix.
         let ordinal = self.csha_fa_call_ordinal;
-        let (csha_layer, csha_extras) = match self.last_csha_bridge.as_ref() {
+        let (csha_layer, csha_extras) = match self.bus.csha_bridge() {
             Some(b) => {
                 let by_name = state
                     .current_function_name
@@ -1707,7 +1707,7 @@ impl Compiler<'_> {
             let mut norm_w_v = null;
             let mut x_v = null;
             if let (Some(bridge), Some(layer)) =
-                (self.last_csha_bridge.as_ref(), csha_layer.as_deref())
+                (self.bus.csha_bridge(), csha_layer.as_deref())
             {
                 use crate::csha_boundary::ProjKind;
                 use crate::csha_apply::{MarkRole, BridgeResult};
