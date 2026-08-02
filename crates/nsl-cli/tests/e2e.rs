@@ -74,8 +74,38 @@ fn normalize_paths(text: &str) -> String {
     result
 }
 
+/// Rebuild `text` with LF line endings and no trailing newline.
+///
+/// The `tests/expected/*.txt` baselines are checked out with CRLF on Windows
+/// while the program under test prints LF, so an unnormalized comparison fails
+/// on every interior line ending — `.trim()` only reaches the ends. `lines()`
+/// strips the `\r`, and `join` drops the trailing newline.
+///
+/// This used to happen ACCIDENTALLY: `strip_linker_noise` filtered MSVC's
+/// "Creating library" lines with the same `lines()`/`join` rebuild, and the
+/// line-ending fix was an undocumented side effect of how it was written.
+/// Deleting that filter once linker output moved to stderr (PR #455) took the
+/// normalization with it and reddened 23 Windows e2e tests. Keeping it
+/// explicit and named is what stops that from being re-deleted.
+fn normalize_line_endings(text: &str) -> String {
+    text.lines().collect::<Vec<_>>().join("\n")
+}
+
 fn normalize(text: &str) -> String {
-    normalize_paths(&normalize_floats(text))
+    normalize_paths(&normalize_floats(&normalize_line_endings(text)))
+}
+
+/// Pins the CRLF collapse that every `assert_output_matches` depends on.
+///
+/// Deliberately platform-independent: the inputs are literals, so this fails
+/// on Linux too. That is the whole point — the breakage it guards against is
+/// invisible on Linux, where no baseline ever contains a `\r`, and the last
+/// time it regressed it took a Windows CI round-trip to find out.
+#[test]
+fn normalize_collapses_crlf_line_endings() {
+    assert_eq!(normalize("a\r\nb\r\nc"), "a\nb\nc");
+    assert_eq!(normalize("a\r\nb\r\n"), "a\nb");
+    assert_eq!(normalize("a\nb"), "a\nb", "LF input must pass through");
 }
 
 fn workspace_root() -> std::path::PathBuf {
