@@ -46,11 +46,29 @@ fn repo_root() -> PathBuf {
 /// for contains none.
 fn code_only(text: &str) -> String {
     text.lines()
+        .map(strip_trailing_comment)
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
         .split_whitespace()
         .collect()
+}
+
+/// Truncate a line at its trailing `//`.
+///
+/// Dropping only lines that START with `//` left a hole: `let x = foo(); // see
+/// .wrga_plan()` satisfied the presence half from prose, which is the more
+/// dangerous direction — it makes a channel look consumed when nothing consumes
+/// it. The `:` guard keeps `https://` and `path::to::thing` intact; nothing
+/// searched for here can appear after a `:` in a way that matters.
+fn strip_trailing_comment(line: &str) -> &str {
+    let b = line.as_bytes();
+    for i in 0..b.len().saturating_sub(1) {
+        if b[i] == b'/' && b[i + 1] == b'/' && (i == 0 || b[i - 1] != b':') {
+            return &line[..i];
+        }
+    }
+    line
 }
 
 fn pass_bus_source() -> String {
@@ -397,6 +415,88 @@ fn is_csha_claimed_still_has_no_production_callers() {
          CshaClaimedOps channel is no longer dead output. Update its \
          ChannelDescriptor consumers and delete this test."
     );
+}
+
+/// Every `PassBus` accessor either counts, or is a declared lifecycle
+/// operation that says why it does not.
+///
+/// Privacy guarantees no access without an accessor. It does NOT guarantee the
+/// accessor counts — a new `pub fn wggo_overrides_unchecked(&self)` returning
+/// the field would compile, satisfy every other gate here, and silently make
+/// that channel's traffic wrong in the direction that hides findings. This is
+/// the static enforcement the privacy argument was resting on and did not have.
+///
+/// The four exemptions are lifecycle operations on a value already published
+/// once: counting a restore as a publish would make a channel nobody consumes
+/// look busier than it is. Adding a fifth is a deliberate edit here.
+#[test]
+fn every_accessor_counts_or_declares_why_not() {
+    const UNCOUNTED: &[&str] = &[
+        "restore_csha_backward_claims",
+        "clear_csha_backward_claims",
+        "clear_wggo_overrides",
+        "clear_cfie_serve_gen",
+    ];
+
+    let src = pass_bus_source();
+    let body = src
+        .split_once("impl PassBus {")
+        .expect("impl PassBus must exist")
+        .1;
+    let body = &body[..body.find("\n}").expect("impl PassBus must close")];
+
+    // Split into methods at each `    pub fn` / `    pub(crate) fn` header.
+    let mut methods: Vec<(String, String)> = Vec::new();
+    for line in body.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t
+            .strip_prefix("pub fn ")
+            .or_else(|| t.strip_prefix("pub(crate) fn "))
+        {
+            let name = rest.split('(').next().unwrap_or("").to_string();
+            methods.push((name, String::new()));
+        }
+        if let Some(last) = methods.last_mut() {
+            last.1.push_str(line);
+            last.1.push('\n');
+        }
+    }
+
+    assert!(
+        methods.len() >= 25,
+        "only {} accessors parsed — the scan failed, so an empty result would \
+         prove nothing",
+        methods.len()
+    );
+
+    let mut uncounted = Vec::new();
+    for (name, body) in &methods {
+        let counts = body.contains("note_publish(")
+            || body.contains("note_read(")
+            // `has_wggo_overrides` delegates to the counting accessor rather
+            // than reading the field, which is the pattern to encourage: one
+            // narrow escape, not a general "mentions the field" clause that
+            // would readmit everything this gate exists to catch.
+            || body.contains("self.wggo_overrides()");
+        if !counts && !UNCOUNTED.contains(&name.as_str()) {
+            uncounted.push(name.clone());
+        }
+    }
+    assert!(
+        uncounted.is_empty(),
+        "PassBus accessors that neither count nor are declared uncounted: \
+         {uncounted:?} — call note_publish/note_read, or add the name to \
+         UNCOUNTED here with a doc comment at the method saying why"
+    );
+
+    // The allowlist must not outlive its entries.
+    for name in UNCOUNTED {
+        assert!(
+            methods.iter().any(|(n, _)| n == name),
+            "UNCOUNTED lists `{name}`, which no longer exists — a stale \
+             exemption is how a real gap gets waved through later"
+        );
+    }
 }
 
 /// The two findings must render distinguishably. A report where both
