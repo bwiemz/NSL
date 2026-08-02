@@ -158,6 +158,25 @@ pub struct VerilatorHarness {
     tap_descriptor: TapDescriptor,
 }
 
+/// Resolve the executable Verilator actually wrote for `-o <sim_name>`.
+///
+/// `-o` takes a suffix-less name, but whether an executable suffix is appended
+/// is the *backend compiler's* choice, not Verilator's — MSVC produces
+/// `<name>.exe`, GCC/Clang produce `<name>`. Probing both is what makes this
+/// correct without asserting which backend built the simulation; on Unix
+/// `EXE_SUFFIX` is empty, so the two candidates are the same path and the
+/// probe collapses to the original behavior.
+///
+/// Falls back to the suffix-less name when neither exists, so a missing binary
+/// surfaces as the spawn error it is rather than as a confusing wrong-name one.
+fn resolve_sim_binary(obj_dir: &Path, sim_name: &str) -> PathBuf {
+    let with_suffix = obj_dir.join(format!("{sim_name}{}", std::env::consts::EXE_SUFFIX));
+    if with_suffix.exists() {
+        return with_suffix;
+    }
+    obj_dir.join(sim_name)
+}
+
 impl VerilatorHarness {
     /// Compile `verilog_path` with Verilator and return a ready harness.
     ///
@@ -198,7 +217,7 @@ impl VerilatorHarness {
         }
 
         Ok(Self {
-            sim_binary: obj_dir.join(&sim_name),
+            sim_binary: resolve_sim_binary(obj_dir, &sim_name),
             tap_descriptor: taps,
         })
     }
@@ -329,7 +348,7 @@ impl VerilatorHarness {
         }
 
         Ok(Self {
-            sim_binary: obj_dir.join(&sim_name),
+            sim_binary: resolve_sim_binary(obj_dir, &sim_name),
             tap_descriptor: taps,
         })
     }

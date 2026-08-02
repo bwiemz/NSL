@@ -74,16 +74,8 @@ fn normalize_paths(text: &str) -> String {
     result
 }
 
-/// Strip MSVC linker noise ("Creating library ... and object ...") from output.
-fn strip_linker_noise(text: &str) -> String {
-    text.lines()
-        .filter(|line| !line.trim_start().starts_with("Creating library"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn normalize(text: &str) -> String {
-    normalize_paths(&normalize_floats(&strip_linker_noise(text)))
+    normalize_paths(&normalize_floats(text))
 }
 
 fn workspace_root() -> std::path::PathBuf {
@@ -656,10 +648,7 @@ fn e2e_dataloader_loop_exit_values() {
         "Unexpected verifier failure for DataLoader loop exit example: {}",
         stderr
     );
-    let stdout_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|line| !line.starts_with("   Creating library "))
-        .collect();
+    let stdout_lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
         stdout_lines,
         vec!["2", "16", "1.5"],

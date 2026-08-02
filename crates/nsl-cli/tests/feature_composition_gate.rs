@@ -911,16 +911,16 @@ fn materialize_csla_fixture(tag: &str, gpu: bool) -> PathBuf {
     let pid = std::process::id();
     let out = tmp.join(format!("nsl_featcomp_csla_{tag}_{pid}.nsl"));
     let save = tmp.join(format!("nsl_featcomp_csla_{tag}_{pid}.nslm"));
-    // The path is substituted into an NSL *string literal*, so backslashes must
-    // be escaped. On Windows `save` is `C:\Users\RUNNER~1\AppData\...`, and
-    // pasting that in raw made the lexer read `\U`, `\R`, `\A` … as escape
-    // sequences: the fixture failed to compile with "unknown escape sequence",
-    // which this gate reports as `CONTROL FAILED ... the fixture must compile in
-    // this SUPPORTED configuration`. `\\` is a supported NSL escape
-    // (nsl-lexer/src/strings.rs), so escaping is the faithful fix — the program
-    // still receives the original path. Never triggered on Unix, where temp
-    // paths contain no backslashes.
-    let save_literal = save.to_str().expect("utf-8 temp path").replace('\\', "\\\\");
+    // The path is substituted into an NSL *string literal*, so a raw Windows
+    // path breaks it: `save` is `C:\Users\RUNNER~1\AppData\...` and the lexer
+    // reads `\U`, `\R`, `\A` … as escape sequences, failing the fixture with
+    // "unknown escape sequence" — which this gate reports as `CONTROL FAILED
+    // ... the fixture must compile in this SUPPORTED configuration`. Forward
+    // slashes carry no escape meaning and Windows accepts them in paths, which
+    // is why every other CSLA_SAVE_PATH substitution in this tree normalizes
+    // the same way. Never triggered on Unix, where temp paths have no
+    // backslashes.
+    let save_literal = save.display().to_string().replace('\\', "/");
     let body = src
         .replace("CSLA_SAVE_PATH", &save_literal)
         .replace("# GPU_PLACEMENT", if gpu { "m.to(cuda)" } else { "" });

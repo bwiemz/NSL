@@ -62,11 +62,13 @@ fn run(save_path: &std::path::Path, checkpoint_blocks: bool, tag: &str) -> (bool
 }
 
 /// The lines between the `LOSS_STREAM_BEGIN`/`LOSS_STREAM_END` markers.
-/// stdout also carries build-toolchain noise ahead of them — on Windows,
-/// MSVC's linker prints `Creating library ...\<pid-and-tempdir-specific
-/// path>.lib and object ...exp` for the compiled .nsl program, which can
-/// never byte-match between two separate runs (different temp dirs/PIDs)
-/// even when the actual program output is identical.
+///
+/// The markers are what makes this comparison run-to-run stable: anything the
+/// toolchain prints alongside the program cannot byte-match across two runs
+/// (different temp dirs and PIDs) even when the program's own output is
+/// identical. Historically that included MSVC's `Creating library ...` line,
+/// which `nsl run` leaked onto *stdout* until PR #455 sent linker output to
+/// stderr; the marker framing is not conditional on that and stays regardless.
 fn loss_stream(stdout: &str) -> String {
     let mut out = String::new();
     let mut in_stream = false;

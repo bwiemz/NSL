@@ -197,12 +197,14 @@ fn nsl_run_produces_finite_loss() {
     cmd.arg("run").arg(&fixture);
     let output = cmd.assert().success().get_output().stdout.clone();
     let stdout = String::from_utf8(output).expect("stdout must be valid UTF-8");
-    // On Windows, `nsl run`'s in-process link step shells out to MSVC
-    // `link.exe`, which prints its own "Creating library ... and object
-    // ..." line to stdout ahead of the fixture's `print(loss)` output --
-    // Linux/macOS toolchains don't emit that noise. The loss is always the
-    // last line the fixture itself prints, so parse the last non-empty
-    // line rather than assuming stdout is the bare float alone.
+    // The loss is the last line the fixture prints, so parse the last
+    // non-empty line rather than assuming stdout is the bare float alone.
+    // This used to be load-bearing on Windows, where `nsl run`'s in-process
+    // link step let MSVC `link.exe`'s "Creating library ..." line onto stdout
+    // ahead of `print(loss)`; PR #455 routed linker output to stderr, and
+    // `run_stdout_is_program_output_only.rs` now pins that directly. Parsing
+    // the last line is kept because it costs nothing and this test's subject
+    // is the loss value, not stdout framing.
     let last_line = stdout
         .lines()
         .rev()

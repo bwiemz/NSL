@@ -56,7 +56,10 @@ fn downscaled_program(save_path: &Path, accum: u32, token_count: u64) -> String 
         ("grad_accumulation=4".to_string(), format!("grad_accumulation={accum}")),
         (
             "model_save(m, \"models/coder-rl/checkpoints/coder_rl_pretrain.nslm\")".to_string(),
-            format!("model_save(m, \"{}\")", save_path.display()),
+            format!(
+                "model_save(m, \"{}\")",
+                save_path.display().to_string().replace('\\', "/")
+            ),
         ),
     ] {
         assert!(out.contains(&from), "knob `{from}` not found in pretrain.nsl — resync harness");
