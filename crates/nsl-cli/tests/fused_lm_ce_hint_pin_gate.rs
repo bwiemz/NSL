@@ -39,6 +39,15 @@
 //! `nsl-runtime::fused_linear_ce::hint_extent_tests`. What only an e2e run
 //! can show is that the pin is REACHED on the production lowering — which is
 //! the half that was missing.
+//!
+//! # On the negative assertions here
+//!
+//! `!stderr.contains("[fused-lm-ce]")` in the control arms is registered in
+//! `exec_markers::NEGATIVE_NEEDLES` — a negative assertion cannot fail, so
+//! renaming that prefix would otherwise leave it permanently, silently true.
+//! `!stderr.contains("@fused_lm_ce shape-hint pin")` needs no entry: the
+//! refusal arms assert the SAME string positively via `assert_pin_refused`,
+//! so a rename reddens those loudly rather than quietly disarming these.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

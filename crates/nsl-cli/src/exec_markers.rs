@@ -397,6 +397,21 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         ],
     },
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs",
+        asserts: "the two control arms fused for real -- a DECLINE would mean \
+                  the composite path ran, the hint pin was never reached, and \
+                  the arm proved nothing about false positives",
+        // Same bare token and same two emitting files as the decline gate
+        // above. Pinned separately because these arms carry different weight:
+        // there the assertion says a matching head produced no fallback, here
+        // it is what stops a false-positive control from passing vacuously
+        // against a program that never engaged the kernel at all.
+        parts: &[
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt.rs"),
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/source_ad.rs"),
+        ],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/multi_adamw_gate.rs",
         asserts: "the multi-tensor FASE step did NOT fire with the flag off",
         parts: &[("[fase-multi]", "crates/nsl-runtime/src/fase_step.rs")],
