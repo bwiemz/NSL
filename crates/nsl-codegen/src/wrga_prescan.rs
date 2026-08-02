@@ -196,7 +196,7 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
         }
     }
 
-    compiler.adapter_sites = sites;
+    compiler.bus.publish_adapter_sites(sites);
     compiler.bus.publish_wrga_plan(plan.clone());
     compiler.bus.publish_adapter_prescan_plan(plan);
 }
@@ -223,7 +223,7 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
 pub(crate) fn rewrite_model_method_bodies_with_adapter_sites(
     compiler: &mut crate::compiler::Compiler<'_>,
 ) {
-    if compiler.adapter_sites.is_empty() {
+    if compiler.bus.adapter_sites().is_empty() {
         return;
     }
     // Collect model names first to avoid mutable-borrow conflict with the

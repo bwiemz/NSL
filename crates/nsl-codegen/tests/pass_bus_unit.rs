@@ -127,35 +127,72 @@ fn taking_a_channel_counts_as_a_read_and_empties_it() {
 }
 
 /// A pass filled a channel and nothing ever got a value out of it.
+///
+/// Uses `csha_claimed_ops`, which ENFORCES `dead_output`. Not `csha_bridge`:
+/// that channel is exempt, because its own producer reads it back two
+/// statements after publishing, so the finding is unreachable there by
+/// construction.
 #[test]
 fn dead_output_fires_when_a_published_channel_is_never_read() {
     let _g = guard();
     let mut bus = PassBus::default();
     pass_trace::record("CSHA");
-    bus.publish_csha_bridge(bridge());
+    bus.publish_csha_claimed_ops([1u32, 2].into_iter().collect());
 
     assert_eq!(
         pass_bus::findings(),
-        vec![BusFinding::DeadOutput { channel: Channel::CshaBridge }]
+        vec![BusFinding::DeadOutput { channel: Channel::CshaClaimedOps }]
     );
 
     // ...and stops firing the moment a consumer reads it.
-    assert!(bus.csha_bridge().is_some());
+    assert!(bus.is_csha_claimed(1));
     assert!(
         pass_bus::findings().is_empty(),
         "one full read is enough to make a channel not-dead"
     );
 }
 
+/// A channel that exempts itself from `dead_output` stays quiet.
+///
+/// `csha_bridge` is exempt because its own producer reads it back two
+/// statements after publishing (`stmt.rs`), to derive the backward claims — so
+/// `reads_full >= publishes` always holds and the finding is unreachable there
+/// by construction. Recording that as an exemption rather than leaving it
+/// looking enforced matters: a future cleanup that used the local `bridge_out`
+/// instead of re-reading the channel would otherwise make every declining
+/// `--csha auto` build report a dead output, for a change that altered nothing.
+#[test]
+fn an_exempt_channel_does_not_report_dead_output() {
+    let _g = guard();
+    let mut bus = PassBus::default();
+    pass_trace::record("CSHA");
+    bus.publish_csha_bridge(bridge());
+    assert_eq!(
+        pass_bus::traffic(Channel::CshaBridge),
+        pass_bus::ChannelTraffic { publishes: 1, reads_full: 0, reads_empty: 0 },
+        "the precondition must hold, or the exemption is not what keeps this \
+         quiet"
+    );
+    assert!(
+        pass_bus::findings().is_empty(),
+        "csha_bridge is exempt from DeadOutput and must not fire: {:?}",
+        pass_bus::findings()
+    );
+}
+
 /// The sharp one: a pass that says it APPLIED a transformation, whose channel
 /// is nevertheless empty when a consumer reads it.
+///
+/// Uses `csha_bridge`, which ENFORCES `applied_implies_published` — CSHA
+/// publishes it unconditionally once it has a plan, so an applying CSHA with an
+/// empty bridge is a genuine contradiction.
 #[test]
 fn silent_default_fires_only_when_the_producer_applied() {
     let _g = guard();
     let bus = PassBus::default();
 
     // 1. Producer never ran: an empty read is the ordinary case.
-    assert!(bus.csha_backward_claims().is_none());
+    assert!(bus.csha_bridge().is_none());
     assert!(
         pass_bus::findings().is_empty(),
         "an empty channel whose pass never ran is a disabled feature, not a \
@@ -173,7 +210,7 @@ fn silent_default_fires_only_when_the_producer_applied() {
             reason: DeclineReason::NoCandidates("no boundary chain admitted"),
         },
     );
-    assert!(bus.csha_backward_claims().is_none());
+    assert!(bus.csha_bridge().is_none());
     assert!(
         pass_bus::findings().is_empty(),
         "a declining pass must not be flagged for the empty channel its \
@@ -182,30 +219,44 @@ fn silent_default_fires_only_when_the_producer_applied() {
 
     // 3. Producer ran and APPLIED, channel still empty: a contradiction.
     pass_trace::record_disposition("CSHA", PassDisposition::Applied { rewrites: 3 });
-    assert!(bus.csha_backward_claims().is_none());
+    assert!(bus.csha_bridge().is_none());
     let f = pass_bus::findings();
     assert!(
         f.contains(&BusFinding::SilentDefault {
-            channel: Channel::CshaBackwardClaims,
+            channel: Channel::CshaBridge,
             reads: 3,
         }),
-        "expected a SilentDefault for csha_backward_claims, got {f:?}"
+        "expected a SilentDefault for csha_bridge, got {f:?}"
     );
 }
 
-/// A producer with no disposition at all is deliberately NOT flagged: the gap
-/// means an exit with no `record_disposition`, which is a fact about
-/// instrumentation rather than about this build.
+/// A channel that exempts itself from `applied_implies_published` stays quiet
+/// under exactly the conditions that would otherwise fire.
+///
+/// Both CSHA channels here are legitimately empty on an APPLYING run:
+/// `collect_claimed_ops` returns an empty set when no boundary chain is
+/// claimed, and `csha_backward_claims` is published only when the backward SMEM
+/// validator admits at least one chain. Before the exemptions, the first was
+/// armed by the very empty-publish suppression that avoids a false DeadOutput,
+/// and the second was reachable on GPU with no test covering it.
 #[test]
-fn a_producer_with_no_disposition_is_not_flagged() {
+fn exempt_channels_do_not_report_silent_default_on_an_applying_pass() {
     let _g = guard();
-    let bus = PassBus::default();
+    let mut bus = PassBus::default();
     pass_trace::record("CSHA");
+    pass_trace::record_disposition("CSHA", PassDisposition::Applied { rewrites: 7 });
+
+    // Publishing an empty claim set leaves publishes == 0 — SilentDefault's
+    // precondition — and the read below would have triggered it.
+    bus.publish_csha_claimed_ops(std::collections::HashSet::new());
+    assert!(!bus.is_csha_claimed(0));
     assert!(bus.csha_backward_claims().is_none());
+
     assert!(
         pass_bus::findings().is_empty(),
-        "no disposition means unknown, and an unknown must not be reported as \
-         a specific consumer's silent default"
+        "an applying CSHA that claims no ops and admits no backward chain is \
+         correct, not a silent default: {:?}",
+        pass_bus::findings()
     );
 }
 
@@ -271,19 +322,27 @@ fn the_report_shows_active_channels_and_omits_silent_ones() {
 
 /// Both finding categories must be legible and distinct in the rendered
 /// report. Two categories that read the same would be worse than one.
+///
+/// Uses channels that ENFORCE the invariant each finding tests:
+/// `csha_claimed_ops` for DeadOutput, `csha_bridge` for SilentDefault.
 #[test]
 fn both_findings_render_distinguishably() {
     let _g = guard();
     let mut bus = PassBus::default();
     pass_trace::record("CSHA");
     pass_trace::record_disposition("CSHA", PassDisposition::Applied { rewrites: 1 });
-    bus.publish_csha_bridge(bridge()); // published, never read -> DeadOutput
-    assert!(bus.csha_backward_claims().is_none()); // empty + applied -> SilentDefault
+    // published, never read -> DeadOutput (enforced on this channel)
+    bus.publish_csha_claimed_ops([3u32].into_iter().collect());
+    // empty + producer applied -> SilentDefault (enforced on this channel)
+    assert!(bus.csha_bridge().is_none());
 
     let r = pass_bus::report();
-    assert!(r.contains("DEAD OUTPUT: csha_bridge"), "missing DeadOutput:\n{r}");
     assert!(
-        r.contains("SILENT DEFAULT: csha_backward_claims"),
+        r.contains("DEAD OUTPUT: csha_claimed_ops"),
+        "missing DeadOutput:\n{r}"
+    );
+    assert!(
+        r.contains("SILENT DEFAULT: csha_bridge"),
         "missing SilentDefault:\n{r}"
     );
     let dead = r.lines().filter(|l| l.contains("DEAD OUTPUT")).count();
@@ -315,12 +374,12 @@ fn edges_for_returns_a_passs_published_channels() {
         csha,
         vec!["csha_bridge", "csha_claimed_ops", "csha_backward_claims"]
     );
-    assert_eq!(
-        pass_bus::edges_for("WGGO").len(),
-        0,
-        "WGGO publishes no bus channel — its output goes through the Wengert \
-         list itself, not a stash field"
-    );
+    // The first revision of this module asserted WGGO published nothing,
+    // "because its output goes through the Wengert list". False, and false
+    // about the very edge the ordering argument depends on: FASE recipe
+    // selection reads `wggo_overrides`, which is why FASE must follow WGGO.
+    let wggo: Vec<&str> = pass_bus::edges_for("WGGO").iter().map(|d| d.name).collect();
+    assert_eq!(wggo, vec!["wggo_overrides", "wggo_preplans"]);
     assert!(
         pass_bus::edges_for("NotAPass").is_empty(),
         "an unknown pass must yield no edges rather than panicking"

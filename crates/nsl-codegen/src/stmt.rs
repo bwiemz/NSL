@@ -136,7 +136,7 @@ fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> b
 /// CPDT driver bridge — mirrors `invoke_wrga_if_enabled`. Builds a `CpdtInput`
 /// from the WGGO `AppliedPlan`, the optional `@train` block (for AdamW hyper-
 /// parameters), and the cluster topology stashed on the Compiler, then stores
-/// the resulting plan on `compiler.cpdt_plan`.
+/// the resulting plan on the `cpdt_plan` bus channel.
 ///
 /// No-op when `compiler.cpdt_mode == CpdtMode::Off` or when no cluster is
 /// configured.
@@ -424,7 +424,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
         inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
-        wggo_overrides: compiler.wggo_overrides.as_ref(),
+        wggo_overrides: compiler.bus.wggo_overrides(),
         // Paper §9.3 ablation flags — forwarded verbatim from `WrgaInputs`.
         // No-op for normal `nsl build` (default `WrgaAblation::default()`);
         // populated by `apply_wrga_check_overrides` in nsl-cli (the bridge
@@ -478,7 +478,7 @@ pub(crate) fn invoke_wrga_if_enabled(
                 }
             }
         }
-        compiler.adapter_sites = sites;
+        compiler.bus.publish_adapter_sites(sites);
     }
     compiler.bus.publish_wrga_plan(plan.clone());
     Some(plan)
@@ -5014,17 +5014,24 @@ impl Compiler<'_> {
         // WGGO-before-kernels: install THIS block's pre-plan overrides — or
         // explicitly `None`, never a previous block's leftovers (the pre-
         // restructure stale-leak) — BEFORE the body compiles. FASE recipe
-        // selection and the per-param mode table read `self.wggo_overrides`
+        // selection and the per-param mode table read `bus.wggo_overrides`
         // well before the in-place planning site in the same function; the
         // pre-pass is what finally lets them see the plan they were written
         // to consume. The offer is validated against the codegen-time
         // extraction at the planning site (graph-fingerprint check) and
         // replaced by an in-place solve on mismatch.
-        self.wggo_overrides = self
-            .wggo_preplans
+        let preplan_overrides = self
+            .bus
+            .wggo_preplans()
             .iter()
             .find(|p| p.train_block_stmt_id == train_block_stmt_id)
             .map(|p| p.overrides.clone());
+        match preplan_overrides {
+            Some(o) => self.bus.publish_wggo_overrides(o),
+            // Explicitly cleared, never a previous block's leftovers — the
+            // pre-restructure stale-leak this site exists to prevent.
+            None => self.bus.clear_wggo_overrides(),
+        }
         let result =
             self.compile_train_block_inner(builder, state, train, train_block_stmt_id);
         self.restore_active_fused_ce_config(saved_active_fused_ce);
@@ -5548,7 +5555,7 @@ impl Compiler<'_> {
             momentum: momentum_value,
             allow_v_approx: true,
         };
-        let fase_plan = match self.wggo_overrides.as_ref() {
+        let fase_plan = match self.bus.wggo_overrides() {
             Some(o) => {
                 let mut fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
                 // Diagnostic knob: NSL_FASE_FUSED_OVERRIDE="1,0,..." replaces
@@ -6013,7 +6020,7 @@ impl Compiler<'_> {
         // None (the existing FP32 path runs verbatim, zero behavior change).
         //
         // Borrow discipline: extract the owned dtype Vecs (and the activation
-        // decision) into a local FIRST, which ends the `self.cpdt_plan` borrow.
+        // decision) into a local FIRST, which ends the `bus.cpdt_plan()` borrow.
         // Only then do the `compile_call_by_name` loop (which borrows `self`
         // mutably) run. No `unsafe`, no tensor clones.
         let cpdt_precision_dtypes: Option<(Value, Value)> = {
@@ -6052,7 +6059,7 @@ impl Compiler<'_> {
                 // envelope). 8-bit clamps to FP16 storage in v1, the same
                 // ladder step as `clamp_int8_to_fp16`.
                 let wggo_bits: Option<(Vec<u16>, Vec<u16>)> = if fase_deferred {
-                    self.wggo_overrides.as_ref().and_then(|o| {
+                    self.bus.wggo_overrides().and_then(|o| {
                         crate::cpdt_precision_exec::build_dtype_lists_from_overrides(
                             o,
                             &param_paths,
@@ -6228,7 +6235,7 @@ impl Compiler<'_> {
                          gradient accumulation / --source-ad",
                     ));
                 }
-                if self.wggo_overrides.is_some() {
+                if self.bus.has_wggo_overrides() {
                     return Err(CodegenError::new(
                         "--param-dtype bf16-sr does not compose with WGGO \
                          per-layer FASE overrides yet (a FullBuffer-routed \
@@ -6303,7 +6310,7 @@ impl Compiler<'_> {
             // the mixed-step routing flags are not threaded. The table is
             // semantically empty for Muon (every byte FullBuffer), so skip
             // it and keep Muon on the monolithic loop. Say so loudly.
-            if self.wggo_overrides.is_some() {
+            if self.bus.has_wggo_overrides() {
                 eprintln!(
                     "[muon] note: WGGO per-layer FASE overrides do not apply to \
                      the mixed Muon/AdamW optimizer (it has no Deferred mode) — \
@@ -6317,7 +6324,7 @@ impl Compiler<'_> {
                 &param_paths,
                 &model_var_name,
                 &fase_plan,
-                self.wggo_overrides.as_ref(),
+                self.bus.wggo_overrides(),
             );
             match modes {
                 Some(bytes) => {
@@ -7734,7 +7741,8 @@ impl Compiler<'_> {
                         // would train with FASE modes that do not match the
                         // final plan every downstream consumer sees.
                         let preplan = self
-                            .wggo_preplans
+                            .bus
+                            .wggo_preplans()
                             .iter()
                             .find(|p| p.train_block_stmt_id == train_block_stmt_id);
                         let reused_plan = preplan.and_then(|pre| {
@@ -7983,7 +7991,7 @@ impl Compiler<'_> {
                                 }
                             }
                             // Stash for all downstream consumers (CSHA, WRGA, ...).
-                            self.wggo_overrides = Some(
+                            self.bus.publish_wggo_overrides(
                                 crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
                             );
                             wggo_applied = Some(plan.applied);
@@ -8001,7 +8009,7 @@ impl Compiler<'_> {
                 //
                 // Pass order: Calibration → WGGO → CSHA.
                 // CSHA receives WGGO's AppliedPlan (if any) as WggoOverrides
-                // (via self.wggo_overrides) so that per-layer fusion-level
+                // (via bus.wggo_overrides) so that per-layer fusion-level
                 // decisions from WGGO are honoured (or rejected with a
                 // diagnostic) by CSHA.
                 if let Some(ref mode_str) = self.compile_options.csha.mode {
@@ -8086,7 +8094,7 @@ impl Compiler<'_> {
                             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
                             csha_shape_override, // H.1: forward decorator head_dim to the planner
                             8,    // default head count; weight-informed path refines this
-                            self.wggo_overrides.as_ref(),
+                            self.bus.wggo_overrides(),
                         ) {
                             if self.compile_options.csha.report {
                                 eprintln!("{}", plan.render_report());
@@ -14956,7 +14964,7 @@ impl Compiler<'_> {
         // runtime load via `load_nested_field` can't traverse the adapter
         // side-table at that point in codegen.
         if include_nontrainable {
-            for site in &self.adapter_sites {
+            for site in self.bus.adapter_sites() {
                 if site.target_model != type_name {
                     continue;
                 }

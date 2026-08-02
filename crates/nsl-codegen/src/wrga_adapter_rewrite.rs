@@ -124,7 +124,8 @@ pub fn rewrite_stmts_for_model(
     // statement before lowering. Only active when adapter sites target
     // this model class.
     let sites_for_model: Vec<&crate::wrga_adapter_inject::AdapterSite> = compiler
-        .adapter_sites
+        .bus
+        .adapter_sites()
         .iter()
         .filter(|s| s.target_model == model_name)
         .collect();

@@ -820,7 +820,6 @@ pub struct Compiler<'a> {
     /// body; `None` everywhere else, so a `generate()` call outside a
     /// CFIE serve context refuses cleanly instead of enqueueing into the
     /// dead M29 path.  Cleared when the serve block finishes compiling.
-    pub cfie_serve_gen: Option<crate::serve::CfieServeGen>,
 
     // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
     /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
@@ -911,7 +910,6 @@ pub struct Compiler<'a> {
     pub inspect_pinned_vars: std::collections::BTreeSet<crate::wengert::VarId>,
 
     // ── WRGA Milestone B.2/B.3 adapter state ─────────────────────
-    pub adapter_sites: Vec<crate::wrga_adapter_inject::AdapterSite>,
     pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
     pub current_method_model_name: Option<String>,
     /// CSHA Tier A.2.0: ordinal of the next FlashAttention call lowered
@@ -986,7 +984,6 @@ pub struct Compiler<'a> {
     /// explicitly `None` otherwise — never a previous block's leftovers) and
     /// re-stashed after in-place planning; read by FASE, CSHA, WRGA, and the
     /// packing validators.
-    pub(crate) wggo_overrides: Option<crate::wggo_overrides::WggoOverrides>,
 
     // ── WGGO pre-main plans (WGGO-before-kernel-synthesis restructure) ──
     /// Per-train-block plans solved BEFORE `compile_flash_attention_kernels`
@@ -997,7 +994,6 @@ pub struct Compiler<'a> {
     /// on mismatch. Empty when WGGO or source AD is off, or when the
     /// pre-pass could not extract — behavior then matches the pre-restructure
     /// pipeline exactly.
-    pub(crate) wggo_preplans: Vec<crate::wggo_prepass::WggoPrePlan>,
 
     // ── M62 Task 4: @export self-field weight-index map ─────────────────────
     /// Maps each `MemberAccess` `NodeId` (for `self.<field>` in @export model
@@ -1153,7 +1149,6 @@ impl<'a> Compiler<'a> {
             wrga_inputs: options.wrga_inputs.clone(),
             cfie_decorator_mode: None,
             cfie_decorator_target: None,
-            cfie_serve_gen: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
             fused_kl_ce_configs: options.fused_kl_ce_configs.clone(),
             active_fused_ce_config: None,
@@ -1172,7 +1167,6 @@ impl<'a> Compiler<'a> {
             source_file_name: String::new(),
             inspect_train_step_var: None,
             inspect_pinned_vars: std::collections::BTreeSet::new(),
-            adapter_sites: Vec::new(),
             synth_member_names: std::collections::HashMap::new(),
             current_method_model_name: None,
             csha_fa_call_ordinal: 0,
@@ -1184,8 +1178,6 @@ impl<'a> Compiler<'a> {
             retention_offsets: std::collections::HashMap::new(),
             retention_splices_emitted: 0,
             grad_arena_layout: None,
-            wggo_overrides: None,
-            wggo_preplans: Vec::new(),
             weight_index_map: options.weight_index_map.clone(),
         })
     }

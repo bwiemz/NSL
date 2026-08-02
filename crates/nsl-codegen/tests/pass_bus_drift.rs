@@ -76,11 +76,83 @@ fn every_channel_producer_is_a_registered_pass() {
         );
     }
     assert!(
-        CHANNELS.len() >= 8,
+        CHANNELS.len() >= 12,
         "only {} channels — the list shrank; if a channel was genuinely \
          removed, lower this floor deliberately",
         CHANNELS.len()
     );
+}
+
+/// Every `Invariant::Exempt` carries a real reason.
+///
+/// The whole argument for a sum type over a `bool` is that an exemption without
+/// a recorded reason outlives the reason for it and cannot be told apart from
+/// an oversight — the same argument `pass_registry::WikiCoverage` makes. An
+/// empty string would give back the `bool` while looking like the sum type.
+#[test]
+fn every_finding_exemption_records_why() {
+    use nsl_codegen::pass_bus::Invariant;
+    let mut exemptions = 0usize;
+    for d in CHANNELS {
+        for (what, inv) in [
+            ("dead_output", d.dead_output),
+            ("applied_implies_published", d.applied_implies_published),
+        ] {
+            if let Invariant::Exempt(reason) = inv {
+                exemptions += 1;
+                assert!(
+                    reason.len() > 30,
+                    "channel `{}` exempts itself from {what} with no useful \
+                     reason: {reason:?}",
+                    d.name
+                );
+            }
+        }
+    }
+    assert!(
+        exemptions >= 6,
+        "only {exemptions} exemptions — if the finding rules became universal, \
+         say so deliberately; this floor exists so the enum cannot quietly \
+         decay into 'always Enforced'"
+    );
+}
+
+/// Both findings must still be ENFORCED somewhere, or the rule is dead code
+/// dressed as a check.
+///
+/// This is the failure mode `pass_registry` deleted its `status` field to
+/// avoid: an enum implying a distinction nothing actually makes. If every
+/// channel ends up exempt from `SilentDefault`, the honest move is to delete
+/// the finding, not to keep a rule that can never fire.
+#[test]
+fn both_findings_are_enforced_by_at_least_one_channel() {
+    use nsl_codegen::pass_bus::Invariant;
+    let dead = CHANNELS.iter().filter(|d| d.dead_output == Invariant::Enforced).count();
+    let applied = CHANNELS
+        .iter()
+        .filter(|d| d.applied_implies_published == Invariant::Enforced)
+        .count();
+    assert!(dead > 0, "no channel enforces DeadOutput — the finding is dead code");
+    assert!(
+        applied > 0,
+        "no channel enforces SilentDefault — delete the finding rather than \
+         keep one that can never fire"
+    );
+}
+
+/// `Channel::ALL` must list every variant, in order. The compile-time assert in
+/// `pass_bus.rs` already checks the count and the ordering; this checks that
+/// the list is not merely self-consistent but agrees with the descriptors.
+#[test]
+fn channel_all_agrees_with_the_descriptors() {
+    assert_eq!(Channel::ALL.len(), CHANNELS.len());
+    for (i, c) in Channel::ALL.iter().enumerate() {
+        assert_eq!(
+            c.descriptor().name,
+            CHANNELS[i].name,
+            "Channel::ALL[{i}] does not match CHANNELS[{i}]"
+        );
+    }
 }
 
 /// `Channel::descriptor` indexes `CHANNELS` by discriminant, so a descriptor

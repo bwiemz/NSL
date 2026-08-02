@@ -573,7 +573,7 @@ impl Compiler<'_> {
         // that has no decorated placements when its placement names don't
         // syntactically match the @adapter target pattern.
         let mut idx: usize = 0;
-        for site in &self.adapter_sites {
+        for site in self.bus.adapter_sites() {
             if site.target_model != model_name {
                 continue;
             }

@@ -135,7 +135,23 @@ fn the_bus_is_opt_in_and_cannot_change_the_program() {
 }
 
 /// A channel carries traffic when its producing pass runs, and none when it
-/// does not. Both directions on the one channel a CPU fixture can drive.
+/// does not.
+///
+/// # What this does NOT prove
+///
+/// The one full read of `csha_bridge` on this fixture is the PRODUCER reading
+/// its own publish back, ~25 lines later in `stmt.rs`, to derive the backward
+/// claims. The declared consumers — `expr/advanced.rs`, `wengert_lower.rs` —
+/// contribute nothing, because an FFN fixture has no attention call to lower.
+/// So this gate proves the publish and read accessors are wired to the same
+/// channel; it does **not** prove the consumers are wired, and an earlier
+/// revision claimed exactly that in its failure message. Deleting every real
+/// consumer leaves it green.
+///
+/// The consumers are covered statically instead, by
+/// `declared_consumer_files_exist_and_read_the_channel` in
+/// `crates/nsl-codegen/tests/pass_bus_drift.rs` — which is the right tool,
+/// since no CPU fixture can reach them at all.
 #[test]
 fn a_channel_is_published_only_when_its_producer_runs() {
     let with = run("csha_on", &["--csha", "auto"], true);
@@ -145,8 +161,8 @@ fn a_channel_is_published_only_when_its_producer_runs() {
     assert_eq!(pubs, 1, "CSHA ran but published no bridge:\n{}", with.stderr);
     assert!(
         full >= 1,
-        "csha_bridge was published and never read — the accessor is not wired \
-         into the consumers:\n{}",
+        "csha_bridge was published and no read of it was counted — publish and \
+         read are not reaching the same channel:\n{}",
         with.stderr
     );
 
@@ -157,6 +173,37 @@ fn a_channel_is_published_only_when_its_producer_runs() {
         "csha_bridge showed traffic with CSHA off, so the positive half above \
          proves nothing:\n{}",
         without.stderr
+    );
+}
+
+/// WGGO's channels carry traffic under `--wggo full` and none without it.
+///
+/// Unlike `csha_bridge` above, `wggo_overrides` has a genuine cross-pass read:
+/// FASE recipe selection consults it, in a different function from the one that
+/// publishes it. That makes this the one end-to-end gate on this fixture where
+/// a full read really does demonstrate a consumer.
+#[test]
+fn wggo_channels_carry_the_edge_fase_reads() {
+    let on = run("wggo_on", &["--wggo", "full"], true);
+    assert!(on.ok, "run failed:\n{}", on.stderr);
+    let (pubs, full, _) = counts(&on.stderr, "wggo_overrides")
+        .unwrap_or_else(|| panic!("no wggo_overrides line:\n{}", on.stderr));
+    assert!(pubs >= 1, "WGGO ran but published no overrides:\n{}", on.stderr);
+    assert!(
+        full >= 1,
+        "wggo_overrides was published and never read — FASE recipe selection \
+         is the consumer and should have read it:\n{}",
+        on.stderr
+    );
+
+    let off = run("wggo_off", &[], true);
+    assert!(off.ok, "run failed:\n{}", off.stderr);
+    let published_off = counts(&off.stderr, "wggo_overrides").map_or(0, |(p, _, _)| p);
+    assert_eq!(
+        published_off, 0,
+        "wggo_overrides was published without --wggo, so the positive half \
+         above proves nothing:\n{}",
+        off.stderr
     );
 }
 
