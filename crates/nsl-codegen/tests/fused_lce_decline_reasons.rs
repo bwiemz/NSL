@@ -9,13 +9,18 @@
 //! whatsoever.
 //!
 //! That mattered because the shapes that decline are not exotic: NSL's own
-//! `models/coder50m/model.nsl:79-80` has a biasless weight-tied head, and
-//! `models/coder50m/pretrain.nsl:30-32` reshapes `[B,S,V]` logits before the
-//! loss. Both decline. A user who added the decorator to either got a clean
-//! compile, no diagnostic, and the full composite path — while believing the
-//! fused kernel was live. That is the failure shape
-//! `feedback_deferral_must_refuse` names: worse than a refusal, because it
-//! looks like success.
+//! `models/coder50m/model.nsl` has a biasless weight-tied head, and its
+//! pretraining scripts reshape `[B,S,V]` logits before the loss. Both used to
+//! decline. A user who added the decorator to either got a clean compile, no
+//! diagnostic, and the full composite path — while believing the fused kernel
+//! was live. That is the failure shape `feedback_deferral_must_refuse` names:
+//! worse than a refusal, because it looks like success.
+//!
+//! Sprint 2.5 flipped both of those shapes into substitutions (see the
+//! BEHAVIOUR FLIP notes on the first two tests), and `coder50m/pretrain.nsl`
+//! now carries the decorator. The fixtures below are kept as the regression
+//! pin on that flip; the remaining declines are the genuinely unmatchable
+//! heads.
 //!
 //! # What is asserted here, and what is NOT
 //!
@@ -125,9 +130,9 @@ fn assert_single_decline(
 
 // ─── The two shapes every production coder model actually has ───────────────
 
-/// `models/coder50m/model.nsl:79-80` — biasless weight-tied head.
+/// `models/coder50m/model.nsl`'s `forward_core` — biasless weight-tied head.
 /// `x @ W.transpose(0, 1)` produces a bare `Matmul`, not the `Add` the
-/// matcher requires.
+/// matcher used to require.
 const BIASLESS_HEAD_SRC: &str = r#"
 fn step(x: Tensor, w: Tensor, targets: Tensor) -> Tensor:
     let w_t = transpose(w, 0, 1)
@@ -149,8 +154,9 @@ fn biasless_head_substitutes_with_no_decline() {
     );
 }
 
-/// `models/coder50m/pretrain.nsl:30-32` — a reshape between the head and the
-/// loss. The producer of `logits` is then the reshape, not the head `Add`.
+/// `models/coder50m/pretrain.nsl`'s step body — a reshape between the head
+/// and the loss. The producer of `logits` is then the reshape, not the head
+/// `Add`.
 const RESHAPE_BEFORE_CE_SRC: &str = r#"
 fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
     let w_t = transpose(w, 0, 1)
@@ -460,8 +466,14 @@ fn classify_coverage(d: &FusedLceDecline) -> Coverage {
             "extract_expr always pushes a producing op; a bare parameter \
              produces PrimalOp::Input, so find_producer never returns None here",
         ),
+        // Produced by RESHAPE_OF_PARAM_SRC and PLAIN_LOGITS_SRC. It was
+        // named for `biasless_head_declines_with_producer_not_add` until
+        // Sprint 2.5 flipped that fixture into a substitution and renamed it;
+        // the claim outlived the test it cited, which the assertion in
+        // `every_exercised_variant_has_a_fixture` cannot catch because it
+        // only checks that SOMETHING produces the variant.
         FusedLceDecline::LogitsProducerNotAdd { .. } => {
-            Coverage::Exercised("biasless_head_declines_with_producer_not_add")
+            Coverage::Exercised("logits_as_a_parameter_declines_naming_the_binding")
         }
         // `PrimalOp::Add` is pushed only from the binary `+` arm of
         // `extract_expr`, which supplies exactly two inputs.

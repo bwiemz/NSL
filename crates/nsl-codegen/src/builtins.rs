@@ -2979,6 +2979,22 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Second arg: expected row count (decorator batch*seq) — the runtime
     // aborts loudly on mismatch instead of overreading the staging buffer.
     ("nsl_fused_lce_targets_i64_alloc", &[types::I64, types::I64], Some(types::I64)),
+    // (x_tensor, w_tensor, batch, seq, vocab_size, hidden_size) -> void.
+    // Aborts when the @fused_lm_ce hints disagree with the head tensors.
+    // batch and seq stay SEPARATE: collapsing them to rows here would let
+    // a swapped pair through, and the backward builds dx from the pair.
+    (
+        "nsl_fused_lce_pin_hint_extents",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        None,
+    ),
     ("nsl_fused_lce_targets_i64_free", &[types::I64], None),
     // D2b weight streaming: pointer-identity host offload of model params
     // (side-table mirrors; tensor pointers never change).

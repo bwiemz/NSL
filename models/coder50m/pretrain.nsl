@@ -21,14 +21,30 @@ let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_
 
 print("Starting train block...")
 
+# The fused linear-CE kernel computes the loss straight from the hidden
+# state and the LM-head weight, so the [batch*seq, vocab] logits surface and
+# its gradient are never materialized: measured here at batch 1 x seq 1024,
+# activations peak 2665 MB -> 2185 MB and the step is ~5% faster (the saving
+# scales with batch -- ~8% at batch 4, where the deleted surface is 4x
+# larger).
+#
+# The four hints must be INT LITERALS matching model.nsl: vocab_size and
+# hidden_size are VOCAB_SIZE / D_MODEL, batch_size and seq_len are the
+# DataLoader's. Getting one wrong is refused at runtime by the pin in
+# `nsl_fused_lce_pin_hint_extents`, which names the value to use.
+#
+# The flatten below must use those same compile-time dims. A runtime read of
+# the logits (the `let ls = logits.shape` this used to open with) keeps the
+# composite chain live, which defeats the fusion -- the compiler refuses it
+# rather than silently falling back.
+@fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=512, batch_size=1, seq_len=1024)
 train(model=m, epochs=1, grad_clip=1.0):
     optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95)
     scheduler: warmup_cosine(warmup_steps=3000, total_steps=10000, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
-        let ls = logits.shape
-        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
-        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let flat_logits = logits.reshape([1024, 49152])
+        let flat_labels = batch.labels.reshape([1024])
         let loss = cross_entropy(flat_logits, flat_labels)
     callbacks:
         on_step(step, loss):

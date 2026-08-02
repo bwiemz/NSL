@@ -10,6 +10,15 @@
 # "resumes at the parent's loss level and keeps improving", not bit-identity
 # with an uninterrupted run.
 #
+# NOT decorated with @fused_lm_ce, deliberately. `pretrain.nsl` is; this arm
+# is not, because its loss trajectory is BANKED (see
+# models/benchmarks/SRBF16_TRAJECTORY_2026_07_30.md). The fused kernel's
+# forward is bit-identical to the composite, but its backward accumulates in a
+# different order, so from step 2 the curve moves by ~1e-5 relative —
+# enough to invalidate a comparison against banked numbers while looking
+# like noise. Adding the decorator here means re-banking the baseline, not
+# just editing this file.
+#
 # Harness markers (exact string rewrites):
 #   CERT_TOKENS_PATH -> the u16 tokens.bin path
 #   CERT_LOAD_PATH   -> the parent run's .nslm checkpoint

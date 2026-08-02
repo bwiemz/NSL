@@ -1,0 +1,69 @@
+# @fused_lm_ce on the shape `models/coder50m/pretrain.nsl` actually uses.
+#
+# The neighbouring `csla_fused_lmce.nsl` is the opposite of coder50m on every
+# axis the substitution branches on: it has a REAL bias, returns FLAT
+# [rows, V] logits (x_rank3 = false), and its small vocab takes the v1 PTX
+# kernels. coder50m has a BIASLESS weight-tied head and 3-D logits flattened
+# at the loss (x_rank3 = true, GEMM-chunked path). A control arm on the wrong
+# one of those cannot show that a guard is false-positive-free on the other.
+#
+# Deliberately kept small: this fixture exists to exercise the SHAPE
+# combination, not the vocab magnitude.
+#   - vocab 256 (>= the emitter's 128 floor, and a multiple of vocab_tile=128)
+#   - biasless tied head: `flat_hn @ embed.transpose(0, 1)`, which the
+#     Sprint 2.5 matcher takes via has_bias=false
+#   - forward_train returns 3-D [B, S, V]; the step flattens with COMPILE-TIME
+#     dims, exactly as coder50m/pretrain.nsl does. A runtime `logits.shape`
+#     read here would be a live consumer and a hard refusal.
+#
+# Marker rewrites (exact string match by the harness):
+#   - "# GPU_PLACEMENT" -> "m.to(cuda)" for GPU runs.
+
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_f: Tensor = ones([64])
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let f = (rmsnorm(h, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h + f
+
+model TinyLM:
+    embed: Tensor = randn([256, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let flat_ids = input_ids.reshape([128])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([2, 64, 64])
+        for block in self.blocks:
+            h = block.forward(h)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        # 3-D logits [2, 64, 256] — the reshape to [128, 256] happens at the
+        # loss, which is the see-through case (x_rank3 = true).
+        return hn @ self.embed.transpose(0, 1)
+
+let m = TinyLM()
+# GPU_PLACEMENT
+
+let tokens = arange(1024) * full([1024], 0.0) + full([1024], 3.0)
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+@fused_lm_ce(enabled=true, vocab_size=256, hidden_size=64, batch_size=2, seq_len=64, vocab_tile=128)
+train(model=m, epochs=1):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let flat_logits = logits.reshape([128, 256])
+        let flat_labels = batch.labels.reshape([128])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")

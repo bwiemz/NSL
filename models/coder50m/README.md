@@ -15,13 +15,22 @@ python prepare_nsl.py path/to/codeforge.json path/to/tokens.bin
 ### 2. Pretrain (Stage 1: 10B StarCoder tokens)
 
 ```bash
-nsl run models/coder50m/pretrain.nsl
+nsl run models/coder50m/pretrain.nsl --source-ad
 ```
+
+`--source-ad` is required, not optional: without it the train block fails to
+compile with "train step body must assign to a variable named 'loss'". It is
+also the only path with flash attention and the fused cross-entropy that
+`pretrain.nsl`'s `@fused_lm_ce` decorator asks for. `--pretrain-optimized`
+implies `--source-ad` and adds the WGGO/CSHA planning stack on top.
+
+Edit the `load_mmap` path at the top of the script to point at the
+`tokens.bin` step 1 produced.
 
 ### 3. Finetune (Stage 2: NSL + general code mix)
 
 ```bash
-nsl run models/coder50m/finetune.nsl
+nsl run models/coder50m/finetune.nsl --source-ad
 ```
 
 ### 4. Generate code interactively
