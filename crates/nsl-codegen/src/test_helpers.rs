@@ -140,8 +140,8 @@ pub fn run_pre_pass_only(
         // Phase 2.5 Task 3: mirror `run_profile_pre_pass` seeding so
         // `fusion_plan_for_profile` is `Some(...)` after the pre-pass.
         let seeded = compiler
-            .last_wrga_plan
-            .as_ref()
+            .bus
+            .wrga_plan()
             .map(|p| p.fusion.clone())
             .unwrap_or_default();
         compiler.fusion_plan_for_profile = Some(seeded);

@@ -427,8 +427,8 @@ pub struct CshaSavePointers {
 /// A.2.1d: collect the Wengert op indices claimed by every boundary
 /// chain in `plan` — RMSNorm prologue, Q/K/V projection matmul, and
 /// (optional) RoPE epilogue. Returned set is what
-/// `Compiler.csha_claimed_ops` is populated from at the same stmt.rs
-/// hook that sets `last_csha_bridge`.
+/// `bus.csha_claimed_ops` is populated from at the same stmt.rs
+/// hook that publishes `bus.csha_bridge`.
 ///
 /// Factored as a free function so the population logic is pure and
 /// directly unit-testable without constructing a full `Compiler`.

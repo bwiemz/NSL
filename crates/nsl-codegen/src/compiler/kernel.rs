@@ -643,7 +643,10 @@ impl Compiler<'_> {
                 );
             }
         } else {
-            self.wggo_preplans = crate::wggo_prepass::run(self, stmts);
+            // Into a local first: `run` takes `&mut self`, so publishing
+            // inline would borrow `self.bus` mutably while `self` already is.
+            let preplans = crate::wggo_prepass::run(self, stmts);
+            self.bus.publish_wggo_preplans(preplans);
         }
 
         for stmt in stmts {
@@ -843,7 +846,8 @@ impl Compiler<'_> {
         // Only report when a plan was actually solved for the governing (first)
         // train block: if extraction failed there is no plan being dropped.
         let Some(pre) = self
-            .wggo_preplans
+            .bus
+            .wggo_preplans()
             .iter()
             .find(|p| p.is_first_train_block)
         else {
@@ -1000,7 +1004,7 @@ impl Compiler<'_> {
         //     plan-level [cep] advisory already reports pruned heads as
         //     CSHA-dispatch-only. CshaExtras.active_heads=0 (= all) is the
         //     only safe training value today.
-        if let Some(pre) = self.wggo_preplans.iter().find(|p| p.is_first_train_block) {
+        if let Some(pre) = self.bus.wggo_preplans().iter().find(|p| p.is_first_train_block) {
             use crate::cfie_persistent::FusionLevel;
             let mut over_level1 = 0usize;
             let mut level1 = 0usize;
@@ -1128,7 +1132,8 @@ impl Compiler<'_> {
         // is no plan entitled to govern it — a later block's preference must
         // not flip admission on the wrong evidence (review finding).
         let plan_prefers_segment_id = self
-            .wggo_preplans
+            .bus
+            .wggo_preplans()
             .iter()
             .find(|p| p.is_first_train_block)
             .is_some_and(|pre| crate::wggo_prepass::plan_prefers_segment_id(&pre.overrides));

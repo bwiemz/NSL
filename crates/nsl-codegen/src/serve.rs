@@ -440,7 +440,7 @@ impl Compiler<'_> {
                 if let Some(ep) = init.endpoint.as_ref() {
                     let scope = cfie_label_scope(self.resolve_sym(serve.name));
                     let wired = self.emit_cfie_endpoint_init(builder, &scope, ep)?;
-                    self.cfie_serve_gen = Some(CfieServeGen {
+                    self.bus.publish_cfie_serve_gen(CfieServeGen {
                         max_new_tokens: ep.max_new_tokens,
                         eos_token_id: ep.eos_token_id,
                         prompt_len: ep.prompt_tokens.len() as i64,
@@ -489,7 +489,7 @@ impl Compiler<'_> {
             // CFIE Cycle 11: the serve body is done — the `generate()`
             // side-channel must not leak into any function compiled
             // after this serve block.
-            self.cfie_serve_gen = None;
+            self.bus.clear_cfie_serve_gen();
 
             // CFIE Cycle 6: free the pool + clear registrations before
             // the serve runtime tears down (CUmodules may stay loaded —
@@ -768,7 +768,7 @@ impl Compiler<'_> {
     /// CFIE Tier-A wiring: extract serve-block CFIE config, resolve the
     /// mode, run the six-pass orchestrator against real inputs (GPU
     /// database + `--weights` WeightMap + serve config keys), print the
-    /// build report, and stash the plan on `self.last_cfie_plan`.
+    /// build report, and publish the plan on `bus.cfie_plan`.
     ///
     /// Returns the runtime-init values the compiled binary must pass to
     /// the `nsl_cfie_*` init FFIs, or `None` when CFIE is not active.
@@ -1506,7 +1506,7 @@ impl Compiler<'_> {
         };
 
         let capacity = plan.persistent.scheduler.ring_buffer.capacity as i64;
-        self.last_cfie_plan = Some(plan);
+        self.bus.publish_cfie_plan(plan);
         Ok(Some(CfieRuntimeInit {
             ring_capacity: capacity,
             kv_slots,

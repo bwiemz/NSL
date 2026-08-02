@@ -173,6 +173,20 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          first-invocation order (roadmap item 2)",
     ),
     m(
+        "[pass-bus]",
+        &[
+            // The report text is built here...
+            "crates/nsl-codegen/src/pass_bus.rs",
+            // ...and printed here, from the same emitter as `[pass-trace]`:
+            // the bus's SILENT DEFAULT finding is computed by cross-referencing
+            // the two, so they must reach every terminal path together.
+            "crates/nsl-cli/src/commands/build/mod.rs",
+        ],
+        "per-channel traffic on the inter-pass bus — which pass published what, \
+         how many consumers read it, and the two patterns that are defects \
+         (roadmap item 2 step 4)",
+    ),
+    m(
         "[param-plan]",
         &[
             // The compile-time report...
@@ -297,6 +311,7 @@ pub mod tokens {
     pub const SR_BF16: &str = "[sr-bf16]";
     pub const PARAM_PLAN: &str = "[param-plan]";
     pub const PASS_TRACE: &str = "[pass-trace]";
+    pub const PASS_BUS: &str = "[pass-bus]";
     pub const FLASH_BWD: &str = "[flash-bwd]";
     pub const ARENA: &str = "[arena]";
     pub const GPU_MEM: &str = "[gpu-mem]";
@@ -358,6 +373,14 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         // `[pass-trace]` line at all), and it is emitted from exactly one
         // place: the report builder.
         parts: &[("[pass-trace]", "crates/nsl-codegen/src/pass_trace.rs")],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/pass_bus_gate.rs",
+        asserts: "the bus report stayed silent without NSL_PASS_TRACE=1",
+        // Same shape as the pass-trace needle above: the test asserts no
+        // `[pass-bus]` line at all, and the bare token is emitted from exactly
+        // one place, the report builder.
+        parts: &[("[pass-bus]", "crates/nsl-codegen/src/pass_bus.rs")],
     },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/param_plan_gate.rs",

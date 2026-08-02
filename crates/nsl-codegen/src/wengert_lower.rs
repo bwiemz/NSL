@@ -890,7 +890,7 @@ fn promote_to_tensor(
 /// claim.
 ///
 /// Called from `PrimalOp::ScaledDotProductAttention` when the op is in
-/// `compiler.csha_backward_claims.op_to_chain` AND the claim's layer has
+/// the bus's `csha_backward_claims` op_to_chain AND the claim's layer has
 /// `save_activations_for_backward=true`.  This REPLACES the primitive
 /// decomposition (matmul → softmax → matmul) for the claimed op.
 ///
@@ -973,8 +973,8 @@ fn emit_fused_forward_under_claim(
     // active_heads from the bridge (same source as
     // `compile_flash_attention_call`'s non-source-AD branch).
     let active_heads_i64 = compiler
-        .last_csha_bridge
-        .as_ref()
+        .bus
+        .csha_bridge()
         .and_then(|b| b.extras_for_layer(layer))
         .map(|e| e.active_heads as i64)
         .unwrap_or(0);
@@ -1102,7 +1102,7 @@ fn emit_fused_forward_under_claim(
     let null = builder.ins().iconst(cl_types::I64, 0);
     let (mut x_v, mut norm_w_v, mut wq_v, mut wk_v, mut wv_v) =
         (null, null, null, null, null);
-    if let Some(claims) = compiler.csha_backward_claims.as_ref() {
+    if let Some(claims) = compiler.bus.csha_backward_claims() {
         if let Some(&chain_idx) = claims.op_to_chain.get(&op.id) {
             if let Some(mark) = claims.chain_marks.get(chain_idx) {
                 if let Some(chain) = mark.chain_varids.as_ref() {
@@ -2217,7 +2217,7 @@ fn lower_single_op(
             // Option 3a — CSHA fused-forward claim dispatch:
             //
             // When the CSHA backward dispatcher has claimed this SDPA
-            // op (it's in `compiler.csha_backward_claims.op_to_chain`)
+            // op (it's in `bus.csha_backward_claims`'s `op_to_chain`)
             // AND the resolved layer has `save_activations_for_backward`,
             // emit the fused `nsl_flash_attention_csha_with_saves` FFI
             // here instead of decomposing into primitive matmul/softmax.
@@ -2234,8 +2234,8 @@ fn lower_single_op(
             // fall back to decomposition — that would reintroduce the
             // dual-path drift class the user explicitly rejected.
             let claim_layer = compiler
-                .csha_backward_claims
-                .as_ref()
+                .bus
+                .csha_backward_claims()
                 .and_then(|claims| {
                     claims
                         .op_to_chain
@@ -2246,8 +2246,8 @@ fn lower_single_op(
                 });
             if let Some(layer) = claim_layer {
                 let needs_saves = compiler
-                    .last_csha_bridge
-                    .as_ref()
+                    .bus
+                    .csha_bridge()
                     .and_then(|b| b.extras_for_layer(&layer))
                     .map(|e| e.save_activations_for_backward)
                     .unwrap_or(false);

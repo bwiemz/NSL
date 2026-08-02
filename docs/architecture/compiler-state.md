@@ -22,11 +22,30 @@ debt.
 
 `crates/nsl-codegen/src/compiler/mod.rs` defines `Compiler<'a>`, which already
 holds the bulk of per-compilation state as ordinary fields: the module being
-built, the interner/type-map, `compile_options: CompileOptions`, pass-result
-caches (`last_wrga_plan`, `cpdt_plan`, flash-attention caches, fused-CE
-caches), and diagnostic/profiling state. Passes receive `&mut Compiler` and
-thread state explicitly. This is the right shape — when state needs to be
-added, **add a `Compiler` field (or a `CompileOptions` field), not a global.**
+built, the interner/type-map, `compile_options: CompileOptions`, emission
+caches (flash-attention, fused-CE), the inter-pass channels in `bus`, and
+diagnostic/profiling state. Passes receive `&mut Compiler` and thread state
+explicitly. This is the right shape — when state needs to be added, **add a
+`Compiler` field (or a `CompileOptions` field), not a global.**
+
+**Not every field is the same kind of thing, and the distinction is now
+enforced.** Eight of them were the *pass bus*: values one pass produces for
+another to consume — `last_wrga_plan`, `cpdt_plan`, `last_csha_bridge` and
+friends. Among 74 fields nothing marked them out from a scratch counter or a
+`Value`-keyed emission cache, and nobody could ask whether a published value
+was ever read. They now live in
+[`crates/nsl-codegen/src/pass_bus.rs`](../../crates/nsl-codegen/src/pass_bus.rs)
+as `PassBus`, reached through `compiler.bus`. Its fields are private **to that
+module** — not to `compiler/mod.rs`, which defines `Compiler` and could
+otherwise still reach them — so an accessor is the only way in, and every
+access is counted. See `NSL_PASS_TRACE` in
+[Optimization-Passes.md](../wiki/Optimization-Passes.md) for what the counts
+report.
+
+When adding state, prefer the narrowest home that fits: a value flowing from
+one pass to another belongs on the bus (add a `ChannelDescriptor`, or the drift
+gate fails); a forward-to-backward buffer keyed by `cranelift::ir::Value`
+belongs in the emission caches; configuration belongs on `CompileOptions`.
 
 `CompileOptions` (in `crates/nsl-codegen/src/lib.rs`) is the configuration
 half of the session. It is being decomposed from a flat "god-config" into

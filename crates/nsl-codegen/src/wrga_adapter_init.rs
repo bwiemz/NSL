@@ -10,7 +10,7 @@
 //! This pass runs immediately after `invoke_wrga_if_enabled` returns a plan
 //! inside the train-step codegen path. At that point:
 //!
-//!   * `compiler.last_wrga_plan` is populated.
+//!   * `compiler.bus.wrga_plan()` is populated.
 //!   * The target model has already been constructed by the `let m = Toy()`
 //!     statement — `model_ptr` is a live Cranelift `Value`.
 //!   * The side-table slot is still null from constructor zero-init.

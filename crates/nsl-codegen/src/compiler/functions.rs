@@ -494,7 +494,7 @@ impl Compiler<'_> {
 
             // B.2.1: Zero-initialise the adapter-sidetable slot when present.
             // Actual tensor allocation is deferred to a later pass that runs
-            // after `invoke_wrga_if_enabled` populates `last_wrga_plan` — at
+            // after `invoke_wrga_if_enabled` populates `bus.wrga_plan` — at
             // constructor codegen time the adapter-site list is not yet known
             // because WRGA fires during train-step source-AD compilation.
             // Field-access codegen in `expr/access.rs` tolerates a null slot
