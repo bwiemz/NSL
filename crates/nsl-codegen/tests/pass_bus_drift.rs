@@ -27,6 +27,32 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Drop `//` comment lines, then remove ALL whitespace.
+///
+/// Both halves are load-bearing, and each was added because the naive version
+/// was wrong in a way that still passed:
+///
+/// * keeping comments made `wrga_adapter_init.rs` an undeclared consumer of
+///   `wrga_plan` on the strength of a doc comment naming the accessor — a gate
+///   that fires on prose trains its reader to add exemptions;
+/// * matching line by line MISSED every multi-line call chain, and this tree
+///   writes them constantly: `compiler\n.bus\n.wrga_plan()` in
+///   `entry_points.rs`, `test_helpers.rs` and `wengert_lower.rs` are real
+///   consumers that a line-based scan reported as clean. A completeness gate
+///   with a blind spot for the dominant formatting style is worse than none,
+///   because it certifies the thing it cannot see.
+///
+/// Removing all whitespace is safe here only because every pattern searched
+/// for contains none.
+fn code_only(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split_whitespace()
+        .collect()
+}
+
 fn pass_bus_source() -> String {
     std::fs::read_to_string(repo_root().join("crates/nsl-codegen/src/pass_bus.rs"))
         .expect("pass_bus.rs must be readable")
@@ -190,16 +216,14 @@ fn declared_consumer_files_exist_and_read_the_channel() {
         for c in d.consumers {
             let p = root.join(c);
             assert!(p.exists(), "channel `{}`: consumer file {c} does not exist", d.name);
-            let text = std::fs::read_to_string(&p).unwrap();
-            // Comment lines are skipped in BOTH directions. This half asserts
+            let src = code_only(&std::fs::read_to_string(&p).unwrap());
+            // Comments are stripped in BOTH directions. This half asserts
             // presence, so prose mentioning an accessor would satisfy it
             // falsely — the more dangerous of the two failure modes, since it
             // makes a channel look consumed when nothing consumes it.
-            let reads = text.lines().filter(|l| !l.trim_start().starts_with("//")).any(|l| {
-                l.contains(&format!(".{}(", d.name))
-                    || l.contains(&format!("take_{}(", d.name))
-                    || (d.name == "csha_claimed_ops" && l.contains("is_csha_claimed("))
-            });
+            let reads = src.contains(&format!("bus.{}(", d.name))
+                || src.contains(&format!("bus.take_{}(", d.name))
+                || (d.name == "csha_claimed_ops" && src.contains("bus.is_csha_claimed("));
             assert!(
                 reads,
                 "channel `{}`: {c} is declared a consumer but never calls its \
@@ -219,7 +243,13 @@ fn declared_consumer_files_exist_and_read_the_channel() {
 fn only_out_of_band_producers_lack_a_compile_phase() {
     for d in CHANNELS {
         let phases = nsl_codegen::pass_bus::producer_phases(d.channel);
-        let pass = nsl_codegen::pass_registry::pass(d.producer).unwrap();
+        let pass = nsl_codegen::pass_registry::pass(d.producer).unwrap_or_else(|| {
+            panic!(
+                "channel `{}` names unregistered producer `{}` — see \
+                 every_channel_producer_is_a_registered_pass",
+                d.name, d.producer
+            )
+        });
         if phases.is_empty() {
             assert_eq!(
                 pass.stage,
@@ -332,25 +362,15 @@ fn every_file_that_reads_a_channel_is_a_declared_consumer() {
             scanned += 1;
             let text = std::fs::read_to_string(&p).unwrap();
             let rel = p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-            // Line-based, skipping comments. A whole-file `contains` reported
-            // `wrga_adapter_init.rs` as an undeclared consumer of `wrga_plan`
-            // on the strength of a doc comment naming the accessor — a gate
-            // that fires on prose would train its reader to add exemptions.
-            for line in text.lines() {
-                let t = line.trim_start();
-                if t.starts_with("//") {
-                    continue;
-                }
-                for d in CHANNELS {
-                    // Reads only. A publish site is the producing pass's own
-                    // file and is described by `producer`, not `consumers`.
-                    let reads = line.contains(&format!("bus.{}(", d.name))
-                        || line.contains(&format!("bus.take_{}(", d.name))
-                        || (d.name == "csha_claimed_ops"
-                            && line.contains("bus.is_csha_claimed("));
-                    if reads && !d.consumers.contains(&rel.as_str()) {
-                        missing.push(format!("{} reads `{}`", rel, d.name));
-                    }
+            let src = code_only(&text);
+            for d in CHANNELS {
+                // Reads only. A publish site is the producing pass's own file
+                // and is described by `producer`, not `consumers`.
+                let reads = src.contains(&format!("bus.{}(", d.name))
+                    || src.contains(&format!("bus.take_{}(", d.name))
+                    || (d.name == "csha_claimed_ops" && src.contains("bus.is_csha_claimed("));
+                if reads && !d.consumers.contains(&rel.as_str()) {
+                    missing.push(format!("{} reads `{}`", rel, d.name));
                 }
             }
         }

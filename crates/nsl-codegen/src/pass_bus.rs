@@ -10,10 +10,17 @@
 //!
 //! They do it through `Compiler`. A pass stashes its output in a public field
 //! — `last_wrga_plan`, `last_csha_bridge`, `cpdt_plan` — and some later stage
-//! reads it back. That is a real dataflow graph: eight channels, one producing
-//! pass each, twenty-odd consumer sites across five files. It was written down
-//! nowhere, and `Compiler` has 74 fields, so nothing distinguished an
-//! inter-pass channel from a scratch counter.
+//! reads it back. That is a real dataflow graph: **eight channels, one
+//! producing pass each, 9 publish sites and 21 read sites across six files**
+//! (five in the compiler proper, plus `test_helpers.rs` under
+//! `cfg(any(test, feature = "test-helpers"))`). It was written down nowhere,
+//! and `Compiler` has 74 fields, so nothing distinguished an inter-pass
+//! channel from a scratch counter.
+//!
+//! Those counts are checked, not asserted from memory:
+//! `every_file_that_reads_a_channel_is_a_declared_consumer` in
+//! `crates/nsl-codegen/tests/pass_bus_drift.rs` fails if a file reads a
+//! channel its descriptor does not list.
 //!
 //! # The ordering argument
 //!
@@ -61,6 +68,23 @@
 //!
 //! An empty read whose producer did NOT run is the ordinary case (the feature
 //! is off) and is counted but not flagged.
+//!
+//! # Scope, and what that costs
+//!
+//! Counters are per PROCESS, not per compile — the same scope
+//! [`crate::pass_trace`] settled on, and for the same reason: `nsl build`
+//! compiles a program's imported modules through a different codegen entry
+//! point than its own, so resetting at either entry would silently drop the
+//! other's traffic. `nsl run` and `nsl build` compile once, so in practice the
+//! two coincide.
+//!
+//! Where they do not, the findings are CONSERVATIVE — they under-report rather
+//! than invent. Two compiles in one process share counters, so a channel read
+//! by the first and left dead by the second shows `reads_full > 0` overall and
+//! no `DeadOutput`. That is a false negative, and the acceptable direction: a
+//! finding that fires on a compile the reader is not looking at would be
+//! unactionable, and this whole campaign is about reports that can be trusted
+//! at face value.
 //!
 //! # Why it cannot change the build
 //!
@@ -113,8 +137,19 @@ impl Channel {
     }
 
     /// This channel's declaration.
+    ///
+    /// `expect` rather than a bare index so that adding a variant without a
+    /// descriptor says what is wrong. The alternative is an out-of-bounds
+    /// panic pointing at this line, which describes the symptom and not the
+    /// omission.
     pub fn descriptor(self) -> &'static ChannelDescriptor {
-        &CHANNELS[self.idx()]
+        CHANNELS.get(self.idx()).unwrap_or_else(|| {
+            panic!(
+                "Channel::{self:?} has no ChannelDescriptor — CHANNELS has {} \
+                 entries and must have one per variant, in discriminant order",
+                CHANNELS.len()
+            )
+        })
     }
 }
 
