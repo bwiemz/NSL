@@ -133,6 +133,30 @@ mod imp {
         WgradAccum,
     }
 
+    /// How the wrapper stored the operands it handed cuBLAS.
+    ///
+    /// `Bf16Storage` means the wrapper cast both operands f32 -> bf16 into
+    /// scratch and ran `cublasGemmEx(16BF -> 32F)`; the two cast launches are
+    /// ordinary hooked kernels recorded immediately BEFORE this pseudo-op,
+    /// and the op's `a`/`b` remain the ORIGINAL f32 pointers (the scratch
+    /// addresses are pinned by the cast ops' recorded argument bytes, so
+    /// scratch stability is still verified every step). `F32` covers every
+    /// f32-storage form — the handle's math mode and the explicit `FAST_TF32`
+    /// low-intensity arm alike, which are the same buffers and the same
+    /// numerics class.
+    ///
+    /// Identity-only: eager repair re-enters the recording wrapper, which
+    /// re-derives the storage route deterministically (the matmul mode is
+    /// resolved once per process and `bf16_storage_worthwhile` is a pure
+    /// function of the recorded dims). The field exists so equality and the
+    /// digest cannot conflate the two forms — the item-9 "three places must
+    /// agree about op identity" lesson, applied at record time.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum GemmPrecision {
+        F32,
+        Bf16Storage,
+    }
+
     /// One recorded GPU interaction. Everything needed both to compare a
     /// later step's issuance for equality and to eagerly re-issue the op
     /// during self-repair.
@@ -168,6 +192,9 @@ mod imp {
             /// the collision reachable from every model instead of only from
             /// the weight-gradient fusion.
             kind: SgemmKind,
+            /// Operand storage route (f32 vs bf16-cast scratch). See the
+            /// enum's docs: identity-only, repair re-derives it.
+            precision: GemmPrecision,
             /// Operand transposition, for the row-major wrapper. `lda`/`ldb`
             /// are derived from these plus (m, n, k) inside the wrapper, so
             /// recording the flags pins the leading dimensions too.
@@ -244,17 +271,17 @@ mod imp {
                 ) => func == f2 && grid == g2 && block == b2 && shared == s2 && params == p2 && offsets == o2,
                 (
                     GpuOp::Sgemm {
-                        kind, transa, transb,
+                        kind, precision, transa, transb,
                         a, b, c, m, n, k, alpha_bits, beta_bits,
                         batch, stride_a, stride_b, stride_c,
                     },
                     GpuOp::Sgemm {
-                        kind: kd2, transa: ta2, transb: tb2,
+                        kind: kd2, precision: pr2, transa: ta2, transb: tb2,
                         a: a2, b: b2, c: c2, m: m2, n: n2, k: k2,
                         alpha_bits: al2, beta_bits: be2,
                         batch: bt2, stride_a: sa2, stride_b: sb2, stride_c: sc2,
                     },
-                ) => kind == kd2 && transa == ta2 && transb == tb2
+                ) => kind == kd2 && precision == pr2 && transa == ta2 && transb == tb2
                     && a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2
                     && alpha_bits == al2 && beta_bits == be2
                     && batch == bt2 && stride_a == sa2 && stride_b == sb2 && stride_c == sc2,
@@ -396,17 +423,22 @@ mod imp {
                     eat(params);
                 }
                 GpuOp::Sgemm {
-                    kind, transa, transb,
+                    kind, precision, transa, transb,
                     a, b, c, m, n, k, batch, stride_a, stride_b, stride_c, ..
                 } => {
                     eat(&[2]);
-                    // Wrapper identity and transposition are digested for the
-                    // same reason batch geometry is: two calls that produce
-                    // different products must not hash alike.
+                    // Wrapper identity, storage route and transposition are
+                    // digested for the same reason batch geometry is: two
+                    // calls that produce different products must not hash
+                    // alike.
                     eat(&[
                         match kind {
                             SgemmKind::RowMajor => 0u8,
                             SgemmKind::WgradAccum => 1u8,
+                        },
+                        match precision {
+                            GemmPrecision::F32 => 0u8,
+                            GemmPrecision::Bf16Storage => 1u8,
                         },
                         u8::from(*transa),
                         u8::from(*transb),
@@ -478,6 +510,12 @@ mod imp {
                     kind, transa, transb,
                     a, b, c, m, n, k, alpha_bits, beta_bits,
                     batch, stride_a, stride_b, stride_c,
+                    // Not dispatched on: re-entering the wrapper re-derives
+                    // the storage route from the same dims and the
+                    // once-per-process matmul mode, and `a`/`b` here are the
+                    // ORIGINAL f32 pointers, so a `Bf16Storage` op re-casts
+                    // fresh scratch exactly as the recorded step did.
+                    precision: _,
                 } => {
                     let (alpha, beta) = (f32::from_bits(*alpha_bits), f32::from_bits(*beta_bits));
                     // Dispatch on `kind`, not on shape. Replaying a
@@ -585,13 +623,17 @@ mod imp {
                     );
                 }
                 (
-                    GpuOp::Sgemm { a: aa, b: ab, c: ac, batch: abt, kind: akd, .. },
-                    GpuOp::Sgemm { a: ba, b: bb, c: bc, batch: bbt, kind: bkd, .. },
+                    GpuOp::Sgemm {
+                        a: aa, b: ab, c: ac, batch: abt, kind: akd, precision: apr, ..
+                    },
+                    GpuOp::Sgemm {
+                        a: ba, b: bb, c: bc, batch: bbt, kind: bkd, precision: bpr, ..
+                    },
                 ) => {
                     eprintln!(
                         "[cuda-graph] region {id}: first divergence at op {i}: sgemm ptrs \
-                         ({aa:#x},{ab:#x},{ac:#x}) batch={abt} {akd:?} vs \
-                         ({ba:#x},{bb:#x},{bc:#x}) batch={bbt} {bkd:?}"
+                         ({aa:#x},{ab:#x},{ac:#x}) batch={abt} {akd:?} {apr:?} vs \
+                         ({ba:#x},{bb:#x},{bc:#x}) batch={bbt} {bkd:?} {bpr:?}"
                     );
                 }
                 _ => {
@@ -601,10 +643,12 @@ mod imp {
                             params.len(),
                             &params[..params.len().min(48)]
                         ),
-                        GpuOp::Sgemm { a, b, c, m, n, k, batch, kind, transa, transb, .. } => {
+                        GpuOp::Sgemm {
+                            a, b, c, m, n, k, batch, kind, precision, transa, transb, ..
+                        } => {
                             format!(
-                                "sgemm[{kind:?} ta={transa} tb={transb}] a={a:#x} b={b:#x} \
-                                 c={c:#x} {m}x{n}x{k} batch={batch}"
+                                "sgemm[{kind:?} {precision:?} ta={transa} tb={transb}] a={a:#x} \
+                                 b={b:#x} c={c:#x} {m}x{n}x{k} batch={batch}"
                             )
                         }
                         GpuOp::Memset { dst, bytes } => format!("memset dst={dst:#x} n={bytes}"),
@@ -1126,8 +1170,9 @@ mod imp {
         a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
         batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
     ) -> bool {
+        // The batched wrapper has no bf16-storage arm — always f32.
         on_sgemm_full(
-            SgemmKind::RowMajor, false, false,
+            SgemmKind::RowMajor, GemmPrecision::F32, false, false,
             a, b, c, m, n, k, alpha, beta, batch, stride_a, stride_b, stride_c,
         )
     }
@@ -1140,7 +1185,7 @@ mod imp {
     /// and one recorded through the 2-D hook describe the same geometry.
     #[allow(clippy::too_many_arguments)]
     pub fn on_sgemm_full(
-        kind: SgemmKind, transa: bool, transb: bool,
+        kind: SgemmKind, precision: GemmPrecision, transa: bool, transb: bool,
         a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
         batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
     ) -> bool {
@@ -1148,7 +1193,7 @@ mod imp {
             return true;
         }
         let op = GpuOp::Sgemm {
-            kind, transa, transb,
+            kind, precision, transa, transb,
             a, b, c, m, n, k,
             alpha_bits: alpha.to_bits(),
             beta_bits: beta.to_bits(),
@@ -1504,6 +1549,7 @@ mod imp {
         fn colliding_pair() -> (GpuOp, GpuOp) {
             let common = |kind: SgemmKind| GpuOp::Sgemm {
                 kind,
+                precision: GemmPrecision::F32,
                 transa: false,
                 transb: false,
                 a: 0x1000,
@@ -1520,6 +1566,54 @@ mod imp {
                 stride_c: 64 * 128,
             };
             (common(SgemmKind::RowMajor), common(SgemmKind::WgradAccum))
+        }
+
+        /// The same gemm over the same buffers in f32-storage and
+        /// bf16-storage form. They enqueue different work (two cast kernels
+        /// plus a 16BF GemmEx versus one f32 sgemm), so neither equality nor
+        /// the digest may conflate them — a mode flip between record and a
+        /// later step must diverge at this op, not replay the wrong storage
+        /// route.
+        fn precision_pair() -> (GpuOp, GpuOp) {
+            let common = |precision: GemmPrecision| GpuOp::Sgemm {
+                kind: SgemmKind::RowMajor,
+                precision,
+                transa: false,
+                transb: false,
+                a: 0x1000,
+                b: 0x2000,
+                c: 0x3000,
+                m: 64,
+                n: 128,
+                k: 32,
+                alpha_bits: 1.0f32.to_bits(),
+                beta_bits: 0.0f32.to_bits(),
+                batch: 1,
+                stride_a: 64 * 32,
+                stride_b: 32 * 128,
+                stride_c: 64 * 128,
+            };
+            (common(GemmPrecision::F32), common(GemmPrecision::Bf16Storage))
+        }
+
+        #[test]
+        fn f32_and_bf16_storage_are_not_equal() {
+            let (f32_op, bf16_op) = precision_pair();
+            assert!(
+                f32_op != bf16_op,
+                "an f32-storage and a bf16-storage gemm over the same \
+                 buffers compared equal"
+            );
+        }
+
+        #[test]
+        fn f32_and_bf16_storage_digests_differ() {
+            let (f32_op, bf16_op) = precision_pair();
+            assert_ne!(
+                digest(std::slice::from_ref(&f32_op)),
+                digest(std::slice::from_ref(&bf16_op)),
+                "storage route is invisible to the region digest"
+            );
         }
 
         #[test]
@@ -1653,5 +1747,5 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 pub(crate) use imp::{
     in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
     on_sgemm_full, queue_deferred_free, taint,
-    MemsetAction, SgemmKind,
+    GemmPrecision, MemsetAction, SgemmKind,
 };
