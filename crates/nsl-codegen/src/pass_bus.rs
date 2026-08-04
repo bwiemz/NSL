@@ -40,14 +40,31 @@
 //! [`Channel::CshaBackwardClaims`] and the source-AD reverse walk consumes it,
 //! then CSHA precedes the reverse walk in any correct schedule — not by
 //! declaration but by construction. The channels below are the edges a
-//! scheduler would order by, which is why they are worth naming before anything
-//! is scheduled.
+//! scheduler would order by.
 //!
 //! The WGGO-to-FASE edge in that very example is
 //! [`Channel::WggoOverrides`]: WGGO fills it, FASE recipe selection reads it,
 //! and that is why FASE must follow WGGO regardless of what their declared
 //! stages imply. An ordering argument whose own worked example was not in the
 //! channel list would have been an argument about nothing.
+//!
+//! Step 5 declares those edges explicitly. Where a channel's value feeds
+//! another PASS's planning, the descriptor names that pass in
+//! `consumed_by_passes`, with an [`OrderClaim`] saying which ordering actually
+//! holds — and the distinction the claims draw is itself a step-1-shaped
+//! finding. "Producer is invoked before consumer" sounds like the obvious
+//! invariant, and for WGGO -> CSHA and WGGO -> WRGA it is one. For WGGO ->
+//! FASE it is FALSE: a train block whose pre-plan is missing or
+//! fingerprint-rejected re-invokes WGGO *in place*, thousands of driver lines
+//! AFTER FASE already planned. What actually holds there is a value-level
+//! order — the publish FASE read came from the pre-pass, and the driver
+//! hard-refuses if the in-place replan diverges from the table FASE consumed.
+//! Declaring `InvocationOrdered` for that edge would make
+//! [`dependency_order_violations`] cry wolf on a legitimate compile path,
+//! which is the finding-rule failure this module's [`Invariant`] type exists
+//! to prevent. The same distinction at read granularity is the
+//! [`BusFinding::ReadBeforePublish`] finding, which the sequence-stamped
+//! counters make checkable per channel.
 //!
 //! # Why the fields are private
 //!
@@ -247,6 +264,53 @@ impl Invariant {
     }
 }
 
+/// Which ordering actually holds between this channel's producer and a
+/// consuming pass.
+///
+/// Two variants because the tree has both, and conflating them produces a
+/// checker that fires on correct compiles. The worked example is the module
+/// header's own edge: WGGO -> FASE is real dataflow, but "WGGO is invoked
+/// before FASE" is false on the in-place-replan path, so only the weaker
+/// value-level claim may be checked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderClaim {
+    /// Whenever both passes are invoked in one process, the producer's first
+    /// invocation precedes the consumer's. Checked at runtime by
+    /// [`dependency_order_violations`], which `pass_trace::report` prints —
+    /// a detector nobody calls is decoration.
+    InvocationOrdered,
+    /// Only the VALUE dependency holds: the publish this consumer read
+    /// preceded its read, but the producing pass's invocation may
+    /// legitimately follow the consumer's. Carries the mechanism that makes
+    /// the late invocation safe, for the reason [`Invariant::Exempt`] carries
+    /// one: an unexplained weakening outlives its explanation.
+    ValueOrderedOnly(&'static str),
+}
+
+/// A pass whose PLANNING consumes this channel's value.
+///
+/// Distinct from `consumers` (files): most consumer files are op lowering or
+/// the driver, which have no place in a pass ordering. An entry here is the
+/// pass-to-pass dependency edge a scheduler must preserve, and nearly every
+/// such edge is DRIVER-MEDIATED — `stmt.rs` reads the channel and hands the
+/// value into the pass's entry function — so `via` records that mediation.
+/// The consuming pass's own modules still show the coupling (they name items
+/// from the channel's carrying module in their signatures), which is what the
+/// drift gate checks; the behavioural half of the claim is checked by
+/// [`dependency_order_violations`] at runtime.
+///
+/// A SELF-edge (`pass == producer`) is allowed and orders nothing: WRGA's
+/// rewrite stage reads back the adapter sites its own prescan published.
+#[derive(Debug, Clone, Copy)]
+pub struct PassConsumer {
+    /// MUST be a name in [`crate::pass_registry::PASSES`]; the drift gate
+    /// checks it, as it does for `producer`.
+    pub pass: &'static str,
+    pub order: OrderClaim,
+    /// How the value reaches the pass — the mediation, recorded.
+    pub via: &'static str,
+}
+
 /// What a channel carries, who fills it, who reads it, and which traffic
 /// patterns are defects for it.
 ///
@@ -278,10 +342,26 @@ pub struct ChannelDescriptor {
     /// empty" is the single most load-bearing fact about a consumer's `None`
     /// branch, and it was previously implicit in every one of them.
     pub empty_means: &'static str,
+    /// Passes whose planning consumes this channel's value — the pass-to-pass
+    /// dependency edges a scheduler would order by. Empty for most channels,
+    /// honestly: their consumers are op lowering or the driver, and claiming
+    /// a pass-to-pass edge that does not exist would be worse than claiming
+    /// none.
+    pub consumed_by_passes: &'static [PassConsumer],
     /// Is `published, never read` a defect here?
     pub dead_output: Invariant,
     /// Is `producer applied, yet the channel is empty` a defect here?
     pub applied_implies_published: Invariant,
+    /// Is `a consumer read this channel empty BEFORE its first publish, and
+    /// the value arrived later in the same process` a defect here?
+    ///
+    /// The read-granularity form of the ordering question. Enforced, it is a
+    /// tripwire for a consumer moved above its producer — a regression the
+    /// counters alone cannot see, because totals carry no order. Exempt, it
+    /// records a path where the tree does exactly that deliberately, with the
+    /// mechanism that guards it; the CPDT entry below records a wart this
+    /// very field's analysis surfaced.
+    pub read_before_publish: Invariant,
 }
 
 /// Every inter-pass channel, in [`Channel`] discriminant order.
@@ -339,6 +419,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         ],
         empty_means: "CSHA is off, or ran and claimed no layers — the \
                       FlashAttention call site uses the non-CSHA FFI variant",
+        consumed_by_passes: &[],
         // The producing site reads it back ~25 lines after publishing, to
         // build the backward claims (stmt.rs). So reads_full >= publishes
         // always holds and the finding is structurally unreachable. Recorded
@@ -351,6 +432,14 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
              csha_backward_claims, so a full read is guaranteed",
         ),
         applied_implies_published: Invariant::Enforced,
+        // Within one train block every read follows the publish in straight
+        // line. Across blocks it can invert legitimately.
+        read_before_publish: Invariant::Exempt(
+            "a multi-train-block compile that declines CSHA on one block and \
+             applies it on a later one produces empty reads (the first \
+             block's FlashAttention sites, correctly falling back to the \
+             non-CSHA variant) that precede the later block's publish",
+        ),
     },
     ChannelDescriptor {
         channel: Channel::CshaClaimedOps,
@@ -360,12 +449,17 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumers: &["crates/nsl-codegen/src/compiler/mod.rs"],
         empty_means: "no op is claimed, so every op lowers normally — the \
                       empty set IS the correct answer, not a missing one",
+        consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Exempt(
             "collect_claimed_ops returns an empty set whenever no boundary \
              chain is claimed, which an applying CSHA does routinely; the \
              empty set is this channel's correct output, not an absence",
         ),
+        // `is_csha_claimed` has no callers today (the drift gate pins that),
+        // so this cannot fire — it is armed for the first real caller, whose
+        // op-lowering reads must not precede CSHA's claim publish.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::CshaBackwardClaims,
@@ -379,11 +473,18 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         empty_means: "the reverse walk applies per-op AD rules instead of \
                       CSHA's fused backward. Also the deliberate state during \
                       adjoint lowering — see take_csha_backward_claims",
+        consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Exempt(
             "published only when chain_marks is non-empty, and the backward \
              SMEM validator can reject every chain while CSHA still applies \
              the forward — so an applying CSHA legitimately leaves it empty",
+        ),
+        read_before_publish: Invariant::Exempt(
+            "same multi-train-block shape as csha_bridge: a block whose SMEM \
+             validator rejects every chain reads this empty (per-op AD rules, \
+             correctly) before a later block's validator admits one and \
+             publishes",
         ),
     },
     ChannelDescriptor {
@@ -397,8 +498,12 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         ],
         empty_means: "no @train block compiled, or WRGA is disabled; \
                       `compile` returns `None` for the plan it hands back",
+        consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
+        // Both readers (entry_points handing the plan back, test_helpers)
+        // run after compilation, which is after every publish.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::AdapterPrescanPlan,
@@ -408,6 +513,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumers: &["crates/nsl-codegen/src/stmt.rs"],
         empty_means: "the prescan did not run (no adapter decorators), so \
                       train-block adapter injection has nothing to apply",
+        consumed_by_passes: &[],
         dead_output: Invariant::Exempt(
             "the prescan publishes unconditionally, and the train-block plan \
              supersedes it whenever that block has decorated placements — an \
@@ -417,6 +523,10 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
             "published by the driver prescan, which never records WRGA as \
              having run, so the antecedent cannot be established for it",
         ),
+        // The prescan publishes before any train block; the sole read is
+        // train-block adapter injection. A compile with no prescan never
+        // publishes, so its empty reads cannot arm the finding.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::CpkdPlan,
@@ -426,11 +536,15 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumers: &["crates/nsl-codegen/src/stmt.rs"],
         empty_means: "no distill block compiled, so no distillation report is \
                       rendered",
+        consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Exempt(
             "CPKD reports AdvisoryOnly and never Applied — it rewrites \
              nothing — so the antecedent never holds for this channel",
         ),
+        // Published inside compile_train_block (on the distill synthetic),
+        // taken by compile_distill_block right after that call returns.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::CpdtPlan,
@@ -439,8 +553,27 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         carries: "crate::cpdt::CpdtPlan",
         consumers: &["crates/nsl-codegen/src/stmt.rs"],
         empty_means: "CPDT is off; the optimizer runs its verbatim FP32 path",
+        consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
+        // A WART, surfaced by the analysis that added this field and recorded
+        // rather than silently blessed: within ONE compile_train_block_inner
+        // run, the moment-init precision read (stmt.rs, the
+        // `precision_active` block) executes in straight line BEFORE
+        // `invoke_cpdt_if_enabled` publishes (which happens after primal
+        // lowering). So a fresh compile's moment-precision arbitration can
+        // only consume a plan published by an EARLIER compile on the same
+        // Compiler — the calibrate-then-compile driver's shape — and on a
+        // single-pass compile the empty read leaves CPDT-sourced precision
+        // inactive. Whether that is design or defect deserves its own
+        // investigation; enforcing here would flag every CPDT-enabled
+        // compile, which is crying wolf either way.
+        read_before_publish: Invariant::Exempt(
+            "the moment-init precision read precedes the same compile's \
+             publish by construction; only an earlier compile on the same \
+             Compiler (calibrate-then-compile) can feed it — recorded as a \
+             wart pending its own investigation",
+        ),
     },
     ChannelDescriptor {
         channel: Channel::CfiePlan,
@@ -449,8 +582,12 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         carries: "crate::cfie::CfiePlan",
         consumers: &["crates/nsl-codegen/src/compiler/entry_points.rs"],
         empty_means: "no serve block opted into CFIE",
+        consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
+        // Published during serve-block compilation, read by entry_points
+        // after compilation returns.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::WggoOverrides,
@@ -461,8 +598,42 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         empty_means: "no WGGO plan exists for this compile, so FASE falls back \
                       to fase::plan, the per-parameter mode table is skipped, \
                       and CSHA and WRGA receive no per-layer decisions",
+        consumed_by_passes: &[
+            // The module header's motivating edge — and the one whose obvious
+            // ordering claim is FALSE. See `OrderClaim`.
+            PassConsumer {
+                pass: "FASE",
+                order: OrderClaim::ValueOrderedOnly(
+                    "a train block whose pre-plan is missing or \
+                     fingerprint-rejected re-invokes WGGO in place AFTER FASE \
+                     already planned; what FASE consumed is the pre-pass \
+                     publish, and stmt.rs hard-refuses if the in-place replan \
+                     diverges from the fase_fused table FASE used",
+                ),
+                via: "stmt.rs builds the per-layer fase_fused vector from the \
+                      overrides and selects the FASE plan from it",
+            },
+            PassConsumer {
+                pass: "CSHA",
+                order: OrderClaim::InvocationOrdered,
+                via: "stmt.rs passes the channel to csha::run_on_wengert as \
+                      its wggo_overrides argument",
+            },
+            PassConsumer {
+                pass: "WRGA",
+                order: OrderClaim::InvocationOrdered,
+                via: "stmt.rs (invoke_wrga_if_enabled) forwards the channel \
+                      as WrgaInput.wggo_overrides for the placement filter",
+            },
+        ],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
+        read_before_publish: Invariant::Exempt(
+            "the FASE edge above at read granularity: with no pre-plan for a \
+             block, FASE's read at plan selection is empty (it falls back to \
+             fase::plan, correctly) and the in-place replan's publish then \
+             postdates that read — guarded by the driver's divergence refusal",
+        ),
     },
     ChannelDescriptor {
         channel: Channel::WggoPreplans,
@@ -475,8 +646,15 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         ],
         empty_means: "the WGGO pre-pass produced no plan, so kernel synthesis \
                       and the train block see no pre-computed decisions",
+        consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
+        // The pre-pass fills it during kernel synthesis; both readers
+        // (kernel.rs later in that same synthesis, the train-block preplan
+        // lookup) run after. A compile whose pre-pass produced nothing never
+        // publishes (an empty vec is not a publish), so its empty reads
+        // cannot arm the finding.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::AdapterSites,
@@ -491,10 +669,36 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         ],
         empty_means: "no adapter decorators resolved, so field access finds no \
                       synthesized adapter members and nothing is injected",
+        consumed_by_passes: &[
+            // A self-edge: WRGA's own rewrite stage reads back what its
+            // prescan published. It orders WRGA against nothing, and is
+            // declared because the completeness gate maps consumer FILES to
+            // passes — wrga_prescan.rs and wrga_adapter_rewrite.rs are WRGA
+            // modules — and an undeclared mapping it can see would read as
+            // an omission.
+            PassConsumer {
+                pass: "WRGA",
+                order: OrderClaim::ValueOrderedOnly(
+                    "a self-edge: the prescan publishes the sites the pass's \
+                     own rewrite stage later applies to model method bodies; \
+                     it imposes no order between WRGA and any other pass",
+                ),
+                via: "wrga_prescan.rs and wrga_adapter_rewrite.rs read the \
+                      sites back when rewriting model method bodies",
+            },
+        ],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Exempt(
             "also published by the driver prescan, which never records WRGA \
              as having run",
+        ),
+        read_before_publish: Invariant::Exempt(
+            "sites inferred from the real Wengert list arrive only at the \
+             train-block WRGA run, after user-function bodies compiled and \
+             their member accesses read the channel empty — the prescan \
+             exists precisely to front-run the decorator-declared subset, and \
+             a late inferred site is the known cost of pattern-vs-inferred \
+             naming mismatches",
         ),
     },
     ChannelDescriptor {
@@ -506,12 +710,18 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         empty_means: "not inside a CFIE-active serve body, so a `generate()` \
                       call refuses cleanly instead of enqueueing into the \
                       dead M29 path",
+        consumed_by_passes: &[],
         dead_output: Invariant::Exempt(
             "installed for the duration of a serve body and cleared on exit; \
              a serve block containing no generate() call legitimately never \
              reads it",
         ),
         applied_implies_published: Invariant::Enforced,
+        read_before_publish: Invariant::Exempt(
+            "a generate() call outside any CFIE-active serve body reads the \
+             empty channel and refuses — the designed path — and a later \
+             CFIE serve block's install then postdates that read legitimately",
+        ),
     },
 ];
 
@@ -521,10 +731,18 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
 /// different: did anyone fill it, did anyone get something out, did anyone ask
 /// and get nothing. Collapsing them loses exactly the distinction that makes
 /// `read while empty` a finding.
+///
+/// The two `first_*_seq` stamps add the dimension totals cannot carry: ORDER.
+/// `publishes: 1, reads_empty: 1` describes both "asked, then answered" and
+/// "answered, then asked about a value already consumed elsewhere" — and only
+/// one of those is [`BusFinding::ReadBeforePublish`]. A stamp of 0 means
+/// "never"; [`SEQ`] starts at 1 so no real event can collide with it.
 struct Counters {
     publishes: AtomicUsize,
     reads_full: AtomicUsize,
     reads_empty: AtomicUsize,
+    first_publish_seq: AtomicUsize,
+    first_empty_read_seq: AtomicUsize,
 }
 
 impl Counters {
@@ -533,8 +751,30 @@ impl Counters {
             publishes: AtomicUsize::new(0),
             reads_full: AtomicUsize::new(0),
             reads_empty: AtomicUsize::new(0),
+            first_publish_seq: AtomicUsize::new(0),
+            first_empty_read_seq: AtomicUsize::new(0),
         }
     }
+}
+
+/// Process-global event sequence, shared by every channel so stamps compare
+/// across channels and against nothing else. Starts at 1: 0 is the "never
+/// happened" value in the per-channel stamps. Deliberately NOT reset by
+/// [`reset`] — the stamps are only ever compared to each other, monotonicity
+/// is all that matters, and resetting a global sequence invites a test to
+/// assert absolute values that break the moment an earlier event is added.
+static SEQ: AtomicUsize = AtomicUsize::new(1);
+
+/// Stamp `slot` with the next sequence number if this is the first such event.
+///
+/// `fetch_update` rather than a load-then-store: two threads can race here
+/// (integration binaries compile in parallel within one process), and a
+/// blind store would let the SECOND event overwrite the first's stamp, which
+/// is the direction that hides a ReadBeforePublish.
+fn stamp_first(slot: &AtomicUsize) {
+    let _ = slot.fetch_update(Relaxed, Relaxed, |cur| {
+        (cur == 0).then(|| SEQ.fetch_add(1, Relaxed))
+    });
 }
 
 /// Per-channel traffic for the process, indexed by [`Channel`] discriminant.
@@ -574,6 +814,12 @@ pub struct ChannelTraffic {
     pub publishes: usize,
     pub reads_full: usize,
     pub reads_empty: usize,
+    /// [`SEQ`] stamp of the first publish; 0 = never published. Only the
+    /// ORDER of stamps is meaningful — never assert absolute values, the
+    /// sequence is process-global and shared by every channel.
+    pub first_publish_seq: usize,
+    /// [`SEQ`] stamp of the first EMPTY read; 0 = never read empty.
+    pub first_empty_read_seq: usize,
 }
 
 /// Read `channel`'s counters.
@@ -583,11 +829,15 @@ pub fn traffic(channel: Channel) -> ChannelTraffic {
         publishes: c.publishes.load(Relaxed),
         reads_full: c.reads_full.load(Relaxed),
         reads_empty: c.reads_empty.load(Relaxed),
+        first_publish_seq: c.first_publish_seq.load(Relaxed),
+        first_empty_read_seq: c.first_empty_read_seq.load(Relaxed),
     }
 }
 
 fn note_publish(channel: Channel) {
-    TRAFFIC[channel.idx()].publishes.fetch_add(1, Relaxed);
+    let c = &TRAFFIC[channel.idx()];
+    c.publishes.fetch_add(1, Relaxed);
+    stamp_first(&c.first_publish_seq);
 }
 
 /// Count a read, and hand the value straight back so that at every call site
@@ -600,6 +850,7 @@ fn note_read<T>(channel: Channel, v: Option<T>) -> Option<T> {
         c.reads_full.fetch_add(1, Relaxed);
     } else {
         c.reads_empty.fetch_add(1, Relaxed);
+        stamp_first(&c.first_empty_read_seq);
     }
     v
 }
@@ -616,6 +867,9 @@ pub fn reset() {
         c.publishes.store(0, Relaxed);
         c.reads_full.store(0, Relaxed);
         c.reads_empty.store(0, Relaxed);
+        c.first_publish_seq.store(0, Relaxed);
+        c.first_empty_read_seq.store(0, Relaxed);
+        // SEQ itself is deliberately not reset — see its definition.
     }
 }
 
@@ -880,6 +1134,12 @@ pub enum BusFinding {
     /// branch, which looks identical to correct behaviour from every layer
     /// above — see the descriptor's `empty_means` for what that branch does.
     SilentDefault { channel: Channel, reads: usize },
+    /// A consumer read this channel EMPTY before its first publish, and the
+    /// value then arrived later in the same process — that reader planned
+    /// against the empty default while a real value existed downstream of it.
+    /// The ordering question at read granularity: the totals alone cannot
+    /// distinguish this from the benign ask-after-answer interleavings.
+    ReadBeforePublish { channel: Channel },
 }
 
 /// Traffic patterns that indicate a defect.
@@ -924,6 +1184,18 @@ pub fn findings() -> Vec<BusFinding> {
             if d.dead_output.enforced() && t.publishes > 0 && t.reads_full == 0 {
                 return Some(BusFinding::DeadOutput { channel: d.channel });
             }
+            // Both stamps set, and the ask preceded the answer. Disjoint from
+            // SilentDefault by construction (that arm requires publishes ==
+            // 0, this one requires a publish); DeadOutput wins above when
+            // both hold, because "published for nobody" subsumes "asked
+            // early" — the early asker is exactly the nobody.
+            if d.read_before_publish.enforced()
+                && t.first_publish_seq != 0
+                && t.first_empty_read_seq != 0
+                && t.first_empty_read_seq < t.first_publish_seq
+            {
+                return Some(BusFinding::ReadBeforePublish { channel: d.channel });
+            }
             // A publish with zero reads_full is already DeadOutput above; this
             // arm is the never-published case. `reads_empty > 0` keeps it to
             // channels somebody actually asked for.
@@ -941,6 +1213,42 @@ pub fn findings() -> Vec<BusFinding> {
             None
         })
         .collect()
+}
+
+/// Declared invocation-order dependency edges violated by the observed trace:
+/// `(producer, consumer, channel)` where the consumer's first invocation
+/// preceded the producer's although both ran and the edge claims
+/// [`OrderClaim::InvocationOrdered`].
+///
+/// Edges claiming [`OrderClaim::ValueOrderedOnly`] are deliberately not
+/// checked here — for those, invocation inversion is a legitimate compile
+/// path (the in-place WGGO replan), and a checker that fired on it would be
+/// the finding-rule failure the [`Invariant`] type exists to prevent. Their
+/// value-level half is [`BusFinding::ReadBeforePublish`], per channel.
+///
+/// Same process scope and the same conservative caveat as everything else
+/// here: two compiles in one process share one first-invocation order, so a
+/// pass that legitimately ran alone in an earlier compile could in principle
+/// present an inversion against a later one. `nsl run` / `nsl build` compile
+/// once, and the report this feeds is read per process, so the exposure
+/// matches [`crate::pass_trace::stage_order_violation`]'s.
+pub fn dependency_order_violations() -> Vec<(&'static str, &'static str, Channel)> {
+    let seen = crate::pass_trace::observed();
+    let pos = |p: &str| seen.iter().position(|s| *s == p);
+    let mut v = Vec::new();
+    for d in CHANNELS {
+        for c in d.consumed_by_passes {
+            if c.order != OrderClaim::InvocationOrdered {
+                continue;
+            }
+            if let (Some(pp), Some(cp)) = (pos(d.producer), pos(c.pass)) {
+                if cp < pp {
+                    v.push((d.producer, c.pass, d.channel));
+                }
+            }
+        }
+    }
+    v
 }
 
 /// The channels a pass publishes and the channels it consumes, as the edges a
@@ -994,6 +1302,16 @@ pub fn report() -> String {
                     "[pass-bus] SILENT DEFAULT: {} read {reads}x while empty \
                      although {} ran AND reported applying a transformation — \
                      consumers took the branch where {}\n",
+                    d.name, d.producer, d.empty_means
+                ));
+            }
+            BusFinding::ReadBeforePublish { channel } => {
+                let d = channel.descriptor();
+                s.push_str(&format!(
+                    "[pass-bus] READ BEFORE PUBLISH: {} was read while empty \
+                     before {} first published it — that reader planned \
+                     against the branch where {}, while the real value \
+                     arrived later in the same process\n",
                     d.name, d.producer, d.empty_means
                 ));
             }

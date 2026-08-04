@@ -115,6 +115,7 @@ fn every_finding_exemption_records_why() {
         for (what, inv) in [
             ("dead_output", d.dead_output),
             ("applied_implies_published", d.applied_implies_published),
+            ("read_before_publish", d.read_before_publish),
         ] {
             if let Invariant::Exempt(reason) = inv {
                 exemptions += 1;
@@ -150,11 +151,20 @@ fn both_findings_are_enforced_by_at_least_one_channel() {
         .iter()
         .filter(|d| d.applied_implies_published == Invariant::Enforced)
         .count();
+    let ordered = CHANNELS
+        .iter()
+        .filter(|d| d.read_before_publish == Invariant::Enforced)
+        .count();
     assert!(dead > 0, "no channel enforces DeadOutput — the finding is dead code");
     assert!(
         applied > 0,
         "no channel enforces SilentDefault — delete the finding rather than \
          keep one that can never fire"
+    );
+    assert!(
+        ordered > 0,
+        "no channel enforces ReadBeforePublish — delete the finding rather \
+         than keep one that can never fire"
     );
 }
 
@@ -499,13 +509,17 @@ fn every_accessor_counts_or_declares_why_not() {
     }
 }
 
-/// The two findings must render distinguishably. A report where both
+/// The finding categories must render distinguishably. A report where two
 /// categories produced the same text would be worse than one category.
 #[test]
-fn the_two_finding_categories_render_differently() {
+fn the_finding_categories_render_differently() {
     let src = pass_bus_source();
     assert!(src.contains("DEAD OUTPUT:"), "DeadOutput lost its marker");
     assert!(src.contains("SILENT DEFAULT:"), "SilentDefault lost its marker");
+    assert!(
+        src.contains("READ BEFORE PUBLISH:"),
+        "ReadBeforePublish lost its marker"
+    );
 }
 
 /// Every consumer file listed for a channel is one the tree actually has, AND
@@ -572,6 +586,194 @@ fn the_wrga_plan_channel_documents_its_test_only_consumer() {
     assert!(
         text.contains("#![cfg(any(test, feature = \"test-helpers\"))]"),
         "test_helpers.rs lost its cfg gate — this test's premise is stale"
+    );
+}
+
+// ─── Step 5: the declared pass-to-pass dependency edges ─────────────────────
+
+/// Every declared consumer pass exists, its `via` says something, and every
+/// `ValueOrderedOnly` weakening records the mechanism that makes it safe.
+///
+/// The same three claims made for `producer`, `empty_means` and
+/// `Invariant::Exempt` respectively, for the same reasons: a renamed pass must
+/// not leave an edge pointing at nothing, and a weakened ordering claim
+/// without its mechanism cannot be told apart from an oversight.
+#[test]
+fn every_declared_pass_consumer_is_registered_and_explained() {
+    use nsl_codegen::pass_bus::OrderClaim;
+    let names: BTreeSet<&str> = PASSES.iter().map(|p| p.name).collect();
+    for d in CHANNELS {
+        for c in d.consumed_by_passes {
+            assert!(
+                names.contains(c.pass),
+                "channel `{}` names consumer pass `{}`, which is not in \
+                 pass_registry::PASSES",
+                d.name,
+                c.pass
+            );
+            assert!(
+                c.via.len() > 20,
+                "channel `{}` -> `{}`: `via` records no useful mediation: {:?}",
+                d.name,
+                c.pass,
+                c.via
+            );
+            if let OrderClaim::ValueOrderedOnly(reason) = c.order {
+                assert!(
+                    reason.len() > 30,
+                    "channel `{}` -> `{}` weakens its ordering claim with no \
+                     useful reason: {reason:?}",
+                    d.name,
+                    c.pass
+                );
+            }
+        }
+    }
+}
+
+/// The edge list must not decay: at least one edge of EACH OrderClaim variant
+/// must exist, or the variant (and everything checking it) is dead code
+/// dressed as a distinction — the `status`-field defect again.
+///
+/// The floors also pin the current graph's minimum: wggo_overrides carries
+/// three real edges (FASE, CSHA, WRGA) and adapter_sites one self-edge. A
+/// shrink below that is a deliberate edit here, not an accident.
+#[test]
+fn both_order_claims_are_used_and_the_edge_list_has_not_shrunk() {
+    use nsl_codegen::pass_bus::OrderClaim;
+    let all: Vec<_> = CHANNELS.iter().flat_map(|d| d.consumed_by_passes.iter()).collect();
+    assert!(
+        all.len() >= 4,
+        "only {} declared pass-consumer edges — the graph shrank; if an edge \
+         was genuinely removed, lower this floor deliberately",
+        all.len()
+    );
+    let invocation = all
+        .iter()
+        .filter(|c| c.order == OrderClaim::InvocationOrdered)
+        .count();
+    let value_only = all.len() - invocation;
+    assert!(
+        invocation >= 2,
+        "no InvocationOrdered edges left ({invocation}) — \
+         dependency_order_violations can never fire and is dead code"
+    );
+    assert!(
+        value_only >= 1,
+        "no ValueOrderedOnly edges left — if invocation order now genuinely \
+         holds universally, delete the variant rather than keep an unused one"
+    );
+}
+
+/// Every non-self dependency edge shows type-level coupling: some module of
+/// the consuming pass names the channel's carrying module.
+///
+/// This is the checkable HALF of the edge claim. Nearly every edge is
+/// driver-mediated — `stmt.rs` reads the channel and hands the value into the
+/// pass entry — so scanning the consuming pass for the ACCESSOR finds
+/// nothing, and a gate that required it would force declaring the driver a
+/// pass. What the consuming pass's own signature must show is the TYPE:
+/// `csha.rs` takes `Option<&crate::wggo_overrides::WggoOverrides>`,
+/// `wrga.rs` carries it as `WrgaInput.wggo_overrides`, `fase.rs` returns
+/// `crate::wggo_overrides::OverrideDiagnostic`s. An edge with no type
+/// coupling at all is either wrong or so indirect the descriptor should say
+/// how, and the behavioural half is checked at runtime by
+/// `dependency_order_violations` plus the ReadBeforePublish stamps.
+///
+/// Self-edges are skipped: a pass trivially couples to its own module.
+#[test]
+fn every_dependency_edge_shows_type_coupling_in_the_consuming_pass() {
+    let root = repo_root();
+    for d in CHANNELS {
+        let non_self: Vec<_> =
+            d.consumed_by_passes.iter().filter(|c| c.pass != d.producer).collect();
+        if non_self.is_empty() {
+            continue;
+        }
+        // "crate::wggo_overrides::WggoOverrides" -> "crate::wggo_overrides::"
+        // (also inside "Vec<crate::wrga_adapter_inject::AdapterSite>"). Only
+        // extracted for channels with a non-self edge: a channel like
+        // csha_claimed_ops legitimately carries a std type, and demanding a
+        // crate path from it would gate a claim nobody made.
+        let start = d.carries.find("crate::").unwrap_or_else(|| {
+            panic!(
+                "channel `{}` declares a non-self pass consumer but carries a \
+                 non-crate type ({}) — the type-coupling check cannot work; \
+                 restructure the edge or this gate",
+                d.name, d.carries
+            )
+        });
+        let end = d.carries.rfind("::").unwrap() + 2;
+        let carrying_module = &d.carries[start..end];
+        assert!(
+            carrying_module.matches("::").count() >= 2,
+            "channel `{}`: carrying-module extraction went wrong: {carrying_module:?}",
+            d.name
+        );
+
+        for c in non_self {
+            let pass = PASSES.iter().find(|p| p.name == c.pass).unwrap();
+            let coupled = pass.source_files.iter().any(|f| {
+                let text = std::fs::read_to_string(root.join(f))
+                    .unwrap_or_else(|e| panic!("reading {f}: {e}"));
+                code_only(&text).contains(carrying_module)
+            });
+            assert!(
+                coupled,
+                "channel `{}` declares consumer pass `{}`, but none of that \
+                 pass's registered source files mentions `{carrying_module}` \
+                 — either the edge is stale or the coupling moved to an \
+                 unregistered module (register it)",
+                d.name, c.pass
+            );
+        }
+    }
+}
+
+/// The completeness direction for pass consumers: every consumer FILE that
+/// belongs to a registered pass (by the same stem rule
+/// `every_codegen_pass_module_belongs_to_a_registered_pass` uses) must appear
+/// in `consumed_by_passes`.
+///
+/// This is what catches a pass module growing a direct bus read without the
+/// edge being declared — the drift that would make the declared graph
+/// understate the ordering constraints a scheduler must preserve. It cannot
+/// see driver-mediated edges (stmt.rs is not a pass module); those are
+/// declared from analysis, which is exactly why the floors above pin their
+/// count.
+#[test]
+fn every_pass_module_consumer_file_is_a_declared_pass_consumer() {
+    let pass_of_file = |rel: &str| -> Option<&'static str> {
+        let stem = Path::new(rel).file_stem()?.to_string_lossy().to_string();
+        PASSES
+            .iter()
+            .find(|p| {
+                let low = p.name.to_lowercase();
+                stem == low
+                    || stem.starts_with(&format!("{low}_"))
+                    || p.source_files.contains(&rel)
+            })
+            .map(|p| p.name)
+    };
+    let mut checked = 0usize;
+    for d in CHANNELS {
+        for f in d.consumers {
+            let Some(pass) = pass_of_file(f) else { continue };
+            checked += 1;
+            assert!(
+                d.consumed_by_passes.iter().any(|c| c.pass == pass),
+                "channel `{}` lists consumer file {f}, which belongs to pass \
+                 `{pass}`, but `{pass}` is not in consumed_by_passes — declare \
+                 the edge (with its OrderClaim) or the dependency graph \
+                 understates what a scheduler must preserve",
+                d.name
+            );
+        }
+    }
+    assert!(
+        checked >= 1,
+        "no consumer file mapped to any pass — the stem rule broke, and \
+         every assertion above was vacuous"
     );
 }
 

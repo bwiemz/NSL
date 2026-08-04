@@ -443,10 +443,40 @@ pub fn report() -> String {
         ));
     }
     if let Some((a, b)) = stage_order_violation() {
+        // An inversion explained by a declared dependency edge is not merely
+        // tolerable, it is REQUIRED — WGGO(OnWengert) before
+        // FASE(PreExtraction) looks backwards by stage rank and is exactly
+        // the order the wggo_overrides edge mandates. Saying which is which
+        // is what the edges bought; before them this line blessed every
+        // inversion with the same shrug.
+        let edge = crate::pass_bus::CHANNELS.iter().find(|d| {
+            d.producer == a && d.consumed_by_passes.iter().any(|c| c.pass == b)
+        });
+        match edge {
+            Some(d) => s.push_str(&format!(
+                "[pass-trace] STAGE ORDER: {a} ran before {b}, inverting \
+                 their declared PipelineStage — required by the declared \
+                 dependency: {b} consumes {}, which {a} produces\n",
+                d.name
+            )),
+            None => s.push_str(&format!(
+                "[pass-trace] STAGE ORDER: {a} ran before {b}, inverting \
+                 their declared PipelineStage (see each pass's CompilePhase \
+                 above — a cross-phase inversion is expected, not a defect)\n"
+            )),
+        }
+    }
+    // The invocation-order half of the declared dependency edges. Printed
+    // here rather than only exposed as a function, for the reason
+    // `phase_mismatches` is: a detector with no production caller is why a
+    // false claim survives.
+    for (producer, consumer, ch) in crate::pass_bus::dependency_order_violations() {
         s.push_str(&format!(
-            "[pass-trace] STAGE ORDER: {a} ran before {b}, inverting their \
-             declared PipelineStage (see each pass's CompilePhase above — a \
-             cross-phase inversion is expected, not a defect)\n"
+            "[pass-trace] DEPENDENCY ORDER: {consumer} was invoked before \
+             {producer}, yet {consumer} consumes {}, which {producer} \
+             produces — whatever {producer} published cannot have reached \
+             this compile's {consumer} planning\n",
+            ch.descriptor().name
         ));
     }
     s
@@ -465,7 +495,11 @@ pub fn report() -> String {
 /// five passes is accepted here. Saying so plainly matters — a checker that
 /// implied it had verified the whole sequence would be claiming coverage it
 /// does not have, which is the failure mode the registry itself was built to
-/// stop. Declaring intra-stage order is the next increment, not this one.
+/// stop. The intra-stage order that IS declared lives on the bus, where the
+/// data dependencies are: `pass_bus::ChannelDescriptor::consumed_by_passes`
+/// names the pass-to-pass edges, and
+/// [`crate::pass_bus::dependency_order_violations`] checks the
+/// invocation-ordered subset of them against this same observed sequence.
 pub fn stage_order_violation() -> Option<(&'static str, &'static str)> {
     use crate::pass_registry::PipelineStage as S;
     fn rank(s: S) -> Option<u8> {

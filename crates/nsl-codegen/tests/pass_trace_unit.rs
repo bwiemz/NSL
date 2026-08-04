@@ -289,6 +289,69 @@ fn csha_off_mode_declines_rather_than_applying_nothing() {
     );
 }
 
+/// A stage-rank inversion that a declared dependency edge MANDATES must say
+/// so, and one no edge explains must keep the generic cross-phase wording.
+///
+/// WGGO(OnWengert) before FASE(PreExtraction) is the canonical case: it reads
+/// as an inversion by stage rank and is exactly the order the wggo_overrides
+/// edge requires. Before the edges existed this line blessed every inversion
+/// with the same "expected, not a defect" shrug; pinning both wordings is
+/// what keeps the upgraded arm from quietly regressing to the shrug.
+#[test]
+fn a_stage_inversion_mandated_by_a_dependency_edge_says_so() {
+    let _g = fresh();
+    record("WGGO");
+    record("FASE");
+    let r = report();
+    assert!(
+        r.contains(
+            "STAGE ORDER: WGGO ran before FASE, inverting their declared \
+             PipelineStage — required by the declared dependency: FASE \
+             consumes wggo_overrides, which WGGO produces"
+        ),
+        "the mandated inversion must be attributed to its edge: {r}"
+    );
+
+    reset();
+    record("CCR"); // OnAdjoint, rank 3
+    record("FASE"); // PreExtraction, rank 0 — inverted, and no CCR->FASE edge
+    let r = report();
+    assert!(
+        r.contains("STAGE ORDER: CCR ran before FASE")
+            && r.contains("a cross-phase inversion is expected, not a defect"),
+        "an unexplained inversion must keep the generic wording: {r}"
+    );
+}
+
+/// A declared InvocationOrdered edge violated by the observed trace is
+/// printed by the report — a detector with no production caller is why a
+/// false claim survives, so the checker's production caller is the report
+/// itself.
+#[test]
+fn a_dependency_order_violation_is_printed_by_the_report() {
+    let _g = fresh();
+    record("CSHA");
+    record("WGGO");
+    let r = report();
+    assert!(
+        r.contains(
+            "DEPENDENCY ORDER: CSHA was invoked before WGGO, yet CSHA \
+             consumes wggo_overrides, which WGGO produces"
+        ),
+        "the violation must be printed with its edge: {r}"
+    );
+
+    // The healthy order prints nothing.
+    reset();
+    record("WGGO");
+    record("CSHA");
+    assert!(
+        !report().contains("DEPENDENCY ORDER"),
+        "no violation, no line: {}",
+        report()
+    );
+}
+
 /// Every name this module's own tests use must be a real registered pass,
 /// so the tests cannot drift into asserting on passes that no longer
 /// exist.
