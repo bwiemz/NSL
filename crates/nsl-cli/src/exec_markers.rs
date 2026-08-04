@@ -260,6 +260,18 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          not this marker)",
     ),
     m(
+        "[lm-head-fusion]",
+        &[
+            "crates/nsl-codegen/src/stmt.rs",
+        ],
+        "item 4 reported what `--fuse-lm-head` decided: `inferred:` names the \
+         four dims of a fused LM head the compiler installed with no \
+         @fused_lm_ce decorator, `declined:` says why it kept the composite \
+         path. Deliberately NOT `[fused-lm-ce]`, which means the opposite \
+         (a fusion that did not happen) and is asserted ABSENT by \
+         fused_lm_ce_decline_gate's success cases",
+    ),
+    m(
         "[nsl-kernel-count]",
         &[
             "crates/nsl-runtime/src/fused_adapter.rs",
@@ -345,6 +357,16 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
             // format!("csha[{}]: {} chains, ...")  <- the summary's own prefix
             ("csha[{}]", "crates/nsl-codegen/src/csha.rs"),
         ],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/lm_head_inference_gate.rs",
+        asserts: "no LM head was inferred — the default-off case, and the case \
+                  where an @fused_lm_ce(enabled = false) opt-out was honoured",
+        // The bare token is the whole needle: those two tests assert no
+        // `[lm-head-fusion]` line AT ALL, neither `inferred:` nor `declined:`,
+        // because "inference never ran" and "inference ran and passed" have to
+        // be distinguishable. One emitting file — the train-block lowering.
+        parts: &[("[lm-head-fusion]", "crates/nsl-codegen/src/stmt.rs")],
     },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/mse_leak_gate.rs",

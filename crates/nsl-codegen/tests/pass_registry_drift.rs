@@ -657,11 +657,23 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("gpu_target", "GPU target selection"),
     ("grammar_compiler", "CFIE grammar compilation"),
     ("hir", "high-level IR"),
+    (
+        "ctor_fold",
+        "item 5: constant-folds constructor arguments into model-field dims \
+         for the arena's shape propagation — an AST fact-scan over model \
+         defs, not a stage that rewrites anything itself",
+    ),
     ("inspect", "dev-tools inspection"),
     ("kernel", "kernel skeleton/IR/lowering machinery"),
     ("layerwise", "CSLA layerwise accumulation scheduling"),
     ("lib", "crate root"),
     ("linker", "object linking"),
+    (
+        "lm_head_inference",
+        "item 4: proves the DataLoader row count a compiler-inferred fused LM \
+         head needs — an AST fact-scan feeding the source-AD substitution, not \
+         a stage that rewrites anything itself",
+    ),
     ("matmul_mma", "tensor-core matmul emitter"),
     ("moe", "mixture-of-experts kernels and HF packing"),
     ("multimodal", "multimodal input support"),

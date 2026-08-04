@@ -120,6 +120,43 @@ pub fn elem_hints_from_var_nodes(
     out
 }
 
+/// Full-dims sibling of [`elem_hints_from_var_nodes`]: the dim VECTOR for
+/// every var whose semantic type has an all-concrete shape. The arena's
+/// shape propagation needs dims, not products — matmul output size is a
+/// function of the shapes, so a numel-only hint stops at the first matmul.
+/// Same concreteness rules: any non-concrete dim drops the whole entry.
+pub fn dim_hints_from_var_nodes(
+    var_nodes: &HashMap<VarId, nsl_ast::NodeId>,
+    type_map: &nsl_semantic::checker::TypeMap,
+) -> HashMap<VarId, Vec<i64>> {
+    use nsl_semantic::types::Type;
+    let mut out = HashMap::new();
+    for (&var, node) in var_nodes {
+        let ty = match type_map.get(node) {
+            Some(t) => t,
+            None => continue,
+        };
+        let shape = match ty {
+            Type::Tensor { shape, .. } => shape,
+            Type::Param { shape, .. } => shape,
+            Type::Buffer { shape, .. } => shape,
+            _ => continue,
+        };
+        if shape.dims.is_empty() {
+            continue;
+        }
+        let dims: Option<Vec<i64>> = shape
+            .dims
+            .iter()
+            .map(|d| concrete_dim(d).filter(|&n| n > 0))
+            .collect();
+        if let Some(dims) = dims {
+            out.insert(var, dims);
+        }
+    }
+    out
+}
+
 fn concrete_dim(dim: &nsl_semantic::types::Dim) -> Option<i64> {
     use nsl_semantic::types::Dim;
     match dim {

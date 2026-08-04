@@ -166,6 +166,9 @@ pub mod flash_attention;
 pub mod flash_attention_selector;
 pub mod flash_attention_v2;
 pub mod fused_linear_ce;
+/// Item 4: proves the row count a compiler-inferred fused LM head needs.
+pub mod ctor_fold;
+pub mod lm_head_inference;
 pub mod precision_cast_ptx;
 pub mod fusion;
 pub mod fusion_report;
@@ -1202,6 +1205,55 @@ pub struct CompileOptions {
     /// backward is retained — it is bit-exact-equivalent to the unfused form
     /// (FASE≡AdamW gates) and is not a distinct-numerics surface.
     pub training_reference: bool,
+    /// Item 4 (`--fuse-lm-head`): whether the compiler may install a fused LM
+    /// head that no `@fused_lm_ce` decorator asked for.
+    ///
+    /// `--pretrain-optimized` selects `Auto`. `Require` turns an unprovable
+    /// chain into a compile error, which is what a certification lane wants:
+    /// silently paying for the `[rows, vocab]` logits surface is exactly the
+    /// failure this item exists to make impossible.
+    ///
+    /// Forced `Off` under `--training-reference`, alongside the decorator, so
+    /// the reference arm's numerics stay a single composite path.
+    pub lm_head_fusion: crate::lm_head_inference::LmHeadFusion,
+    /// Item 4: literal dims and ranks of model fields declared in IMPORTED
+    /// modules, `model_type -> field_name -> dims|rank`.
+    ///
+    /// `collect_models` only sees the entry module's AST, and the multi-file
+    /// build path propagated `model_field_types` but never these two. Every
+    /// real model lives in its own `model.nsl` and is imported, so the fused
+    /// LM head of every real model was invisible to both the CFTP v10 rank
+    /// guard (which treats an absent rank as "fire", so it was silently
+    /// inoperative on exactly the MoE-expert-stack case it was written for)
+    /// and to item 4's dims lookup.
+    ///
+    /// Carried on the options rather than as two more positional parameters
+    /// to a twelve-argument `compile_entry_returning_plan`, matching how
+    /// `csha_configs` and `checkpoint_policies` already reach it.
+    /// Item 5 (`--transient-arena`): place admitted backward temporaries at
+    /// fixed arena offsets instead of letting the caching allocator choose.
+    ///
+    /// Default OFF, and it will stay off until the byte-identity validation in
+    /// `scripts/arena-parity.sh` is green on a scale that matters. The payoff
+    /// is stable addresses for CUDA-graph capture; the risk, in the design
+    /// note's words, is that "a liveness error → silent memory corruption".
+    /// Turning this on by default before the parity gate would be exactly the
+    /// jump from lower-bound analysis to placement that the staging exists to
+    /// prevent.
+    pub transient_arena: bool,
+    pub imported_model_field_dims: std::collections::HashMap<String, std::collections::HashMap<String, Vec<i64>>>,
+    /// See [`Self::imported_model_field_dims`].
+    pub imported_model_field_ranks: std::collections::HashMap<String, std::collections::HashMap<String, usize>>,
+    /// The veto companion to [`Self::imported_model_field_dims`]: bare names
+    /// of imported tensor fields whose dims could NOT be derived. Without
+    /// this, `unique_field_elems`/`unique_field_dims` let a derivable
+    /// same-named field in one model win uncontested over an underivable
+    /// twin in an imported model — sizing it wrong instead of not at all.
+    pub imported_tensor_fields_without_dims: std::collections::HashSet<String>,
+    /// Constructor-folded VALUES of 1-element config fields — the runtime
+    /// `int(self._n_heads.item())` reads these back, so the arena's shape
+    /// propagation needs them to fold attention reshape targets.
+    pub imported_model_field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     /// Also controls PIC codegen (`is_pic`), which every object linked into
     /// the shared library needs — including non-entry modules on the
@@ -1491,6 +1543,12 @@ impl Default for CompileOptions {
             debug_training: false,
             grad_integrity: false,
             training_reference: false,
+            lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
+            transient_arena: false,
+            imported_model_field_dims: std::collections::HashMap::new(),
+            imported_model_field_ranks: std::collections::HashMap::new(),
+            imported_tensor_fields_without_dims: std::collections::HashSet::new(),
+            imported_model_field_values: std::collections::HashMap::new(),
             shared_lib: false,
             emit_export_table: false,
             wrga_inputs: None,

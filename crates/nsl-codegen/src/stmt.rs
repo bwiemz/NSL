@@ -5028,6 +5028,15 @@ impl Compiler<'_> {
         let result =
             self.compile_train_block_inner(builder, state, train, train_block_stmt_id);
         self.restore_active_fused_ce_config(saved_active_fused_ce);
+        // Item 5: the placement map is keyed by VarIds from THIS block's
+        // extraction, and the VarId counter restarts per extraction — so
+        // leaving it installed would apply this block's byte offsets to the
+        // next block's unrelated tensors. Cleared unconditionally, including
+        // on the error path, for the same reason the fused-CE config is.
+        if !self.arena_placements.is_empty() {
+            self.arena_placements.clear();
+            let _ = self.compile_call_by_name(builder, "nsl_arena_destroy", &[]);
+        }
         result
     }
 
@@ -7275,6 +7284,16 @@ impl Compiler<'_> {
             // scenario (`self.experts.weight: [D, V, H]` accessed via
             // `matmul(x, transpose(self.experts.weight, -2, -1)) + bias`).
             extractor.set_model_field_ranks(self.models.model_field_ranks.clone());
+            // Item 4: the same map at full width. Ranks let the matcher REFUSE
+            // a bad `W`; dims let inference AFFIRM a good one, which is what
+            // reading `[V, H]` off the weight requires.
+            extractor.set_model_field_dims(self.models.model_field_dims.clone());
+            extractor.set_model_field_scalar_values(
+                self.models.model_field_scalar_values.clone(),
+            );
+            if let Some(ctx) = self.lm_head_inference_for_train_block(train_block_stmt_id) {
+                extractor.set_lm_head_inference(ctx);
+            }
             // WRGA B.3.2 Option 3: plumb synth overrides so the extractor
             // resolves sentinel-Ident callees/members emitted by the
             // adapter rewrite (fused FFI name + adapter field names).
@@ -7688,6 +7707,80 @@ impl Compiler<'_> {
                 extractor
                     .apply_pending_fused_lce_prunes()
                     .map_err(CodegenError::new)?;
+
+            // ── Item 4: compiler-inferred LM head ──────────────────
+            //
+            // A distinct marker from `[fused-lm-ce]`, which means "the
+            // fusion did NOT happen" and is asserted ABSENT by
+            // `fused_lm_ce_decline_gate`. Overloading one token for both
+            // outcomes would make every one of those negative assertions
+            // pass or fail for the wrong reason.
+            if let Some(ctx) =
+                self.lm_head_inference_for_train_block(train_block_stmt_id)
+            {
+                // Same dedup as the declines above, for the same reason:
+                // `try_unroll_for` re-extracts a loop body per iteration,
+                // so one source-level head can report N times.
+                let mut heads: Vec<crate::source_ad::InferredHead> = Vec::new();
+                for h in extractor.inferred_heads() {
+                    if !heads.contains(&h) {
+                        heads.push(h);
+                    }
+                }
+                let mut reasons: Vec<String> = Vec::new();
+                for r in extractor.inference_declines() {
+                    if !reasons.contains(r) {
+                        reasons.push(r.clone());
+                    }
+                }
+                for h in &heads {
+                    eprintln!(
+                        "[lm-head-fusion] inferred: vocab={} hidden={} \
+                         rows={}x{}={} bias={} (no @fused_lm_ce decorator \
+                         needed; --fuse-lm-head {})",
+                        h.vocab_size,
+                        h.hidden_size,
+                        h.batch_size,
+                        h.seq_len,
+                        h.batch_size as u64 * h.seq_len as u64,
+                        h.has_bias,
+                        ctx.mode.as_str(),
+                    );
+                }
+                for r in &reasons {
+                    eprintln!("[lm-head-fusion] declined: {r}");
+                }
+                if heads.is_empty()
+                    && ctx.mode
+                        == crate::lm_head_inference::LmHeadFusion::Require
+                {
+                    // `require` is for lanes that would rather not find out
+                    // at step 40,000 that the run has been materializing
+                    // the [rows, vocab] logits all along.
+                    let detail = if reasons.is_empty() {
+                        "this train block's step body has no \
+                         cross_entropy(logits, targets) call for the fused \
+                         kernel to replace"
+                            .to_string()
+                    } else {
+                        let mut s = String::new();
+                        for (i, r) in reasons.iter().enumerate() {
+                            s.push_str(&format!("\n  {}. {}", i + 1, r));
+                        }
+                        format!("the chain could not be proven:{s}")
+                    };
+                    return Err(CodegenError::new(format!(
+                        "--fuse-lm-head require: no fused LM head could be \
+                         inferred for this train block, so the full \
+                         [batch*seq, vocab] logits surface would be \
+                         materialized every step.\n\n{detail}\n\n\
+                         Pass --fuse-lm-head auto to fall back to the \
+                         composite path instead of refusing, or write an \
+                         explicit @fused_lm_ce(...) decorator if the shapes \
+                         are known to you but not to the compiler."
+                    )));
+                }
+            }
 
                 // WGGO: run the global optimization planner if enabled.  The
                 // planner call itself is pure data-in/data-out — it produces a
@@ -9129,7 +9222,9 @@ impl Compiler<'_> {
                 //      gradient transients, the surface the arena exists
                 //      to place.
                 // Symbolic/computed dims stay unsized; nothing is guessed.
+                let arena_place_on = self.compile_options.transient_arena;
                 let arena_report_on = self.compile_options.memory_report
+                    || arena_place_on
                     || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1");
                 let elem_hints: std::collections::HashMap<crate::wengert::VarId, u64> =
                     if arena_report_on || csla_active {
@@ -9196,14 +9291,450 @@ impl Compiler<'_> {
                         .map(|(_, a)| *a)
                         .collect();
                     tape_escaping.insert(effective_primal.output);
+                    // Stage-2B: sizes the hint bridge cannot reach. Shapes
+                    // first — dims propagate through matmul, which is where
+                    // the numel-only pass stopped (it sized 0 of 1321
+                    // transients on coder50m: every backward elementwise
+                    // chain sits downstream of a matmul, and a matmul's
+                    // output numel is a function of the SHAPES). The numel
+                    // pass still runs last, as a fallback for values whose
+                    // dims die at a runtime-shaped op but whose count
+                    // survives.
+                    let mut dim_seeds: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        Vec<i64>,
+                    > = crate::profiling::captures::dim_hints_from_var_nodes(
+                        extractor.var_nodes(),
+                        self.type_map,
+                    );
+                    // Model-type-resolved per-var dims FIRST: a field named
+                    // `weight` exists in every Linear/Embedding module, so
+                    // the bare-leaf-name bridge below drops it as ambiguous
+                    // while this map has each var's correct dims.
+                    for (vid, d) in extractor.known_param_dims() {
+                        dim_seeds.entry(*vid).or_insert_with(|| d.clone());
+                    }
+                    let field_dims = self.models.unique_field_dims();
+                    for (name, vid) in extractor.named_param_var_ids() {
+                        if dim_seeds.contains_key(vid) {
+                            continue;
+                        }
+                        let leaf = name.rsplit('.').next().unwrap_or(name);
+                        if let Some(d) = field_dims.get(leaf) {
+                            dim_seeds.insert(*vid, d.clone());
+                        }
+                    }
+                    // Item 4's DataLoader proof seeds the batch fields: a
+                    // Proven scan certifies every batch is exactly
+                    // [batch_size, seq_len] (unanimous loaders, drop_last
+                    // required, short batches padded by the runtime), and
+                    // those fields are the entry point the whole forward
+                    // chain hangs off. Only fields the runtime emits at
+                    // [B, S], and only reads of a step-input dict (an Input
+                    // leaf) — a user-built dict proves nothing.
+                    let arena_debug =
+                        std::env::var("NSL_ARENA_DEBUG").ok().as_deref() == Some("1");
+                    if let Some(facts) = self.lm_head_loader_scan.facts() {
+                        let input_leaves: std::collections::HashSet<
+                            crate::wengert::VarId,
+                        > = effective_primal
+                            .ops
+                            .iter()
+                            .filter(|o| {
+                                matches!(o.op, crate::wengert::PrimalOp::Input(_))
+                            })
+                            .map(|o| o.result)
+                            .collect();
+                        for op in &effective_primal.ops {
+                            let crate::wengert::PrimalOp::Passthrough(n) = &op.op else {
+                                continue;
+                            };
+                            let Some(field) = n.strip_prefix("dict_get:") else {
+                                continue;
+                            };
+                            let eligible = matches!(
+                                field,
+                                "input_ids" | "labels" | "segment_ids" | "position_ids"
+                            ) && op.inputs.len() == 1
+                                && input_leaves.contains(&op.inputs[0]);
+                            if arena_debug {
+                                eprintln!(
+                                    "[arena-debug] dict_get:{field} v{} inputs={:?} \
+                                     leaf={} -> seed {}",
+                                    op.result,
+                                    op.inputs,
+                                    op.inputs
+                                        .first()
+                                        .is_some_and(|i| input_leaves.contains(i)),
+                                    eligible,
+                                );
+                            }
+                            if eligible {
+                                dim_seeds.entry(op.result).or_insert_with(|| {
+                                    vec![facts.batch_size as i64, facts.seq_len as i64]
+                                });
+                            }
+                        }
+                    } else if arena_debug {
+                        eprintln!(
+                            "[arena-debug] loader scan unproven: {:?}",
+                            self.lm_head_loader_scan.reason()
+                        );
+                    }
+                    // Same unique-preimage rule as the elems mirror above:
+                    // an adjoint has its primal's shape by construction, but
+                    // only a dedicated accumulator certifies WHICH primal.
+                    let mirror_pairs: Vec<(
+                        crate::wengert::VarId,
+                        crate::wengert::VarId,
+                    )> = {
+                        let mut preimage: std::collections::HashMap<
+                            crate::wengert::VarId,
+                            u32,
+                        > = Default::default();
+                        for a in gen.adjoint_vars_map().values() {
+                            *preimage.entry(*a).or_default() += 1;
+                        }
+                        gen.adjoint_vars_map()
+                            .iter()
+                            .filter(|(_, a)| preimage.get(a) == Some(&1))
+                            .map(|(p, a)| (*p, *a))
+                            .collect()
+                    };
+                    let n_dim_seeds = dim_seeds.len();
+                    let scalar_seeds = extractor.known_param_scalar_values();
+                    let size_info = crate::transient_arena::propagate_size_info(
+                        &effective_primal,
+                        &adjoint,
+                        &|v| dim_seeds.get(&v).cloned(),
+                        &|v| scalar_seeds.get(&v).copied(),
+                        &mirror_pairs,
+                    );
+                    let shape_elems: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        u64,
+                    > = size_info
+                        .iter()
+                        .filter_map(|(v, si)| si.numel().map(|n| (*v, n)))
+                        .collect();
+                    let propagated = crate::transient_arena::propagate_elems(
+                        &effective_primal,
+                        &adjoint,
+                        &|v| {
+                            shape_elems
+                                .get(&v)
+                                .copied()
+                                .or_else(|| elem_hints.get(&v).copied())
+                        },
+                    );
+                    // Provenance split. "Sized nothing" reads completely
+                    // differently when the seeds are empty vs when the
+                    // propagation stopped early — and the fixes differ too.
+                    eprintln!(
+                        "[arena] element counts: {} dim seed(s) + {} numel \
+                         hint(s) -> {} shape-propagated -> {} sized, of {} \
+                         tape value(s)",
+                        n_dim_seeds,
+                        elem_hints.len(),
+                        shape_elems.len(),
+                        propagated.len(),
+                        effective_primal.ops.len() + adjoint.ops.len(),
+                    );
                     let arena = crate::transient_arena::analyze(
                         &effective_primal,
                         &adjoint,
-                        &|v| elem_hints.get(&v).copied(),
+                        &|v| propagated.get(&v).copied(),
                         &tape_escaping,
                         4, // GPU f32 training dtype width
                     );
                     eprintln!("[arena]\n{}", arena.render_report("  "));
+
+                    // ── Stage-2B: placement ──────────────────────────
+                    //
+                    // Admission is deliberately narrow (see `admit`), so the
+                    // interesting number is usually how much was REFUSED and
+                    // to which rule. Printing that is the difference between
+                    // "the arena placed nothing because the model has no
+                    // eligible temporaries" and "the arena placed nothing
+                    // because a rule is broken", which otherwise look
+                    // identical from outside.
+                    if arena_place_on {
+                        let (ok, refused) = crate::transient_arena::admit(
+                            &arena,
+                            &effective_primal,
+                            &adjoint,
+                            &tape_escaping,
+                            &size_info,
+                        );
+                        let (placements, payload) =
+                            crate::transient_arena::pack(&arena, &ok);
+                        let mut by_reason: std::collections::BTreeMap<&str, usize> =
+                            Default::default();
+                        for (_, r) in &refused {
+                            *by_reason.entry(match r {
+                                crate::transient_arena::RefusedBecause::NotBackward =>
+                                    "forward region",
+                                crate::transient_arena::RefusedBecause::Unsized =>
+                                    "no static size",
+                                crate::transient_arena::RefusedBecause::SavedForBackward =>
+                                    "saved for backward",
+                                crate::transient_arena::RefusedBecause::EscapesTape =>
+                                    "escapes the tape",
+                                crate::transient_arena::RefusedBecause::Aliasing =>
+                                    "may alias an input",
+                                crate::transient_arena::RefusedBecause::NotSingleAllocation =>
+                                    "not a proven single allocation",
+                                crate::transient_arena::RefusedBecause::InPlaceReuse =>
+                                    "in-place reuse (input dies here)",
+                                crate::transient_arena::RefusedBecause::RuntimePathVaries =>
+                                    "runtime path varies (broadcast/view operand)",
+                            }).or_default() += 1;
+                        }
+                        eprintln!(
+                            "[arena] placement: {} of {} transient(s) admitted, \
+                             {:.2} MiB payload in {} slot(s)",
+                            placements.len(),
+                            arena.transients.len(),
+                            payload as f64 / 1048576.0,
+                            placements.len(),
+                        );
+                        for (reason, n) in &by_reason {
+                            eprintln!("[arena]   refused {n:>5} — {reason}");
+                        }
+                        // Which op kinds cost the coverage. Unsized = a
+                        // propagation rule is missing or a seed never
+                        // reached it; NotSingleAllocation = sized but the
+                        // allowlist excludes its producer. The two have
+                        // completely different fixes, per-op-kind counts
+                        // are what tells them apart.
+                        if std::env::var("NSL_ARENA_DEBUG").ok().as_deref() == Some("1") {
+                            let mut by_kind: std::collections::BTreeMap<String, usize> =
+                                Default::default();
+                            for (v, r) in &refused {
+                                use crate::transient_arena::RefusedBecause as R;
+                                if !matches!(r, R::Unsized | R::NotSingleAllocation) {
+                                    continue;
+                                }
+                                let producer = adjoint
+                                    .ops
+                                    .iter()
+                                    .chain(effective_primal.ops.iter())
+                                    .find(|o| o.result == *v);
+                                let kind = match producer.map(|o| &o.op) {
+                                    Some(crate::wengert::PrimalOp::Passthrough(n)) => {
+                                        format!(
+                                            "Passthrough:{}",
+                                            n.split(':').next().unwrap_or(n)
+                                        )
+                                    }
+                                    Some(other) => {
+                                        let d = format!("{other:?}");
+                                        d.split([' ', '{', '('])
+                                            .next()
+                                            .unwrap_or("?")
+                                            .to_string()
+                                    }
+                                    None => "<no producing op>".to_string(),
+                                };
+                                *by_kind
+                                    .entry(format!("{kind} [{r:?}]"))
+                                    .or_default() += 1;
+                            }
+                            let mut rows: Vec<_> = by_kind.into_iter().collect();
+                            rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                            for (kind, n) in rows {
+                                eprintln!("[arena-debug]   {n:>5} x {kind}");
+                            }
+                            // The forward stall is invisible above (admit
+                            // refuses forward transients NotBackward before
+                            // Unsized ever fires), but an unsized forward
+                            // value starves everything downstream of it in
+                            // the backward too.
+                            let mut fwd_unsized: std::collections::BTreeMap<String, usize> =
+                                Default::default();
+                            for t in &arena.transients {
+                                if t.region != crate::transient_arena::Region::Forward
+                                    || t.elems.is_some()
+                                {
+                                    continue;
+                                }
+                                if let Some(o) =
+                                    effective_primal.ops.iter().find(|o| o.result == t.var)
+                                {
+                                    let kind = match &o.op {
+                                        crate::wengert::PrimalOp::Passthrough(n) => {
+                                            format!(
+                                                "Passthrough:{}",
+                                                n.split(':').next().unwrap_or(n)
+                                            )
+                                        }
+                                        other => {
+                                            let d = format!("{other:?}");
+                                            d.split([' ', '{', '('])
+                                                .next()
+                                                .unwrap_or("?")
+                                                .to_string()
+                                        }
+                                    };
+                                    *fwd_unsized.entry(kind).or_default() += 1;
+                                }
+                            }
+                            let mut rows: Vec<_> = fwd_unsized.into_iter().collect();
+                            rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                            for (kind, n) in rows {
+                                eprintln!("[arena-debug]   fwd unsized {n:>5} x {kind}");
+                            }
+                            // The FIRST stalls in tape order — everything
+                            // after the first is usually just downstream
+                            // starvation.
+                            let mut shown = 0;
+                            for (i, o) in effective_primal.ops.iter().enumerate() {
+                                if shown >= 15 {
+                                    break;
+                                }
+                                if shape_elems.contains_key(&o.result)
+                                    || matches!(
+                                        o.op,
+                                        crate::wengert::PrimalOp::Input(_)
+                                            | crate::wengert::PrimalOp::Param(_)
+                                            | crate::wengert::PrimalOp::Constant(_)
+                                            | crate::wengert::PrimalOp::FreeTensor
+                                    )
+                                {
+                                    continue;
+                                }
+                                // Const-lattice ops (non-tensor results)
+                                // are not stalls; their state is invisible
+                                // to shape_elems by design.
+                                if let crate::wengert::PrimalOp::Passthrough(n) = &o.op {
+                                    if matches!(
+                                        n.as_str(),
+                                        "shape" | "subscript" | "int" | "float" | "list"
+                                            | "ndim" | "item"
+                                    ) {
+                                        continue;
+                                    }
+                                }
+                                let ins: Vec<String> = o
+                                    .inputs
+                                    .iter()
+                                    .map(|v| match size_info.get(v) {
+                                        Some(si) => format!("v{v}:{si:?}"),
+                                        None => format!("v{v}:?"),
+                                    })
+                                    .collect();
+                                let kind = match &o.op {
+                                    crate::wengert::PrimalOp::Passthrough(n) => {
+                                        format!("Passthrough:{n}")
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                eprintln!(
+                                    "[arena-debug]   stall #{i} v{} {} <- [{}]",
+                                    o.result,
+                                    kind.chars().take(60).collect::<String>(),
+                                    ins.join(", ")
+                                );
+                                shown += 1;
+                            }
+                            // Where dims get LOST (result Numel): the
+                            // dims-loss point poisons everything downstream
+                            // into numel-land even when counts survive.
+                            let mut shown = 0;
+                            for (i, o) in effective_primal.ops.iter().enumerate() {
+                                if shown >= 12 {
+                                    break;
+                                }
+                                if !matches!(
+                                    size_info.get(&o.result),
+                                    Some(crate::transient_arena::SizeInfo::Numel(_))
+                                ) {
+                                    continue;
+                                }
+                                let ins: Vec<String> = o
+                                    .inputs
+                                    .iter()
+                                    .map(|v| match size_info.get(v) {
+                                        Some(si) => format!("v{v}:{si:?}"),
+                                        None => format!("v{v}:?"),
+                                    })
+                                    .collect();
+                                let kind = match &o.op {
+                                    crate::wengert::PrimalOp::Passthrough(n) => {
+                                        format!("Passthrough:{n}")
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                eprintln!(
+                                    "[arena-debug]   numel #{i} v{} {} <- [{}]",
+                                    o.result,
+                                    kind.chars().take(60).collect::<String>(),
+                                    ins.join(", ")
+                                );
+                                shown += 1;
+                            }
+                        }
+                        if std::env::var("NSL_ARENA_DEBUG").ok().as_deref() == Some("1") {
+                            for p in &placements {
+                                let kind = adjoint
+                                    .ops
+                                    .iter()
+                                    .find(|o| o.result == p.var)
+                                    .map(|o| match &o.op {
+                                        crate::wengert::PrimalOp::Passthrough(n) => {
+                                            format!("Passthrough:{n}")
+                                        }
+                                        other => format!("{other:?}")
+                                            .split([' ', '{', '('])
+                                            .next()
+                                            .unwrap_or("?")
+                                            .to_string(),
+                                    })
+                                    .unwrap_or_else(|| "<none>".into());
+                                let inputs_desc = adjoint
+                                    .ops
+                                    .iter()
+                                    .find(|o| o.result == p.var)
+                                    .map(|o| {
+                                        o.inputs
+                                            .iter()
+                                            .map(|v| {
+                                                let pk = adjoint
+                                                    .ops
+                                                    .iter()
+                                                    .chain(effective_primal.ops.iter())
+                                                    .find(|q| q.result == *v)
+                                                    .map(|q| match &q.op {
+                                                        crate::wengert::PrimalOp::Passthrough(n) => n.clone(),
+                                                        other => format!("{other:?}")
+                                                            .split([' ', '{', '('])
+                                                            .next()
+                                                            .unwrap_or("?")
+                                                            .to_string(),
+                                                    })
+                                                    .unwrap_or_else(|| "<leaf?>".into());
+                                                format!("v{v}<{pk}>{:?}", size_info.get(v))
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "[arena-debug] slot {} v{} {} B {} <- {}",
+                                    p.slot_index, p.var, p.bytes, kind, inputs_desc
+                                );
+                            }
+                        }
+                        self.arena_placements =
+                            placements.iter().map(|p| (p.var, *p)).collect();
+                        if !placements.is_empty() {
+                            let total = builder.ins().iconst(cl_types::I64, payload as i64);
+                            let nslots =
+                                builder.ins().iconst(cl_types::I64, placements.len() as i64);
+                            self.compile_call_by_name(
+                                builder, "nsl_arena_init", &[total, nslots])?;
+                        }
+                    }
                 }
 
                 // ── D2b part 2: CSLA schedule precompute (pre-forward) ──
@@ -14385,6 +14916,14 @@ impl Compiler<'_> {
             let step_val = builder.use_var(step_count_var);
             self.compile_call_by_name(builder, "nsl_debug_gpu_mem", &[step_val])?;
             self.compile_call_by_name(builder, "nsl_debug_gpu_alloc_summary", &[step_val])?;
+        }
+
+        // Stage-2C canary: verify every red zone after the step's kernels
+        // have all run. Runtime-gated by NSL_ARENA_CHECK=1, so one binary
+        // serves both the validation runs and production.
+        if self.compile_options.transient_arena {
+            let step_val = builder.use_var(step_count_var);
+            self.compile_call_by_name(builder, "nsl_arena_check_step", &[step_val])?;
         }
 
         // ── 8. Close batch loop (if DataLoader) and increment epoch ──────

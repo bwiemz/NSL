@@ -6,7 +6,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Added — pass EFFECT dispositions: `applied` / `declined, <reason>` / `advisory only`
+### Added — `--fuse-lm-head`: the fused LM head joins the production profile
+
+- **An ~8.5% measured step-time win no longer depends on hand-editing model
+  source.** The CFTP fused linear-CE kernel required a `@fused_lm_ce`
+  decorator carrying four numbers the compiler already knows; no shipped
+  pretraining script had one. `--fuse-lm-head {off,auto,require}` infers the
+  chain and the numbers: `vocab/hidden` from the head weight's derivable dims,
+  `batch/seq` from a **unanimous-or-nothing DataLoader scan** that refuses
+  `drop_last=false`, non-literal shapes, or disagreeing loaders — the row
+  count is baked into PTX, so a short batch would read out of bounds and the
+  scan treats "cannot prove" as "do not fuse". `require` turns the decline
+  into a compile error; `--pretrain-optimized` selects `auto`;
+  `--training-reference` forces `off`; an explicit decorator (including
+  `enabled=false`) always wins.
+- **The house `logits.shape` idiom is folded to the proven `[B, S, V]`** so
+  the shape read stops keeping the logits alive — without this the flag fires
+  on zero shipped programs. Validated: inferred vs explicit decorator
+  bit-identical over 195 deterministic steps; composite-vs-fused divergence
+  3.7e-2 max-rel (the kernel's known numerics), fused arm bit-reproducible.
+- Fixed en route: the multi-file build dropped `model_field_dims`/`ranks` on
+  the floor for every imported model, which had silently disarmed the CFTP
+  v10 rank guard for every real model since it landed.
+
+### Added — `--transient-arena` Stage 2B/2C: placed backward temporaries
+
+- **Compile-time shape propagation that can actually cross a matmul.** Dims
+  flow through the `[forward ; adjoint]` tape from semantic types,
+  model-field initializers, constructor-argument folding (`ctor_fold.rs`:
+  `randn([d_model, d_ff])` under `TransformerBlock(512, …)` — previously
+  structurally underivable, which was ALL block weights), and the
+  `--fuse-lm-head` loader proof for batch fields. A constant lattice folds
+  `x.shape` reads, subscripts, integer arithmetic, and
+  `int(self._n_heads.item())` config reads, so the attention stack's
+  runtime-value reshapes resolve statically. coder50m: 1456 of 2159 tape
+  values sized, where the numel-only Stage-2A bridge sized 1.
+- **Admission models the runtime it actually runs against.** Beyond the
+  Stage-1 rules (backward-only, sized, unsaved, non-escaping, non-aliasing,
+  single-allocation elementwise), two rules exist because the bind/placement
+  reconciliation caught the plan lying: an op whose input dies at it is
+  refused (the FBIP arm mutates a dying uniquely-owned input IN PLACE — every
+  admitted Sqrt/Neg leaked its bind through exactly that), and a binary
+  without provably-equal shapes or with a view operand is refused (broadcast
+  and non-contiguous routes allocate off the straight-line path).
+- **Placement is sequential disjoint regions, deliberately not BFD
+  time-sharing.** The shared-offset plan aliased payload ranges under the
+  runtime layout (`payload = base + offset + REDZONE·(idx+1)`) — found by
+  planned-vs-unplanned byte-bisection (`NSL_ARENA_SLOT_LIMIT`), losses
+  diverging at step 1 from slot 8 on. Stable addresses are the point; the
+  sequential cost on coder50m is 308 MiB.
+- **The pin is size-exact, single-shot, and audited.** Armed before each
+  admitted op, disarmed after; consumed only by an allocation of exactly the
+  planned bytes — and the consult now sits in BOTH allocator entries
+  (`try_alloc_managed` is the one elementwise outputs use; with the consult
+  only in `alloc_managed`, all 7240 binds leaked). Teardown reconciles binds
+  vs placements; `NSL_ARENA_CHECK=1` sweeps every 0xA5 red zone per step.
+- **Validation (coder50m, 40 steps, `--deterministic --seed 4242`):** planned
+  vs unplanned loss streams and 199 MB `.nslm` checkpoints byte-identical;
+  7240/7240 binds placed; 0 guard failures; canary run clean. CUDA-graph
+  offset feeding is deliberately NOT wired — that lands separately now that
+  the byte-identity gate is green.
+
+### Added — SR-BF16 certification instrumentation (item 7)
+
+- `NSL_SR_HIST=1`: every fused SR step samples each mirrored parameter's
+  bf16 mirror before/after the update and reports a `|Δθ|`
+  binary-exponent histogram plus the **stalled rate** (bf16 bits unchanged —
+  the empirical underflow measure under stochastic rounding) at teardown.
+- `models/coder{500m,1b}/pretrain_srbf16_{cert,continue}.nsl` and a `1b`
+  campaign scale; `srbf16_campaign.py` gains `--corpus` (slice a real token
+  stream instead of the synthetic tiled block), `--tag` (parallel log
+  namespaces), `--sr-hist`; `tools/build_byte_corpus.py` builds a 23M-token
+  real corpus from the repo's own sources (byte-level, labeled as such).
+
+### Fixed — the item-6 matrix silently dropped its layerwise-family arms
+
+- The generated program hard-coded `grad_clip=1.0` (refused by
+  `--layerwise-accum`) and never emitted `grad_accumulation>=2` (required by
+  FASE-Deferred), so the 500M `srbf16` and both 1B `layerwise` arms failed to
+  BUILD and vanished from the results without a trace. Arms now carry their
+  own `accum`/`grad_clip`; tokens-per-step scales with accumulation;
+  loss-divergence only compares config-matching arms. Also fixed: the
+  admissions/dispositions capture scanned the RUNTIME stderr for
+  COMPILE-time markers (every optimized-arm admission read false), and
+  `REGION_RE` lacked `re.M` so region attribution parsed nothing.
 
 - **The trace could say a pass was REACHED; it could not say whether anything
   happened.** "CSHA did not run" and "CSHA ran and found no attention chain it

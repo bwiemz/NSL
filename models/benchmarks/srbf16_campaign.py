@@ -107,6 +107,7 @@ SCALES = {
     # scale: (model dir, batch, seq, accum-in-program, per-micro budget s)
     "50m": ("coder50m", 1, 1024, 2, 4.0),
     "500m": ("coder500m", 2, 512, 8, 10.0),
+    "1b": ("coder1b", 1, 512, 8, 20.0),
 }
 
 
@@ -120,6 +121,17 @@ def main() -> None:
                         help="reload-continuation optimizer steps (0 skips)")
     parser.add_argument("--skip-f32", action="store_true",
                         help="only run the bf16-sr arms")
+    parser.add_argument("--corpus", type=Path, default=None,
+                        help="REAL u16 token corpus to slice instead of the "
+                             "synthetic gen_tokens stream (item 7's "
+                             "real-corpus trajectory arm)")
+    parser.add_argument("--tag", default="",
+                        help="suffix appended to every arm name so a real-"
+                             "corpus campaign does not overwrite the "
+                             "synthetic one's logs")
+    parser.add_argument("--sr-hist", action="store_true",
+                        help="run the bf16-sr arms under NSL_SR_HIST=1 "
+                             "(update-magnitude/stall histograms in stderr)")
     args = parser.parse_args()
 
     model_dir, batch, seq, accum, per_micro_s = SCALES[args.scale]
@@ -132,8 +144,21 @@ def main() -> None:
         )
 
     micro_per_step = accum
-    tok = TOKENS_DIR / f"srbf16_{args.scale}_{args.steps}.bin"
-    gen_tokens(tok, args.steps * tokens_per_step_for(batch, seq, micro_per_step))
+    need = args.steps * tokens_per_step_for(batch, seq, micro_per_step)
+    if args.corpus is not None:
+        # Slice the REAL corpus to length. Refusing a short corpus beats
+        # silently wrapping it (which would train on repeats and report a
+        # memorization curve as a real-data curve).
+        raw = args.corpus.read_bytes()
+        if len(raw) < need * 2:
+            raise SystemExit(
+                f"corpus {args.corpus} has {len(raw) // 2} tokens, need {need}")
+        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{args.steps}.bin"
+        tok.parent.mkdir(parents=True, exist_ok=True)
+        tok.write_bytes(raw[: need * 2])
+    else:
+        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{args.steps}.bin"
+        gen_tokens(tok, need)
     timeout_s = int(args.steps * micro_per_step * per_micro_s * 1.6) + 900
 
     env = {"NSL_WS_COUNTER": "1"}
@@ -148,20 +173,25 @@ def main() -> None:
     save_paths: dict[str, Path] = {}
 
     for seed in args.seeds:
-        arm_pairs = [] if args.skip_f32 else [(f"f32_s{seed}", BASE_FLAGS)]
+        arm_pairs = [] if args.skip_f32 else [
+            (f"f32{args.tag}_s{seed}", BASE_FLAGS)
+        ]
         arm_pairs.append(
-            (f"bf16sr_s{seed}", [*BASE_FLAGS, "--param-dtype", "bf16-sr"])
+            (f"bf16sr{args.tag}_s{seed}", [*BASE_FLAGS, "--param-dtype", "bf16-sr"])
         )
         for name, flags in arm_pairs:
             save = LOGS / name / "final.nslm"
             save.parent.mkdir(parents=True, exist_ok=True)
             print(f"=== {name}: {' '.join(flags)}")
+            arm_env = dict(env)
+            if args.sr_hist and "bf16sr" in name:
+                arm_env["NSL_SR_HIST"] = "1"
             res = run_arm(
                 name,
                 program,
                 tok,
                 [*flags, "--seed", str(seed)],
-                env,
+                arm_env,
                 rewrites=[("CERT_SAVE_PATH", save.as_posix())],
                 timeout_s=timeout_s,
             )
@@ -173,16 +203,17 @@ def main() -> None:
 
     # Reload-continuation under bf16-sr from the first seed's checkpoint.
     if args.continue_steps > 0:
-        parent = f"bf16sr_s{args.seeds[0]}"
+        parent = f"bf16sr{args.tag}_s{args.seeds[0]}"
         parent_save = save_paths.get(parent)
         if parent_save is None or not parent_save.exists():
             raise SystemExit(f"continuation parent checkpoint missing: {parent}")
-        cont_tok = TOKENS_DIR / f"srbf16_{args.scale}_cont_{args.continue_steps}.bin"
+        cont_tok = TOKENS_DIR / (
+            f"srbf16_{args.scale}{args.tag}_cont_{args.continue_steps}.bin")
         gen_tokens(
             cont_tok,
             args.continue_steps * tokens_per_step_for(batch, seq, micro_per_step),
         )
-        name = "bf16sr_continue"
+        name = f"bf16sr{args.tag}_continue"
         save = LOGS / name / "final.nslm"
         save.parent.mkdir(parents=True, exist_ok=True)
         print(f"=== {name}: reload {parent_save}")
@@ -234,7 +265,8 @@ def main() -> None:
         print("| seed | steps | mean |dL| | max |dL| | f32 final | bf16sr final |")
         print("|---|---|---|---|---|---|")
         for seed in args.seeds:
-            a, b = results.get(f"f32_s{seed}"), results.get(f"bf16sr_s{seed}")
+            a = results.get(f"f32{args.tag}_s{seed}")
+            b = results.get(f"bf16sr{args.tag}_s{seed}")
             if not a or not b:
                 continue
             n, mean_d, max_d = curve_delta(a, b)
@@ -246,9 +278,10 @@ def main() -> None:
     # Seed spread within each arm family (final losses).
     for fam in ("f32", "bf16sr"):
         finals = [
-            results[f"{fam}_s{s}"].losses[-1][1]
+            results[f"{fam}{args.tag}_s{s}"].losses[-1][1]
             for s in args.seeds
-            if f"{fam}_s{s}" in results and results[f"{fam}_s{s}"].losses
+            if f"{fam}{args.tag}_s{s}" in results
+            and results[f"{fam}{args.tag}_s{s}"].losses
         ]
         if len(finals) > 1:
             print(

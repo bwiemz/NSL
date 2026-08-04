@@ -886,6 +886,39 @@ pub(crate) struct BuildArgs {
               value_parser = ["f32", "bf16-sr"])]
         pub(crate) param_dtype: String,
 
+        /// Item 5 (Milestone C p2 Stage-2B): place admitted backward
+        /// temporaries at fixed transient-arena offsets instead of letting the
+        /// caching allocator choose an address per step.
+        ///
+        /// Admission is narrow on purpose — statically sized, non-escaping,
+        /// non-aliasing backward temporaries produced by an op proven to make
+        /// exactly one device allocation. Saved tensors, views, external
+        /// workspaces and optimizer-visible values are excluded by
+        /// construction. `[arena] placement:` reports what was admitted and,
+        /// more usefully, what was refused and to which rule.
+        ///
+        /// The payoff is address stability for CUDA-graph capture, not bytes.
+        /// EXPERIMENTAL until `scripts/arena-parity.sh` is green: a liveness
+        /// error here is silent memory corruption, which is why placement is
+        /// staged behind the analysis rather than shipped with it.
+        #[arg(long)]
+        pub(crate) transient_arena: bool,
+
+        /// Item 4: authorize the compiler to install a fused LM head that no
+        /// `@fused_lm_ce` decorator asked for.
+        ///
+        /// `auto` recognises the `matmul(x, transpose(W)) [+ bias] ->
+        /// cross_entropy` chain, reads `(vocab, hidden)` off the weight's
+        /// declared dims and the row count off the DataLoader, and falls back
+        /// to the composite path (saying why, on stderr) when any of that
+        /// cannot be proven. `require` makes the fallback a compile error.
+        /// `--pretrain-optimized` selects `auto`.
+        ///
+        /// An explicit `@fused_lm_ce` on a train block always wins, including
+        /// `enabled = false`, which is an opt-out this must not overturn.
+        #[arg(long, value_name = "MODE", value_parser = ["off", "auto", "require"])]
+        pub(crate) fuse_lm_head: Option<String>,
+
         /// P4 item 18: Muon optimizer-state storage ladder. `bf16` stores
         /// the first-moment (momentum) buffers in BF16 with an FP32 working
         /// buffer per update and a counter-based stochastically-rounded
@@ -1427,6 +1460,39 @@ pub(crate) struct RunArgs {
         #[arg(long, value_name = "DTYPE", default_value = "f32",
               value_parser = ["f32", "bf16-sr"])]
         pub(crate) param_dtype: String,
+
+        /// Item 5 (Milestone C p2 Stage-2B): place admitted backward
+        /// temporaries at fixed transient-arena offsets instead of letting the
+        /// caching allocator choose an address per step.
+        ///
+        /// Admission is narrow on purpose — statically sized, non-escaping,
+        /// non-aliasing backward temporaries produced by an op proven to make
+        /// exactly one device allocation. Saved tensors, views, external
+        /// workspaces and optimizer-visible values are excluded by
+        /// construction. `[arena] placement:` reports what was admitted and,
+        /// more usefully, what was refused and to which rule.
+        ///
+        /// The payoff is address stability for CUDA-graph capture, not bytes.
+        /// EXPERIMENTAL until `scripts/arena-parity.sh` is green: a liveness
+        /// error here is silent memory corruption, which is why placement is
+        /// staged behind the analysis rather than shipped with it.
+        #[arg(long)]
+        pub(crate) transient_arena: bool,
+
+        /// Item 4: authorize the compiler to install a fused LM head that no
+        /// `@fused_lm_ce` decorator asked for.
+        ///
+        /// `auto` recognises the `matmul(x, transpose(W)) [+ bias] ->
+        /// cross_entropy` chain, reads `(vocab, hidden)` off the weight's
+        /// declared dims and the row count off the DataLoader, and falls back
+        /// to the composite path (saying why, on stderr) when any of that
+        /// cannot be proven. `require` makes the fallback a compile error.
+        /// `--pretrain-optimized` selects `auto`.
+        ///
+        /// An explicit `@fused_lm_ce` on a train block always wins, including
+        /// `enabled = false`, which is an opt-out this must not overturn.
+        #[arg(long, value_name = "MODE", value_parser = ["off", "auto", "require"])]
+        pub(crate) fuse_lm_head: Option<String>,
 
         /// P4 item 18: Muon optimizer-state storage ladder. `bf16` stores
         /// the first-moment (momentum) buffers in BF16 with an FP32 working

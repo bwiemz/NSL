@@ -189,8 +189,11 @@ fn stage2a_report_quantifies_param_gradients_cpu() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Everything AFTER the first tag, not just the first tagged chunk: the
+    // Stage-2B provenance line ("element counts: ...") now precedes the
+    // rendered report, and taking one chunk would grade the wrong text.
     let arena = stderr
-        .split("[arena]")
+        .splitn(2, "[arena]")
         .nth(1)
         .expect("no [arena] report in stderr");
     assert!(

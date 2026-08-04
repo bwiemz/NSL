@@ -252,6 +252,14 @@ fn run_build_shared_multi(
             let mut imported_enum_defs = HashMap::new();
             let mut imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>> = HashMap::new();
             let mut imported_model_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let mut imported_tensor_fields_without_dims: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut imported_model_field_values: HashMap<String, HashMap<String, f64>> =
+                HashMap::new();
+            let mut imported_model_field_dims: HashMap<String, HashMap<String, Vec<i64>>> =
+                HashMap::new();
+            let mut imported_model_field_ranks: HashMap<String, HashMap<String, usize>> =
+                HashMap::new();
 
             for dep_path in &graph.dep_order {
                 if dep_path == &graph.entry {
@@ -312,6 +320,22 @@ fn run_build_shared_multi(
                 for (name, fields) in temp_compiler.models.model_field_types.drain() {
                     imported_model_field_types.entry(name).or_insert(fields);
                 }
+                // Item 4: the same propagation for the two SHAPE maps
+                // `collect_models` also filled. These were dropped on the
+                // floor, so a model defined in `model.nsl` and imported here —
+                // i.e. every real model — reached codegen with no derivable
+                // weight dims at all.
+                for (name, dims) in temp_compiler.models.model_field_dims.drain() {
+                    imported_model_field_dims.entry(name).or_insert(dims);
+                }
+                for (name, ranks) in temp_compiler.models.model_field_ranks.drain() {
+                    imported_model_field_ranks.entry(name).or_insert(ranks);
+                }
+                // The veto set must travel with the dims: an imported field
+                // whose dims were underivable has to keep blocking a
+                // derivable same-named twin in `unique_field_dims`.
+                imported_tensor_fields_without_dims
+                    .extend(temp_compiler.models.tensor_fields_without_dims.drain());
 
                 // Extract model method bodies directly from AST
                 for stmt in &dep_data.ast.stmts {
@@ -367,6 +391,25 @@ fn run_build_shared_multi(
             // M62: route entry-module weight_index_map so @export model methods
             // can resolve `self.<field>` → weight index on the multi-file path.
             entry_options.weight_index_map = mod_data.weight_index_map.clone();
+            // Item 5: constructor-argument folding over the WHOLE module
+            // graph — a submodule's def and its instantiation routinely
+            // live in different files, so per-module collection can never
+            // see both sides.
+            let all_asts: Vec<&nsl_ast::Module> = graph
+                .dep_order
+                .iter()
+                .map(|p| &graph.modules[p].ast)
+                .collect();
+            nsl_codegen::ctor_fold::fold_constructor_dims(&all_asts, &interner).merge_into(
+                &mut imported_model_field_dims,
+                &mut imported_model_field_values,
+                &mut imported_tensor_fields_without_dims,
+            );
+            entry_options.imported_model_field_dims = imported_model_field_dims;
+            entry_options.imported_model_field_ranks = imported_model_field_ranks;
+            entry_options.imported_tensor_fields_without_dims =
+                imported_tensor_fields_without_dims;
+            entry_options.imported_model_field_values = imported_model_field_values;
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(

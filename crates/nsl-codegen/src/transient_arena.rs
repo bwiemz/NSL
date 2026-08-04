@@ -301,6 +301,1178 @@ pub fn analyze(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage-2B: element-count propagation
+// ---------------------------------------------------------------------------
+
+/// Propagate element counts forward through a tape from a seed.
+///
+/// # Why this had to exist before placement was worth anything
+///
+/// Measured on `models/coder50m/pretrain_cert.nsl`, the Stage-2A hint bridge
+/// sized **1 of 1321** transients: it derives counts from model-field dims and
+/// mirrors them onto param-gradient accumulators, and nothing else on the tape
+/// has an AST node the type checker gave a concrete shape. So every byte
+/// figure the arena reported was one transient's worth, and Stage-2B admitted
+/// nothing at all — not because the admission rules were too strict, but
+/// because 843 of 844 backward temporaries had no size to pack.
+///
+/// A pass that places nothing is indistinguishable from a pass that is off.
+///
+/// # What is propagated, and what deliberately is not
+///
+/// Only the ops whose output element count is determined by their inputs
+/// WITHOUT knowing the shapes:
+///
+/// * unary elementwise — numel is preserved exactly;
+/// * binary elementwise where both operands have the SAME numel — no
+///   broadcast is possible, so the result matches.
+///
+/// A binary op whose operands differ in numel broadcasts, and the result's
+/// numel is then a function of the shapes, which the tape does not carry — so
+/// it stops. Matmul, reductions, reshape, concat and split all likewise stop:
+/// each would need real shapes, and guessing one produces an undersized slot,
+/// which is a buffer overrun rather than a bad statistic.
+///
+/// Stopping is free: an unsized transient is simply refused admission and
+/// stays on the caching allocator.
+pub fn propagate_elems(
+    forward: &WengertList,
+    adjoint: &WengertList,
+    seed: &dyn Fn(VarId) -> Option<u64>,
+) -> HashMap<VarId, u64> {
+    let mut known: HashMap<VarId, u64> = HashMap::new();
+    let note = |v: VarId, known: &mut HashMap<VarId, u64>| {
+        if let Some(n) = seed(v) {
+            known.insert(v, n);
+        }
+    };
+    // Seed leaves and anything the caller already sized.
+    for list in [forward, adjoint] {
+        for op in &list.ops {
+            note(op.result, &mut known);
+            for &i in &op.inputs {
+                note(i, &mut known);
+            }
+        }
+    }
+    // One forward sweep over the concatenated timeline. The tape is in
+    // topological order by construction, so a single pass reaches every
+    // derivable value; iterating to a fixpoint would buy nothing.
+    for list in [forward, adjoint] {
+        for op in &list.ops {
+            if known.contains_key(&op.result) {
+                continue;
+            }
+            let derived = match &op.op {
+                PrimalOp::Neg
+                | PrimalOp::Relu
+                | PrimalOp::Gelu
+                | PrimalOp::Silu
+                | PrimalOp::Sigmoid
+                | PrimalOp::Tanh
+                | PrimalOp::Exp
+                | PrimalOp::Log
+                | PrimalOp::Sqrt => op.inputs.first().and_then(|i| known.get(i).copied()),
+                PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
+                    match (op.inputs.first(), op.inputs.get(1)) {
+                        (Some(a), Some(b)) => {
+                            match (known.get(a).copied(), known.get(b).copied()) {
+                                // Equal numel ⇒ no broadcast ⇒ result matches.
+                                // Unequal ⇒ a broadcast whose result depends on
+                                // the shapes, which the tape does not carry.
+                                (Some(x), Some(y)) if x == y => Some(x),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(n) = derived {
+                known.insert(op.result, n);
+            }
+        }
+    }
+    known
+}
+
+// ---------------------------------------------------------------------------
+// Stage-2B: shape propagation
+// ---------------------------------------------------------------------------
+
+/// What is statically known about one tape value's size.
+///
+/// Two levels rather than one because the shipped models run every batch
+/// through a runtime-shaped `reshape` (`logits.reshape([ls[0]*ls[1], ls[2]])`,
+/// `input_ids` flattened for the rank-1 embedding lookup): the dims are lost
+/// there, but the element count is not — and a matmul against a rank-2
+/// weight of known shape can carry the COUNT across (`numel_out =
+/// numel_in / k * n`, exact because a mismatched inner dim is a runtime
+/// abort, so any program that runs satisfies it). Numel-only propagation
+/// with no shape seeds could do neither, which is why it sized 0 of 1321
+/// transients on coder50m.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SizeInfo {
+    /// Exact dims, every entry >= 1.
+    Shape(Vec<i64>),
+    /// Element count only — the dims died at a runtime-shaped op, the count
+    /// survived. Enough to size a slot; not enough to cross a dim-dependent
+    /// op (reductions, slices, non-rank-2 matmuls).
+    Numel(u64),
+}
+
+impl SizeInfo {
+    pub fn numel(&self) -> Option<u64> {
+        match self {
+            SizeInfo::Shape(dims) => shape_numel(dims),
+            SizeInfo::Numel(n) => Some(*n),
+        }
+    }
+}
+
+/// A compile-time-constant VALUE the propagation tracks alongside sizes.
+///
+/// The shipped attention stack routes its shape arithmetic through runtime
+/// values: `let s = x.shape; let batch = s[0]`, `let nh =
+/// int(self._n_heads.item())`, `q.reshape([batch, seq_len, nh, hd])`. Every
+/// one of those is a compile-time constant on a proven-loader tape — but
+/// only if `shape`-of-a-known-var folds to a list, `subscript` of that list
+/// folds to an int, integer arithmetic folds, and `item()` of a 1-element
+/// config tensor folds to its constructor-folded value. Without this
+/// lattice the forward chain died at the first `q.reshape(...)` and the
+/// arena placed 8 of 1321 transients.
+#[derive(Debug, Clone, PartialEq)]
+enum ConstEntry {
+    Int(i64),
+    Num(f64),
+    List(Vec<i64>),
+}
+
+impl ConstEntry {
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            ConstEntry::Int(n) => Some(*n),
+            // An integral float IS the int for dim purposes ("item" yields
+            // f64; `full([1], float(8))` round-trips through Num).
+            ConstEntry::Num(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e15 => {
+                Some(*f as i64)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Checked product of validated-positive dims; empty (rank 0) = 1 element.
+/// Bounded by `i64::MAX` — beyond that the byte math downstream (`pack`
+/// multiplies by `elem_bytes` unchecked) could wrap, and no real tensor is
+/// within 2^20 of the bound anyway.
+fn shape_numel(dims: &[i64]) -> Option<u64> {
+    dims.iter()
+        .try_fold(1u64, |acc, &d| {
+            if d <= 0 {
+                None
+            } else {
+                acc.checked_mul(d as u64)
+            }
+        })
+        .filter(|&n| n <= i64::MAX as u64)
+}
+
+/// NumPy right-aligned broadcast: pad the shorter shape with leading 1s;
+/// per dim the sizes must be equal or one must be 1 (else None — the runtime
+/// aborts on exactly that condition, `cpu.rs` `tensor_elementwise_op`).
+fn numpy_broadcast(a: &[i64], b: &[i64]) -> Option<Vec<i64>> {
+    let n = a.len().max(b.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let da = if i < n - a.len() { 1 } else { a[i - (n - a.len())] };
+        let db = if i < n - b.len() { 1 } else { b[i - (n - b.len())] };
+        if da == db || db == 1 {
+            out.push(da);
+        } else if da == 1 {
+            out.push(db);
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Propagate [`SizeInfo`] through the forward tape, mirror onto adjoint
+/// accumulators, then propagate through the adjoint.
+///
+/// `seed(var)` supplies dims for leaves (semantic-typed values, model-field
+/// initializer dims, DataLoader-proven batch fields). `scalar_seed(var)`
+/// supplies the VALUE of a 1-element config tensor (constructor-folded
+/// `full([1], v)` fields), which is what lets `int(self._n_heads.item())`
+/// fold. `mirror` is `(primal, adjoint_accumulator)` pairs restricted by the
+/// caller to UNIQUE preimages — an adjoint has its primal's shape by
+/// construction, but a shared accumulator (Add/Sub alias the output's
+/// adjoint onto both operands) carries the OUTPUT's shape and must not be
+/// mirrored.
+///
+/// Every rule was traced to the lowering + runtime kernel it describes; an
+/// op with no rule, an out-of-range dim, an overflowing product, or a
+/// device-divergent case (equal-numel differing-shape binaries, `Gather`,
+/// `ScatterAdd`) derives nothing. Stopping is free — an unsized transient is
+/// refused admission and stays on the caching allocator — while a wrong size
+/// can never place a tensor (the runtime pin fires only on an EXACT size
+/// match and the bind/placement reconciliation reports the miss), so the
+/// failure direction of any rule error is loud and benign, not corruption.
+pub fn propagate_size_info(
+    forward: &WengertList,
+    adjoint: &WengertList,
+    seed: &dyn Fn(VarId) -> Option<Vec<i64>>,
+    scalar_seed: &dyn Fn(VarId) -> Option<f64>,
+    mirror: &[(VarId, VarId)],
+) -> HashMap<VarId, SizeInfo> {
+    let mut prop = SizeProp {
+        known: HashMap::new(),
+        consts: HashMap::new(),
+        op_of: HashMap::new(),
+        ty_of: HashMap::new(),
+    };
+    // Producing-op + type lookup across BOTH lists (adjoint ops reference
+    // forward vars; the tape is topological so a lookup only ever chases an
+    // already-defined var).
+    for list in [forward, adjoint] {
+        for op in &list.ops {
+            prop.op_of.entry(op.result).or_insert(op);
+            prop.ty_of
+                .entry(op.result)
+                .or_insert_with(|| result_type(list, op));
+        }
+    }
+    for list in [forward, adjoint] {
+        for op in &list.ops {
+            for v in op.inputs.iter().chain(std::iter::once(&op.result)) {
+                if !prop.known.contains_key(v) {
+                    if let Some(dims) = seed(*v) {
+                        if shape_numel(&dims).is_some() {
+                            prop.known.insert(*v, SizeInfo::Shape(dims));
+                        }
+                    }
+                }
+                if !prop.consts.contains_key(v) {
+                    if let Some(val) = scalar_seed(*v) {
+                        prop.consts.insert(*v, ConstEntry::Num(val));
+                    }
+                }
+            }
+        }
+    }
+
+    prop.sweep(forward);
+    for (p, a) in mirror {
+        if let Some(info) = prop.known.get(p).cloned() {
+            prop.known.entry(*a).or_insert(info);
+        }
+    }
+    prop.sweep(adjoint);
+    prop.known
+}
+
+struct SizeProp<'a> {
+    known: HashMap<VarId, SizeInfo>,
+    consts: HashMap<VarId, ConstEntry>,
+    op_of: HashMap<VarId, &'a crate::wengert::WengertOp>,
+    ty_of: HashMap<VarId, WengertType>,
+}
+
+impl<'a> SizeProp<'a> {
+    fn sweep(&mut self, list: &'a WengertList) {
+        for op in &list.ops {
+            // Constant values first: they feed the very size rules below
+            // (a `shape` read of a sized var -> the reshape list that sizes
+            // the next var).
+            if !self.consts.contains_key(&op.result) {
+                if let Some(c) = self.derive_const(op) {
+                    self.consts.insert(op.result, c);
+                }
+            }
+            if self.known.contains_key(&op.result) {
+                continue;
+            }
+            // Only tensor results occupy device memory; a List/Scalar/
+            // Integer result must never be given a byte size.
+            if self.ty_of.get(&op.result) != Some(&WengertType::Tensor) {
+                continue;
+            }
+            if let Some(info) = self.derive_size(op) {
+                if info.numel().is_some() {
+                    self.known.insert(op.result, info);
+                }
+            }
+        }
+    }
+
+    /// The known size of an op INPUT. A Scalar/Integer-typed operand is
+    /// promoted to a 0-dim tensor by the lowerer (`promote_to_tensor` ->
+    /// `nsl_tensor_scalar`), so it participates in broadcast as rank 0.
+    fn input_info(&self, op: &crate::wengert::WengertOp, i: usize) -> Option<SizeInfo> {
+        let v = *op.inputs.get(i)?;
+        if let Some(info) = self.known.get(&v) {
+            return Some(info.clone());
+        }
+        match self.ty_of.get(&v) {
+            Some(WengertType::Scalar) | Some(WengertType::Integer) => {
+                Some(SizeInfo::Shape(vec![]))
+            }
+            _ => None,
+        }
+    }
+
+    fn const_of(&self, v: VarId) -> Option<&ConstEntry> {
+        self.consts.get(&v)
+    }
+
+    fn const_int(&self, v: VarId) -> Option<i64> {
+        self.const_of(v)?.as_int()
+    }
+
+    /// Statically-recoverable dims of a runtime shape LIST: an item-4
+    /// `const_shape:` op (dims baked into the op name), a `list`
+    /// passthrough whose every element folded, or a folded `shape` read.
+    fn static_list_dims(&self, v: VarId) -> Option<Vec<i64>> {
+        if let Some(ConstEntry::List(dims)) = self.const_of(v) {
+            if !dims.is_empty() && dims.iter().all(|&d| d > 0) {
+                return Some(dims.clone());
+            }
+        }
+        None
+    }
+
+    /// Constant-value rules. Every arm mirrors the lowering it names.
+    fn derive_const(&self, op: &crate::wengert::WengertOp) -> Option<ConstEntry> {
+        use ConstEntry::{Int, List, Num};
+        match &op.op {
+            PrimalOp::Constant(f) => {
+                if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e15 {
+                    Some(Int(*f as i64))
+                } else {
+                    Some(Num(*f))
+                }
+            }
+            // Arithmetic on folded scalar values. NOT gated on the result's
+            // Wengert type: `batch_size * seq_len` defaults to Tensor in
+            // `type_for_op` (the Integer-vs-tensor choice happens at
+            // lowering, by input types, with no override recorded), and the
+            // VALUE of a scalar-constant op is the same whether it lowers
+            // as `imul` or as a 0-dim tensor multiply. Both operands must
+            // fold to scalars; a List operand refuses below.
+            PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
+                let a = self.const_of(*op.inputs.first()?)?;
+                let b = self.const_of(*op.inputs.get(1)?)?;
+                match (a.as_int(), b.as_int()) {
+                    (Some(x), Some(y)) => match op.op {
+                        PrimalOp::Add => x.checked_add(y).map(Int),
+                        PrimalOp::Sub => x.checked_sub(y).map(Int),
+                        PrimalOp::Mul => x.checked_mul(y).map(Int),
+                        // Cranelift `sdiv` truncates toward zero.
+                        PrimalOp::Div => x.checked_div(y).map(Int),
+                        _ => unreachable!(),
+                    },
+                    _ => {
+                        let to_f = |c: &ConstEntry| match c {
+                            Int(n) => Some(*n as f64),
+                            Num(f) => Some(*f),
+                            List(_) => None,
+                        };
+                        let (x, y) = (to_f(a)?, to_f(b)?);
+                        let r = match op.op {
+                            PrimalOp::Add => x + y,
+                            PrimalOp::Sub => x - y,
+                            PrimalOp::Mul => x * y,
+                            PrimalOp::Div => x / y,
+                            _ => unreachable!(),
+                        };
+                        Some(Num(r))
+                    }
+                }
+            }
+            PrimalOp::Passthrough(name) => match name.as_str() {
+                // The value of a 1-element tensor: only present when the
+                // tensor's value was seeded (constructor-folded config
+                // fields) or itself derived.
+                "item" => match self.const_of(*op.inputs.first()?)? {
+                    Num(f) => Some(Num(*f)),
+                    Int(n) => Some(Num(*n as f64)),
+                    List(_) => None,
+                },
+                "int" => self.const_int(*op.inputs.first()?).map(Int),
+                "float" => match self.const_of(*op.inputs.first()?)? {
+                    Int(n) => Some(Num(*n as f64)),
+                    Num(f) => Some(Num(*f)),
+                    List(_) => None,
+                },
+                // A shape READ of a var whose dims are known IS a constant
+                // list. This is the bridge that turns `let s = x.shape;
+                // s[0]` into a foldable int.
+                "shape" => {
+                    let v = *op.inputs.first()?;
+                    match self.known.get(&v)? {
+                        SizeInfo::Shape(dims) => Some(List(dims.clone())),
+                        SizeInfo::Numel(_) => None,
+                    }
+                }
+                "subscript" => {
+                    let list = match self.const_of(*op.inputs.first()?)? {
+                        List(l) => l.clone(),
+                        _ => return None,
+                    };
+                    let idx = self.const_int(*op.inputs.get(1)?)?;
+                    let n = list.len() as i64;
+                    let idx = if idx < 0 { n + idx } else { idx };
+                    if (0..n).contains(&idx) {
+                        Some(Int(list[idx as usize]))
+                    } else {
+                        None
+                    }
+                }
+                "list" => {
+                    let dims: Option<Vec<i64>> = op
+                        .inputs
+                        .iter()
+                        .map(|&i| self.const_int(i))
+                        .collect();
+                    Some(List(dims?))
+                }
+                n if n.starts_with(crate::lm_head_inference::CONST_SHAPE_PREFIX) => {
+                    let dims = crate::lm_head_inference::parse_const_shape_dims(n);
+                    if dims.is_empty() {
+                        None
+                    } else {
+                        Some(List(dims))
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Elementwise-binary result size (`Add/Sub/Mul/Div` semantics).
+    fn binary_size(&self, a: SizeInfo, b: SizeInfo) -> Option<SizeInfo> {
+        use SizeInfo::{Numel, Shape};
+        match (a, b) {
+            (Shape(sa), Shape(sb)) => {
+                if sa == sb {
+                    return Some(Shape(sa));
+                }
+                let na = shape_numel(&sa)?;
+                let nb = shape_numel(&sb)?;
+                // Equal-numel differing-shape pairs diverge by device: the
+                // GPU flat path skips broadcasting and stamps A's shape,
+                // the CPU path broadcasts (possibly to something LARGER).
+                // Refuse rather than pick a device. Numel-1 sides broadcast
+                // identically everywhere and fall through to NumPy.
+                if na == nb && na > 1 {
+                    return None;
+                }
+                numpy_broadcast(&sa, &sb).map(Shape)
+            }
+            (Shape(s), Numel(n)) | (Numel(n), Shape(s)) => {
+                let ns = shape_numel(&s)?;
+                if n == 1 {
+                    // The count is exact; the RANK of the numel-1 side is
+                    // unknown and can exceed the shaped side's, so dims are
+                    // not claimable.
+                    Some(Numel(ns))
+                } else if ns == 1 {
+                    Some(Numel(n))
+                } else {
+                    None
+                }
+            }
+            (Numel(x), Numel(y)) => {
+                if x == 1 {
+                    Some(Numel(y))
+                } else if y == 1 {
+                    Some(Numel(x))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Matmul result size. `[..b, m, k] x [..b', k, n] -> broadcast(b, b')
+    /// ++ [m, n]` when both shapes are known; when one side is numel-only
+    /// the count still crosses if the OTHER side is rank-2 (no batch dims
+    /// to broadcast, and the inner-dim match is a runtime abort
+    /// precondition, so any program that runs satisfies it).
+    fn matmul_size(&self, a: SizeInfo, b: SizeInfo) -> Option<SizeInfo> {
+        use SizeInfo::{Numel, Shape};
+        match (a, b) {
+            (Shape(sa), Shape(sb)) if sa.len() >= 2 && sb.len() >= 2 => {
+                let (m, k) = (sa[sa.len() - 2], sa[sa.len() - 1]);
+                let (k2, n) = (sb[sb.len() - 2], sb[sb.len() - 1]);
+                if k != k2 {
+                    return None;
+                }
+                let mut out = numpy_broadcast(&sa[..sa.len() - 2], &sb[..sb.len() - 2])?;
+                out.push(m);
+                out.push(n);
+                Some(Shape(out))
+            }
+            // a: [batch.., m, k] with only numel known; b: [k, n].
+            // numel_out = prod(batch) * m * n = na / k * n.
+            (Numel(na), Shape(sb)) if sb.len() == 2 => {
+                let (k, n) = (sb[0] as u64, sb[1] as u64);
+                if k == 0 || na % k != 0 {
+                    None
+                } else {
+                    (na / k).checked_mul(n).map(Numel)
+                }
+            }
+            // a: [m, k]; b: [batch.., k, n] with only numel known.
+            // numel_out = prod(batch) * m * n = nb * m / k  (n cancels).
+            (Shape(sa), Numel(nb)) if sa.len() == 2 => {
+                let (m, k) = (sa[0] as u64, sa[1] as u64);
+                let prod = nb.checked_mul(m)?;
+                if k == 0 || prod % k != 0 {
+                    None
+                } else {
+                    Some(Numel(prod / k))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// One op's result size, or None to stop. The catch-all refuses
+    /// anything untraced (Concat's per-input extents are invisible behind
+    /// its list var, Gather is device-divergent at dim 0, ScatterAdd's
+    /// leading dim is `max(index)+1` — data-dependent, the conv/pool
+    /// family has no transformer callers to validate against).
+    fn derive_size(&self, op: &'a crate::wengert::WengertOp) -> Option<SizeInfo> {
+        use SizeInfo::{Numel, Shape};
+        match &op.op {
+            // Shape-preserving: unary elementwise; softmax family; the
+            // norms (result is x-shaped, gamma/beta are separate inputs);
+            // Dropout; RoPE/RoPEInverse (clone / same-shape rotation); the
+            // AD-internal Reshape/Broadcast/Split whose lowerings are
+            // `nsl_tensor_clone`; Condition (mask stamped with lhs shape).
+            PrimalOp::Relu
+            | PrimalOp::Sigmoid
+            | PrimalOp::Tanh
+            | PrimalOp::Gelu
+            | PrimalOp::Silu
+            | PrimalOp::Exp
+            | PrimalOp::Log
+            | PrimalOp::Sqrt
+            | PrimalOp::Abs
+            | PrimalOp::Neg
+            | PrimalOp::Clamp { .. }
+            | PrimalOp::Softmax { .. }
+            | PrimalOp::LogSoftmax { .. }
+            | PrimalOp::LayerNorm { .. }
+            | PrimalOp::RMSNorm { .. }
+            | PrimalOp::BatchNorm { .. }
+            | PrimalOp::Dropout { .. }
+            | PrimalOp::RoPE { .. }
+            | PrimalOp::RoPEInverse { .. }
+            | PrimalOp::Reshape { .. }
+            | PrimalOp::Broadcast
+            | PrimalOp::Split { .. }
+            | PrimalOp::Condition(_) => self.input_info(op, 0),
+
+            PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
+                self.binary_size(self.input_info(op, 0)?, self.input_info(op, 1)?)
+            }
+
+            PrimalOp::Matmul => {
+                self.matmul_size(self.input_info(op, 0)?, self.input_info(op, 1)?)
+            }
+
+            PrimalOp::Transpose { dim0, dim1 } => match self.input_info(op, 0)? {
+                Shape(mut s) => {
+                    if *dim0 < s.len() && *dim1 < s.len() {
+                        s.swap(*dim0, *dim1);
+                        Some(Shape(s))
+                    } else {
+                        None
+                    }
+                }
+                n @ Numel(_) => Some(n),
+            },
+
+            PrimalOp::Sum { dim } | PrimalOp::Mean { dim } => match dim {
+                // Global reduction: 1 element (0-dim on CPU, [1] on GPU —
+                // the count is what sizing needs and it is 1 on both).
+                None => Some(Shape(vec![1])),
+                // keepdim=0 everywhere on this tape: the dim is REMOVED.
+                Some(d) => match self.input_info(op, 0)? {
+                    Shape(s) => {
+                        let nd = s.len() as i64;
+                        let dd = if *d < 0 { nd + d } else { *d };
+                        if (0..nd).contains(&dd) {
+                            let mut out = s;
+                            out.remove(dd as usize);
+                            Some(Shape(out))
+                        } else {
+                            None
+                        }
+                    }
+                    Numel(_) => None,
+                },
+            },
+
+            PrimalOp::CrossEntropyLoss
+            | PrimalOp::MSELoss
+            | PrimalOp::L1Loss
+            | PrimalOp::FusedLinearCe { .. }
+            | PrimalOp::FusedKlCe { .. } => Some(Shape(vec![1])),
+
+            // The fused-CE backward bakes its shapes into the op itself.
+            PrimalOp::FusedLinearCeBackwardExtract {
+                component,
+                vocab_size,
+                hidden_size,
+                batch_size,
+                seq_len,
+                x_rank3,
+                ..
+            } => {
+                let (v, h) = (*vocab_size as i64, *hidden_size as i64);
+                let (b, s) = (*batch_size as i64, *seq_len as i64);
+                match component {
+                    0 if *x_rank3 => Some(Shape(vec![b, s, h])),
+                    0 => Some(Shape(vec![b.checked_mul(s)?, h])),
+                    1 => Some(Shape(vec![v, h])),
+                    2 => Some(Shape(vec![v])),
+                    _ => None,
+                }
+            }
+            PrimalOp::FusedKlCeBackwardExtract {
+                component,
+                vocab_size,
+                student_hidden,
+                batch_size,
+                seq_len,
+                ..
+            } => {
+                let (v, h) = (*vocab_size as i64, *student_hidden as i64);
+                let (b, s) = (*batch_size as i64, *seq_len as i64);
+                match component {
+                    // dx_s is ALWAYS rank-2 [B*S, H_s] — no x_rank3 here.
+                    0 => Some(Shape(vec![b.checked_mul(s)?, h])),
+                    1 => Some(Shape(vec![v, h])),
+                    2 => Some(Shape(vec![v])),
+                    _ => None,
+                }
+            }
+
+            // out = q's leading dims + v's last dim, valid only in the
+            // regime every lowering path enforces (k exactly q-shaped, v
+            // agreeing in the leading dims); anything looser hits matmul
+            // batch-broadcast in the decomposed path and is refused here.
+            PrimalOp::ScaledDotProductAttention { .. }
+            | PrimalOp::ScaledDotProductAttentionPacked => {
+                match (
+                    self.input_info(op, 0)?,
+                    self.input_info(op, 1)?,
+                    self.input_info(op, 2)?,
+                ) {
+                    (Shape(sq), Shape(sk), Shape(sv))
+                        if sq.len() >= 2
+                            && sk == sq
+                            && sv.len() == sq.len()
+                            && sv[..sv.len() - 1] == sq[..sq.len() - 1] =>
+                    {
+                        let mut out = sq;
+                        let last = out.len() - 1;
+                        out[last] = sv[sv.len() - 1];
+                        Some(Shape(out))
+                    }
+                    _ => None,
+                }
+            }
+
+            // inputs = [dout, q, k, v, fwd_out, ...]: dQ is q-shaped, dK
+            // k-shaped, dV v-shaped.
+            PrimalOp::FlashAttentionBackwardExtract { component, .. }
+            | PrimalOp::FlashAttentionBackwardExtractPacked { component, .. } => {
+                self.input_info(op, 1 + *component as usize)
+            }
+
+            // Placeholder result ([1] zeros, never consumed as data).
+            PrimalOp::FusedCshaBackward { .. } => Some(Shape(vec![1])),
+
+            PrimalOp::Slice { dim, start, end, .. } => match self.input_info(op, 0)? {
+                Shape(s) => {
+                    let nd = s.len() as i64;
+                    let dd = if *dim < 0 { nd + dim } else { *dim };
+                    if !(0..nd).contains(&dd) {
+                        return None;
+                    }
+                    let size = s[dd as usize];
+                    // Exact replica of the runtime clamp (`shape_ops.rs`).
+                    let sc = if *start < 0 {
+                        (size + start).max(0)
+                    } else {
+                        (*start).min(size)
+                    };
+                    let ec = if *end < 0 {
+                        (size + end).max(0)
+                    } else {
+                        (*end).min(size)
+                    };
+                    let extent = (ec - sc).max(0);
+                    if extent <= 0 {
+                        return None; // 0-element result: legal, never sized
+                    }
+                    let mut out = s;
+                    out[dd as usize] = extent;
+                    Some(Shape(out))
+                }
+                Numel(_) => None,
+            },
+
+            PrimalOp::PadZero { dim, pad_before, pad_after } => {
+                match self.input_info(op, 0)? {
+                    Shape(s) => {
+                        let nd = s.len() as i64;
+                        let dd = if *dim < 0 { nd + dim } else { *dim };
+                        if !(0..nd).contains(&dd) || *pad_before < 0 || *pad_after < 0 {
+                            return None;
+                        }
+                        let mut out = s;
+                        out[dd as usize] = out[dd as usize]
+                            .checked_add(*pad_before)?
+                            .checked_add(*pad_after)?;
+                        Some(Shape(out))
+                    }
+                    Numel(_) => None,
+                }
+            }
+
+            // 2-D spatial upsample: BOTH trailing dims scale by `kernel`.
+            PrimalOp::Repeat { kernel } => match self.input_info(op, 0)? {
+                Shape(mut s) if s.len() >= 2 && *kernel > 0 => {
+                    let n = s.len();
+                    s[n - 2] = s[n - 2].checked_mul(*kernel as i64)?;
+                    s[n - 1] = s[n - 1].checked_mul(*kernel as i64)?;
+                    Some(Shape(s))
+                }
+                _ => None,
+            },
+
+            // inputs = [table, indices]; indices must be rank-1 at runtime
+            // (anything else aborts), so out = [numel(indices), cols].
+            PrimalOp::Embedding => {
+                let table = match self.input_info(op, 0)? {
+                    Shape(t) if t.len() == 2 => t,
+                    _ => return None,
+                };
+                let n = self.input_info(op, 1)?.numel()?;
+                if n > i64::MAX as u64 {
+                    return None;
+                }
+                Some(Shape(vec![n as i64, table[1]]))
+            }
+
+            // Declared shape is true_val's, but the BUFFER is max(len)
+            // over all three operands (`nsl_tensor_where`) — so equal
+            // shapes are the only case where shape and buffer agree;
+            // otherwise only the count is claimable, as the max.
+            PrimalOp::Select => {
+                let (c, t, f) = (
+                    self.input_info(op, 0)?,
+                    self.input_info(op, 1)?,
+                    self.input_info(op, 2)?,
+                );
+                match (&c, &t, &f) {
+                    (Shape(sc), Shape(st), Shape(sf)) if sc == st && st == sf => Some(t),
+                    _ => {
+                        let m = c.numel()?.max(t.numel()?).max(f.numel()?);
+                        Some(Numel(m))
+                    }
+                }
+            }
+
+            // y = x @ W (+ adapter terms that never change the shape):
+            // [..., k] x [k, n] -> [..., n].
+            PrimalOp::FusedGatedLoraMatmul { .. }
+            | PrimalOp::FusedLoraMatmul { .. }
+            | PrimalOp::FusedIa3Matmul { .. } => {
+                let w = match self.input_info(op, 1)? {
+                    Shape(w) if w.len() == 2 => w,
+                    _ => return None,
+                };
+                match self.input_info(op, 0)? {
+                    Shape(x) if !x.is_empty() && x[x.len() - 1] == w[0] => {
+                        let mut out = x;
+                        let last = out.len() - 1;
+                        out[last] = w[1];
+                        Some(Shape(out))
+                    }
+                    Numel(nx) => {
+                        let (k, n) = (w[0] as u64, w[1] as u64);
+                        if k == 0 || nx % k != 0 {
+                            None
+                        } else {
+                            (nx / k).checked_mul(n).map(Numel)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+
+            PrimalOp::Passthrough(name) => match name.as_str() {
+                // Shape-preserving passthroughs.
+                "contiguous" | "cos" | "sin" | "rotate_half" | "zeros_like"
+                | "ones_like" | "silu_backward" | "gelu_backward" | "sigmoid_backward"
+                | "tanh_backward" | "swiglu_gate_backward" => self.input_info(op, 0),
+                n if n.starts_with("ccr_cast_") => self.input_info(op, 0),
+                // Backward FFIs whose result is a NON-FIRST input's shape.
+                n if n.starts_with("rmsnorm_dx_backward") => self.input_info(op, 1),
+                n if n.starts_with("rmsnorm_dgamma_backward") => self.input_info(op, 2),
+                "embedding_backward" => self.input_info(op, 2),
+                "cross_entropy_backward" | "mse_backward" | "l1_backward" => {
+                    self.input_info(op, 1)
+                }
+                "reduce_to_shape" => self.input_info(op, 1),
+                // Real reshape: the runtime ABORTS unless the target list's
+                // product equals the input count, so a static target IS the
+                // result shape for any program that runs — even when the
+                // input is unsized (that is what recovers the RoPE
+                // cos/sin path, whose table read is unsized but whose
+                // `[1, 1, seq, d]` target is folded). A sized input that
+                // CONTRADICTS the static target means the static reading
+                // is wrong; refuse.
+                "reshape" => {
+                    if op.inputs.len() != 2 {
+                        return None;
+                    }
+                    let n_in = self.input_info(op, 0).and_then(|i| i.numel());
+                    if let Some(dims) = self.static_list_dims(op.inputs[1]) {
+                        let n_out = shape_numel(&dims)?;
+                        return match n_in {
+                            Some(n) if n != n_out => None,
+                            _ => Some(Shape(dims)),
+                        };
+                    }
+                    n_in.map(Numel)
+                }
+                "expand" => {
+                    let dims = self.static_list_dims(*op.inputs.get(1)?)?;
+                    Some(Shape(dims))
+                }
+                // Rank changes with a preserved count.
+                "squeeze" | "unsqueeze" => {
+                    Some(Numel(self.input_info(op, 0)?.numel()?))
+                }
+                "item" => Some(Shape(vec![])),
+                "mean_keepdim_last" | "sum_keepdim_last" => match self.input_info(op, 0)? {
+                    Shape(mut s) if !s.is_empty() => {
+                        let last = s.len() - 1;
+                        s[last] = 1;
+                        Some(Shape(s))
+                    }
+                    _ => None,
+                },
+                "transpose" => {
+                    let d0 = self.const_int(*op.inputs.get(1)?)?;
+                    let d1 = self.const_int(*op.inputs.get(2)?)?;
+                    match self.input_info(op, 0)? {
+                        Shape(mut s) => {
+                            let nd = s.len() as i64;
+                            let n0 = if d0 < 0 { nd + d0 } else { d0 };
+                            let n1 = if d1 < 0 { nd + d1 } else { d1 };
+                            if (0..nd).contains(&n0) && (0..nd).contains(&n1) {
+                                s.swap(n0 as usize, n1 as usize);
+                                Some(Shape(s))
+                            } else {
+                                None
+                            }
+                        }
+                        n @ Numel(_) => Some(n),
+                    }
+                }
+                "zeros" | "ones" | "full" | "randn" => {
+                    let dims = self.static_list_dims(*op.inputs.first()?)?;
+                    Some(Shape(dims))
+                }
+                // dict_get is seeded from DataLoader facts by the caller,
+                // never derived; everything else ("arange", "list",
+                // "shape", ...) has a data-dependent or non-tensor result.
+                _ => None,
+            },
+
+            // Constant lowers to a 0-dim scalar tensor when tensor-typed.
+            PrimalOp::Constant(_) => Some(Shape(vec![])),
+
+            // Leaves are seeded, never derived; markers and everything
+            // untraced (Concat behind its list var, device-divergent
+            // Gather, the data-dependent ScatterAdd, conv/pool,
+            // CshaFusedBackwardExtract) derive nothing.
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage-2B: admission
+// ---------------------------------------------------------------------------
+
+/// Why a transient was refused a planned address.
+///
+/// Enumerated rather than a bool so `--arena-report` can say which rule is
+/// costing coverage. "Nothing was admitted" and "everything was aliasing" are
+/// different findings and only one of them is a reason to widen the rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedBecause {
+    /// Forward-region value. Stage-2B is backward temporaries only.
+    NotBackward,
+    /// No static element count, so no slot size.
+    Unsized,
+    /// Read by the backward — its address is a gradient-map key.
+    SavedForBackward,
+    /// Read after the tape (optimizer, callbacks); the tape's last-use is not
+    /// its real death.
+    EscapesTape,
+    /// The producing op returns storage aliased to an input, so a "slot" for
+    /// it would be a second name for someone else's memory.
+    Aliasing,
+    /// Produced by an op whose lowering is not known to make exactly one
+    /// device allocation.
+    NotSingleAllocation,
+    /// The op's mutation-candidate operand DIES at this op, so the runtime's
+    /// FBIP arm (`can_mutate_inplace_gpu`: uniquely-owned input -> mutate in
+    /// place, return the input pointer) can serve the result with NO
+    /// allocation. Measured, not theoretical: every admitted Sqrt/Neg on
+    /// coder50m leaked its bind through exactly this arm.
+    InPlaceReuse,
+    /// A binary whose operand shapes are not proven EQUAL (broadcast), or
+    /// whose operand comes from a view (non-contiguous storage): both leave
+    /// the GPU flat path, and the broadcast/fallback routes allocate
+    /// differently (or on the host) — the single-straight-line-allocation
+    /// claim does not hold.
+    RuntimePathVaries,
+}
+
+/// One admitted transient and the slot it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    pub var: VarId,
+    /// Dense slot index, also the number of leading guards to skip.
+    pub slot_index: u32,
+    /// Byte offset of the slot's payload within the packed plan.
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// Ops whose `wengert_lower` arm makes exactly ONE device allocation.
+///
+/// The pin is single-shot and size-exact, so an op that allocates a scratch
+/// buffer before its result would either consume the pin with the scratch (if
+/// the sizes happened to match) or leave it armed for something later. Both
+/// are wrong in ways nothing downstream would notice, so admission is an
+/// ALLOWLIST rather than a denylist: an op nobody has checked is refused.
+///
+/// Kept to the elementwise and reduction family on purpose. Matmul goes
+/// through cuBLAS with its own workspace, attention allocates several buffers,
+/// and the fused kernels allocate loss + LSE — none belong here.
+fn is_single_allocation_op(op: &PrimalOp) -> bool {
+    matches!(
+        op,
+        PrimalOp::Add
+            | PrimalOp::Sub
+            | PrimalOp::Mul
+            | PrimalOp::Div
+            | PrimalOp::Neg
+            | PrimalOp::Relu
+            | PrimalOp::Gelu
+            | PrimalOp::Silu
+            | PrimalOp::Sigmoid
+            | PrimalOp::Tanh
+            | PrimalOp::Exp
+            | PrimalOp::Log
+            | PrimalOp::Sqrt
+    )
+}
+
+/// True when `op`'s result may alias an input's storage.
+///
+/// Deliberately the UNION of two predicates that disagree. This module's
+/// `op_allocates` argues `Reshape`/`Broadcast`/`Slice`/`Select` genuinely copy
+/// on this tape and so must be COUNTED (undercounting a byte figure is the
+/// unsafe direction for a measurement), while `wengert::is_view_producing_op`
+/// lists the user-facing `reshape`/`contiguous`/`expand`/`squeeze`/`unsqueeze`
+/// passthroughs as runtime view ops.
+///
+/// For a byte count the disagreement is academic. For PLACEMENT it is not:
+/// giving a fixed address to something that turns out to alias an input hands
+/// two logical values one buffer. So placement takes the union and refuses
+/// anything either predicate calls a view.
+fn may_alias(op: &PrimalOp) -> bool {
+    crate::wengert::is_view_producing_op(op)
+        || matches!(
+            op,
+            PrimalOp::Transpose { .. }
+                | PrimalOp::Reshape { .. }
+                | PrimalOp::Broadcast
+                | PrimalOp::Slice { .. }
+        )
+}
+
+/// Stage-2B admission: which transients may be given a fixed address.
+///
+/// Conservative by construction — see [`RefusedBecause`] for every rule. The
+/// returned placements are packed by [`pack`]; refusals are returned alongside
+/// so the report can say what coverage was lost and to which rule.
+pub fn admit(
+    plan: &ArenaPlan,
+    forward: &WengertList,
+    adjoint: &WengertList,
+    tape_escaping: &std::collections::HashSet<VarId>,
+    sizes: &HashMap<VarId, SizeInfo>,
+) -> (Vec<VarId>, Vec<(VarId, RefusedBecause)>) {
+    // Concatenated last-use, same construction as `analyze` — the FBIP
+    // in-place arm fires exactly when the mutated operand has no later
+    // reader, which on the tape means its last use IS this op.
+    let fwd_n = forward.ops.len();
+    let mut last_use: HashMap<VarId, u32> = HashMap::new();
+    for (base, list) in [(0usize, forward), (fwd_n, adjoint)] {
+        for (i, op) in list.ops.iter().enumerate() {
+            for &input in &op.inputs {
+                last_use.insert(input, (base + i) as u32);
+            }
+        }
+    }
+    // Producers across BOTH lists, for the view check on binary operands.
+    let mut producer: HashMap<VarId, &crate::wengert::WengertOp> = HashMap::new();
+    for list in [forward, adjoint] {
+        for op in &list.ops {
+            producer.entry(op.result).or_insert(op);
+        }
+    }
+    let is_view_output = |v: VarId| -> bool {
+        producer.get(&v).is_some_and(|o| {
+            crate::wengert::is_view_producing_op(&o.op)
+                || matches!(o.op, PrimalOp::Transpose { .. })
+        })
+    };
+
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for t in &plan.transients {
+        let why = if t.region != Region::Backward {
+            Some(RefusedBecause::NotBackward)
+        } else if t.elems.is_none() {
+            Some(RefusedBecause::Unsized)
+        } else if t.saved_for_backward {
+            Some(RefusedBecause::SavedForBackward)
+        } else if tape_escaping.contains(&t.var) {
+            Some(RefusedBecause::EscapesTape)
+        } else {
+            match adjoint.ops.iter().find(|o| o.result == t.var) {
+                Some(op) if may_alias(&op.op) => Some(RefusedBecause::Aliasing),
+                Some(op) if !is_single_allocation_op(&op.op) => {
+                    Some(RefusedBecause::NotSingleAllocation)
+                }
+                // A transient with no producing op in the adjoint is not one
+                // this pass can reason about at all.
+                None => Some(RefusedBecause::NotSingleAllocation),
+                Some(op) => {
+                    let dies_here = |v: VarId| last_use.get(&v) == Some(&t.birth);
+                    let is_binary = matches!(
+                        op.op,
+                        PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div
+                    );
+                    if is_binary {
+                        // The GPU flat path — the only arm whose single
+                        // exact-size allocation the pin can match — requires
+                        // equal element counts and contiguous operands. A
+                        // broadcast or a view operand takes a different
+                        // route (possibly through the host).
+                        let shapes_equal = match (
+                            op.inputs.first().and_then(|v| sizes.get(v)),
+                            op.inputs.get(1).and_then(|v| sizes.get(v)),
+                        ) {
+                            (Some(SizeInfo::Shape(a)), Some(SizeInfo::Shape(b))) => a == b,
+                            _ => false,
+                        };
+                        let any_view = op.inputs.iter().take(2).any(|&v| is_view_output(v));
+                        if !shapes_equal || any_view {
+                            Some(RefusedBecause::RuntimePathVaries)
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Unary elementwise: the runtime mutates a dying,
+                        // uniquely-owned input in place and allocates
+                        // nothing. `can_mutate_inplace_gpu` checks refcount
+                        // at call time; a dying operand is the static
+                        // over-approximation of that.
+                        if op.inputs.first().copied().is_some_and(dies_here) {
+                            Some(RefusedBecause::InPlaceReuse)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        match why {
+            Some(r) => refused.push((t.var, r)),
+            None => admitted.push(t.var),
+        }
+    }
+    (admitted, refused)
+}
+
+/// Pack the admitted transients: every placement gets its OWN disjoint
+/// region, laid out sequentially in dense-index order.
+///
+/// Deliberately NOT the M36 BFD time-sharing engine. BFD assigns two
+/// disjoint-lifetime placements the SAME byte offset, but the runtime
+/// layout is `payload = base + offset + REDZONE * (idx + 1)` with `idx`
+/// the dense placement index — under shared offsets, payload regions from
+/// DIFFERENT slots bleed into each other by `REDZONE * Δidx` bytes while
+/// both are live. That is silent device-memory corruption, and it was
+/// caught only by the planned-vs-unplanned byte-identity bisection (slot 8
+/// on coder50m — losses diverged at step 1). Time-sharing can return later
+/// with a layout model that carries per-slot guard geometry; the point of
+/// placement is stable addresses, not byte savings, and the sequential
+/// layout's cost on the real model is ~11 MiB.
+///
+/// With offsets assigned in dense order, payload `k` ends at
+/// `offset_k + REDZONE*(k+1) + bytes_k = offset_{k+1} + REDZONE*(k+1)`,
+/// which is exactly one red zone before payload `k+1` begins — every pair
+/// of adjacent payloads is separated by REDZONE poison bytes, matching
+/// what `nsl_arena_init` sizes.
+pub fn pack(plan: &ArenaPlan, admitted: &[VarId]) -> (Vec<Placement>, u64) {
+    let wanted: std::collections::HashSet<VarId> = admitted.iter().copied().collect();
+    let chosen: Vec<&Transient> = plan
+        .transients
+        .iter()
+        .filter(|t| wanted.contains(&t.var))
+        .collect();
+    if chosen.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut placements = Vec::with_capacity(chosen.len());
+    let mut offset = 0u64;
+    for (dense, t) in chosen.iter().enumerate() {
+        let bytes = align_up(
+            t.elems.expect("admission required a size") * plan.elem_bytes,
+            SLAB_ALIGNMENT,
+        );
+        placements.push(Placement {
+            var: t.var,
+            slot_index: dense as u32,
+            offset,
+            bytes,
+        });
+        offset += bytes;
+    }
+    (placements, offset)
+}
+
 /// Occupancy interval of a transient, half-open: `[birth, last_use + 1)`. The
 /// `+ 1` is load-bearing and memory-correct, not padding: a value's last use is,
 /// by definition, an *input* to the op at that index, and that same op *writes*
@@ -687,5 +1859,744 @@ mod tests {
         let s2_slot = slab.assignments.get(&id_of(3)).map(|(s, _)| *s);
         assert!(s1_slot.is_some() && s2_slot.is_some());
         assert_ne!(s1_slot, s2_slot, "saved tensors must not share a slot");
+    }
+
+    // -----------------------------------------------------------------
+    // Stage-2B admission
+    // -----------------------------------------------------------------
+
+    /// The admission set is the whole safety argument, so each rule gets a
+    /// case that would be ADMITTED if that one rule were dropped.
+    fn admit_of(
+        fwd: Vec<WengertOp>,
+        adj: Vec<WengertOp>,
+        escaping: &[VarId],
+    ) -> (Vec<VarId>, Vec<(VarId, RefusedBecause)>) {
+        let esc: std::collections::HashSet<VarId> = escaping.iter().copied().collect();
+        let forward = list(fwd);
+        let adjoint = list(adj);
+        let elems = |_v: VarId| Some(64u64);
+        let plan = analyze(&forward, &adjoint, &elems, &esc, 4);
+        // Every var the tapes mention gets the SAME shape, so the binary
+        // equal-shape rule admits; tests for the broadcast/view refusals
+        // build their own sizes maps.
+        let mut sizes: HashMap<VarId, SizeInfo> = HashMap::new();
+        for l in [&forward, &adjoint] {
+            for o in &l.ops {
+                for v in o.inputs.iter().chain(std::iter::once(&o.result)) {
+                    sizes.insert(*v, SizeInfo::Shape(vec![64]));
+                }
+            }
+        }
+        admit(&plan, &forward, &adjoint, &esc, &sizes)
+    }
+
+    #[test]
+    fn a_plain_backward_elementwise_temporary_is_admitted() {
+        // Var 1 is read AGAIN after the Relu, so the runtime cannot mutate
+        // it in place and the result genuinely allocates.
+        let (ok, _) = admit_of(
+            vec![],
+            vec![
+                op(0, 10, PrimalOp::Relu, vec![1]),
+                op(1, 11, PrimalOp::Gelu, vec![1]),
+            ],
+            &[],
+        );
+        assert_eq!(ok, vec![10], "the one case the whole stage exists for");
+    }
+
+    /// FBIP: a dying, uniquely-owned input is mutated IN PLACE by the
+    /// runtime (`can_mutate_inplace_gpu`) — no allocation ever reaches the
+    /// pin. Dropping this rule admitted 34 Sqrt ops on coder50m and every
+    /// one leaked its bind.
+    #[test]
+    fn an_in_place_candidate_is_refused() {
+        let (ok, no) = admit_of(vec![], vec![op(0, 10, PrimalOp::Relu, vec![1])], &[]);
+        assert!(ok.is_empty());
+        assert_eq!(no, vec![(10, RefusedBecause::InPlaceReuse)]);
+    }
+
+    /// A broadcast (unequal shapes) or a view operand leaves the GPU flat
+    /// path; those routes do not make one straight-line allocation of the
+    /// result's size.
+    #[test]
+    fn broadcast_and_view_operand_binaries_are_refused() {
+        // Unequal shapes -> broadcast.
+        let forward = list(vec![]);
+        let adjoint = list(vec![
+            op(0, 10, PrimalOp::Add, vec![1, 2]),
+            op(1, 11, PrimalOp::Gelu, vec![1]),
+            op(2, 12, PrimalOp::Gelu, vec![2]),
+        ]);
+        let elems = |_v: VarId| Some(64u64);
+        let plan = analyze(&forward, &adjoint, &elems, &Default::default(), 4);
+        let mut sizes: HashMap<VarId, SizeInfo> = HashMap::new();
+        sizes.insert(1, SizeInfo::Shape(vec![64]));
+        sizes.insert(2, SizeInfo::Shape(vec![8, 64]));
+        let (ok, no) = admit(&plan, &forward, &adjoint, &Default::default(), &sizes);
+        assert!(!ok.contains(&10));
+        assert_eq!(
+            no.iter().find(|(v, _)| *v == 10).map(|(_, r)| *r),
+            Some(RefusedBecause::RuntimePathVaries)
+        );
+
+        // A transpose-view operand -> non-contiguous -> off the flat path.
+        let forward2 = list(vec![
+            op(0, 3, PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![1]),
+        ]);
+        let adjoint2 = list(vec![
+            op(0, 10, PrimalOp::Add, vec![3, 2]),
+            op(1, 11, PrimalOp::Gelu, vec![3]),
+            op(2, 12, PrimalOp::Gelu, vec![2]),
+        ]);
+        let plan2 = analyze(&forward2, &adjoint2, &elems, &Default::default(), 4);
+        let mut sizes2: HashMap<VarId, SizeInfo> = HashMap::new();
+        for v in [1, 2, 3] {
+            sizes2.insert(v, SizeInfo::Shape(vec![64]));
+        }
+        let (ok2, no2) = admit(&plan2, &forward2, &adjoint2, &Default::default(), &sizes2);
+        assert!(!ok2.contains(&10));
+        assert_eq!(
+            no2.iter().find(|(v, _)| *v == 10).map(|(_, r)| *r),
+            Some(RefusedBecause::RuntimePathVaries)
+        );
+    }
+
+    #[test]
+    fn forward_temporaries_are_refused() {
+        let (ok, no) = admit_of(vec![op(0, 10, PrimalOp::Relu, vec![1])], vec![], &[]);
+        assert!(ok.is_empty());
+        assert_eq!(no, vec![(10, RefusedBecause::NotBackward)]);
+    }
+
+    #[test]
+    fn an_unsized_temporary_is_refused() {
+        // Same tape as the admitted case, but with no static element count:
+        // no size, no slot.
+        let adjoint = list(vec![op(0, 10, PrimalOp::Relu, vec![1])]);
+        let forward = list(vec![]);
+        let plan = analyze(&forward, &adjoint, &none_elems(), &Default::default(), 4);
+        let (ok, no) = admit(&plan, &forward, &adjoint, &Default::default(), &HashMap::new());
+        assert!(ok.is_empty());
+        assert_eq!(no, vec![(10, RefusedBecause::Unsized)]);
+    }
+
+    #[test]
+    fn a_saved_temporary_is_refused() {
+        let (ok, no) = admit_of(vec![], vec![saved(op(0, 10, PrimalOp::Relu, vec![1]))], &[]);
+        assert!(ok.is_empty(), "a saved tensor's ADDRESS is a gradient-map key");
+        assert_eq!(no, vec![(10, RefusedBecause::SavedForBackward)]);
+    }
+
+    #[test]
+    fn a_tape_escaping_temporary_is_refused() {
+        let (ok, no) = admit_of(vec![], vec![op(0, 10, PrimalOp::Relu, vec![1])], &[10]);
+        assert!(ok.is_empty(), "the optimizer reads this after the tape ends");
+        assert_eq!(no, vec![(10, RefusedBecause::EscapesTape)]);
+    }
+
+    /// Aliasing is the rule that would corrupt memory rather than merely
+    /// mis-measure, so it takes the UNION of the two view predicates this
+    /// crate carries — which disagree about reshape.
+    #[test]
+    fn aliasing_producers_are_refused_under_either_predicate() {
+        for o in [
+            op(0, 10, PrimalOp::Passthrough("reshape".into()), vec![1]),
+            op(0, 10, PrimalOp::Passthrough("contiguous".into()), vec![1]),
+            op(0, 10, PrimalOp::Passthrough("expand".into()), vec![1]),
+            op(0, 10, PrimalOp::Broadcast, vec![1]),
+        ] {
+            let name = format!("{:?}", o.op);
+            let (ok, no) = admit_of(vec![], vec![o], &[]);
+            assert!(ok.is_empty(), "{name} may alias its input and must be refused");
+            assert_eq!(no.first().map(|(_, r)| *r), Some(RefusedBecause::Aliasing),
+                       "{name}");
+        }
+    }
+
+    /// The allowlist is what keeps the size-exact pin honest: an op that
+    /// allocates a scratch before its result would hand the pin to the wrong
+    /// buffer.
+    #[test]
+    fn multi_allocation_ops_are_refused() {
+        for o in [
+            op(0, 10, PrimalOp::Matmul, vec![1, 2]),
+            op(0, 10, PrimalOp::Softmax { dim: -1 }, vec![1]),
+        ] {
+            let name = format!("{:?}", o.op);
+            let (ok, no) = admit_of(vec![], vec![o], &[]);
+            assert!(ok.is_empty(), "{name} is not a proven single allocation");
+            assert_eq!(no.first().map(|(_, r)| *r),
+                       Some(RefusedBecause::NotSingleAllocation), "{name}");
+        }
+    }
+
+    /// Packing must give distinct addresses to transients that are live at the
+    /// same time — the property whose violation is silent corruption rather
+    /// than a wrong number.
+    #[test]
+    fn overlapping_admitted_transients_never_share_an_offset() {
+        // t10 is born at 0 and read at 2, so it is live across t11's whole
+        // life. They must not land on the same offset.
+        let adj = vec![
+            op(0, 10, PrimalOp::Relu, vec![1]),
+            op(1, 11, PrimalOp::Relu, vec![2]),
+            op(2, 12, PrimalOp::Add, vec![10, 11]),
+            // Keep 1 and 2 alive past their Relus, or the FBIP rule
+            // (correctly) refuses both.
+            op(3, 13, PrimalOp::Gelu, vec![1]),
+            op(4, 14, PrimalOp::Gelu, vec![2]),
+        ];
+        let forward = list(vec![]);
+        let adjoint = list(adj.clone());
+        let elems = |_v: VarId| Some(64u64);
+        let plan = analyze(&forward, &adjoint, &elems, &Default::default(), 4);
+        let mut sizes: HashMap<VarId, SizeInfo> = HashMap::new();
+        for v in [1, 2, 10, 11, 12, 13, 14] {
+            sizes.insert(v, SizeInfo::Shape(vec![64]));
+        }
+        let (ok, _) = admit(&plan, &forward, &adjoint, &Default::default(), &sizes);
+        assert!(ok.contains(&10) && ok.contains(&11), "both should be admitted: {ok:?}");
+        let (placements, total) = pack(&plan, &ok);
+        assert!(total > 0);
+        let a = placements.iter().find(|p| p.var == 10).unwrap();
+        let b = placements.iter().find(|p| p.var == 11).unwrap();
+        assert_ne!(a.offset, b.offset,
+                   "simultaneously-live transients were given the same address");
+        assert_ne!(a.slot_index, b.slot_index);
+    }
+
+    // -----------------------------------------------------------------
+    // Element-count propagation
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unary_elementwise_preserves_numel_down_a_chain() {
+        let adj = list(vec![
+            op(0, 10, PrimalOp::Relu, vec![1]),
+            op(1, 11, PrimalOp::Gelu, vec![10]),
+            op(2, 12, PrimalOp::Tanh, vec![11]),
+        ]);
+        let seed = |v: VarId| (v == 1).then_some(512u64);
+        let got = propagate_elems(&list(vec![]), &adj, &seed);
+        for v in [10, 11, 12] {
+            assert_eq!(got.get(&v), Some(&512), "numel must survive var {v}");
+        }
+    }
+
+    #[test]
+    fn equal_numel_binaries_propagate_and_unequal_ones_stop() {
+        let adj = list(vec![
+            op(0, 10, PrimalOp::Add, vec![1, 2]), // 64 + 64 -> 64
+            op(1, 11, PrimalOp::Mul, vec![1, 3]), // 64 * 8  -> broadcast, unknown
+        ]);
+        let seed = |v: VarId| match v {
+            1 | 2 => Some(64u64),
+            3 => Some(8u64),
+            _ => None,
+        };
+        let got = propagate_elems(&list(vec![]), &adj, &seed);
+        assert_eq!(got.get(&10), Some(&64));
+        assert_eq!(
+            got.get(&11), None,
+            "a broadcasting binary's numel depends on shapes the tape does not \
+             carry; guessing it would undersize a slot, which is a buffer \
+             overrun rather than a bad statistic"
+        );
+    }
+
+    #[test]
+    fn propagation_stops_at_ops_that_need_real_shapes() {
+        // Matmul, reductions and reshape all change numel in ways only the
+        // shapes determine. Each must leave its result unsized — and, because
+        // the sweep is single-pass over a topological tape, everything
+        // downstream of it too.
+        for o in [
+            op(0, 10, PrimalOp::Matmul, vec![1, 2]),
+            op(0, 10, PrimalOp::Sum { dim: None }, vec![1]),
+            op(0, 10, PrimalOp::Passthrough("reshape".into()), vec![1, 2]),
+        ] {
+            let name = format!("{:?}", o.op);
+            let adj = list(vec![o, op(1, 11, PrimalOp::Relu, vec![10])]);
+            let seed = |v: VarId| (v == 1 || v == 2).then_some(64u64);
+            let got = propagate_elems(&list(vec![]), &adj, &seed);
+            assert_eq!(got.get(&10), None, "{name} must not derive a numel");
+            assert_eq!(got.get(&11), None, "nothing downstream of {name} either");
+        }
+    }
+
+    #[test]
+    fn a_seed_always_wins_over_derivation() {
+        // The caller's hint is authoritative: it came from a declared shape,
+        // while derivation is an inference over op semantics.
+        let adj = list(vec![op(0, 10, PrimalOp::Relu, vec![1])]);
+        let seed = |v: VarId| match v {
+            1 => Some(64u64),
+            10 => Some(999u64),
+            _ => None,
+        };
+        let got = propagate_elems(&list(vec![]), &adj, &seed);
+        assert_eq!(got.get(&10), Some(&999));
+    }
+
+    /// Propagation is what makes admission non-vacuous, so pin the two
+    /// together: the same tape admits nothing on bare seeds and something
+    /// once counts are propagated.
+    #[test]
+    fn propagation_is_what_makes_admission_non_vacuous() {
+        // Three readers of var 1, then one more read of 1 at the end, so
+        // none of the unaries is an in-place candidate.
+        let adj_ops = vec![
+            op(0, 10, PrimalOp::Relu, vec![1]),
+            op(1, 11, PrimalOp::Gelu, vec![1]),
+            op(2, 12, PrimalOp::Tanh, vec![1]),
+            op(3, 13, PrimalOp::Sigmoid, vec![1]),
+        ];
+        let forward = list(vec![]);
+        let adjoint = list(adj_ops);
+        let bare = |v: VarId| (v == 1).then_some(512u64);
+        let plan0 = analyze(&forward, &adjoint, &bare, &Default::default(), 4);
+        let (ok0, _) = admit(&plan0, &forward, &adjoint, &Default::default(), &HashMap::new());
+        assert!(ok0.is_empty(), "without propagation nothing is sized, so nothing is placed");
+
+        let hints = propagate_elems(&forward, &adjoint, &bare);
+        let plan1 = analyze(&forward, &adjoint,
+                            &|v| hints.get(&v).copied(), &Default::default(), 4);
+        let (ok1, _) = admit(&plan1, &forward, &adjoint, &Default::default(), &HashMap::new());
+        assert_eq!(
+            ok1.len(),
+            3,
+            "the three non-final readers become placeable (the final one is \
+             an in-place candidate): {ok1:?}"
+        );
+    }
+
+    #[test]
+    fn packing_nothing_is_zero_bytes() {
+        let plan = analyze(&list(vec![]), &list(vec![]), &none_elems(), &Default::default(), 4);
+        let (p, total) = pack(&plan, &[]);
+        assert!(p.is_empty());
+        assert_eq!(total, 0);
+    }
+}
+
+#[cfg(test)]
+mod shape_prop_tests {
+    use super::SizeInfo::{Numel, Shape};
+    use super::*;
+    use crate::wengert::{PrimalOp, WengertOp};
+
+    fn op(id: u32, result: VarId, primal: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
+        WengertOp {
+            id,
+            result,
+            op: primal,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        }
+    }
+
+    fn list(ops: Vec<WengertOp>) -> WengertList {
+        WengertList {
+            ops,
+            output: 0,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        }
+    }
+
+    fn run(
+        fwd: &WengertList,
+        bwd: &WengertList,
+        seeds: &[(VarId, Vec<i64>)],
+        mirror: &[(VarId, VarId)],
+    ) -> HashMap<VarId, SizeInfo> {
+        let m: HashMap<VarId, Vec<i64>> = seeds.iter().cloned().collect();
+        propagate_size_info(fwd, bwd, &|v| m.get(&v).cloned(), &|_| None, mirror)
+    }
+
+    #[test]
+    fn matmul_batched_shapes_cross() {
+        // x:[2,3,8,16] @ w:[16,32] -> [2,3,8,32]; then relu keeps it.
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("w".into()), vec![]),
+            op(2, 2, PrimalOp::Matmul, vec![0, 1]),
+            op(3, 3, PrimalOp::Relu, vec![2]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![2, 3, 8, 16]), (1, vec![16, 32])], &[]);
+        assert_eq!(k.get(&2), Some(&Shape(vec![2, 3, 8, 32])));
+        assert_eq!(k.get(&3), Some(&Shape(vec![2, 3, 8, 32])));
+    }
+
+    #[test]
+    fn matmul_inner_dim_mismatch_refuses() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("w".into()), vec![]),
+            op(2, 2, PrimalOp::Matmul, vec![0, 1]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![4, 8]), (1, vec![16, 32])], &[]);
+        assert_eq!(k.get(&2), None);
+    }
+
+    #[test]
+    fn matmul_carries_numel_across_a_rank2_weight() {
+        // The load-bearing rule: input_ids reshaped at runtime (dims lost,
+        // count kept) still crosses `x @ W[16,32]`: 128 elems / 16 * 32 = 256.
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("shape_list".into()), vec![]),
+            op(2, 2, PrimalOp::Passthrough("reshape".into()), vec![0, 1]),
+            op(3, 3, PrimalOp::Param("w".into()), vec![]),
+            op(4, 4, PrimalOp::Matmul, vec![2, 3]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![8, 16]), (3, vec![16, 32])], &[]);
+        assert_eq!(k.get(&2), Some(&Numel(128)), "reshape keeps the count");
+        assert_eq!(k.get(&4), Some(&Numel(256)), "numel crosses a rank-2 matmul");
+    }
+
+    #[test]
+    fn matmul_numel_left_operand_rank2() {
+        // a:[4,16] known, b numel-only 16*32=512 -> out = 512*4/16 = 128.
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("a".into()), vec![]),
+            op(1, 1, PrimalOp::Input("b0".into()), vec![]),
+            op(2, 2, PrimalOp::Param("l".into()), vec![]),
+            op(3, 3, PrimalOp::Passthrough("reshape".into()), vec![1, 2]),
+            op(4, 4, PrimalOp::Matmul, vec![0, 3]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![4, 16]), (1, vec![16, 32])], &[]);
+        assert_eq!(k.get(&4), Some(&Numel(128)));
+    }
+
+    #[test]
+    fn binary_broadcast_and_the_equal_numel_refusal() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("a".into()), vec![]),
+            op(1, 1, PrimalOp::Input("b".into()), vec![]),
+            op(2, 2, PrimalOp::Add, vec![0, 1]), // [2,3,4] + [4] -> [2,3,4]
+            op(3, 3, PrimalOp::Input("c".into()), vec![]),
+            op(4, 4, PrimalOp::Input("d".into()), vec![]),
+            op(5, 5, PrimalOp::Mul, vec![3, 4]), // [3,1] * [1,3]: equal numel, differing shape
+            op(6, 6, PrimalOp::Input("e".into()), vec![]),
+            op(7, 7, PrimalOp::Sub, vec![0, 6]), // [2,3,4] - [2,1,4] -> [2,3,4]
+        ]);
+        let k = run(
+            &fwd,
+            &list(vec![]),
+            &[
+                (0, vec![2, 3, 4]),
+                (1, vec![4]),
+                (3, vec![3, 1]),
+                (4, vec![1, 3]),
+                (6, vec![2, 1, 4]),
+            ],
+            &[],
+        );
+        assert_eq!(k.get(&2), Some(&Shape(vec![2, 3, 4])));
+        assert_eq!(
+            k.get(&5),
+            None,
+            "equal-numel differing-shape binaries diverge by device and must refuse"
+        );
+        assert_eq!(k.get(&7), Some(&Shape(vec![2, 3, 4])));
+    }
+
+    #[test]
+    fn scalar_constant_broadcasts_without_losing_the_shape() {
+        // x * 0.02 (the coder init idiom): Constant is a 0-dim tensor.
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Constant(0.02), vec![]),
+            op(2, 2, PrimalOp::Mul, vec![0, 1]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![49152, 512])], &[]);
+        assert_eq!(k.get(&2), Some(&Shape(vec![49152, 512])));
+    }
+
+    #[test]
+    fn reductions_remove_the_dim_and_support_negative_indexing() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Sum { dim: Some(-1) }, vec![0]),
+            op(2, 2, PrimalOp::Mean { dim: Some(0) }, vec![0]),
+            op(3, 3, PrimalOp::Sum { dim: None }, vec![0]),
+            op(4, 4, PrimalOp::Softmax { dim: -1 }, vec![0]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![2, 3, 4])], &[]);
+        assert_eq!(k.get(&1), Some(&Shape(vec![2, 3])));
+        assert_eq!(k.get(&2), Some(&Shape(vec![3, 4])));
+        assert_eq!(k.get(&3), Some(&Shape(vec![1])));
+        assert_eq!(k.get(&4), Some(&Shape(vec![2, 3, 4])));
+    }
+
+    #[test]
+    fn embedding_takes_indices_numel_and_table_cols() {
+        // Real forward entry: dict_get [2,1024] -> runtime flatten (numel
+        // survives) -> embedding vs table [49152, 512] -> [2048, 512].
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("batch".into()), vec![]),
+            op(1, 1, PrimalOp::Passthrough("dict_get:input_ids".into()), vec![0]),
+            op(2, 2, PrimalOp::Param("l".into()), vec![]),
+            op(3, 3, PrimalOp::Passthrough("reshape".into()), vec![1, 2]),
+            op(4, 4, PrimalOp::Param("embed".into()), vec![]),
+            op(5, 5, PrimalOp::Embedding, vec![4, 3]),
+        ]);
+        let k = run(
+            &fwd,
+            &list(vec![]),
+            &[(1, vec![2, 1024]), (4, vec![49152, 512])],
+            &[],
+        );
+        assert_eq!(k.get(&5), Some(&Shape(vec![2048, 512])));
+    }
+
+    #[test]
+    fn static_reshape_recovers_dims_from_constant_lists_and_const_shape() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Constant(6.0), vec![]),
+            op(2, 2, PrimalOp::Constant(4.0), vec![]),
+            op(3, 3, PrimalOp::Passthrough("list".into()), vec![1, 2]),
+            op(4, 4, PrimalOp::Passthrough("reshape".into()), vec![0, 3]),
+            op(
+                5,
+                5,
+                PrimalOp::Passthrough(crate::lm_head_inference::const_shape_name(&[2, 12])),
+                vec![],
+            ),
+            op(6, 6, PrimalOp::Passthrough("reshape".into()), vec![0, 5]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![2, 3, 4])], &[]);
+        assert_eq!(k.get(&4), Some(&Shape(vec![6, 4])));
+        assert_eq!(k.get(&6), Some(&Shape(vec![2, 12])));
+    }
+
+    #[test]
+    fn static_reshape_contradicting_the_input_count_refuses() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Constant(7.0), vec![]),
+            op(2, 2, PrimalOp::Constant(4.0), vec![]),
+            op(3, 3, PrimalOp::Passthrough("list".into()), vec![1, 2]),
+            op(4, 4, PrimalOp::Passthrough("reshape".into()), vec![0, 3]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![2, 3, 4])], &[]);
+        assert_eq!(k.get(&4), None, "24 elems cannot become 28");
+    }
+
+    #[test]
+    fn reduce_to_shape_takes_the_target() {
+        let bwd = list(vec![
+            op(0, 10, PrimalOp::Constant(1.0), vec![]),
+            op(1, 11, PrimalOp::Passthrough("reduce_to_shape".into()), vec![10, 0]),
+        ]);
+        let fwd = list(vec![op(0, 0, PrimalOp::Param("gamma".into()), vec![])]);
+        let k = run(&fwd, &bwd, &[(0, vec![512])], &[]);
+        assert_eq!(k.get(&11), Some(&Shape(vec![512])));
+    }
+
+    #[test]
+    fn mirror_seeds_the_adjoint_between_sweeps() {
+        // Forward sizes h; the mirror hands h's shape to its accumulator;
+        // the adjoint sweep then sizes an op computed FROM the accumulator.
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Relu, vec![0]),
+        ]);
+        let bwd = list(vec![
+            op(0, 100, PrimalOp::Constant(1.0), vec![]),
+            op(1, 101, PrimalOp::Mul, vec![100, 50]), // 50 = h's adjoint accumulator
+        ]);
+        let k = run(&fwd, &bwd, &[(0, vec![8, 16])], &[(1, 50)]);
+        assert_eq!(k.get(&50), Some(&Shape(vec![8, 16])));
+        assert_eq!(k.get(&101), Some(&Shape(vec![8, 16])));
+    }
+
+    #[test]
+    fn data_dependent_and_device_divergent_ops_refuse() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Input("idx".into()), vec![]),
+            op(2, 2, PrimalOp::ScatterAdd { dim: 0 }, vec![0, 1]),
+            op(3, 3, PrimalOp::Gather { dim: 0 }, vec![0, 1]),
+            op(4, 4, PrimalOp::Concat { dim: 0 }, vec![0]),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![8, 16]), (1, vec![8])], &[]);
+        assert_eq!(k.get(&2), None, "ScatterAdd's leading dim is max(index)+1");
+        assert_eq!(k.get(&3), None, "Gather dim-0 semantics differ by device");
+        assert_eq!(k.get(&4), None, "Concat extents hide behind its list var");
+    }
+
+    #[test]
+    fn fused_ce_backward_shapes_come_from_the_op_fields() {
+        let mk = |component: u8, x_rank3: bool| PrimalOp::FusedLinearCeBackwardExtract {
+            component,
+            vocab_size: 49152,
+            hidden_size: 512,
+            batch_size: 2,
+            seq_len: 1024,
+            vocab_tile: 1024,
+            ignore_index: -100,
+            has_bias: false,
+            x_rank3,
+        };
+        let bwd = list(vec![
+            op(0, 100, PrimalOp::Constant(1.0), vec![]),
+            op(1, 101, mk(0, true), vec![100]),
+            op(2, 102, mk(0, false), vec![100]),
+            op(3, 103, mk(1, false), vec![100]),
+        ]);
+        let k = run(&list(vec![]), &bwd, &[], &[]);
+        assert_eq!(k.get(&101), Some(&Shape(vec![2, 1024, 512])));
+        assert_eq!(k.get(&102), Some(&Shape(vec![2048, 512])));
+        assert_eq!(k.get(&103), Some(&Shape(vec![49152, 512])));
+    }
+
+    #[test]
+    fn slice_replicates_the_runtime_clamp_and_padzero_restores() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(
+                1,
+                1,
+                PrimalOp::Slice { dim: 1, start: 2, end: 99, orig_dim_size: 10 },
+                vec![0],
+            ),
+            op(
+                2,
+                2,
+                PrimalOp::PadZero { dim: 1, pad_before: 2, pad_after: 0 },
+                vec![1],
+            ),
+        ]);
+        let k = run(&fwd, &list(vec![]), &[(0, vec![4, 10])], &[]);
+        assert_eq!(k.get(&1), Some(&Shape(vec![4, 8])), "end clamps to dim size");
+        assert_eq!(k.get(&2), Some(&Shape(vec![4, 10])));
+    }
+
+    #[test]
+    fn sdpa_requires_the_uniform_regime() {
+        let sdpa = |r, q, k_, v| {
+            op(
+                r,
+                r,
+                PrimalOp::ScaledDotProductAttention { causal: true },
+                vec![q, k_, v],
+            )
+        };
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("q".into()), vec![]),
+            op(1, 1, PrimalOp::Input("k".into()), vec![]),
+            op(2, 2, PrimalOp::Input("v".into()), vec![]),
+            sdpa(3, 0, 1, 2),
+            op(4, 4, PrimalOp::Input("k2".into()), vec![]),
+            sdpa(5, 0, 4, 2),
+        ]);
+        let k = run(
+            &fwd,
+            &list(vec![]),
+            &[
+                (0, vec![2, 8, 128, 64]),
+                (1, vec![2, 8, 128, 64]),
+                (2, vec![2, 8, 128, 64]),
+                (4, vec![2, 4, 128, 64]), // GQA-unexpanded K: refuse
+            ],
+            &[],
+        );
+        assert_eq!(k.get(&3), Some(&Shape(vec![2, 8, 128, 64])));
+        assert_eq!(k.get(&5), None, "K not q-shaped -> outside the proven regime");
+    }
+
+    #[test]
+    fn flash_backward_extract_mirrors_q_k_v() {
+        let ext = |r, c| {
+            op(
+                r,
+                r,
+                PrimalOp::FlashAttentionBackwardExtract { causal: true, component: c },
+                vec![10, 0, 1, 2, 11],
+            )
+        };
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("q".into()), vec![]),
+            op(1, 1, PrimalOp::Input("k".into()), vec![]),
+            op(2, 2, PrimalOp::Input("v".into()), vec![]),
+        ]);
+        let bwd = list(vec![ext(20, 0), ext(21, 1), ext(22, 2)]);
+        let k = run(
+            &fwd,
+            &bwd,
+            &[
+                (0, vec![2, 8, 128, 64]),
+                (1, vec![2, 4, 128, 64]),
+                (2, vec![2, 4, 128, 64]),
+            ],
+            &[],
+        );
+        assert_eq!(k.get(&20), Some(&Shape(vec![2, 8, 128, 64])), "dQ is Q-shaped");
+        assert_eq!(k.get(&21), Some(&Shape(vec![2, 4, 128, 64])), "dK is K-shaped under GQA");
+        assert_eq!(k.get(&22), Some(&Shape(vec![2, 4, 128, 64])), "dV is V-shaped under GQA");
+    }
+
+    #[test]
+    fn norm_backward_ffi_shapes_follow_the_non_first_inputs() {
+        let bwd = list(vec![
+            op(0, 100, PrimalOp::Constant(1.0), vec![]),
+            op(
+                1,
+                101,
+                PrimalOp::Passthrough("rmsnorm_dgamma_backward:4562254508917369340".into()),
+                vec![100, 0, 1],
+            ),
+            op(
+                2,
+                102,
+                PrimalOp::Passthrough("rmsnorm_dx_backward:4562254508917369340".into()),
+                vec![100, 0, 1],
+            ),
+            op(3, 103, PrimalOp::Passthrough("embedding_backward".into()), vec![100, 2, 3]),
+            op(4, 104, PrimalOp::Passthrough("cross_entropy_backward".into()), vec![100, 4, 5]),
+        ]);
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("gamma".into()), vec![]),
+            op(2, 2, PrimalOp::Input("idx".into()), vec![]),
+            op(3, 3, PrimalOp::Param("table".into()), vec![]),
+            op(4, 4, PrimalOp::Input("logits".into()), vec![]),
+            op(5, 5, PrimalOp::Input("targets".into()), vec![]),
+        ]);
+        let k = run(
+            &fwd,
+            &bwd,
+            &[
+                (0, vec![2, 128, 512]),
+                (1, vec![512]),
+                (3, vec![49152, 512]),
+                (4, vec![256, 49152]),
+            ],
+            &[],
+        );
+        assert_eq!(k.get(&101), Some(&Shape(vec![512])), "dgamma is gamma-shaped");
+        assert_eq!(k.get(&102), Some(&Shape(vec![2, 128, 512])), "dx is x-shaped");
+        assert_eq!(k.get(&103), Some(&Shape(vec![49152, 512])), "d(table) is table-shaped");
+        assert_eq!(k.get(&104), Some(&Shape(vec![256, 49152])), "dlogits is logits-shaped");
+    }
+
+    #[test]
+    fn overflow_and_nonpositive_dims_refuse() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Relu, vec![0]),
+        ]);
+        // Overflowing product: i64::MAX * 2 as u64 product overflows.
+        let k = run(&fwd, &list(vec![]), &[(0, vec![i64::MAX, 2])], &[]);
+        assert_eq!(k.get(&0), None, "an overflowing seed is not a size");
+        assert_eq!(k.get(&1), None);
+        let k2 = run(&fwd, &list(vec![]), &[(0, vec![4, 0])], &[]);
+        assert_eq!(k2.get(&1), None, "a zero dim is a sentinel, not a size");
     }
 }

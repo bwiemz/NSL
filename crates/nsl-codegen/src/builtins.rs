@@ -672,6 +672,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_grad_integrity_step_end", &[], None),
     // Prefetch tensor to GPU asynchronously
     ("nsl_tensor_prefetch", &[types::I64, types::I64], None),
+    // Milestone C p2 Stage-2B: the placed transient arena. `bind` arms a
+    // single-shot, size-exact pin that the device allocator consumes; `unbind`
+    // disarms it so an op that took a non-allocating path cannot leak the pin
+    // into an unrelated allocation.
+    ("nsl_arena_init", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_arena_bind", &[types::I64, types::I64, types::I64], None),
+    ("nsl_arena_unbind", &[], None),
+    ("nsl_arena_check", &[], Some(types::I64)),
+    ("nsl_arena_check_step", &[types::I64], None),
+    ("nsl_arena_destroy", &[], None),
     // M36: GPU memory slab (compile-time planned device memory arena)
     ("nsl_gpu_slab_init", &[types::I64], Some(types::I64)),
     (
