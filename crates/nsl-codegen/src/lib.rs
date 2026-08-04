@@ -174,6 +174,8 @@ pub mod fusion;
 pub mod fusion_report;
 pub mod inspect;
 pub mod memory_planner;
+/// Item 2 step 4: the typed inter-pass channels, and their traffic.
+pub mod pass_bus;
 pub mod pass_registry;
 /// Item 2 step 1: records which registered passes actually ran, in order.
 pub mod pass_trace;

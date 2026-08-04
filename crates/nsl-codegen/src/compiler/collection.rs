@@ -839,7 +839,7 @@ impl Compiler<'_> {
                 // table of adapter-tensor pointers. At construction time the
                 // slot is zero-initialised; actual tensor allocation happens
                 // in a later pass (after `invoke_wrga_if_enabled` populates
-                // `last_wrga_plan`). Field access for synthesized adapter
+                // `bus.wrga_plan`). Field access for synthesized adapter
                 // names routes through this slot — see
                 // `expr/access.rs::is_synthesized_adapter_field_name`.
                 let adapter_sidetable_offset = if self

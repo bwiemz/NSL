@@ -684,6 +684,11 @@ const NOT_A_PASS: &[(&str, &str)] = &[
         "per-parameter storage plan (roadmap item 3) — a derived description \
          consumed by the registration sites, not a tree-transforming pass",
     ),
+    (
+        "pass_bus",
+        "the typed inter-pass channels (roadmap item 2 step 4) — carries what \
+         passes produce for each other, is not itself a pass",
+    ),
     ("pass_registry", "this registry"),
     (
         "pass_trace",

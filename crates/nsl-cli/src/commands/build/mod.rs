@@ -81,4 +81,10 @@ pub fn emit_pass_trace() {
         return;
     }
     eprint!("{}", nsl_codegen::pass_trace::report());
+    // Step 4: the bus report goes out with the trace, from the same emitter
+    // and under the same env var, because its `SILENT DEFAULT` finding is
+    // computed by cross-referencing the two — a channel read while empty is
+    // only a finding once you know its producing pass ran. Two emitters could
+    // reach different terminal paths and print half the picture.
+    eprint!("{}", nsl_codegen::pass_bus::report());
 }

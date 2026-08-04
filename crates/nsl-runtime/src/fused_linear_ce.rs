@@ -202,6 +202,473 @@ pub extern "C" fn nsl_fused_lce_launch_count(kind: i64) -> i64 {
     }
 }
 
+/// Kill switch for the `@fused_lm_ce` shape-hint pin.
+///
+/// The pin aborts, so a false positive would be unfixable without rebuilding
+/// the compiler. Every comparable mechanism in this subsystem has an escape
+/// hatch (`NSL_FUSED_LCE_GEMM=0`, `NSL_FA_FWD_MMA=0`); this is that hatch. It
+/// still PRINTS the diagnostic — silencing the guard entirely would hide the
+/// wrong hint as well as the abort.
+fn hint_pin_disabled() -> bool {
+    std::env::var_os("NSL_FUSED_LCE_HINT_PIN").as_deref() == Some(std::ffi::OsStr::new("0"))
+}
+
+/// A `[dim, stride]` pair list, as the kernels will actually read the tensor.
+///
+/// Borrows rather than owns: this is built and torn down on every
+/// `@fused_lm_ce` forward AND backward call (i.e. every training step), so an
+/// owned `Vec` here would be a heap alloc/free pair on the hot path purely to
+/// satisfy this struct -- the memory-slab invariant the compiler enforces
+/// elsewhere for exactly this reason.
+struct Extents<'a> {
+    shape: &'a [i64],
+    strides: &'a [i64],
+    len: i64,
+}
+
+/// Pin the `@fused_lm_ce` shape hints against the tensors they describe.
+///
+/// `vocab_size` / `hidden_size` / `batch_size` / `seq_len` are hand-written
+/// decorator literals — nothing in the compiler derives them from the model,
+/// so a hand-copy that disagrees with the real head reaches the kernels
+/// intact. The kernels then stride `x` as `[rows, h]` and `W` as `[v, h]`
+/// with no bounds check of their own.
+///
+/// A too-SMALL `hidden_size` surfaces downstream as a tensor-shape mismatch,
+/// but a too-LARGE one reads off the end of the activation allocation:
+/// measured on Coder-50M with `hidden_size = 1024` against a `d_model = 512`
+/// head, the run died at `cuMemcpyHtoD_v2 ... CUDA_ERROR_ILLEGAL_ADDRESS
+/// [context: rmsnorm_f32]` and then aborted through `panic in a function that
+/// cannot unwind` — a diagnostic that names neither the decorator nor the
+/// hint. Worse, an overread that lands inside pool slack produces no error at
+/// all, just a wrong loss.
+///
+/// # Why this compares SHAPES and not just element counts
+///
+/// Counts alone let a `batch_size`/`seq_len` SWAP through: the forward FFI
+/// collapses the pair into `rows = b * s`, so `4 x 256` and `256 x 4` are
+/// indistinguishable there. The backward does not collapse it — it allocates
+/// `dx` as `[batch_size, seq_len, hidden_size]` on the rank-3 path — so a
+/// swapped pair yields a `dx` with the right rank and element count and the
+/// wrong dims, flowing into the shape-sensitive norm/residual backward.
+/// Comparing `x`'s actual dims closes that.
+///
+/// The density check is the same guard [`nsl_fused_lce_targets_i64_alloc`]
+/// applies to labels, for the same reason: the kernels walk these buffers
+/// linearly, so a broadcast view (stride 0) or a non-contiguous slice is
+/// silently misread rather than refused.
+///
+/// # Ordering
+///
+/// `rows` is an INPUT here, not something this function validates, so every
+/// `x` mismatch would otherwise be blamed on `hidden_size` — including one
+/// actually caused by a wrong `batch_size`. The lowering therefore emits this
+/// AFTER `nsl_fused_lce_targets_i64_alloc`, which pins `rows` against the
+/// label tensor. By the time this runs, `rows` is trustworthy and the
+/// attribution below is sound.
+///
+/// `Ok(())` when the hints agree, or when a non-positive hint makes the pin
+/// meaningless — this exists to catch a wrong shape, not to add a new
+/// refusal class for shapes the rest of the stack already rejects.
+fn check_hint_extents(
+    site: &str,
+    x: &Extents<'_>,
+    w: &Extents<'_>,
+    batch: i64,
+    seq: i64,
+    v: i64,
+    h: i64,
+) -> Result<(), String> {
+    let rows = match batch.checked_mul(seq) {
+        Some(r) if r > 0 => r,
+        _ => return Ok(()),
+    };
+    if v <= 0 || h <= 0 || x.len <= 0 || w.len <= 0 {
+        return Ok(());
+    }
+
+    // `x` is the head input: `[B, S, H]` on the rank-3 path, or the flattened
+    // `[B*S, H]`. Both are accepted; anything else is not a head input.
+    // Element COUNTS are equal for both forms and for the 16-bit dtype casts
+    // (which change bytes per element, not the count), but the dims are what
+    // the backward's `dx` allocation is built from -- so compare those.
+    let x_ok = match x.shape {
+        [b, s, hh] => *b == batch && *s == seq && *hh == h,
+        [r, hh] => *r == rows && *hh == h,
+        _ => false,
+    };
+    if !x_ok {
+        let implied_h = (x.len % rows == 0).then(|| x.len / rows);
+        return Err(format!(
+            "{site}: the @fused_lm_ce decorator pins batch_size = {batch}, \
+             seq_len = {seq}, hidden_size = {h}, but the head's input tensor \
+             is {:?}{}. The fused kernel strides it as [batch_size * seq_len, \
+             hidden_size] with no bounds check of its own, and the backward \
+             allocates dx as [batch_size, seq_len, hidden_size] -- so a \
+             mismatch here reads past the allocation \
+             (CUDA_ERROR_ILLEGAL_ADDRESS, or a silently wrong loss when the \
+             overread lands in allocator slack), or produces a dx with the \
+             wrong dims. Correct the hints on @fused_lm_ce to match the model \
+             and the DataLoader.",
+            x.shape,
+            match implied_h {
+                Some(hh) if hh != h => format!(" -- its {} elements over {rows} row(s) imply hidden_size = {hh}", x.len),
+                _ => String::new(),
+            }
+        ));
+    }
+
+    // `W` is the LM head `[V, H]`. `h` is trustworthy by the check above.
+    if w.shape != [v, h] {
+        let implied_v = (w.len % h == 0).then(|| w.len / h);
+        return Err(format!(
+            "{site}: the @fused_lm_ce decorator pins vocab_size = {v} (at \
+             hidden_size = {h}), but the LM-head weight is {:?}{}. The fused \
+             kernel strides it as [vocab_size, hidden_size] with no bounds \
+             check of its own, so it would read past the allocation. Correct \
+             vocab_size on @fused_lm_ce to the model's vocabulary.",
+            w.shape,
+            match implied_v {
+                Some(vv) if vv != v => format!(" -- implying vocab_size = {vv}"),
+                _ => String::new(),
+            }
+        ));
+    }
+
+    for (name, t) in [("head input (x)", x), ("LM-head weight (W)", w)] {
+        let mut dense_extent: i64 = 1;
+        let mut has_zero_stride = false;
+        for (&dim, &st) in t.shape.iter().zip(t.strides.iter()) {
+            if dim > 1 && st == 0 {
+                has_zero_stride = true;
+            }
+            dense_extent += st * (dim - 1).max(0);
+        }
+        if has_zero_stride || dense_extent != t.len {
+            return Err(format!(
+                "{site}: non-contiguous {name} (dense extent {dense_extent} \
+                 vs len {}, zero-stride={has_zero_stride}). The fused kernel \
+                 walks it linearly, so a broadcast or strided view is \
+                 silently misread -- call .contiguous() before the fused \
+                 loss.",
+                t.len
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Read the two head tensors and abort with [`check_hint_extents`]'s
+/// diagnostic if the `@fused_lm_ce` hints disagree with them.
+///
+/// # Why this takes TENSOR handles, not the kernel's pointers
+///
+/// The five `nsl_fused_linear_ce_*` entry points below receive `x_ptr` /
+/// `w_ptr` as raw DEVICE DATA pointers — the lowering passes
+/// `nsl_tensor_data_ptr(x_t)`, and the kernels stride them from the hints
+/// alone. There is no shape to compare against at that boundary, which is
+/// precisely why a wrong hint reaches the hardware. Reinterpreting one of
+/// those addresses as an `NslTensor` reads device memory as a host struct:
+/// tried, and it killed the CORRECT run too — silently, because
+/// `NslTensor::from_ptr`'s magic check is a `debug_assert!` and CI and
+/// production both ship release builds. Hence the explicit `TENSOR_MAGIC`
+/// check here: passing a data pointer where a handle belongs is one careless
+/// edit away at the call sites, and it must diagnose rather than corrupt.
+///
+/// So the pin belongs at the lowering, where `x_t` and `w_t` are still tensor
+/// values — the same place and shape of guard as
+/// [`nsl_fused_lce_targets_i64_alloc`], which pins `batch_size * seq_len`
+/// against the label tensor.
+///
+/// Aborts rather than returning an error code: the codegen call sites
+/// discard these functions' return values, so a refusal that returns is a
+/// refusal nobody hears.
+#[no_mangle]
+pub extern "C" fn nsl_fused_lce_pin_hint_extents(
+    x_tensor_ptr: i64,
+    w_tensor_ptr: i64,
+    batch: i64,
+    seq: i64,
+    v: i64,
+    h: i64,
+) {
+    const SITE: &str = "@fused_lm_ce shape-hint pin";
+    let extents_of = |ptr: i64, what: &str| -> Extents {
+        if ptr == 0 {
+            eprintln!("{SITE}: null {what} tensor");
+            std::process::abort();
+        }
+        // NOT `NslTensor::from_ptr`: its magic check is a `debug_assert!`,
+        // so in the release builds we ship it would silently reinterpret a
+        // device data pointer as a host struct instead of diagnosing.
+        let t = unsafe { &*(ptr as *const crate::tensor::NslTensor) };
+        if t.magic != crate::tensor::TENSOR_MAGIC {
+            eprintln!(
+                "{SITE}: {what} is not an NslTensor handle (magic \
+                 0x{:08X} at 0x{ptr:X}, expected 0x{:08X}). The pin needs \
+                 the tensor, not the `nsl_tensor_data_ptr` result the \
+                 kernels take.",
+                t.magic,
+                crate::tensor::TENSOR_MAGIC
+            );
+            std::process::abort();
+        }
+        let ndim = t.ndim.max(0) as usize;
+        Extents {
+            shape: unsafe { std::slice::from_raw_parts(t.shape, ndim) },
+            strides: unsafe { std::slice::from_raw_parts(t.strides, ndim) },
+            len: t.len,
+        }
+    };
+    let x = extents_of(x_tensor_ptr, "head input (x)");
+    let w = extents_of(w_tensor_ptr, "LM-head weight (W)");
+    if let Err(msg) = check_hint_extents(SITE, &x, &w, batch, seq, v, h) {
+        if hint_pin_disabled() {
+            eprintln!("{msg}\n{SITE}: NSL_FUSED_LCE_HINT_PIN=0 set — continuing anyway.");
+            return;
+        }
+        eprintln!("{msg}");
+        std::process::abort();
+    }
+}
+
+#[cfg(test)]
+mod hint_extent_tests {
+    //! Unit coverage for the `@fused_lm_ce` hint pin.
+    //!
+    //! These run without a GPU because [`super::check_hint_extents`] takes
+    //! shapes and strides rather than tensor pointers. The end-to-end proof
+    //! that the pin actually fires — a real `nsl run` with a wrong
+    //! `hidden_size`, aborting instead of dying at
+    //! `CUDA_ERROR_ILLEGAL_ADDRESS` — is the GPU gate
+    //! `crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs`. It has to live
+    //! there and not here: the guard aborts the process, so no in-process
+    //! `#[should_panic]` can observe it.
+
+    use super::{check_hint_extents, Extents};
+
+    /// Coder-50M's actual head: batch 1 x seq 1024, d_model 512, vocab 49152.
+    const B: i64 = 1;
+    const S: i64 = 1024;
+    const H: i64 = 512;
+    const V: i64 = 49152;
+
+    /// A contiguous tensor of `shape` (row-major strides), as every real
+    /// head input and LM-head weight is. `stride0_override` lets the
+    /// non-contiguous-input tests bake in a broadcast/strided dim 0 without
+    /// mutating in place — `Extents` borrows now (see its doc comment), so
+    /// the backing storage is leaked to get a `'static` slice. That's fine
+    /// for a handful of small test fixtures; it would not be fine on the
+    /// production path this struct also serves, which is the point.
+    fn dense_with_stride0(shape: &[i64], stride0_override: Option<i64>) -> Extents<'static> {
+        let mut strides = vec![1i64; shape.len()];
+        for i in (0..shape.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+        if let (Some(s0), true) = (stride0_override, !strides.is_empty()) {
+            strides[0] = s0;
+        }
+        Extents {
+            shape: shape.to_vec().leak(),
+            strides: strides.leak(),
+            len: shape.iter().product(),
+        }
+    }
+
+    fn dense(shape: &[i64]) -> Extents<'static> {
+        dense_with_stride0(shape, None)
+    }
+
+    fn check(x: &Extents<'_>, w: &Extents<'_>, b: i64, s: i64, v: i64, h: i64) -> Result<(), String> {
+        check_hint_extents("test_site", x, w, b, s, v, h)
+    }
+
+    /// The shipped shape: rank-3 `[B, S, H]` head input.
+    fn ok3() -> (Extents<'static>, Extents<'static>) {
+        (dense(&[B, S, H]), dense(&[V, H]))
+    }
+
+    #[test]
+    fn agreeing_hints_pass() {
+        let (x, w) = ok3();
+        assert!(check(&x, &w, B, S, V, H).is_ok());
+    }
+
+    /// The flattened `[B*S, H]` form is equally valid — the matcher accepts
+    /// either, so the pin must too.
+    ///
+    /// Unlike the count-based version of this test, this one CAN fail: the
+    /// rank-2 arm is a distinct branch with its own comparison.
+    #[test]
+    fn flattened_rank2_input_is_accepted() {
+        let x = dense(&[B * S, H]);
+        assert!(check(&x, &dense(&[V, H]), B, S, V, H).is_ok());
+    }
+
+    /// A rank the head never produces is not silently accepted.
+    #[test]
+    fn unexpected_rank_is_refused() {
+        let x = dense(&[B, S, H / 2, 2]);
+        assert!(check(&x, &dense(&[V, H]), B, S, V, H).is_err());
+    }
+
+    /// The measured production failure: `hidden_size` larger than the real
+    /// `d_model`, which used to reach the kernel and read past the
+    /// activation allocation.
+    #[test]
+    fn hidden_size_too_large_is_refused_and_names_the_real_value() {
+        let (x, w) = ok3();
+        let err = check(&x, &w, B, S, V, 1024).unwrap_err();
+        assert!(err.contains("hidden_size = 1024"), "must quote the wrong hint: {err}");
+        assert!(
+            err.contains("hidden_size = 512"),
+            "must name the value the tensor implies, so the fix is mechanical: {err}"
+        );
+        assert!(err.contains("@fused_lm_ce"), "must point at the decorator: {err}");
+    }
+
+    #[test]
+    fn hidden_size_too_small_is_refused() {
+        let (x, w) = ok3();
+        let err = check(&x, &w, B, S, V, 256).unwrap_err();
+        assert!(err.contains("hidden_size = 256"), "{err}");
+        assert!(err.contains("hidden_size = 512"), "{err}");
+    }
+
+    #[test]
+    fn vocab_size_mismatch_is_refused_and_names_the_real_value() {
+        let (x, w) = ok3();
+        let err = check(&x, &w, B, S, 49151, H).unwrap_err();
+        assert!(err.contains("vocab_size = 49151"), "{err}");
+        assert!(err.contains("vocab_size = 49152"), "{err}");
+    }
+
+    /// REVIEW FINDING. `x` is diagnosed before `W`, so a run with both wrong
+    /// gets the `x` message — a `vocab_size` derived from an `h` that is
+    /// itself wrong would send the reader somewhere useless.
+    ///
+    /// Asserting `err.contains("hidden_size")` would be VACUOUS here: the
+    /// vocab message also mentions hidden_size ("pins vocab_size = V (at
+    /// hidden_size = H)"). Discriminate on the phrase only one branch uses,
+    /// and assert the absence of the other branch's.
+    #[test]
+    fn the_input_tensor_is_diagnosed_before_the_weight() {
+        let (x, w) = ok3();
+        let err = check(&x, &w, B, S, 49151, 1024).unwrap_err();
+        assert!(
+            err.contains("the head's input tensor"),
+            "with both wrong, x must be reported first: {err}"
+        );
+        assert!(
+            !err.contains("the LM-head weight is"),
+            "the weight branch must not also fire: {err}"
+        );
+    }
+
+    /// REVIEW FINDING. Counts alone cannot see a `batch_size`/`seq_len` swap
+    /// — the forward collapses them to `rows`, but the backward allocates
+    /// `dx` as `[batch_size, seq_len, hidden_size]`, so a swapped pair
+    /// yields a `dx` with the right element count and the wrong dims.
+    #[test]
+    fn transposed_batch_and_seq_is_refused_despite_matching_row_count() {
+        let x = dense(&[4, 256, H]);
+        let w = dense(&[V, H]);
+        // rows = 1024 either way, and the element count is identical.
+        assert!(check(&x, &w, 4, 256, V, H).is_ok(), "the true pair must pass");
+        let err = check(&x, &w, 256, 4, V, H).unwrap_err();
+        assert!(
+            err.contains("batch_size = 256") && err.contains("seq_len = 4"),
+            "the swap must be refused and both hints quoted: {err}"
+        );
+    }
+
+    /// REVIEW FINDING. The kernels walk `x` and `W` linearly, so a broadcast
+    /// view (stride 0) or a non-contiguous slice is silently misread. Same
+    /// guard the targets pin applies to labels.
+    #[test]
+    fn non_contiguous_input_is_refused() {
+        // Batch 4, not the shipped 1: a stride of 0 on a size-1 dim is
+        // genuinely harmless, so broadcasting over a 1-wide batch would (and
+        // did, when this test was first written) pass correctly.
+        let x = dense_with_stride0(&[4, 256, H], Some(0)); // one row broadcast across the batch
+        let err = check(&x, &dense(&[V, H]), 4, 256, V, H).unwrap_err();
+        assert!(err.contains("non-contiguous"), "{err}");
+        assert!(err.contains(".contiguous()"), "must name the fix: {err}");
+    }
+
+    /// The companion to the case above: a stride of 0 on a SIZE-1 dim is not
+    /// a broadcast of anything and must not be refused. Without this, the
+    /// obvious "any zero stride is bad" tightening would look correct and
+    /// would reject the shipped `batch_size = 1` shape.
+    #[test]
+    fn zero_stride_on_a_size_one_dim_is_not_a_broadcast() {
+        let x = dense_with_stride0(&[B, S, H], Some(0));
+        assert!(check(&x, &dense(&[V, H]), B, S, V, H).is_ok());
+    }
+
+    #[test]
+    fn non_contiguous_weight_is_refused() {
+        let w = dense_with_stride0(&[V, H], Some(H * 2)); // a row-strided slice of a wider buffer
+        let err = check(&dense(&[B, S, H]), &w, B, S, V, H).unwrap_err();
+        assert!(err.contains("non-contiguous"), "{err}");
+        assert!(err.contains("LM-head weight"), "must name which tensor: {err}");
+    }
+
+    /// The pin exists to catch a wrong shape, not to become a new refusal
+    /// class for degenerate inputs the rest of the stack already rejects.
+    #[test]
+    fn non_positive_inputs_are_not_a_new_refusal() {
+        let (x, w) = ok3();
+        for (b, s, v, h) in [(0, S, V, H), (B, 0, V, H), (B, S, 0, H), (B, S, V, 0), (-1, S, V, H)] {
+            assert!(
+                check(&x, &w, b, s, v, h).is_ok(),
+                "degenerate hint ({b}, {s}, {v}, {h}) must not refuse"
+            );
+        }
+        let empty = Extents { shape: &[], strides: &[], len: 0 };
+        assert!(check(&empty, &w, B, S, V, H).is_ok(), "empty x must not refuse");
+        assert!(check(&x, &empty, B, S, V, H).is_ok(), "empty w must not refuse");
+    }
+
+    /// ANTI-VACUITY. Every assertion above except `agreeing_hints_pass` is on
+    /// an `unwrap_err`, so they would all hold against a function that
+    /// refused unconditionally — including one that broke every correct
+    /// `@fused_lm_ce` program in the repo. Walk a neighbourhood of the true
+    /// shape and pin that exactly one point in it is accepted.
+    #[test]
+    fn only_the_agreeing_shape_is_accepted() {
+        let (x, w) = ok3();
+        let mut accepted = 0;
+        for h in [256, 480, 512, 1024] {
+            for v in [49151, 49152] {
+                for (b, s) in [(B, S), (S, B), (2, 512)] {
+                    if check(&x, &w, b, s, v, h).is_ok() {
+                        accepted += 1;
+                        assert_eq!(
+                            (b, s, v, h),
+                            (B, S, V, H),
+                            "accepted a wrong shape: b={b} s={s} v={v} h={h}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(accepted, 1, "the true shape must be accepted exactly once");
+    }
+
+    /// Overflow must not wrap into a false accept: `batch * seq` at i64
+    /// extremes returns `None` from `checked_mul`, which is treated as
+    /// "no meaningful pin" rather than as a match.
+    #[test]
+    fn overflowing_hints_do_not_wrap_into_a_false_accept() {
+        let (x, w) = ok3();
+        assert!(check(&x, &w, i64::MAX, i64::MAX, V, H).is_ok());
+        // ...and a merely-large-but-wrong pair is still refused.
+        assert!(check(&x, &w, i64::MAX, 1, V, H).is_err());
+    }
+}
+
 /// Targets dtype bridge for the fused linear-CE kernels.
 ///
 /// The kernels read targets with `ld.global.s64` — the direct-FFI test

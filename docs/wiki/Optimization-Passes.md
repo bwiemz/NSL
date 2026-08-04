@@ -68,14 +68,14 @@ The optimization passes that operate on the `WengertList` run inside `compile_tr
 2. **Source AD extraction** — `WengertExtractor::extract_stmts` builds the `WengertList`.
 3. **Calibration** — optional; runs the calibration harness and populates `calibration_sidecar` if `--calibration-data` is set. Feeds gradient-importance scores to WGGO.
 4. **WGGO** — `wggo::run_on_wengert_with_weights`; consumes the `WengertList` and emits a `WggoPlan` + `AppliedPlan`. Stashes `WggoOverrides` for all downstream passes (and for the NEXT compile's FASE planning).
-5. **CSHA** — `csha::run_on_wengert`; consumes the `WengertList` + `WggoOverrides`; emits a `CshaPlan` and bridges it into kernel-site annotations (`last_csha_bridge`).
+5. **CSHA** — `csha::run_on_wengert`; consumes the `WengertList` + `WggoOverrides`; emits a `CshaPlan` and bridges it into kernel-site annotations (the `csha_bridge` channel — see the pass bus below).
 6. **WRGA** — `invoke_wrga_if_enabled`; consumes the `WengertList`; runs dead-gradient elimination (`wrga_prune`), rank allocation (`wrga_roofline`), memory planning (`wrga_memory`), and fusion decisions (`wrga_fusion`).
 7. **CPDT** — `invoke_cpdt_if_enabled`; consumes the `AppliedPlan` from WGGO. **CPDT is a no-op unless WGGO produced a plan first.**
 8. **Source-AD adjoint generation + lowering** — `AdjointGenerator` rewrites the pruned `WengertList` into an adjoint program; `wengert_lower` lowers it to Cranelift IR.
 9. **CCR (Compiler-Chosen Recomputation)** — straddles step 8. Its *planning* half (`ccr::plan`, `select_partition_dp`, `apply_budget`) runs on the PRIMAL tape before `AdjointGenerator`, segmenting per transformer block and classifying each result as escaping or interior; its *rewriting* half (`apply_to_adjoint`, `splice_decompress`, `insert_adjoint_last_use_frees`) then early-frees the interiors and splices recompute clones into the generated adjoint. Driven by `--checkpoint-blocks` / `--checkpoint-stride`; see the per-pass description below.
 10. **Memory planner (M36)** — runs after all user-function bodies are compiled, before `compile_main`. See above.
 
-**Pass ordering is load-bearing.** FASE planning reads `wggo_overrides` from the compiler state, which is set by a prior WGGO run — on a fresh first-pass compile, FASE falls back to `fase::plan` (no overrides). CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT hard-depends on WGGO: if `--wggo` is absent, `cpdt_plan` remains `None`. The memory planner (M36) must run after `compile_user_functions` and before `compile_main`; reversing this order means the slab-initialization call is emitted before the plan is computed.
+**Pass ordering is load-bearing.** FASE planning reads `wggo_overrides` from the compiler state, which is set by a prior WGGO run — on a fresh first-pass compile, FASE falls back to `fase::plan` (no overrides). CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT hard-depends on WGGO: if `--wggo` is absent, the `cpdt_plan` channel is never published. The memory planner (M36) must run after `compile_user_functions` and before `compile_main`; reversing this order means the slab-initialization call is emitted before the plan is computed.
 
 ## Observing which passes ran (`NSL_PASS_TRACE`)
 
@@ -103,6 +103,97 @@ Two things the trace deliberately does not do:
 - It does **not** change the build. The whole mechanism is two compiler-side vectors of `Copy` data; nothing is emitted into the compiled program. `crates/nsl-cli/tests/pass_trace_gate.rs` pins that by comparing loss streams with the trace on and off.
 
 Implementation: [`crates/nsl-codegen/src/pass_trace.rs`](../../crates/nsl-codegen/src/pass_trace.rs), printed from `emit_pass_trace` in [`crates/nsl-cli/src/commands/build/mod.rs`](../../crates/nsl-cli/src/commands/build/mod.rs).
+
+## How passes reach each other: the pass bus (`[pass-bus]`)
+
+The trace above answers *which passes ran*. It does not answer how one pass's
+output reaches another. That happens through the **pass bus**: twelve channels
+on `compiler.bus`, each filled by exactly one pass and read by later stages.
+
+| Channel | Producer | Read by |
+| --- | --- | --- |
+| `csha_bridge` | CSHA | the FlashAttention call site, Wengert lowering |
+| `csha_claimed_ops` | CSHA | `Compiler::is_csha_claimed` |
+| `csha_backward_claims` | CSHA | the source-AD reverse walk, CCR's claim exemption |
+| `wrga_plan` | WRGA | adapter init/inject, `compile*_returning_plan` |
+| `adapter_prescan_plan` | WRGA | train-block adapter injection |
+| `adapter_sites` | WRGA | adapter rewrite, synthesized-field access |
+| `cpkd_plan` | CPKD | the distillation build report |
+| `cpdt_plan` | CPDT | the precision-adaptive optimizer path |
+| `cfie_plan` | CFIE | the build report |
+| `cfie_serve_gen` | CFIE | the `generate()` rewrite |
+| `wggo_overrides` | WGGO | FASE recipe selection, the per-parameter mode table, CSHA's and WRGA's inputs |
+| `wggo_preplans` | WGGO | kernel synthesis, the train-block driver |
+
+These are the edges a future pass *manager* would order by, and the
+pass-to-pass subset is now **declared**: where a channel's value feeds another
+pass's planning, its descriptor names that pass in `consumed_by_passes`
+(`wggo_overrides` → FASE, CSHA, WRGA). `PipelineStage` cannot do that job —
+`WGGO(OnWengert)` runs before `FASE(PreExtraction)` because a different driver
+invokes it — but a data dependency orders by construction.
+
+Each declared edge carries an `OrderClaim`, and the distinction it draws is
+not decoration: for CSHA and WRGA, "WGGO is invoked first" genuinely holds
+whenever both run, and the report checks it (`DEPENDENCY ORDER` line on
+violation). For FASE it is **false** — a train block whose pre-plan is missing
+or fingerprint-rejected re-invokes WGGO *in place*, after FASE already planned
+— so that edge claims only the value-level order, with a different guard per
+path: on the rejected-pre-plan path FASE consumed the pre-pass publish and the
+driver hard-refuses if the replan diverges from it; on the missing-pre-plan
+path FASE read the channel empty and fell back, so no mode table exists to go
+stale. The `STAGE ORDER` line uses the same edges in the other direction: an
+inversion is attributed to its edge (*required by* for an invocation-ordered
+edge, *consistent with* for a value-ordered one) — and only when the channel
+actually published, because a producer that ran and declined carried nothing,
+and attributing the inversion to it would be a false explanation.
+
+The same `NSL_PASS_TRACE=1` prints one line per channel that saw traffic:
+
+```
+[pass-bus] csha_bridge: published 1x by CSHA, read 5x full, 0x empty
+[pass-bus] wrga_plan: published 0x by WRGA, read 0x full, 3x empty
+```
+
+`full` reads got a value; `empty` reads found the channel unfilled and took
+their fallback branch. Channels with no traffic at all are omitted. Two
+patterns are reported as findings rather than counts:
+
+- **`DEAD OUTPUT`** — a pass filled a channel and nothing ever read a value out
+  of it. The pass computed something for nobody. This tree has produced that
+  defect repeatedly (an autotuner chooser with zero production callers; a
+  certification gate silently off), and it was previously only ever found by
+  someone grepping.
+- **`SILENT DEFAULT`** — a consumer read an empty channel *although the
+  producing pass ran and reported applying a transformation*. Every consumer's
+  `None` branch is a working fallback, so this is invisible from every layer
+  above; the finding names the channel and says what the fallback does.
+- **`READ BEFORE PUBLISH`** — a consumer read the channel empty *before* its
+  first publish, and the value then arrived later in the same process: the
+  early reader planned against the fallback while a real value existed
+  downstream of it. This is the ordering question at read granularity — the
+  totals alone cannot distinguish ask-before-answer from the benign
+  interleavings, which is what the sequence stamps on the counters are for.
+  Channels where the tree does this deliberately — or where the
+  process-scoped stamps defeat the per-compile ordering argument (a
+  multi-file build compiles library modules, each reading some channels
+  empty, before the entry compile publishes) — are exempt with the mechanism
+  recorded (`wggo_overrides` under the in-place replan; `wrga_plan`,
+  `cfie_plan` and `wggo_preplans` under multi-module builds; the CPDT
+  moment-precision read, a wart the analysis surfaced and recorded rather
+  than silently blessed: it structurally precedes its own train block's
+  publish, and only an earlier train block's never-cleared plan can feed it).
+
+`SILENT DEFAULT` deliberately does **not** fire when the producer merely ran: a
+pass that runs and *declines* leaves its channel empty by definition, and that
+decline is already reported on its disposition line. Only the contradiction —
+applied, yet empty — is a finding.
+
+Fields on the bus are private to `pass_bus.rs`, so the accessors are the only
+way to reach a channel and the counts cannot be incomplete. Adding a channel
+without declaring it fails
+[`pass_bus_drift.rs`](../../crates/nsl-codegen/tests/pass_bus_drift.rs).
+
+Implementation: [`crates/nsl-codegen/src/pass_bus.rs`](../../crates/nsl-codegen/src/pass_bus.rs).
 
 ## The fused LM head (`--fuse-lm-head`)
 
@@ -317,7 +408,7 @@ Research paper: [`docs/research/NSL-CSHA-Research.PDF`](../../docs/research/NSL-
 
 Design specs: [`docs/superpowers/specs/2026-04-13-csha-tier-a-wiring-design.md`](../../docs/superpowers/specs/2026-04-13-csha-tier-a-wiring-design.md), [`2026-04-15-csha-tier-c-fused-backward-design.md`](../../docs/superpowers/specs/2026-04-15-csha-tier-c-fused-backward-design.md).
 
-The CSHA driver orchestrates three passes (§3 of the research paper): (1) Level 1 boundary fusion (`csha_boundary`) — identifies adjacent attention sub-ops (RMSNorm, RoPE, matmul projections, softmax) that can be merged into a single tiled GPU kernel; (2) Level 2/3 pipelining/blocking (`csha_pipeline`) — selects tile configurations and SMEM budgets using a roofline model; (3) per-layer specialization (`csha_specialize`) — applies weight-aware and head-count-aware tuning. The driver is pure data-in / data-out; it receives `WggoOverrides` and honours (or rejects with a diagnostic) any per-layer fusion-level decision WGGO made. The resulting `CshaPlan` is bridged into `last_csha_bridge` so FlashAttention-2 call sites can route CSHA-active layers through CSHA-aware FFI. Synthesized FlashAttention-2 PTX (forward + backward) is emitted by [`compiler/kernel.rs::maybe_synthesize_csha_training_ptx`](../../crates/nsl-codegen/src/compiler/kernel.rs) and embedded as Cranelift data sections.
+The CSHA driver orchestrates three passes (§3 of the research paper): (1) Level 1 boundary fusion (`csha_boundary`) — identifies adjacent attention sub-ops (RMSNorm, RoPE, matmul projections, softmax) that can be merged into a single tiled GPU kernel; (2) Level 2/3 pipelining/blocking (`csha_pipeline`) — selects tile configurations and SMEM budgets using a roofline model; (3) per-layer specialization (`csha_specialize`) — applies weight-aware and head-count-aware tuning. The driver is pure data-in / data-out; it receives `WggoOverrides` and honours (or rejects with a diagnostic) any per-layer fusion-level decision WGGO made. The resulting `CshaPlan` is bridged into the `csha_bridge` channel so FlashAttention-2 call sites can route CSHA-active layers through CSHA-aware FFI. Synthesized FlashAttention-2 PTX (forward + backward) is emitted by [`compiler/kernel.rs::maybe_synthesize_csha_training_ptx`](../../crates/nsl-codegen/src/compiler/kernel.rs) and embedded as Cranelift data sections.
 
 Fires: **`@flash_attention`-annotated models inside `@train`, when `--csha <mode>` is set.**
 

@@ -55,8 +55,16 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # --no-fail-fast: without it, `cargo test` stops at the FIRST failing test
+      # binary and never builds/runs the rest, so a red run reports exactly one
+      # broken target no matter how many are broken. That turned the four
+      # independent windows-latest failures of PR #455 into four serial ~25 min
+      # CI round-trips (one bug surfaced per run). A green run is unaffected —
+      # nothing aborts early, so there is nothing to skip — and the job still
+      # exits non-zero if any target fails. Only RED runs pay: they now run to
+      # completion rather than aborting, which is the intended trade.
       - name: Unit tests
-        run: cargo test --workspace -- --skip e2e_
+        run: cargo test --workspace --no-fail-fast -- --skip e2e_
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings

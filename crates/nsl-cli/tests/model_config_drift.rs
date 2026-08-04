@@ -296,3 +296,136 @@ fn every_model_is_actually_covered() {
          (or COVERED_MODELS lists one that no longer exists)"
     );
 }
+
+// ─── @fused_lm_ce shape hints ───────────────────────────────────────────────
+//
+// Same defect class this file exists for, one level out. The decorator's four
+// hints are hand-written INT LITERALS — the compiler derives none of them from
+// the model — so a training script restates `VOCAB_SIZE` and `D_MODEL` a
+// fourth time, and its `batch_size`/`seq_len` a second time after the
+// DataLoader. There IS a runtime guard (`nsl_fused_lce_pin_hint_extents`), but
+// it needs a GPU and a full run to fire; a change to `D_MODEL` would otherwise
+// leave every decorated script stale with nothing catching it in CI.
+
+/// Parse `key=value` pairs out of a `@fused_lm_ce(...)` decorator line.
+fn parse_decorator_hints(line: &str) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    let Some(args) = line
+        .split_once("@fused_lm_ce(")
+        .and_then(|(_, r)| r.rsplit_once(')'))
+        .map(|(a, _)| a)
+    else {
+        return out;
+    };
+    for pair in args.split(',') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if let Ok(n) = v.trim().parse::<f64>() {
+                out.insert(k.trim().to_string(), n);
+            }
+        }
+    }
+    out
+}
+
+/// `DataLoader(..., batch_size=N, seq_len=M, ...)` -> (N, M).
+fn parse_loader_shape(src: &str) -> Option<(f64, f64)> {
+    let line = src.lines().find(|l| l.contains("DataLoader("))?;
+    let hints = parse_decorator_hints(&line.replace("DataLoader(", "@fused_lm_ce("));
+    Some((*hints.get("batch_size")?, *hints.get("seq_len")?))
+}
+
+/// Every `@fused_lm_ce` in a covered model's scripts must agree with that
+/// model's constants, with the DataLoader beside it, and with the flatten it
+/// feeds.
+#[test]
+fn fused_lm_ce_hints_match_the_model_and_the_loader() {
+    let root = repo_root();
+    let mut checked = 0usize;
+
+    for model in COVERED_MODELS {
+        let dir = root.join("models").join(model);
+        let model_path = dir.join("model.nsl");
+        if !model_path.exists() {
+            continue;
+        }
+        let consts = parse_consts(&read(&model_path));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("nsl") {
+                continue;
+            }
+            let src = read(&path);
+            let Some(line) = src.lines().find(|l| l.trim_start().starts_with("@fused_lm_ce(")) else {
+                continue;
+            };
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let hints = parse_decorator_hints(line);
+            let where_ = format!("{model}/{name}");
+
+            for (hint, konst) in [("vocab_size", "VOCAB_SIZE"), ("hidden_size", "D_MODEL")] {
+                if let (Some(h), Some(c)) = (hints.get(hint), consts.get(konst)) {
+                    assert_eq!(
+                        h, c,
+                        "{where_}: @fused_lm_ce {hint} = {h} but model.nsl says \
+                         {konst} = {c}. The fused kernel strides the head from \
+                         the decorator literal, so this reads out of bounds at \
+                         runtime."
+                    );
+                    checked += 1;
+                }
+            }
+
+            if let Some((lb, ls)) = parse_loader_shape(&src) {
+                for (hint, want, which) in [
+                    ("batch_size", lb, "DataLoader batch_size"),
+                    ("seq_len", ls, "DataLoader seq_len"),
+                ] {
+                    if let Some(h) = hints.get(hint) {
+                        assert_eq!(
+                            *h, want,
+                            "{where_}: @fused_lm_ce {hint} = {h} but the {which} \
+                             is {want}. The backward allocates dx as \
+                             [batch_size, seq_len, hidden_size] from the hints."
+                        );
+                        checked += 1;
+                    }
+                }
+
+                // The loss flatten must use the same dims. A stale row count
+                // here is what silently defeats the fusion.
+                if let (Some(v), Some(h)) = (hints.get("vocab_size"), hints.get("hidden_size")) {
+                    let _ = h;
+                    let needle = format!(", {}])", *v as i64);
+                    for l in src.lines().filter(|l| l.contains(".reshape([") && l.contains(&needle)) {
+                        let rows: f64 = l
+                            .split_once(".reshape([")
+                            .and_then(|(_, r)| r.split_once(','))
+                            .and_then(|(a, _)| a.trim().parse().ok())
+                            .unwrap_or_else(|| panic!("{where_}: cannot parse rows from `{}`", l.trim()));
+                        assert_eq!(
+                            rows,
+                            lb * ls,
+                            "{where_}: logits flatten is [{rows}, {v}] but \
+                             batch_size * seq_len = {}. Line: `{}`",
+                            lb * ls,
+                            l.trim()
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Anti-vacuity: this whole test is `if let`s over a directory scan, so a
+    // parser that stopped matching -- or a decorator that was removed -- would
+    // check nothing and pass. models/coder50m/pretrain.nsl carries one.
+    assert!(
+        checked >= 5,
+        "expected to cross-check at least 5 @fused_lm_ce hints, saw {checked} \
+         — did the decorator move, or did the parser stop matching?"
+    );
+}

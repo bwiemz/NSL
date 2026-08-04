@@ -289,6 +289,96 @@ fn csha_off_mode_declines_rather_than_applying_nothing() {
     );
 }
 
+/// A stage-rank inversion that a declared dependency edge EXPLAINS must be
+/// attributed to it — but only when the edge actually carried a value, and
+/// in the words the edge's own OrderClaim licenses.
+///
+/// WGGO(OnWengert) before FASE(PreExtraction) is the canonical case: it reads
+/// as an inversion by stage rank and is exactly the order the wggo_overrides
+/// value flowed in. Three arms, because the first draft got two of them
+/// wrong: it printed "required by" for an edge that declares itself
+/// ValueOrderedOnly (an edge that by its own words does NOT require
+/// invocation order), and it printed the attribution even when WGGO ran,
+/// DECLINED, and published nothing — blaming an inversion on a dependency
+/// that carried no value.
+#[test]
+fn a_stage_inversion_mandated_by_a_dependency_edge_says_so() {
+    use nsl_codegen::pass_bus::PassBus;
+
+    // 1. The edge carried a value: attribute, with ValueOrderedOnly's
+    //    "consistent with", not InvocationOrdered's "required by".
+    let _g = fresh();
+    let mut bus = PassBus::default();
+    bus.publish_wggo_overrides(nsl_codegen::wggo_overrides::WggoOverrides {
+        per_layer: vec![],
+    });
+    record("WGGO");
+    record("FASE");
+    let r = report();
+    assert!(
+        r.contains(
+            "STAGE ORDER: WGGO ran before FASE, inverting their declared \
+             PipelineStage — consistent with the declared dependency: FASE \
+             consumes wggo_overrides, which WGGO produces"
+        ),
+        "a value-carrying inversion must be attributed to its edge, in \
+         ValueOrderedOnly wording: {r}"
+    );
+
+    // 2. WGGO ran and DECLINED — nothing published, nothing flowed. The
+    //    attribution would be a false explanation; keep the generic wording.
+    reset();
+    record("WGGO");
+    record("FASE");
+    let r = report();
+    assert!(
+        r.contains("STAGE ORDER: WGGO ran before FASE")
+            && r.contains("a cross-phase inversion is expected, not a defect"),
+        "an inversion whose edge carried nothing must keep the generic \
+         wording: {r}"
+    );
+
+    // 3. No edge at all.
+    reset();
+    record("CCR"); // OnAdjoint, rank 3
+    record("FASE"); // PreExtraction, rank 0 — inverted, and no CCR->FASE edge
+    let r = report();
+    assert!(
+        r.contains("STAGE ORDER: CCR ran before FASE")
+            && r.contains("a cross-phase inversion is expected, not a defect"),
+        "an unexplained inversion must keep the generic wording: {r}"
+    );
+}
+
+/// A declared InvocationOrdered edge violated by the observed trace is
+/// printed by the report — a detector with no production caller is why a
+/// false claim survives, so the checker's production caller is the report
+/// itself.
+#[test]
+fn a_dependency_order_violation_is_printed_by_the_report() {
+    let _g = fresh();
+    record("CSHA");
+    record("WGGO");
+    let r = report();
+    assert!(
+        r.contains(
+            "DEPENDENCY ORDER: CSHA was invoked before WGGO, yet CSHA \
+             consumes wggo_overrides, which WGGO produces"
+        ),
+        "the violation must be printed with its edge: {r}"
+    );
+
+    // The healthy order prints nothing.
+    reset();
+    record("WGGO");
+    record("CSHA");
+    assert!(
+        !report().contains("DEPENDENCY ORDER"),
+        "no violation, no line: {}",
+        report()
+    );
+}
+
 /// Every name this module's own tests use must be a real registered pass,
 /// so the tests cannot drift into asserting on passes that no longer
 /// exist.

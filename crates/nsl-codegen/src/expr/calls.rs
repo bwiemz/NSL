@@ -2724,7 +2724,7 @@ impl Compiler<'_> {
         // emission — the epilogue would need them re-plumbed through
         // FuncState for zero benefit (documented decision).
         if func_name == "generate" {
-            let Some(gen) = self.cfie_serve_gen.as_ref() else {
+            let Some(gen) = self.bus.cfie_serve_gen() else {
                 // OUTSIDE a CFIE serve context there is no bound model to
                 // drive.  Refuse cleanly rather than enqueue into the dead
                 // M29 `nsl_serve_enqueue` path (the pre-Cycle-11 bug that

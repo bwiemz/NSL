@@ -38,7 +38,10 @@ fn run_gpu(tag: &str, extra: &[&str]) -> RunOut {
     )
     .unwrap()
     .replace("# GPU_PLACEMENT", "m.to(cuda)")
-    .replace("CSLA_SAVE_PATH", &save.display().to_string());
+    .replace(
+        "CSLA_SAVE_PATH",
+        &save.display().to_string().replace('\\', "/"),
+    );
     let prog = tmp.join("prog.nsl");
     std::fs::write(&prog, src).unwrap();
 
@@ -190,7 +193,10 @@ fn run_gpu_stage2(tag: &str, envs: &[(&str, &str)]) -> RunOut {
     )
     .unwrap()
     .replace("# GPU_PLACEMENT", "m.to(cuda)")
-    .replace("CSLA_SAVE_PATH", &save.display().to_string());
+    .replace(
+        "CSLA_SAVE_PATH",
+        &save.display().to_string().replace('\\', "/"),
+    );
     let prog = tmp.join("prog.nsl");
     std::fs::write(&prog, src).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));

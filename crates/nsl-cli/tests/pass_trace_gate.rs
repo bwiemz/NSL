@@ -439,7 +439,6 @@ fn the_fixture_these_gates_use_exists() {
 /// a backtrace hunt; this makes the next one fail a test instead.
 #[test]
 fn every_pass_runs_in_the_compile_phase_the_registry_declares() {
-    use nsl_codegen::pass_registry::CompilePhase;
     let cases: &[(&str, &[&str])] = &[
         ("p_wggo", &["--wggo", "full", "--csha", "auto"]),
         ("p_ccr", &["--checkpoint-blocks", "--layerwise-accum", "--csha", "auto"]),

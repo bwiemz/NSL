@@ -17,7 +17,11 @@
 #
 # Marker rewrites (exact string match by the harness):
 #   - "# GPU_PLACEMENT" -> "m.to(cuda)" for GPU runs;
-#   - "CSLA_SAVE_PATH"  -> the temp .nslm path;
+#   - "CSLA_SAVE_PATH"  -> the temp .nslm path. It lands inside an NSL string
+#     literal, so the harness MUST normalize it with `.replace('\\', "/")`:
+#     a raw Windows temp path makes the lexer read `\U`, `\R` … as escape
+#     sequences and the fixture fails to compile. Forward slashes need no
+#     escaping and Windows accepts them;
 #   - "epochs=1"        -> "epochs=2" for the epoch-straddle case;
 #   - "grad_accumulation=2)" -> "grad_accumulation=2, grad_clip=1.0)" for the
 #     refusal test.

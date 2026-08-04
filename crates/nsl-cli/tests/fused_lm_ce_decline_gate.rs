@@ -5,8 +5,9 @@
 //! The decorator's purpose is to delete the `[batch*seq, vocab]`
 //! logits-gradient surface. Historically its substitution declined on a
 //! biasless LM head and on a reshape between the head and the loss — which
-//! is exactly what `models/coder50m/model.nsl:79-80` and
-//! `models/coder50m/pretrain.nsl:30-32` have. Before item 6 those declines
+//! is exactly what `models/coder50m/model.nsl`'s biasless weight-tied head
+//! and its pretraining scripts' logits flatten have. Before item 6 those
+//! declines
 //! were silent: `nsl build` exited 0, said nothing, and emitted the full
 //! composite path while the user believed the fused kernel was live.
 //! Sprint 2.5 flipped BOTH of those shapes into substitutions (GEMM-chunked
@@ -109,7 +110,7 @@ train(model=m, epochs=1):
     )
 }
 
-/// `models/coder50m/model.nsl:79-80` — biasless weight-tied head.
+/// `models/coder50m/model.nsl`'s `forward_core` — biasless weight-tied head.
 /// BEHAVIOUR FLIP (Sprint 2.5): substitutes (has_bias=false, GEMM path).
 const BIASLESS_HEAD: &str = "        let flat_hn = hn.reshape([batch_size * seq_len, 64])\n\
     \x20       return flat_hn @ self.embed.transpose(0, 1)";
@@ -184,8 +185,8 @@ fn biasless_head_compiles_and_fuses() {
 }
 
 /// BEHAVIOUR FLIP (Sprint 2.5): a reshape between the head and the loss
-/// (`coder50m/pretrain.nsl:30-32` — the shape the repo's own pretrain
-/// scripts use) is now seen through and fuses.
+/// (the shape `coder50m/pretrain.nsl` uses — it carries the decorator now)
+/// is seen through and fuses.
 #[test]
 fn reshape_between_head_and_loss_compiles_and_fuses() {
     // 3-D logits out of the head, flattened at the loss with COMPILE-TIME

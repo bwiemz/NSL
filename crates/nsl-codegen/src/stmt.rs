@@ -131,12 +131,12 @@ fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> b
 /// callers fall back to the unpruned primal/adjoint lists — this matches the
 /// Task 5 sanity expectation that an empty `WrgaInputs` is a no-op.
 ///
-/// When a plan is produced, it is stashed on `compiler.last_wrga_plan` for
+/// When a plan is produced, it is published to `compiler.bus.wrga_plan` for
 /// later observability (`nsl check --wrga-report`).
 /// CPDT driver bridge — mirrors `invoke_wrga_if_enabled`. Builds a `CpdtInput`
 /// from the WGGO `AppliedPlan`, the optional `@train` block (for AdamW hyper-
 /// parameters), and the cluster topology stashed on the Compiler, then stores
-/// the resulting plan on `compiler.cpdt_plan`.
+/// the resulting plan on the `cpdt_plan` bus channel.
 ///
 /// No-op when `compiler.cpdt_mode == CpdtMode::Off` or when no cluster is
 /// configured.
@@ -299,7 +299,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
             *guard = Some(plan.clone());
         }
     }
-    compiler.cpdt_plan = Some(plan);
+    compiler.bus.publish_cpdt_plan(plan);
 }
 
 pub(crate) fn invoke_wrga_if_enabled(
@@ -424,7 +424,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
         inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
-        wggo_overrides: compiler.wggo_overrides.as_ref(),
+        wggo_overrides: compiler.bus.wggo_overrides(),
         // Paper §9.3 ablation flags — forwarded verbatim from `WrgaInputs`.
         // No-op for normal `nsl build` (default `WrgaAblation::default()`);
         // populated by `apply_wrga_check_overrides` in nsl-cli (the bridge
@@ -465,7 +465,7 @@ pub(crate) fn invoke_wrga_if_enabled(
     // (which runs before user-function compilation) when a target pattern
     // like "Toy.w" doesn't match any placement name emitted by
     // `infer_sites_from_wengert` (which uses bare "w"-style names).
-    // `last_wrga_plan` is always overwritten — the train-block plan is
+    // `bus.wrga_plan` is always overwritten — the train-block plan is
     // strictly more informative (real Wengert list, real placements).
     if !inject.sites.is_empty() {
         // B.3 Task 4: wire fusion decisions onto each newly-injected site.
@@ -478,9 +478,9 @@ pub(crate) fn invoke_wrga_if_enabled(
                 }
             }
         }
-        compiler.adapter_sites = sites;
+        compiler.bus.publish_adapter_sites(sites);
     }
-    compiler.last_wrga_plan = Some(plan.clone());
+    compiler.bus.publish_wrga_plan(plan.clone());
     Some(plan)
 }
 
@@ -4417,7 +4417,7 @@ impl Compiler<'_> {
         // source-AD extraction inside the inner lowering). Stderr, CFIE
         // convention for in-codegen build reports.
         if result.is_ok() {
-            if let Some(plan) = self.last_cpkd_plan.take() {
+            if let Some(plan) = self.bus.take_cpkd_plan() {
                 eprint!("{}", plan.render_report());
             }
         }
@@ -5014,17 +5014,24 @@ impl Compiler<'_> {
         // WGGO-before-kernels: install THIS block's pre-plan overrides — or
         // explicitly `None`, never a previous block's leftovers (the pre-
         // restructure stale-leak) — BEFORE the body compiles. FASE recipe
-        // selection and the per-param mode table read `self.wggo_overrides`
+        // selection and the per-param mode table read `bus.wggo_overrides`
         // well before the in-place planning site in the same function; the
         // pre-pass is what finally lets them see the plan they were written
         // to consume. The offer is validated against the codegen-time
         // extraction at the planning site (graph-fingerprint check) and
         // replaced by an in-place solve on mismatch.
-        self.wggo_overrides = self
-            .wggo_preplans
+        let preplan_overrides = self
+            .bus
+            .wggo_preplans()
             .iter()
             .find(|p| p.train_block_stmt_id == train_block_stmt_id)
             .map(|p| p.overrides.clone());
+        match preplan_overrides {
+            Some(o) => self.bus.publish_wggo_overrides(o),
+            // Explicitly cleared, never a previous block's leftovers — the
+            // pre-restructure stale-leak this site exists to prevent.
+            None => self.bus.clear_wggo_overrides(),
+        }
         let result =
             self.compile_train_block_inner(builder, state, train, train_block_stmt_id);
         self.restore_active_fused_ce_config(saved_active_fused_ce);
@@ -5557,7 +5564,7 @@ impl Compiler<'_> {
             momentum: momentum_value,
             allow_v_approx: true,
         };
-        let fase_plan = match self.wggo_overrides.as_ref() {
+        let fase_plan = match self.bus.wggo_overrides() {
             Some(o) => {
                 let mut fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
                 // Diagnostic knob: NSL_FASE_FUSED_OVERRIDE="1,0,..." replaces
@@ -6022,7 +6029,7 @@ impl Compiler<'_> {
         // None (the existing FP32 path runs verbatim, zero behavior change).
         //
         // Borrow discipline: extract the owned dtype Vecs (and the activation
-        // decision) into a local FIRST, which ends the `self.cpdt_plan` borrow.
+        // decision) into a local FIRST, which ends the `bus.cpdt_plan()` borrow.
         // Only then do the `compile_call_by_name` loop (which borrows `self`
         // mutably) run. No `unsafe`, no tensor clones.
         let cpdt_precision_dtypes: Option<(Value, Value)> = {
@@ -6061,7 +6068,7 @@ impl Compiler<'_> {
                 // envelope). 8-bit clamps to FP16 storage in v1, the same
                 // ladder step as `clamp_int8_to_fp16`.
                 let wggo_bits: Option<(Vec<u16>, Vec<u16>)> = if fase_deferred {
-                    self.wggo_overrides.as_ref().and_then(|o| {
+                    self.bus.wggo_overrides().and_then(|o| {
                         crate::cpdt_precision_exec::build_dtype_lists_from_overrides(
                             o,
                             &param_paths,
@@ -6071,7 +6078,7 @@ impl Compiler<'_> {
                     None
                 };
 
-                let plan = self.cpdt_plan.as_ref();
+                let plan = self.bus.cpdt_plan();
                 let active = plan
                     .map(|p| {
                         crate::cpdt_precision_exec::precision_active(
@@ -6237,7 +6244,7 @@ impl Compiler<'_> {
                          gradient accumulation / --source-ad",
                     ));
                 }
-                if self.wggo_overrides.is_some() {
+                if self.bus.has_wggo_overrides() {
                     return Err(CodegenError::new(
                         "--param-dtype bf16-sr does not compose with WGGO \
                          per-layer FASE overrides yet (a FullBuffer-routed \
@@ -6312,7 +6319,7 @@ impl Compiler<'_> {
             // the mixed-step routing flags are not threaded. The table is
             // semantically empty for Muon (every byte FullBuffer), so skip
             // it and keep Muon on the monolithic loop. Say so loudly.
-            if self.wggo_overrides.is_some() {
+            if self.bus.has_wggo_overrides() {
                 eprintln!(
                     "[muon] note: WGGO per-layer FASE overrides do not apply to \
                      the mixed Muon/AdamW optimizer (it has no Deferred mode) — \
@@ -6326,7 +6333,7 @@ impl Compiler<'_> {
                 &param_paths,
                 &model_var_name,
                 &fase_plan,
-                self.wggo_overrides.as_ref(),
+                self.bus.wggo_overrides(),
             );
             match modes {
                 Some(bytes) => {
@@ -7661,7 +7668,7 @@ impl Compiler<'_> {
                     // performed by the `@fused_kl_ce` decorator during
                     // extraction, not by this code — CPKD rewrites nothing.
                     crate::pass_trace::record_disposition("CPKD", crate::pass_trace::PassDisposition::AdvisoryOnly);
-                    self.last_cpkd_plan = Some(crate::cpkd::CpkdPlan {
+                    self.bus.publish_cpkd_plan(crate::cpkd::CpkdPlan {
                         teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
                         student_name: self.resolve_sym(distill.student_sym).to_string(),
                         epochs: distill.epochs,
@@ -7827,7 +7834,8 @@ impl Compiler<'_> {
                         // would train with FASE modes that do not match the
                         // final plan every downstream consumer sees.
                         let preplan = self
-                            .wggo_preplans
+                            .bus
+                            .wggo_preplans()
                             .iter()
                             .find(|p| p.train_block_stmt_id == train_block_stmt_id);
                         let reused_plan = preplan.and_then(|pre| {
@@ -8076,7 +8084,7 @@ impl Compiler<'_> {
                                 }
                             }
                             // Stash for all downstream consumers (CSHA, WRGA, ...).
-                            self.wggo_overrides = Some(
+                            self.bus.publish_wggo_overrides(
                                 crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
                             );
                             wggo_applied = Some(plan.applied);
@@ -8094,7 +8102,7 @@ impl Compiler<'_> {
                 //
                 // Pass order: Calibration → WGGO → CSHA.
                 // CSHA receives WGGO's AppliedPlan (if any) as WggoOverrides
-                // (via self.wggo_overrides) so that per-layer fusion-level
+                // (via bus.wggo_overrides) so that per-layer fusion-level
                 // decisions from WGGO are honoured (or rejected with a
                 // diagnostic) by CSHA.
                 if let Some(ref mode_str) = self.compile_options.csha.mode {
@@ -8179,7 +8187,7 @@ impl Compiler<'_> {
                             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
                             csha_shape_override, // H.1: forward decorator head_dim to the planner
                             8,    // default head count; weight-informed path refines this
-                            self.wggo_overrides.as_ref(),
+                            self.bus.wggo_overrides(),
                         ) {
                             if self.compile_options.csha.report {
                                 eprintln!("{}", plan.render_report());
@@ -8230,7 +8238,7 @@ impl Compiler<'_> {
                             for extras in bridge_out.extras.values_mut() {
                                 extras.save_activations_for_backward = true;
                             }
-                            self.last_csha_bridge = Some(bridge_out);
+                            self.bus.publish_csha_bridge(bridge_out);
                             for d in diags { eprintln!("warning: {d}"); }
                             // A.2.1d: record the Wengert op indices CSHA
                             // has claimed across all boundary chains so
@@ -8238,8 +8246,9 @@ impl Compiler<'_> {
                             // A.2.3 matmul projection, A.2.4 RoPE
                             // epilogue) can ask `is_csha_claimed(op)`
                             // before emitting a redundant launch.
-                            self.csha_claimed_ops =
-                                crate::csha_apply::collect_claimed_ops(&plan);
+                            self.bus.publish_csha_claimed_ops(
+                                crate::csha_apply::collect_claimed_ops(&plan),
+                            );
                             // T7.1 / Gap D.1: build the chain-level dispatch
                             // map for the AD reverse walk. Gap D.1 passes the
                             // Wengert list so the dispatcher can resolve
@@ -8247,7 +8256,15 @@ impl Compiler<'_> {
                             // RMSNorm-out) and detect the shared SDPA op —
                             // which is the correct primary claim site for
                             // `EmitFused`.
-                            if let Some(ref bridge) = self.last_csha_bridge {
+                            // Computed into a local FIRST so the read borrow of
+                            // `self.bus` ends before the publish below takes it
+                            // mutably. Both values used to be separate public
+                            // fields, which let the read and the write overlap;
+                            // they are one struct now, so the sequence has to be
+                            // written out. Same values, same order.
+                            let backward_claims = if let Some(bridge) =
+                                self.bus.csha_bridge()
+                            {
                                 // Gap I.1: pass the TRAINING config (clamped, no
                                 // fusion flags) so the dispatcher's backward SMEM
                                 // validator sees the same geometry the real
@@ -8266,13 +8283,17 @@ impl Compiler<'_> {
                                         Some(extractor.wengert_list()),
                                         training_config,
                                     );
-                                if !chain_marks.is_empty() {
-                                    self.csha_backward_claims =
-                                        Some(crate::source_ad::CshaBackwardClaims {
-                                            op_to_chain,
-                                            chain_marks,
-                                        });
-                                }
+                                (!chain_marks.is_empty()).then_some(
+                                    crate::source_ad::CshaBackwardClaims {
+                                        op_to_chain,
+                                        chain_marks,
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                            if let Some(claims) = backward_claims {
+                                self.bus.publish_csha_backward_claims(claims);
                             }
                         }
                     }
@@ -8442,7 +8463,7 @@ impl Compiler<'_> {
                     if train_has_decorated {
                         wrga_plan.clone()
                     } else {
-                        self.adapter_prescan_plan.clone()
+                        self.bus.adapter_prescan_plan().cloned()
                     }
                 };
                 if let Some(plan_ref) = init_plan.as_ref() {
@@ -8618,7 +8639,7 @@ impl Compiler<'_> {
                     || ccr_selective_decorated
                 {
                     let claimed_ids: Option<std::collections::HashSet<u32>> =
-                        self.csha_backward_claims.as_ref().map(|claims| {
+                        self.bus.csha_backward_claims().map(|claims| {
                             claims.op_to_chain.keys().copied().collect()
                         });
                     let policy = if self.compile_options.checkpoint_selective
@@ -8993,7 +9014,7 @@ impl Compiler<'_> {
                 // T7.1: thread CSHA backward claims into the generator so
                 // the reverse walk can route claimed ops through the fused
                 // backward dispatcher instead of per-op AD rules.
-                if let Some(claims) = self.csha_backward_claims.take() {
+                if let Some(claims) = self.bus.take_csha_backward_claims() {
                     gen.set_csha_claims(claims);
                 }
                 // Item 9: opt-in fused RMSNorm input-gradient lowering.
@@ -9037,7 +9058,7 @@ impl Compiler<'_> {
                 // compiler slot is cleared again right after the forward, so
                 // the ADJOINT lowering still never sees claims — the same
                 // invariant the old post-forward `take()` enforced.
-                self.csha_backward_claims = gen.take_csha_claims();
+                self.bus.restore_csha_backward_claims(gen.take_csha_claims());
                 // T7.1: surface any CSHA fallback diagnostics.
                 for diag in gen.csha_diagnostics() {
                     eprintln!("[nsl] {diag}");
@@ -10404,7 +10425,7 @@ impl Compiler<'_> {
                 // pre-forward and handed them back for the forward's fused
                 // dispatch — clear them NOW so the adjoint/window lowering
                 // never sees claims (the old post-forward `take()` contract).
-                self.csha_backward_claims = None;
+                self.bus.clear_csha_backward_claims();
                 let full_vars = &full_lowered.var_map;
 
                 // D2b part 2: the plan restriction above consumed
@@ -15482,7 +15503,7 @@ impl Compiler<'_> {
         // runtime load via `load_nested_field` can't traverse the adapter
         // side-table at that point in codegen.
         if include_nontrainable {
-            for site in &self.adapter_sites {
+            for site in self.bus.adapter_sites() {
                 if site.target_model != type_name {
                     continue;
                 }

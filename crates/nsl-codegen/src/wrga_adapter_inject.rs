@@ -3,7 +3,7 @@
 //! rewrite.
 //!
 //! Runs once per compile, after `wrga::run` produces the `WrgaPlan` (and the
-//! plan has been stashed on `compiler.last_wrga_plan`), and before the model
+//! plan has been published to `compiler.bus`), and before the model
 //! struct / forward pass are lowered.  This is the B.2 observation surface:
 //! it only decides synthesized field names and init strategies.  B.3 will
 //! collapse the unfused update `y = x @ W + ((x @ A) @ B) * (alpha / rank)`

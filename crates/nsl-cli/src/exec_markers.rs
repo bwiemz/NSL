@@ -173,6 +173,20 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          first-invocation order (roadmap item 2)",
     ),
     m(
+        "[pass-bus]",
+        &[
+            // The report text is built here...
+            "crates/nsl-codegen/src/pass_bus.rs",
+            // ...and printed here, from the same emitter as `[pass-trace]`:
+            // the bus's SILENT DEFAULT finding is computed by cross-referencing
+            // the two, so they must reach every terminal path together.
+            "crates/nsl-cli/src/commands/build/mod.rs",
+        ],
+        "per-channel traffic on the inter-pass bus — which pass published what, \
+         how many consumers read it, and the two patterns that are defects \
+         (roadmap item 2 step 4)",
+    ),
+    m(
         "[param-plan]",
         &[
             // The compile-time report...
@@ -309,6 +323,7 @@ pub mod tokens {
     pub const SR_BF16: &str = "[sr-bf16]";
     pub const PARAM_PLAN: &str = "[param-plan]";
     pub const PASS_TRACE: &str = "[pass-trace]";
+    pub const PASS_BUS: &str = "[pass-bus]";
     pub const FLASH_BWD: &str = "[flash-bwd]";
     pub const ARENA: &str = "[arena]";
     pub const GPU_MEM: &str = "[gpu-mem]";
@@ -382,6 +397,14 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         parts: &[("[pass-trace]", "crates/nsl-codegen/src/pass_trace.rs")],
     },
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/pass_bus_gate.rs",
+        asserts: "the bus report stayed silent without NSL_PASS_TRACE=1",
+        // Same shape as the pass-trace needle above: the test asserts no
+        // `[pass-bus]` line at all, and the bare token is emitted from exactly
+        // one place, the report builder.
+        parts: &[("[pass-bus]", "crates/nsl-codegen/src/pass_bus.rs")],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/param_plan_gate.rs",
         asserts: "the per-parameter plan listing stayed OFF without \
                   NSL_PARAM_PLAN_REPORT=1 (the one-line summary still prints)",
@@ -413,6 +436,21 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         // assertions become permanently true while the positive assertions in
         // the same file still pass — which is why the token is pinned per
         // file rather than once.
+        parts: &[
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt.rs"),
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/source_ad.rs"),
+        ],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs",
+        asserts: "the two control arms fused for real -- a DECLINE would mean \
+                  the composite path ran, the hint pin was never reached, and \
+                  the arm proved nothing about false positives",
+        // Same bare token and same two emitting files as the decline gate
+        // above. Pinned separately because these arms carry different weight:
+        // there the assertion says a matching head produced no fallback, here
+        // it is what stops a false-positive control from passing vacuously
+        // against a program that never engaged the kernel at all.
         parts: &[
             ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt.rs"),
             ("[fused-lm-ce]", "crates/nsl-codegen/src/source_ad.rs"),
