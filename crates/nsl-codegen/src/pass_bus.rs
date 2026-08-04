@@ -501,9 +501,18 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
-        // Both readers (entry_points handing the plan back, test_helpers)
-        // run after compilation, which is after every publish.
-        read_before_publish: Invariant::Enforced,
+        // NOT enforced, and the first draft's "both readers run after every
+        // publish" claim was false twice over: the epilogue read runs at the
+        // end of EVERY module compile (a multi-file build compiles library
+        // modules, each reading empty, before the entry compile publishes),
+        // and the profile pre-pass reads at compile START by design — it
+        // seeds itself from a prior @train compile's plan, otherwise empty.
+        read_before_publish: Invariant::Exempt(
+            "process scope defeats the per-compile argument: library-module \
+             compiles in a multi-file build each end with an empty read \
+             before the entry compile publishes, and the profile pre-pass \
+             deliberately reads at compile start",
+        ),
     },
     ChannelDescriptor {
         channel: Channel::AdapterPrescanPlan,
@@ -560,18 +569,21 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         // rather than silently blessed: within ONE compile_train_block_inner
         // run, the moment-init precision read (stmt.rs, the
         // `precision_active` block) executes in straight line BEFORE
-        // `invoke_cpdt_if_enabled` publishes (which happens after primal
-        // lowering). So a fresh compile's moment-precision arbitration can
-        // only consume a plan published by an EARLIER compile on the same
-        // Compiler — the calibrate-then-compile driver's shape — and on a
-        // single-pass compile the empty read leaves CPDT-sourced precision
-        // inactive. Whether that is design or defect deserves its own
-        // investigation; enforcing here would flag every CPDT-enabled
-        // compile, which is crying wolf either way.
+        // `invoke_cpdt_if_enabled` publishes (which happens after extraction
+        // and pass planning, before primal lowering). So a single-train-block
+        // compile's moment-precision arbitration reads the channel empty and
+        // CPDT-sourced precision stays inactive. The only feeder is an
+        // EARLIER TRAIN BLOCK in the same process: the channel is never
+        // cleared between blocks, so block 2's read consumes block 1's plan
+        // — a stale cross-block consumption of exactly the shape
+        // wggo_overrides' install/clear pairing exists to prevent. Whether
+        // that is design or defect deserves its own investigation; enforcing
+        // here would flag every CPDT-enabled compile, which is crying wolf
+        // either way.
         read_before_publish: Invariant::Exempt(
-            "the moment-init precision read precedes the same compile's \
-             publish by construction; only an earlier compile on the same \
-             Compiler (calibrate-then-compile) can feed it — recorded as a \
+            "the moment-init precision read precedes the same train block's \
+             publish by construction; only an earlier train block's plan \
+             (never cleared between blocks) can feed it — recorded as a \
              wart pending its own investigation",
         ),
     },
@@ -585,9 +597,11 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
-        // Published during serve-block compilation, read by entry_points
-        // after compilation returns.
-        read_before_publish: Invariant::Enforced,
+        read_before_publish: Invariant::Exempt(
+            "same shape as wrga_plan: the per-module epilogue read runs at \
+             the end of every library-module compile in a multi-file build, \
+             before the entry compile's serve block publishes",
+        ),
     },
     ChannelDescriptor {
         channel: Channel::WggoOverrides,
@@ -605,10 +619,14 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
                 pass: "FASE",
                 order: OrderClaim::ValueOrderedOnly(
                     "a train block whose pre-plan is missing or \
-                     fingerprint-rejected re-invokes WGGO in place AFTER FASE \
-                     already planned; what FASE consumed is the pre-pass \
-                     publish, and stmt.rs hard-refuses if the in-place replan \
-                     diverges from the fase_fused table FASE used",
+                     fingerprint-rejected re-invokes WGGO in place AFTER \
+                     FASE already planned. The guard differs per path: on \
+                     the REJECTED path FASE consumed the pre-pass publish \
+                     and stmt.rs hard-refuses if the replan's fase_fused \
+                     table diverges from it; on the MISSING path FASE read \
+                     empty and fell back to fase::plan — no mode table \
+                     exists to go stale, and downstream consumers read the \
+                     fresh publish",
                 ),
                 via: "stmt.rs builds the per-layer fase_fused vector from the \
                       overrides and selects the FASE plan from it",
@@ -629,10 +647,12 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
         read_before_publish: Invariant::Exempt(
-            "the FASE edge above at read granularity: with no pre-plan for a \
-             block, FASE's read at plan selection is empty (it falls back to \
-             fase::plan, correctly) and the in-place replan's publish then \
-             postdates that read — guarded by the driver's divergence refusal",
+            "the FASE edge's MISSING-preplan path at read granularity: \
+             FASE's plan-selection read is empty (it falls back to \
+             fase::plan, correctly) and the in-place replan's publish \
+             postdates that read — safe because no stale mode table exists \
+             on that path and downstream consumers read the fresh publish; \
+             the divergence refusal guards the other (rejected-preplan) path",
         ),
     },
     ChannelDescriptor {
@@ -649,12 +669,16 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
-        // The pre-pass fills it during kernel synthesis; both readers
-        // (kernel.rs later in that same synthesis, the train-block preplan
-        // lookup) run after. A compile whose pre-pass produced nothing never
-        // publishes (an empty vec is not a publish), so its empty reads
-        // cannot arm the finding.
-        read_before_publish: Invariant::Enforced,
+        // Within one compile the ordering holds (the pre-pass fills it
+        // during kernel synthesis, both readers run after, and a pre-pass
+        // that produced nothing never publishes). Across module compiles it
+        // does not.
+        read_before_publish: Invariant::Exempt(
+            "a dependency module's kernel synthesis can read the channel \
+             empty before the entry compile's pre-pass publishes — the \
+             per-compile ordering argument does not survive the \
+             process-scoped stamps",
+        ),
     },
     ChannelDescriptor {
         channel: Channel::AdapterSites,
@@ -1181,20 +1205,23 @@ pub fn findings() -> Vec<BusFinding> {
         .iter()
         .filter_map(|d| {
             let t = traffic(d.channel);
-            if d.dead_output.enforced() && t.publishes > 0 && t.reads_full == 0 {
-                return Some(BusFinding::DeadOutput { channel: d.channel });
-            }
-            // Both stamps set, and the ask preceded the answer. Disjoint from
-            // SilentDefault by construction (that arm requires publishes ==
-            // 0, this one requires a publish); DeadOutput wins above when
-            // both hold, because "published for nobody" subsumes "asked
-            // early" — the early asker is exactly the nobody.
+            // Both stamps set, and the ask preceded the answer. Checked
+            // BEFORE DeadOutput because when both hold — consumer moved
+            // above its producer, nobody read after — DeadOutput's "never
+            // read, computed for nobody" contradicts the evidence (it WAS
+            // read: empty, too early) and blames the producer when the
+            // actionable party is the mis-ordered consumer. Disjoint from
+            // SilentDefault by construction: that arm requires publishes ==
+            // 0, this one requires a publish.
             if d.read_before_publish.enforced()
                 && t.first_publish_seq != 0
                 && t.first_empty_read_seq != 0
                 && t.first_empty_read_seq < t.first_publish_seq
             {
                 return Some(BusFinding::ReadBeforePublish { channel: d.channel });
+            }
+            if d.dead_output.enforced() && t.publishes > 0 && t.reads_full == 0 {
+                return Some(BusFinding::DeadOutput { channel: d.channel });
             }
             // A publish with zero reads_full is already DeadOutput above; this
             // arm is the never-published case. `reads_empty > 0` keeps it to
@@ -1229,9 +1256,15 @@ pub fn findings() -> Vec<BusFinding> {
 /// Same process scope and the same conservative caveat as everything else
 /// here: two compiles in one process share one first-invocation order, so a
 /// pass that legitimately ran alone in an earlier compile could in principle
-/// present an inversion against a later one. `nsl run` / `nsl build` compile
-/// once, and the report this feeds is read per process, so the exposure
-/// matches [`crate::pass_trace::stage_order_violation`]'s.
+/// present an inversion against a later one. Multi-file builds DO compile
+/// several modules per process — the header says so — but library-module
+/// compiles reach none of the passes on the edges declared today (the only
+/// entry sites for `csha::run` / `wrga::run` / `fase::plan` on the compile
+/// path are train-block-driver calls, and library modules compile no train
+/// blocks), so those compiles cannot pollute the pairs checked here. A
+/// future edge between passes that DO run per-module would need this
+/// revisited; the exposure otherwise matches
+/// [`crate::pass_trace::stage_order_violation`]'s.
 pub fn dependency_order_violations() -> Vec<(&'static str, &'static str, Channel)> {
     let seen = crate::pass_trace::observed();
     let pos = |p: &str| seen.iter().position(|s| *s == p);

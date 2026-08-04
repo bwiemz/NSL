@@ -125,11 +125,27 @@ on `compiler.bus`, each filled by exactly one pass and read by later stages.
 | `wggo_overrides` | WGGO | FASE recipe selection, the per-parameter mode table, CSHA's and WRGA's inputs |
 | `wggo_preplans` | WGGO | kernel synthesis, the train-block driver |
 
-These are the edges a future pass *manager* would order by. `PipelineStage`
-cannot do that job — `WGGO(OnWengert)` runs before `FASE(PreExtraction)`
-because a different driver invokes it — but a data dependency orders by
-construction: `wggo_overrides` is exactly why FASE must follow WGGO, whatever
-their declared stages imply.
+These are the edges a future pass *manager* would order by, and the
+pass-to-pass subset is now **declared**: where a channel's value feeds another
+pass's planning, its descriptor names that pass in `consumed_by_passes`
+(`wggo_overrides` → FASE, CSHA, WRGA). `PipelineStage` cannot do that job —
+`WGGO(OnWengert)` runs before `FASE(PreExtraction)` because a different driver
+invokes it — but a data dependency orders by construction.
+
+Each declared edge carries an `OrderClaim`, and the distinction it draws is
+not decoration: for CSHA and WRGA, "WGGO is invoked first" genuinely holds
+whenever both run, and the report checks it (`DEPENDENCY ORDER` line on
+violation). For FASE it is **false** — a train block whose pre-plan is missing
+or fingerprint-rejected re-invokes WGGO *in place*, after FASE already planned
+— so that edge claims only the value-level order, with a different guard per
+path: on the rejected-pre-plan path FASE consumed the pre-pass publish and the
+driver hard-refuses if the replan diverges from it; on the missing-pre-plan
+path FASE read the channel empty and fell back, so no mode table exists to go
+stale. The `STAGE ORDER` line uses the same edges in the other direction: an
+inversion is attributed to its edge (*required by* for an invocation-ordered
+edge, *consistent with* for a value-ordered one) — and only when the channel
+actually published, because a producer that ran and declined carried nothing,
+and attributing the inversion to it would be a false explanation.
 
 The same `NSL_PASS_TRACE=1` prints one line per channel that saw traffic:
 
@@ -151,6 +167,21 @@ patterns are reported as findings rather than counts:
   producing pass ran and reported applying a transformation*. Every consumer's
   `None` branch is a working fallback, so this is invisible from every layer
   above; the finding names the channel and says what the fallback does.
+- **`READ BEFORE PUBLISH`** — a consumer read the channel empty *before* its
+  first publish, and the value then arrived later in the same process: the
+  early reader planned against the fallback while a real value existed
+  downstream of it. This is the ordering question at read granularity — the
+  totals alone cannot distinguish ask-before-answer from the benign
+  interleavings, which is what the sequence stamps on the counters are for.
+  Channels where the tree does this deliberately — or where the
+  process-scoped stamps defeat the per-compile ordering argument (a
+  multi-file build compiles library modules, each reading some channels
+  empty, before the entry compile publishes) — are exempt with the mechanism
+  recorded (`wggo_overrides` under the in-place replan; `wrga_plan`,
+  `cfie_plan` and `wggo_preplans` under multi-module builds; the CPDT
+  moment-precision read, a wart the analysis surfaced and recorded rather
+  than silently blessed: it structurally precedes its own train block's
+  publish, and only an earlier train block's never-cleared plan can feed it).
 
 `SILENT DEFAULT` deliberately does **not** fire when the producer merely ran: a
 pass that runs and *declines* leaves its channel empty by definition, and that

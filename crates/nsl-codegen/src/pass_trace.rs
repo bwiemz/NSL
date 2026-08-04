@@ -444,21 +444,36 @@ pub fn report() -> String {
     }
     if let Some((a, b)) = stage_order_violation() {
         // An inversion explained by a declared dependency edge is not merely
-        // tolerable, it is REQUIRED — WGGO(OnWengert) before
-        // FASE(PreExtraction) looks backwards by stage rank and is exactly
-        // the order the wggo_overrides edge mandates. Saying which is which
-        // is what the edges bought; before them this line blessed every
-        // inversion with the same shrug.
-        let edge = crate::pass_bus::CHANNELS.iter().find(|d| {
-            d.producer == a && d.consumed_by_passes.iter().any(|c| c.pass == b)
+        // tolerable — WGGO(OnWengert) before FASE(PreExtraction) looks
+        // backwards by stage rank and is exactly the order the
+        // wggo_overrides edge describes. Two conditions keep this line
+        // honest. The edge must have CARRIED something (publishes > 0): a
+        // WGGO that ran and DECLINED publishes nothing, FASE reads the
+        // channel empty and falls back, and attributing the inversion to a
+        // dependency that carried nothing would be a false explanation. And
+        // the wording follows the edge's own OrderClaim: only an
+        // InvocationOrdered edge REQUIRES the order; a ValueOrderedOnly edge
+        // merely makes the observed order the one its value flowed in.
+        let edge = crate::pass_bus::CHANNELS.iter().find_map(|d| {
+            if d.producer != a {
+                return None;
+            }
+            let c = d.consumed_by_passes.iter().find(|c| c.pass == b)?;
+            (crate::pass_bus::traffic(d.channel).publishes > 0).then_some((d, c))
         });
         match edge {
-            Some(d) => s.push_str(&format!(
-                "[pass-trace] STAGE ORDER: {a} ran before {b}, inverting \
-                 their declared PipelineStage — required by the declared \
-                 dependency: {b} consumes {}, which {a} produces\n",
-                d.name
-            )),
+            Some((d, c)) => {
+                let claim = match c.order {
+                    crate::pass_bus::OrderClaim::InvocationOrdered => "required by",
+                    crate::pass_bus::OrderClaim::ValueOrderedOnly(_) => "consistent with",
+                };
+                s.push_str(&format!(
+                    "[pass-trace] STAGE ORDER: {a} ran before {b}, inverting \
+                     their declared PipelineStage — {claim} the declared \
+                     dependency: {b} consumes {}, which {a} produces\n",
+                    d.name
+                ));
+            }
             None => s.push_str(&format!(
                 "[pass-trace] STAGE ORDER: {a} ran before {b}, inverting \
                  their declared PipelineStage (see each pass's CompilePhase \

@@ -703,8 +703,15 @@ fn every_dependency_edge_shows_type_coupling_in_the_consuming_pass() {
                 d.name, d.carries
             )
         });
-        let end = d.carries.rfind("::").unwrap() + 2;
-        let carrying_module = &d.carries[start..end];
+        // Truncate at the first generic/argument delimiter BEFORE taking the
+        // last `::` — for a future `HashMap<crate::a::B, crate::c::D>` a bare
+        // rfind on the whole string would span both arguments and produce a
+        // needle no source file contains, failing with the misdiagnosing
+        // "edge is stale" message.
+        let tail = &d.carries[start..];
+        let tail = &tail[..tail.find([',', '<', '>', ' ']).unwrap_or(tail.len())];
+        let end = tail.rfind("::").unwrap() + 2;
+        let carrying_module = &tail[..end];
         assert!(
             carrying_module.matches("::").count() >= 2,
             "channel `{}`: carrying-module extraction went wrong: {carrying_module:?}",
