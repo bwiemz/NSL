@@ -2353,10 +2353,14 @@ pub(crate) mod cublas_inner {
             // cuda-graphs replay the region's work is enqueued later still
             // (the region-end graph launch), but the graph preserves the
             // captured stream order, so the block's write/read timeline
-            // inside the graph matches the eager one. A future
-            // multi-threaded dispatcher or cross-stream writer must either
-            // event-defer these frees (`defer_free_device`) or keep the
-            // scratch alive until a sync.
+            // inside the graph matches the eager one. One cross-stream
+            // writer DOES exist today — `prefetch_htod_on_transfer` on the
+            // NON_BLOCKING transfer stream — but it writes only persistent
+            // weight-stream arena slots guarded by events, never
+            // caching-allocator blocks, and transfer-stream interactions
+            // inside regions taint; any future writer without those
+            // constraints must either event-defer these frees
+            // (`defer_free_device`) or keep the scratch alive until a sync.
             super::inner::free_managed(self.first16);
             super::inner::free_managed(self.second16);
         }

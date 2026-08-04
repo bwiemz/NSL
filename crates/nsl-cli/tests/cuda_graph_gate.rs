@@ -257,11 +257,14 @@ fn cuda_graph_capture_replay_bitexact_gpu() {
 /// onto every gemm, every capturable region on this fixture contains one.
 ///
 /// `NSL_MATMUL_BF16_MIN_RATIO=1` forces the cast path onto this fixture's
-/// small GEMMs — the default 512 intensity floor would decline them all and
-/// this gate would silently re-test the plain-f32 path the core gate already
-/// covers. The loss-stream INEQUALITY against a default-mode control is the
-/// witness that bf16 actually engaged; without it a typo'd env var would
-/// leave everything green while testing nothing new.
+/// small GEMMs — the default 512 intensity floor would decline them all
+/// (max ratio here is ~43) and this gate would silently test only
+/// `gemm_bf16_mode`'s FAST_TF32 fallback arm, never the casts. The
+/// loss-stream INEQUALITY against a default-mode control is the witness
+/// that bf16 actually engaged; without it a typo'd env var would leave
+/// everything green while testing nothing new. Mode envs are pinned on
+/// every arm because an ambient `NSL_MATMUL_PEDANTIC=1`/`NSL_MATMUL_BF16=1`
+/// on a dev box would otherwise defeat the bf16 arm or flip the control.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn cuda_graph_bf16_storage_captures_gpu() {
@@ -270,6 +273,7 @@ fn cuda_graph_bf16_storage_captures_gpu() {
     let bf16: &[(&str, &str)] = &[
         ("NSL_MATMUL_BF16", "1"),
         ("NSL_MATMUL_BF16_MIN_RATIO", "1"),
+        ("NSL_MATMUL_PEDANTIC", "0"),
         ("NSL_CUDA_GRAPH_LOG", "1"),
     ];
     let on = run_fixture_env(
@@ -315,17 +319,90 @@ fn cuda_graph_bf16_storage_captures_gpu() {
 
     // Mode-engagement witness: bf16-storage products round differently from
     // the default mode, so the streams must NOT match.
-    let control = run_fixture(
+    let control = run_fixture_env(
         "cuda_graph_gate.nsl",
         "bf16ctl",
         &[GPU_MLP, XG, YG, EPOCHS],
         &["--seed", "777", "--cuda-graphs"],
+        &[("NSL_MATMUL_BF16", "0"), ("NSL_MATMUL_PEDANTIC", "0")],
     );
     assert!(control.success, "control run failed:\n{}", control.stderr);
+    assert!(
+        !control.losses.is_empty(),
+        "control losses did not parse — the inequality below would pass \
+         vacuously:\n{}",
+        control.stdout
+    );
     assert_ne!(
         on.losses, control.losses,
         "bf16-storage mode did not engage (loss stream identical to the \
          default mode) — env plumbing dead, gate is vacuous"
+    );
+}
+
+/// The op-0 divergence gate: a replay verification that MISMATCHES ON THE
+/// REGION'S FIRST OP produces an EMPTY repair prefix, which used to be
+/// indistinguishable from the verified-skip sentinel — the hook returned
+/// "skip" for an op the just-destroyed graph would never perform, and the
+/// step ran with that op silently dropped (under bf16: an operand cast whose
+/// GemmEx then read the previous step's stale scratch — corrupted numerics,
+/// no error, no taint). `HookOutcome` makes the two cases distinct types;
+/// this gate forces the exact scenario via the
+/// `NSL_CUDA_GRAPH_TEST_DIVERGE_FIRST` kill switch (fires once per
+/// region-phase, at the first replay's op 0) and asserts the run heals:
+/// mismatches observed, the region re-captures and replays, and the loss
+/// stream is STILL bit-identical to the eager run.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn cuda_graph_survives_forced_first_op_divergence_gpu() {
+    let env: &[(&str, &str)] = &[
+        ("NSL_MATMUL_BF16", "1"),
+        ("NSL_MATMUL_BF16_MIN_RATIO", "1"),
+        ("NSL_MATMUL_PEDANTIC", "0"),
+        ("NSL_CUDA_GRAPH_TEST_DIVERGE_FIRST", "1"),
+        ("NSL_CUDA_GRAPH_LOG", "1"),
+    ];
+    let on = run_fixture_env(
+        "cuda_graph_gate.nsl",
+        "div0on",
+        &[GPU_MLP, XG, YG, EPOCHS],
+        &["--seed", "777", "--cuda-graphs"],
+        env,
+    );
+    assert!(
+        on.success,
+        "forced-divergence run failed:\nstdout:\n{}\nstderr:\n{}",
+        on.stdout, on.stderr
+    );
+    let c = banner_counters(&on.stderr);
+    assert!(
+        c["mismatches"] > 0,
+        "the kill switch never forced a divergence — this gate is testing \
+         nothing: {c:?}\n{}",
+        on.stderr
+    );
+    assert!(
+        c["captured"] > 0 && c["replays"] > 0,
+        "region did not re-capture and replay after the forced divergence: {c:?}\n{}",
+        on.stderr
+    );
+
+    // The whole point: an op-0 divergence must not cost one silently
+    // corrupted step. Same env on the eager arm (the kill switch is inert
+    // without --cuda-graphs: no regions, no Skipping mode).
+    let off = run_fixture_env(
+        "cuda_graph_gate.nsl",
+        "div0off",
+        &[GPU_MLP, XG, YG, EPOCHS],
+        &["--seed", "777"],
+        env,
+    );
+    assert!(off.success, "eager arm failed:\n{}", off.stderr);
+    assert!(!on.losses.is_empty(), "no losses parsed:\n{}", on.stdout);
+    assert_eq!(
+        on.losses, off.losses,
+        "an op-0 divergence corrupted the step — the dropped-op sentinel \
+         conflation is back"
     );
 }
 

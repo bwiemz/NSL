@@ -513,8 +513,15 @@ mod imp {
                     // Not dispatched on: re-entering the wrapper re-derives
                     // the storage route from the same dims and the
                     // once-per-process matmul mode, and `a`/`b` here are the
-                    // ORIGINAL f32 pointers, so a `Bf16Storage` op re-casts
-                    // fresh scratch exactly as the recorded step did.
+                    // ORIGINAL f32 pointers. For a `Bf16Storage` op this
+                    // double-issues the casts — the repaired prefix already
+                    // re-launched the recorded cast kernels into the
+                    // recorded scratch, and the wrapper re-entry then casts
+                    // again into FRESH scratch for its GemmEx. Harmless
+                    // (same sources, deterministic rounding, all
+                    // stream-ordered) but the extra alloc/free pair can
+                    // perturb the allocator once, costing one extra record
+                    // cycle before the region re-captures.
                     precision: _,
                 } => {
                     let (alpha, beta) = (f32::from_bits(*alpha_bits), f32::from_bits(*beta_bits));
@@ -1073,20 +1080,20 @@ mod imp {
         if !enabled() {
             return true;
         }
-        let to_repair = ACTIVE.with(|a| {
+        let outcome = ACTIVE.with(|a| {
             let mut guard = a.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { ref mut tainted } => {
                     match read_kernel_op(func, grid, block, shared, args, name_ptr) {
                         Some(op) => {
                             active.seq.push(op);
-                            None
+                            HookOutcome::Issue
                         }
                         None => {
                             *tainted = true;
-                            None
+                            HookOutcome::Issue
                         }
                     }
                 }
@@ -1094,37 +1101,102 @@ mod imp {
                     match read_kernel_op(func, grid, block, shared, args, name_ptr) {
                         Some(op) => {
                             active.seq.push(op);
-                            None
+                            HookOutcome::Issue
                         }
                         None => {
                             // Param query failed only NOW (never during the
                             // record steps that proved stability) — cannot
                             // happen in practice, but fail safe: abort.
                             TAINTS.fetch_add(1, Ordering::Relaxed);
-                            Some(diverge(active, fail_state(active.attempts)))
+                            HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                         }
                     }
                 }
                 Mode::Skipping { idx } => {
+                    if idx == 0 && test_diverge_arm(active.id, active.phase) {
+                        // Test-only kill switch: force the op-0 divergence
+                        // that motivated `HookOutcome` (see its docs), once
+                        // per (region, phase) — the region then re-records,
+                        // re-captures and replays normally. The gate asserts
+                        // the run stays bit-exact anyway.
+                        MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                        return HookOutcome::Diverged(diverge(
+                            active,
+                            fail_state(active.attempts),
+                        ));
+                    }
                     let matches = read_kernel_op(func, grid, block, shared, args, name_ptr)
                         .is_some_and(|op| active.seq.get(idx) == Some(&op));
                     if matches {
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new()); // sentinel: SKIP the launch
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false, // verified — skip
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
+    }
+
+    /// `NSL_CUDA_GRAPH_TEST_DIVERGE_FIRST=1` — test-only: force each
+    /// (region, phase)'s first replay verification to report a mismatch at
+    /// op 0. This is the exact shape that used to conflate with the skip
+    /// sentinel and drop the op (see `HookOutcome`); the e2e gate keeps it
+    /// covered. Returns true exactly once per (region, phase); the fired
+    /// set is global (NOT on `Active`, which is rebuilt every occurrence —
+    /// a per-occurrence flag would re-fire on every replay attempt and the
+    /// region could never re-capture).
+    fn test_diverge_arm(id: i64, phase: u64) -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        if !*FLAG.get_or_init(|| {
+            std::env::var("NSL_CUDA_GRAPH_TEST_DIVERGE_FIRST").ok().as_deref() == Some("1")
+        }) {
+            return false;
+        }
+        static FIRED: OnceLock<Mutex<std::collections::HashSet<(i64, u64)>>> = OnceLock::new();
+        FIRED
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert((id, phase))
+    }
+
+    /// Verdict from a hook's ACTIVE-borrow section, deciding whether the
+    /// wrapper performs its real GPU op.
+    ///
+    /// This is a three-way enum because two of its cases used to share one
+    /// `Option<Vec<GpuOp>>` emptiness sentinel: "verified — skip" and "the
+    /// region just diverged" both surfaced as a vector, and a divergence at
+    /// region op 0 (or a capture abort with nothing recorded yet) produced
+    /// an EMPTY repair prefix — indistinguishable from the skip sentinel.
+    /// The hook then returned "skip" for an op the destroyed graph would
+    /// never perform, and the step ran with a hole in it: e.g. a dropped
+    /// bf16 operand cast whose GemmEx went on to read stale scratch —
+    /// silent numeric corruption, no error, no taint (review 2026-08-04,
+    /// HIGH). The enum makes the ambiguity unrepresentable; `Diverged`
+    /// always issues the current op after repairing, even when the prefix
+    /// is empty.
+    enum HookOutcome {
+        /// Perform the real op (recording, capturing as a graph node via
+        /// the stream, eager, or no active region).
+        Issue,
+        /// The wrapper must NOT perform the real op: it was verified
+        /// against the captured sequence and the region-end graph launch
+        /// will perform it, or the capture hook already issued the async
+        /// form itself.
+        Handled,
+        /// The region diverged at this op: eagerly re-issue the
+        /// matched-and-skipped prefix (possibly empty — a mismatch at op 0
+        /// has nothing to repair), then perform the current op.
+        Diverged(Vec<GpuOp>),
     }
 
     fn read_kernel_op(
@@ -1199,32 +1271,32 @@ mod imp {
             beta_bits: beta.to_bits(),
             batch, stride_a, stride_b, stride_c,
         };
-        let to_repair = ACTIVE.with(|act| {
+        let outcome = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { .. } | Mode::Capturing => {
                     active.seq.push(op.clone());
-                    None
+                    HookOutcome::Issue
                 }
                 Mode::Skipping { idx } => {
                     if active.seq.get(idx) == Some(&op) {
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new());
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false,
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
     }
 
@@ -1289,14 +1361,14 @@ mod imp {
         if !enabled() {
             return true;
         }
-        let to_repair = ACTIVE.with(|act| {
+        let outcome = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { .. } => {
                     active.seq.push(GpuOp::HtoD { dst: dst as usize, len, staging: None });
-                    None
+                    HookOutcome::Issue
                 }
                 Mode::Capturing => match StagingBuf::alloc(len) {
                     Some(staging) => {
@@ -1314,18 +1386,21 @@ mod imp {
                             // Node creation failed — abort the capture and
                             // let the wrapper run the plain sync copy.
                             TAINTS.fetch_add(1, Ordering::Relaxed);
-                            return Some(diverge(active, fail_state(active.attempts)));
+                            return HookOutcome::Diverged(diverge(
+                                active,
+                                fail_state(active.attempts),
+                            ));
                         }
                         active.seq.push(GpuOp::HtoD {
                             dst: dst as usize,
                             len,
                             staging: Some(staging),
                         });
-                        Some(Vec::new()) // handled — wrapper must not copy
+                        HookOutcome::Handled // wrapper must not copy
                     }
                     None => {
                         TAINTS.fetch_add(1, Ordering::Relaxed);
-                        Some(diverge(active, fail_state(active.attempts)))
+                        HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                     }
                 },
                 Mode::Skipping { idx } => {
@@ -1339,20 +1414,20 @@ mod imp {
                             st.fill_from(src, len);
                         }
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new());
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false,
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
     }
 
@@ -1364,14 +1439,14 @@ mod imp {
             return true;
         }
         let op = GpuOp::DtoD { dst: dst as usize, src: src as usize, len };
-        let to_repair = ACTIVE.with(|act| {
+        let outcome = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { .. } => {
                     active.seq.push(op.clone());
-                    None
+                    HookOutcome::Issue
                 }
                 Mode::Capturing => {
                     let stream = crate::cuda::inner::current_stream();
@@ -1385,28 +1460,31 @@ mod imp {
                     };
                     if r != CUresult::CUDA_SUCCESS {
                         TAINTS.fetch_add(1, Ordering::Relaxed);
-                        return Some(diverge(active, fail_state(active.attempts)));
+                        return HookOutcome::Diverged(diverge(
+                            active,
+                            fail_state(active.attempts),
+                        ));
                     }
                     active.seq.push(op.clone());
-                    Some(Vec::new())
+                    HookOutcome::Handled
                 }
                 Mode::Skipping { idx } => {
                     if active.seq.get(idx) == Some(&op) {
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new());
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false,
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
     }
 
