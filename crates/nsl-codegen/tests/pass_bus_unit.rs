@@ -167,9 +167,10 @@ fn an_exempt_channel_does_not_report_dead_output() {
     let mut bus = PassBus::default();
     pass_trace::record("CSHA");
     bus.publish_csha_bridge(bridge());
+    let t = pass_bus::traffic(Channel::CshaBridge);
     assert_eq!(
-        pass_bus::traffic(Channel::CshaBridge),
-        pass_bus::ChannelTraffic { publishes: 1, reads_full: 0, reads_empty: 0 },
+        (t.publishes, t.reads_full, t.reads_empty),
+        (1, 0, 0),
         "the precondition must hold, or the exemption is not what keeps this \
          quiet"
     );
@@ -364,6 +365,160 @@ fn every_channel_explains_what_an_empty_read_means() {
         );
         assert!(!d.carries.is_empty(), "channel `{}` declares no type", d.name);
     }
+}
+
+// ─── Step 5: sequence stamps, ReadBeforePublish, dependency order ───────────
+
+/// The stamps record ORDER, which the totals cannot: `publishes: 1,
+/// reads_empty: 1` describes both interleavings, and only ask-before-answer
+/// is the finding.
+#[test]
+fn read_before_publish_fires_only_when_the_ask_preceded_the_answer() {
+    let _g = guard();
+
+    // Ask, THEN answer, then ask again successfully: the early reader planned
+    // against the empty default while the value existed later in the process.
+    // `csha_claimed_ops` enforces the invariant, and the trailing full read
+    // keeps DeadOutput (which would win otherwise) out of the picture.
+    let mut bus = PassBus::default();
+    assert!(!bus.is_csha_claimed(1)); // empty read, stamped
+    bus.publish_csha_claimed_ops([1u32].into_iter().collect());
+    assert!(bus.is_csha_claimed(1)); // full read: not DeadOutput
+    let t = pass_bus::traffic(Channel::CshaClaimedOps);
+    assert!(
+        t.first_empty_read_seq != 0 && t.first_publish_seq > t.first_empty_read_seq,
+        "the scenario must actually be ask-before-answer: {t:?}"
+    );
+    assert_eq!(
+        pass_bus::findings(),
+        vec![BusFinding::ReadBeforePublish { channel: Channel::CshaClaimedOps }]
+    );
+
+    // Control: answer, then ask. Same totals for publishes/reads_full, no
+    // empty read before the publish — and no finding.
+    pass_trace::reset();
+    let mut bus = PassBus::default();
+    bus.publish_csha_claimed_ops([1u32].into_iter().collect());
+    assert!(bus.is_csha_claimed(1));
+    assert!(
+        pass_bus::findings().is_empty(),
+        "publish-then-read is the healthy order and must not fire: {:?}",
+        pass_bus::findings()
+    );
+}
+
+/// A channel that EXEMPTS itself from ReadBeforePublish stays quiet under
+/// exactly the pattern that would otherwise fire.
+///
+/// `wggo_overrides` is the production case the exemption exists for: with no
+/// pre-plan, FASE's plan-selection read is empty (it falls back to
+/// `fase::plan`, correctly) and the in-place replan's publish postdates it,
+/// guarded by the driver's divergence refusal.
+#[test]
+fn an_exempt_channel_does_not_report_read_before_publish() {
+    let _g = guard();
+    let mut bus = PassBus::default();
+    assert!(bus.wggo_overrides().is_none()); // FASE's empty read
+    bus.publish_wggo_overrides(nsl_codegen::wggo_overrides::WggoOverrides {
+        per_layer: vec![],
+    }); // the in-place replan's late publish
+    assert!(bus.wggo_overrides().is_some());
+    let t = pass_bus::traffic(Channel::WggoOverrides);
+    assert!(
+        t.first_empty_read_seq != 0 && t.first_publish_seq > t.first_empty_read_seq,
+        "the pattern must be present, or the exemption is not what keeps \
+         this quiet: {t:?}"
+    );
+    assert!(
+        pass_bus::findings().is_empty(),
+        "wggo_overrides is exempt from ReadBeforePublish and must not fire: \
+         {:?}",
+        pass_bus::findings()
+    );
+}
+
+/// `reset` must clear the stamps too, or a finding would compare one
+/// compile's ask against another's answer.
+#[test]
+fn reset_clears_the_sequence_stamps() {
+    let _g = guard();
+    let bus = PassBus::default();
+    assert!(!bus.is_csha_claimed(0));
+    assert!(pass_bus::traffic(Channel::CshaClaimedOps).first_empty_read_seq != 0);
+    pass_bus::reset();
+    let t = pass_bus::traffic(Channel::CshaClaimedOps);
+    assert_eq!(
+        (t.first_publish_seq, t.first_empty_read_seq),
+        (0, 0),
+        "stamps survived reset"
+    );
+}
+
+/// The invocation-order checker fires on a declared InvocationOrdered edge
+/// whose consumer was reached first — and ONLY on that.
+#[test]
+fn dependency_order_violations_fire_in_exactly_the_declared_direction() {
+    let _g = guard();
+
+    // Consumer before producer: the violation.
+    pass_trace::record("CSHA");
+    pass_trace::record("WGGO");
+    assert_eq!(
+        pass_bus::dependency_order_violations(),
+        vec![("WGGO", "CSHA", Channel::WggoOverrides)]
+    );
+
+    // Producer before consumer: the declared order.
+    pass_trace::reset();
+    pass_trace::record("WGGO");
+    pass_trace::record("CSHA");
+    pass_trace::record("WRGA");
+    assert!(pass_bus::dependency_order_violations().is_empty());
+
+    // Only one side ran: nothing to order.
+    pass_trace::reset();
+    pass_trace::record("CSHA");
+    assert!(pass_bus::dependency_order_violations().is_empty());
+    pass_trace::reset();
+    pass_trace::record("WGGO");
+    assert!(pass_bus::dependency_order_violations().is_empty());
+}
+
+/// THE pin for the OrderClaim distinction: FASE before WGGO is a legitimate
+/// compile path (the in-place replan), so the FASE edge is ValueOrderedOnly
+/// and must NOT produce an invocation-order violation. Flip that edge to
+/// InvocationOrdered and this test is the one that says why not.
+#[test]
+fn a_value_ordered_only_edge_never_produces_an_invocation_violation() {
+    let _g = guard();
+    pass_trace::record("FASE");
+    pass_trace::record("WGGO");
+    assert!(
+        pass_bus::dependency_order_violations().is_empty(),
+        "FASE-then-WGGO is the in-place-replan path; the WGGO->FASE edge is \
+         ValueOrderedOnly precisely so this is not flagged: {:?}",
+        pass_bus::dependency_order_violations()
+    );
+}
+
+/// The third finding renders distinctly, naming the channel, the producer,
+/// and what the early reader's branch did.
+#[test]
+fn read_before_publish_renders_with_its_own_marker() {
+    let _g = guard();
+    let mut bus = PassBus::default();
+    assert!(!bus.is_csha_claimed(1));
+    bus.publish_csha_claimed_ops([1u32].into_iter().collect());
+    assert!(bus.is_csha_claimed(1));
+    let r = pass_bus::report();
+    assert!(
+        r.contains("READ BEFORE PUBLISH: csha_claimed_ops"),
+        "missing or mis-attributed ReadBeforePublish:\n{r}"
+    );
+    assert!(
+        r.contains("before CSHA first published it"),
+        "the line must name the producer:\n{r}"
+    );
 }
 
 /// `edges_for` is the scheduler-facing view: the channels a pass fills.

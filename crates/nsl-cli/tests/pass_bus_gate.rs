@@ -234,11 +234,16 @@ fn empty_reads_are_counted_on_a_plain_compile() {
 
 /// The standard CPU configurations must produce NO findings.
 ///
-/// Both findings describe a contradiction, not a configuration, so a clean
+/// Every finding describes a contradiction, not a configuration, so a clean
 /// fixture producing one means either a real defect or a rule that cries wolf
 /// — and the first version of the `SilentDefault` rule did exactly that, firing
 /// on every compile where CSHA ran and declined. Pinning zero here is what
 /// stops that regressing quietly into noise nobody reads.
+///
+/// `READ BEFORE PUBLISH` is in the filter for the same reason: the first
+/// draft of its per-channel dispositions enforced three channels whose
+/// per-compile ordering argument a multi-file build defeats, and a filter
+/// that cannot see the category cannot catch that class regressing.
 #[test]
 fn the_standard_configurations_report_no_findings() {
     for (tag, flags) in [
@@ -252,7 +257,11 @@ fn the_standard_configurations_report_no_findings() {
         let findings: Vec<&str> = r
             .stderr
             .lines()
-            .filter(|l| l.contains("DEAD OUTPUT") || l.contains("SILENT DEFAULT"))
+            .filter(|l| {
+                l.contains("DEAD OUTPUT")
+                    || l.contains("SILENT DEFAULT")
+                    || l.contains("READ BEFORE PUBLISH")
+            })
             .collect();
         assert!(
             findings.is_empty(),
