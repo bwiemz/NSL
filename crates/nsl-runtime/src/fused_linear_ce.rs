@@ -214,9 +214,15 @@ fn hint_pin_disabled() -> bool {
 }
 
 /// A `[dim, stride]` pair list, as the kernels will actually read the tensor.
-struct Extents {
-    shape: Vec<i64>,
-    strides: Vec<i64>,
+///
+/// Borrows rather than owns: this is built and torn down on every
+/// `@fused_lm_ce` forward AND backward call (i.e. every training step), so an
+/// owned `Vec` here would be a heap alloc/free pair on the hot path purely to
+/// satisfy this struct -- the memory-slab invariant the compiler enforces
+/// elsewhere for exactly this reason.
+struct Extents<'a> {
+    shape: &'a [i64],
+    strides: &'a [i64],
     len: i64,
 }
 
@@ -266,8 +272,8 @@ struct Extents {
 /// refusal class for shapes the rest of the stack already rejects.
 fn check_hint_extents(
     site: &str,
-    x: &Extents,
-    w: &Extents,
+    x: &Extents<'_>,
+    w: &Extents<'_>,
     batch: i64,
     seq: i64,
     v: i64,
@@ -286,7 +292,7 @@ fn check_hint_extents(
     // Element COUNTS are equal for both forms and for the 16-bit dtype casts
     // (which change bytes per element, not the count), but the dims are what
     // the backward's `dx` allocation is built from -- so compare those.
-    let x_ok = match x.shape.as_slice() {
+    let x_ok = match x.shape {
         [b, s, hh] => *b == batch && *s == seq && *hh == h,
         [r, hh] => *r == rows && *hh == h,
         _ => false,
@@ -313,7 +319,7 @@ fn check_hint_extents(
     }
 
     // `W` is the LM head `[V, H]`. `h` is trustworthy by the check above.
-    if w.shape.as_slice() != [v, h] {
+    if w.shape != [v, h] {
         let implied_v = (w.len % h == 0).then(|| w.len / h);
         return Err(format!(
             "{site}: the @fused_lm_ce decorator pins vocab_size = {v} (at \
@@ -332,7 +338,7 @@ fn check_hint_extents(
     for (name, t) in [("head input (x)", x), ("LM-head weight (W)", w)] {
         let mut dense_extent: i64 = 1;
         let mut has_zero_stride = false;
-        for (&dim, &st) in t.shape.iter().zip(&t.strides) {
+        for (&dim, &st) in t.shape.iter().zip(t.strides.iter()) {
             if dim > 1 && st == 0 {
                 has_zero_stride = true;
             }
@@ -410,8 +416,8 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
         }
         let ndim = t.ndim.max(0) as usize;
         Extents {
-            shape: unsafe { std::slice::from_raw_parts(t.shape, ndim) }.to_vec(),
-            strides: unsafe { std::slice::from_raw_parts(t.strides, ndim) }.to_vec(),
+            shape: unsafe { std::slice::from_raw_parts(t.shape, ndim) },
+            strides: unsafe { std::slice::from_raw_parts(t.strides, ndim) },
             len: t.len,
         }
     };
@@ -449,25 +455,37 @@ mod hint_extent_tests {
     const V: i64 = 49152;
 
     /// A contiguous tensor of `shape` (row-major strides), as every real
-    /// head input and LM-head weight is.
-    fn dense(shape: &[i64]) -> Extents {
+    /// head input and LM-head weight is. `stride0_override` lets the
+    /// non-contiguous-input tests bake in a broadcast/strided dim 0 without
+    /// mutating in place — `Extents` borrows now (see its doc comment), so
+    /// the backing storage is leaked to get a `'static` slice. That's fine
+    /// for a handful of small test fixtures; it would not be fine on the
+    /// production path this struct also serves, which is the point.
+    fn dense_with_stride0(shape: &[i64], stride0_override: Option<i64>) -> Extents<'static> {
         let mut strides = vec![1i64; shape.len()];
         for i in (0..shape.len().saturating_sub(1)).rev() {
             strides[i] = strides[i + 1] * shape[i + 1];
         }
+        if let (Some(s0), true) = (stride0_override, !strides.is_empty()) {
+            strides[0] = s0;
+        }
         Extents {
-            shape: shape.to_vec(),
-            strides,
+            shape: shape.to_vec().leak(),
+            strides: strides.leak(),
             len: shape.iter().product(),
         }
     }
 
-    fn check(x: &Extents, w: &Extents, b: i64, s: i64, v: i64, h: i64) -> Result<(), String> {
+    fn dense(shape: &[i64]) -> Extents<'static> {
+        dense_with_stride0(shape, None)
+    }
+
+    fn check(x: &Extents<'_>, w: &Extents<'_>, b: i64, s: i64, v: i64, h: i64) -> Result<(), String> {
         check_hint_extents("test_site", x, w, b, s, v, h)
     }
 
     /// The shipped shape: rank-3 `[B, S, H]` head input.
-    fn ok3() -> (Extents, Extents) {
+    fn ok3() -> (Extents<'static>, Extents<'static>) {
         (dense(&[B, S, H]), dense(&[V, H]))
     }
 
@@ -573,8 +591,7 @@ mod hint_extent_tests {
         // Batch 4, not the shipped 1: a stride of 0 on a size-1 dim is
         // genuinely harmless, so broadcasting over a 1-wide batch would (and
         // did, when this test was first written) pass correctly.
-        let mut x = dense(&[4, 256, H]);
-        x.strides[0] = 0; // one row broadcast across the batch
+        let x = dense_with_stride0(&[4, 256, H], Some(0)); // one row broadcast across the batch
         let err = check(&x, &dense(&[V, H]), 4, 256, V, H).unwrap_err();
         assert!(err.contains("non-contiguous"), "{err}");
         assert!(err.contains(".contiguous()"), "must name the fix: {err}");
@@ -586,15 +603,13 @@ mod hint_extent_tests {
     /// would reject the shipped `batch_size = 1` shape.
     #[test]
     fn zero_stride_on_a_size_one_dim_is_not_a_broadcast() {
-        let mut x = dense(&[B, S, H]);
-        x.strides[0] = 0;
+        let x = dense_with_stride0(&[B, S, H], Some(0));
         assert!(check(&x, &dense(&[V, H]), B, S, V, H).is_ok());
     }
 
     #[test]
     fn non_contiguous_weight_is_refused() {
-        let mut w = dense(&[V, H]);
-        w.strides[0] = H * 2; // a row-strided slice of a wider buffer
+        let w = dense_with_stride0(&[V, H], Some(H * 2)); // a row-strided slice of a wider buffer
         let err = check(&dense(&[B, S, H]), &w, B, S, V, H).unwrap_err();
         assert!(err.contains("non-contiguous"), "{err}");
         assert!(err.contains("LM-head weight"), "must name which tensor: {err}");
@@ -611,7 +626,7 @@ mod hint_extent_tests {
                 "degenerate hint ({b}, {s}, {v}, {h}) must not refuse"
             );
         }
-        let empty = Extents { shape: vec![], strides: vec![], len: 0 };
+        let empty = Extents { shape: &[], strides: &[], len: 0 };
         assert!(check(&empty, &w, B, S, V, H).is_ok(), "empty x must not refuse");
         assert!(check(&x, &empty, B, S, V, H).is_ok(), "empty w must not refuse");
     }
