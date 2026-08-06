@@ -46,7 +46,14 @@ fn a_loop_bound_wggo_replan_is_a_declared_phase_not_a_mismatch() {
     cmd.assert()
         .success()
         .stderr(predicate::str::contains("WGGO(OnWengert)@TrainBlock"))
-        .stderr(predicate::str::contains("PHASE MISMATCH: WGGO").not());
+        .stderr(predicate::str::contains("PHASE MISMATCH: WGGO").not())
+        // The review found the SIBLING false finding on this same path:
+        // "WGGO applied" conflates its two invocation sites, and only the
+        // prepass publishes pre-plans — so wggo_preplans printed a SILENT
+        // DEFAULT on every fully-correct loop-bound compile. Exempted per
+        // channel (the #462 mechanism); this pins the whole witness
+        // compile clean of false findings, not just the phase half.
+        .stderr(predicate::str::contains("SILENT DEFAULT: wggo_preplans").not());
 }
 
 /// The enforcement path, driven by the same knob convention as

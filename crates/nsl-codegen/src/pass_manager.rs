@@ -55,13 +55,25 @@ const FORCE_KNOB: &str = "NSL_FORCE_DEPENDENCY_ORDER_VIOLATION";
 pub struct PassManager {
     epoch: u64,
     prev_epoch: u64,
+    /// `Drop` mutates a THREAD-LOCAL. A manager dropped on a different
+    /// thread than `begin()` ran on would clobber the dropping thread's
+    /// epoch with a foreign one and leave the origin thread on a dead
+    /// epoch — records would leak out of their compile's view and
+    /// violations could be MISSED. No production path moves a Compiler
+    /// across threads, and this marker keeps it that way at compile time:
+    /// a raw pointer makes the type `!Send + !Sync`.
+    _thread_bound: std::marker::PhantomData<*const ()>,
 }
 
 impl PassManager {
     /// Anchor a new compile epoch on this thread.
     pub fn begin() -> Self {
         let (epoch, prev_epoch) = crate::pass_trace::begin_epoch();
-        Self { epoch, prev_epoch }
+        Self {
+            epoch,
+            prev_epoch,
+            _thread_bound: std::marker::PhantomData,
+        }
     }
 
     /// This compile's epoch.
@@ -137,6 +149,21 @@ impl PassManager {
 
 impl Drop for PassManager {
     fn drop(&mut self) {
+        // The restore assumes LIFO: this manager's epoch is the thread's
+        // current one. `begin()` is `pub`, so nothing else GUARANTEES the
+        // discipline — check it, loudly but without panicking (a panic in
+        // Drop during unwind aborts the process). A mismatch means two
+        // managers on one thread were dropped out of order and the
+        // survivor's tail records will mis-attribute.
+        let current = crate::pass_trace::current_epoch();
+        if current != self.epoch {
+            eprintln!(
+                "[pass-manager] BUG: non-LIFO epoch drop — dropping epoch \
+                 {} while the thread is on epoch {current}; records after \
+                 this point may be attributed to the wrong compile",
+                self.epoch
+            );
+        }
         crate::pass_trace::restore_epoch(self.prev_epoch);
     }
 }

@@ -667,7 +667,24 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
                       and the train block see no pre-computed decisions",
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
-        applied_implies_published: Invariant::Enforced,
+        // Stated as Enforced this cries wolf: "WGGO applied" conflates the
+        // producer's TWO invocation sites, and only the prepass publishes
+        // pre-plans. A block the prepass structurally cannot plan — a
+        // loop-bound model var, whose type resolves only during codegen —
+        // is planned by the IN-PLACE site, which applies rewrites while
+        // this channel legitimately stays empty; the loop-bound fixture
+        // witnessed the false SILENT DEFAULT on every fully-correct
+        // compile (found by this PR's own review — the same
+        // false-reporting class as the PHASE MISMATCH it fixed, one
+        // finding over). The real invariant would be "a prepass that
+        // PLANNED published", which the finding's evidence (pass-level
+        // Applied) cannot express.
+        applied_implies_published: Invariant::Exempt(
+            "WGGO has two invocation sites and only the prepass publishes \
+             pre-plans; the in-place replan applies on exactly the blocks \
+             the prepass cannot plan (loop-bound model vars), where empty \
+             is this channel's correct answer, not a silent default",
+        ),
         // Within one compile the ordering holds (the pre-pass fills it
         // during kernel synthesis, both readers run after, and a pre-pass
         // that produced nothing never publishes). Across module compiles it

@@ -92,6 +92,11 @@ use std::sync::Mutex;
 /// dedupe by name at first occurrence, which reproduces the pre-epoch
 /// semantics exactly: before epochs existed, `record` was idempotent
 /// process-wide, so only the first entry per name could exist at all.
+///
+/// Growth is O(passes x compiles) per process where it used to be bounded
+/// by pass count — irrelevant at CLI scales (one entry per pass per module
+/// compile), noted for any future long-lived recompiling process, which
+/// would want an epoch-retiring compaction here.
 static TRACE: Mutex<Vec<(&'static str, Option<CompilePhase>, u64)>> = Mutex::new(Vec::new());
 
 /// Source of unique compile epochs. Global, not thread-local: two threads
@@ -124,6 +129,12 @@ pub(crate) fn begin_epoch() -> (u64, u64) {
 /// Restore the epoch that was active before [`begin_epoch`].
 pub(crate) fn restore_epoch(prev: u64) {
     CURRENT_EPOCH.with(|c| c.set(prev));
+}
+
+/// The epoch currently attributing on this thread (0 = none installed).
+/// The manager's `Drop` uses it to detect a non-LIFO drop before restoring.
+pub(crate) fn current_epoch() -> u64 {
+    CURRENT_EPOCH.with(|c| c.get())
 }
 
 /// The entries recorded under `epoch`, in first-invocation order — the

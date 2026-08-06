@@ -16,6 +16,14 @@ fn src(rel: &str) -> String {
 /// Strip `//` comments then all whitespace — the multi-line-call-chain
 /// lesson: a line-based scan misses a call split across lines and certifies
 /// what it cannot see.
+///
+/// Known limit, accepted: `/* block comments */` are NOT stripped, so a
+/// block-commented-out call would keep these scans green. Both pins are
+/// double-covered against that: the `passes` field is mandatory with
+/// private fields and `begin()` as the only constructor (the type system
+/// re-proves the mod.rs pin), and the stmt.rs consult is end-to-end
+/// covered by `pass_manager_gate.rs`'s forced-knob refusal (a dead consult
+/// makes that compile succeed and the arm fail).
 fn code_only(text: &str) -> String {
     text.lines()
         .map(|l| match l.find("//") {
