@@ -268,6 +268,12 @@ fn every_model_is_actually_covered() {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // Campaign scratch: srbf16_campaign.py copies each scale's
+                // model.nsl into every per-arm workdir under srbf16_logs/
+                // (gitignored), which is replication, not a new model.
+                if path.file_name().and_then(|n| n.to_str()) == Some("srbf16_logs") {
+                    continue;
+                }
                 walk(&path, root, found);
             } else if path.file_name().and_then(|n| n.to_str()) == Some("model.nsl") {
                 let src = std::fs::read_to_string(&path).unwrap_or_default();
