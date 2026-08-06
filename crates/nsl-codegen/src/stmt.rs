@@ -12017,17 +12017,18 @@ impl Compiler<'_> {
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
                 if let Some(sc) = multi {
-                    // bf16-sr must be re-checked here too: the closure cannot
-                    // infer it from sr_step (both call sites thread Some
-                    // unconditionally), and batching under bf16-sr would
-                    // bypass the authoritative-mirror SR step silently — the
-                    // exact divergence class fase_emit_final_step refuses
-                    // loudly.
+                    // The envelope booleans are re-checked here as a belt: a
+                    // future call site passing scalars alongside an envelope
+                    // falls through to the per-param loop instead of
+                    // mis-batching. bf16-sr no longer excludes (item 8, SR
+                    // arm): it selects the SR twin below, whose runtime entry
+                    // performs the same authoritative-mirror SR step and
+                    // coherence widen per member that fase_emit_final_step
+                    // emits per param.
                     if muon.is_none()
                         && zero3.is_none()
                         && !wrap_precision
                         && !wrap_offload
-                        && !c.features.param_dtype_bf16sr
                     {
                         if idxs.is_empty() {
                             return Ok(());
@@ -12051,6 +12052,38 @@ impl Compiler<'_> {
                         // mp_scale = 1.0: the layerwise schedule refuses
                         // grad_clip, so a clip factor can never exist here.
                         let zero_i = builder.ins().iconst(cl_types::I64, 0);
+                        if c.features.param_dtype_bf16sr {
+                            let step_v = sr_step.ok_or_else(|| {
+                                CodegenError::new(
+                                    "bf16-sr group update reached without an \
+                                     opt_step value — dispatcher must thread \
+                                     sr_step",
+                                )
+                            })?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_fase_fused_adamw_step_bf16sr_multi_idx",
+                                &[
+                                    param_list,
+                                    state_list_1,
+                                    state_list_2,
+                                    accum_val,
+                                    il,
+                                    lr_v,
+                                    b1_v,
+                                    omb1_v,
+                                    b2_v,
+                                    omb2_v,
+                                    eps_v,
+                                    wd_v,
+                                    bc.0,
+                                    bc.1,
+                                    zero_i,
+                                    zero_i,
+                                    step_v,
+                                ],
+                            )?;
+                        } else {
                         let one_scale = builder.ins().f64const(1.0);
                         c.compile_call_by_name(
                             builder,
@@ -12075,6 +12108,7 @@ impl Compiler<'_> {
                                 one_scale,
                             ],
                         )?;
+                        }
                         c.compile_call_by_name(builder, "nsl_list_free", &[il])?;
                         // The CSLA tail, unchanged: free the group's
                         // accumulators (fresh zeros next window). The
@@ -12443,23 +12477,42 @@ impl Compiler<'_> {
                 None
             };
 
-            // Item 8, CSLA half: when every group member takes the PLAIN
-            // fused AdamW step — no muon routing, no ZeRO-3 owner gates, no
-            // CPDT precision or offload envelope, no bf16-sr mirror step —
-            // each layer-group update collapses into ONE pointer-table
-            // launch over the group's indices
-            // (nsl_fase_fused_adamw_step_multi_idx), bit-identical per
-            // element to the per-param loop (same kernel body, table
-            // addressing). Admission mirrors the FullBuffer multi arm and
-            // shares its kill-switches; the runtime still falls back
-            // per-param for non-uniform members (CPU tensors, tied-θ
-            // aliases), so this admits TRYING to batch, never a numeric
-            // fork.
+            // Item 8, CSLA half: when the group takes the fused AdamW step
+            // with no muon routing, no ZeRO-3 owner gates, and no CPDT
+            // precision or offload envelope, each layer-group update
+            // collapses into ONE pointer-table launch over the group's
+            // indices — nsl_fase_fused_adamw_step_multi_idx for plain f32,
+            // or its bf16-sr twin (SR arm, same item) which performs the
+            // identical per-member SR step and coherence widen. Both are
+            // bit-identical per element to the per-param loop they replace
+            // (same kernel bodies, table addressing; the SR dither is a
+            // pure function of (param, element, step)).
+            //
+            // Fallback semantics differ per twin: the f32 runtime entry
+            // demotes non-uniform members (CPU tensors, tied-θ aliases,
+            // oversize params) to its sequential arm, while the SR entry
+            // falls back per-param only for UN-STREAMED members (no bf16
+            // mirror — which is where tied/view-rooted params land, since
+            // registration refuses non-owners) and asserts the streamed
+            // set's m/v/mp uniformity outright. Admission mirrors the
+            // FullBuffer multi arm and shares its kill-switches.
+            //
+            // If AdamW parameter groups (`no_decay`) are ever threaded into
+            // this batched call, the per-param loop in
+            // emit_csla_group_update must gain the same group plumbing
+            // FIRST — it bakes the recipe's flat λ today, and it is the
+            // NSL_FASE_MULTI_STEP=0 parity reference the SR gate diffs
+            // against.
             let csla_multi_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
                 if muon_csla_ctx.is_none()
                     && !wrap_precision
                     && !self.compile_options.optim_state_offload
-                    && !self.features.param_dtype_bf16sr
+                    // bf16-sr admits (item 8, SR arm): the group update
+                    // selects the SR twin of the multi_idx launch, which
+                    // performs the identical per-member SR step and coherence
+                    // widen. The layerwise schedule refuses grad_clip, so
+                    // the SR entries' no-clip contract can never be violated
+                    // from this site.
                     && zero3_streamed.is_none()
                     && two_state
                     && !self.compile_options.training_reference
@@ -13502,6 +13555,12 @@ impl Compiler<'_> {
                     && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
                     && !zero_enabled
                     && !self.compile_options.optim_state_offload
+                    // Belt only: bf16-sr structurally cannot reach this
+                    // FullBuffer path (it requires --weight-stream, which
+                    // clap-requires --layerwise-accum, so SR always takes the
+                    // CSLA schedule and its SR multi_idx arm — item 8). Kept
+                    // so a future envelope change fails safe into the
+                    // per-param loop instead of silently mis-batching.
                     && !self.features.param_dtype_bf16sr
                     && num_state_buffers >= 2
                 {

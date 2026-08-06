@@ -98,6 +98,7 @@ crates/nsl-cli/tests/sampling_device_gate.rs	gpu_redirect_does_not_strand_per_ca
 crates/nsl-cli/tests/sampling_device_gate.rs	returned_sampling_results_do_not_double_own	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	topk_dicts_no_longer_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sdpa_decorator_free_gpu_backward.rs	decorator_free_sdpa_backward_dispatches_on_gpu	gpu	requires a CUDA-capable GPU
+crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_batched_step_matches_per_param_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_e2e_deterministic_and_sane_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_tracks_f32_baseline_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/stage_c_packed_parity.rs	packed_fused_matches_decomposed_on_gpu	gpu	requires CUDA GPU (two real training runs)

@@ -309,6 +309,36 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         None,
     ),
+    // Item 8, bf16-SR arm: the SR twin of the idx entry above. Same contract
+    // minus mp_scale (the SR path has no clip fold; the layerwise schedule
+    // refuses grad_clip) plus the trailing `step` the SR counter stream is
+    // keyed on. No full-list twin exists: bf16-sr requires --weight-stream,
+    // which requires --layerwise-accum, so SR only ever batches from the
+    // CSLA group update. Same lockstep warning: this list, the `stmt.rs`
+    // emission order, and the Rust signature in `sr_bf16.rs` must not drift.
+    (
+        "nsl_fase_fused_adamw_step_bf16sr_multi_idx",
+        &[
+            types::I64, // params_list
+            types::I64, // m_list
+            types::I64, // v_list
+            types::I64, // mp_list
+            types::I64, // idx_list (NslList of i64 param indices)
+            types::F64, // lr
+            types::F64, // beta1
+            types::F64, // one_minus_beta1
+            types::F64, // beta2
+            types::F64, // one_minus_beta2
+            types::F64, // eps
+            types::F64, // wd
+            types::F64, // bc1_inv
+            types::F64, // bc2_inv
+            types::I64, // wd_exempt_list (0 = flat wd; CSLA passes 0)
+            types::I64, // wd_exempt_non_rank2
+            types::I64, // step (SR counter key)
+        ],
+        None,
+    ),
     // FASE two-phase-clip Phase A: global sum-of-squares over an NslList of
     // m_partial tensors with ONE pipeline drain (batched device reduction).
     ("nsl_fase_sum_sq_list", &[types::I64], Some(types::F64)),
