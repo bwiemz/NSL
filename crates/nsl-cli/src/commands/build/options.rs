@@ -117,6 +117,26 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
     // a pin mismatch must refuse the build outright rather than silently
     // compiling with unpinned selections.
     if let Some(ref db) = autotune_db {
+        // Refuse the combinations that would load the pin and then ignore
+        // it: --autotune-fresh skips every cache lookup (the overlay is a
+        // cache layer) and --no-autotune skips selection entirely. A build
+        // that prints "frozen db loaded" and then discards every pinned
+        // winner is worse than one that refuses (review MEDIUM).
+        if autotune_fresh {
+            eprintln!(
+                "error: --autotune-db does not compose with --autotune-fresh — \
+                 fresh mode bypasses every cache lookup, so the pinned winners \
+                 would be silently ignored"
+            );
+            process::exit(1);
+        }
+        if no_autotune {
+            eprintln!(
+                "error: --autotune-db does not compose with --no-autotune — \
+                 middle-value mode never consults tuning records"
+            );
+            process::exit(1);
+        }
         match nsl_codegen::autotune::load_frozen_db(db, autotune_db_sha256.as_deref()) {
             Ok(n) => eprintln!("[autotune] frozen db: {} record(s) from {}", n, db.display()),
             Err(e) => {

@@ -69,7 +69,6 @@ experimental-wrga = []
 experimental-cpdt = []
 
 [dev-dependencies]
-string-interner.workspace = true
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
 libloading = "0.8"

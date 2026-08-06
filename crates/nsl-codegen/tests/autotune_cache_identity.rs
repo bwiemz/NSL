@@ -675,14 +675,18 @@ fn the_autotune_key_is_not_built_from_the_database_default() {
 /// names the exact contract instead.
 #[test]
 fn symbol_resolution_for_hash_resolves_the_right_names() {
-    use string_interner::Symbol as _;
     let mut interner = nsl_lexer::Interner::new();
     let a = interner.get_or_intern("alpha");
     let b = interner.get_or_intern("beta");
+    // Derive the input from the REAL Debug rendering of the AST's Symbol
+    // wrapper — not a hand-built string — so a string-interner Debug-format
+    // or offset change fails HERE (the normalizer would match nothing and
+    // keys would silently become interning-order-dependent again; only the
+    // GPU e2e lane would notice, and default CI lanes are CPU).
     let debug = format!(
-        "Ident(Symbol(SymbolU32 {{ value: {} }})) @ Symbol(SymbolU32 {{ value: {} }})",
-        a.to_usize() + 1,
-        b.to_usize() + 1,
+        "Ident({:?}) @ {:?}",
+        nsl_ast::Symbol(a),
+        nsl_ast::Symbol(b),
     );
     let resolved = nsl_codegen::autotune::resolve_symbols_for_hash(&debug, &interner);
     assert_eq!(resolved, "Ident(Sym(\"alpha\")) @ Sym(\"beta\")");
@@ -690,6 +694,15 @@ fn symbol_resolution_for_hash_resolves_the_right_names() {
     assert_eq!(
         nsl_codegen::autotune::resolve_symbols_for_hash("no symbols here", &interner),
         "no symbols here"
+    );
+    // FileId is registration order — entry-point-dependent for imported
+    // modules — so it must normalize away while byte positions survive.
+    assert_eq!(
+        nsl_codegen::autotune::resolve_symbols_for_hash(
+            "span: Span { file_id: FileId(3), start: BytePos(7), end: BytePos(9) }",
+            &interner
+        ),
+        "span: Span { file_id: FileId(_), start: BytePos(7), end: BytePos(9) }"
     );
 }
 

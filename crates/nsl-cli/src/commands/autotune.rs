@@ -26,6 +26,10 @@ use std::process;
 use nsl_lexer::Interner;
 
 pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) {
+    if elements == 0 {
+        eprintln!("error: --elements must be at least 1 (0 elements benches nothing)");
+        process::exit(1);
+    }
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -128,7 +132,8 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
     if captured.is_empty() {
         eprintln!(
             "error: the compile captured no @autotune kernels from '{}' — \
-             selection never ran (is --no-autotune configured somewhere?)",
+             kernel selection never ran (the kernels may be unreachable from \
+             this file's compile)",
             file.display()
         );
         process::exit(1);
@@ -145,14 +150,28 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
         );
         match measure(cap, &device, elements) {
             Ok(winner) => {
-                println!("[autotune] '{}': measured winner {winner:?}", cap.name);
+                // Read back BEFORE claiming anything: "measured winner" must
+                // mean a Measured record exists. The all-variants-failed
+                // median fallback returns Ok but writes nothing, and a
+                // cost-model record must never be presented (or frozen) as
+                // a measurement (review findings, 2026-08-06).
                 match nsl_codegen::autotune::load_cache_record(&cap.name, &cap.hash, &device, None)
                 {
-                    Ok(Some(rec)) => frozen.push(rec),
+                    Ok(Some(rec))
+                        if matches!(
+                            rec.selection,
+                            nsl_codegen::autotune::SelectionMethod::Measured
+                        ) =>
+                    {
+                        println!("[autotune] '{}': measured winner {winner:?}", cap.name);
+                        frozen.push(rec);
+                    }
                     other => {
                         eprintln!(
-                            "[autotune] '{}': winner not readable back from the \
-                             cache ({other:?}) — freeze would ship nothing for it",
+                            "[autotune] '{}': no Measured record after tuning \
+                             ({other:?}) — every variant failed to benchmark, so \
+                             the selection fell back to an estimate; nothing to \
+                             report or freeze",
                             cap.name
                         );
                         failures += 1;

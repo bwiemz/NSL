@@ -123,6 +123,8 @@ const CPDT_CALIB: &str = "crates/nsl-codegen/src/bin/cpdt_calibrate.rs";
 /// of each feature's envelope in one place.
 pub const FEATURE_RULES: &[FeatureRule] = &[
     // ── clap-enforced (parse time; must match in BuildArgs AND RunArgs) ────
+    // Item 10: the pin is meaningless without a DB to pin.
+    clap_rule("--autotune-db-sha256", RuleKind::Requires, "autotune_db"),
     clap_rule("--checkpoint-selective", RuleKind::Requires, "checkpoint_blocks"),
     clap_rule("--checkpoint-budget-mib", RuleKind::Requires, "checkpoint_blocks"),
     clap_rule("--checkpoint-stride", RuleKind::Requires, "checkpoint_blocks"),
@@ -245,6 +247,21 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "FASE-Deferred plan",
         STMT,
         "--param-dtype bf16-sr requires the FASE-Deferred plan",
+    ),
+    // ── Frozen tuning DB (item 10) ─────────────────────────────────────────
+    src_rule(
+        "--autotune-db",
+        RuleKind::Conflicts,
+        "--autotune-fresh",
+        CLI_OPTIONS,
+        "--autotune-db does not compose with --autotune-fresh",
+    ),
+    src_rule(
+        "--autotune-db",
+        RuleKind::Conflicts,
+        "--no-autotune",
+        CLI_OPTIONS,
+        "--autotune-db does not compose with --no-autotune",
     ),
     src_rule(
         "--param-dtype",

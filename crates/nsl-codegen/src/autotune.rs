@@ -344,24 +344,20 @@ pub struct BenchmarkResult {
 
 /// Callback type for benchmarking a single variant on real hardware.
 ///
-/// **Nothing implements this.** The intended implementation belongs in the
-/// runtime — load the PTX, allocate dummy data, launch with CUDA events, return
-/// a `BenchmarkResult` — but no such function exists anywhere in the tree, so
-/// the only callers are this module's unit tests passing synthetic closures.
-/// Wiring it is the measured half of roadmap item 10; see the module header.
+/// The production implementation is [`bench_one_variant`] (item 10): load
+/// the PTX, synthesize buffers, launch with CUDA events, return a
+/// `BenchmarkResult`. It is reached only through [`measure_variants`] —
+/// the offline `nsl autotune` command — never from a compile; unit tests
+/// pass synthetic closures.
 ///
 /// Arguments: (ptx_source, kernel_name, variant_params) -> Result<BenchmarkResult>
 pub type BenchmarkFn = dyn Fn(&str, &str, &Variant) -> Result<BenchmarkResult, String>;
 
-/// Number of warmup launches (not timed) before measured runs.
-///
-/// Advisory only — read by nothing, because nothing implements [`BenchmarkFn`].
-/// It describes the protocol a future measured path should follow, not one this
-/// compiler performs.
+/// Number of warmup launches (not timed) before measured runs — followed
+/// by [`bench_one_variant`], the offline measured path (item 10).
 pub const WARMUP_RUNS: usize = 5;
-/// Number of measured launches for computing median latency.
-///
-/// Advisory only, for the same reason as [`WARMUP_RUNS`].
+/// Number of measured launches for computing median latency
+/// ([`bench_one_variant`]).
 pub const MEASURED_RUNS: usize = 10;
 /// Maximum time (ms) for a single variant before it's skipped.
 pub const VARIANT_TIMEOUT_MS: f64 = 5000.0;
@@ -383,14 +379,30 @@ pub fn find_best_variant(
     ptx_generator: &dyn Fn(&Variant) -> Result<String, String>,
     benchmark_fn: &BenchmarkFn,
 ) -> Result<Variant, String> {
-    // 1. Check cache
-    // `None`: this path measures, so there is no cost-model spec to invalidate
-    // against. A Measured record stays valid until the device or key changes.
-    if let Some(cached) = check_cache(kernel_name, cache_hash, device, None) {
-        if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-            eprintln!("[autotune] cache hit for {kernel_name}");
+    // 1. Check cache — MEASURED records only. A CostModel record for the
+    // same (device, key) is an ESTIMATE occupying the slot this path exists
+    // to fill; accepting it made `nsl build` before `nsl autotune` a silent
+    // no-op that could freeze the estimate into a pinned DB while printing
+    // "measured winner" (review HIGH, 2026-08-06 — a collision the v3 key
+    // unification created, since under v2's entry-point-dependent keys the
+    // two paths never shared a slot). An existing Measured record still
+    // short-circuits: re-tuning is idempotent by design.
+    match load_cache_record(kernel_name, cache_hash, device, None) {
+        Ok(Some(rec)) if matches!(rec.selection, SelectionMethod::Measured) => {
+            if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                eprintln!("[autotune] cache hit for {kernel_name} (measured)");
+            }
+            return Ok(rec.winner);
         }
-        return Ok(cached);
+        Ok(Some(_)) => {
+            if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                eprintln!(
+                    "[autotune] {kernel_name}: cost-model record present — measuring \
+                     (measurement replaces estimates, never the reverse)"
+                );
+            }
+        }
+        _ => {}
     }
 
     // 2. Fallback mode (no GPU)
@@ -561,19 +573,39 @@ pub fn resolve_symbols_for_hash(debug: &str, interner: &nsl_lexer::Interner) -> 
 /// Drop `, id: NodeId(N)` fields: node ids are a PARSER COUNTER, so the
 /// same kernel gets different ids depending on what the process parsed
 /// first (measured: `nsl build` starts ~26 ids later than `nsl autotune`
-/// on the identical file). Structure, spans, and resolved symbols carry
-/// all the identity the key needs.
+/// on the identical file). Then neutralize `FileId(N)` inside spans: the
+/// file id is the SOURCE-MAP REGISTRATION ORDER, so a kernel in an imported
+/// module hashes differently under `nsl autotune lib.nsl` (FileId(0)) than
+/// under `nsl build main.nsl` (FileId >= 1) — the import-structured layout
+/// would silently never consume measured records (review HIGH, 2026-08-06).
+/// Byte positions stay: they are file-content-relative and deterministic
+/// (position sensitivity is conservative — an edit above the kernel
+/// invalidates the tune, which is the safe direction).
+///
+/// Both rewrites assume their patterns cannot occur in user-controlled
+/// text: the kernel DSL refuses string literals today, and if that ever
+/// changes these delimiters must be escaped first or two kernels differing
+/// only inside a literal could collide.
 fn strip_node_ids(s: &str) -> String {
-    const PAT: &str = ", id: NodeId(";
+    let no_ids = strip_delimited(s, ", id: NodeId(", ')', "");
+    strip_delimited(&no_ids, "file_id: FileId(", ')', "file_id: FileId(_")
+}
+
+/// Remove `pat…close` spans, emitting `replacement` in their place.
+fn strip_delimited(s: &str, pat: &str, close: char, replacement: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(i) = rest.find(PAT) {
+    while let Some(i) = rest.find(pat) {
         out.push_str(&rest[..i]);
-        let tail = &rest[i + PAT.len()..];
-        let Some(end) = tail.find(')') else {
+        let tail = &rest[i + pat.len()..];
+        let Some(end) = tail.find(close) else {
             out.push_str(&rest[i..]);
             return out;
         };
+        out.push_str(replacement);
+        if !replacement.is_empty() {
+            out.push(close);
+        }
         rest = &tail[end + 1..];
     }
     out.push_str(rest);
@@ -593,9 +625,11 @@ fn strip_node_ids(s: &str) -> String {
 pub enum BenchArg {
     /// Device f32 buffer of `elems` elements, zero-filled.
     TensorF32,
-    /// Immediate f32 scalar.
+    /// Scalar delivered as round-toward-zero(x): the kernel ABI declares
+    /// every param `.param .u64` and converts numerically, so the bencher
+    /// passes an 8-byte integer slot (see `bench_one_variant`).
     F32(f32),
-    /// Immediate i64 scalar.
+    /// Immediate integer scalar (8-byte slot, matching the `.u64` ABI).
     I64(i64),
 }
 
@@ -781,9 +815,16 @@ fn bench_one_variant(
             }
 
             // Synthesize arguments. Slot storage must outlive the launches.
+            //
+            // The kernel compiler declares EVERY parameter `.param .u64` and
+            // consumes scalars via numeric conversion (`cvt.rn.f32.u64`), so
+            // every slot here is 8 bytes — a 4-byte f32 slot would make
+            // cuLaunchKernel read past the allocation AND deliver the f32's
+            // bit pattern as a giant integer (review MEDIUM, 2026-08-06).
+            // Scalars are therefore encoded as their integer value in a u64;
+            // BenchArg::F32(x) reaches the kernel as round-toward-zero(x).
             let mut dev_bufs: Vec<sys::CUdeviceptr> = Vec::new();
-            let mut f32_slots: Vec<f32> = Vec::new();
-            let mut i64_slots: Vec<i64> = Vec::new();
+            let mut scalar_slots: Vec<u64> = Vec::new();
             for a in args {
                 match a {
                     BenchArg::TensorF32 => {
@@ -795,11 +836,14 @@ fn bench_one_variant(
                             }
                             return Err(format!("cuMemAlloc({} B): {r:?}", elems * 4));
                         }
+                        // Fill result ignored: a memset failure surfaces as
+                        // a launch/timing error two calls later, on the same
+                        // stream (same policy as the event calls below).
                         sys::cuMemsetD8_v2(p, 0, elems * 4);
                         dev_bufs.push(p);
                     }
-                    BenchArg::F32(v) => f32_slots.push(*v),
-                    BenchArg::I64(v) => i64_slots.push(*v),
+                    BenchArg::F32(v) => scalar_slots.push(*v as u64),
+                    BenchArg::I64(v) => scalar_slots.push(*v as u64),
                 }
             }
             let free_all = |bufs: &[sys::CUdeviceptr]| {
@@ -807,7 +851,7 @@ fn bench_one_variant(
                     sys::cuMemFree_v2(b);
                 }
             };
-            let (mut di, mut fi, mut ii) = (0usize, 0usize, 0usize);
+            let (mut di, mut si) = (0usize, 0usize);
             let mut slots: Vec<*mut c_void> = Vec::with_capacity(args.len());
             for a in args {
                 match a {
@@ -815,23 +859,48 @@ fn bench_one_variant(
                         slots.push(&mut dev_bufs[di] as *mut _ as *mut c_void);
                         di += 1;
                     }
-                    BenchArg::F32(_) => {
-                        slots.push(&mut f32_slots[fi] as *mut _ as *mut c_void);
-                        fi += 1;
-                    }
-                    BenchArg::I64(_) => {
-                        slots.push(&mut i64_slots[ii] as *mut _ as *mut c_void);
-                        ii += 1;
+                    BenchArg::F32(_) | BenchArg::I64(_) => {
+                        slots.push(&mut scalar_slots[si] as *mut _ as *mut c_void);
+                        si += 1;
                     }
                 }
             }
 
-            // Elementwise launch geometry; block from the variant.
-            let block = variant
-                .iter()
-                .find(|(n, _)| n.contains("block"))
-                .map(|&(_, v)| v.clamp(1, 1024))
-                .unwrap_or(256);
+            // Elementwise launch geometry; block from the variant. The
+            // heuristic is name-based — say so out loud when it is guessing
+            // (no block-named param, several of them, or a clamp), because a
+            // clamped launch measures PTX compiled for one block size but
+            // launched at another.
+            let block_params: Vec<&(String, i64)> =
+                variant.iter().filter(|(n, _)| n.contains("block")).collect();
+            let block = match block_params.as_slice() {
+                [] => {
+                    eprintln!(
+                        "[autotune] {kernel_name}: no block-named tuning param — \
+                         launching at blockDim.x=256"
+                    );
+                    256
+                }
+                [one] => one.1,
+                many => {
+                    eprintln!(
+                        "[autotune] {kernel_name}: {} block-named params — using '{}' \
+                         for blockDim.x",
+                        many.len(),
+                        many[0].0
+                    );
+                    many[0].1
+                }
+            };
+            let clamped = block.clamp(1, 1024);
+            if clamped != block {
+                eprintln!(
+                    "[autotune] {kernel_name}: blockDim.x clamped {block} -> {clamped}; \
+                     this variant's timing mixes PTX compiled for {block} with a \
+                     {clamped}-thread launch"
+                );
+            }
+            let block = clamped;
             let grid = ((elems as i64 + block - 1) / block).max(1);
 
             let launch = |func: sys::CUfunction, slots: &mut [*mut c_void]| -> Result<(), String> {
@@ -1123,6 +1192,24 @@ pub fn load_cache_record(
     if let Some(db) = FROZEN_DB.get() {
         if let Some(record) = db.get(&(kernel_name.to_string(), hash.to_string())) {
             return validate_record(record.clone(), hash, device, cost_model_spec).map(Some);
+        }
+        // Drift is otherwise SILENT: the pin validates content, not
+        // applicability, so an edited kernel (or device swap) quietly
+        // reverts to the cost model while the build looks pinned. Warn
+        // once per kernel when the DB carries records for this kernel
+        // that no longer match this source/device (review MEDIUM).
+        if db.keys().any(|(k, _)| k == kernel_name) {
+            static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+                std::sync::Mutex::new(None);
+            let mut g = WARNED.lock().unwrap();
+            if g.get_or_insert_with(Default::default).insert(kernel_name.to_string()) {
+                eprintln!(
+                    "[autotune] warning: the frozen tuning DB has record(s) for \
+                     '{kernel_name}' but none match this source/device — the kernel \
+                     or its file changed since the DB was frozen; falling back to \
+                     the cost model. Re-run `nsl autotune --freeze` to re-pin."
+                );
+            }
         }
     }
     let path = cache_dir().join(format!("{}_{}.json", kernel_name, hash));

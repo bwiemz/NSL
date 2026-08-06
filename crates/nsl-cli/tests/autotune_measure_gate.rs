@@ -63,6 +63,15 @@ fn autotune_measures_and_compiles_consume_it_gpu() {
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("prog.nsl"), PROG).unwrap();
 
+    // 0. Build FIRST, so a CostModel record occupies the (device, key)
+    //    slot before the tune runs. The measured path must treat it as a
+    //    miss and measure anyway — accepting it made `build`-then-`autotune`
+    //    a silent no-op that froze the estimate while printing "measured
+    //    winner" (review HIGH). Step 2's selection assert proves the record
+    //    was REPLACED by a measurement.
+    let (ok, _, err) = nsl(&tmp, &["build", "prog.nsl", "-o", "prog_0.bin"], &[]);
+    assert!(ok, "pre-tune build failed:\n{err}");
+
     // 1. Offline tune, freezing a DB. This is the measured path's one
     //    production trigger.
     let (ok, out, err) = nsl(
@@ -82,6 +91,21 @@ fn autotune_measures_and_compiles_consume_it_gpu() {
         .trim()
         .to_string();
     assert!(tmp.join("db.json").exists());
+    // The cache record the tune produced must SAY it was measured — a
+    // cost-model record surviving the tune is exactly the review-HIGH
+    // silent no-op.
+    let cache = tmp.join(".nsl-cache/autotune");
+    let record = std::fs::read_dir(&cache)
+        .expect("cache dir exists")
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("scale_by_"))
+        .expect("a scale_by cache record");
+    let record_json = std::fs::read_to_string(record.path()).unwrap();
+    let compact: String = record_json.split_whitespace().collect();
+    assert!(
+        compact.contains("\"kind\":\"measured\""),
+        "the tune left a non-measured record in place:\n{record_json}"
+    );
 
     // 2. A compile in the SAME cache dir now takes the Measured record —
     //    the key roundtrip. If the offline key drifts from the compile key,
