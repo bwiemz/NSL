@@ -21,6 +21,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             embed_threshold,
             no_autotune,
             autotune_fresh,
+            autotune_db,
+            autotune_db_sha256,
             autotune_clean,
             fusion_report,
             vram_budget,
@@ -109,6 +111,20 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             cep_emit_weights,
             cep_emit_source,
     } = args;
+
+    // Item 10: load the frozen tuning DB before ANY compile work — the
+    // overlay must be in place before the first autotune cache lookup, and
+    // a pin mismatch must refuse the build outright rather than silently
+    // compiling with unpinned selections.
+    if let Some(ref db) = autotune_db {
+        match nsl_codegen::autotune::load_frozen_db(db, autotune_db_sha256.as_deref()) {
+            Ok(n) => eprintln!("[autotune] frozen db: {} record(s) from {}", n, db.display()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+    }
 
     // Meta-flag expansion (roadmap 3.3): must run BEFORE mode-string
     // validation below so bundle-filled values take the same validation

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 nsl-ast.workspace = true
 nsl-lexer.workspace = true
+string-interner.workspace = true
 nsl-semantic.workspace = true
 nsl-errors.workspace = true
 cranelift-codegen.workspace = true

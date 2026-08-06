@@ -296,39 +296,11 @@ impl Compiler<'_> {
         &self,
         decorators: &[Decorator],
     ) -> Result<crate::autotune::TuningParams, CodegenError> {
-        let autotune_deco = decorators
-            .iter()
-            .find(|d| {
-                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
-            })
-            .ok_or_else(|| CodegenError::new("@autotune decorator not found".to_string()))?;
-
-        let mut params = Vec::new();
-        if let Some(ref args) = autotune_deco.args {
-            for arg in args {
-                let name = arg
-                    .name
-                    .as_ref()
-                    .and_then(|s| self.interner.resolve(s.0))
-                    .unwrap_or("unnamed")
-                    .to_string();
-                let values = match &arg.value.kind {
-                    ExprKind::ListLiteral(items) => items
-                        .iter()
-                        .filter_map(|item| {
-                            if let ExprKind::IntLiteral(v) = &item.kind {
-                                Some(*v)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                    _ => vec![],
-                };
-                params.push((name, values));
-            }
-        }
-        Ok(params)
+        // Shared with the offline `nsl autotune` command, which has no
+        // Compiler — one implementation so the two paths cannot drift on
+        // what a decorator means.
+        crate::autotune::extract_autotune_params(decorators, self.interner)
+            .map_err(CodegenError::new)
     }
 
     // ── @autotune variant generation + cost-model selection (M26) ──────
@@ -485,7 +457,15 @@ impl Compiler<'_> {
                 fallback
             }
         };
-        let ast_bytes = format!("{:?}", kernel.body).into_bytes();
+        // Symbol-resolved on purpose: raw Debug bytes carry interner
+        // indices, which differ between entry points (`nsl autotune` vs
+        // `nsl build`) and would put measured records under keys no compile
+        // looks at. See resolve_symbols_for_hash.
+        let ast_bytes = crate::autotune::resolve_symbols_for_hash(
+            &format!("{:?}", kernel.body),
+            self.interner,
+        )
+        .into_bytes();
         let cache_hash = crate::autotune::hash_kernel_ast(
             kernel_name,
             &ast_bytes,
@@ -493,6 +473,19 @@ impl Compiler<'_> {
             &[], // shapes are unknown until runtime — see hash_kernel_ast
             &device,
         );
+        if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+            // Key-drift forensics: when two paths disagree on the key, this
+            // names WHICH input diverged (the item-10 offline command found
+            // out the hard way that reconstructed keys drift).
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&ast_bytes);
+            eprintln!(
+                "[autotune] key inputs for '{kernel_name}': ast_sha={:x} params={tuning_params:?} device={}",
+                h.finalize(),
+                device.describe(),
+            );
+        }
 
         // PTX generator closure: compile kernel with substituted constants
         let interner = self.interner;
@@ -505,6 +498,38 @@ impl Compiler<'_> {
             let ptx_str = String::from_utf8_lossy(&ptx_bytes).to_string();
             Ok(ptx_str)
         };
+
+        // Item 10 capture mode (`nsl autotune` only — normal compiles never
+        // arm): record this kernel's name, params, KEY, and every variant's
+        // PTX so the offline bencher measures exactly what this compile
+        // selects among, under exactly the key this compile looks up.
+        // Reconstructing the key outside this pipeline provably drifts
+        // (interner indices feed the AST bytes), which is why the capture
+        // exists at all.
+        if crate::autotune::capture_armed() {
+            let variants = crate::autotune::cartesian_product(tuning_params);
+            let mut variant_ptx = Vec::with_capacity(variants.len());
+            for v in &variants {
+                match ptx_generator(v) {
+                    Ok(p) => variant_ptx.push((v.clone(), p)),
+                    Err(e) => eprintln!(
+                        "[autotune] capture: variant {v:?} of '{kernel_name}' failed to \
+                         compile: {e}"
+                    ),
+                }
+            }
+            crate::autotune::push_capture(crate::autotune::CapturedAutotuneKernel {
+                name: kernel_name.to_string(),
+                params: tuning_params.clone(),
+                hash: cache_hash.clone(),
+                args: kernel
+                    .params
+                    .iter()
+                    .map(|p| crate::autotune::bench_arg_for_param(p, self.interner))
+                    .collect(),
+                variant_ptx,
+            });
+        }
 
         // Cost estimator closure: use roofline model as proxy for timing
         let cost_estimator = |variant: &crate::autotune::Variant| -> Result<f64, String> {

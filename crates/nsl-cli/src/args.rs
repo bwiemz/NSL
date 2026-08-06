@@ -172,6 +172,25 @@ pub(crate) enum Cli {
         html: Option<PathBuf>,
     },
 
+    /// Measure @autotune kernel variants on this GPU and cache the winners
+    /// (roadmap item 10 — the measured path; compiles themselves never
+    /// benchmark). A Measured cache record short-circuits the cost model at
+    /// every subsequent compile of the same kernel on the same device.
+    Autotune {
+        /// Path to the .nsl file containing @autotune kernels
+        file: PathBuf,
+
+        /// Representative element count for synthesized tensor arguments
+        /// (matches the cost model's own workload assumption by default)
+        #[arg(long, default_value_t = 1_048_576)]
+        elements: usize,
+
+        /// Also write a frozen tuning database of this run's measured
+        /// records; prints the sha256 to pin with --autotune-db-sha256
+        #[arg(long)]
+        freeze: Option<PathBuf>,
+    },
+
     /// Train a BPE tokenizer from source files
     Tokenize {
         /// Directories to scan for source files (default: stdlib/ examples/ tests/)
@@ -524,6 +543,17 @@ pub(crate) struct BuildArgs {
         /// Re-run all @autotune benchmarks, ignoring cached results
         #[arg(long)]
         pub(crate) autotune_fresh: bool,
+
+        /// Frozen tuning database (written by `nsl autotune --freeze`).
+        /// Records are validated per lookup — device identity, cache key,
+        /// schema — and win over the per-machine cache when they match.
+        #[arg(long)]
+        pub(crate) autotune_db: Option<PathBuf>,
+
+        /// Refuse the tuning database unless its content sha256 matches —
+        /// the reproducible-build pin printed by `nsl autotune --freeze`
+        #[arg(long, requires = "autotune_db")]
+        pub(crate) autotune_db_sha256: Option<String>,
 
         /// Delete the autotune cache directory and exit
         #[arg(long)]

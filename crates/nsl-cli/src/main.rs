@@ -54,6 +54,9 @@ fn main_inner() {
 
     match cli {
         Cli::Check(args) => commands::check::dispatch(args),
+        Cli::Autotune { file, elements, freeze } => {
+            commands::autotune::run_autotune(&file, elements, freeze.as_deref())
+        }
         Cli::Build(args) => commands::build::dispatch(args),
         Cli::Run(args) => commands::run::dispatch(args),
         Cli::Test { file, filter } => {
