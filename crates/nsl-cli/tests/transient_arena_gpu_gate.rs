@@ -226,3 +226,30 @@ fn stage2a_report_quantifies_param_gradients_cpu() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Stage-2B/2C: the full byte-identity parity gate, as a cert-lane test.
+///
+/// Delegates to `scripts/arena-parity.sh` (the same script the flag's help
+/// names) rather than reimplementing it: two builds of the deterministic
+/// coder50m cert program (with/without `--transient-arena`), full runs,
+/// byte-compared loss streams AND checkpoints, bind/placement
+/// reconciliation (placements == binds, 0 guard failures, 0 misplaced),
+/// and a per-step red-zone canary pass. This is the gate that caught the
+/// allocator-entry pin bypass and the BFD cross-slot aliasing.
+#[test]
+#[ignore = "requires CUDA GPU (~5 runs of a 40-step coder50m program)"]
+fn arena_parity_script_passes() {
+    let root = repo_root();
+    let out = Command::new("bash")
+        .arg(root.join("scripts/arena-parity.sh"))
+        .arg(env!("CARGO_BIN_EXE_nsl"))
+        .current_dir(&root)
+        .output()
+        .expect("spawn arena-parity.sh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("arena-parity: PASS"),
+        "arena parity failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}

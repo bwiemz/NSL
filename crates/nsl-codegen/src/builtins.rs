@@ -679,6 +679,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_arena_init", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_arena_bind", &[types::I64, types::I64, types::I64], None),
     ("nsl_arena_unbind", &[], None),
+    ("nsl_arena_unbind_verify", &[types::I64], None),
+    ("nsl_arena_declare_slot", &[types::I64, types::I64], None),
     ("nsl_arena_check", &[], Some(types::I64)),
     ("nsl_arena_check_step", &[types::I64], None),
     ("nsl_arena_destroy", &[], None),

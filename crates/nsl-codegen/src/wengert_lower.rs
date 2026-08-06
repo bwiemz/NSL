@@ -498,7 +498,11 @@ pub fn compile_wengert_ops_range(
         }
         let result_val = lower_single_op(compiler, builder, op, var_map, var_types)?;
         if placement.is_some() {
-            call(compiler, builder, "nsl_arena_unbind", &[])?;
+            // Verify-and-disarm: the pin's exact-size rule cannot tell the
+            // output from an output-sized interior allocation, so the
+            // runtime compares the RESULT's data pointer against where the
+            // pin landed and counts any mismatch (teardown: "N misplaced").
+            call(compiler, builder, "nsl_arena_unbind_verify", &[result_val])?;
         }
         var_map.insert(op.result, result_val);
         // FASE hook: consume parameter gradients immediately during lowering.

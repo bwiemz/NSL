@@ -656,24 +656,39 @@ impl<'a> SizeProp<'a> {
                 }
             }
             // Arithmetic on folded scalar values. NOT gated on the result's
-            // Wengert type: `batch_size * seq_len` defaults to Tensor in
-            // `type_for_op` (the Integer-vs-tensor choice happens at
-            // lowering, by input types, with no override recorded), and the
-            // VALUE of a scalar-constant op is the same whether it lowers
-            // as `imul` or as a 0-dim tensor multiply. Both operands must
-            // fold to scalars; a List operand refuses below.
+            // Wengert type for Add/Sub/Mul: `batch_size * seq_len` defaults
+            // to Tensor in `type_for_op` (the Integer-vs-tensor choice
+            // happens at lowering, by INPUT types, with no override
+            // recorded), and those three agree between `imul` and a 0-dim
+            // tensor op on in-range integers. DIVISION does not: the
+            // lowering emits truncating `sdiv` only when BOTH operands are
+            // Integer-typed, and `nsl_tensor_div` otherwise divides in
+            // floating point — `100 / item(_n_heads)` is 12 one way and
+            // 12.5 the other. So Div folds as integer only under the same
+            // both-Integer condition the lowering checks; every other
+            // typing folds as f64, matching `nsl_tensor_div` exactly (and
+            // an inexact quotient then refuses `as_int`, so downstream
+            // dims stop instead of claiming falsely).
             PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
                 let a = self.const_of(*op.inputs.first()?)?;
                 let b = self.const_of(*op.inputs.get(1)?)?;
+                let both_integer_typed = op.inputs.len() >= 2
+                    && op.inputs.iter().take(2).all(|v| {
+                        self.ty_of.get(v) == Some(&WengertType::Integer)
+                    });
                 match (a.as_int(), b.as_int()) {
-                    (Some(x), Some(y)) => match op.op {
-                        PrimalOp::Add => x.checked_add(y).map(Int),
-                        PrimalOp::Sub => x.checked_sub(y).map(Int),
-                        PrimalOp::Mul => x.checked_mul(y).map(Int),
-                        // Cranelift `sdiv` truncates toward zero.
-                        PrimalOp::Div => x.checked_div(y).map(Int),
-                        _ => unreachable!(),
-                    },
+                    (Some(x), Some(y))
+                        if !matches!(op.op, PrimalOp::Div) || both_integer_typed =>
+                    {
+                        match op.op {
+                            PrimalOp::Add => x.checked_add(y).map(Int),
+                            PrimalOp::Sub => x.checked_sub(y).map(Int),
+                            PrimalOp::Mul => x.checked_mul(y).map(Int),
+                            // Cranelift `sdiv` truncates toward zero.
+                            PrimalOp::Div => x.checked_div(y).map(Int),
+                            _ => unreachable!(),
+                        }
+                    }
                     _ => {
                         let to_f = |c: &ConstEntry| match c {
                             Int(n) => Some(*n as f64),
@@ -1403,13 +1418,21 @@ pub fn admit(
                             None
                         }
                     } else {
-                        // Unary elementwise: the runtime mutates a dying,
-                        // uniquely-owned input in place and allocates
-                        // nothing. `can_mutate_inplace_gpu` checks refcount
-                        // at call time; a dying operand is the static
-                        // over-approximation of that.
+                        // Unary elementwise: two runtime arms to model.
+                        // (a) `can_mutate_inplace_gpu` mutates a dying,
+                        // uniquely-owned input in place — no allocation;
+                        // a dying operand is the static over-approximation.
+                        // (b) a NON-CONTIGUOUS operand is materialized
+                        // first (`nsl_tensor_contiguous`), and because
+                        // unaries preserve numel that clone is EXACTLY
+                        // output-sized — it would consume the pin and put
+                        // an op-local scratch at the planned stable
+                        // address with every reconciliation counter still
+                        // green. Same view refusal as the binary arm.
                         if op.inputs.first().copied().is_some_and(dies_here) {
                             Some(RefusedBecause::InPlaceReuse)
+                        } else if op.inputs.first().copied().is_some_and(is_view_output) {
+                            Some(RefusedBecause::RuntimePathVaries)
                         } else {
                             None
                         }
@@ -1458,17 +1481,22 @@ pub fn pack(plan: &ArenaPlan, admitted: &[VarId]) -> (Vec<Placement>, u64) {
     let mut placements = Vec::with_capacity(chosen.len());
     let mut offset = 0u64;
     for (dense, t) in chosen.iter().enumerate() {
-        let bytes = align_up(
-            t.elems.expect("admission required a size") * plan.elem_bytes,
-            SLAB_ALIGNMENT,
-        );
+        let exact = t.elems.expect("admission required a size") * plan.elem_bytes;
+        // The PIN carries the EXACT byte count — the runtime allocation
+        // asks for `numel * 4` unaligned, and the pin's exact-match rule
+        // would otherwise never fire for any tensor whose bytes are not a
+        // 256 multiple (e.g. every [50257]-vocab gradient). The LAYOUT
+        // still strides by the aligned size, so every payload keeps its
+        // 256-byte alignment and the slack between `exact` and the next
+        // guard stays poison — an overrun of even one byte past the exact
+        // payload lands in the checked window.
         placements.push(Placement {
             var: t.var,
             slot_index: dense as u32,
             offset,
-            bytes,
+            bytes: exact,
         });
-        offset += bytes;
+        offset += align_up(exact, SLAB_ALIGNMENT);
     }
     (placements, offset)
 }
@@ -2584,6 +2612,81 @@ mod shape_prop_tests {
         assert_eq!(k.get(&102), Some(&Shape(vec![2, 128, 512])), "dx is x-shaped");
         assert_eq!(k.get(&103), Some(&Shape(vec![49152, 512])), "d(table) is table-shaped");
         assert_eq!(k.get(&104), Some(&Shape(vec![256, 49152])), "dlogits is logits-shaped");
+    }
+
+    /// The const lattice end to end — the mechanism that recovered the
+    /// attention chain. A tape shaped like the GQA forward: a config tensor
+    /// whose VALUE is seeded (ctor-folded `full([1], 8.0)`), read back via
+    /// `item()` -> `int()`, multiplied into a reshape target list alongside
+    /// subscripts of a shape read. If any lattice link drops, the reshape
+    /// falls to Numel and this fails.
+    #[test]
+    fn the_scalar_value_lattice_folds_an_attention_style_reshape() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("_n_heads".into()), vec![]),
+            // let s = x.shape; b = s[0]; sl = s[1]
+            op(2, 2, PrimalOp::Passthrough("shape".into()), vec![0]),
+            op(3, 3, PrimalOp::Constant(0.0), vec![]),
+            op(4, 4, PrimalOp::Passthrough("subscript".into()), vec![2, 3]),
+            op(5, 5, PrimalOp::Constant(1.0), vec![]),
+            op(6, 6, PrimalOp::Passthrough("subscript".into()), vec![2, 5]),
+            // nh = int(_n_heads.item()); hd = 64
+            op(7, 7, PrimalOp::Passthrough("item".into()), vec![1]),
+            op(8, 8, PrimalOp::Passthrough("int".into()), vec![7]),
+            op(9, 9, PrimalOp::Constant(64.0), vec![]),
+            // list [b, sl, nh, hd] -> q.reshape(...)
+            op(10, 10, PrimalOp::Passthrough("list".into()), vec![4, 6, 8, 9]),
+            op(11, 11, PrimalOp::Passthrough("reshape".into()), vec![0, 10]),
+        ]);
+        let m: HashMap<VarId, Vec<i64>> = [(0, vec![2, 128, 512])].into();
+        let scalars: HashMap<VarId, f64> = [(1, 8.0)].into();
+        let known = propagate_size_info(
+            &fwd,
+            &list(vec![]),
+            &|v| m.get(&v).cloned(),
+            &|v| scalars.get(&v).copied(),
+            &[],
+        );
+        assert_eq!(
+            known.get(&11),
+            Some(&Shape(vec![2, 128, 8, 64])),
+            "the item()/int()/shape-subscript lattice must fold the reshape"
+        );
+    }
+
+    #[test]
+    fn division_folds_as_f64_unless_both_operands_are_integer_typed() {
+        // d / nh where nh came through item() (Tensor-typed): the lowering
+        // divides in floating point, so trunc(100/8)=12 would be a false
+        // claim — the fold must yield 12.5 and downstream int-consumers
+        // must refuse.
+        let mut fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("_n".into()), vec![]),
+            op(2, 2, PrimalOp::Constant(100.0), vec![]),
+            op(3, 3, PrimalOp::Passthrough("item".into()), vec![1]),
+            op(4, 4, PrimalOp::Div, vec![2, 3]),
+            op(5, 5, PrimalOp::Passthrough("list".into()), vec![4]),
+            op(6, 6, PrimalOp::Passthrough("reshape".into()), vec![0, 5]),
+        ]);
+        // Mark the Div result Tensor-typed (the default; explicit for the
+        // test's clarity).
+        fwd.var_types.insert(4, crate::wengert::WengertType::Tensor);
+        let scalars: HashMap<VarId, f64> = [(1, 8.0)].into();
+        let known = propagate_size_info(
+            &fwd,
+            &list(vec![]),
+            &|_| None,
+            &|v| scalars.get(&v).copied(),
+            &[],
+        );
+        assert_eq!(
+            known.get(&6),
+            None,
+            "100/8.0 is 12.5 at runtime; folding it to 12 and claiming a \
+             12-element reshape would be a false compile-time shape"
+        );
     }
 
     #[test]

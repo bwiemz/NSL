@@ -366,14 +366,6 @@ pub extern "C" fn nsl_sr_bf16_teardown() {
     SRBF16_ACTIVE.store(false, Ordering::Relaxed);
 }
 
-/// P4 item 17: the ONLY sanctioned weight mutation under bf16-sr — fused
-/// AdamW step against the bf16 mirror with counter-based SR, then a refresh
-/// of the resident f32 working view so the coherence invariant holds.
-///
-/// Mirrors `nsl_fase_fused_adamw_step`'s scalar contract (f64 scalars,
-/// bc1/bc2 precomputed by codegen); adds `step` (the optimizer step counter
-/// the SR stream is keyed on). Seed comes from the global `--seed` store.
-#[allow(clippy::too_many_arguments)]
 // ---------------------------------------------------------------------------
 // Item 7: update-magnitude / stall histograms (NSL_SR_HIST=1)
 // ---------------------------------------------------------------------------
@@ -382,11 +374,13 @@ pub extern "C" fn nsl_sr_bf16_teardown() {
 // `NSL_SR_HIST=1` every fused SR step samples the FIRST
 // `SR_HIST_SAMPLE` bf16 elements of each mirrored parameter before and
 // after the update, widens both, and buckets `|delta theta|` by binary
-// exponent. An element whose bf16 bits did not change counts as STALLED —
-// the observable form of "the update rounded to zero at this magnitude"
-// (with stochastic rounding the stall rate is the empirical underflow
-// measure: SR turns sub-ULP updates into a probability, and this counts
-// how often the coin came up zero). Reported at teardown.
+// exponent. An element whose bf16 bits did not change counts as STALLED.
+// NOTE what that includes: sub-ULP updates whose SR coin came up zero (the
+// underflow signal this exists for) AND updates that were exactly zero in
+// f32 (untouched embedding rows under wd=0 have zero grad, zero moments,
+// zero update). The report says "bf16 bits unchanged", not "underflowed";
+// interpret the rate against the run's expected zero-update surface.
+// Reported at teardown.
 #[cfg(feature = "cuda")]
 const SR_HIST_SAMPLE: usize = 16384;
 /// `buckets[i]` counts updates with 2^(i-48) <= |delta| < 2^(i-47);
@@ -467,12 +461,21 @@ pub extern "C" fn nsl_sr_bf16_hist_report() {
         );
     }
     eprintln!(
-        "[sr-hist]   stalled (bf16 bits unchanged): {} ({:.3}%)",
+        "[sr-hist]   stalled (bf16 bits unchanged — includes exactly-zero f32 \
+         updates, e.g. untouched embedding rows): {} ({:.3}%)",
         h.stalled,
         100.0 * h.stalled as f64 / h.sampled as f64
     );
 }
 
+/// P4 item 17: the ONLY sanctioned weight mutation under bf16-sr — fused
+/// AdamW step against the bf16 mirror with counter-based SR, then a refresh
+/// of the resident f32 working view so the coherence invariant holds.
+///
+/// Mirrors `nsl_fase_fused_adamw_step`'s scalar contract (f64 scalars,
+/// bc1/bc2 precomputed by codegen); adds `step` (the optimizer step counter
+/// the SR stream is keyed on). Seed comes from the global `--seed` store.
+#[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub extern "C" fn nsl_sr_bf16_step_adamw(
     theta_ptr: i64,

@@ -145,6 +145,7 @@ def main() -> None:
 
     micro_per_step = accum
     need = args.steps * tokens_per_step_for(batch, seq, micro_per_step)
+    kind = "real" if args.corpus is not None else "syn"
     if args.corpus is not None:
         # Slice the REAL corpus to length. Refusing a short corpus beats
         # silently wrapping it (which would train on repeats and report a
@@ -153,11 +154,14 @@ def main() -> None:
         if len(raw) < need * 2:
             raise SystemExit(
                 f"corpus {args.corpus} has {len(raw) // 2} tokens, need {need}")
-        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{args.steps}.bin"
+        # The kind is in the FILENAME, not just the tag: gen_tokens has a
+        # size-check cache, so a same-named synthetic run would silently
+        # reuse the corpus bytes as its "synthetic" stream.
+        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{kind}_{args.steps}.bin"
         tok.parent.mkdir(parents=True, exist_ok=True)
         tok.write_bytes(raw[: need * 2])
     else:
-        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{args.steps}.bin"
+        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{kind}_{args.steps}.bin"
         gen_tokens(tok, need)
     timeout_s = int(args.steps * micro_per_step * per_micro_s * 1.6) + 900
 
@@ -207,23 +211,37 @@ def main() -> None:
         parent_save = save_paths.get(parent)
         if parent_save is None or not parent_save.exists():
             raise SystemExit(f"continuation parent checkpoint missing: {parent}")
+        cont_need = args.continue_steps * tokens_per_step_for(
+            batch, seq, micro_per_step)
         cont_tok = TOKENS_DIR / (
-            f"srbf16_{args.scale}{args.tag}_cont_{args.continue_steps}.bin")
-        gen_tokens(
-            cont_tok,
-            args.continue_steps * tokens_per_step_for(batch, seq, micro_per_step),
-        )
+            f"srbf16_{args.scale}{args.tag}_{kind}_cont_{args.continue_steps}.bin")
+        if args.corpus is not None:
+            # FRESH real data from past the parent's consumed range — a
+            # continuation that replays the parent's tokens would grade
+            # memorization, and one on the synthetic stream would grade a
+            # different distribution than the checkpoint was trained on.
+            raw = args.corpus.read_bytes()
+            if len(raw) < (need + cont_need) * 2:
+                raise SystemExit(
+                    f"corpus too short for continuation: have {len(raw) // 2} "
+                    f"tokens, need {need + cont_need}")
+            cont_tok.write_bytes(raw[need * 2 : (need + cont_need) * 2])
+        else:
+            gen_tokens(cont_tok, cont_need)
         name = f"bf16sr{args.tag}_continue"
         save = LOGS / name / "final.nslm"
         save.parent.mkdir(parents=True, exist_ok=True)
         print(f"=== {name}: reload {parent_save}")
+        cont_env = dict(env)
+        if args.sr_hist:
+            cont_env["NSL_SR_HIST"] = "1"
         res = run_arm(
             name,
             cont_program,
             cont_tok,
             [*BASE_FLAGS, "--param-dtype", "bf16-sr", "--seed",
              str(args.seeds[0])],
-            env,
+            cont_env,
             rewrites=[
                 ("CERT_LOAD_PATH", parent_save.as_posix()),
                 ("CERT_SAVE_PATH", save.as_posix()),
@@ -289,7 +307,7 @@ def main() -> None:
                 f"max={max(finals):.4f} range={max(finals) - min(finals):.4f}"
             )
 
-    (LOGS / "campaign_summary.json").write_text(
+    (LOGS / f"campaign_summary{args.tag}_{kind}.json").write_text(
         json.dumps(
             {
                 name: {

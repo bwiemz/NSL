@@ -125,7 +125,7 @@ fn install_per_compile_program_facts(
     ast: &nsl_ast::Module,
     interner: &Interner,
     type_map: &TypeMap,
-) {
+) -> Result<(), crate::CodegenError> {
     compiler.compile_options.calibration_compile_bundle = Some(Arc::new(
         crate::calibration::CalibrationCompileBundle {
             ast: ast.clone(),
@@ -133,6 +133,19 @@ fn install_per_compile_program_facts(
             type_map: type_map.clone(),
         },
     ));
+    // `--fuse-lm-head require` off the source-AD path can never fuse, so it
+    // must refuse HERE rather than compile a clean, plausible, unfused build
+    // (the same backstop posture as parameter_plan's dtype refusals). The
+    // in-compile check at the tape-fallback site covers extraction failure;
+    // this covers the lane that never enabled source AD at all.
+    if compiler.compile_options.lm_head_fusion
+        == crate::lm_head_inference::LmHeadFusion::Require
+        && !compiler.compile_options.source_ad
+    {
+        return Err(crate::CodegenError::new(
+            "--fuse-lm-head require needs --source-ad (or --pretrain-optimized):              the fused LM head only exists on the source-AD path, so without it              `require` would pass while fusing nothing",
+        ));
+    }
     // Item 4: the token-row count an inferred fused LM head is sized from.
     // Scanned ONCE here, not at the train block, so the WGGO pre-pass and the
     // real extraction see the same answer — a pre-pass that planned against an
@@ -140,6 +153,7 @@ fn install_per_compile_program_facts(
     // emitted graph out of step.
     compiler.lm_head_loader_scan =
         crate::lm_head_inference::scan_dataloaders(ast, interner);
+    Ok(())
 }
 
 /// Dev Tools Phase 2, Task 6: drain `Compiler.manifest_builder` (if set) and
@@ -592,7 +606,7 @@ pub fn compile_returning_splice_count_for_tests(
     options: &crate::CompileOptions,
 ) -> Result<u32, CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
-    install_per_compile_program_facts(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
 
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -682,7 +696,7 @@ fn compile_returning_plan_impl(
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.profile_capture_slot = capture_slot;
-    install_per_compile_program_facts(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
 
     // M52: load weights if --weights was provided.
     load_and_register_weights_if_needed(&mut compiler, options)?;
@@ -888,7 +902,11 @@ fn compile_with_zk_info_best_effort_plan(
         Ok(c) => c,
         Err(e) => return (Err(e), HashMap::new(), Vec::new(), None),
     };
-    install_per_compile_program_facts(&mut compiler, ast, interner, type_map);
+    if let Err(e) =
+        install_per_compile_program_facts(&mut compiler, ast, interner, type_map)
+    {
+        return (Err(e), HashMap::new(), Vec::new(), None);
+    }
 
     compiler.dump_ir = dump_ir;
 
@@ -1070,7 +1088,11 @@ fn compile_standalone_best_effort_plan(
         Ok(c) => c,
         Err(e) => return (Err(e), None),
     };
-    install_per_compile_program_facts(&mut compiler, ast, interner, type_map);
+    if let Err(e) =
+        install_per_compile_program_facts(&mut compiler, ast, interner, type_map)
+    {
+        return (Err(e), None);
+    }
     compiler.dump_ir = dump_ir;
     compiler.standalone_config = Some(config);
     let pre_finalize = (|| -> Result<(), CodegenError> {
@@ -1132,7 +1154,7 @@ pub fn compile_test(
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Vec<String>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
-    install_per_compile_program_facts(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
     compiler.dump_ir = dump_ir;
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -1340,7 +1362,11 @@ pub fn compile_module_with_imports_best_effort_plans(
         Ok(c) => c,
         Err(e) => return (Err(e), None, None),
     };
-    install_per_compile_program_facts(&mut compiler, ast, interner, type_map);
+    if let Err(e) =
+        install_per_compile_program_facts(&mut compiler, ast, interner, type_map)
+    {
+        return (Err(e), None, None);
+    }
     compiler.dump_ir = dump_ir;
     compiler.module_prefix = module_prefix.to_string();
     for (name, layout) in imported_struct_layouts {
@@ -1468,7 +1494,7 @@ pub fn compile_entry_returning_plan(
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
-    install_per_compile_program_facts(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
     compiler.dump_ir = dump_ir;
 
     // M52 / CPDT Phase 1: load weights if --weights was provided.  Load-bearing

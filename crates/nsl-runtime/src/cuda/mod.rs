@@ -701,6 +701,37 @@ pub(crate) mod inner {
 
     /// Allocate device-only memory (not accessible from host without explicit copy).
     /// On OOM, attempts sync + pool drain recovery before panicking.
+    /// Non-panicking sibling of [`alloc_device`] for OPTIONAL allocations
+    /// (the transient arena): OOM — after the same sync + drain recovery —
+    /// returns null instead of aborting the run, because the caller has a
+    /// correct fallback (the caching allocator) and "no stable addresses"
+    /// must degrade the feature, not kill a near-capacity training run.
+    /// Non-OOM errors still panic (they mean the context is broken).
+    pub(crate) fn try_alloc_device(size_bytes: usize) -> *mut c_void {
+        ensure_context();
+        unsafe {
+            let mut ptr: CUdeviceptr = 0;
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+            if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                return account_direct_device(ptr as *mut c_void, size_bytes);
+            }
+            if result != CUresult::CUDA_SUCCESS
+                && !matches!(result, CUresult::CUDA_ERROR_OUT_OF_MEMORY)
+            {
+                panic!("cuMemAlloc({size_bytes} bytes) failed: {result:?}");
+            }
+            cuCtxSynchronize();
+            drain_completed_frees();
+            let _ = pool_drain();
+            ptr = 0;
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+            if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                return account_direct_device(ptr as *mut c_void, size_bytes);
+            }
+            std::ptr::null_mut()
+        }
+    }
+
     pub(crate) fn alloc_device(size_bytes: usize) -> *mut c_void {
         ensure_context();
         unsafe {

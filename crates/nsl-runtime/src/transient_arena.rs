@@ -69,11 +69,33 @@ static ARENA_SIZE: AtomicU64 = AtomicU64::new(0);
 /// nobody consumed means the compiler wrapped an op that did not allocate,
 /// which makes the plan's slot count a fiction.
 static BINDS: AtomicUsize = AtomicUsize::new(0);
+/// Slot count from `nsl_arena_init`, capping the declare table: the
+/// init+declare emission point sits in the STEP body (init self-guards via
+/// `active()`), so declares re-run every step and would otherwise append a
+/// duplicate geometry set per step.
+static N_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
 static GUARD_FAILURES: AtomicUsize = AtomicUsize::new(0);
+/// Placements whose op RESULT did not end up at the pinned address — some
+/// interior allocation of the same size (a contiguity clone, a device
+/// transfer) consumed the pin instead. Every such case means the stable
+/// address holds op-local scratch, which is exactly what CUDA-graph capture
+/// must never build on; the reconciliation alone cannot see it because the
+/// pin WAS consumed.
+static MISPLACED: AtomicUsize = AtomicUsize::new(0);
 /// Diagnostics: every take_pin invocation / ones that found a pin armed.
 static PIN_PROBES: AtomicUsize = AtomicUsize::new(0);
 static PIN_PROBES_ARMED: AtomicUsize = AtomicUsize::new(0);
+
+/// Slot geometry declared by the compiler after init: `(offset, bytes)` per
+/// dense slot index, in index order. What lets `nsl_arena_check` verify the
+/// INTERIOR guards — without it only the arena's outermost guards are
+/// checkable from the total size, and a slot-k overrun into slot k+1 (the
+/// exact corruption red zones exist for) would go unseen until it surfaced
+/// as a wrong loss.
+static SLOTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+use std::sync::Mutex;
 
 thread_local! {
     /// The armed single-shot pin: `(payload_ptr, exact_bytes)`, or `(0, 0)`.
@@ -82,6 +104,9 @@ thread_local! {
     /// are: the allocation it steers happens on the calling thread, inside an
     /// FFI whose signature has no room for an out-parameter.
     static PIN: std::cell::Cell<(u64, usize, i64)> = const { std::cell::Cell::new((0, 0, -1)) };
+    /// Payload pointer the CURRENT window's pin was consumed at (0 = not
+    /// consumed). Set by `take_pin`, read+cleared by the verify/unbind.
+    static PLACED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// True when an arena is allocated.
@@ -116,7 +141,7 @@ pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
     let total = payload_bytes as usize + REDZONE * (n_slots as usize + 1);
     #[cfg(feature = "cuda")]
     {
-        let ptr = crate::cuda::inner::alloc_device(total);
+        let ptr = crate::cuda::inner::try_alloc_device(total);
         if ptr.is_null() {
             eprintln!("[arena] init failed: {total} bytes unavailable; the run \
                        continues on the caching allocator (addresses will not \
@@ -133,6 +158,9 @@ pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
         BINDS.store(0, SeqCst);
         PLACEMENTS.store(0, SeqCst);
         GUARD_FAILURES.store(0, SeqCst);
+        SLOTS.lock().unwrap().clear();
+        N_SLOTS.store(n_slots as usize, SeqCst);
+        MISPLACED.store(0, SeqCst);
         eprintln!(
             "[arena] init: {:.1} MiB payload in {} slot(s), {:.1} MiB total with guards",
             payload_bytes as f64 / 1048576.0,
@@ -146,6 +174,20 @@ pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
         let _ = total;
         0
     }
+}
+
+/// Declare one slot's geometry (compiler-emitted right after a successful
+/// `nsl_arena_init`, once per placement, in dense-index order).
+#[no_mangle]
+pub extern "C" fn nsl_arena_declare_slot(payload_offset: i64, bytes: i64) {
+    if !active() || payload_offset < 0 || bytes <= 0 {
+        return;
+    }
+    let mut slots = SLOTS.lock().unwrap();
+    if slots.len() >= N_SLOTS.load(SeqCst) {
+        return; // per-step re-execution of the declare block — table is full
+    }
+    slots.push((payload_offset as u64, bytes as u64));
 }
 
 /// Arm the pin for the next allocation of exactly `bytes`.
@@ -163,10 +205,20 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
     // slot in O(log n) runs instead of a debugger session on device memory.
     static LIMIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
-        std::env::var("NSL_ARENA_SLOT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(i64::MAX)
+        match std::env::var("NSL_ARENA_SLOT_LIMIT") {
+            Err(_) => i64::MAX,
+            // Fail CLOSED on an unparseable value: this knob exists for
+            // corruption bisection, where "silently place everything"
+            // inverts the experiment ("0x08" would otherwise read as
+            // unlimited and the operator chases a phantom).
+            Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+                eprintln!(
+                    "[arena] NSL_ARENA_SLOT_LIMIT={v:?} is not an integer; \
+                     placing NOTHING (fail-closed)"
+                );
+                0
+            }),
+        }
     });
     if slot_index >= limit {
         return;
@@ -181,7 +233,43 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
         return;
     }
     BINDS.fetch_add(1, SeqCst);
+    PLACED_AT.with(|c| c.set(0));
     PIN.with(|p| p.set((payload, bytes as usize, slot_index)));
+}
+
+/// Unbind that also VERIFIES the placement went to the op's RESULT.
+///
+/// The pin's exact-size rule cannot distinguish the output from an
+/// output-sized interior allocation (a contiguity clone of a unary's
+/// operand, a device transfer of a binary's) — those exist precisely in the
+/// elementwise family, where every intra-op materialization preserves
+/// numel. Comparing the result tensor's data pointer against where the pin
+/// actually landed catches the whole class at runtime; the admission rules
+/// refuse the statically visible cases, this counts anything that slips
+/// past them. A misplaced placement keeps the run CORRECT (the scratch at
+/// the planned address dies at op end; values are unaffected) but the
+/// stable-address claim for that slot is false, so it is counted and the
+/// teardown reports it — the p8 CUDA-graph gate is `misplaced == 0`.
+#[no_mangle]
+pub extern "C" fn nsl_arena_unbind_verify(result_tensor: i64) {
+    let placed = PLACED_AT.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    if placed != 0 && result_tensor != 0 {
+        let t = unsafe { &*(result_tensor as *const crate::tensor::NslTensor) };
+        if t.data as u64 != placed {
+            MISPLACED.fetch_add(1, SeqCst);
+            static SHOWN: AtomicUsize = AtomicUsize::new(0);
+            if SHOWN.fetch_add(1, SeqCst) < 20 {
+                eprintln!(
+                    "[arena] MISPLACED: an op-interior allocation consumed the                      pin; the planned address holds scratch, not the result"
+                );
+            }
+        }
+    }
+    nsl_arena_unbind();
 }
 
 /// Disarm without placing. Emitted after an admitted op so a pin cannot leak
@@ -245,6 +333,7 @@ pub(crate) fn take_pin(size_bytes: usize) -> Option<*mut c_void> {
             return None;
         }
         p.set((0, 0, -1));
+        PLACED_AT.with(|c| c.set(ptr));
         PLACEMENTS.fetch_add(1, SeqCst);
         Some(ptr as *mut c_void)
     })
@@ -274,11 +363,6 @@ pub extern "C" fn nsl_arena_check() -> i64 {
             base as *const c_void,
             size,
         );
-        // Guards are the REDZONE-sized regions the plan reserved; without the
-        // slot table here, check the two that are unambiguous from size alone
-        // (the leading and trailing guards) plus report any interior run of
-        // non-POISON that is exactly REDZONE-aligned. The compiler-side gate
-        // owns the per-slot check; this is the cheap always-available one.
         let mut bad = 0i64;
         if host[..REDZONE].iter().any(|&b| b != POISON) {
             eprintln!("[arena] leading guard corrupted");
@@ -287,6 +371,25 @@ pub extern "C" fn nsl_arena_check() -> i64 {
         if host[size - REDZONE..].iter().any(|&b| b != POISON) {
             eprintln!("[arena] trailing guard corrupted — a slot wrote past the arena");
             bad += 1;
+        }
+        // Interior guards, from the declared slot geometry: slot k's payload
+        // spans [offset_k + REDZONE*(k+1), +bytes_k), and the REDZONE bytes
+        // right after it are the guard between it and slot k+1 — the region
+        // whose corruption means "slot k's kernel wrote past its planned
+        // size", which is the exact failure this arena exists to catch
+        // before it reads as a wrong loss.
+        for (k, &(off, bytes)) in SLOTS.lock().unwrap().iter().enumerate() {
+            let payload_end = off as usize + REDZONE * (k + 1) + bytes as usize;
+            let guard_end = payload_end + REDZONE;
+            if guard_end > size {
+                eprintln!("[arena] declared slot {k} runs past the arena");
+                bad += 1;
+                continue;
+            }
+            if host[payload_end..guard_end].iter().any(|&b| b != POISON) {
+                eprintln!("[arena] guard after slot {k} corrupted — its op wrote past its planned {bytes} B");
+                bad += 1;
+            }
         }
         GUARD_FAILURES.fetch_add(bad as usize, SeqCst);
         bad
@@ -334,8 +437,10 @@ pub extern "C" fn nsl_arena_destroy() {
     let placements = PLACEMENTS.load(SeqCst);
     eprintln!(
         "[arena] teardown: {placements} placement(s) from {binds} bind(s), \
-         {} guard failure(s); allocator probes: {} total, {} while armed",
+         {} guard failure(s), {} misplaced; allocator probes: {} total, {} \
+         while armed",
         GUARD_FAILURES.load(SeqCst),
+        MISPLACED.load(SeqCst),
         PIN_PROBES.load(SeqCst),
         PIN_PROBES_ARMED.load(SeqCst),
     );
@@ -388,7 +493,21 @@ mod tests {
         assert!(!active());
         PIN.with(|p| p.set((0x1000, 4096, 0)));
         assert!(take_pin(4096).is_none(), "an inactive arena must place nothing");
+        // Fake an active arena so the SIZE comparison actually executes —
+        // without this the test never reached the load-bearing branch and a
+        // "first allocation <= bound size wins" regression would stay green.
+        ARENA_BASE.store(0x1000, SeqCst);
+        ARENA_SIZE.store(1 << 20, SeqCst);
+        PIN.with(|p| p.set((0x2000, 4096, 0)));
+        assert!(take_pin(4095).is_none(), "smaller must not consume");
+        assert!(take_pin(4097).is_none(), "larger must not consume");
+        assert_eq!(take_pin(4096), Some(0x2000 as *mut c_void), "exact consumes");
+        assert!(take_pin(4096).is_none(), "single-shot: second exact declines");
+        ARENA_BASE.store(0, SeqCst);
+        ARENA_SIZE.store(0, SeqCst);
         PIN.with(|p| p.set((0, 0, -1)));
+        PLACED_AT.with(|c| c.set(0));
+        PLACEMENTS.store(0, SeqCst);
     }
 
     #[test]

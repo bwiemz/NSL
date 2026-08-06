@@ -338,7 +338,12 @@ fn a_pre_transposed_head_declines_and_still_compiles() {
 /// single-file fixture would have passed while every real model declined.
 #[test]
 fn the_shipped_coder50m_pretraining_scripts_infer_a_fused_head() {
-    for script in ["pretrain.nsl", "pretrain_cert.nsl"] {
+    // PR #463 put an EXPLICIT `@fused_lm_ce` on `pretrain.nsl`, and an
+    // explicit decorator wins over inference by design — so that script must
+    // reach the fused path WITHOUT the `inferred:` marker, while the bare
+    // `pretrain_cert.nsl` remains the proof that inference still carries the
+    // shipped idiom on its own.
+    for (script, expect_inferred) in [("pretrain.nsl", false), ("pretrain_cert.nsl", true)] {
         let dir = workspace_root().join("models").join("coder50m");
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("out.o");
@@ -357,9 +362,29 @@ fn the_shipped_coder50m_pretraining_scripts_infer_a_fused_head() {
             output.status.success(),
             "models/coder50m/{script} must build under --pretrain-optimized:\n{stderr}"
         );
-        assert!(
-            stderr.contains("vocab=49152 hidden=512"),
-            "models/coder50m/{script} no longer infers its fused LM head:\n{stderr}"
+        assert_eq!(
+            stderr.contains("[lm-head-fusion] inferred:"),
+            expect_inferred,
+            "models/coder50m/{script}: inference fired where the explicit \
+             decorator should own the head (or stopped firing where it must):\n{stderr}"
         );
+        if expect_inferred {
+            assert!(
+                stderr.contains("vocab=49152 hidden=512"),
+                "models/coder50m/{script} inferred the wrong dims:\n{stderr}"
+            );
+        } else {
+            // The explicit-decorator SUCCESS path is silent at compile time
+            // (its `[fused-lm-ce]` marker is a runtime exec marker, asserted
+            // by fused_lm_ce_hint_pin_gate); what a compile CAN prove is
+            // that inference correctly stood down — no inferred line above,
+            // and no decline either, since a decorated block never enters
+            // the inference machinery at all.
+            assert!(
+                !stderr.contains("[lm-head-fusion] declined:"),
+                "models/coder50m/{script}: the decorated block entered the \
+                 inference machinery:\n{stderr}"
+            );
+        }
     }
 }

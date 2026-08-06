@@ -7521,6 +7521,18 @@ impl Compiler<'_> {
                     ));
                 }
 
+                // `--fuse-lm-head require` promises "fused or refuse"; the
+                // tape fallback has no fused path, so falling back silently
+                // would make `require` vacuous exactly when it matters (a
+                // step-body change breaks extraction and the lane keeps
+                // passing while paying for the logits surface).
+                if self.compile_options.lm_head_fusion
+                    == crate::lm_head_inference::LmHeadFusion::Require
+                {
+                    return Err(CodegenError::new(
+                        "--fuse-lm-head require: source-AD extraction failed,                          and the tape fallback cannot fuse an LM head.                          Restrict the step body to source-AD-supported                          operations or drop `require`",
+                    ));
+                }
                 // Source AD extraction failed — fall back to tape
                 eprintln!("[nsl] source AD extraction failed, falling back to tape-based AD");
 
@@ -9754,6 +9766,22 @@ impl Compiler<'_> {
                                 builder.ins().iconst(cl_types::I64, placements.len() as i64);
                             self.compile_call_by_name(
                                 builder, "nsl_arena_init", &[total, nslots])?;
+                            // Slot geometry, in dense order, so the runtime
+                            // can verify the INTERIOR red zones — without it
+                            // only the arena's outermost guards are
+                            // checkable and a slot-k overrun into slot k+1
+                            // goes unseen.
+                            for p in &placements {
+                                let off =
+                                    builder.ins().iconst(cl_types::I64, p.offset as i64);
+                                let bytes =
+                                    builder.ins().iconst(cl_types::I64, p.bytes as i64);
+                                self.compile_call_by_name(
+                                    builder,
+                                    "nsl_arena_declare_slot",
+                                    &[off, bytes],
+                                )?;
+                            }
                         }
                     }
                 }

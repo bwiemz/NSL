@@ -149,13 +149,17 @@ ARMS = {
             what="the shipped bundle: source-AD, WGGO greedy, CSHA auto, both "
                  "backward fusions, and the inferred fused LM head"),
         Arm("layerwise",
-            ("--pretrain-optimized", "--checkpoint-blocks", "--layerwise-accum",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
              "--weight-stream"),
-            what="the bundle plus the CSLA window-buffered schedule and weight "
-                 "streaming — the arm that makes 1B fit. Trains with "
-                 "grad_accumulation=2 and NO grad_clip (both required by "
-                 "--layerwise-accum), so its loss stream is not comparable "
-                 "to the other arms'",
+            what="the CSLA window-buffered schedule with weight streaming — "
+                 "the shipped memory stack that makes 1B fit. NOT built on "
+                 "--pretrain-optimized: the bundle's WGGO per-parameter FASE "
+                 "mode table is refused by --layerwise-accum (the "
+                 "window-buffered backward assumes the uniform Deferred "
+                 "hook), so this is the same composition the SR-BF16 "
+                 "campaign certifies. Trains with grad_accumulation=2 and NO "
+                 "grad_clip (both required by --layerwise-accum), so its "
+                 "loss stream is not comparable to the other arms'",
             accum=2, grad_clip=False),
         Arm("fp32", ("--source-ad",), (("NSL_MATMUL_TF32", "0"),), "fp32",
             what="full-f32 matmul (TF32 tensor cores off)"),
@@ -314,6 +318,9 @@ def build_binary(nsl: Path, prog: Path, arm: Arm, timeout: int) -> Path | None:
     out = (prog.parent / "prog").resolve()
     env = dict(os.environ)
     env.setdefault("NSL_STDLIB_PATH", str(REPO / "stdlib"))
+    # [pass-trace] dispositions are COMPILE-time output; setting this on the
+    # runtime (as the attribution pass once did) yields an empty table.
+    env["NSL_PASS_TRACE"] = "1"
     r = subprocess.run(
         [str(nsl), "build", prog.name, *arm.flags, "-o", str(out)],
         cwd=prog.parent, capture_output=True, text=True, env=env, timeout=timeout,
@@ -335,6 +342,9 @@ def run_once(binary: Path, arm: Arm, max_steps: int, timeout: int,
     """Execute one prebuilt arm once, timing the interval between callbacks."""
     env = dict(os.environ)
     env.update(dict(arm.env))
+    # nsl_debug_gpu_mem early-returns after step 5 without this, so the peak
+    # columns would only describe the warmup.
+    env["NSL_DEBUG_MEM_ALL"] = "1"
     env.update(extra_env or {})
 
     started = time.monotonic()
@@ -504,10 +514,14 @@ def attribution_run(binary: Path, arm: Arm, timeout: int) -> dict:
             "pct": float(m.group(5)),
         }
     pcie = None
-    pm = PCIE_RE.search(res.stderr)
-    if pm:
-        pcie = {"h2d_mib": float(pm.group(1)), "d2h_mib": float(pm.group(2)),
-                "total_mib": float(pm.group(3))}
+    pms = PCIE_RE.findall(res.stderr)
+    if pms:
+        # LAST interval: the first one folds in the one-time model upload,
+        # which is not steady-state traffic (and the region table already
+        # reflects the last interval).
+        h2d, d2h, total = pms[-1]
+        pcie = {"h2d_mib": float(h2d), "d2h_mib": float(d2h),
+                "total_mib": float(total)}
     dispositions = {}
     for line in build_log.splitlines():
         m = DISPOSITION_RE.match(line.strip())
@@ -656,6 +670,19 @@ def main() -> None:
                 "mflop_per_token": fpt / 1e6,
                 "arms": {},
             }
+            # A refused BUILD is a result, not an absence: the 2026-08-02
+            # matrix lost three arms exactly because a missing key reads as
+            # "not requested".
+            for a in arm_keys:
+                if a in bins:
+                    continue
+                stderr_tail = ""
+                log = work / f"b{batch}_{a}" / "build_stderr.txt"
+                if log.exists():
+                    stderr_tail = "\n".join(
+                        log.read_text(errors="replace").strip().splitlines()[-3:])
+                cell["arms"][a] = {"ok": False, "why": "build refused",
+                                   "build_stderr_tail": stderr_tail}
             ref_losses: list[float] | None = None
             for a in live:
                 runs = [r for r in results[a] if r.ok]
@@ -670,9 +697,12 @@ def main() -> None:
                 # the machine's actual capability.
                 best = min(runs, key=lambda r: median_ms(r, args.warmup))
                 ms = median_ms(best, args.warmup)
-                # on_step fires per OPTIMIZER step; with accumulation the
-                # step consumed accum microbatches of tokens.
-                toks = batch * seq * ARMS[a].accum
+                # on_step fires per MICRO-batch (the step counter increments
+                # and callbacks run once per DataLoader iteration; only the
+                # optimizer update is gated on grad_accumulation) — so a
+                # "step" is batch*seq tokens for EVERY arm, accumulating or
+                # not. Multiplying by accum here inflated the accum arms 2x.
+                toks = batch * seq
                 tok_s = toks / (ms / 1000.0)
                 tflops = tok_s * fpt / 1e12
                 mfu = 100.0 * tflops / peak[ARMS[a].precision]

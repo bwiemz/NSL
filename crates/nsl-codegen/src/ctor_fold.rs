@@ -51,8 +51,15 @@ pub struct FoldedCtorDims {
     pub values: HashMap<String, HashMap<String, f64>>,
     pub conflicted: HashSet<String>,
     /// `"type.field"` tombstones so a value dropped for conflicting cannot
-    /// be re-proposed by a third agreeing instantiation.
+    /// be re-proposed by a third agreeing instantiation. (One fold call per
+    /// compile, so `merge_into` does not need to carry these across calls.)
     values_conflicted: HashSet<String>,
+    /// Types with at least one instantiation the fold could NOT evaluate
+    /// (non-constant args, named args, arity mismatch, a cycle). The dims
+    /// map is keyed by TYPE, so claims from the foldable instantiations
+    /// would silently be asserted for the unfoldable instance too — the
+    /// whole type is dropped instead.
+    poisoned_types: HashSet<String>,
 }
 
 impl FoldedCtorDims {
@@ -162,6 +169,19 @@ pub fn fold_constructor_dims(modules: &[&Module], interner: &Interner) -> Folded
     for root in roots {
         fold_type(&root, &HashMap::new(), &defs, interner, &mut out, &mut visiting);
     }
+    // Poisoning and name-vetoes can land AFTER a proposal; strip last so
+    // ordering cannot leak a claim.
+    for ty in &out.poisoned_types {
+        out.dims.remove(ty);
+        out.values.remove(ty);
+    }
+    for name in &out.conflicted {
+        for fields in out.dims.values_mut() {
+            fields.remove(name);
+        }
+    }
+    out.dims.retain(|_, f| !f.is_empty());
+    out.values.retain(|_, f| !f.is_empty());
     out
 }
 
@@ -174,7 +194,10 @@ fn fold_type(
     visiting: &mut Vec<String>,
 ) {
     if visiting.iter().any(|t| t == type_name) {
-        return; // cycle — a broken program, not a recursion to chase
+        // A cycle is a broken program, not a recursion to chase — and any
+        // dims already proposed for it describe an unconstructible value.
+        out.poisoned_types.insert(type_name.to_string());
+        return;
     }
     let Some(info) = defs.get(type_name) else {
         return;
@@ -203,15 +226,35 @@ fn fold_type(
                 // model reads back at runtime (`int(self._n_heads.item())`).
                 if one_elem {
                     if let Some(v) = full_scalar_value(init, env, interner) {
-                        propose_value(out, type_name, field_name, v);
+                        // The runtime stores `full([1], v)` as f32 and
+                        // `item()` widens it back; fold the same round-trip
+                        // or a non-f32-representable constant would compare
+                        // unequal to what the program computes.
+                        propose_value(out, type_name, field_name, (v as f32) as f64);
                     }
                 }
             }
             continue;
         }
-        // A submodule instantiation: evaluate the args, recurse.
-        if let Some((child, child_env)) = instantiation(init, env, defs, interner) {
-            fold_type(&child, &child_env, defs, interner, out, visiting);
+        // A submodule instantiation: evaluate the args, recurse. A call to
+        // a KNOWN model type whose args do NOT fold poisons that type —
+        // the per-type map cannot say "these dims, except for the instance
+        // built from runtime values".
+        match instantiation(init, env, defs, interner) {
+            Some((child, child_env)) => {
+                fold_type(&child, &child_env, defs, interner, out, visiting);
+            }
+            None => {
+                if let ExprKind::Call { callee, .. } = &init.kind {
+                    if let ExprKind::Ident(sym) = &callee.kind {
+                        if let Some(name) = interner.resolve(sym.0) {
+                            if defs.contains_key(name) {
+                                out.poisoned_types.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     visiting.pop();
@@ -257,7 +300,7 @@ fn propose_value(out: &mut FoldedCtorDims, type_name: &str, field: &str, value: 
 }
 
 fn propose(out: &mut FoldedCtorDims, type_name: &str, field: &str, dims: Vec<i64>) {
-    if out.conflicted.contains(field) {
+    if out.conflicted.contains(field) || out.poisoned_types.contains(type_name) {
         return;
     }
     let fields = out.dims.entry(type_name.to_string()).or_default();
@@ -268,10 +311,15 @@ fn propose(out: &mut FoldedCtorDims, type_name: &str, field: &str, dims: Vec<i64
         Some(prev) if *prev == dims => {}
         Some(_) => {
             // Two instantiations of this TYPE disagree; per-type dims are
-            // then a lie for at least one instance. Drop and veto the NAME
-            // (the leaf-name bridges downstream key on it too).
-            fields.remove(field);
+            // then a lie for at least one instance. Veto the NAME (the
+            // leaf-name bridges downstream key on it too) and strip it
+            // from EVERY type — vetoing only this type's entry would leave
+            // a possibly-stale claim under another type whose later
+            // conflicting proposal the veto now suppresses.
             out.conflicted.insert(field.to_string());
+            for fields in out.dims.values_mut() {
+                fields.remove(field);
+            }
         }
     }
 }
@@ -379,16 +427,21 @@ fn eval_const(
                     BinOp::Add => a.checked_add(b).map(I),
                     BinOp::Sub => a.checked_sub(b).map(I),
                     BinOp::Mul => a.checked_mul(b).map(I),
+                    // Division: non-negative operands only. NSL's compiled
+                    // `/` truncates (Cranelift sdiv) and `//` floors; for
+                    // negative operands those disagree with each other AND
+                    // with div_euclid, and no dim or config constant is
+                    // negative — refusing is free.
                     BinOp::Div => {
-                        if b != 0 && a % b == 0 {
+                        if a >= 0 && b > 0 && a % b == 0 {
                             Some(I(a / b))
                         } else {
                             None
                         }
                     }
                     BinOp::FloorDiv => {
-                        if b != 0 {
-                            Some(I(a.div_euclid(b)))
+                        if a >= 0 && b > 0 {
+                            Some(I(a / b))
                         } else {
                             None
                         }
