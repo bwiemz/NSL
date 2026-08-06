@@ -3707,10 +3707,35 @@ pub(crate) fn gpu_fase_fused_adamw_step(
     let m = unsafe { &*(m_ptr as *const NslTensor) };
     let v = unsafe { &*(v_ptr as *const NslTensor) };
     let mp = unsafe { &*(mp_ptr as *const NslTensor) };
-    let mut th_data = th.data as u64;
-    let mut m_data = m.data as u64;
-    let mut v_data = v.data as u64;
-    let mut mp_data = mp.data as u64;
+    gpu_fase_fused_adamw_step_raw(
+        th.data as u64, m.data as u64, v.data as u64, mp.data as u64, n,
+        b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2, has_wd,
+    );
+}
+
+/// The raw-pointer launcher behind `gpu_fase_fused_adamw_step` — item 11's
+/// elementwise ZeRO-3 step launches the SAME kernel on a slice region
+/// (theta/m/v at a byte offset, gradient from the reduce_scattered slice),
+/// which is what makes the sharded update bit-equal to the baseline's.
+///
+/// PRECONDITION (unenforceable here): all four pointers address `n`
+/// contiguous f32 device elements — no `NslTensor` in the signature, so the
+/// caller owns the dtype/contiguity/device guarantees (the
+/// `gpu_scale_raw_f32` discipline).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_raw(
+    th_data: u64, m_data: u64, v_data: u64, mp_data: u64, n: usize,
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+) {
+    if n == 0 {
+        return;
+    }
+    let mut th_data = th_data;
+    let mut m_data = m_data;
+    let mut v_data = v_data;
+    let mut mp_data = mp_data;
     let mut n_val = n as u64;
     let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
     let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =

@@ -5819,6 +5819,17 @@ impl Compiler<'_> {
                      partitioning)",
                 )));
             }
+            // Item 11: refuse rather than silently ignore — stages 1/2 never
+            // shard parameters, so the flag would be inert (the
+            // declared-but-inert class the composition registry exists to
+            // kill).
+            if s != 3 && self.features.zero_elementwise {
+                return Err(CodegenError::new(format!(
+                    "--zero-elementwise requires --zero-stage 3 (got stage \
+                     {s}): stages 1/2 shard optimizer state and gradients, \
+                     never parameters — there is nothing to slice",
+                )));
+            }
             if s == 3 && !(csla_active && self.compile_options.weight_stream) {
                 return Err(CodegenError::new(
                     "--zero-stage 3 requires --layerwise-accum --weight-stream \
@@ -5835,6 +5846,22 @@ impl Compiler<'_> {
                      host-resident moments x owner-gated sharded updates is an \
                      untested composition (deferral-must-refuse). Drop one",
                 ));
+            }
+            // Item 11: elementwise slices are stepped by the fused-AdamW
+            // kernel on every rank — Muon's Newton-Schulz needs the WHOLE
+            // matrix (gather-before-NS is the documented follow-up), and
+            // SGD/Lion have no fused elementwise twin yet.
+            if s == 3
+                && self.features.zero_elementwise
+                && !matches!(optimizer_name.as_str(), "adamw" | "adam")
+            {
+                return Err(CodegenError::new(format!(
+                    "--zero-elementwise requires the AdamW/Adam optimizer \
+                     (train block uses '{optimizer_name}'): every rank steps \
+                     its 1/ws slice with the fused-AdamW kernel, and Muon's \
+                     Newton-Schulz needs whole matrices. Drop \
+                     --zero-elementwise, or switch the optimizer",
+                )));
             }
             // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
             // The all-reduce is emitted BEFORE the Deferred dispatch, but
@@ -9826,13 +9853,24 @@ impl Compiler<'_> {
                         // the flags — the duplication that let the three
                         // residency tables be populated from three separate
                         // spellings of the same intent.
+                        // Item 11: static element counts, aligned with
+                        // param_paths (0 = symbolic — derive treats it as
+                        // elementwise-ineligible).
+                        let plan_elems: Vec<u64> = (0..param_paths.len())
+                            .map(|u| {
+                                elems_by_accum.get(&(u as i64)).copied().unwrap_or(0)
+                            })
+                            .collect();
                         let plan = crate::parameter_plan::ParameterPlan::derive(
                             &param_paths,
                             &ws_streamed_sorted,
+                            &plan_elems,
                             &crate::parameter_plan::PlanFeatures {
                                 weight_stream: self.compile_options.weight_stream,
                                 param_dtype_bf16sr: self.features.param_dtype_bf16sr,
                                 zero_stage: self.features.zero_stage,
+                                zero_elementwise: self.features.zero_elementwise,
+                                world_size: self.features.world_size as u32,
                             },
                         )
                         .map_err(|e| {
@@ -9929,6 +9967,16 @@ impl Compiler<'_> {
                             self.compile_call_by_name(
                                 builder,
                                 "nsl_sr_bf16_note_param",
+                                &[pw, iv],
+                            )?;
+                        }
+                        // Item 11: the mark must precede the register that
+                        // carves the slice — same plan-driven ordering
+                        // discipline as the SR note above.
+                        if entry.is_elementwise() {
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_zero3_mark_elementwise",
                                 &[pw, iv],
                             )?;
                         }
@@ -12005,6 +12053,15 @@ impl Compiler<'_> {
                 // owner gate while resident/tied params update on every rank
                 // from the identical reduced gradients.
                 zero3: Option<&std::collections::HashSet<i64>>,
+                // Item 11: the ELEMENTWISE subset of `zero3` (plan-driven).
+                // These params reduce_scatter their slots (the runtime
+                // dispatches on the mark), skip the owner gate, and step via
+                // nsl_zero3_elem_adamw_step on EVERY rank.
+                zero3_elem: Option<&std::collections::HashSet<i64>>,
+                // Item 11: the fused-AdamW scalars for the elementwise step
+                // (Some iff zero3_elem is non-empty — enforced at the
+                // dispatcher, which refuses non-AdamW recipes).
+                elem_scalars: Option<&crate::stmt_fase::FusedAdamwScalars>,
                 // P4 item 17: Some(opt_step) under --param-dtype bf16-sr.
                 sr_step: Option<Value>,
                 // Item 8: Some(recipe scalars) admits collapsing this group
@@ -12027,6 +12084,7 @@ impl Compiler<'_> {
                     // emits per param.
                     if muon.is_none()
                         && zero3.is_none()
+                        && zero3_elem.is_none()
                         && !wrap_precision
                         && !wrap_offload
                     {
@@ -12165,13 +12223,16 @@ impl Compiler<'_> {
                     } else {
                         m
                     };
+                    // Item 11: elementwise params take their own step arm —
+                    // every rank updates its slice, so no owner gate.
+                    let is_elem = zero3_elem.is_some_and(|s| s.contains(&i));
                     // P3 ZeRO-3: owner-gate the update of a SHARDED param —
                     // non-owners' gathered copies are released right after
                     // this group and refetched (post-update) from the owner
                     // next window, so skipping their update is the sharded
                     // semantic, not a divergence.
                     let z3_gate: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Block)> =
-                        if zero3.is_some_and(|s| s.contains(&i)) {
+                        if !is_elem && zero3.is_some_and(|s| s.contains(&i)) {
                             let owns =
                                 c.compile_call_by_name(builder, "nsl_zero_owns_param", &[iv])?;
                             let one = builder.ins().iconst(cl_types::I64, 1);
@@ -12185,7 +12246,46 @@ impl Compiler<'_> {
                         } else {
                             None
                         };
-                    if let Some(mc) = muon {
+                    if is_elem {
+                        // Item 11: the elementwise fused step — every rank,
+                        // its own slice, the exact fused-AdamW kernel math.
+                        // The runtime already holds the reduce_scattered
+                        // gradient slice (the reduce loop above dispatched on
+                        // the mark), so m_partial is not an argument; codegen
+                        // frees it in the shared tail like every other arm.
+                        let sc = elem_scalars.ok_or_else(|| {
+                            CodegenError::new(
+                                "elementwise group update reached without \
+                                 fused-AdamW scalars — dispatcher must thread \
+                                 elem_scalars",
+                            )
+                        })?;
+                        let lr_v = builder.ins().f64const(sc.lr);
+                        let b1_v = builder.ins().f64const(sc.beta1);
+                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+                        let b2_v = builder.ins().f64const(sc.beta2);
+                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+                        let eps_v = builder.ins().f64const(sc.eps);
+                        // The recipe's flat λ — same as the per-param loop
+                        // and the multi arm (CSLA has no AdamW group
+                        // plumbing; grad_clip is refused by the schedule).
+                        let wd_v = builder.ins().f64const(sc.wd);
+                        let rc = c.compile_call_by_name(
+                            builder,
+                            "nsl_zero3_elem_adamw_step",
+                            &[
+                                theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v,
+                                omb2_v, eps_v, wd_v, bc.0, bc.1,
+                            ],
+                        )?;
+                        let z = builder.ins().iconst(cl_types::I64, 0);
+                        let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+                        let msg =
+                            "nsl: zero3 elementwise step failed — aborting";
+                        c.intern_string(msg)?;
+                        let mp = c.compile_string_literal(builder, msg)?;
+                        c.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
+                    } else if let Some(mc) = muon {
                         // Muon separate-accumulator mode: m_partial holds the
                         // RAW window gradient sum (accum_scale forced to 1.0),
                         // exactly what the non-CSLA FullBuffer path hands
@@ -12354,9 +12454,25 @@ impl Compiler<'_> {
                         .plan
                         .entries()
                         .iter()
-                        .filter(|e| {
-                            e.sharding == crate::parameter_plan::ParamSharding::Sharded
-                        })
+                        .filter(|e| e.sharding.is_sharded())
+                        .map(|e| e.idx)
+                        .collect()
+                });
+            // Item 11: the ELEMENTWISE subset — these params skip the owner
+            // gate (every rank steps its own slice) and their group update
+            // emits nsl_zero3_elem_adamw_step instead of the stdlib call.
+            // Same single-source rule as zero3_streamed: read the plan.
+            let zero3_elem: Option<std::collections::HashSet<i64>> = self
+                .features
+                .zero_stage
+                .filter(|&s| s == 3 && self.features.zero_elementwise)
+                .map(|_| {
+                    pending
+                        .schedule
+                        .plan
+                        .entries()
+                        .iter()
+                        .filter(|e| e.is_elementwise())
                         .map(|e| e.idx)
                         .collect()
                 });
@@ -12384,6 +12500,7 @@ impl Compiler<'_> {
                             ))
                         })?;
                     let needs_sr_note = entry.needs_sr_note();
+                    let needs_elem_mark = entry.is_elementwise();
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
@@ -12391,6 +12508,15 @@ impl Compiler<'_> {
                         self.compile_call_by_name(
                             builder,
                             "nsl_sr_bf16_note_param",
+                            &[pw, iv],
+                        )?;
+                    }
+                    // Item 11: mark-before-register, from the same plan entry
+                    // as the pre-forward belt.
+                    if needs_elem_mark {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_zero3_mark_elementwise",
                             &[pw, iv],
                         )?;
                     }
@@ -12522,6 +12648,39 @@ impl Compiler<'_> {
                     Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
                         &fase_plan.recipe,
                     ))
+                } else {
+                    None
+                };
+
+            // Item 11: the elementwise step re-runs the fused-AdamW math on a
+            // slice, so the update program must BE fused-AdamW-shaped. The
+            // optimizer-name refusal happened at setup; this is the belt for
+            // a recipe that drifted from the name (e.g. an adam variant
+            // emit_final_step no longer matches).
+            let zero3_elem_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
+                if zero3_elem.as_ref().is_some_and(|s| !s.is_empty()) {
+                    if wrap_precision || self.compile_options.training_reference {
+                        return Err(CodegenError::new(
+                            "--zero-elementwise does not compose with a CPDT \
+                             reduced-precision moment plan or \
+                             --training-reference: the elementwise step is the \
+                             fused f32 kernel on a slice, which those modes \
+                             replace. Drop the conflicting option",
+                        ));
+                    }
+                    let sc = Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
+                        &fase_plan.recipe,
+                    ));
+                    if sc.is_none() {
+                        return Err(CodegenError::new(
+                            "--zero-elementwise requires the fused-AdamW update \
+                             program (the elementwise step IS that math on a \
+                             slice) — this train block's optimizer recipe does \
+                             not match it. Use AdamW/Adam, or drop \
+                             --zero-elementwise",
+                        ));
+                    }
+                    sc
                 } else {
                     None
                 };
@@ -13190,6 +13349,8 @@ impl Compiler<'_> {
                     self.compile_options.optim_state_offload,
                     muon_csla_ctx.as_ref(),
                     zero3_streamed.as_ref(),
+                    zero3_elem.as_ref(),
+                    zero3_elem_scalars.as_ref(),
                     Some(opt_step),
                     csla_multi_scalars.as_ref(),
                     &layer_group[ri],
@@ -13265,6 +13426,8 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
                 muon_csla_ctx.as_ref(),
                 zero3_streamed.as_ref(),
+                zero3_elem.as_ref(),
+                zero3_elem_scalars.as_ref(),
                 Some(opt_step),
                 csla_multi_scalars.as_ref(),
                 global_group,

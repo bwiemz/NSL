@@ -632,7 +632,16 @@ pub static ZERO_BUCKET_MEMBERS: std::sync::atomic::AtomicU64 =
 
 /// P4 item 16 (ZeRO-2): reduce_scatter collectives that actually ran — the
 /// stage-2 gate asserts this is nonzero AND all_reduce stays 0 for grads.
+/// Item 11: the elementwise stage-3 gradient path bumps this too (its gate
+/// asserts it is nonzero at stage 3, where the tensor-granular path never
+/// scatters).
 pub static ZERO_REDUCE_SCATTER_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Item 11 (elementwise ZeRO-3): all_gather collectives that actually ran
+/// (ws>1, rc==0 — the same counting rule as the others). The elementwise
+/// gather is the only producer; the tensor-granular gather broadcasts.
+pub static ZERO_ALL_GATHER_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// One eligible tensor (or, on the stage-2 scatter path ONLY, one byte-range
@@ -1966,18 +1975,92 @@ pub enum ParameterResidency {
     Evicted = 3,
 }
 
+/// Item 11: storage for one rank's persistent 1/ws shard (and its reduced
+/// gradient slice). `Vec<u64>` keeps host storage 8-byte aligned for f64
+/// slices; device storage is an `alloc_managed` pointer freed explicitly at
+/// teardown (entries live in a static, so Drop cannot be cfg(cuda)-gated).
+enum ShardBuf {
+    Host(Vec<u64>),
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    Dev(i64),
+}
+
+impl ShardBuf {
+    fn alloc(bytes: usize, device: u8) -> ShardBuf {
+        if device != 0 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::cuda::inner::ensure_context();
+                return ShardBuf::Dev(crate::cuda::inner::alloc_managed(bytes) as i64);
+            }
+            #[cfg(not(feature = "cuda"))]
+            unreachable!("device tensor in a non-cuda build");
+        }
+        ShardBuf::Host(vec![0u64; bytes.div_ceil(8)])
+    }
+
+    fn ptr(&self) -> *mut std::ffi::c_void {
+        match self {
+            ShardBuf::Host(v) => v.as_ptr() as *mut std::ffi::c_void,
+            ShardBuf::Dev(p) => *p as *mut std::ffi::c_void,
+        }
+    }
+
+    fn free(self) {
+        match self {
+            ShardBuf::Host(_) => {}
+            ShardBuf::Dev(_p) =>
+            {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::inner::ensure_context();
+                    crate::cuda::inner::free_managed(_p as *mut std::ffi::c_void);
+                }
+            }
+        }
+    }
+}
+
+/// Item 11: the elementwise 1/ws shard of one parameter. Every rank holds
+/// `shard = numel/ws` elements at flat offset `rank*shard`; the slice is the
+/// authoritative storage (there is no owner), the full tensor is a transient
+/// reconstructed by all_gather for the layer window.
+struct ElemShard {
+    slice: ShardBuf,
+    /// The window's reduce_scattered (averaged) gradient slice. Allocated on
+    /// first reduce, reused across windows (shard size never changes).
+    grad: Option<ShardBuf>,
+    /// Reduce/step handshake: set by `nsl_zero3_reduce_grad_slot`, consumed
+    /// by `nsl_zero3_elem_adamw_step`. A step without a fresh reduce is a
+    /// codegen ordering bug and aborts.
+    grad_ready: bool,
+    /// Elements per rank.
+    shard: usize,
+    elem_bytes: usize,
+}
+
 struct Zero3Entry {
     /// param_list index — the cross-rank collective ordering key for
     /// gather_all/release_all (heap pointers are per-process).
     idx: usize,
     owner: i32,
     state: ParameterResidency,
+    /// Item 11: set by `nsl_zero3_mark_elementwise` (plan-driven, before the
+    /// first registration); the register carves the slice.
+    elem_pending: bool,
+    /// Present once the first registration carved this rank's slice.
+    elem: Option<ElemShard>,
 }
 
 static ZERO3_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ZERO3_TABLE: Mutex<Option<std::collections::HashMap<i64, Zero3Entry>>> = Mutex::new(None);
 static ZERO3_GATHERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ZERO3_RELEASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Item 11 anti-vacuity: elementwise params carved / elementwise fused
+/// steps executed. Reported on the teardown line so the gate can assert the
+/// elementwise machinery ran (and, in the tensor-granular arm, did not).
+static ZERO3_ELEM_PARAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ZERO3_ELEM_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Codegen calls this once per train block when `--zero-stage 3` is baked.
 #[no_mangle]
@@ -2025,8 +2108,62 @@ pub extern "C" fn nsl_zero3_note_param(tensor_ptr: i64, idx: i64) -> i64 {
             idx: idx as usize,
             owner,
             state: ParameterResidency::Replicated,
+            elem_pending: false,
+            elem: None,
         },
     );
+    0
+}
+
+/// Item 11: mark a noted param for ELEMENTWISE 1/ws sharding — the plan
+/// decided this at compile time (streamed, AdamW-stepped, numel divisible by
+/// world_size), and codegen emits this right before the registration belt,
+/// exactly like `nsl_sr_bf16_note_param`. Idempotent (the belt re-runs every
+/// micro-batch). The slice itself is carved at the first registration, where
+/// the admission guard has already vetted the tensor.
+#[no_mangle]
+pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64) -> i64 {
+    let ws = {
+        let guard = ZERO_CTX.lock().unwrap();
+        let Some(ctx) = guard.as_ref() else {
+            eprintln!("nsl_zero3_mark_elementwise: ZeRO context not initialized");
+            return -1;
+        };
+        ctx.world_size.max(1)
+    };
+    let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
+    let numel = t.len.max(0) as usize;
+    if numel == 0 || numel % ws != 0 {
+        // The plan's eligibility already excluded ragged params — reaching
+        // here means codegen and runtime disagree about the shard layout.
+        eprintln!(
+            "[zero3] FATAL: param {idx} marked elementwise with numel {numel} \
+             not divisible by world_size {ws} — the compile-time eligibility \
+             and this runtime have drifted"
+        );
+        std::process::abort();
+    }
+    let mut guard = ZERO3_TABLE.lock().unwrap();
+    let Some(e) = guard.as_mut().and_then(|m| m.get_mut(&tensor_ptr)) else {
+        eprintln!(
+            "[zero3] FATAL: elementwise mark of an un-noted param tensor \
+             {tensor_ptr} — codegen must emit nsl_zero3_note_param first"
+        );
+        std::process::abort();
+    };
+    if !e.elem_pending {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            eprintln!(
+                "[zero3] elementwise sharding armed: eligible params live as \
+                 1/{ws} slices per rank, gathers ride all_gather, gradients \
+                 reduce_scatter, every rank steps its own slice (v1: optimizer \
+                 state stays replicated; m/v regions outside this rank's slice \
+                 are never touched)"
+            );
+        });
+        e.elem_pending = true;
+    }
     0
 }
 
@@ -2060,9 +2197,12 @@ pub extern "C" fn nsl_zero3_release_count() -> i64 {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn zero3_register(tensor_ptr: i64) {
     let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
-    let rank = {
+    let (rank, ws) = {
         let guard = ZERO_CTX.lock().unwrap();
-        guard.as_ref().map(|c| c.rank).unwrap_or(0)
+        guard
+            .as_ref()
+            .map(|c| (c.rank, c.world_size.max(1)))
+            .unwrap_or((0, 1))
     };
     let mut guard = ZERO3_TABLE.lock().unwrap();
     let table = guard.get_or_insert_with(std::collections::HashMap::new);
@@ -2085,6 +2225,66 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
             t.owns_data, t.data_owner, t.slab_managed
         );
         std::process::abort();
+    }
+    // Item 11: elementwise registration — carve this rank's slice out of the
+    // initial full replica, then drop the full bytes on EVERY rank (there is
+    // no owner; the slice is the authoritative storage). Idempotent once
+    // carved: re-registration at window start only needs the eviction reset
+    // below the tensor-granular arms never see for elementwise entries.
+    if e.elem_pending {
+        if e.elem.is_none() {
+            let numel = t.len.max(0) as usize;
+            let elem_bytes = if t.dtype == 0 { 8 } else { 4 };
+            let shard = numel / ws;
+            let slice = ShardBuf::alloc(shard * elem_bytes, t.device);
+            let off = rank * shard * elem_bytes;
+            unsafe {
+                if t.device != 0 {
+                    #[cfg(feature = "cuda")]
+                    {
+                        crate::cuda::inner::ensure_context();
+                        crate::cuda::inner::memcpy_dtod(
+                            slice.ptr(),
+                            (t.data as *const u8).add(off) as *const std::ffi::c_void,
+                            shard * elem_bytes,
+                        );
+                        crate::cuda::inner::free_managed(t.data);
+                    }
+                } else {
+                    std::ptr::copy_nonoverlapping(
+                        (t.data as *const u8).add(off),
+                        slice.ptr() as *mut u8,
+                        shard * elem_bytes,
+                    );
+                    // CPU full replicas are heap allocations the runtime
+                    // cannot reconstruct a Layout for here — null without
+                    // freeing, exactly like the tensor-granular non-cuda
+                    // eviction below.
+                }
+            }
+            t.data = std::ptr::null_mut();
+            e.elem = Some(ElemShard {
+                slice,
+                grad: None,
+                grad_ready: false,
+                shard,
+                elem_bytes,
+            });
+            e.state = ParameterResidency::Evicted;
+            ZERO3_ELEM_PARAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else if e.state == ParameterResidency::GatheredTemporary && !t.data.is_null() {
+            // Window-start re-register of a still-materialized full copy:
+            // drop it (the slice holds the truth), mirroring the non-owner
+            // re-evict below.
+            #[cfg(feature = "cuda")]
+            if t.device != 0 {
+                crate::cuda::inner::ensure_context();
+                crate::cuda::inner::free_managed(t.data);
+            }
+            t.data = std::ptr::null_mut();
+            e.state = ParameterResidency::Evicted;
+        }
+        return;
     }
     if e.owner as usize == rank {
         // Window-start reset (mirrors the non-owner re-evict below): a
@@ -2120,7 +2320,8 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
 /// (silent corruption / barrier timeout; review finding 1).
 pub(crate) fn zero3_gather(tensor_ptr: i64) {
     let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
-    let (owner, is_owner) = {
+    // (owner, is_owner, Some((slice_ptr, shard, elem_bytes)) for elementwise)
+    let (owner, is_owner, elem_info) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
             eprintln!("[zero3] FATAL: gather of untracked tensor {tensor_ptr}");
@@ -2138,18 +2339,33 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
         }
         let guard = ZERO_CTX.lock().unwrap();
         let rank = guard.as_ref().map(|c| c.rank).unwrap_or(0);
-        (e.owner, e.owner as usize == rank)
+        (
+            e.owner,
+            e.owner as usize == rank,
+            e.elem
+                .as_ref()
+                .map(|s| (s.slice.ptr() as i64, s.shard, s.elem_bytes)),
+        )
     };
-    #[cfg(feature = "cuda")]
-    {
-        if !is_owner && t.data.is_null() {
-            crate::cuda::inner::ensure_context();
-            let bytes = t.data_byte_size();
-            t.data = crate::cuda::inner::alloc_managed(bytes);
+    // Materialize the full buffer. Tensor-granular: non-owners only (the
+    // owner's full replica is live). Item 11 elementwise: EVERY rank — the
+    // at-rest state holds nothing but the slice.
+    let need_full = elem_info.is_some() || !is_owner;
+    if need_full && t.data.is_null() {
+        if t.device != 0 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::cuda::inner::ensure_context();
+                t.data = crate::cuda::inner::alloc_managed(t.data_byte_size());
+            }
+        } else if elem_info.is_some() {
+            // Host transient for the elementwise unit paths; released (and
+            // exactly-sized freed) by zero3_release. The tensor-granular host
+            // arm keeps its pre-existing behavior (GPU-only in production).
+            t.data =
+                crate::memory::checked_alloc_zeroed(t.data_byte_size()) as *mut std::ffi::c_void;
         }
     }
-    #[cfg(not(feature = "cuda"))]
-    let _ = is_owner;
     let rc = {
         let guard = ZERO_CTX.lock().unwrap();
         let Some(ctx) = guard.as_ref() else {
@@ -2159,42 +2375,85 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
             eprintln!("[zero3] FATAL: gather with no ZeRO context (post-destroy?)");
             std::process::abort();
         };
-        if ctx.world_size <= 1 {
+        // The backend checks apply exactly where a collective will run
+        // (ws>1) — a single-rank gather is a local copy (elementwise) or a
+        // no-op (tensor-granular) and must not add new refusals.
+        if t.device != 0 && ctx.world_size > 1 && !ctx.cuda_aware {
+            eprintln!(
+                "[zero3] FATAL: GPU-resident ZeRO-3 needs a CUDA-aware \
+                 collective backend (sim-gpu or nccl)"
+            );
+            std::process::abort();
+        }
+        if t.device != 0 && t.dtype != 1 && ctx.world_size > 1 {
+            eprintln!(
+                "[zero3] FATAL: GPU param dtype {} unsupported (f32 only)",
+                t.dtype
+            );
+            std::process::abort();
+        }
+        let dtype_id = if t.device != 0 {
+            crate::tensor_parallel::collective::DTYPE_F32
+        } else {
+            t.dtype as crate::tensor_parallel::collective::DtypeId
+        };
+        if let Some((slice_ptr, shard, elem_bytes)) = elem_info {
+            // Elementwise: reconstruct the full tensor from every rank's
+            // slice. all_gather's recv layout is rank-ordered concatenation
+            // (pinned by the sim impl), which is exactly the slicing rule.
+            if ctx.world_size <= 1 {
+                unsafe {
+                    if t.device != 0 {
+                        #[cfg(feature = "cuda")]
+                        crate::cuda::inner::memcpy_dtod(
+                            t.data,
+                            slice_ptr as *const std::ffi::c_void,
+                            shard * elem_bytes,
+                        );
+                    } else {
+                        std::ptr::copy_nonoverlapping(
+                            slice_ptr as *const u8,
+                            t.data as *mut u8,
+                            shard * elem_bytes,
+                        );
+                    }
+                }
+                0
+            } else {
+                let backend = ctx
+                    .backend
+                    .as_ref()
+                    .expect("world_size > 1 implies a backend");
+                let rc = backend.all_gather(
+                    slice_ptr as *const std::ffi::c_void,
+                    t.data,
+                    shard,
+                    dtype_id,
+                    std::ptr::null_mut(),
+                );
+                if rc == 0 {
+                    ZERO_ALL_GATHER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                rc
+            }
+        } else if ctx.world_size <= 1 {
             0
         } else {
             let backend = ctx
                 .backend
                 .as_ref()
                 .expect("world_size > 1 implies a backend");
-            if t.device != 0 && !ctx.cuda_aware {
-                eprintln!(
-                    "[zero3] FATAL: GPU-resident ZeRO-3 needs a CUDA-aware \
-                     collective backend (sim-gpu or nccl)"
-                );
-                std::process::abort();
-            }
-            if t.device != 0 && t.dtype != 1 {
-                eprintln!(
-                    "[zero3] FATAL: GPU param dtype {} unsupported (f32 only)",
-                    t.dtype
-                );
-                std::process::abort();
-            }
             backend.broadcast(
                 t.data,
                 t.len as usize,
-                if t.device != 0 {
-                    crate::tensor_parallel::collective::DTYPE_F32
-                } else {
-                    t.dtype as crate::tensor_parallel::collective::DtypeId
-                },
+                dtype_id,
                 owner,
                 std::ptr::null_mut(),
             )
         }
     };
     if rc != 0 {
-        eprintln!("[zero3] FATAL: gather broadcast failed rc={rc}");
+        eprintln!("[zero3] FATAL: gather collective failed rc={rc}");
         std::process::abort();
     }
     let mut tbl = ZERO3_TABLE.lock().unwrap();
@@ -2209,7 +2468,7 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
 /// non-owners free their gathered copy. Safe on an already-evicted param.
 pub(crate) fn zero3_release(tensor_ptr: i64) {
     let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
-    let is_owner = {
+    let (is_owner, is_elem) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
             eprintln!("[zero3] FATAL: release of untracked tensor {tensor_ptr}");
@@ -2221,9 +2480,12 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         }
         let guard = ZERO_CTX.lock().unwrap();
         let rank = guard.as_ref().map(|c| c.rank).unwrap_or(0);
-        e.owner as usize == rank
+        (e.owner as usize == rank, e.elem.is_some())
     };
-    if is_owner {
+    // Item 11 elementwise: the slice is the authoritative storage, so the
+    // full transient is dropped on EVERY rank — the owner arm below is
+    // tensor-granular-only.
+    if is_owner && !is_elem {
         // Data stays (authoritative replica); the state transition mirrors
         // the non-owner's so the NEXT gather broadcasts symmetrically.
         let mut tbl = ZERO3_TABLE.lock().unwrap();
@@ -2236,10 +2498,17 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         return;
     }
     if !t.data.is_null() {
-        #[cfg(feature = "cuda")]
-        {
-            crate::cuda::inner::ensure_context();
-            crate::cuda::inner::free_managed(t.data);
+        if t.device != 0 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::cuda::inner::ensure_context();
+                crate::cuda::inner::free_managed(t.data);
+            }
+        } else if is_elem {
+            // Exact pair of the gather's host checked_alloc_zeroed.
+            unsafe {
+                crate::memory::checked_free(t.data as *mut u8, t.data_byte_size());
+            }
         }
         t.data = std::ptr::null_mut();
     }
@@ -2256,13 +2525,6 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
 /// invariant). The slot is the layer's m_partial accumulator tensor.
 #[no_mangle]
 pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
-    let guard = ZERO_CTX.lock().unwrap();
-    let Some(ctx) = guard.as_ref() else {
-        return -1;
-    };
-    if ctx.world_size <= 1 {
-        return 0;
-    }
     let list = unsafe { &*(list_ptr as *const crate::list::NslList) };
     if idx < 0 || idx >= list.len {
         return -1;
@@ -2272,6 +2534,169 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
         return 0; // null slot (already consumed) — nothing to reduce
     }
     let t = unsafe { &*(raw as *const crate::tensor::NslTensor) };
+
+    // Item 11: an elementwise param's window gradient reduce_scatters into
+    // its persistent grad slice — each rank receives only the averaged
+    // elements it will step. The full slot is left with its LOCAL sum
+    // (never read again; codegen frees it right after the group update).
+    // Lock order: ZERO3_TABLE strictly before ZERO_CTX, matching gather.
+    let elem_info = {
+        let tbl = ZERO3_TABLE.lock().unwrap();
+        tbl.as_ref().and_then(|m| {
+            m.iter().find_map(|(k, e)| {
+                if e.idx == idx as usize {
+                    e.elem
+                        .as_ref()
+                        .map(|s| (*k, s.shard, s.elem_bytes, s.grad.is_some()))
+                } else {
+                    None
+                }
+            })
+        })
+    };
+    if let Some((key, shard, elem_bytes, grad_allocated)) = elem_info {
+        if shard * elem_bytes == 0 {
+            return -1;
+        }
+        if !grad_allocated {
+            let buf = ShardBuf::alloc(shard * elem_bytes, t.device);
+            let mut tbl = ZERO3_TABLE.lock().unwrap();
+            if let Some(s) = tbl
+                .as_mut()
+                .and_then(|m| m.get_mut(&key))
+                .and_then(|e| e.elem.as_mut())
+            {
+                s.grad = Some(buf);
+            }
+        }
+        let grad_ptr = {
+            let tbl = ZERO3_TABLE.lock().unwrap();
+            tbl.as_ref()
+                .and_then(|m| m.get(&key))
+                .and_then(|e| e.elem.as_ref())
+                .and_then(|s| s.grad.as_ref().map(|g| g.ptr() as i64))
+                .unwrap_or(0)
+        };
+        if grad_ptr == 0 {
+            return -1;
+        }
+        let (ws, rc) = {
+            let guard = ZERO_CTX.lock().unwrap();
+            let Some(ctx) = guard.as_ref() else {
+                return -1;
+            };
+            if (t.len.max(0) as usize) != shard * ctx.world_size.max(1) {
+                eprintln!(
+                    "[zero3] FATAL: elementwise grad slot {idx} has {} elements \
+                     but the shard layout says {}x{} — plan/runtime drift",
+                    t.len,
+                    shard,
+                    ctx.world_size
+                );
+                std::process::abort();
+            }
+            if ctx.world_size <= 1 {
+                // Degenerate single rank: the "slice" is the whole gradient,
+                // unaveraged — copy it over (baseline semantics).
+                unsafe {
+                    if t.device != 0 {
+                        #[cfg(feature = "cuda")]
+                        crate::cuda::inner::memcpy_dtod(
+                            grad_ptr as *mut std::ffi::c_void,
+                            t.data as *const std::ffi::c_void,
+                            shard * elem_bytes,
+                        );
+                    } else {
+                        std::ptr::copy_nonoverlapping(
+                            t.data as *const u8,
+                            grad_ptr as *mut u8,
+                            shard * elem_bytes,
+                        );
+                    }
+                }
+                (1usize, 0i32)
+            } else {
+                let backend = ctx
+                    .backend
+                    .as_ref()
+                    .expect("world_size > 1 implies a backend");
+                if t.device != 0 && !ctx.cuda_aware {
+                    eprintln!(
+                        "[zero3] FATAL: GPU-resident gradient reduce_scatter \
+                         needs a CUDA-aware collective backend (sim-gpu or nccl)"
+                    );
+                    std::process::abort();
+                }
+                if t.device != 0 && t.dtype != 1 {
+                    eprintln!("[zero3] FATAL: GPU grad dtype {} unsupported", t.dtype);
+                    std::process::abort();
+                }
+                let rc = backend.reduce_scatter_sum(
+                    t.data as *const std::ffi::c_void,
+                    grad_ptr as *mut std::ffi::c_void,
+                    t.len as usize,
+                    if t.device != 0 {
+                        crate::tensor_parallel::collective::DTYPE_F32
+                    } else {
+                        t.dtype as crate::tensor_parallel::collective::DtypeId
+                    },
+                    std::ptr::null_mut(),
+                );
+                if rc == 0 {
+                    ZERO_REDUCE_SCATTER_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                (ctx.world_size, rc)
+            }
+        };
+        if rc != 0 {
+            eprintln!("[zero3] gradient reduce_scatter failed rc={rc} for slot {idx}");
+            return -1;
+        }
+        // The same sum-then-divide averaging as the all-reduce arm, applied
+        // to the slice with the identical scalar conversion (f64 factor,
+        // per-dtype rounding at the multiply — see
+        // nsl_tensor_mul_scalar_inplace).
+        if ws > 1 {
+            let inv_ws = 1.0 / ws as f64;
+            if t.device != 0 {
+                #[cfg(feature = "cuda")]
+                crate::cuda::gpu_scale_raw_f32(
+                    grad_ptr as *mut std::ffi::c_void,
+                    shard,
+                    inv_ws as f32,
+                );
+            } else if t.dtype == 0 {
+                let p = grad_ptr as *mut f64;
+                for i in 0..shard {
+                    unsafe { *p.add(i) *= inv_ws };
+                }
+            } else {
+                let p = grad_ptr as *mut f32;
+                let f = inv_ws as f32;
+                for i in 0..shard {
+                    unsafe { *p.add(i) *= f };
+                }
+            }
+        }
+        let mut tbl = ZERO3_TABLE.lock().unwrap();
+        if let Some(s) = tbl
+            .as_mut()
+            .and_then(|m| m.get_mut(&key))
+            .and_then(|e| e.elem.as_mut())
+        {
+            s.grad_ready = true;
+        }
+        return 0;
+    }
+
+    let guard = ZERO_CTX.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else {
+        return -1;
+    };
+    if ctx.world_size <= 1 {
+        return 0;
+    }
     let backend = ctx
         .backend
         .as_ref()
@@ -2310,6 +2735,275 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
     drop(guard);
     crate::tensor::nsl_tensor_mul_scalar_inplace(raw, inv_ws);
     0
+}
+
+/// Item 11: the elementwise fused-AdamW step — EVERY rank updates its own
+/// `[rank*shard, (rank+1)*shard)` region using the reduce_scattered gradient
+/// slice, with the EXACT per-element math of `nsl_fase_fused_adamw_step`
+/// (GPU: the same `FASE_FUSED_ADAMW_STEP_F32_PTX` kernel launched on the
+/// region; CPU: the same loops). AdamW has no cross-element terms, so the
+/// result is bit-identical to the baseline full-tensor step restricted to
+/// this region. The updated theta region is then persisted into the slice
+/// (release frees the full transient right after the group update).
+///
+/// v1: `m`/`v` are the codegen-allocated FULL moment tensors (replicated);
+/// only this rank's region is ever touched, so each region equals the
+/// baseline's bit-for-bit. Owner-only slice moments are the follow-up.
+///
+/// The scalar argument order mirrors `nsl_fase_fused_adamw_step` exactly.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_zero3_elem_adamw_step(
+    theta_ptr: i64,
+    m_ptr: i64,
+    v_ptr: i64,
+    idx: i64,
+    lr: f64,
+    beta1: f64,
+    one_minus_beta1: f64,
+    beta2: f64,
+    one_minus_beta2: f64,
+    eps: f64,
+    wd: f64,
+    bc1_inv: f64,
+    bc2_inv: f64,
+) -> i64 {
+    let th = unsafe { &*(theta_ptr as *const crate::tensor::NslTensor) };
+    let m = unsafe { &*(m_ptr as *const crate::tensor::NslTensor) };
+    let v = unsafe { &*(v_ptr as *const crate::tensor::NslTensor) };
+
+    let (shard, elem_bytes, grad_ptr) = {
+        let tbl = ZERO3_TABLE.lock().unwrap();
+        let Some(e) = tbl.as_ref().and_then(|map| map.get(&theta_ptr)) else {
+            eprintln!(
+                "[zero3] FATAL: elementwise step of untracked tensor \
+                 {theta_ptr} (param {idx})"
+            );
+            std::process::abort();
+        };
+        if e.idx != idx as usize {
+            eprintln!(
+                "[zero3] FATAL: elementwise step param-index mismatch \
+                 (tensor says {}, codegen says {idx})",
+                e.idx
+            );
+            std::process::abort();
+        }
+        let Some(s) = e.elem.as_ref() else {
+            eprintln!(
+                "[zero3] FATAL: elementwise step of param {idx}, which was \
+                 never carved — the plan and the emitted step dispatch have \
+                 drifted"
+            );
+            std::process::abort();
+        };
+        if !s.grad_ready {
+            // A step without a fresh reduce would apply a stale or
+            // uninitialized gradient slice — a silent-wrong-numerics class.
+            eprintln!(
+                "[zero3] FATAL: elementwise step of param {idx} before its \
+                 window gradient was reduce_scattered"
+            );
+            std::process::abort();
+        }
+        (
+            s.shard,
+            s.elem_bytes,
+            s.grad.as_ref().map(|g| g.ptr() as i64).unwrap_or(0),
+        )
+    };
+    if th.data.is_null() || grad_ptr == 0 {
+        eprintln!(
+            "[zero3] FATAL: elementwise step of param {idx} without a \
+             materialized full tensor (gather must precede the group update)"
+        );
+        std::process::abort();
+    }
+    let n = th.len.max(0) as usize;
+    assert!(
+        m.len.max(0) as usize == n && v.len.max(0) as usize == n,
+        "zero3 elem step: m/v length mismatch (theta={}, m={}, v={})",
+        th.len,
+        m.len,
+        v.len
+    );
+    assert!(
+        m.device == th.device && v.device == th.device,
+        "zero3 elem step: device mismatch"
+    );
+    let rank = {
+        let guard = ZERO_CTX.lock().unwrap();
+        guard.as_ref().map(|c| c.rank).unwrap_or(0)
+    };
+    let off_bytes = rank * shard * elem_bytes;
+    let has_wd = wd != 0.0;
+
+    if th.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            assert!(
+                th.dtype == 1 && m.dtype == 1 && v.dtype == 1,
+                "zero3 elem step: GPU path requires f32 tensors"
+            );
+            // Identical f64→f32 conversions to nsl_fase_fused_adamw_step's
+            // GPU arm — this is what makes the region bit-equal.
+            crate::cuda::gpu_fase_fused_adamw_step_raw(
+                (th.data as u64) + off_bytes as u64,
+                (m.data as u64) + off_bytes as u64,
+                (v.data as u64) + off_bytes as u64,
+                grad_ptr as u64,
+                shard,
+                beta1 as f32,
+                one_minus_beta1 as f32,
+                beta2 as f32,
+                one_minus_beta2 as f32,
+                eps as f32,
+                (-lr) as f32,
+                ((-lr) * wd) as f32,
+                bc1_inv as f32,
+                bc2_inv as f32,
+                has_wd,
+            );
+            crate::cuda::inner::ensure_context();
+            crate::cuda::inner::memcpy_dtod(
+                {
+                    let tbl = ZERO3_TABLE.lock().unwrap();
+                    tbl.as_ref()
+                        .and_then(|map| map.get(&theta_ptr))
+                        .and_then(|e| e.elem.as_ref())
+                        .map(|s| s.slice.ptr())
+                        .expect("entry verified above")
+                },
+                unsafe { (th.data as *const u8).add(off_bytes) } as *const std::ffi::c_void,
+                shard * elem_bytes,
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!("[zero3] FATAL: GPU elementwise step in a non-cuda build");
+            std::process::abort();
+        }
+    } else if th.dtype == 0 && m.dtype == 0 && v.dtype == 0 {
+        // CPU f64 — the same op order as nsl_fase_fused_adamw_step's f64 arm.
+        let neg_lr = -lr;
+        let neg_lr_wd = (-lr) * wd;
+        let off = rank * shard;
+        let (td, md, vd) = (
+            th.data as *mut f64,
+            m.data as *mut f64,
+            v.data as *mut f64,
+        );
+        let gd = grad_ptr as *const f64;
+        for i in 0..shard {
+            unsafe {
+                let g_i = *gd.add(i);
+                let t1 = *md.add(off + i) * beta1;
+                let t2 = g_i * one_minus_beta1;
+                let m_new = t1 + t2;
+                *md.add(off + i) = m_new;
+                let sq = g_i * g_i;
+                let ssq = sq * one_minus_beta2;
+                let vdec = *vd.add(off + i) * beta2;
+                let v_new = vdec + ssq;
+                *vd.add(off + i) = v_new;
+                let mh = m_new * bc1_inv;
+                let vh = v_new * bc2_inv;
+                let tden = vh.sqrt() + eps;
+                let u = mh / tden;
+                let mut adj = u * neg_lr;
+                if has_wd {
+                    let wdt = *td.add(off + i) * neg_lr_wd;
+                    adj += wdt;
+                }
+                *td.add(off + i) += adj;
+            }
+        }
+        persist_host_slice(theta_ptr, th, off_bytes, shard * elem_bytes);
+    } else if th.dtype == 1 && m.dtype == 1 && v.dtype == 1 {
+        // CPU f32 — mirrors the fused step's f32 arm (per-scalar `as f32`).
+        let b1 = beta1 as f32;
+        let omb1 = one_minus_beta1 as f32;
+        let b2 = beta2 as f32;
+        let omb2 = one_minus_beta2 as f32;
+        let epsf = eps as f32;
+        let bc1 = bc1_inv as f32;
+        let bc2 = bc2_inv as f32;
+        let neg_lr = (-lr) as f32;
+        let neg_lr_wd = ((-lr) * wd) as f32;
+        let off = rank * shard;
+        let (td, md, vd) = (
+            th.data as *mut f32,
+            m.data as *mut f32,
+            v.data as *mut f32,
+        );
+        let gd = grad_ptr as *const f32;
+        for i in 0..shard {
+            unsafe {
+                let g_i = *gd.add(i);
+                let t1 = *md.add(off + i) * b1;
+                let t2 = g_i * omb1;
+                let m_new = t1 + t2;
+                *md.add(off + i) = m_new;
+                let sq = g_i * g_i;
+                let ssq = sq * omb2;
+                let vdec = *vd.add(off + i) * b2;
+                let v_new = vdec + ssq;
+                *vd.add(off + i) = v_new;
+                let mh = m_new * bc1;
+                let vh = v_new * bc2;
+                let tden = vh.sqrt() + epsf;
+                let u = mh / tden;
+                let mut adj = u * neg_lr;
+                if has_wd {
+                    let wdt = *td.add(off + i) * neg_lr_wd;
+                    adj += wdt;
+                }
+                *td.add(off + i) += adj;
+            }
+        }
+        persist_host_slice(theta_ptr, th, off_bytes, shard * elem_bytes);
+    } else {
+        eprintln!(
+            "[zero3] FATAL: elementwise step dtype combination unsupported \
+             (theta={}, m={}, v={})",
+            th.dtype, m.dtype, v.dtype
+        );
+        std::process::abort();
+    }
+
+    let mut tbl = ZERO3_TABLE.lock().unwrap();
+    if let Some(s) = tbl
+        .as_mut()
+        .and_then(|map| map.get_mut(&theta_ptr))
+        .and_then(|e| e.elem.as_mut())
+    {
+        s.grad_ready = false;
+    }
+    ZERO3_ELEM_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+/// Copy the just-updated host theta region into the persistent slice.
+fn persist_host_slice(
+    theta_ptr: i64,
+    th: &crate::tensor::NslTensor,
+    off_bytes: usize,
+    bytes: usize,
+) {
+    let tbl = ZERO3_TABLE.lock().unwrap();
+    if let Some(s) = tbl
+        .as_ref()
+        .and_then(|map| map.get(&theta_ptr))
+        .and_then(|e| e.elem.as_ref())
+    {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (th.data as *const u8).add(off_bytes),
+                s.slice.ptr() as *mut u8,
+                bytes,
+            );
+        }
+    }
 }
 
 /// Gather every REGISTERED (non-Replicated) param — the open bracket for
@@ -2376,16 +3070,40 @@ pub extern "C" fn nsl_zero3_teardown() -> i64 {
     if zero3_active() {
         zero3_gather_all();
         // Anti-vacuity line for the gates: a zero3 run whose schedule never
-        // gathered/released anything is a broken schedule, not a pass.
-        eprintln!(
-            "[zero3] teardown: full residency restored (gathers={} releases={})",
+        // gathered/released anything is a broken schedule, not a pass. The
+        // elem_* fields let the elementwise gate prove its machinery ran —
+        // and the tensor-granular gate that it did NOT (label-anchored
+        // parsers; appended fields are compatible). Format first, write
+        // once: both ranks exit through here simultaneously and `eprintln!`
+        // issues one write(2) per fragment, TEARING the two ranks' lines
+        // into each other (the same failure args.rs's [zero] counter line
+        // already guards against — observed on this line the first time a
+        // gate parsed a field from it).
+        let line = format!(
+            "[zero3] teardown: full residency restored (gathers={} releases={} \
+             elem_params={} elem_steps={})\n",
             ZERO3_GATHERS.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_RELEASES.load(std::sync::atomic::Ordering::Relaxed),
+            ZERO3_ELEM_PARAMS.load(std::sync::atomic::Ordering::Relaxed),
+            ZERO3_ELEM_STEPS.load(std::sync::atomic::Ordering::Relaxed),
         );
+        use std::io::Write;
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
     }
     ZERO3_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut guard = ZERO3_TABLE.lock().unwrap();
-    *guard = None;
+    // Item 11: device shard buffers are freed explicitly — entries live in a
+    // static, so ShardBuf cannot carry a cfg(cuda) Drop.
+    if let Some(map) = guard.take() {
+        for (_, e) in map {
+            if let Some(s) = e.elem {
+                s.slice.free();
+                if let Some(g) = s.grad {
+                    g.free();
+                }
+            }
+        }
+    }
     0
 }
 
@@ -2913,5 +3631,234 @@ mod tests {
                 assert_eq!((x.idx, x.off, x.bytes), (y.idx, y.off, y.bytes));
             }
         }
+    }
+
+    // ── Item 11: elementwise sharding state machine (ws=1 degenerate) ────
+
+    /// Owned-looking CPU tensor over a caller-owned Vec. The carve's CPU arm
+    /// nulls `data` without freeing, so claiming `owns_data=1` over a
+    /// Vec-backed buffer is safe here (and required — the register admission
+    /// aborts on borrowed tensors).
+    fn owned_cpu_tensor(data: *mut c_void, shape: *mut i64, strides: *mut i64, len: i64) -> NslTensor {
+        NslTensor {
+            magic: crate::tensor::TENSOR_MAGIC,
+            data,
+            shape,
+            strides,
+            ndim: 1,
+            len,
+            refcount: std::sync::atomic::AtomicI64::new(1),
+            device: 0,
+            dtype: 0, // f64 (CPU params)
+            owns_data: 1,
+            data_owner: 0,
+            slab_managed: 0,
+            tape_id: 0,
+        }
+    }
+
+    /// The full lifecycle at ws=1: carve → gather (slice → full) → reduce
+    /// (slot → grad slice) → elementwise step → release → teardown restore.
+    /// The step's result is diffed BIT-FOR-BIT against
+    /// `nsl_fase_fused_adamw_step` on an identical twin — at ws=1 the slice
+    /// is the whole tensor, so any arithmetic divergence in the elementwise
+    /// arm shows up here without a GPU or a second rank.
+    #[test]
+    fn elementwise_ws1_lifecycle_is_bit_identical_to_the_fused_step() {
+        let _g = zero_serial_lock();
+        // Fresh context, stage 3, single rank (no backend, no shm).
+        nsl_zero_destroy();
+        assert_eq!(nsl_zero_init(3, 1), 0);
+        nsl_zero3_enable();
+
+        let mut theta = vec![0.5f64, -1.25, 2.0, 3.75];
+        let mut shape = vec![4i64];
+        let mut strides = vec![1i64];
+        let t = owned_cpu_tensor(
+            theta.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+        );
+        let tp = &t as *const NslTensor as i64;
+
+        assert_eq!(nsl_zero3_note_param(tp, 0), 0);
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0, "mark must be idempotent");
+        zero3_register(tp);
+        assert!(t.data.is_null(), "carve must drop the full replica");
+        assert_eq!(nsl_zero3_residency(tp), ParameterResidency::Evicted as i64);
+
+        // Gather materializes the full tensor from the slice.
+        zero3_gather(tp);
+        assert!(!t.data.is_null());
+        assert_eq!(
+            nsl_zero3_residency(tp),
+            ParameterResidency::GatheredTemporary as i64
+        );
+        let gathered: Vec<f64> =
+            unsafe { std::slice::from_raw_parts(t.data as *const f64, 4) }.to_vec();
+        assert_eq!(gathered, vec![0.5, -1.25, 2.0, 3.75], "carve+gather must roundtrip");
+
+        // Window gradient in an accumulator slot; the elementwise arm copies
+        // it into the grad slice (ws=1: no reduce, no averaging).
+        let mut grad = vec![0.1f64, -0.2, 0.3, -0.4];
+        let g = owned_cpu_tensor(
+            grad.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+        );
+        let list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(list, &g as *const NslTensor as i64);
+        assert_eq!(nsl_zero3_reduce_grad_slot(list, 0), 0);
+
+        // The elementwise step vs the fused step on an identical twin.
+        let mut m = vec![0.0f64; 4];
+        let mut v = vec![0.0f64; 4];
+        let ms = owned_cpu_tensor(m.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
+        let vs = owned_cpu_tensor(v.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
+        let (lr, b1, b2, eps, wd) = (0.002f64, 0.9f64, 0.95f64, 1e-8f64, 0.01f64);
+        let (bc1, bc2) = (1.0 / (1.0 - b1), 1.0 / (1.0 - b2)); // t=1
+        assert_eq!(
+            nsl_zero3_elem_adamw_step(
+                tp,
+                &ms as *const NslTensor as i64,
+                &vs as *const NslTensor as i64,
+                0,
+                lr, b1, 1.0 - b1, b2, 1.0 - b2, eps, wd, bc1, bc2,
+            ),
+            0
+        );
+
+        // Twin: plain fused step over the same starting values.
+        let mut theta2 = vec![0.5f64, -1.25, 2.0, 3.75];
+        let mut m2 = vec![0.0f64; 4];
+        let mut v2 = vec![0.0f64; 4];
+        let t2 = owned_cpu_tensor(theta2.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
+        let m2t = owned_cpu_tensor(m2.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
+        let v2t = owned_cpu_tensor(v2.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
+        let g2 = owned_cpu_tensor(grad.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
+        crate::fase_step::nsl_fase_fused_adamw_step(
+            &t2 as *const NslTensor as i64,
+            &m2t as *const NslTensor as i64,
+            &v2t as *const NslTensor as i64,
+            &g2 as *const NslTensor as i64,
+            lr, b1, 1.0 - b1, b2, 1.0 - b2, eps, wd, bc1, bc2,
+        );
+        let stepped: Vec<f64> =
+            unsafe { std::slice::from_raw_parts(t.data as *const f64, 4) }.to_vec();
+        assert_eq!(
+            stepped.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            theta2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "elementwise step must be BIT-identical to the fused step"
+        );
+        assert_eq!(
+            m.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            m2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "first moment must match"
+        );
+        assert_eq!(
+            v.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            v2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "second moment must match"
+        );
+
+        // Release frees the full transient on this (only) rank...
+        zero3_release(tp);
+        assert!(t.data.is_null());
+        assert_eq!(nsl_zero3_residency(tp), ParameterResidency::Evicted as i64);
+        // ...and teardown restores full residency with the UPDATED values
+        // (the persist-into-slice happened at the step).
+        nsl_zero3_teardown();
+        assert!(!t.data.is_null(), "teardown must leave full replicas");
+        let final_theta: Vec<f64> =
+            unsafe { std::slice::from_raw_parts(t.data as *const f64, 4) }.to_vec();
+        assert_eq!(
+            final_theta.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            theta2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "teardown gather must serve the post-step slice"
+        );
+        unsafe {
+            crate::memory::checked_free(t.data as *mut u8, 32);
+        }
+        crate::list::nsl_list_free(list);
+        nsl_zero_destroy();
+    }
+
+    /// The reduce/step handshake: a second step without a fresh reduce must
+    /// abort (stale-gradient class). Verified via the grad_ready flag rather
+    /// than a death test — the abort arm itself is a process::abort.
+    #[test]
+    fn elementwise_step_consumes_the_reduce_handshake() {
+        let _g = zero_serial_lock();
+        nsl_zero_destroy();
+        assert_eq!(nsl_zero_init(3, 1), 0);
+        nsl_zero3_enable();
+
+        let mut theta = vec![1.0f64, 2.0];
+        let mut shape = vec![2i64];
+        let mut strides = vec![1i64];
+        let t = owned_cpu_tensor(
+            theta.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            2,
+        );
+        let tp = &t as *const NslTensor as i64;
+        assert_eq!(nsl_zero3_note_param(tp, 0), 0);
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
+        zero3_register(tp);
+        zero3_gather(tp);
+
+        let mut grad = vec![0.5f64, 0.5];
+        let g = owned_cpu_tensor(
+            grad.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            2,
+        );
+        let list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(list, &g as *const NslTensor as i64);
+        assert_eq!(nsl_zero3_reduce_grad_slot(list, 0), 0);
+        let ready = {
+            let tbl = ZERO3_TABLE.lock().unwrap();
+            tbl.as_ref()
+                .and_then(|m| m.get(&tp))
+                .and_then(|e| e.elem.as_ref())
+                .map(|s| s.grad_ready)
+        };
+        assert_eq!(ready, Some(true), "reduce must arm the handshake");
+
+        let mut m = vec![0.0f64; 2];
+        let mut v = vec![0.0f64; 2];
+        let ms = owned_cpu_tensor(m.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 2);
+        let vs = owned_cpu_tensor(v.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 2);
+        assert_eq!(
+            nsl_zero3_elem_adamw_step(
+                tp,
+                &ms as *const NslTensor as i64,
+                &vs as *const NslTensor as i64,
+                0,
+                0.001, 0.9, 0.1, 0.95, 0.05, 1e-8, 0.0, 1.0, 1.0,
+            ),
+            0
+        );
+        let ready = {
+            let tbl = ZERO3_TABLE.lock().unwrap();
+            tbl.as_ref()
+                .and_then(|m| m.get(&tp))
+                .and_then(|e| e.elem.as_ref())
+                .map(|s| s.grad_ready)
+        };
+        assert_eq!(ready, Some(false), "the step must consume the handshake");
+
+        zero3_release(tp);
+        nsl_zero3_teardown();
+        if !t.data.is_null() {
+            unsafe { crate::memory::checked_free(t.data as *mut u8, 16) };
+        }
+        crate::list::nsl_list_free(list);
+        nsl_zero_destroy();
     }
 }

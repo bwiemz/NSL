@@ -65,11 +65,17 @@ pub const PLAN_BF16_SR: i64 = 1 << 1;
 /// It is tensor-granular sharded across ranks (`--zero-stage 3`) — the
 /// [`crate::zero`] broadcast backend.
 pub const PLAN_SHARDED: i64 = 1 << 2;
+/// Item 11: within the zero-3 backend, the parameter is ELEMENTWISE sharded
+/// (each rank persistently holds a 1/ws slice; gathers ride all_gather,
+/// gradients reduce_scatter, every rank steps its own slice). Only valid
+/// alongside [`PLAN_SHARDED`] — it refines the same backend, so `expected()`
+/// still maps it to the zero-3 table.
+pub const PLAN_ELEMENTWISE: i64 = 1 << 3;
 
 /// Every bit this ABI version defines. An unknown bit in a `declare` call
 /// means codegen and runtime disagree about the plan encoding; that is a
 /// build-integrity failure, not a recoverable condition.
-const PLAN_KNOWN_BITS: i64 = PLAN_STREAMED | PLAN_BF16_SR | PLAN_SHARDED;
+const PLAN_KNOWN_BITS: i64 = PLAN_STREAMED | PLAN_BF16_SR | PLAN_SHARDED | PLAN_ELEMENTWISE;
 
 #[derive(Clone, Copy)]
 struct Declared {
@@ -196,12 +202,23 @@ pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) 
     // and zero-3 residency are properties of *being registered* with a
     // backend. This is the compile-time invariant restated where a
     // hand-built CompileOptions caller can still trip it.
-    if flags & PLAN_STREAMED == 0 && flags & (PLAN_BF16_SR | PLAN_SHARDED) != 0 {
+    if flags & PLAN_STREAMED == 0 && flags & (PLAN_BF16_SR | PLAN_SHARDED | PLAN_ELEMENTWISE) != 0
+    {
         eprintln!(
             "[param-plan] FATAL: parameter {idx} declared with a storage mode \
              ({:#x}) but not STREAMED — bf16-sr and zero-3 residency only \
              exist for registered parameters",
-            flags & (PLAN_BF16_SR | PLAN_SHARDED)
+            flags & (PLAN_BF16_SR | PLAN_SHARDED | PLAN_ELEMENTWISE)
+        );
+        std::process::abort();
+    }
+    // Item 11: ELEMENTWISE refines the zero-3 backend — without SHARDED it
+    // names no backend at all.
+    if flags & PLAN_ELEMENTWISE != 0 && flags & PLAN_SHARDED == 0 {
+        eprintln!(
+            "[param-plan] FATAL: parameter {idx} declared ELEMENTWISE without \
+             SHARDED — elementwise sharding is a refinement of the zero-3 \
+             backend, not a backend"
         );
         std::process::abort();
     }
@@ -333,6 +350,11 @@ mod tests {
         assert_eq!(expected(PLAN_STREAMED), Observed::HostMirror);
         assert_eq!(expected(PLAN_STREAMED | PLAN_BF16_SR), Observed::Bf16Sr);
         assert_eq!(expected(PLAN_STREAMED | PLAN_SHARDED), Observed::Sharded);
+        // Item 11: elementwise refines the zero-3 backend — same table.
+        assert_eq!(
+            expected(PLAN_STREAMED | PLAN_SHARDED | PLAN_ELEMENTWISE),
+            Observed::Sharded
+        );
         // zero3 wins over srbf16, exactly as nsl_weight_stream_register does.
         // (The composition matrix refuses this pair at the CLI; the tie-break
         // is pinned anyway so the two chains cannot drift apart unnoticed.)

@@ -168,6 +168,65 @@ fn zero3_refuses_without_layerwise_schedule() {
     );
 }
 
+/// Item 11: `--zero-elementwise` on stages 1/2 would be an inert flag —
+/// refuse with the actionable message instead.
+#[test]
+fn zero_elementwise_requires_stage3() {
+    let tmp = std::env::temp_dir().join(format!("nsl_z3e_s1_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("e1.nslm");
+    let out = run_nsl_with_env(
+        &program(&save, false),
+        "elem_s1",
+        &["--zero-stage", "1", "--zero-elementwise"],
+        &[],
+        300,
+    );
+    assert!(!out.success, "stage 1 + elementwise ran:\n{}", out.stdout);
+    assert!(
+        out.stderr.contains("--zero-elementwise requires --zero-stage 3"),
+        "wrong refusal:\n{}",
+        out.stderr
+    );
+}
+
+/// Item 11: Muon needs whole matrices for Newton-Schulz — elementwise
+/// slices refuse it up front (gather-before-NS is the documented follow-up).
+#[test]
+fn zero_elementwise_refuses_muon() {
+    let tmp = std::env::temp_dir().join(format!("nsl_z3e_mu_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("mu.nslm");
+    let src = program(&save, false).replace(
+        "AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)",
+        "Muon(lr=0.002, momentum=0.95, nesterov=true, ns_steps=5, \
+         weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)",
+    );
+    let out = run_nsl_with_env(
+        &src,
+        "elem_muon",
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--weight-stream",
+            "--zero-stage",
+            "3",
+            "--devices",
+            "2",
+            "--zero-elementwise",
+        ],
+        &[],
+        300,
+    );
+    assert!(!out.success, "muon + elementwise ran:\n{}", out.stdout);
+    assert!(
+        out.stderr
+            .contains("--zero-elementwise requires the AdamW/Adam optimizer"),
+        "wrong refusal:\n{}",
+        out.stderr
+    );
+}
+
 /// Stage 4 does not exist.
 #[test]
 fn zero_stage_4_refuses() {
@@ -262,6 +321,139 @@ fn zero3_bit_exact_vs_single_rank_gpu() {
     let a = std::fs::read(&save_base).expect("baseline .nslm");
     let b = std::fs::read(&save_z3).expect("zero3 .nslm");
     assert_eq!(a, b, "model bytes diverged under zero3");
+}
+
+/// Item 11: rewrite the fixture's hidden dim 64 -> 63 so the model carries
+/// BOTH sharding modes at ws=2: the block norms (63 elems, odd) stay
+/// tensor-granular while w_up/w_down (63x128 = 8064) go elementwise —
+/// the mixed-mode plan is the production shape, not a corner case.
+fn oddify(src: String) -> String {
+    src.replace("ones([64])", "ones([63])")
+        .replace("randn([64, 128])", "randn([63, 128])")
+        .replace("randn([128, 64])", "randn([128, 63])")
+        .replace("randn([64, 64]) * 0.1", "randn([64, 63]) * 0.1")
+        .replace("reshape([batch_size, seq_len, 64])", "reshape([batch_size, seq_len, 63])")
+}
+
+/// Label-anchored counter field from a `[zero3] teardown:` or `[zero]` line.
+fn counter_field(line: &str, label: &str) -> Option<u64> {
+    line.split(&format!("{label}="))
+        .nth(1)?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Item 11 core parity gate: elementwise-sharded 2-rank training (sim-gpu)
+/// is BIT-IDENTICAL to the single-rank baseline of the same layerwise
+/// config — loss stream and saved bytes — and the elementwise machinery
+/// demonstrably ran: params carved, every-rank slice steps executed,
+/// gradients reduce_scattered (stage 3 never scatters on the
+/// tensor-granular path), gathers rode all_gather. The odd norms prove
+/// MIXED mode: granular gathers coexist (gathers > all_gather count).
+#[test]
+#[ignore = "requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)"]
+fn zero3_elementwise_bit_exact_vs_single_rank_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_z3e_bx_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let flags_common = [
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+    ];
+
+    let save_base = tmp.join("e_base.nslm");
+    let base = run_nsl_with_env(
+        &oddify(program(&save_base, true)),
+        "e_base",
+        &flags_common,
+        &[],
+        600,
+    );
+    assert!(base.success, "single-rank baseline failed:\n{}", base.stderr);
+    let base_losses = losses(&base.stdout);
+    assert!(!base_losses.is_empty(), "empty baseline stream");
+
+    let save_z3 = tmp.join("e_z3.nslm");
+    let mut z3_args: Vec<&str> = flags_common.to_vec();
+    z3_args.extend_from_slice(&[
+        "--zero-stage",
+        "3",
+        "--devices",
+        "2",
+        "--collectives",
+        "sim-gpu",
+        "--zero-elementwise",
+    ]);
+    let z3 = run_nsl_with_env(
+        &oddify(program(&save_z3, true)),
+        "e_z3",
+        &z3_args,
+        &[("NSL_ZERO_COUNTER", "1")],
+        900,
+    );
+    assert!(z3.success, "elementwise 2-rank run failed:\n{}", z3.stderr);
+
+    // Parity: rank-0 loss stream and saved model bytes.
+    assert_eq!(
+        base_losses,
+        losses(&z3.stdout),
+        "elementwise loss stream diverged from the single-rank baseline\nstderr:\n{}",
+        z3.stderr
+    );
+    let a = std::fs::read(&save_base).expect("baseline .nslm");
+    let b = std::fs::read(&save_z3).expect("elementwise .nslm");
+    assert_eq!(a, b, "model bytes diverged under elementwise zero3");
+
+    // Anti-vacuity, both directions:
+    assert!(
+        z3.stderr.contains("[zero3] elementwise sharding armed"),
+        "elementwise arming note missing:\n{}",
+        z3.stderr
+    );
+    let teardown = z3
+        .stderr
+        .lines()
+        .find(|l| l.contains("[zero3] teardown"))
+        .unwrap_or_else(|| panic!("no teardown line:\n{}", z3.stderr));
+    let elem_params = counter_field(teardown, "elem_params").expect("elem_params field");
+    let elem_steps = counter_field(teardown, "elem_steps").expect("elem_steps field");
+    // 2 blocks x (w_up, w_down) elementwise; the 63-elem norms are ragged
+    // and MUST stay tensor-granular (mixed mode is the property under test).
+    assert_eq!(
+        elem_params, 4,
+        "expected exactly the 4 even-sized matrices elementwise:\n{teardown}"
+    );
+    assert!(
+        elem_steps >= elem_params,
+        "elementwise steps never ran:\n{teardown}"
+    );
+    let gathers = counter_field(teardown, "gathers").expect("gathers field");
+
+    // The [zero] counter lines (one per rank): reduce_scatter and
+    // all_gather both nonzero on EVERY rank — and all_gather strictly
+    // below the total gather count, which proves granular (broadcast)
+    // gathers coexisted.
+    let zero_lines: Vec<&str> = z3
+        .stderr
+        .lines()
+        .filter(|l| l.starts_with("[zero] ws="))
+        .collect();
+    assert_eq!(zero_lines.len(), 2, "expected 2 rank counter lines:\n{}", z3.stderr);
+    let mut all_gather_total = 0;
+    for l in &zero_lines {
+        let rs = counter_field(l, "reduce_scatter").expect("reduce_scatter field");
+        let ag = counter_field(l, "all_gather").expect("all_gather field");
+        assert!(rs > 0, "stage-3 elementwise must reduce_scatter: {l}");
+        assert!(ag > 0, "elementwise gathers must ride all_gather: {l}");
+        all_gather_total = ag; // identical on both ranks (symmetric schedule)
+    }
+    assert!(
+        all_gather_total < gathers,
+        "no tensor-granular gathers — the mixed-mode arm went vacuous \
+         (all_gather={all_gather_total}, gathers={gathers})"
+    );
 }
 
 /// Compositions on the same parity bar:
