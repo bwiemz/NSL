@@ -24,7 +24,7 @@ m.to(cuda)
 print("CERT_MODEL_READY")
 
 let tokens = load_mmap("CERT_TOKENS_PATH", 3)
-let loader = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
+let loader = DataLoader(tokens, batch_size=1, seq_len=512, shuffle=false, drop_last=true)
 
 print("LOSS_STREAM_BEGIN")
 

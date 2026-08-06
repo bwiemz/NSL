@@ -106,7 +106,7 @@ def curve_delta(a: RunResult, b: RunResult) -> tuple[int, float, float]:
 SCALES = {
     # scale: (model dir, batch, seq, accum-in-program, per-micro budget s)
     "50m": ("coder50m", 1, 1024, 2, 4.0),
-    "500m": ("coder500m", 2, 512, 8, 10.0),
+    "500m": ("coder500m", 1, 512, 8, 10.0),
     "1b": ("coder1b", 1, 512, 8, 20.0),
 }
 
