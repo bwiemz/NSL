@@ -1277,7 +1277,21 @@ pub fn findings() -> Vec<BusFinding> {
 /// revisited; the exposure otherwise matches
 /// [`crate::pass_trace::stage_order_violation`]'s.
 pub fn dependency_order_violations() -> Vec<(&'static str, &'static str, Channel)> {
-    let seen = crate::pass_trace::observed();
+    dependency_order_violations_in(&crate::pass_trace::observed())
+}
+
+/// The shared core: `InvocationOrdered` edges inverted within `seen`, an
+/// invocation sequence in first-invocation order. Two callers, two scopes,
+/// ONE edge semantics: the process-global advisory above (its `seen` is
+/// [`crate::pass_trace::observed`], subject to the cross-compile caveat in
+/// its doc), and the per-compile ENFORCED check
+/// (`crate::pass_manager::PassManager::dependency_order_violations`, whose
+/// `seen` is one epoch's view and therefore refusable evidence). Splitting
+/// the core out is what keeps the two answers from drifting: a new edge or
+/// claim is judged identically by both.
+pub(crate) fn dependency_order_violations_in(
+    seen: &[&'static str],
+) -> Vec<(&'static str, &'static str, Channel)> {
     let pos = |p: &str| seen.iter().position(|s| *s == p);
     let mut v = Vec::new();
     for d in CHANNELS {

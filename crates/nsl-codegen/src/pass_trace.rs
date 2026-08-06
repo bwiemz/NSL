@@ -80,12 +80,68 @@
 //! PipelineStage`] partial order becomes checkable the moment a trace exists.
 
 use crate::pass_registry::CompilePhase;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Passes observed this compile, in first-invocation order, each tagged with
-/// the driver phase that was active when it was reached (`None` = the pass ran
-/// outside every declared phase — see [`enter_phase`]).
-static TRACE: Mutex<Vec<(&'static str, Option<CompilePhase>)>> = Mutex::new(Vec::new());
+/// Passes observed this PROCESS, in first-invocation order per compile scope,
+/// each tagged with the driver phase that was active when it was reached
+/// (`None` = the pass ran outside every declared phase — see [`enter_phase`])
+/// and the compile epoch it was reached in (see [`begin_epoch`]).
+///
+/// Process-facing readers ([`observed`], [`observed_phases`], the report)
+/// dedupe by name at first occurrence, which reproduces the pre-epoch
+/// semantics exactly: before epochs existed, `record` was idempotent
+/// process-wide, so only the first entry per name could exist at all.
+static TRACE: Mutex<Vec<(&'static str, Option<CompilePhase>, u64)>> = Mutex::new(Vec::new());
+
+/// Source of unique compile epochs. Global, not thread-local: two threads
+/// each compiling (parallel libtest binaries drive full compiles) must not
+/// mint the same epoch, or their per-compile views would merge — the exact
+/// cross-attribution the epoch exists to prevent.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+// The compile epoch currently attributing on this THREAD. 0 = no compile
+// scope installed (unit tests driving passes directly; the out-of-band CLI
+// subcommand drivers). Thread-local for the same reason CURRENT_PHASE is: a
+// compile never spans threads, and a process-global would let one thread's
+// compile claim another's pass invocations.
+thread_local! {
+    static CURRENT_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Begin a per-compile attribution scope on this thread: mint a fresh epoch,
+/// install it, and return `(new, previous)`. The caller is responsible for
+/// [`restore_epoch`]`(previous)` when its compile ends — in production that
+/// caller is exactly one place, `PassManager::begin` (RAII-restored on drop),
+/// so a nested compile (should one ever exist) re-attributes to its outer
+/// scope instead of leaking its own epoch over the outer compile's tail.
+pub(crate) fn begin_epoch() -> (u64, u64) {
+    let e = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    let prev = CURRENT_EPOCH.with(|c| c.replace(e));
+    (e, prev)
+}
+
+/// Restore the epoch that was active before [`begin_epoch`].
+pub(crate) fn restore_epoch(prev: u64) {
+    CURRENT_EPOCH.with(|c| c.set(prev));
+}
+
+/// The entries recorded under `epoch`, in first-invocation order — the
+/// per-compile view [`crate::pass_manager::PassManager`] decides from. This
+/// is the sound counterpart of [`observed`]: the process-global view is for
+/// REPORTING (where over-inclusion is a wording problem), the per-epoch view
+/// is for ENFORCEMENT (where over-inclusion is a false refusal — the #466
+/// lesson: per-compile ordering arguments over process-scoped state are
+/// defeated by multi-module builds).
+pub(crate) fn per_compile_view(epoch: u64) -> Vec<(&'static str, Option<CompilePhase>)> {
+    TRACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, _, e)| *e == epoch)
+        .map(|(p, ph, _)| (*p, *ph))
+        .collect()
+}
 
 // The phase currently executing, per THREAD.
 // 
@@ -121,9 +177,17 @@ pub fn enter_phase(phase: CompilePhase) -> PhaseGuard {
     PhaseGuard(CURRENT_PHASE.with(|c| c.replace(Some(phase))))
 }
 
-/// The phase each observed pass ran in.
+/// The phase each observed pass ran in — first occurrence per name, which is
+/// exactly what the pre-epoch process-wide idempotence produced.
 pub fn observed_phases() -> Vec<(&'static str, Option<CompilePhase>)> {
-    TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    let t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(&'static str, Option<CompilePhase>)> = Vec::new();
+    for (p, ph, _) in t.iter() {
+        if !out.iter().any(|(q, _)| q == p) {
+            out.push((*p, *ph));
+        }
+    }
+    out
 }
 
 /// Passes whose observed phase differs from the registry's declaration, as
@@ -230,9 +294,15 @@ pub fn record(pass: &'static str) {
          registry — add a PassDescriptor, or fix the name"
     );
     let phase = CURRENT_PHASE.with(|c| c.get());
+    let epoch = CURRENT_EPOCH.with(|c| c.get());
     let mut t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
-    if !t.iter().any(|(p, _)| *p == pass) {
-        t.push((pass, phase));
+    // Idempotent PER COMPILE EPOCH, not per process: a pass that runs again
+    // in a later compile of the same process (multi-module builds construct
+    // one Compiler per module) must appear in that compile's view, or the
+    // per-compile ordering authority would judge an incomplete sequence.
+    // Process-facing readers dedupe by name, so the report is unchanged.
+    if !t.iter().any(|(p, _, e)| *p == pass && *e == epoch) {
+        t.push((pass, phase, epoch));
     }
 }
 
@@ -268,10 +338,11 @@ pub fn record(pass: &'static str) {
 /// layer-decision count is superseded by `wggo_prune`'s tape-rewrite count.
 pub fn record_disposition(pass: &'static str, d: PassDisposition) {
     let entered = {
-        // TRACE holds (name, phase) pairs — match on the name only; the phase
-        // a pass was entered in has no bearing on whether it may report one.
+        // TRACE holds (name, phase, epoch) triples — match on the name only;
+        // neither the phase a pass was entered in nor the compile it was
+        // entered by has any bearing on whether it may report a disposition.
         let t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
-        t.iter().any(|(p, _)| *p == pass)
+        t.iter().any(|(p, _, _)| *p == pass)
     };
     assert!(
         entered,
@@ -287,14 +358,10 @@ pub fn record_disposition(pass: &'static str, d: PassDisposition) {
     }
 }
 
-/// The passes reached this compile, in first-invocation order.
+/// The passes reached this process, in first-invocation order — deduped by
+/// name, matching the pre-epoch semantics (see [`TRACE`]).
 pub fn observed() -> Vec<&'static str> {
-    TRACE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .map(|(p, _)| *p)
-        .collect()
+    observed_phases().into_iter().map(|(p, _)| p).collect()
 }
 
 /// What each pass that reported a disposition did, in first-disposition order.

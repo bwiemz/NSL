@@ -287,7 +287,19 @@ pub const PASSES: &[PassDescriptor] = &[
             f("wggo-weights", BR),
         ],
         stage: PipelineStage::OnWengert,
-        phases: &[CompilePhase::KernelPrepass],
+        // TWO phases, and the second is not theoretical: the prepass runs
+        // WGGO under KernelPrepass, but a train block whose pre-plan is
+        // missing or fingerprint-rejected re-invokes WGGO IN PLACE from the
+        // train-block driver (stmt.rs, the `reused_plan: None` arm). A block
+        // the prepass structurally cannot plan — a loop-bound model var,
+        // whose type only resolves once compile_for_model_array runs — hits
+        // that arm on EVERY compile, and WGGO's first record then lands in
+        // TrainBlock. Declaring only KernelPrepass survived as long as it
+        // did because `record` is idempotent and the prepass usually wins
+        // the first-invocation slot; the loop-bound fixture proved the
+        // declaration false (PHASE MISMATCH on a real compile).
+        // `pass_manager_gate.rs` pins the fix.
+        phases: &[CompilePhase::KernelPrepass, CompilePhase::TrainBlock],
         decorator_triggers: &["wggo", "wggo_target"],
         wiki: WikiCoverage::Documented("WGGO — Wengert Graph Global Optimization"),
     },

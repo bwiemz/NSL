@@ -5067,7 +5067,21 @@ impl Compiler<'_> {
         let result =
             self.compile_train_block_inner(builder, state, train, train_block_stmt_id);
         self.restore_active_fused_ce_config(saved_active_fused_ce);
-        result
+        result?;
+        // Item 2 step 6: the ordering decision, enforced. Every pass on a
+        // declared InvocationOrdered edge (CSHA, WRGA — both invoked inside
+        // the inner function) has run by now if it is going to, so the
+        // per-compile evidence is complete here and the check is decidable.
+        // The manager's view is THIS compile's epoch, which is what makes a
+        // refusal sound where the process-scoped advisory could not be (a
+        // multi-module build interleaves compiles; see pass_manager.rs).
+        // This single-exit wrapper is the enforcement point for the same
+        // reason it hosts the fused-CE save/restore: every early-return path
+        // of the inner function funnels through it.
+        self.passes
+            .enforce_dependency_order()
+            .map_err(CodegenError::new)?;
+        Ok(())
     }
 
     /// CFTP v10 (item 3): pulled out so `compile_train_block` can wrap it
