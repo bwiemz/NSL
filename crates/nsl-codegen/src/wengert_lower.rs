@@ -4028,17 +4028,35 @@ fn alloc_gpu_f32_tensor(
     Ok(gpu_tensor)
 }
 
-/// Emit the `@fused_lm_ce` shape-hint pin before a fused linear-CE FFI.
+/// Which decorator/tensor pair a hint pin protects. The discriminant is the
+/// `site_code` the runtime pin matches on — its diagnostics name the caller
+/// and the hint to fix, so the two lists must move together
+/// (`site_codes_agree_with_the_codegen_enum` in the runtime's
+/// `hint_extent_tests` pins the pairing).
+#[derive(Clone, Copy)]
+enum FusedCePinSite {
+    /// `@fused_lm_ce` (x, W) against `hidden_size`.
+    Lm = 0,
+    /// `@fused_kl_ce` student pair (x_s, W_s) against `hidden_size`.
+    KlStudent = 1,
+    /// `@fused_kl_ce` teacher pair (x_t, W_t) against `teacher_hidden`.
+    KlTeacher = 2,
+}
+
+/// Emit a fused-CE shape-hint pin before the FFIs that stride from hints.
 ///
-/// `vocab_size` / `hidden_size` are hand-written decorator literals that
-/// nothing derives from the model, and the kernels stride `x` as `[rows, h]`
-/// and `W` as `[v, h]` from those literals alone. Compare them against the
-/// tensors HERE, while the shapes still exist: the FFIs receive only
+/// The hidden/vocab hints are hand-written decorator literals that nothing
+/// derives from the model, and the kernels stride `x` as `[rows, h]` and `W`
+/// as `[v, h]` from those literals alone. Compare them against the tensors
+/// HERE, while the shapes still exist: the FFIs receive only
 /// `nsl_tensor_data_ptr` results, so there is nothing to check against down
 /// there. Sibling of the targets pin, which covers `batch_size * seq_len`.
 ///
 /// One helper rather than a copy at each lowering: this is a safety guard,
-/// and two call sites free to drift apart is how one of them ends up missing.
+/// and call sites free to drift apart is how one of them ends up missing —
+/// which is exactly how `@fused_kl_ce` shipped a release behind
+/// `@fused_lm_ce` on this same defect.
+#[allow(clippy::too_many_arguments)]
 fn emit_fused_lce_hint_pin(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
@@ -4048,16 +4066,18 @@ fn emit_fused_lce_hint_pin(
     seq_len: u32,
     vocab_size: u32,
     hidden_size: u32,
+    site: FusedCePinSite,
 ) -> Result<(), CodegenError> {
     let pin_b = builder.ins().iconst(cl_types::I64, batch_size as i64);
     let pin_s = builder.ins().iconst(cl_types::I64, seq_len as i64);
     let pin_v = builder.ins().iconst(cl_types::I64, vocab_size as i64);
     let pin_h = builder.ins().iconst(cl_types::I64, hidden_size as i64);
+    let pin_site = builder.ins().iconst(cl_types::I64, site as i64);
     let _ = call(
         compiler,
         builder,
         "nsl_fused_lce_pin_hint_extents",
-        &[x_t, w_t, pin_b, pin_s, pin_v, pin_h],
+        &[x_t, w_t, pin_b, pin_s, pin_v, pin_h, pin_site],
     )?;
     Ok(())
 }
@@ -4194,6 +4214,7 @@ fn lower_fused_linear_ce_forward(
         seq_len,
         vocab_size,
         hidden_size,
+        FusedCePinSite::Lm,
     )?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
@@ -4607,6 +4628,7 @@ fn lower_fused_linear_ce_backward_extract(
             seq_len,
             vocab_size,
             hidden_size,
+            FusedCePinSite::Lm,
         )?;
         let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
         let dx_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dx_out])?;
@@ -4807,15 +4829,15 @@ impl FusedKlCeLowerParams {
 /// (and fused linear-CE) lowerings so the scalar is dual-path compatible.
 ///
 /// inputs = [x_s, W_s, bias_s, x_t, W_t, bias_t, targets] (7).
-// TODO(fused-kl-ce): the `@fused_kl_ce` lowerings below carry the SAME
-// unpinned-hint hole `emit_fused_lce_hint_pin` closes for `@fused_lm_ce`.
-// `p.vocab_size` / `p.student_hidden` / `p.teacher_hidden` are hand-written
-// decorator literals that go straight into kernels which receive only
-// `nsl_tensor_data_ptr` results, and both call
-// `nsl_fused_lce_targets_i64_alloc` (so `rows` is pinned) but neither checks
-// the hidden/vocab extents. Deliberately out of scope here — different
-// decorator, and no production caller was measured — but the fix is the same
-// helper with the student/teacher tensors passed in.
+// `@fused_kl_ce` carries the same unpinned-hint hole `emit_fused_lce_hint_pin`
+// closes for `@fused_lm_ce`, twice over: `p.vocab_size` / `p.student_hidden` /
+// `p.teacher_hidden` are hand-written decorator literals that go straight into
+// kernels which receive only `nsl_tensor_data_ptr` results. Both lowerings
+// pin each (x, W) pair right after the targets pin — after, because `rows` is
+// an input to the pin's own diagnostics and must be validated first, the
+// ordering-equals-attribution finding from the `@fused_lm_ce` review. The
+// student and teacher pairs pin under DISTINCT site codes so a refusal names
+// the hint that is actually wrong (`hidden_size` vs `teacher_hidden`).
 fn lower_fused_kl_ce_forward(
     compiler: &mut crate::compiler::Compiler,
     builder: &mut FunctionBuilder,
@@ -4856,6 +4878,28 @@ fn lower_fused_kl_ce_forward(
         builder,
         "nsl_fused_lce_targets_i64_alloc",
         &[targets_t, expected_rows_v],
+    )?;
+    emit_fused_lce_hint_pin(
+        compiler,
+        builder,
+        xs_t,
+        ws_t,
+        p.batch_size,
+        p.seq_len,
+        p.vocab_size,
+        p.student_hidden,
+        FusedCePinSite::KlStudent,
+    )?;
+    emit_fused_lce_hint_pin(
+        compiler,
+        builder,
+        xt_t,
+        wt_t,
+        p.batch_size,
+        p.seq_len,
+        p.vocab_size,
+        p.teacher_hidden,
+        FusedCePinSite::KlTeacher,
     )?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1_out])?;
@@ -5029,6 +5073,28 @@ fn lower_fused_kl_ce_backward_extract(
             builder,
             "nsl_fused_lce_targets_i64_alloc",
             &[targets_t, expected_rows_v],
+        )?;
+        emit_fused_lce_hint_pin(
+            compiler,
+            builder,
+            xs_t,
+            ws_t,
+            p.batch_size,
+            p.seq_len,
+            p.vocab_size,
+            p.student_hidden,
+            FusedCePinSite::KlStudent,
+        )?;
+        emit_fused_lce_hint_pin(
+            compiler,
+            builder,
+            xt_t,
+            wt_t,
+            p.batch_size,
+            p.seq_len,
+            p.vocab_size,
+            p.teacher_hidden,
+            FusedCePinSite::KlTeacher,
         )?;
         let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1])?;
         let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st])?;
