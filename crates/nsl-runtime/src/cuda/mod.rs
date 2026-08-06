@@ -7524,12 +7524,9 @@ pub(crate) fn upload_meta_i64_cached(host: *const i64, ndim: usize) -> *mut std:
     }
     let bytes = ndim * std::mem::size_of::<i64>();
     let dev = {
-        use crate::cuda::caching_allocator::{get_alloc_pool, set_alloc_pool, AllocPool};
-        let prev = get_alloc_pool();
-        set_alloc_pool(AllocPool::Persistent);
-        let p = inner::alloc_managed(bytes);
-        set_alloc_pool(prev);
-        p
+        use crate::cuda::caching_allocator::{AllocPool, PoolGuard};
+        let _pool = PoolGuard::new(AllocPool::Persistent);
+        inner::alloc_managed(bytes)
     };
     // Immediate, NOT `memcpy_htod`: a capture region would defer this to graph
     // launch and the cache would publish a pointer to unwritten memory. See

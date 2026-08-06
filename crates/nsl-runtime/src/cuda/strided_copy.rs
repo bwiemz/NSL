@@ -516,12 +516,9 @@ pub(crate) fn resident_plan(
     }).map(|plan| {
         let bytes = std::mem::size_of_val(&plan.src_offsets[..]);
         let dev = {
-            use super::caching_allocator::{get_alloc_pool, set_alloc_pool, AllocPool};
-            let prev = get_alloc_pool();
-            set_alloc_pool(AllocPool::Persistent);
-            let p = super::inner::alloc_managed(bytes);
-            set_alloc_pool(prev);
-            p
+            use super::caching_allocator::{AllocPool, PoolGuard};
+            let _pool = PoolGuard::new(AllocPool::Persistent);
+            super::inner::alloc_managed(bytes)
         };
         // Immediate, not stream-ordered: under CUDA-graph capture a deferred
         // copy would publish a pointer to unwritten memory (same reasoning as

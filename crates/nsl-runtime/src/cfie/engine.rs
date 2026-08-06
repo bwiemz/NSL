@@ -300,11 +300,11 @@ pub extern "C" fn nsl_cfie_kv_pool_alloc(bytes: i64) -> i64 {
                 return -1;
             }
         }
-        use crate::cuda::caching_allocator::{get_alloc_pool, set_alloc_pool, AllocPool};
-        let prev = get_alloc_pool();
-        set_alloc_pool(AllocPool::Persistent);
-        let ptr = crate::cuda::inner::alloc_managed(bytes as usize);
-        set_alloc_pool(prev);
+        use crate::cuda::caching_allocator::{AllocPool, PoolGuard};
+        let ptr = {
+            let _pool = PoolGuard::new(AllocPool::Persistent);
+            crate::cuda::inner::alloc_managed(bytes as usize)
+        };
         if ptr.is_null() {
             return -1;
         }
@@ -533,12 +533,9 @@ fn free_weight_allocs(g: &mut EngineState) {
 /// panics on real OOM, matching `nsl_cfie_kv_pool_alloc`).
 #[cfg(feature = "cuda")]
 fn alloc_persistent(bytes: usize) -> *mut c_void {
-    use crate::cuda::caching_allocator::{get_alloc_pool, set_alloc_pool, AllocPool};
-    let prev = get_alloc_pool();
-    set_alloc_pool(AllocPool::Persistent);
-    let ptr = crate::cuda::inner::alloc_managed(bytes);
-    set_alloc_pool(prev);
-    ptr
+    use crate::cuda::caching_allocator::{AllocPool, PoolGuard};
+    let _pool = PoolGuard::new(AllocPool::Persistent);
+    crate::cuda::inner::alloc_managed(bytes)
 }
 
 /// Byte count for a weight upload of `n_elems` f32 read from host.
