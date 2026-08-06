@@ -169,6 +169,12 @@ def main() -> None:
     # run_arm writes under p0's LOGS constant — repoint it at ours.
     import p0_campaign as p0
 
+    # Per-SCALE log namespace: arm names carry only tag+seed, so without
+    # this a 1b run overwrites a 500m run's per-arm dirs and summary (it
+    # did, on 2026-08-06 — the 500m-synthetic stderr logs were lost and
+    # only the captured stdout tables survive).
+    global LOGS
+    LOGS = LOGS / args.scale
     p0.LOGS = LOGS
     LOGS.mkdir(parents=True, exist_ok=True)
 
