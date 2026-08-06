@@ -8228,14 +8228,21 @@ impl Compiler<'_> {
                             }
                             self.bus.publish_csha_bridge(bridge_out);
                             for d in diags { eprintln!("warning: {d}"); }
-                            // A.2.1d: record the Wengert op indices CSHA
-                            // has claimed across all boundary chains so
+                            // A.2.1d: record the Wengert OpIds CSHA has
+                            // claimed across all boundary chains so
                             // downstream passes (A.2.2 RMSNorm prologue,
                             // A.2.3 matmul projection, A.2.4 RoPE
                             // epilogue) can ask `is_csha_claimed(op)`
-                            // before emitting a redundant launch.
+                            // before emitting a redundant launch. The list
+                            // argument is the id-space conversion boundary:
+                            // chain fields are positions in the scanned
+                            // list, and positions stop equaling ids the
+                            // moment any earlier prune deleted an op.
                             self.bus.publish_csha_claimed_ops(
-                                crate::csha_apply::collect_claimed_ops(&plan),
+                                crate::csha_apply::collect_claimed_ops(
+                                    &plan,
+                                    extractor.wengert_list(),
+                                ),
                             );
                             // T7.1 / Gap D.1: build the chain-level dispatch
                             // map for the AD reverse walk. Gap D.1 passes the

@@ -424,21 +424,48 @@ pub struct CshaSavePointers {
 // Bridge
 // ---------------------------------------------------------------------------
 
-/// A.2.1d: collect the Wengert op indices claimed by every boundary
+/// A.2.1d: collect the Wengert **OpIds** claimed by every boundary
 /// chain in `plan` — RMSNorm prologue, Q/K/V projection matmul, and
 /// (optional) RoPE epilogue. Returned set is what
 /// `bus.csha_claimed_ops` is populated from at the same stmt.rs
 /// hook that publishes `bus.csha_bridge`.
 ///
+/// `wengert` must be the SAME list state the boundary scan ran on: the
+/// chain fields are positional indices, valid only against that state,
+/// and this function is the boundary where they convert to id-space —
+/// every consumer of a claim set compares against `op.id`
+/// (`source_ad`'s reverse walk, `wengert_lower`'s fused-forward lookup,
+/// CCR's exemption test at `claimed.contains(&op.id)`). Positions and
+/// ids agree only while `op.id == index`, which the fused-LCE prune
+/// breaks BEFORE this scan on any `@fused_lm_ce` build — publishing raw
+/// positions there mis-keys every claim.
+///
 /// Factored as a free function so the population logic is pure and
 /// directly unit-testable without constructing a full `Compiler`.
-pub fn collect_claimed_ops(plan: &CshaPlan) -> std::collections::HashSet<u32> {
+pub fn collect_claimed_ops(
+    plan: &CshaPlan,
+    wengert: &crate::wengert::WengertList,
+) -> std::collections::HashSet<u32> {
+    let id_of = |pos: u32| -> u32 {
+        wengert
+            .ops
+            .get(pos as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "boundary-chain position {pos} is out of bounds for the \
+                     scanned list ({} ops) — the claim set is being built \
+                     against a different tape state than the scan ran on",
+                    wengert.ops.len()
+                )
+            })
+            .id
+    };
     let mut out = std::collections::HashSet::new();
     for chain in &plan.boundary.chains {
-        out.insert(chain.norm_op);
-        out.insert(chain.matmul_op);
+        out.insert(id_of(chain.norm_op));
+        out.insert(id_of(chain.matmul_op));
         if let Some(rope_op) = chain.rope_op {
-            out.insert(rope_op);
+            out.insert(id_of(rope_op));
         }
     }
     out
@@ -598,19 +625,43 @@ pub fn collect_chain_dispatch_map_with_wengert(
             // primary, Q/K/V norm+matmul+rope are secondary.
             let chain_idx = chain_marks.len();
 
+            // The chain fields are POSITIONS in the scanned list; the map's
+            // keys are consumed against `op.id` (`source_ad` reverse walk,
+            // `wengert_lower` fused-forward lookup, CCR's exemption test).
+            // Convert here — the id-space boundary — because the two spaces
+            // agree only while `op.id == index`, and the fused-LCE prune
+            // deletes without renumbering BEFORE this scan on any
+            // `@fused_lm_ce` build. (The positional VarId lookups below are
+            // fine as-is: they dereference the same list state the scan
+            // captured positions from.)
+            let id_of = |pos: u32| -> u32 {
+                w.ops
+                    .get(pos as usize)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "boundary-chain position {pos} is out of bounds \
+                             for the scanned list ({} ops) — the dispatch \
+                             map is being built against a different tape \
+                             state than the scan ran on",
+                            w.ops.len()
+                        )
+                    })
+                    .id
+            };
+
             // Map SDPA first so it's the primary EmitFused target when
             // walked in reverse. Every other op in the chain maps to
             // the same idx → AlreadyEmitted on subsequent visits.
-            op_to_chain.insert(sdpa_op, chain_idx);
+            op_to_chain.insert(id_of(sdpa_op), chain_idx);
 
             // Per-chain secondary ops: norm (shared across chains, inserted
             // once), matmul, rope (when present).
             let norm_op = qc.norm_op;
-            op_to_chain.insert(norm_op, chain_idx);
+            op_to_chain.insert(id_of(norm_op), chain_idx);
             for c in [qc, kc, vc] {
-                op_to_chain.insert(c.matmul_op, chain_idx);
+                op_to_chain.insert(id_of(c.matmul_op), chain_idx);
                 if let Some(rope) = c.rope_op {
-                    op_to_chain.insert(rope, chain_idx);
+                    op_to_chain.insert(id_of(rope), chain_idx);
                 }
             }
 
@@ -741,12 +792,35 @@ pub fn collect_chain_dispatch_map_with_wengert(
             // available) → emit a mark per chain. This preserves the
             // pre-Gap-D.1 behavior for structural tests and any Wengert
             // topology that doesn't include the fused SDPA primitive.
+            //
+            // Same id-space conversion as the grouped path when the list
+            // is available. When it is NOT (`wengert: None` — the one-arg
+            // back-compat helper, structural tests only; the production
+            // call site always supplies it), positions pass through
+            // unconverted: those synthetic tapes are built with
+            // `op.id == index` and never pruned, so the two spaces agree.
             for chain in chains {
                 let chain_idx = chain_marks.len();
-                op_to_chain.insert(chain.norm_op, chain_idx);
-                op_to_chain.insert(chain.matmul_op, chain_idx);
+                let key_of = |pos: u32| -> u32 {
+                    match wengert {
+                        Some(w) => w
+                            .ops
+                            .get(pos as usize)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "boundary-chain position {pos} is out of \
+                                     bounds for the scanned list ({} ops)",
+                                    w.ops.len()
+                                )
+                            })
+                            .id,
+                        None => pos,
+                    }
+                };
+                op_to_chain.insert(key_of(chain.norm_op), chain_idx);
+                op_to_chain.insert(key_of(chain.matmul_op), chain_idx);
                 if let Some(rope_op) = chain.rope_op {
-                    op_to_chain.insert(rope_op, chain_idx);
+                    op_to_chain.insert(key_of(rope_op), chain_idx);
                 }
 
                 let per_kind_config = bridge_result
@@ -1215,9 +1289,12 @@ mod tests {
         //   op 9 — Matmul (V)    ← no RoPE consumer
         //
         // Claimed set must contain {1, 3, 4, 6, 7, 9} — three matmuls,
-        // two RoPEs, one shared RMSNorm; exactly six entries.
+        // two RoPEs, one shared RMSNorm; exactly six entries. (On this
+        // synthetic list `op.id == index`, so the id-space conversion is
+        // the identity here; `claims_are_op_ids_not_positions` is the test
+        // where the two spaces differ.)
         let plan = toy_plan(CshaMode::Auto);
-        let claimed = collect_claimed_ops(&plan);
+        let claimed = collect_claimed_ops(&plan, &attn_wengert());
         assert_eq!(claimed.len(), 6, "got {:?}", claimed);
         assert!(claimed.contains(&1), "RMSNorm op missing");
         assert!(claimed.contains(&3), "Q matmul missing");
@@ -1236,7 +1313,7 @@ mod tests {
     #[test]
     fn a21d_collect_claimed_ops_empty_when_csha_off() {
         let plan = toy_plan(CshaMode::Off);
-        let claimed = collect_claimed_ops(&plan);
+        let claimed = collect_claimed_ops(&plan, &attn_wengert());
         assert!(
             claimed.is_empty(),
             "Off mode must produce no claimed ops; got {:?}",

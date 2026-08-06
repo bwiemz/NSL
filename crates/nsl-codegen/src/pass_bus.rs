@@ -157,7 +157,7 @@ pub enum Channel {
     /// CSHA's per-layer bridge result: which layers were claimed and the
     /// `CshaExtras` each FlashAttention launch needs.
     CshaBridge,
-    /// The Wengert op indices CSHA claimed, so op lowering can skip emitting a
+    /// The Wengert OpIds CSHA claimed, so op lowering can skip emitting a
     /// redundant launch for an op the fused kernel already covers.
     CshaClaimedOps,
     /// The chain-level dispatch map the source-AD reverse walk uses to route
@@ -948,7 +948,8 @@ impl PassBus {
 
     // ── CSHA claimed ops ─────────────────────────────────────────────
 
-    /// Publish the Wengert op indices CSHA claimed.
+    /// Publish the Wengert OpIds CSHA claimed (converted from boundary-chain
+    /// positions at `collect_claimed_ops` — the id-space boundary).
     ///
     /// An EMPTY set is not counted as a publish. "CSHA claimed no ops" is the
     /// absence of a claim, not a claim of nothing, and the two must not read

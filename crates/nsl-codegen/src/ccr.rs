@@ -1226,7 +1226,15 @@ pub fn append_compressed_saves(
     for &v in &plan.compress {
         let half = *fresh;
         *fresh += 1;
-        let id = primal.ops.len() as u32;
+        // fresh_op_id, NOT ops.len(): the primal reaching this point has
+        // been through deletions (the fused-LCE prune, WGGO's sub-block
+        // prune) that do not renumber, so len sits BELOW the surviving max
+        // id and a len-minted id collides with a live op — at which point
+        // the id-keyed claim tables (CSHA's dispatch map, CCR's own
+        // exemption set) can match the appended cast instead of the op
+        // they claimed. Uniqueness is re-asserted at the end of this
+        // function.
+        let id = primal.fresh_op_id();
         primal.ops.push(WengertOp {
             id,
             result: half,
@@ -1241,7 +1249,7 @@ pub fn append_compressed_saves(
         }
         let free_result = *fresh;
         *fresh += 1;
-        let id = primal.ops.len() as u32;
+        let id = primal.fresh_op_id();
         primal.ops.push(WengertOp {
             id,
             result: free_result,
@@ -1252,6 +1260,7 @@ pub fn append_compressed_saves(
         });
         map.insert(v, half);
     }
+    primal.assert_unique_op_ids("ccr::append_compressed_saves");
     map
 }
 
