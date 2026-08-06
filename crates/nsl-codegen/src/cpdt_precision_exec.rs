@@ -49,14 +49,39 @@ pub fn dtype_for_precision_full(p: OptimPrecision) -> u16 {
 /// Find the precision for a param path. Matches CPDT plan names against the
 /// codegen path with light normalization: exact match, or a trailing
 /// `.weight`/`.bias` stripped from either side. Unmatched -> None.
+fn name_matches_path(name: &str, path: &str) -> bool {
+    name == path
+        || name.strip_suffix(".weight").map(|s| s == path).unwrap_or(false)
+        || name.strip_suffix(".bias").map(|s| s == path).unwrap_or(false)
+        || path.strip_suffix(".weight").map(|s| s == name).unwrap_or(false)
+        || path.strip_suffix(".bias").map(|s| s == name).unwrap_or(false)
+}
+
 fn precision_for_path<'a>(plan: &'a PrecisionPlan, path: &str) -> Option<&'a ParamPrecision> {
-    plan.params.iter().find(|p| {
-        p.name == path
-            || p.name.strip_suffix(".weight").map(|s| s == path).unwrap_or(false)
-            || p.name.strip_suffix(".bias").map(|s| s == path).unwrap_or(false)
-            || path.strip_suffix(".weight").map(|s| s == p.name).unwrap_or(false)
-            || path.strip_suffix(".bias").map(|s| s == p.name).unwrap_or(false)
-    })
+    // Exact spelling first, then with the LEADING MODEL-VARIABLE SEGMENT
+    // stripped. `param_paths` are enumerated as `<model var>.<field path>`
+    // (`enumerate_model_tensor_paths`: `m.blocks.0.w`), while the plan's
+    // names come from the weight file's keys, which carry no variable
+    // prefix (`blocks.0.w`) — so the exact match alone joined NOTHING on
+    // any real model, and every moment silently stayed F32 via the
+    // unmatched-path fallback below. The WGGO-side join
+    // (`build_dtype_lists_from_overrides`) handles the identical mismatch
+    // via `wggo_graph::layer_prefix`; this is the same accommodation for
+    // the per-param plan. One segment only: stripping repeatedly would let
+    // `blocks.0.w` on some sibling container match a plan entry for a
+    // different parameter.
+    //
+    // Residual gaps, recorded rather than silently carried: (a) a plan name
+    // that itself carries a prefix (HF-style `model.blocks.0.w`) still
+    // falls to F32 — the strip applies to the PATH only, never the name;
+    // (b) two model variables joined against one weights file both strip
+    // to the same keys, so the second silently inherits the first's
+    // decisions — the same property as the WGGO-side layer_prefix join.
+    if let Some(pp) = plan.params.iter().find(|p| name_matches_path(&p.name, path)) {
+        return Some(pp);
+    }
+    let stripped = path.split_once('.').map(|(_, rest)| rest)?;
+    plan.params.iter().find(|p| name_matches_path(&p.name, stripped))
 }
 
 /// Build (m_dtype_codes, v_dtype_codes) in `param_paths` order. Each code is
