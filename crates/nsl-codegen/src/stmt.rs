@@ -149,6 +149,16 @@ fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> b
 ///
 /// No-op when `compiler.cpdt_mode == CpdtMode::Off` or when no cluster is
 /// configured.
+/// The staleness-refusal test knob, parsed in ONE place: both the
+/// pre-plan-path re-arbitration and the weights-only re-check honor it,
+/// and a drifted parse between the two arms would make one refusal
+/// gate-testable and the other silently not.
+fn cpdt_forced_stale_plan() -> bool {
+    std::env::var("NSL_CPDT_FORCE_STALE_PLAN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 pub(crate) fn invoke_cpdt_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     applied_plan: Option<&crate::wggo_apply::AppliedPlan>,
@@ -273,17 +283,34 @@ pub(crate) fn invoke_cpdt_if_enabled(
         wggo_recommended_shard: overrides.as_ref().and_then(|o| o.min_shard_factor()),
     };
 
-    let plan = cpdt_run(input);
+    let mut plan = cpdt_run(input);
+    plan.planned_without_wggo = applied_plan.is_none();
 
-    // Say which capacity CPDT planned in. The precision half is fully valid
-    // (it never reads the applied plan); the ZeRO/comm halves ran over an
-    // empty cost model and their numbers describe a zero-size model.
+    // Say which capacity CPDT planned in. The precision half, when one was
+    // built at all, is fully valid (it never reads the applied plan); the
+    // ZeRO/comm halves ran over an empty cost model and their numbers
+    // describe a zero-size model. Do not claim a weight-derived precision
+    // plan on configurations that build none (zero_only mode, or the
+    // @cpdt(weight_aware=false) opt-out) — the review caught the first
+    // wording overclaiming exactly that.
     if applied_plan.is_none() {
-        eprintln!(
-            "[cpdt] planned without a WGGO plan for this block (weights-only): \
-             optimizer-moment precision derives from the weight map; the \
-             ZeRO/comm halves saw an empty cost model."
-        );
+        if compiler.cpdt_mode == CpdtMode::Full && weights_present {
+            eprintln!(
+                "[cpdt] planned without a WGGO plan for this block \
+                 (weights-only): optimizer-moment precision derives from \
+                 the weight map; the ZeRO/comm halves saw an empty cost \
+                 model."
+            );
+        } else {
+            eprintln!(
+                "[cpdt] planned without a WGGO plan for this block: the \
+                 ZeRO/comm halves saw an empty cost model, and this \
+                 configuration builds no per-param precision plan (mode \
+                 {} / weight-aware {}).",
+                compiler.cpdt_mode.as_str(),
+                compiler.cpdt_weight_aware,
+            );
+        }
     }
 
     // Tier-agreement diagnostic requires a populated precision plan, which
@@ -5017,6 +5044,15 @@ impl Compiler<'_> {
                      pipelined train path (@pipeline). Drop one",
                 ));
             }
+            // The pipelined path returns before the pre-plan/weights-only
+            // offer below, so clear the channels it will never install —
+            // the enforcement argument on cpdt_plan ("every consult read
+            // follows a same-block publish") must not rest on the accident
+            // that this path has no consult today; a stale previous block's
+            // plan surviving into it would be exactly the leak the wrapper
+            // exists to prevent.
+            self.bus.clear_wggo_overrides();
+            self.bus.clear_cpdt_plan();
             return self.compile_train_block_pipelined(
                 builder,
                 state,
@@ -6165,6 +6201,34 @@ impl Compiler<'_> {
                     .unwrap_or(false);
                 let cpdt_lists = if active {
                     let plan = plan.unwrap();
+                    // Wrong-checkpoint backstop (review finding on the
+                    // weights-only path): `cpdt_sensitivity::validate` needs
+                    // an AppliedPlan and so cannot run when the offer was
+                    // weights-only — a checkpoint naming a DIFFERENT model
+                    // would otherwise reach here and report "active: 0
+                    // moment buffer(s)", activation with no effect, the
+                    // exact shape the join defect had. A non-empty
+                    // precision plan whose names join ZERO of this block's
+                    // params is certainly wrong; refuse it. (Partial joins
+                    // are the join's documented residual gaps and are not
+                    // judged here; the WGGO-path validate, when it runs,
+                    // still checks the stronger every-layer property.)
+                    if crate::cpdt_precision_exec::joined_param_count(
+                        &plan.precision,
+                        &param_paths,
+                    ) == 0
+                    {
+                        return Err(CodegenError::new(
+                            "--cpdt full derived a per-param precision plan \
+                             from the weight map, but none of its parameter \
+                             names join this train block's parameters — \
+                             either the weight file describes a different \
+                             model, or the parameter paths nest deeper than \
+                             the join's one-segment strip accommodates (a \
+                             recorded join limitation). Pass the checkpoint \
+                             for THIS model, or drop --cpdt.",
+                        ));
+                    }
                     Some(crate::cpdt_precision_exec::build_dtype_lists(
                         &plan.precision,
                         &param_paths,
@@ -8487,9 +8551,7 @@ impl Compiler<'_> {
                     // NSL_WGGO_FORCE_STALE_TABLE: force the divergence arm so
                     // the refusal is gate-testable without engineering a real
                     // fingerprint drift.
-                    let forced_stale_plan = std::env::var("NSL_CPDT_FORCE_STALE_PLAN")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
+                    let forced_stale_plan = crate::stmt::cpdt_forced_stale_plan();
                     match (&cpdt_moment_lists_consumed, &fresh_lists) {
                         (Some(consumed), fresh)
                             if fresh.as_ref() != Some(consumed) || forced_stale_plan =>
@@ -8514,6 +8576,16 @@ impl Compiler<'_> {
                                  the current graph, or drop --cpdt / \
                                  --wggo-moment-precision for this block."
                             } else {
+                                // Remedy check (review finding 3): the two
+                                // advised here are each FOLLOWABLE — dropping
+                                // --wggo removes the in-place plan so the
+                                // weights-only offer IS the final
+                                // arbitration, and dropping --cpdt removes
+                                // the offer. Do NOT advise dropping
+                                // --wggo-moment-precision: without it a real
+                                // divergence arbitrates to NotLoweredNoOptIn
+                                // (fresh = None ≠ consumed), so that advice
+                                // could never resolve the refusal.
                                 "the optimizer moments were typed from the \
                                  weights-only CPDT offer made before this \
                                  block's in-place WGGO plan existed, and \
@@ -8521,9 +8593,10 @@ impl Compiler<'_> {
                                  now sees WGGO's moment-bit decisions) \
                                  DISAGREES with the allocated moment dtypes — \
                                  refusing to execute a stale precision plan. \
-                                 Drop --wggo-moment-precision for this block \
-                                 so the weights-only offer is the final \
-                                 arbitration, or drop --cpdt."
+                                 This block's precision cannot be settled \
+                                 before its in-place WGGO plan exists: drop \
+                                 --wggo so the weights-only offer is the \
+                                 final arbitration, or drop --cpdt."
                             }));
                         }
                         (None, Some(_)) => {
@@ -8607,9 +8680,7 @@ impl Compiler<'_> {
                             MPA::NotLoweredNoOptIn | MPA::Inactive => None,
                         }
                     };
-                    let forced_stale_plan = std::env::var("NSL_CPDT_FORCE_STALE_PLAN")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
+                    let forced_stale_plan = crate::stmt::cpdt_forced_stale_plan();
                     if fresh_weights_only.as_ref() != Some(consumed) || forced_stale_plan {
                         return Err(CodegenError::new(
                             "the optimizer moments were typed from the \
@@ -8623,22 +8694,47 @@ impl Compiler<'_> {
                 } else if self.cpdt_mode != crate::cpdt::CpdtMode::Off
                     && self.cpdt_cluster.is_some()
                 {
-                    // CPDT was requested and DID plan (weights-only, at the
-                    // pre-body offer), but arbitration lowered nothing: the
-                    // precision plan was empty (zero_only mode, no weight
-                    // map, or no sub-32 decisions) or the FASE-Deferred
-                    // envelope is absent (grad accumulation < 2). Say so —
-                    // the pre-#470 wording claimed CPDT "requires a WGGO
-                    // plan", which stopped being true when the weights-only
-                    // offer landed.
-                    eprintln!(
-                        "[cpdt] optimizer-moment precision not active for \
-                         this block (planned weights-only; no WGGO plan): \
-                         arbitration lowered nothing. Check --cpdt full, \
-                         --weights, and grad accumulation >= 2 \
-                         (FASE-Deferred). No CPDT decisions apply to this \
-                         block."
-                    );
+                    // CPDT was requested but nothing lowered. Name the real
+                    // provenance (review findings: the first wording said
+                    // "planned weights-only" on a path where the plan came
+                    // from a pre-plan offer, and claimed planning happened
+                    // on feature-off builds where the bridge no-ops).
+                    if !cfg!(feature = "experimental-cpdt") {
+                        eprintln!(
+                            "[cpdt] requested, but this build omits the \
+                             experimental-cpdt feature — no planning ran. \
+                             No CPDT decisions apply to this block."
+                        );
+                    } else if wggo_preplan_offered {
+                        // Reachable: pre-plan offered, fingerprint rejected,
+                        // in-place replan produced no plan, and the consult
+                        // consumed nothing (e.g. the pre-plan's moment bits
+                        // arbitrated to NotLoweredNoOptIn).
+                        eprintln!(
+                            "[cpdt] optimizer-moment precision not active \
+                             for this block (planned from the WGGO pre-plan \
+                             offer; the fingerprint rejected it and the \
+                             in-place replan produced no plan): arbitration \
+                             lowered nothing. No CPDT decisions apply to \
+                             this block."
+                        );
+                    } else {
+                        // The weights-only offer ran and arbitration
+                        // lowered nothing: empty precision plan (zero_only
+                        // mode, weight-aware opt-out, no sub-32 decisions)
+                        // or no FASE-Deferred envelope (grad accumulation
+                        // < 2). The pre-#470 wording claimed CPDT
+                        // "requires a WGGO plan", which stopped being true
+                        // when the weights-only offer landed.
+                        eprintln!(
+                            "[cpdt] optimizer-moment precision not active \
+                             for this block (planned weights-only; no WGGO \
+                             plan): arbitration lowered nothing. Check \
+                             --cpdt full, --weights, and grad accumulation \
+                             >= 2 (FASE-Deferred). No CPDT decisions apply \
+                             to this block."
+                        );
+                    }
                 }
                 // Task 6: render any override-rejected diagnostics to stderr so
                 // the Phase 3 decision explainer and the user can see which

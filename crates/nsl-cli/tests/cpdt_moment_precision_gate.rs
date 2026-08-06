@@ -182,6 +182,61 @@ fn loop_fixture() -> PathBuf {
         .join("crates/nsl-codegen/tests/fixtures/cpdt_precision_fp16_loop.nsl")
 }
 
+/// The weights-only path cannot run `cpdt_sensitivity::validate` (there is
+/// no AppliedPlan to check the WeightMap against), so a checkpoint naming a
+/// DIFFERENT model used to sail through as "active: 0 moment buffer(s)" —
+/// activation with no effect, the exact shape the join defect had (this
+/// file's module doc calls it defect 2). The consult now refuses a
+/// non-empty precision plan that joins zero of the block's params.
+#[test]
+fn a_wrong_checkpoint_refuses_instead_of_activating_nothing() {
+    use safetensors::tensor::{serialize, TensorView};
+    use safetensors::Dtype;
+    use std::collections::HashMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let wrong = tmp.path().join("wrong_model.safetensors");
+    // Names that join NOTHING in the fixture's model (embed/blocks.N.w/
+    // final_norm), with values in the Medium-tier range so the plan is
+    // non-empty and carries sub-32 decisions — the maximally-misleading
+    // wrong checkpoint.
+    let mut raw: HashMap<String, Vec<u8>> = HashMap::new();
+    for name in ["foo.0.w", "foo.1.w"] {
+        raw.insert(
+            name.to_string(),
+            (0..64 * 64).flat_map(|_| 1e-4_f32.to_le_bytes()).collect(),
+        );
+    }
+    let views: HashMap<String, TensorView<'_>> = raw
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                TensorView::new(Dtype::F32, vec![64, 64], v.as_slice()).unwrap(),
+            )
+        })
+        .collect();
+    std::fs::write(&wrong, serialize(&views, &None).unwrap()).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+    cmd.arg("run")
+        .arg(fixture())
+        .arg("--source-ad")
+        .arg("--weights")
+        .arg(&wrong)
+        .arg("--cpdt")
+        .arg("full")
+        .arg("--cpdt-num-gpus")
+        .arg("2");
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "none of its parameter names join this train block's parameters",
+        ))
+        .stderr(predicate::str::contains("0 moment buffer(s)").not());
+}
+
 /// The structural case the weights-only offer exists for: a train block whose
 /// model variable is LOOP-BOUND (a `for` over a fixed model array), which the
 /// WGGO prepass cannot type — so no pre-plan can ever exist. Before the
@@ -279,6 +334,35 @@ fn a_distill_block_plans_weights_only_but_stays_fp32_without_the_envelope() {
             "arbitration lowered nothing",
         ))
         .stderr(predicate::str::contains("optimizer-moment precision active").not());
+}
+
+/// `--cpdt-report` on a weights-only build must not present zero-model
+/// shard math as a recommendation: the ZeRO section's numbers describe an
+/// empty cost model (0.00 GB per GPU), and pre-caveat they rendered
+/// exactly like a real plan. The NOTE sits between the Mode line and the
+/// numbers it disclaims.
+#[test]
+fn the_report_caveats_the_zero_model_zero_halves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+    cmd.current_dir(tmp.path());
+    cmd.arg("build")
+        .arg(fixture())
+        .arg("--source-ad")
+        .arg("--weights")
+        .arg(weights())
+        .arg("--cpdt")
+        .arg("full")
+        .arg("--cpdt-num-gpus")
+        .arg("2")
+        .arg("--cpdt-report");
+    cmd.assert().success().stdout(
+        predicate::str::contains(
+            "NOTE: planned without a WGGO plan (weights-only).",
+        )
+        .and(predicate::str::contains("=== CPDT Training Plan ===")),
+    );
 }
 
 /// The FP16 moments must CHANGE training — activation without effect is

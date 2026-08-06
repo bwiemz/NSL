@@ -82,6 +82,13 @@ pub struct CpdtPlan {
     /// hardware constraints. Empty when no recommendation was supplied
     /// or it was applied verbatim.
     pub override_diagnostics: Vec<crate::wggo_overrides::OverrideDiagnostic>,
+    /// True when the driver planned WITHOUT an AppliedPlan (the
+    /// weights-only offer): the precision half is fully valid, but the
+    /// ZeRO/comm halves ran over an EMPTY cost model and their numbers
+    /// describe a zero-size model. Set by `invoke_cpdt_if_enabled` after
+    /// the run; `render_report` prints the caveat so `--cpdt-report`
+    /// cannot present zero-model shard math as a recommendation.
+    pub planned_without_wggo: bool,
 }
 
 impl CpdtPlan {
@@ -91,6 +98,16 @@ impl CpdtPlan {
         let mut s = String::new();
         writeln!(s, "=== CPDT Training Plan ===").unwrap();
         writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
+        if self.planned_without_wggo {
+            writeln!(
+                s,
+                "NOTE: planned without a WGGO plan (weights-only). The \
+                 optimizer-precision section is fully valid; the ZeRO/comm \
+                 sections ran over an empty cost model and describe a \
+                 zero-size model, not a recommendation."
+            )
+            .unwrap();
+        }
         if let Some(zero) = self.zero.as_ref() {
             writeln!(s).unwrap();
             writeln!(s, "ZeRO Configuration:").unwrap();
@@ -184,6 +201,7 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
             joint: None,
             solve_us: t0.elapsed().as_micros() as u64,
             override_diagnostics: Vec::new(),
+            planned_without_wggo: false,
         };
     }
 
@@ -339,6 +357,7 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         joint,
         solve_us: t0.elapsed().as_micros() as u64,
         override_diagnostics,
+        planned_without_wggo: false,
     }
 }
 

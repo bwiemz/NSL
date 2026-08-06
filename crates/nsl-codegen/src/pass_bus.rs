@@ -573,8 +573,12 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         // is FIXED by the pre-plan offer, and the residual no-pre-plan hole
         // (distill and loop-bound train blocks, which the prepass does not
         // walk) is closed by the weights-only offer: `compile_train_block`
-        // now publishes a plan before EVERY body compiles — from the
-        // block's WGGO pre-plan when one exists, weights-only otherwise.
+        // now publishes a plan before every body it compiles through the
+        // offer — from the block's WGGO pre-plan when one exists,
+        // weights-only otherwise. The one body that bypasses the offer,
+        // the `@pipeline` early return, CLEARS the channel instead: it has
+        // no consult today, and the clear keeps that a fact about state
+        // rather than a reliance on the absence.
         // Enforcement argument, checked against the #466 recurrence class
         // (multi-module builds, the profile pre-pass, multi-train-block
         // programs, take/restore windows): the channel's only readers are
