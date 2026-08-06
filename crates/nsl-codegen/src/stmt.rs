@@ -12477,18 +12477,32 @@ impl Compiler<'_> {
                 None
             };
 
-            // Item 8, CSLA half: when every group member takes the PLAIN
-            // fused AdamW step — no muon routing, no ZeRO-3 owner gates, no
-            // CPDT precision or offload envelope, no bf16-sr mirror step —
-            // each layer-group update collapses into ONE pointer-table
-            // launch over the group's indices
-            // (nsl_fase_fused_adamw_step_multi_idx), bit-identical per
-            // element to the per-param loop (same kernel body, table
-            // addressing). Admission mirrors the FullBuffer multi arm and
-            // shares its kill-switches; the runtime still falls back
-            // per-param for non-uniform members (CPU tensors, tied-θ
-            // aliases), so this admits TRYING to batch, never a numeric
-            // fork.
+            // Item 8, CSLA half: when the group takes the fused AdamW step
+            // with no muon routing, no ZeRO-3 owner gates, and no CPDT
+            // precision or offload envelope, each layer-group update
+            // collapses into ONE pointer-table launch over the group's
+            // indices — nsl_fase_fused_adamw_step_multi_idx for plain f32,
+            // or its bf16-sr twin (SR arm, same item) which performs the
+            // identical per-member SR step and coherence widen. Both are
+            // bit-identical per element to the per-param loop they replace
+            // (same kernel bodies, table addressing; the SR dither is a
+            // pure function of (param, element, step)).
+            //
+            // Fallback semantics differ per twin: the f32 runtime entry
+            // demotes non-uniform members (CPU tensors, tied-θ aliases,
+            // oversize params) to its sequential arm, while the SR entry
+            // falls back per-param only for UN-STREAMED members (no bf16
+            // mirror — which is where tied/view-rooted params land, since
+            // registration refuses non-owners) and asserts the streamed
+            // set's m/v/mp uniformity outright. Admission mirrors the
+            // FullBuffer multi arm and shares its kill-switches.
+            //
+            // If AdamW parameter groups (`no_decay`) are ever threaded into
+            // this batched call, the per-param loop in
+            // emit_csla_group_update must gain the same group plumbing
+            // FIRST — it bakes the recipe's flat λ today, and it is the
+            // NSL_FASE_MULTI_STEP=0 parity reference the SR gate diffs
+            // against.
             let csla_multi_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
                 if muon_csla_ctx.is_none()
                     && !wrap_precision

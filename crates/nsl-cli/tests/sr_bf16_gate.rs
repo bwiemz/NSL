@@ -274,7 +274,22 @@ fn srbf16_batched_step_matches_per_param_gpu() {
     let mut args = FULL_FLAGS.to_vec();
     args.extend_from_slice(&["--seed", "4242"]);
 
-    let batched = run_nsl(&program(&tmp.join("mb.nslm"), true), "multi_b", &args, 600);
+    // Widen the FFN to 130 so w_up/w_down are 8320 elements = 32 full
+    // 256-thread blocks + a PARTIAL tail block at a NONZERO element base.
+    // The stock fixture's multi-block params are exact multiples of 256 (its
+    // only ragged params are single-block 64-elem norms with base 0), so
+    // without this a bounds-guard bug of the shape "compare tid instead of
+    // bbtab[b]+tid against ntab[p]" would pass — the item-8 aligned-fixture
+    // lesson, applied to this gate.
+    let widen = |src: &str| -> String {
+        let out = src
+            .replace("randn([64, 128])", "randn([64, 130])")
+            .replace("randn([128, 64])", "randn([130, 64])");
+        assert_ne!(out, src, "FFN width markers missing from fixture");
+        out
+    };
+
+    let batched = run_nsl(&widen(&program(&tmp.join("mb.nslm"), true)), "multi_b", &args, 600);
     assert!(
         batched.success,
         "batched bf16-sr run failed:\nstdout:\n{}\nstderr:\n{}",
@@ -290,7 +305,7 @@ fn srbf16_batched_step_matches_per_param_gpu() {
     );
 
     let per_param = run_nsl_env(
-        &program(&tmp.join("mp.nslm"), true),
+        &widen(&program(&tmp.join("mp.nslm"), true)),
         "multi_p",
         &args,
         &[("NSL_FASE_MULTI_STEP", "0")],

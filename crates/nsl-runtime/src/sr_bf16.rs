@@ -618,6 +618,18 @@ fn bf16sr_multi_impl(
         // Coherence refreshes deferred until after the batched launches:
         // (mirror ptr, resident f32 view ptr, len).
         let mut refreshes: Vec<(u64, u64, usize)> = Vec::new();
+        // Review-A1 guard, mirrored from `fase_multi_impl`: two idx entries
+        // aliasing ONE mirror inside a single launch would race
+        // last-writer-wins across grid slices, where the per-param loop
+        // double-steps sequentially and deterministically. Unreachable by
+        // construction (registration refuses non-owning tensors, so tied/
+        // view-rooted params never get a mirror; CSLA index sets are
+        // compile-time disjoint) — but the f32 twin guards the same
+        // "impossible" case, and an aliased duplicate here silently
+        // corrupts instead of failing. Duplicates demote to the per-param
+        // SR entry, which re-resolves the mirror and steps sequentially.
+        let mut batched_mirrors: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
 
         let seed = crate::deterministic_ops::get_rng_seed();
         let key = seed ^ (step as u64).wrapping_mul(SR_STEP_SALT);
@@ -652,6 +664,16 @@ fn bf16sr_multi_impl(
                     );
                 }
                 Some((dev_bf16, len, param_idx)) => {
+                    if !batched_mirrors.insert(dev_bf16) {
+                        // Aliased mirror: sequential per-param step, exactly
+                        // what the loop this entry replaces would do.
+                        nsl_sr_bf16_step_adamw(
+                            tp, mp_, vp, ap, lr, beta1, one_minus_beta1,
+                            beta2, one_minus_beta2, eps, lam, bc1_inv,
+                            bc2_inv, step,
+                        );
+                        continue;
+                    }
                     let th = NslTensor::from_ptr(tp);
                     let m = unsafe { &*(mp_ as *const NslTensor) };
                     let v = unsafe { &*(vp as *const NslTensor) };

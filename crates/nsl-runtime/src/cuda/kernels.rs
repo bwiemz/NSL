@@ -1423,9 +1423,14 @@ MDONE: ret;\n\
 ///     FASE-Deferred lifecycle; mirroring that keeps the replacement
 ///     observationally identical.
 ///
-/// `ntab` is u32 (4G-element params are refused far upstream); `ctrtab` is
-/// u64 per-param SR counter bases. Same `blockDim.x == build_block_tables
-/// block` contract as the f32 multi kernel — one constant feeds both.
+/// `ntab` is u32 — enforced at the batching entry itself
+/// (`bf16sr_multi_impl`'s `u32::try_from(len)` aborts on overflow;
+/// registration only bounds len below 2^40 for the counter scheme). The f32
+/// multi demotes oversize params to its sequential arm instead; both are
+/// unreachable on hardware where a >4G-element param's moments alone
+/// exceed VRAM. `ctrtab` is u64 per-param SR counter bases. Same
+/// `blockDim.x == build_block_tables block` contract as the f32 multi
+/// kernel — one constant feeds both.
 pub(crate) const FASE_FUSED_ADAMW_MULTI_BF16SR_PTX: &str = "\
 .version 7.0\n\
 .target sm_70\n\
