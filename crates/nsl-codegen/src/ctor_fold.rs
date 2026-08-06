@@ -363,8 +363,14 @@ fn tensor_init_dims<'a>(expr: &'a Expr, interner: &Interner) -> Option<&'a [Expr
                 tensor_init_dims(left, interner),
                 tensor_init_dims(right, interner),
             ) {
-                (Some(d), None) => Some(d),
-                (None, Some(d)) => Some(d),
+                // The unrecognized side must be a PROVABLE scalar factor
+                // (literal, foldable arithmetic, a 1-element init, a call
+                // chain over those). "Anything we don't recognize is a
+                // scalar" would claim `randn([a, b]) * bigger_tensor`'s
+                // dims as [a, b] while the runtime broadcasts larger.
+                (Some(d), None) if is_scalar_factor(right, interner) => Some(d),
+                (None, Some(d)) if is_scalar_factor(left, interner) => Some(d),
+                (Some(_), None) | (None, Some(_)) => None,
                 (Some(dl), Some(dr)) => {
                     if is_one_elem(dr) {
                         Some(dl)
@@ -397,6 +403,40 @@ fn tensor_init_dims<'a>(expr: &'a Expr, interner: &Interner) -> Option<&'a [Expr
 
 fn is_one_elem(dims: &[Expr]) -> bool {
     dims.len() == 1 && matches!(dims[0].kind, ExprKind::IntLiteral(1))
+}
+
+/// Is `expr` provably a SCALAR multiplicand? Literals, arithmetic over
+/// scalar factors, 1-element tensor inits (`full([1], ..)` and friends),
+/// call chains over scalar factors (`sqrt(full([1], ..))`), and `.item()`
+/// reads of scalar factors. Anything else — in particular a bare
+/// identifier, which could name a tensor of any shape — is not.
+fn is_scalar_factor(expr: &Expr, interner: &Interner) -> bool {
+    match &expr.kind {
+        ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_) => true,
+        ExprKind::Paren(inner) => is_scalar_factor(inner, interner),
+        ExprKind::UnaryOp { operand, .. } => is_scalar_factor(operand, interner),
+        ExprKind::BinaryOp { left, right, .. } => {
+            is_scalar_factor(left, interner) && is_scalar_factor(right, interner)
+        }
+        ExprKind::Call { callee, args } => {
+            // A 1-element tensor init is a scalar side by definition.
+            if let Some(dims) = tensor_init_dims(expr, interner) {
+                return is_one_elem(dims);
+            }
+            match &callee.kind {
+                // sqrt(..)/float(..)/exp(..)/... over scalar factors.
+                ExprKind::Ident(_) => args
+                    .iter()
+                    .all(|a| a.name.is_none() && is_scalar_factor(&a.value, interner)),
+                // `<scalar factor>.item()` and similar method reads.
+                ExprKind::MemberAccess { object, .. } => {
+                    is_scalar_factor(object, interner)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Evaluate a compile-time-constant scalar expression under a constructor
