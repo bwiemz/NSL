@@ -220,7 +220,20 @@ pub(crate) fn invoke_cpdt_if_enabled(
     if let Some(wm) = weight_map_ref {
         if compiler.cpdt_mode == CpdtMode::Full {
             if let Err(e) = crate::cpdt_sensitivity::validate(wm, applied_plan) {
-                eprintln!("error: {}", e);
+                // KNOWN LIMIT: on the pre-plan offer (compile_train_block),
+                // `applied_plan` is the pre-pass's — a plan the fingerprint
+                // check has not yet accepted. A checkpoint that would
+                // validate against the fresh in-place replan can therefore
+                // die here on the stale one; say so, because a validation
+                // error that names the wrong plan generation sends the user
+                // at the wrong artifact.
+                eprintln!(
+                    "error: {} (checked against the WGGO plan available at \
+                     this point — the pre-pass offer when one exists; if the \
+                     graph changed since the pre-pass, recompile so it \
+                     regenerates)",
+                    e
+                );
                 std::process::exit(1);
             }
         }
@@ -5020,17 +5033,36 @@ impl Compiler<'_> {
         // to consume. The offer is validated against the codegen-time
         // extraction at the planning site (graph-fingerprint check) and
         // replaced by an in-place solve on mismatch.
-        let preplan_overrides = self
+        let preplan_offer = self
             .bus
             .wggo_preplans()
             .iter()
             .find(|p| p.train_block_stmt_id == train_block_stmt_id)
-            .map(|p| p.overrides.clone());
-        match preplan_overrides {
-            Some(o) => self.bus.publish_wggo_overrides(o),
+            .map(|p| (p.overrides.clone(), p.plan.applied.clone()));
+        match preplan_offer {
+            Some((o, applied)) => {
+                self.bus.publish_wggo_overrides(o);
+                // CPDT-before-moments: offer the same pre-plan to CPDT. The
+                // moment-precision consult reads `bus.cpdt_plan` ~2.2k lines
+                // before the in-place planning site in the inner function,
+                // so a plan published only there arrives after the consult
+                // already allocated the moments — CPDT-sourced moment
+                // precision was structurally inert on every fresh compile
+                // (the bus proved it: `published 1x, read 0x full` plus a
+                // DEAD OUTPUT finding, with every activating flag passed).
+                // Speculative in exactly the way the overrides install is;
+                // the planning site refuses if the fingerprint rejects this
+                // pre-plan and the consumed moment dtypes no longer match.
+                crate::stmt::invoke_cpdt_if_enabled(self, &applied, Some(train));
+            }
             // Explicitly cleared, never a previous block's leftovers — the
-            // pre-restructure stale-leak this site exists to prevent.
-            None => self.bus.clear_wggo_overrides(),
+            // pre-restructure stale-leak this site exists to prevent. The
+            // cpdt_plan clear closes the same leak one channel over: block
+            // 2's moment consult must not consume block 1's plan.
+            None => {
+                self.bus.clear_wggo_overrides();
+                self.bus.clear_cpdt_plan();
+            }
         }
         let result =
             self.compile_train_block_inner(builder, state, train, train_block_stmt_id);
@@ -6032,6 +6064,16 @@ impl Compiler<'_> {
         // decision) into a local FIRST, which ends the `bus.cpdt_plan()` borrow.
         // Only then do the `compile_call_by_name` loop (which borrows `self`
         // mutably) run. No `unsafe`, no tensor clones.
+        //
+        // The ARBITRATED dtype lists — what the moments were actually
+        // allocated from, not what CPDT offered — are also kept for the
+        // in-place planning site: if the graph fingerprint later rejects the
+        // pre-plan this consult consumed, the moments cannot be re-typed, so
+        // the site re-arbitrates against the fresh plan and refuses on
+        // divergence. Recording the raw CPDT offer instead would refuse a
+        // correct compile with a wrong message whenever arbitration had
+        // dropped (NotLoweredNoOptIn) or merged the offer.
+        let cpdt_moment_lists_consumed: Option<(Vec<u16>, Vec<u16>)>;
         let cpdt_precision_dtypes: Option<(Value, Value)> = {
             let dtype_data: Option<(Vec<u16>, Vec<u16>)> = {
                 // Pre-S2: the FASE cast wrapping was emitted ONLY on the
@@ -6160,10 +6202,24 @@ impl Compiler<'_> {
                         );
                         Some((m, v))
                     }
-                    MPA::CpdtOnly(m, v) => Some((m, v)),
+                    MPA::CpdtOnly(m, v) => {
+                        // Every other active arm announces itself; a silent
+                        // arm is invisible — this one WAS silent, which is
+                        // part of how its dead consult went unnoticed.
+                        let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
+                        eprintln!(
+                            "[cpdt] optimizer-moment precision active (CPDT \
+                             per-param plan): {sub32} moment buffer(s) in FP16 \
+                             storage (device-resident; GPU runs use the \
+                             CFTP-v7 PTX cast kernels for the \
+                             dequant->step->quant envelope)."
+                        );
+                        Some((m, v))
+                    }
                     MPA::Inactive => None,
                 }
             };
+            cpdt_moment_lists_consumed = dtype_data.clone();
             // P1 Muon item 11: muon's group update runs the stdlib muon_step
             // (no dequant->step->quant envelope), so reduced-precision
             // moments would feed FP16 buffers to an unwrapped update —
@@ -7813,6 +7869,15 @@ impl Compiler<'_> {
                 // prune, and CFIE inference decisions).
                 //
                 let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
+                // Whether a pre-plan existed for this block (=> the wrapper
+                // already offered it to CPDT before the moment consult) and
+                // whether the fingerprint check rejected it. Hoisted out of
+                // the WGGO block for the CPDT planning site below, which
+                // must not re-plan what the wrapper planned, and must refuse
+                // when the consult consumed dtype lists a rejection made
+                // stale.
+                let mut wggo_preplan_offered = false;
+                let mut wggo_preplan_was_rejected = false;
                 if let Some(ref mode_str) = self.compile_options.wggo.mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
@@ -7873,6 +7938,8 @@ impl Compiler<'_> {
                         });
                         let preplan_was_rejected =
                             preplan.is_some() && reused_plan.is_none();
+                        wggo_preplan_offered = preplan.is_some();
+                        wggo_preplan_was_rejected = preplan_was_rejected;
                         let plan = match reused_plan {
                             Some(plan) => Some(plan),
                             None => crate::wggo::run_on_wengert_with_weights(
@@ -8409,16 +8476,148 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
-                // CPDT pipeline planner — runs immediately after WRGA so the
-                // AppliedPlan produced by WGGO (if any) flows through as the
-                // ModelSize source + wggo_recommended_shard. No-op when
-                // `cpdt_mode == Off` or no cluster topology was configured.
-                // NOTE: CPDT runs only when WGGO produced a plan. If `--cpdt` is enabled
-                // without `--wggo`, `cpdt_plan` remains `None` and no diagnostics fire.
-                // The CLI post-compile layer should warn when `cpdt_mode != Off` but
-                // `cpdt_plan.is_none()` to surface this silent-skip case.
+                // CPDT planning site. On the pre-plan path the wrapper
+                // already planned before the moment consult (a plan
+                // published only HERE arrives ~2.2k lines after that consult
+                // allocated the moments, which kept CPDT-sourced moment
+                // precision structurally inert), so this site plans only
+                // when the wrapper could not — no pre-plan — or must not be
+                // trusted — fingerprint-rejected pre-plan. Either way it
+                // then compares the CPDT-sourced dtype lists the consult
+                // consumed against the current plan: matching lists proceed,
+                // a consumed-but-stale list refuses (the moments are
+                // allocated; their dtypes cannot be re-derived), and a plan
+                // that arrives too late to lower says so instead of
+                // silently training with FP32 moments.
                 if let Some(ref applied) = wggo_applied {
-                    crate::stmt::invoke_cpdt_if_enabled(self, applied, Some(train));
+                    if !wggo_preplan_offered || wggo_preplan_was_rejected {
+                        crate::stmt::invoke_cpdt_if_enabled(self, applied, Some(train));
+                    }
+                    // Re-arbitrate what the moments WOULD be typed as under
+                    // the CURRENT plan and overrides — the same pipeline the
+                    // consult ran (WGGO bits, CPDT lists, opt-in), against
+                    // the fresh bus state. Comparing final-vs-final rather
+                    // than offer-vs-offer is what keeps this from refusing a
+                    // correct compile whose arbitration dropped or merged
+                    // the CPDT offer, and it also covers a replan that
+                    // changed WGGO's moment-bit decisions — a divergence the
+                    // FASE mode-table refusal does not look at.
+                    let fresh_lists: Option<(Vec<u16>, Vec<u16>)> = {
+                        let fresh_wggo_bits = if fase_deferred {
+                            self.bus.wggo_overrides().and_then(|o| {
+                                crate::cpdt_precision_exec::build_dtype_lists_from_overrides(
+                                    o,
+                                    &param_paths,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        let fresh_cpdt = self
+                            .bus
+                            .cpdt_plan()
+                            .filter(|p| {
+                                crate::cpdt_precision_exec::precision_active(
+                                    matches!(p.mode, crate::cpdt::CpdtMode::Full),
+                                    !p.precision.params.is_empty(),
+                                    true,
+                                    fase_deferred,
+                                    true,
+                                )
+                            })
+                            .map(|p| {
+                                crate::cpdt_precision_exec::build_dtype_lists(
+                                    &p.precision,
+                                    &param_paths,
+                                )
+                            });
+                        use crate::cpdt_precision_exec::{
+                            arbitrate_moment_precision, MomentPrecisionArbitration as MPA,
+                        };
+                        // `arbitrate_moment_precision` is pure; the consult's
+                        // diagnostics print at ITS call site, so re-running
+                        // it here is silent by construction.
+                        match arbitrate_moment_precision(
+                            fresh_wggo_bits,
+                            fresh_cpdt,
+                            self.compile_options.wggo.moment_precision,
+                        ) {
+                            MPA::Merged(m, v) | MPA::WggoOnly(m, v) | MPA::CpdtOnly(m, v) => {
+                                Some((m, v))
+                            }
+                            MPA::NotLoweredNoOptIn | MPA::Inactive => None,
+                        }
+                    };
+                    // Test-only knob, same convention as
+                    // NSL_WGGO_FORCE_STALE_TABLE: force the divergence arm so
+                    // the refusal is gate-testable without engineering a real
+                    // fingerprint drift.
+                    let forced_stale_plan = std::env::var("NSL_CPDT_FORCE_STALE_PLAN")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                    match (&cpdt_moment_lists_consumed, &fresh_lists) {
+                        (Some(consumed), fresh)
+                            if fresh.as_ref() != Some(consumed) || forced_stale_plan =>
+                        {
+                            return Err(CodegenError::new(
+                                "the optimizer moments were allocated from \
+                                 dtype decisions derived from a WGGO pre-plan \
+                                 whose graph fingerprint no longer matches, \
+                                 and re-arbitrating under the fresh plan \
+                                 DISAGREES with the allocated moment dtypes — \
+                                 refusing to execute a stale precision plan. \
+                                 Recompile so the pre-plan regenerates against \
+                                 the current graph, or drop --cpdt / \
+                                 --wggo-moment-precision for this block.",
+                            ));
+                        }
+                        (None, Some(_)) => {
+                            // ROUTINELY reachable, not hypothetical: distill
+                            // blocks and loop-bound train blocks get no
+                            // pre-plan (the prepass walks only plain train
+                            // blocks), so on those paths CPDT-sourced moment
+                            // precision is structurally unavailable — the
+                            // original wart survives there, now loud instead
+                            // of silent.
+                            eprintln!(
+                                "[cpdt] optimizer-moment precision NOT \
+                                 lowered: the plan arrived after the moments \
+                                 were allocated (no usable WGGO pre-plan for \
+                                 this block). Moments stay FP32."
+                            );
+                        }
+                        _ => {}
+                    }
+                } else if cpdt_moment_lists_consumed.is_some() {
+                    // The hole a review closed: the pre-plan was offered, the
+                    // moments were typed from it, the fingerprint rejected it
+                    // — and the in-place replan itself returned None (scorer
+                    // build failure, provably-incompatible shapes). The
+                    // moment dtypes are baked from a plan the compile just
+                    // declared stale, and there is no fresh plan to
+                    // re-arbitrate against; printing the "no CPDT decisions
+                    // apply" notice here would be factually false.
+                    return Err(CodegenError::new(
+                        "the optimizer moments were allocated from dtype \
+                         decisions derived from a WGGO pre-plan whose graph \
+                         fingerprint no longer matches, and the in-place \
+                         replan produced no plan at all — refusing to \
+                         execute a stale precision plan. Recompile so the \
+                         pre-plan regenerates against the current graph, or \
+                         drop --cpdt for this block.",
+                    ));
+                } else if self.cpdt_mode != crate::cpdt::CpdtMode::Off
+                    && self.cpdt_cluster.is_some()
+                {
+                    // The silent-skip case the previous NOTE asked a CLI
+                    // layer to surface: CPDT was requested, its cluster is
+                    // configured, and it will never run because WGGO
+                    // produced no plan for this block.
+                    eprintln!(
+                        "[cpdt] skipped: CPDT planning requires a WGGO plan \
+                         and this block has none (pass --wggo full, or drop \
+                         --cpdt). No CPDT decisions apply to this block."
+                    );
                 }
                 // Task 6: render any override-rejected diagnostics to stderr so
                 // the Phase 3 decision explainer and the user can see which
@@ -12377,17 +12576,18 @@ impl Compiler<'_> {
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
                 if let Some(sc) = multi {
-                    // bf16-sr must be re-checked here too: the closure cannot
-                    // infer it from sr_step (both call sites thread Some
-                    // unconditionally), and batching under bf16-sr would
-                    // bypass the authoritative-mirror SR step silently — the
-                    // exact divergence class fase_emit_final_step refuses
-                    // loudly.
+                    // The envelope booleans are re-checked here as a belt: a
+                    // future call site passing scalars alongside an envelope
+                    // falls through to the per-param loop instead of
+                    // mis-batching. bf16-sr no longer excludes (item 8, SR
+                    // arm): it selects the SR twin below, whose runtime entry
+                    // performs the same authoritative-mirror SR step and
+                    // coherence widen per member that fase_emit_final_step
+                    // emits per param.
                     if muon.is_none()
                         && zero3.is_none()
                         && !wrap_precision
                         && !wrap_offload
-                        && !c.features.param_dtype_bf16sr
                     {
                         if idxs.is_empty() {
                             return Ok(());
@@ -12411,6 +12611,38 @@ impl Compiler<'_> {
                         // mp_scale = 1.0: the layerwise schedule refuses
                         // grad_clip, so a clip factor can never exist here.
                         let zero_i = builder.ins().iconst(cl_types::I64, 0);
+                        if c.features.param_dtype_bf16sr {
+                            let step_v = sr_step.ok_or_else(|| {
+                                CodegenError::new(
+                                    "bf16-sr group update reached without an \
+                                     opt_step value — dispatcher must thread \
+                                     sr_step",
+                                )
+                            })?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_fase_fused_adamw_step_bf16sr_multi_idx",
+                                &[
+                                    param_list,
+                                    state_list_1,
+                                    state_list_2,
+                                    accum_val,
+                                    il,
+                                    lr_v,
+                                    b1_v,
+                                    omb1_v,
+                                    b2_v,
+                                    omb2_v,
+                                    eps_v,
+                                    wd_v,
+                                    bc.0,
+                                    bc.1,
+                                    zero_i,
+                                    zero_i,
+                                    step_v,
+                                ],
+                            )?;
+                        } else {
                         let one_scale = builder.ins().f64const(1.0);
                         c.compile_call_by_name(
                             builder,
@@ -12435,6 +12667,7 @@ impl Compiler<'_> {
                                 one_scale,
                             ],
                         )?;
+                        }
                         c.compile_call_by_name(builder, "nsl_list_free", &[il])?;
                         // The CSLA tail, unchanged: free the group's
                         // accumulators (fresh zeros next window). The
@@ -12803,23 +13036,42 @@ impl Compiler<'_> {
                 None
             };
 
-            // Item 8, CSLA half: when every group member takes the PLAIN
-            // fused AdamW step — no muon routing, no ZeRO-3 owner gates, no
-            // CPDT precision or offload envelope, no bf16-sr mirror step —
-            // each layer-group update collapses into ONE pointer-table
-            // launch over the group's indices
-            // (nsl_fase_fused_adamw_step_multi_idx), bit-identical per
-            // element to the per-param loop (same kernel body, table
-            // addressing). Admission mirrors the FullBuffer multi arm and
-            // shares its kill-switches; the runtime still falls back
-            // per-param for non-uniform members (CPU tensors, tied-θ
-            // aliases), so this admits TRYING to batch, never a numeric
-            // fork.
+            // Item 8, CSLA half: when the group takes the fused AdamW step
+            // with no muon routing, no ZeRO-3 owner gates, and no CPDT
+            // precision or offload envelope, each layer-group update
+            // collapses into ONE pointer-table launch over the group's
+            // indices — nsl_fase_fused_adamw_step_multi_idx for plain f32,
+            // or its bf16-sr twin (SR arm, same item) which performs the
+            // identical per-member SR step and coherence widen. Both are
+            // bit-identical per element to the per-param loop they replace
+            // (same kernel bodies, table addressing; the SR dither is a
+            // pure function of (param, element, step)).
+            //
+            // Fallback semantics differ per twin: the f32 runtime entry
+            // demotes non-uniform members (CPU tensors, tied-θ aliases,
+            // oversize params) to its sequential arm, while the SR entry
+            // falls back per-param only for UN-STREAMED members (no bf16
+            // mirror — which is where tied/view-rooted params land, since
+            // registration refuses non-owners) and asserts the streamed
+            // set's m/v/mp uniformity outright. Admission mirrors the
+            // FullBuffer multi arm and shares its kill-switches.
+            //
+            // If AdamW parameter groups (`no_decay`) are ever threaded into
+            // this batched call, the per-param loop in
+            // emit_csla_group_update must gain the same group plumbing
+            // FIRST — it bakes the recipe's flat λ today, and it is the
+            // NSL_FASE_MULTI_STEP=0 parity reference the SR gate diffs
+            // against.
             let csla_multi_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
                 if muon_csla_ctx.is_none()
                     && !wrap_precision
                     && !self.compile_options.optim_state_offload
-                    && !self.features.param_dtype_bf16sr
+                    // bf16-sr admits (item 8, SR arm): the group update
+                    // selects the SR twin of the multi_idx launch, which
+                    // performs the identical per-member SR step and coherence
+                    // widen. The layerwise schedule refuses grad_clip, so
+                    // the SR entries' no-clip contract can never be violated
+                    // from this site.
                     && zero3_streamed.is_none()
                     && two_state
                     && !self.compile_options.training_reference
@@ -13862,6 +14114,12 @@ impl Compiler<'_> {
                     && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
                     && !zero_enabled
                     && !self.compile_options.optim_state_offload
+                    // Belt only: bf16-sr structurally cannot reach this
+                    // FullBuffer path (it requires --weight-stream, which
+                    // clap-requires --layerwise-accum, so SR always takes the
+                    // CSLA schedule and its SR multi_idx arm — item 8). Kept
+                    // so a future envelope change fails safe into the
+                    // per-param loop instead of silently mis-batching.
                     && !self.features.param_dtype_bf16sr
                     && num_state_buffers >= 2
                 {

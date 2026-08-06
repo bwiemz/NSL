@@ -1196,6 +1196,41 @@ impl Drop for SurfaceGuard {
     }
 }
 
+/// RAII guard: allocate in `pool` for the enclosing scope, restoring the
+/// previous pool on drop (panic-safe — the restore also runs during unwind).
+///
+/// The runtime-internal counterpart of the codegen-emitted
+/// `nsl_gpu_set_persistent_pool` / `nsl_gpu_set_transient_pool` brackets,
+/// exactly as [`SurfaceGuard`] is for `nsl_gpu_set_alloc_surface`: emitted IR
+/// cannot hold a Rust guard, but every Rust-side bracket can and must. The
+/// manual `let prev = get; set(P); ...; set(prev)` spelling this replaces
+/// left the thread pinned to `pool` if the bracketed allocation panicked —
+/// every later Transient allocation on that thread would then land in
+/// Persistent-tagged segments that `drain_all` never returns to the driver
+/// (VRAM held at high-water forever, growing under size churn), and the
+/// per-pool accounting the two-pool design exists for would silently lie.
+/// (The BYTES stay reusable — best-fit falls back cross-pool — so this is
+/// held-forever reservation and lying accounting, not lost memory.)
+/// `pool_guard_sites` in `tests/alloc_pool_guard.rs` pins that no manual
+/// bracket comes back.
+pub(crate) struct PoolGuard {
+    prev: AllocPool,
+}
+
+impl PoolGuard {
+    pub(crate) fn new(pool: AllocPool) -> PoolGuard {
+        let prev = get_alloc_pool();
+        set_alloc_pool(pool);
+        PoolGuard { prev }
+    }
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        set_alloc_pool(self.prev);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration parsing
 // ---------------------------------------------------------------------------
@@ -1685,6 +1720,45 @@ mod tests {
             assert_eq!(get_alloc_surface(), SurfaceTag::AttnWorkspace);
         }
         assert_eq!(get_alloc_surface(), SurfaceTag::Other);
+    }
+
+    #[test]
+    fn test_pool_guard_restores_on_drop_and_nests() {
+        // Thread-local, so no cross-test interference; establish the
+        // baseline explicitly rather than assuming it.
+        set_alloc_pool(AllocPool::Transient);
+        {
+            let _g1 = PoolGuard::new(AllocPool::Persistent);
+            assert_eq!(get_alloc_pool(), AllocPool::Persistent);
+            {
+                let _g2 = PoolGuard::new(AllocPool::Transient);
+                assert_eq!(get_alloc_pool(), AllocPool::Transient);
+            }
+            assert_eq!(get_alloc_pool(), AllocPool::Persistent);
+        }
+        assert_eq!(get_alloc_pool(), AllocPool::Transient);
+    }
+
+    /// THE case the guard exists for, and the one the manual
+    /// `set(P); ...; set(prev)` brackets it replaced got wrong: a panic
+    /// inside the bracket must not leave the thread pinned Persistent —
+    /// every later Transient allocation on the thread would land in
+    /// Persistent-tagged segments drain_all never returns to the driver,
+    /// with the per-pool accounting lying about all of it.
+    #[test]
+    fn test_pool_guard_restores_during_unwind() {
+        set_alloc_pool(AllocPool::Transient);
+        let caught = std::panic::catch_unwind(|| {
+            let _g = PoolGuard::new(AllocPool::Persistent);
+            assert_eq!(get_alloc_pool(), AllocPool::Persistent);
+            panic!("mid-bracket failure");
+        });
+        assert!(caught.is_err(), "the probe must actually panic");
+        assert_eq!(
+            get_alloc_pool(),
+            AllocPool::Transient,
+            "a panic mid-bracket left the thread pinned Persistent"
+        );
     }
 
     #[test]

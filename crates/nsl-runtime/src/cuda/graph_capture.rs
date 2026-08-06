@@ -133,6 +133,30 @@ mod imp {
         WgradAccum,
     }
 
+    /// How the wrapper stored the operands it handed cuBLAS.
+    ///
+    /// `Bf16Storage` means the wrapper cast both operands f32 -> bf16 into
+    /// scratch and ran `cublasGemmEx(16BF -> 32F)`; the two cast launches are
+    /// ordinary hooked kernels recorded immediately BEFORE this pseudo-op,
+    /// and the op's `a`/`b` remain the ORIGINAL f32 pointers (the scratch
+    /// addresses are pinned by the cast ops' recorded argument bytes, so
+    /// scratch stability is still verified every step). `F32` covers every
+    /// f32-storage form — the handle's math mode and the explicit `FAST_TF32`
+    /// low-intensity arm alike, which are the same buffers and the same
+    /// numerics class.
+    ///
+    /// Identity-only: eager repair re-enters the recording wrapper, which
+    /// re-derives the storage route deterministically (the matmul mode is
+    /// resolved once per process and `bf16_storage_worthwhile` is a pure
+    /// function of the recorded dims). The field exists so equality and the
+    /// digest cannot conflate the two forms — the item-9 "three places must
+    /// agree about op identity" lesson, applied at record time.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum GemmPrecision {
+        F32,
+        Bf16Storage,
+    }
+
     /// One recorded GPU interaction. Everything needed both to compare a
     /// later step's issuance for equality and to eagerly re-issue the op
     /// during self-repair.
@@ -168,6 +192,9 @@ mod imp {
             /// the collision reachable from every model instead of only from
             /// the weight-gradient fusion.
             kind: SgemmKind,
+            /// Operand storage route (f32 vs bf16-cast scratch). See the
+            /// enum's docs: identity-only, repair re-derives it.
+            precision: GemmPrecision,
             /// Operand transposition, for the row-major wrapper. `lda`/`ldb`
             /// are derived from these plus (m, n, k) inside the wrapper, so
             /// recording the flags pins the leading dimensions too.
@@ -244,17 +271,17 @@ mod imp {
                 ) => func == f2 && grid == g2 && block == b2 && shared == s2 && params == p2 && offsets == o2,
                 (
                     GpuOp::Sgemm {
-                        kind, transa, transb,
+                        kind, precision, transa, transb,
                         a, b, c, m, n, k, alpha_bits, beta_bits,
                         batch, stride_a, stride_b, stride_c,
                     },
                     GpuOp::Sgemm {
-                        kind: kd2, transa: ta2, transb: tb2,
+                        kind: kd2, precision: pr2, transa: ta2, transb: tb2,
                         a: a2, b: b2, c: c2, m: m2, n: n2, k: k2,
                         alpha_bits: al2, beta_bits: be2,
                         batch: bt2, stride_a: sa2, stride_b: sb2, stride_c: sc2,
                     },
-                ) => kind == kd2 && transa == ta2 && transb == tb2
+                ) => kind == kd2 && precision == pr2 && transa == ta2 && transb == tb2
                     && a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2
                     && alpha_bits == al2 && beta_bits == be2
                     && batch == bt2 && stride_a == sa2 && stride_b == sb2 && stride_c == sc2,
@@ -396,17 +423,22 @@ mod imp {
                     eat(params);
                 }
                 GpuOp::Sgemm {
-                    kind, transa, transb,
+                    kind, precision, transa, transb,
                     a, b, c, m, n, k, batch, stride_a, stride_b, stride_c, ..
                 } => {
                     eat(&[2]);
-                    // Wrapper identity and transposition are digested for the
-                    // same reason batch geometry is: two calls that produce
-                    // different products must not hash alike.
+                    // Wrapper identity, storage route and transposition are
+                    // digested for the same reason batch geometry is: two
+                    // calls that produce different products must not hash
+                    // alike.
                     eat(&[
                         match kind {
                             SgemmKind::RowMajor => 0u8,
                             SgemmKind::WgradAccum => 1u8,
+                        },
+                        match precision {
+                            GemmPrecision::F32 => 0u8,
+                            GemmPrecision::Bf16Storage => 1u8,
                         },
                         u8::from(*transa),
                         u8::from(*transb),
@@ -478,6 +510,19 @@ mod imp {
                     kind, transa, transb,
                     a, b, c, m, n, k, alpha_bits, beta_bits,
                     batch, stride_a, stride_b, stride_c,
+                    // Not dispatched on: re-entering the wrapper re-derives
+                    // the storage route from the same dims and the
+                    // once-per-process matmul mode, and `a`/`b` here are the
+                    // ORIGINAL f32 pointers. For a `Bf16Storage` op this
+                    // double-issues the casts — the repaired prefix already
+                    // re-launched the recorded cast kernels into the
+                    // recorded scratch, and the wrapper re-entry then casts
+                    // again into FRESH scratch for its GemmEx. Harmless
+                    // (same sources, deterministic rounding, all
+                    // stream-ordered) but the extra alloc/free pair can
+                    // perturb the allocator once, costing one extra record
+                    // cycle before the region re-captures.
+                    precision: _,
                 } => {
                     let (alpha, beta) = (f32::from_bits(*alpha_bits), f32::from_bits(*beta_bits));
                     // Dispatch on `kind`, not on shape. Replaying a
@@ -585,13 +630,17 @@ mod imp {
                     );
                 }
                 (
-                    GpuOp::Sgemm { a: aa, b: ab, c: ac, batch: abt, kind: akd, .. },
-                    GpuOp::Sgemm { a: ba, b: bb, c: bc, batch: bbt, kind: bkd, .. },
+                    GpuOp::Sgemm {
+                        a: aa, b: ab, c: ac, batch: abt, kind: akd, precision: apr, ..
+                    },
+                    GpuOp::Sgemm {
+                        a: ba, b: bb, c: bc, batch: bbt, kind: bkd, precision: bpr, ..
+                    },
                 ) => {
                     eprintln!(
                         "[cuda-graph] region {id}: first divergence at op {i}: sgemm ptrs \
-                         ({aa:#x},{ab:#x},{ac:#x}) batch={abt} {akd:?} vs \
-                         ({ba:#x},{bb:#x},{bc:#x}) batch={bbt} {bkd:?}"
+                         ({aa:#x},{ab:#x},{ac:#x}) batch={abt} {akd:?} {apr:?} vs \
+                         ({ba:#x},{bb:#x},{bc:#x}) batch={bbt} {bkd:?} {bpr:?}"
                     );
                 }
                 _ => {
@@ -601,10 +650,12 @@ mod imp {
                             params.len(),
                             &params[..params.len().min(48)]
                         ),
-                        GpuOp::Sgemm { a, b, c, m, n, k, batch, kind, transa, transb, .. } => {
+                        GpuOp::Sgemm {
+                            a, b, c, m, n, k, batch, kind, precision, transa, transb, ..
+                        } => {
                             format!(
-                                "sgemm[{kind:?} ta={transa} tb={transb}] a={a:#x} b={b:#x} \
-                                 c={c:#x} {m}x{n}x{k} batch={batch}"
+                                "sgemm[{kind:?} {precision:?} ta={transa} tb={transb}] a={a:#x} \
+                                 b={b:#x} c={c:#x} {m}x{n}x{k} batch={batch}"
                             )
                         }
                         GpuOp::Memset { dst, bytes } => format!("memset dst={dst:#x} n={bytes}"),
@@ -1029,20 +1080,20 @@ mod imp {
         if !enabled() {
             return true;
         }
-        let to_repair = ACTIVE.with(|a| {
+        let outcome = ACTIVE.with(|a| {
             let mut guard = a.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { ref mut tainted } => {
                     match read_kernel_op(func, grid, block, shared, args, name_ptr) {
                         Some(op) => {
                             active.seq.push(op);
-                            None
+                            HookOutcome::Issue
                         }
                         None => {
                             *tainted = true;
-                            None
+                            HookOutcome::Issue
                         }
                     }
                 }
@@ -1050,37 +1101,102 @@ mod imp {
                     match read_kernel_op(func, grid, block, shared, args, name_ptr) {
                         Some(op) => {
                             active.seq.push(op);
-                            None
+                            HookOutcome::Issue
                         }
                         None => {
                             // Param query failed only NOW (never during the
                             // record steps that proved stability) — cannot
                             // happen in practice, but fail safe: abort.
                             TAINTS.fetch_add(1, Ordering::Relaxed);
-                            Some(diverge(active, fail_state(active.attempts)))
+                            HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                         }
                     }
                 }
                 Mode::Skipping { idx } => {
+                    if idx == 0 && test_diverge_arm(active.id, active.phase) {
+                        // Test-only kill switch: force the op-0 divergence
+                        // that motivated `HookOutcome` (see its docs), once
+                        // per (region, phase) — the region then re-records,
+                        // re-captures and replays normally. The gate asserts
+                        // the run stays bit-exact anyway.
+                        MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                        return HookOutcome::Diverged(diverge(
+                            active,
+                            fail_state(active.attempts),
+                        ));
+                    }
                     let matches = read_kernel_op(func, grid, block, shared, args, name_ptr)
                         .is_some_and(|op| active.seq.get(idx) == Some(&op));
                     if matches {
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new()); // sentinel: SKIP the launch
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false, // verified — skip
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
+    }
+
+    /// `NSL_CUDA_GRAPH_TEST_DIVERGE_FIRST=1` — test-only: force each
+    /// (region, phase)'s first replay verification to report a mismatch at
+    /// op 0. This is the exact shape that used to conflate with the skip
+    /// sentinel and drop the op (see `HookOutcome`); the e2e gate keeps it
+    /// covered. Returns true exactly once per (region, phase); the fired
+    /// set is global (NOT on `Active`, which is rebuilt every occurrence —
+    /// a per-occurrence flag would re-fire on every replay attempt and the
+    /// region could never re-capture).
+    fn test_diverge_arm(id: i64, phase: u64) -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        if !*FLAG.get_or_init(|| {
+            std::env::var("NSL_CUDA_GRAPH_TEST_DIVERGE_FIRST").ok().as_deref() == Some("1")
+        }) {
+            return false;
+        }
+        static FIRED: OnceLock<Mutex<std::collections::HashSet<(i64, u64)>>> = OnceLock::new();
+        FIRED
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert((id, phase))
+    }
+
+    /// Verdict from a hook's ACTIVE-borrow section, deciding whether the
+    /// wrapper performs its real GPU op.
+    ///
+    /// This is a three-way enum because two of its cases used to share one
+    /// `Option<Vec<GpuOp>>` emptiness sentinel: "verified — skip" and "the
+    /// region just diverged" both surfaced as a vector, and a divergence at
+    /// region op 0 (or a capture abort with nothing recorded yet) produced
+    /// an EMPTY repair prefix — indistinguishable from the skip sentinel.
+    /// The hook then returned "skip" for an op the destroyed graph would
+    /// never perform, and the step ran with a hole in it: e.g. a dropped
+    /// bf16 operand cast whose GemmEx went on to read stale scratch —
+    /// silent numeric corruption, no error, no taint (review 2026-08-04,
+    /// HIGH). The enum makes the ambiguity unrepresentable; `Diverged`
+    /// always issues the current op after repairing, even when the prefix
+    /// is empty.
+    enum HookOutcome {
+        /// Perform the real op (recording, capturing as a graph node via
+        /// the stream, eager, or no active region).
+        Issue,
+        /// The wrapper must NOT perform the real op: it was verified
+        /// against the captured sequence and the region-end graph launch
+        /// will perform it, or the capture hook already issued the async
+        /// form itself.
+        Handled,
+        /// The region diverged at this op: eagerly re-issue the
+        /// matched-and-skipped prefix (possibly empty — a mismatch at op 0
+        /// has nothing to repair), then perform the current op.
+        Diverged(Vec<GpuOp>),
     }
 
     fn read_kernel_op(
@@ -1126,8 +1242,9 @@ mod imp {
         a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
         batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
     ) -> bool {
+        // The batched wrapper has no bf16-storage arm — always f32.
         on_sgemm_full(
-            SgemmKind::RowMajor, false, false,
+            SgemmKind::RowMajor, GemmPrecision::F32, false, false,
             a, b, c, m, n, k, alpha, beta, batch, stride_a, stride_b, stride_c,
         )
     }
@@ -1140,7 +1257,7 @@ mod imp {
     /// and one recorded through the 2-D hook describe the same geometry.
     #[allow(clippy::too_many_arguments)]
     pub fn on_sgemm_full(
-        kind: SgemmKind, transa: bool, transb: bool,
+        kind: SgemmKind, precision: GemmPrecision, transa: bool, transb: bool,
         a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
         batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
     ) -> bool {
@@ -1148,38 +1265,38 @@ mod imp {
             return true;
         }
         let op = GpuOp::Sgemm {
-            kind, transa, transb,
+            kind, precision, transa, transb,
             a, b, c, m, n, k,
             alpha_bits: alpha.to_bits(),
             beta_bits: beta.to_bits(),
             batch, stride_a, stride_b, stride_c,
         };
-        let to_repair = ACTIVE.with(|act| {
+        let outcome = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { .. } | Mode::Capturing => {
                     active.seq.push(op.clone());
-                    None
+                    HookOutcome::Issue
                 }
                 Mode::Skipping { idx } => {
                     if active.seq.get(idx) == Some(&op) {
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new());
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false,
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
     }
 
@@ -1244,14 +1361,14 @@ mod imp {
         if !enabled() {
             return true;
         }
-        let to_repair = ACTIVE.with(|act| {
+        let outcome = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { .. } => {
                     active.seq.push(GpuOp::HtoD { dst: dst as usize, len, staging: None });
-                    None
+                    HookOutcome::Issue
                 }
                 Mode::Capturing => match StagingBuf::alloc(len) {
                     Some(staging) => {
@@ -1269,18 +1386,21 @@ mod imp {
                             // Node creation failed — abort the capture and
                             // let the wrapper run the plain sync copy.
                             TAINTS.fetch_add(1, Ordering::Relaxed);
-                            return Some(diverge(active, fail_state(active.attempts)));
+                            return HookOutcome::Diverged(diverge(
+                                active,
+                                fail_state(active.attempts),
+                            ));
                         }
                         active.seq.push(GpuOp::HtoD {
                             dst: dst as usize,
                             len,
                             staging: Some(staging),
                         });
-                        Some(Vec::new()) // handled — wrapper must not copy
+                        HookOutcome::Handled // wrapper must not copy
                     }
                     None => {
                         TAINTS.fetch_add(1, Ordering::Relaxed);
-                        Some(diverge(active, fail_state(active.attempts)))
+                        HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                     }
                 },
                 Mode::Skipping { idx } => {
@@ -1294,20 +1414,20 @@ mod imp {
                             st.fill_from(src, len);
                         }
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new());
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false,
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
     }
 
@@ -1319,14 +1439,14 @@ mod imp {
             return true;
         }
         let op = GpuOp::DtoD { dst: dst as usize, src: src as usize, len };
-        let to_repair = ACTIVE.with(|act| {
+        let outcome = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
-                Mode::EagerRest => None,
+                Mode::EagerRest => HookOutcome::Issue,
                 Mode::Recording { .. } => {
                     active.seq.push(op.clone());
-                    None
+                    HookOutcome::Issue
                 }
                 Mode::Capturing => {
                     let stream = crate::cuda::inner::current_stream();
@@ -1340,28 +1460,31 @@ mod imp {
                     };
                     if r != CUresult::CUDA_SUCCESS {
                         TAINTS.fetch_add(1, Ordering::Relaxed);
-                        return Some(diverge(active, fail_state(active.attempts)));
+                        return HookOutcome::Diverged(diverge(
+                            active,
+                            fail_state(active.attempts),
+                        ));
                     }
                     active.seq.push(op.clone());
-                    Some(Vec::new())
+                    HookOutcome::Handled
                 }
                 Mode::Skipping { idx } => {
                     if active.seq.get(idx) == Some(&op) {
                         active.mode = Mode::Skipping { idx: idx + 1 };
-                        return Some(Vec::new());
+                        return HookOutcome::Handled;
                     }
                     MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                    Some(diverge(active, fail_state(active.attempts)))
+                    HookOutcome::Diverged(diverge(active, fail_state(active.attempts)))
                 }
             }
         });
-        match to_repair {
-            Some(ops) if ops.is_empty() => false,
-            Some(ops) => {
+        match outcome {
+            HookOutcome::Handled => false,
+            HookOutcome::Diverged(ops) => {
                 repair(&ops);
                 true
             }
-            None => true,
+            HookOutcome::Issue => true,
         }
     }
 
@@ -1504,6 +1627,7 @@ mod imp {
         fn colliding_pair() -> (GpuOp, GpuOp) {
             let common = |kind: SgemmKind| GpuOp::Sgemm {
                 kind,
+                precision: GemmPrecision::F32,
                 transa: false,
                 transb: false,
                 a: 0x1000,
@@ -1520,6 +1644,54 @@ mod imp {
                 stride_c: 64 * 128,
             };
             (common(SgemmKind::RowMajor), common(SgemmKind::WgradAccum))
+        }
+
+        /// The same gemm over the same buffers in f32-storage and
+        /// bf16-storage form. They enqueue different work (two cast kernels
+        /// plus a 16BF GemmEx versus one f32 sgemm), so neither equality nor
+        /// the digest may conflate them — a mode flip between record and a
+        /// later step must diverge at this op, not replay the wrong storage
+        /// route.
+        fn precision_pair() -> (GpuOp, GpuOp) {
+            let common = |precision: GemmPrecision| GpuOp::Sgemm {
+                kind: SgemmKind::RowMajor,
+                precision,
+                transa: false,
+                transb: false,
+                a: 0x1000,
+                b: 0x2000,
+                c: 0x3000,
+                m: 64,
+                n: 128,
+                k: 32,
+                alpha_bits: 1.0f32.to_bits(),
+                beta_bits: 0.0f32.to_bits(),
+                batch: 1,
+                stride_a: 64 * 32,
+                stride_b: 32 * 128,
+                stride_c: 64 * 128,
+            };
+            (common(GemmPrecision::F32), common(GemmPrecision::Bf16Storage))
+        }
+
+        #[test]
+        fn f32_and_bf16_storage_are_not_equal() {
+            let (f32_op, bf16_op) = precision_pair();
+            assert!(
+                f32_op != bf16_op,
+                "an f32-storage and a bf16-storage gemm over the same \
+                 buffers compared equal"
+            );
+        }
+
+        #[test]
+        fn f32_and_bf16_storage_digests_differ() {
+            let (f32_op, bf16_op) = precision_pair();
+            assert_ne!(
+                digest(std::slice::from_ref(&f32_op)),
+                digest(std::slice::from_ref(&bf16_op)),
+                "storage route is invisible to the region digest"
+            );
         }
 
         #[test]
@@ -1653,5 +1825,5 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 pub(crate) use imp::{
     in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
     on_sgemm_full, queue_deferred_free, taint,
-    MemsetAction, SgemmKind,
+    GemmPrecision, MemsetAction, SgemmKind,
 };

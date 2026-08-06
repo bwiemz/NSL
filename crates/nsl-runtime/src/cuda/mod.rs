@@ -2405,9 +2405,99 @@ pub(crate) mod cublas_inner {
         cast_cells > 0.0 && flops_cells / cast_cells >= min_ratio
     }
 
-    /// The BF16 math-mode GEMM: cast both operands f32 -> bf16 into scratch
-    /// and run `cublasGemmEx(16BF, 16BF -> 32F, COMPUTE_32F)`, or fall back
-    /// to f32-storage `FAST_TF32` for low-intensity shapes.
+    /// Bf16-cast scratch for one GEMM's two operands, in cuBLAS operand
+    /// order (`first16` holds the wrapper's FIRST cuBLAS operand — the
+    /// caller's B_row on the row-major path).
+    ///
+    /// Allocated by `prepare_bf16_operands` and freed by `Drop` on EVERY
+    /// path through a wrapper — including a cuda-graphs replay step where
+    /// the cast launches and the GemmEx itself are all verified-and-skipped.
+    /// Region digest stability across steps depends on that lockstep: the
+    /// caching allocator hands out blocks as a function of the alloc/free
+    /// sequence, so a scratch alloc skipped only on replay steps would shift
+    /// every later same-size allocation in the region and diverge the
+    /// recorded pointers.
+    struct Bf16Scratch {
+        first16: *mut std::ffi::c_void,
+        second16: *mut std::ffi::c_void,
+    }
+
+    impl Drop for Bf16Scratch {
+        fn drop(&mut self) {
+            // Freeing immediately after enqueue is safe, but NOT because the
+            // free is deferred — `free_managed` returns the block to the
+            // caching allocator's free list synchronously, and the very next
+            // `alloc_managed` can hand it out while the GemmEx is still
+            // pending (review finding, 2026-07-30). Safety rests on two
+            // process invariants documented at the launch path: all GPU work
+            // is single-threaded on per-thread BLOCKING streams, so any
+            // subsequent WRITE into a reused block — kernel or NULL-stream
+            // copy — is enqueued after the GemmEx on the same stream. Under
+            // cuda-graphs replay the region's work is enqueued later still
+            // (the region-end graph launch), but the graph preserves the
+            // captured stream order, so the block's write/read timeline
+            // inside the graph matches the eager one. One cross-stream
+            // writer DOES exist today — `prefetch_htod_on_transfer` on the
+            // NON_BLOCKING transfer stream — but it writes only persistent
+            // weight-stream arena slots guarded by events, never
+            // caching-allocator blocks, and transfer-stream interactions
+            // inside regions taint; any future writer without those
+            // constraints must either event-defer these frees
+            // (`defer_free_device`) or keep the scratch alive until a sync.
+            super::inner::free_managed(self.first16);
+            super::inner::free_managed(self.second16);
+        }
+    }
+
+    /// Decide the storage route for one GEMM under the BF16 matmul mode
+    /// and, when bf16 storage wins, cast both operands into fresh scratch.
+    /// Returns `None` outside BF16 mode and for low-intensity shapes (the
+    /// `FAST_TF32` arm of `gemm_bf16_mode`).
+    ///
+    /// cuda-graphs: this MUST run BEFORE the wrapper's `on_sgemm_full` hook.
+    /// The two cast launches are ordinary hooked kernels, so issuing them
+    /// first records them AHEAD of the gemm pseudo-op — the order the stream
+    /// actually executes. On a replay step each cast then verifies-and-skips
+    /// itself at its own hook (its recorded argument bytes pin the scratch
+    /// addresses, so scratch that fails to stabilize across steps diverges
+    /// the region rather than corrupting it), and the alloc/free bookkeeping
+    /// still runs — see `Bf16Scratch`. Recording the casts BEHIND the gemm —
+    /// the pre-2026-08 shape, where the decision lived after the hook —
+    /// meant a replay's early-return at the gemm hook could never re-issue
+    /// them, which is why this path used to taint every region it touched.
+    ///
+    /// The cast uses the SR-BF16 campaign's round-to-nearest-even
+    /// `precision_cast_kernels` (deterministic, not stochastic) and the
+    /// caching allocator, so steady-state scratch is a cache hit, not a
+    /// cuMemAlloc. Element counts are independent of the transpose flags (a
+    /// transposed 2-D view is the same dense buffer read with swapped lda
+    /// semantics, so casting the flat buffer is exact).
+    fn prepare_bf16_operands(
+        first_dev: *const f32,
+        first_elems: usize,
+        second_dev: *const f32,
+        second_elems: usize,
+        m: i64,
+        n: i64,
+        k: i64,
+    ) -> Option<Bf16Scratch> {
+        if resolved_math_mode() != CublasMathMode::Bf16 {
+            return None;
+        }
+        if !bf16_storage_worthwhile(m, n, k, first_elems, second_elems) {
+            return None;
+        }
+        let first16 = super::inner::alloc_managed(first_elems * 2);
+        let second16 = super::inner::alloc_managed(second_elems * 2);
+        super::gpu_cast_raw_f32_to_bf16(first_dev as u64, first16 as u64, first_elems);
+        super::gpu_cast_raw_f32_to_bf16(second_dev as u64, second16 as u64, second_elems);
+        Some(Bf16Scratch { first16, second16 })
+    }
+
+    /// The BF16 math-mode GEMM issue path: `cublasGemmEx(16BF, 16BF -> 32F,
+    /// COMPUTE_32F)` over the pre-cast scratch when `prepare_bf16_operands`
+    /// produced one, or the f32-storage `FAST_TF32` form when it declined
+    /// (low-intensity shapes).
     ///
     /// Why storage and not a compute-type hint: measured on CUDA 13.3 /
     /// RTX 5070 Ti (N=4096, 2026-07-29 probe),
@@ -2420,17 +2510,10 @@ pub(crate) mod cublas_inner {
     ///
     /// `FAST_16BF` with f32 storage is silently served by the TF32 kernels;
     /// only bf16 operand storage reaches the 87.9-TFLOPS-peak kernel family.
-    /// The cast uses the SR-BF16 campaign's round-to-nearest-even
-    /// `precision_cast_kernels` (deterministic, not stochastic) and the
-    /// caching allocator, so steady-state scratch is a cache hit, not a
-    /// cuMemAlloc.
     ///
     /// Arguments are in cuBLAS column-major order, ALREADY operand-swapped
-    /// by the caller (first operand is the caller's B_row); `a_elems` /
-    /// `b_elems` are the dense element counts of the buffers, which are
-    /// independent of the transpose flags (a transposed 2-D view is the
-    /// same dense buffer read with swapped lda semantics, so casting the
-    /// flat buffer is exact).
+    /// by the caller (first operand is the caller's B_row); `scratch` was
+    /// prepared in the same operand order.
     #[allow(clippy::too_many_arguments)]
     unsafe fn gemm_bf16_mode(
         handle: cublas_sys::cublasHandle_t,
@@ -2442,50 +2525,27 @@ pub(crate) mod cublas_inner {
         alpha: &f32,
         a_dev: *const f32,
         lda: i32,
-        a_elems: usize,
         b_dev: *const f32,
         ldb: i32,
-        b_elems: usize,
         beta: &f32,
         c_dev: *mut f32,
         ldc: i32,
+        scratch: Option<&Bf16Scratch>,
     ) -> Result<(), cublas_result::CublasError> {
         let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
-        let use_bf16 = bf16_storage_worthwhile(m as i64, n as i64, k as i64, a_elems, b_elems);
-        let (a_ptr, b_ptr, ab_type, a_scratch, b_scratch, compute) = if use_bf16 {
-            // cuda-graphs: taint the region (review finding, 2026-07-30).
-            // The caller's Sgemm pseudo-op was recorded BEFORE this branch,
-            // but the two cast launches below are hooked kernels that would
-            // ALSO be recorded — and on replay the wrapper early-returns at
-            // the Sgemm hook, so the casts are never re-issued: the next
-            // hooked op mismatches the recorded cast, the region cycles
-            // through repair, and after MAX_CAPTURE_ATTEMPTS goes
-            // permanently eager anyway — silently. Tainting makes the same
-            // outcome explicit and cheap (the muon strided path sets the
-            // precedent). BF16-mode GEMMs inside captured regions run
-            // eager; correctness is unaffected either way.
-            super::graph_capture::taint("bf16-storage gemm casts");
-            let a16 = super::inner::alloc_managed(a_elems * 2);
-            let b16 = super::inner::alloc_managed(b_elems * 2);
-            super::gpu_cast_raw_f32_to_bf16(a_dev as u64, a16 as u64, a_elems);
-            super::gpu_cast_raw_f32_to_bf16(b_dev as u64, b16 as u64, b_elems);
-            (
-                a16 as *const std::ffi::c_void,
-                b16 as *const std::ffi::c_void,
+        let (a_ptr, b_ptr, ab_type, compute) = match scratch {
+            Some(s) => (
+                s.first16 as *const std::ffi::c_void,
+                s.second16 as *const std::ffi::c_void,
                 cublas_sys::cudaDataType_t::CUDA_R_16BF,
-                a16,
-                b16,
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            )
-        } else {
-            (
+            ),
+            None => (
                 a_dev as *const std::ffi::c_void,
                 b_dev as *const std::ffi::c_void,
                 f32t,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
-            )
+            ),
         };
         let status = unsafe {
             cublas_sys::cublasGemmEx(
@@ -2510,22 +2570,9 @@ pub(crate) mod cublas_inner {
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
             )
         };
-        // Freeing immediately after enqueue is safe, but NOT because the
-        // free is deferred — `free_managed` returns the block to the
-        // caching allocator's free list synchronously, and the very next
-        // `alloc_managed` can hand it out while the GemmEx is still
-        // pending (review finding, 2026-07-30). Safety rests on two
-        // process invariants documented at the launch path: all GPU work
-        // is single-threaded on per-thread BLOCKING streams, so any
-        // subsequent WRITE into a reused block — kernel or NULL-stream
-        // copy — is enqueued after the GemmEx on the same stream. A future
-        // multi-threaded dispatcher or cross-stream writer must either
-        // event-defer these frees (`defer_free_device`) or keep the
-        // scratch alive until a sync.
-        if !a_scratch.is_null() {
-            super::inner::free_managed(a_scratch);
-            super::inner::free_managed(b_scratch);
-        }
+        // The scratch (when present) is freed by the caller's `Bf16Scratch`
+        // Drop right after this returns — see its Drop for the
+        // free-after-enqueue safety argument.
         if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublas_result::CublasError(status));
         }
@@ -2577,8 +2624,27 @@ pub(crate) mod cublas_inner {
             m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
             "sgemm dims must fit in i32"
         );
+        // cuda-graphs: the bf16-storage decision and its two cast launches
+        // come BEFORE the gemm hook, so the recorded op order matches the
+        // stream order (casts, then gemm) and the scratch bookkeeping runs
+        // on replay steps too — see `prepare_bf16_operands`.
+        let scratch = prepare_bf16_operands(
+            b_dev,
+            (k * n) as usize, // cuBLAS's FIRST operand is B_row
+            a_dev,
+            (m * k) as usize, // ...and its SECOND is A_row
+            n as i64,
+            m as i64,
+            k as i64,
+        );
+        let precision = if scratch.is_some() {
+            super::graph_capture::GemmPrecision::Bf16Storage
+        } else {
+            super::graph_capture::GemmPrecision::F32
+        };
         if !super::graph_capture::on_sgemm_full(
             super::graph_capture::SgemmKind::RowMajor,
+            precision,
             transa,
             transb,
             a_dev as usize,
@@ -2587,6 +2653,9 @@ pub(crate) mod cublas_inner {
             m, n, k, alpha, beta,
             1, m * k, k * n, m * n,
         ) {
+            // Verified-and-skipped: the region-end graph launch performs the
+            // whole cast+gemm group. `scratch` drops here, keeping the
+            // allocator in lockstep with the recorded steps.
             return Ok(());
         }
         let handle = cublas_handle();
@@ -2609,7 +2678,7 @@ pub(crate) mod cublas_inner {
             }
         };
         // BF16 cannot be expressed on the handle, so its branch goes through
-        // `gemm_bf16_mode` (bf16-storage casts for high-intensity shapes,
+        // `gemm_bf16_mode` (the pre-cast scratch for high-intensity shapes,
         // explicit FAST_TF32 otherwise). Every other mode keeps the proven
         // cublasSgemm_v2 call, where the handle's math mode governs —
         // converting those too would re-open the measured speed/accuracy
@@ -2626,13 +2695,12 @@ pub(crate) mod cublas_inner {
                     &alpha,
                     b_dev,
                     if transb { k as i32 } else { n as i32 },
-                    (k * n) as usize, // B_row's dense element count
                     a_dev,
                     if transa { m as i32 } else { k as i32 },
-                    (m * k) as usize, // A_row's dense element count
                     &beta,
                     c_dev,
                     n as i32,
+                    scratch.as_ref(),
                 )
             };
         }
@@ -2803,7 +2871,24 @@ pub(crate) mod cublas_inner {
             n_rows <= i32::MAX as u64 && d_in <= i32::MAX as u64 && d_out <= i32::MAX as u64,
             "wgrad gemm dims must fit in i32"
         );
-        // cuda-graphs: recorded as a distinct pseudo-op shape. The alpha/beta
+        // cuda-graphs: the bf16-storage decision and its cast launches come
+        // BEFORE the gemm hook — see `prepare_bf16_operands` and the
+        // row-major wrapper.
+        let scratch = prepare_bf16_operands(
+            g_dev,
+            (n_rows * d_out) as usize, // cuBLAS's FIRST operand is G
+            x_dev,
+            (n_rows * d_in) as usize, // ...and its SECOND is X
+            d_out as i64,
+            d_in as i64,
+            n_rows as i64,
+        );
+        let precision = if scratch.is_some() {
+            super::graph_capture::GemmPrecision::Bf16Storage
+        } else {
+            super::graph_capture::GemmPrecision::F32
+        };
+        // Recorded as a distinct pseudo-op shape. The alpha/beta
         // bits are part of GpuOp::Sgemm's identity, so an accumulating gemm
         // can never be replayed as an overwriting one.
         // Recorded with its OWN kind. `sgemm_row_major` calls the same hook
@@ -2813,6 +2898,7 @@ pub(crate) mod cublas_inner {
         // row-major gemm. Silently wrong gradients, no error.
         if !super::graph_capture::on_sgemm_full(
             super::graph_capture::SgemmKind::WgradAccum,
+            precision,
             false,
             false,
             x_dev as usize,
@@ -2828,6 +2914,8 @@ pub(crate) mod cublas_inner {
             n_rows * d_out,
             d_in * d_out,
         ) {
+            // Verified-and-skipped; `scratch` drops here (allocator
+            // lockstep — see `Bf16Scratch`).
             return Ok(());
         }
         let handle = cublas_handle();
@@ -2861,13 +2949,12 @@ pub(crate) mod cublas_inner {
                     &alpha,
                     g_dev,
                     d_out as i32,
-                    (n_rows * d_out) as usize, // G's dense element count
                     x_dev,
                     d_in as i32,
-                    (n_rows * d_in) as usize, // X's dense element count
                     &beta,
                     c_dev,
                     d_out as i32,
+                    scratch.as_ref(),
                 )
             };
         }
@@ -3957,6 +4044,233 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     assert_eq!(
         result as u32, 0,
         "GPU fase_fused_adamw_multi kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
+/// Roadmap item 8, bf16-SR arm: the flat-grid MULTI variant of
+/// `gpu_fase_fused_adamw_step_bf16sr`. One launch steps every bf16-mirrored
+/// parameter in the bucket: `t_ptrs` are RAW bf16 mirror device pointers
+/// (2 bytes/elem), `ctr_bases[i]` is param i's stable SR counter base
+/// (`param_idx << SR_PARAM_SHIFT`, the SAME value its per-param launch would
+/// pass), and `sr_key` is the per-step key — so every (param, element)
+/// draws the identical dither the per-param loop draws, and the batched
+/// step is bit-identical to the launches it replaces.
+///
+/// Same workspace discipline as `gpu_fase_fused_adamw_step_multi`: pinned
+/// staging + device tables cached at capacity, block tables cached on the
+/// shape list. A SEPARATE thread-local workspace — this one stages FIVE u64
+/// tables (the extra one is ctrtab), so sharing the f32 workspace would
+/// mis-offset every upload after the first.
+///
+/// No `mp_scale`: the per-param SR entry has no clip fold, and this arm
+/// exists to replace exactly that entry. No m_partial zeroing either — the
+/// FASE-Deferred lifecycle owns it on the SR path.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
+    t_ptrs: &[u64], m_ptrs: &[u64], v_ptrs: &[u64], mp_ptrs: &[u64],
+    lens: &[u32], ctr_bases: &[u64],
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+    sr_key: u64,
+) {
+    let k = t_ptrs.len();
+    if k == 0 {
+        return;
+    }
+    assert!(
+        k == m_ptrs.len() && k == v_ptrs.len() && k == mp_ptrs.len()
+            && k == lens.len() && k == ctr_bases.len(),
+        "multi bf16sr adamw: table length mismatch"
+    );
+
+    struct SrMultiWs {
+        cap: usize,
+        stage: u64,     // pinned host: 5*cap u64 + cap u32
+        tabs: [u64; 5], // device u64 tables: theta, m, v, mp, ctr
+        ntab: u64,      // device u32 table
+        blk_lens: Vec<u32>,
+        blk_param: u64, // device u32[nblocks]
+        blk_base: u64,  // device u32[nblocks]
+        blk_count: usize,
+    }
+    thread_local! {
+        static SR_WS: std::cell::Cell<*mut SrMultiWs> =
+            const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+
+    inner::set_oom_context("fase_fused_adamw_multi_bf16sr");
+    let ws: &mut SrMultiWs = SR_WS.with(|c| {
+        let cur = c.get();
+        let need_new = cur.is_null() || unsafe { (*cur).cap } < k;
+        if need_new {
+            unsafe {
+                inner::ensure_context();
+                // Quiesce before releasing/rewriting anything a prior step
+                // may still be reading.
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+                if !cur.is_null() {
+                    let old = Box::from_raw(cur);
+                    for t in old.tabs {
+                        inner::free_managed(t as *mut c_void);
+                    }
+                    inner::free_managed(old.ntab as *mut c_void);
+                    if old.blk_param != 0 {
+                        inner::free_managed(old.blk_param as *mut c_void);
+                        inner::free_managed(old.blk_base as *mut c_void);
+                    }
+                    cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
+                }
+                let mut stage: *mut c_void = std::ptr::null_mut();
+                let bytes = 5 * k * 8 + k * 4;
+                let r = cudarc::driver::sys::cuMemAllocHost_v2(&mut stage, bytes.max(8));
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "multi bf16sr adamw: pinned staging alloc failed"
+                );
+                let tabs = [
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                ];
+                let ntab = inner::alloc_managed(k * 4) as u64;
+                let fresh = Box::into_raw(Box::new(SrMultiWs {
+                    cap: k,
+                    stage: stage as u64,
+                    tabs,
+                    ntab,
+                    blk_lens: Vec::new(),
+                    blk_param: 0,
+                    blk_base: 0,
+                    blk_count: 0,
+                }));
+                c.set(fresh);
+            }
+        } else {
+            // Same-cap reuse: the previous optimizer step's uploads read this
+            // pinned block — quiesce before the host rewrite below.
+            unsafe {
+                inner::ensure_context();
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+            }
+        }
+        unsafe { &mut *c.get() }
+    });
+
+    unsafe {
+        let base = ws.stage as *mut u64;
+        std::ptr::copy_nonoverlapping(t_ptrs.as_ptr(), base, k);
+        std::ptr::copy_nonoverlapping(m_ptrs.as_ptr(), base.add(ws.cap), k);
+        std::ptr::copy_nonoverlapping(v_ptrs.as_ptr(), base.add(2 * ws.cap), k);
+        std::ptr::copy_nonoverlapping(mp_ptrs.as_ptr(), base.add(3 * ws.cap), k);
+        std::ptr::copy_nonoverlapping(ctr_bases.as_ptr(), base.add(4 * ws.cap), k);
+        let nbase = (ws.stage as usize + 5 * ws.cap * 8) as *mut u32;
+        std::ptr::copy_nonoverlapping(lens.as_ptr(), nbase, k);
+        let up = |dst: u64, src_off: usize, bytes: usize| {
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst,
+                (ws.stage as usize + src_off) as *const c_void,
+                bytes,
+                inner::current_stream(),
+            );
+            assert_eq!(
+                r,
+                cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                "multi bf16sr adamw: table upload failed"
+            );
+        };
+        for (idx, tab) in ws.tabs.iter().enumerate() {
+            up(*tab, idx * ws.cap * 8, k * 8);
+        }
+        up(ws.ntab, 5 * ws.cap * 8, k * 4);
+    }
+
+    // Block tables: same pure function of `lens`, same cache-on-shape-list
+    // policy as the f32 multi. The `blockDim.x == build_block_tables block`
+    // contract is shared — one constant feeds both.
+    let block = 256i64;
+    if ws.blk_lens != lens {
+        let (bparam, bbase) = crate::fase_step::build_block_tables(lens, block as u32);
+        let nblocks = bparam.len();
+        unsafe {
+            inner::ensure_context();
+            // The previous step's launch may still be reading these.
+            let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+            assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+            if ws.blk_param != 0 {
+                inner::free_managed(ws.blk_param as *mut c_void);
+                inner::free_managed(ws.blk_base as *mut c_void);
+            }
+            ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
+            ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
+            let cp = |dst: u64, src: &[u32]| {
+                let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
+                    dst,
+                    src.as_ptr() as *const c_void,
+                    src.len() * 4,
+                );
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "multi bf16sr adamw: block table upload failed"
+                );
+            };
+            cp(ws.blk_param, &bparam);
+            cp(ws.blk_base, &bbase);
+        }
+        ws.blk_count = nblocks;
+        ws.blk_lens = lens.to_vec();
+    }
+
+    let mut a0 = ws.tabs[0];
+    let mut a1 = ws.tabs[1];
+    let mut a2 = ws.tabs[2];
+    let mut a3 = ws.tabs[3];
+    let mut a4 = ws.ntab;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let mut sr_key_val = sr_key;
+    let mut a5 = ws.tabs[4];
+    let mut a6 = ws.blk_param;
+    let mut a7 = ws.blk_base;
+    let args = [
+        &mut a0 as *mut _ as *mut c_void,
+        &mut a1 as *mut _ as *mut c_void,
+        &mut a2 as *mut _ as *mut c_void,
+        &mut a3 as *mut _ as *mut c_void,
+        &mut a4 as *mut _ as *mut c_void,
+        &mut b1 as *mut _ as *mut c_void,
+        &mut omb1 as *mut _ as *mut c_void,
+        &mut b2 as *mut _ as *mut c_void,
+        &mut omb2 as *mut _ as *mut c_void,
+        &mut eps as *mut _ as *mut c_void,
+        &mut neg_lr as *mut _ as *mut c_void,
+        &mut neg_lr_wd as *mut _ as *mut c_void,
+        &mut bc1 as *mut _ as *mut c_void,
+        &mut bc2 as *mut _ as *mut c_void,
+        &mut has_wd_val as *mut _ as *mut c_void,
+        &mut sr_key_val as *mut _ as *mut c_void,
+        &mut a5 as *mut _ as *mut c_void,
+        &mut a6 as *mut _ as *mut c_void,
+        &mut a7 as *mut _ as *mut c_void,
+    ];
+    let grid_x = ws.blk_count as i64;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_MULTI_BF16SR_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_multi_bf16sr\0".as_ptr(),
+        [grid_x, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_multi_bf16sr kernel failed: {}", result as u32
     );
     inner::sync_after_kernel();
 }
@@ -7522,12 +7836,9 @@ pub(crate) fn upload_meta_i64_cached(host: *const i64, ndim: usize) -> *mut std:
     }
     let bytes = ndim * std::mem::size_of::<i64>();
     let dev = {
-        use crate::cuda::caching_allocator::{get_alloc_pool, set_alloc_pool, AllocPool};
-        let prev = get_alloc_pool();
-        set_alloc_pool(AllocPool::Persistent);
-        let p = inner::alloc_managed(bytes);
-        set_alloc_pool(prev);
-        p
+        use crate::cuda::caching_allocator::{AllocPool, PoolGuard};
+        let _pool = PoolGuard::new(AllocPool::Persistent);
+        inner::alloc_managed(bytes)
     };
     // Immediate, NOT `memcpy_htod`: a capture region would defer this to graph
     // launch and the cache would publish a pointer to unwritten memory. See

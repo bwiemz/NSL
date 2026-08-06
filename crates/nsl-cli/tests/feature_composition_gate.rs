@@ -1054,6 +1054,21 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
     // continues. The registry models refusals — RuleKind has no "advisory"
     // variant — so recording it here would overstate what is enforced.
     ("has no effect without --monitor", "advisory warning, run continues"),
+    // ADVISORY, same reasoning: --cpdt without a WGGO plan prints the skip
+    // notice and the compile SUCCEEDS (CPDT simply does not apply). This
+    // replaced a silent skip; registering it as a refusal would overstate it.
+    (
+        "CPDT planning requires a WGGO plan",
+        "advisory skip notice, compile succeeds",
+    ),
+    // A STALENESS refusal, not a composition rule: the flags compose fine —
+    // what is refused is executing moment dtypes derived from a
+    // fingerprint-rejected WGGO pre-plan. A pairwise flag registry cannot
+    // express "this artifact went stale mid-compile".
+    (
+        "refusing to execute a stale precision plan",
+        "staleness refusal, not a flag-pair incompatibility",
+    ),
     ("warning \u{2014} --wrga-ablate=spectral", "advisory warning, run continues"),
     ("--trace is not implemented", "unimplemented-subcommand notice, not a composition"),
     ("cannot determine export format", "diagnostic listing ways to supply a format"),

@@ -309,6 +309,36 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         None,
     ),
+    // Item 8, bf16-SR arm: the SR twin of the idx entry above. Same contract
+    // minus mp_scale (the SR path has no clip fold; the layerwise schedule
+    // refuses grad_clip) plus the trailing `step` the SR counter stream is
+    // keyed on. No full-list twin exists: bf16-sr requires --weight-stream,
+    // which requires --layerwise-accum, so SR only ever batches from the
+    // CSLA group update. Same lockstep warning: this list, the `stmt.rs`
+    // emission order, and the Rust signature in `sr_bf16.rs` must not drift.
+    (
+        "nsl_fase_fused_adamw_step_bf16sr_multi_idx",
+        &[
+            types::I64, // params_list
+            types::I64, // m_list
+            types::I64, // v_list
+            types::I64, // mp_list
+            types::I64, // idx_list (NslList of i64 param indices)
+            types::F64, // lr
+            types::F64, // beta1
+            types::F64, // one_minus_beta1
+            types::F64, // beta2
+            types::F64, // one_minus_beta2
+            types::F64, // eps
+            types::F64, // wd
+            types::F64, // bc1_inv
+            types::F64, // bc2_inv
+            types::I64, // wd_exempt_list (0 = flat wd; CSLA passes 0)
+            types::I64, // wd_exempt_non_rank2
+            types::I64, // step (SR counter key)
+        ],
+        None,
+    ),
     // FASE two-phase-clip Phase A: global sum-of-squares over an NslList of
     // m_partial tensors with ONE pipeline drain (batched device reduction).
     ("nsl_fase_sum_sq_list", &[types::I64], Some(types::F64)),
@@ -2991,13 +3021,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Second arg: expected row count (decorator batch*seq) — the runtime
     // aborts loudly on mismatch instead of overreading the staging buffer.
     ("nsl_fused_lce_targets_i64_alloc", &[types::I64, types::I64], Some(types::I64)),
-    // (x_tensor, w_tensor, batch, seq, vocab_size, hidden_size) -> void.
-    // Aborts when the @fused_lm_ce hints disagree with the head tensors.
-    // batch and seq stay SEPARATE: collapsing them to rows here would let
-    // a swapped pair through, and the backward builds dx from the pair.
+    // (x_tensor, w_tensor, batch, seq, vocab_size, hidden_size, site_code)
+    // -> void. Aborts when the decorator hints disagree with the head
+    // tensors. batch and seq stay SEPARATE: collapsing them to rows here
+    // would let a swapped pair through, and the backward builds dx from the
+    // pair. site_code names the caller in the diagnostic (0 = @fused_lm_ce,
+    // 1/2 = @fused_kl_ce student/teacher) so a refusal never blames the
+    // wrong decorator or the wrong hint name.
     (
         "nsl_fused_lce_pin_hint_extents",
         &[
+            types::I64,
             types::I64,
             types::I64,
             types::I64,

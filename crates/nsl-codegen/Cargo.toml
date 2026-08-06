@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 nsl-ast.workspace = true
 nsl-lexer.workspace = true
+string-interner.workspace = true
 nsl-semantic.workspace = true
 nsl-errors.workspace = true
 cranelift-codegen.workspace = true
@@ -68,7 +69,6 @@ experimental-wrga = []
 experimental-cpdt = []
 
 [dev-dependencies]
-string-interner.workspace = true
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
 libloading = "0.8"

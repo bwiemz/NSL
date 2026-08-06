@@ -565,26 +565,25 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
         applied_implies_published: Invariant::Enforced,
-        // A WART, surfaced by the analysis that added this field and recorded
-        // rather than silently blessed: within ONE compile_train_block_inner
-        // run, the moment-init precision read (stmt.rs, the
-        // `precision_active` block) executes in straight line BEFORE
-        // `invoke_cpdt_if_enabled` publishes (which happens after extraction
-        // and pass planning, before primal lowering). So a single-train-block
-        // compile's moment-precision arbitration reads the channel empty and
-        // CPDT-sourced precision stays inactive. The only feeder is an
-        // EARLIER TRAIN BLOCK in the same process: the channel is never
-        // cleared between blocks, so block 2's read consumes block 1's plan
-        // — a stale cross-block consumption of exactly the shape
-        // wggo_overrides' install/clear pairing exists to prevent. Whether
-        // that is design or defect deserves its own investigation; enforcing
-        // here would flag every CPDT-enabled compile, which is crying wolf
-        // either way.
+        // The wart this field's analysis originally surfaced — the
+        // moment-precision consult read the channel ~2.2k driver lines
+        // before the same block's publish, so CPDT-sourced moment precision
+        // was structurally inert (proved: `published 1x, read 0x full, 1x
+        // empty` + a DEAD OUTPUT finding on a fully-flag-enabled compile) —
+        // is FIXED by the pre-plan offer: `compile_train_block` now runs
+        // CPDT planning from the block's WGGO pre-plan before the body
+        // compiles, the same install/clear pairing as wggo_overrides. The
+        // empty-read-then-late-publish pattern remains reachable only on
+        // the NO-pre-plan path (distill and loop-bound train blocks, which
+        // the prepass does not walk) — on the rejected-fingerprint path the
+        // consult's read was FULL, rejection is decided later, and the
+        // planning site refuses on divergence rather than staying silent.
         read_before_publish: Invariant::Exempt(
-            "the moment-init precision read precedes the same train block's \
-             publish by construction; only an earlier train block's plan \
-             (never cleared between blocks) can feed it — recorded as a \
-             wart pending its own investigation",
+            "reachable only where no pre-plan exists (distill and loop-bound \
+             train blocks): the late publish postdates the moment consult by \
+             construction there, and the planning site prints a not-lowered \
+             notice instead of silently training with FP32 moments the flags \
+             asked to narrow",
         ),
     },
     ChannelDescriptor {
@@ -1047,6 +1046,18 @@ impl PassBus {
 
     pub fn cpdt_plan(&self) -> Option<&crate::cpdt::CpdtPlan> {
         note_read(Channel::CpdtPlan, self.cpdt_plan.as_ref())
+    }
+
+    /// Clear the plan before compiling a train block that has no WGGO
+    /// pre-plan to offer CPDT.
+    ///
+    /// Not a publish, and not counted — the same install/clear pairing as
+    /// [`Self::clear_wggo_overrides`], for the same stale-leak: without it a
+    /// block with no pre-plan would let its moment-precision consult consume
+    /// the PREVIOUS block's plan, which is exactly the cross-block
+    /// consumption this channel's descriptor recorded as a wart.
+    pub fn clear_cpdt_plan(&mut self) {
+        self.cpdt_plan = None;
     }
 
     // ── CFIE plan ────────────────────────────────────────────────────

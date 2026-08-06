@@ -270,8 +270,16 @@ struct Extents<'a> {
 /// `Ok(())` when the hints agree, or when a non-positive hint makes the pin
 /// meaningless — this exists to catch a wrong shape, not to add a new
 /// refusal class for shapes the rest of the stack already rejects.
+#[allow(clippy::too_many_arguments)] // threading h_name pushed this to 8; splitting a pure checker to dodge a lint would hurt more
 fn check_hint_extents(
     site: &str,
+    // The decorator hint the `h` value came from ("hidden_size" for the
+    // @fused_lm_ce and @fused_kl_ce STUDENT pins, "teacher_hidden" for the
+    // teacher pin). Threaded into the message bodies because a diagnostic
+    // that says "correct hidden_size" for a wrong teacher_hidden sends the
+    // user at the correct hint — the followable-but-wrong-advice class,
+    // one level below the site prefix.
+    h_name: &str,
     x: &Extents<'_>,
     w: &Extents<'_>,
     batch: i64,
@@ -300,19 +308,19 @@ fn check_hint_extents(
     if !x_ok {
         let implied_h = (x.len % rows == 0).then(|| x.len / rows);
         return Err(format!(
-            "{site}: the @fused_lm_ce decorator pins batch_size = {batch}, \
-             seq_len = {seq}, hidden_size = {h}, but the head's input tensor \
+            "{site}: the decorator pins batch_size = {batch}, \
+             seq_len = {seq}, {h_name} = {h}, but the head's input tensor \
              is {:?}{}. The fused kernel strides it as [batch_size * seq_len, \
-             hidden_size] with no bounds check of its own, and the backward \
-             allocates dx as [batch_size, seq_len, hidden_size] -- so a \
+             {h_name}] with no bounds check of its own, and the backward \
+             allocates dx as [batch_size, seq_len, {h_name}] -- so a \
              mismatch here reads past the allocation \
              (CUDA_ERROR_ILLEGAL_ADDRESS, or a silently wrong loss when the \
              overread lands in allocator slack), or produces a dx with the \
-             wrong dims. Correct the hints on @fused_lm_ce to match the model \
-             and the DataLoader.",
+             wrong dims. Correct the decorator's hints to match the model \
+             and the data.",
             x.shape,
             match implied_h {
-                Some(hh) if hh != h => format!(" -- its {} elements over {rows} row(s) imply hidden_size = {hh}", x.len),
+                Some(hh) if hh != h => format!(" -- its {} elements over {rows} row(s) imply {h_name} = {hh}", x.len),
                 _ => String::new(),
             }
         ));
@@ -322,11 +330,11 @@ fn check_hint_extents(
     if w.shape != [v, h] {
         let implied_v = (w.len % h == 0).then(|| w.len / h);
         return Err(format!(
-            "{site}: the @fused_lm_ce decorator pins vocab_size = {v} (at \
-             hidden_size = {h}), but the LM-head weight is {:?}{}. The fused \
+            "{site}: the decorator pins vocab_size = {v} (at \
+             {h_name} = {h}), but the LM-head weight is {:?}{}. The fused \
              kernel strides it as [vocab_size, hidden_size] with no bounds \
              check of its own, so it would read past the allocation. Correct \
-             vocab_size on @fused_lm_ce to the model's vocabulary.",
+             vocab_size on the decorator to the model's vocabulary.",
             w.shape,
             match implied_v {
                 Some(vv) if vv != v => format!(" -- implying vocab_size = {vv}"),
@@ -360,7 +368,16 @@ fn check_hint_extents(
 }
 
 /// Read the two head tensors and abort with [`check_hint_extents`]'s
-/// diagnostic if the `@fused_lm_ce` hints disagree with them.
+/// diagnostic if the decorator's hints disagree with them.
+///
+/// `site_code` names the CALLER in every diagnostic, because the same
+/// arithmetic pins two decorators' hints and a refusal that blames the wrong
+/// one gives followable-but-wrong advice (the failure class the first
+/// version of the `@fused_lm_ce` pin shipped, at message granularity):
+/// 0 = `@fused_lm_ce` (x, W); 1 = `@fused_kl_ce` student (x_s, W_s, against
+/// `hidden_size`); 2 = `@fused_kl_ce` teacher (x_t, W_t, against
+/// `teacher_hidden`). An unknown code aborts — the codegen helper and this
+/// match must move together.
 ///
 /// # Why this takes TENSOR handles, not the kernel's pointers
 ///
@@ -392,11 +409,24 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
     seq: i64,
     v: i64,
     h: i64,
+    site_code: i64,
 ) {
-    const SITE: &str = "@fused_lm_ce shape-hint pin";
+    let (site, h_name): (&'static str, &'static str) = match site_code {
+        0 => ("@fused_lm_ce shape-hint pin", "hidden_size"),
+        1 => ("@fused_kl_ce student shape-hint pin (hidden_size)", "hidden_size"),
+        2 => ("@fused_kl_ce teacher shape-hint pin (teacher_hidden)", "teacher_hidden"),
+        other => {
+            eprintln!(
+                "nsl_fused_lce_pin_hint_extents: unknown site code {other} — \
+                 the emit_fused_lce_hint_pin helper and this match are out of \
+                 sync; refusing rather than misattributing the diagnostic"
+            );
+            std::process::abort();
+        }
+    };
     let extents_of = |ptr: i64, what: &str| -> Extents {
         if ptr == 0 {
-            eprintln!("{SITE}: null {what} tensor");
+            eprintln!("{site}: null {what} tensor");
             std::process::abort();
         }
         // NOT `NslTensor::from_ptr`: its magic check is a `debug_assert!`,
@@ -405,7 +435,7 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
         let t = unsafe { &*(ptr as *const crate::tensor::NslTensor) };
         if t.magic != crate::tensor::TENSOR_MAGIC {
             eprintln!(
-                "{SITE}: {what} is not an NslTensor handle (magic \
+                "{site}: {what} is not an NslTensor handle (magic \
                  0x{:08X} at 0x{ptr:X}, expected 0x{:08X}). The pin needs \
                  the tensor, not the `nsl_tensor_data_ptr` result the \
                  kernels take.",
@@ -423,9 +453,9 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
     };
     let x = extents_of(x_tensor_ptr, "head input (x)");
     let w = extents_of(w_tensor_ptr, "LM-head weight (W)");
-    if let Err(msg) = check_hint_extents(SITE, &x, &w, batch, seq, v, h) {
+    if let Err(msg) = check_hint_extents(site, h_name, &x, &w, batch, seq, v, h) {
         if hint_pin_disabled() {
-            eprintln!("{msg}\n{SITE}: NSL_FUSED_LCE_HINT_PIN=0 set — continuing anyway.");
+            eprintln!("{msg}\n{site}: NSL_FUSED_LCE_HINT_PIN=0 set — continuing anyway.");
             return;
         }
         eprintln!("{msg}");
@@ -481,7 +511,7 @@ mod hint_extent_tests {
     }
 
     fn check(x: &Extents<'_>, w: &Extents<'_>, b: i64, s: i64, v: i64, h: i64) -> Result<(), String> {
-        check_hint_extents("test_site", x, w, b, s, v, h)
+        check_hint_extents("test_site", "hidden_size", x, w, b, s, v, h)
     }
 
     /// The shipped shape: rank-3 `[B, S, H]` head input.
@@ -525,7 +555,69 @@ mod hint_extent_tests {
             err.contains("hidden_size = 512"),
             "must name the value the tensor implies, so the fix is mechanical: {err}"
         );
-        assert!(err.contains("@fused_lm_ce"), "must point at the decorator: {err}");
+        // The SITE prefix is what points at the decorator now — the body
+        // says "the decorator" so the same arithmetic can serve
+        // @fused_kl_ce's student/teacher pins without misattributing. The
+        // production site strings each name their decorator and hint; here
+        // the helper passes "test_site", so that is what must appear.
+        assert!(err.contains("test_site"), "must carry the site prefix: {err}");
+        assert!(
+            !err.contains("@fused_lm_ce"),
+            "the body must not hardcode a decorator the site may contradict: {err}"
+        );
+    }
+
+    /// The site discriminants live in TWO crates: the codegen enum
+    /// (`FusedCePinSite` in wengert_lower.rs) and the extern fn's match in
+    /// THIS file. The runtime's unknown-code abort catches out-of-range
+    /// codes; a 1<->2 SWAP would misattribute silently everywhere except
+    /// the GPU-#[ignore] gates, which the PR lane never runs. This pins the
+    /// pairing on the featureless lane, the same sibling-crate-source idiom
+    /// nsl-abi uses.
+    #[test]
+    fn site_codes_agree_with_the_codegen_enum() {
+        let codegen = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("nsl-codegen/src/wengert_lower.rs");
+        let codegen = std::fs::read_to_string(&codegen)
+            .expect("wengert_lower.rs must be readable from the sibling crate");
+        for needle in ["Lm = 0", "KlStudent = 1", "KlTeacher = 2"] {
+            assert!(
+                codegen.contains(needle),
+                "codegen's FusedCePinSite lost `{needle}` — realign with the \
+                 runtime match before anything else"
+            );
+        }
+        let runtime = include_str!("fused_linear_ce.rs");
+        for needle in [
+            "0 => (\"@fused_lm_ce",
+            "1 => (\"@fused_kl_ce student",
+            "2 => (\"@fused_kl_ce teacher",
+        ] {
+            assert!(
+                runtime.contains(needle),
+                "the runtime site match lost `{needle}` — realign with \
+                 codegen's FusedCePinSite"
+            );
+        }
+    }
+
+    /// The h_name threading exists so a wrong `teacher_hidden` is never
+    /// reported as a wrong `hidden_size` — the followable-but-wrong-advice
+    /// class, one level below the site prefix. Pin both directions.
+    #[test]
+    fn a_teacher_hint_mismatch_names_teacher_hidden() {
+        let (x, w) = ok3();
+        let err =
+            check_hint_extents("test_site", "teacher_hidden", &x, &w, B, S, V, 1024)
+                .unwrap_err();
+        assert!(err.contains("teacher_hidden = 1024"), "{err}");
+        assert!(err.contains("imply teacher_hidden = 512"), "{err}");
+        assert!(
+            !err.contains("hidden_size"),
+            "a teacher-side mismatch must not mention the student's hint: {err}"
+        );
     }
 
     #[test]

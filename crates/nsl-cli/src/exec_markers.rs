@@ -187,6 +187,25 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          (roadmap item 2 step 4)",
     ),
     m(
+        "[cpdt]",
+        &[
+            // The planning driver's diagnostics: tier agreement, the
+            // moment-precision arbitration arms (active / NOT lowered), the
+            // stale-plan refusal's neighbors, and the no-WGGO skip notice.
+            "crates/nsl-codegen/src/stmt.rs",
+            // Decorator, MoE capacity, and expert-prune diagnostics.
+            "crates/nsl-codegen/src/cpdt_decorator.rs",
+            "crates/nsl-codegen/src/cpdt_moe_capacity.rs",
+            "crates/nsl-codegen/src/cpdt_expert_prune.rs",
+            // CLI-side plan rendering.
+            "crates/nsl-cli/src/commands/build/options.rs",
+            "crates/nsl-cli/src/commands/build/run.rs",
+        ],
+        "CPDT planning diagnostics — tier agreement, optimizer-moment \
+         precision arbitration, and the skip/refusal notices for plans that \
+         cannot apply (roadmap item 12 family)",
+    ),
+    m(
         "[param-plan]",
         &[
             // The compile-time report...
@@ -322,6 +341,7 @@ pub mod tokens {
     pub const TAPE_AD: &str = "[tape-ad]";
     pub const SR_BF16: &str = "[sr-bf16]";
     pub const PARAM_PLAN: &str = "[param-plan]";
+    pub const CPDT: &str = "[cpdt]";
     pub const PASS_TRACE: &str = "[pass-trace]";
     pub const PASS_BUS: &str = "[pass-bus]";
     pub const FLASH_BWD: &str = "[flash-bwd]";

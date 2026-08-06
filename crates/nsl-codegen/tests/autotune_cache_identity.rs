@@ -669,23 +669,78 @@ fn the_autotune_key_is_not_built_from_the_database_default() {
     );
 }
 
+/// The v3 key hashes symbol-RESOLVED AST bytes. This pins the SymbolU32
+/// Debug offset (`value` = index + 1): if string-interner ever changes its
+/// Debug format or offset, keys would silently change meaning — this test
+/// names the exact contract instead.
+#[test]
+fn symbol_resolution_for_hash_resolves_the_right_names() {
+    let mut interner = nsl_lexer::Interner::new();
+    let a = interner.get_or_intern("alpha");
+    let b = interner.get_or_intern("beta");
+    // Derive the input from the REAL Debug rendering of the AST's Symbol
+    // wrapper — not a hand-built string — so a string-interner Debug-format
+    // or offset change fails HERE (the normalizer would match nothing and
+    // keys would silently become interning-order-dependent again; only the
+    // GPU e2e lane would notice, and default CI lanes are CPU).
+    let debug = format!(
+        "Ident({:?}) @ {:?}",
+        nsl_ast::Symbol(a),
+        nsl_ast::Symbol(b),
+    );
+    let resolved = nsl_codegen::autotune::resolve_symbols_for_hash(&debug, &interner);
+    assert_eq!(resolved, "Ident(Sym(\"alpha\")) @ Sym(\"beta\")");
+    // Text without the pattern passes through untouched.
+    assert_eq!(
+        nsl_codegen::autotune::resolve_symbols_for_hash("no symbols here", &interner),
+        "no symbols here"
+    );
+    // FileId is registration order — entry-point-dependent for imported
+    // modules — so it must normalize away while byte positions survive.
+    assert_eq!(
+        nsl_codegen::autotune::resolve_symbols_for_hash(
+            "span: Span { file_id: FileId(3), start: BytePos(7), end: BytePos(9) }",
+            &interner
+        ),
+        "span: Span { file_id: FileId(_), start: BytePos(7), end: BytePos(9) }"
+    );
+}
+
 #[test]
 fn autotune_selection_method_is_honest() {
-    // The module doc states that the measured path is not wired and that cache
-    // entries therefore record CostModel. Both halves are gated here so the doc
-    // cannot rot into a false claim about what NSL measures.
+    // Item 10 wired the measured path. The division of labor this gate pins:
+    // COMPILES estimate (cost model only, never a launch), the OFFLINE
+    // `nsl autotune` command measures (through `measure_variants`, the one
+    // sanctioned wrapper), and the module doc says exactly that. Every half
+    // is asserted so neither the doc nor the wiring can rot silently.
     let kernel_rs =
         std::fs::read_to_string(repo_root().join("crates/nsl-codegen/src/compiler/kernel.rs"))
             .expect("kernel.rs readable");
     assert!(
         kernel_rs.contains("find_best_variant_cost_model("),
-        "the production path is the cost-model path"
+        "the compile path is the cost-model path"
+    );
+    assert!(
+        !kernel_rs.contains("measure_variants("),
+        "the compile path must never benchmark — measurement belongs to the \
+         offline `nsl autotune` command alone (no unbounded runtime autotuner)"
     );
 
-    // Nothing outside autotune.rs may call the measured path. When someone
-    // wires it, this fails and they must update the module doc that says it is
-    // unwired — which is the point.
-    let mut callers = Vec::new();
+    let autotune_rs =
+        std::fs::read_to_string(repo_root().join("crates/nsl-codegen/src/autotune.rs"))
+            .expect("autotune.rs readable");
+    assert!(
+        autotune_rs.contains("ONE production caller"),
+        "autotune.rs's module doc no longer describes the item-10 wiring — \
+         keep the doc and the dispatch in lockstep"
+    );
+
+    // Tree walk: `find_best_variant(` must have NO callers outside
+    // autotune.rs (measurement is routed through `measure_variants` so this
+    // invariant stays checkable), and `measure_variants(` must be called
+    // from EXACTLY the offline command.
+    let mut fbv_callers = Vec::new();
+    let mut mv_callers = Vec::new();
     let mut dirs = vec![repo_root().join("crates")];
     let mut files_scanned = 0usize;
     while let Some(dir) = dirs.pop() {
@@ -710,7 +765,10 @@ fn autotune_selection_method_is_honest() {
                 // `find_best_variant_cost_model(` also contains
                 // `find_best_variant`, so match on the exact call opener.
                 if text.contains("find_best_variant(") {
-                    callers.push(path.display().to_string());
+                    fbv_callers.push(path.display().to_string());
+                }
+                if text.contains("measure_variants(") {
+                    mv_callers.push(path.display().to_string());
                 }
             }
         }
@@ -720,9 +778,21 @@ fn autotune_selection_method_is_honest() {
         "the walk must actually reach the tree; only scanned {files_scanned} files"
     );
     assert!(
-        callers.is_empty(),
-        "find_best_variant (the measured path) gained callers: {callers:?}. \
-         Update autotune.rs's module doc — it currently states the measured path is unwired."
+        fbv_callers.is_empty(),
+        "find_best_variant gained direct callers outside autotune.rs: \
+         {fbv_callers:?}. Route measurement through measure_variants so the \
+         offline-only invariant stays checkable here."
+    );
+    assert_eq!(
+        mv_callers.len(),
+        1,
+        "measure_variants must have exactly one caller (the offline \
+         `nsl autotune` command); found: {mv_callers:?}"
+    );
+    assert!(
+        mv_callers[0].ends_with("nsl-cli/src/commands/autotune.rs"),
+        "measure_variants' caller moved: {mv_callers:?} — the measured path \
+         must stay offline-only"
     );
 }
 

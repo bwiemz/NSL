@@ -445,6 +445,7 @@ fn every_accessor_counts_or_declares_why_not() {
         "restore_csha_backward_claims",
         "clear_csha_backward_claims",
         "clear_wggo_overrides",
+        "clear_cpdt_plan",
         "clear_cfie_serve_gen",
     ];
 
