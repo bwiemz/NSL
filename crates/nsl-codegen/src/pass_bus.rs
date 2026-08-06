@@ -570,21 +570,22 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         // before the same block's publish, so CPDT-sourced moment precision
         // was structurally inert (proved: `published 1x, read 0x full, 1x
         // empty` + a DEAD OUTPUT finding on a fully-flag-enabled compile) —
-        // is FIXED by the pre-plan offer: `compile_train_block` now runs
-        // CPDT planning from the block's WGGO pre-plan before the body
-        // compiles, the same install/clear pairing as wggo_overrides. The
-        // empty-read-then-late-publish pattern remains reachable only on
-        // the NO-pre-plan path (distill and loop-bound train blocks, which
-        // the prepass does not walk) — on the rejected-fingerprint path the
-        // consult's read was FULL, rejection is decided later, and the
-        // planning site refuses on divergence rather than staying silent.
-        read_before_publish: Invariant::Exempt(
-            "reachable only where no pre-plan exists (distill and loop-bound \
-             train blocks): the late publish postdates the moment consult by \
-             construction there, and the planning site prints a not-lowered \
-             notice instead of silently training with FP32 moments the flags \
-             asked to narrow",
-        ),
+        // is FIXED by the pre-plan offer, and the residual no-pre-plan hole
+        // (distill and loop-bound train blocks, which the prepass does not
+        // walk) is closed by the weights-only offer: `compile_train_block`
+        // now publishes a plan before EVERY body compiles — from the
+        // block's WGGO pre-plan when one exists, weights-only otherwise.
+        // Enforcement argument, checked against the #466 recurrence class
+        // (multi-module builds, the profile pre-pass, multi-train-block
+        // programs, take/restore windows): the channel's only readers are
+        // the train-block consult and the post-body re-arbitrations, each
+        // of which follows its own block's wrapper publish whenever CPDT
+        // can publish at all; when CPDT is off (mode, feature, or absent
+        // cluster) no publish ever happens, and an empty read with no later
+        // publish is not READ BEFORE PUBLISH. No module epilogue reads this
+        // channel (consumers: stmt.rs only, drift-checked), and the profile
+        // pre-pass reads wrga_plan, not this.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::CfiePlan,
