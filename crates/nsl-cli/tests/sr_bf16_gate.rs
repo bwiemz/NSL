@@ -46,6 +46,18 @@ fn spawn_drain<R: Read + Send + 'static>(
 }
 
 fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> RunOutput {
+    run_nsl_env(source, tag, extra_args, &[], timeout_secs)
+}
+
+/// `run_nsl` plus environment overrides for the child — the batched-parity
+/// gate forces the per-param arm with `NSL_FASE_MULTI_STEP=0`.
+fn run_nsl_env(
+    source: &str,
+    tag: &str,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+    timeout_secs: u64,
+) -> RunOutput {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_srbf16_gate_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -58,6 +70,7 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn nsl run");
@@ -205,19 +218,106 @@ fn srbf16_refuses_training_reference() {
 
 /// Parse "[sr-bf16] teardown: N bf16-authoritative param(s), M SR optimizer
 /// step(s), K widen-upload(s)".
-fn teardown_counts(stderr: &str) -> Option<(u64, u64, u64)> {
+/// The number immediately PRECEDING `label` on the teardown line.
+///
+/// Label-anchored on purpose: the old positional parser split the line on
+/// non-digits and indexed the pieces, with a comment skipping "the '16'
+/// from '[sr-bf16]'" — but "bf16-authoritative" contributes a SECOND 16,
+/// so (params, steps, uploads) actually read (params, 16, steps) for the
+/// whole life of that parser. Its consumers only asserted `> 0`, which 16
+/// satisfies, so nothing noticed until the 4th counter landed on the wrong
+/// field and a kill-switch assert read 120.
+fn teardown_field(stderr: &str, label: &str) -> Option<u64> {
     let line = stderr.lines().find(|l| l.contains("[sr-bf16] teardown:"))?;
-    let nums: Vec<u64> = line
-        .split(|c: char| !c.is_ascii_digit())
+    let end = line.find(label)?;
+    line[..end]
+        .trim_end()
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()
         .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if nums.len() >= 4 {
-        // nums[0] is the "16" from "[sr-bf16]" — skip it.
-        Some((nums[1], nums[2], nums[3]))
-    } else {
-        None
-    }
+        .and_then(|s| s.parse().ok())
+}
+
+fn teardown_counts(stderr: &str) -> Option<(u64, u64, u64)> {
+    Some((
+        teardown_field(stderr, " bf16-authoritative")?,
+        teardown_field(stderr, " SR optimizer step")?,
+        teardown_field(stderr, " widen-upload")?,
+    ))
+}
+
+/// The 4th teardown counter (item 8): batched SR launches. 0 under the
+/// per-param loop, >0 when the group update batched.
+fn teardown_batched(stderr: &str) -> Option<u64> {
+    teardown_field(stderr, " batched launch")
+}
+
+/// Item 8, bf16-SR arm: the batched group update
+/// (`nsl_fase_fused_adamw_step_bf16sr_multi_idx`, one flat-grid launch per
+/// wd bucket per group) must be BIT-IDENTICAL to the per-param SR loop it
+/// replaces. This holds by construction — the SR dither is a pure function
+/// of (seed, step, param_idx << SR_PARAM_SHIFT, element), independent of
+/// launch shape, and the kernel body is byte-for-byte the per-param
+/// arithmetic — and this gate keeps it empirically true.
+///
+/// The batched-launch counters make the comparison non-vacuous in BOTH
+/// directions: the batched arm must actually batch (>0) and the
+/// kill-switch arm must actually not (==0). Without them, an admission
+/// regression sends both arms down the per-param loop and the equality
+/// silently compares a path to itself (which is exactly what the first
+/// draft of this feature did).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn srbf16_batched_step_matches_per_param_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_srbf16_multi_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut args = FULL_FLAGS.to_vec();
+    args.extend_from_slice(&["--seed", "4242"]);
+
+    let batched = run_nsl(&program(&tmp.join("mb.nslm"), true), "multi_b", &args, 600);
+    assert!(
+        batched.success,
+        "batched bf16-sr run failed:\nstdout:\n{}\nstderr:\n{}",
+        batched.stdout, batched.stderr
+    );
+    let nb = teardown_batched(&batched.stderr)
+        .unwrap_or_else(|| panic!("no batched counter in teardown:\n{}", batched.stderr));
+    assert!(
+        nb > 0,
+        "the batched arm never batched — admission regressed and this gate \
+         is comparing the per-param loop to itself: {}",
+        batched.stderr
+    );
+
+    let per_param = run_nsl_env(
+        &program(&tmp.join("mp.nslm"), true),
+        "multi_p",
+        &args,
+        &[("NSL_FASE_MULTI_STEP", "0")],
+        600,
+    );
+    assert!(
+        per_param.success,
+        "per-param bf16-sr run failed:\n{}",
+        per_param.stderr
+    );
+    let np = teardown_batched(&per_param.stderr)
+        .unwrap_or_else(|| panic!("no batched counter in teardown:\n{}", per_param.stderr));
+    assert_eq!(
+        np, 0,
+        "NSL_FASE_MULTI_STEP=0 did not disable batching — the kill switch \
+         is dead: {}",
+        per_param.stderr
+    );
+
+    let lb = losses(&batched.stdout);
+    assert!(lb.len() >= 10, "loss stream too short: {lb:?}");
+    assert_eq!(
+        loss_text(&batched.stdout),
+        loss_text(&per_param.stdout),
+        "batched SR step diverged from the per-param loop — the SR counter \
+         stream or the update arithmetic is no longer launch-shape-independent"
+    );
 }
 
 /// Core e2e: bf16-sr training runs the mirror schedule (counters > 0),
