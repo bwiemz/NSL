@@ -108,7 +108,7 @@ fn parse_integrity(stderr: &str) -> Option<(u64, u64, u64, u64, u64, usize)> {
 /// `(notes_expected, notes_observed, under_noted, over_noted)`.
 ///
 /// Every field is anchored on its LABEL, inside a deliberately generous
-/// bounded window (the report is 10 lines today; 32 leaves slack). The
+/// bounded window (the report is 11 lines today; 32 leaves slack). The
 /// six-line window above is what pins the legacy fields' positions —
 /// duplicating that exactness here would make a future append break two
 /// parsers instead of none, which is the whole reason the new fields were

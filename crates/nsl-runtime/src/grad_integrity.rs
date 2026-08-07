@@ -19,6 +19,7 @@
 //! notes_observed=4..4
 //! under_noted=[]
 //! over_noted=[]
+//! unjudged_checks=0
 //! ```
 //!
 //! Semantics (all counts are the WORST step observed, so a gate that reads
@@ -32,20 +33,37 @@
 //!   - `missing`         param indices that received NO gradient on some step
 //!                       (the #396 symptom) — the union over all steps.
 //!   - `notes_expected`  gradient contributions each param must receive per
-//!                       bracket, declared by the emitter (0 ⇒ undeclared, and
-//!                       then the two verdict lines below are always empty).
+//!                       bracket, declared by the emitter (0 ⇒ NO bracket
+//!                       declared one, and then the two verdict lines below
+//!                       are always empty).
 //!   - `notes_observed`  `min..max` of the per-(step, param) contribution
 //!                       count over params that got at least one (params with
 //!                       none are `missing`, not under-noted — see below).
-//!   - `under_noted`     params that got 1..expected-1 contributions on some
-//!                       step, i.e. a STRICT SUBSET of the window's
-//!                       micro-batches reached them.
-//!   - `over_noted`      params whose gradient was consumed MORE than
-//!                       `notes_expected` times on some step.
+//!   - `under_noted`     params that got 1..N-1 contributions on some step,
+//!                       against THAT step's own declared N, i.e. a STRICT
+//!                       SUBSET of the window's micro-batches reached them.
+//!   - `over_noted`      params whose gradient was consumed MORE than their
+//!                       own step's declared N times.
+//!   - `unjudged_checks` brackets (of `checks`) that declared no expectation,
+//!                       so no verdict was rendered on them. Nonzero means
+//!                       the two lists above are SILENT about that many
+//!                       brackets — they are not evidence for those.
 //!
-//! The first six lines are the frozen prefix: three consumers parse a fixed
-//! six-line window after the header (two Rust gates plus
-//! `models/benchmarks/p0_campaign.py`), so anything new must be APPENDED.
+//! POOLING. Every line is process-global: one aggregate spans all of a
+//! program's train blocks. `notes_expected` and `notes_observed` are the only
+//! lines whose meaning changes when the brackets disagree, so `notes_expected`
+//! prints as `lo..hi` whenever declaring brackets differ (and as a bare `N`
+//! when they all agree, which is the single-train-block case every gate in the
+//! tree asserts on). WITHOUT that, a perfectly clean program with two CSLA
+//! train blocks at `grad_accumulation` 2 and 4 printed
+//! `notes_expected=4 / notes_observed=2..4` — byte-identical, on those two
+//! lines, to a real k-of-N gradient loss under a single accum-4 block. The
+//! verdict lists never had that ambiguity: they are computed against EACH
+//! bracket's own declaration, so they stay authoritative when the summary
+//! range is wide, and `unjudged_checks` says how much they do not cover.
+//!
+//! The first six lines are the frozen prefix: two Rust gates parse a fixed
+//! six-line window after the header, so anything new must be APPENDED.
 //!
 //! Why the note COUNT is load-bearing, not decoration. Under CSLA the bracket
 //! spans a whole accumulation window (see below), and repeat notes for one
@@ -60,8 +78,13 @@
 //! `under_noted` restores it. `over_noted` is its mirror: a gradient consumed
 //! twice double-counts into `m_partial` at the same `1/N` scale.
 //!
-//! `missing` deliberately keeps sole ownership of the count==0 case, so the
-//! two verdict lists stay disjoint from it and from each other.
+//! `missing` deliberately keeps sole ownership of the count==0 case, so
+//! WITHIN ONE STEP the three lists are disjoint: a count is 0 (`missing`),
+//! below (`under_noted`), equal, or above (`over_noted`) — exactly one holds.
+//! The printed lists are UNIONS over steps, so that disjointness does not
+//! survive to the report: a param missing on one step and under-noted on
+//! another appears in both, which is two steps' facts side by side, not a
+//! double-classification. Do not read an overlap as a bug.
 //!
 //! Two feed paths, one accumulator:
 //!   - FullBuffer / composite path: `nsl_grad_integrity_check(grads, n)` scans
@@ -124,15 +147,28 @@ struct Aggregate {
     min_nonzero: Option<usize>,
     /// Union of parameter indices that were missing on some step.
     missing_union: BTreeSet<usize>,
-    /// Largest `expected_notes` any bracket declared (0 ⇒ none did).
-    notes_expected: u32,
+    /// Extremes of `expected_notes` over the brackets that DECLARED one, i.e.
+    /// the spread of the declaration itself, not of the observations. `None`
+    /// until a bracket declares. Kept as a pair rather than the old single
+    /// max because the aggregate is process-global: two train blocks at
+    /// different `grad_accumulation` both feed it, and collapsing them to the
+    /// max prints one block's expectation next to the other's observations.
+    notes_expected_min: Option<u32>,
+    notes_expected_max: Option<u32>,
+    /// Brackets finalized with `expected_notes == 0`. They contribute to the
+    /// observed range but are exempt from the verdict, so without this the
+    /// report reads as if every one of `checks` brackets had been judged.
+    unjudged: u64,
     /// Extremes of the per-(step, param) contribution count, over the params
     /// that received at least one. `None` until the first note lands.
     notes_min: Option<u32>,
     notes_max: Option<u32>,
-    /// Union of parameter indices whose contribution count deviated from the
-    /// declared expectation on some step. Disjoint from `missing_union` by
-    /// construction: a count of 0 is `missing`, never `under`.
+    /// Union of parameter indices whose contribution count deviated from
+    /// THEIR OWN bracket's declaration on some step. Disjoint from
+    /// `missing_union` within a step (a count of 0 is `missing`, never
+    /// `under`) — but these are unions over steps, so a param missing on one
+    /// step and under-noted on another lands in both. That is two steps'
+    /// verdicts, not an overlap to be fixed.
     under_union: BTreeSet<usize>,
     over_union: BTreeSet<usize>,
 }
@@ -158,7 +194,9 @@ static STATE: Mutex<State> = Mutex::new(State {
         min_finite: None,
         min_nonzero: None,
         missing_union: BTreeSet::new(),
-        notes_expected: 0,
+        notes_expected_min: None,
+        notes_expected_max: None,
+        unjudged: 0,
         notes_min: None,
         notes_max: None,
         under_union: BTreeSet::new(),
@@ -179,9 +217,17 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// green on every fixture in the tree, and a stub that always reported `[]`
 /// would be indistinguishable from the real check. These two knobs make the
 /// failing arm reachable: `drop` suppresses a param's FIRST contribution in
-/// each bracket (leaving the other N-1 — the k-of-N silent-scaling defect,
-/// which `missing` cannot see because the count is still nonzero), and
-/// `double` records every contribution twice (consumed-more-than-once).
+/// each bracket, and `double` records every contribution twice
+/// (consumed-more-than-once).
+///
+/// `drop` only produces an `under_noted` on a bracket that declares N >= 2 —
+/// the CSLA window bracket, where the other N-1 contributions still land, the
+/// count stays nonzero, and `missing` therefore cannot see the k-of-N
+/// silent-scaling defect. On the per-micro-batch baseline bracket (N == 1,
+/// both the FASE-interleaved and the FullBuffer paths) the suppressed
+/// contribution is the ONLY one, so the count falls to 0 and the param shows
+/// up as `missing` — a different field, and not a demonstration of the
+/// contribution counter at all. Aim `drop` at a windowed run.
 ///
 /// Applies to the FASE note path only — the composite scan reads the
 /// materialized grads list directly and has no per-contribution hook.
@@ -300,7 +346,23 @@ fn finalize(agg: &mut Aggregate, step: StepAcc) {
     agg.min_gradient = Some(agg.min_gradient.map_or(gradient, |m| m.min(gradient)));
     agg.min_finite = Some(agg.min_finite.map_or(finite, |m| m.min(finite)));
     agg.min_nonzero = Some(agg.min_nonzero.map_or(nonzero, |m| m.min(nonzero)));
-    agg.notes_expected = agg.notes_expected.max(step.expected_notes);
+    // Track the DECLARATION's own spread separately from the observations,
+    // and count the brackets that declined to declare. Folding an undeclared
+    // bracket in as a 0 would drag the printed range down to `0..N` and read
+    // as if some bracket expected nothing; folding it away silently (what the
+    // old single `max` did) hides it behind a declaring bracket entirely.
+    if step.expected_notes == 0 {
+        agg.unjudged += 1;
+    } else {
+        agg.notes_expected_min = Some(
+            agg.notes_expected_min
+                .map_or(step.expected_notes, |m| m.min(step.expected_notes)),
+        );
+        agg.notes_expected_max = Some(
+            agg.notes_expected_max
+                .map_or(step.expected_notes, |m| m.max(step.expected_notes)),
+        );
+    }
     for (i, &count) in step.counts.iter().enumerate() {
         if count == 0 {
             // `missing` owns the zero case exclusively — reporting it in
@@ -462,15 +524,26 @@ extern "C" fn grad_integrity_atexit() {
     eprintln!("finite={finite}");
     eprintln!("nonzero={nonzero}");
     eprintln!("missing=[{}]", list(&missing));
-    // APPEND-ONLY below this line: three consumers parse a fixed six-line
-    // window after the header (crates/nsl-cli/tests/grad_integrity_gate.rs,
-    // crates/nsl-cli/tests/csla_layerwise_gate.rs, and
-    // models/benchmarks/p0_campaign.py). Inserting a field above would push
-    // `missing` out of that window and break all three silently.
+    // APPEND-ONLY below this line: two consumers pin the six legacy fields by
+    // POSITION, and inserting a field above pushes `missing` out of their
+    // six-line window. They then fail differently, which is the part worth
+    // copying:
+    //   - crates/nsl-cli/tests/csla_layerwise_gate.rs fails LOUDLY — its
+    //     `missing=[` lookup is `?`-anchored, so a vanished field collapses
+    //     the whole parse to `None` and the caller's `unwrap_or_else` panics
+    //     with the raw stderr;
+    //   - crates/nsl-cli/tests/grad_integrity_gate.rs fails SILENTLY — its
+    //     `missing` counter is a plain local initialized to 0, so a vanished
+    //     field reads as "no param was missing" and `assert_eq!(missing, 0)`
+    //     passes on a report that never said so.
+    // A new parser must use the `?`-anchored form. (Third consumer,
+    // models/benchmarks/p0_campaign.py, no longer pins positions: it reads
+    // `key=value` lines until the block ends, so appends just widen it.)
     eprintln!("notes_expected={}", notes.expected);
     eprintln!("notes_observed={}..{}", notes.min, notes.max);
     eprintln!("under_noted=[{}]", list(&notes.under));
     eprintln!("over_noted=[{}]", list(&notes.over));
+    eprintln!("unjudged_checks={}", notes.unjudged);
 }
 
 /// Snapshot for the atexit report and for tests:
@@ -491,26 +564,47 @@ pub fn grad_integrity_snapshot() -> (u64, usize, usize, usize, usize, Vec<usize>
 /// Contribution-count half of the snapshot (kept separate so the six-field
 /// tuple every existing caller destructures keeps its shape).
 pub struct NotesSnapshot {
-    /// Declared contributions per parameter per bracket (0 ⇒ undeclared).
-    pub expected: u32,
+    /// Declared contributions per parameter per bracket, ALREADY RENDERED as
+    /// the report prints it — `N` when every declaring bracket agreed, `lo..hi`
+    /// when they did not, `0` when none declared. A `String` rather than a
+    /// number precisely so the printed spelling has one definition that a test
+    /// can pin; a numeric field plus a format at the print site lets the two
+    /// drift, and gates assert on the exact bytes.
+    pub expected: String,
     /// Extremes of the observed count over params that got at least one; both
     /// 0 when no note ever landed.
     pub min: u32,
     pub max: u32,
-    /// Params that got strictly fewer / more than `expected` on some step.
+    /// Params that got strictly fewer / more than their own bracket's
+    /// declaration on some step.
     pub under: Vec<usize>,
     pub over: Vec<usize>,
+    /// Brackets that declared nothing and were therefore never judged. The
+    /// two lists above say nothing about these.
+    pub unjudged: u64,
+}
+
+/// Render the pooled declaration the way the report prints it. Single-bracket
+/// (and any all-agreeing multi-bracket) programs keep the historical bare
+/// integer — the CSLA and FASE gates assert on those exact bytes.
+fn render_expected(min: Option<u32>, max: Option<u32>) -> String {
+    match (min, max) {
+        (Some(lo), Some(hi)) if lo != hi => format!("{lo}..{hi}"),
+        (Some(v), _) => v.to_string(),
+        _ => "0".to_string(),
+    }
 }
 
 pub fn grad_integrity_notes_snapshot() -> NotesSnapshot {
     let state = STATE.lock().unwrap();
     let a = &state.agg;
     NotesSnapshot {
-        expected: a.notes_expected,
+        expected: render_expected(a.notes_expected_min, a.notes_expected_max),
         min: a.notes_min.unwrap_or(0),
         max: a.notes_max.unwrap_or(0),
         under: a.under_union.iter().copied().collect(),
         over: a.over_union.iter().copied().collect(),
+        unjudged: a.unjudged,
     }
 }
 
@@ -576,6 +670,10 @@ mod tests {
         let n = grad_integrity_notes_snapshot();
         assert!(n.under.is_empty(), "count 0 is `missing`, not under-noted");
         assert!(n.over.is_empty());
+        // Two brackets, both declaring 1: the agreeing case must keep the
+        // historical bare-integer spelling.
+        assert_eq!(n.expected, "1");
+        assert_eq!(n.unjudged, 0);
     }
 
     /// The k-of-N case the CSLA window bracket could not see: `present`,
@@ -605,10 +703,119 @@ mod tests {
             "the pre-existing fields cannot distinguish k-of-N — that is the defect"
         );
         let n = grad_integrity_notes_snapshot();
-        assert_eq!(n.expected, 4);
+        assert_eq!(n.expected, "4");
         assert_eq!((n.min, n.max), (1, 8));
         assert_eq!(n.under, vec![1], "param 1 got 1 of 4 contributions");
         assert_eq!(n.over, vec![2], "param 2 was consumed 8 times, not 4");
+        assert_eq!(n.unjudged, 0, "the bracket declared, so it was judged");
+    }
+
+    /// The pooled-expectation defect: the aggregate is process-global, so a
+    /// program with two CSLA train blocks at `grad_accumulation` 2 and 4 feeds
+    /// it two brackets with different declarations. Both are CLEAN — every
+    /// param received exactly what its own bracket asked for — yet collapsing
+    /// the declaration to its max printed `notes_expected=4` beside
+    /// `notes_observed=2..4`, which on those two lines alone is the signature
+    /// of a real k-of-N gradient loss (compare
+    /// `partial_contributions_are_under_noted_while_every_old_field_reads_green`
+    /// above, whose pair is `4` / `1..8`). Reproduced end-to-end before the
+    /// fix on a two-train-block fixture; pinned here at the accumulator.
+    #[test]
+    fn disagreeing_brackets_print_a_range_not_one_blocks_expectation() {
+        let _serial = reset();
+        // Block A: grad_accumulation=2, both micro-batches reached every param.
+        {
+            let mut s = STATE.lock().unwrap();
+            finalize(
+                &mut s.agg,
+                StepAcc {
+                    expected: 2,
+                    counts: vec![2, 2],
+                    expected_notes: 2,
+                    fin: vec![true, true],
+                    nz: vec![true, true],
+                },
+            );
+        }
+        // Block B: grad_accumulation=4, likewise complete.
+        {
+            let mut s = STATE.lock().unwrap();
+            finalize(
+                &mut s.agg,
+                StepAcc {
+                    expected: 2,
+                    counts: vec![4, 4],
+                    expected_notes: 4,
+                    fin: vec![true, true],
+                    nz: vec![true, true],
+                },
+            );
+        }
+        let n = grad_integrity_notes_snapshot();
+        assert_eq!(
+            n.expected, "2..4",
+            "brackets disagreed, so the pooled expectation is a range — \
+             printing `4` here would accuse block A of losing half its \
+             contributions"
+        );
+        assert_eq!((n.min, n.max), (2, 4));
+        assert!(
+            n.under.is_empty() && n.over.is_empty(),
+            "each bracket is judged against ITS OWN declaration, so a clean \
+             mixed-accumulation program has no verdict: under={:?} over={:?}",
+            n.under,
+            n.over
+        );
+        assert_eq!(n.unjudged, 0, "both brackets declared");
+    }
+
+    /// A bracket that declares nothing is skipped by the verdict loop, so with
+    /// a declaring bracket also present the old report showed that bracket's
+    /// expectation and two empty verdict lines — indistinguishable from "every
+    /// bracket was judged and all were clean". `unjudged_checks` is what says
+    /// otherwise: param 1's 7 contributions below are NOT vouched for.
+    #[test]
+    fn undeclared_brackets_are_counted_not_hidden_behind_a_declaring_one() {
+        let _serial = reset();
+        {
+            let mut s = STATE.lock().unwrap();
+            finalize(
+                &mut s.agg,
+                StepAcc {
+                    expected: 2,
+                    counts: vec![2, 2],
+                    expected_notes: 2,
+                    fin: vec![true, true],
+                    nz: vec![true, true],
+                },
+            );
+        }
+        {
+            let mut s = STATE.lock().unwrap();
+            finalize(
+                &mut s.agg,
+                StepAcc {
+                    expected: 2,
+                    counts: vec![1, 7],
+                    expected_notes: 0,
+                    fin: vec![true, true],
+                    nz: vec![true, true],
+                },
+            );
+        }
+        let n = grad_integrity_notes_snapshot();
+        assert_eq!(
+            n.expected, "2",
+            "an undeclared bracket must not widen the declaration's range to \
+             0..2 — it declared nothing, it did not declare zero"
+        );
+        assert_eq!((n.min, n.max), (1, 7), "its counts still reach the range");
+        assert!(n.under.is_empty() && n.over.is_empty());
+        assert_eq!(
+            n.unjudged, 1,
+            "1 of the 2 brackets went unjudged, and the empty verdict lines \
+             are not evidence about it"
+        );
     }
 
     /// An undeclared bracket (`expected_notes == 0`) observes without judging:
@@ -630,8 +837,9 @@ mod tests {
             );
         }
         let n = grad_integrity_notes_snapshot();
-        assert_eq!(n.expected, 0);
+        assert_eq!(n.expected, "0");
         assert_eq!((n.min, n.max), (1, 7));
         assert!(n.under.is_empty() && n.over.is_empty());
+        assert_eq!(n.unjudged, 1, "the only bracket went unjudged");
     }
 }

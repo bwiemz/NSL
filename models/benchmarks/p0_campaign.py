@@ -143,6 +143,11 @@ class RunResult:
 LOSS_RE = re.compile(r"^-?\d+(\.\d+)?(e-?\d+)?$")
 PHASE_RE = re.compile(r"\[phase\] (?:fwd=(\S+) bwd=(\S+)|opt=(\S+))")
 WS_RE = re.compile(r"\[weight-stream\] uploads: (\d+) evicts: (\d+) writeback: (\d+) registered: (\d+) ptr_moves: (\d+) pack_uploads: (\d+) pack_evicts: (\d+) prefetches: (\d+) async_wb: (\d+)")
+# Every line of the [grad-integrity] atexit block is `key=value`. Matching the
+# SHAPE rather than counting lines is what keeps appended fields (the report
+# grew from 6 to 11 lines when the contribution counters landed) inside the
+# capture instead of being truncated away.
+GI_FIELD_RE = re.compile(r"^[a-z_]+=")
 
 
 def run_arm(
@@ -335,15 +340,19 @@ def run_arm(
         except (json.JSONDecodeError, OSError, ValueError):
             pass
     res.health = [health_seen[k] for k in sorted(health_seen)]
-    # Grad-integrity report: a "[grad-integrity]" marker followed by
-    # checks=/expected_params=/gradient_params=/finite=/nonzero=/missing=
-    # lines — join the block.
+    # Grad-integrity report: a "[grad-integrity]" marker followed by one
+    # `key=value` line per field — take them until the block ends rather than
+    # a fixed count, so appended fields (notes_expected/notes_observed/
+    # under_noted/over_noted/unjudged_checks, which the old 6-line capture
+    # dropped on the 1B arm) land in result.json too.
     for i, (_, s) in enumerate(err_lines):
         if s.strip() == "[grad-integrity]":
-            block = [
-                err_lines[j][1].strip()
-                for j in range(i + 1, min(i + 7, len(err_lines)))
-            ]
+            block = []
+            for j in range(i + 1, len(err_lines)):
+                line = err_lines[j][1].strip()
+                if not GI_FIELD_RE.match(line):
+                    break
+                block.append(line)
             res.grad_integrity = " ".join(block)
             break
     # GPU sampler stats.

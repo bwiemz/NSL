@@ -1346,7 +1346,7 @@ fn grad_integrity_report(stderr: &str) -> Option<(i64, i64, i64, i64, i64, bool)
 /// present/finite/nonzero cannot tell k<N from N, while `fase_emit_accumulate`
 /// scales by 1/N per note — so such a param trains on k/N of its gradient,
 /// silently. Parsed by LABEL inside a generous bounded window (the report is
-/// 10 lines today; 32 leaves slack), never by line position.
+/// 11 lines today; 32 leaves slack), never by line position.
 fn grad_integrity_notes(stderr: &str) -> Option<(i64, String, Vec<i64>, Vec<i64>)> {
     let block: Vec<&str> = stderr
         .lines()
