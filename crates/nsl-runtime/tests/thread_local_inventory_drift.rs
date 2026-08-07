@@ -1,6 +1,7 @@
 //! Item 17: the thread-local inventory in
 //! `docs/architecture/compiler-state.md` is machine-checked against the
-//! source of both state-bearing crates.
+//! source of EVERY workspace crate (nsl-cli housed the last MIGRATE-class
+//! offenders — the retired WRGA trio — so scope matters).
 //!
 //! Why: the table's whole value is the classification discipline ("new
 //! behavior threads through an explicit context, never a new thread-local"
@@ -10,8 +11,8 @@
 //! stop (the `pass_registry_drift` / `NO_DTYPE_TENSOR` precedent).
 //!
 //! Two directions:
-//!  1. every `thread_local!` static in `nsl-runtime` and `nsl-codegen`
-//!     appears in the doc's marked table (a NEW thread-local must be added
+//!  1. every `thread_local!` static in any workspace crate appears in the
+//!     doc's marked table (a NEW thread-local must be added
 //!     there, with a class and a reason, to pass CPU CI);
 //!  2. every name the table lists still exists in the file its row names
 //!     (renames and deletions must update the doc in the same PR).
@@ -48,14 +49,47 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Brace-counted from each `thread_local!` occurrence; `static NAME:` lines
 /// with an ALL_CAPS name are collected (macro `$counter` declarations have a
 /// lowercase `$` head and fall out naturally).
+/// `name` appears in `text` as a standalone identifier (both neighbors are
+/// non-ident chars) — the fence that stops `WS` matching inside `SR_WS`.
+fn contains_ident(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(name) {
+        let s = from + pos;
+        let e = s + name.len();
+        let left_ok = s == 0 || !is_ident(bytes[s - 1]);
+        let right_ok = e >= bytes.len() || !is_ident(bytes[e]);
+        if left_ok && right_ok {
+            return true;
+        }
+        from = s + 1;
+    }
+    false
+}
+
 fn scan_thread_local_statics(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut search_from = 0;
     while let Some(pos) = src[search_from..].find("thread_local!") {
         let start = search_from + pos;
+        // A doc-comment MENTION of thread_local! (hir/ids.rs's module doc)
+        // must not anchor a pseudo-block over whatever braces follow —
+        // skip matches on comment lines (review finding).
+        let line_start = src[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_head = src[line_start..start].trim_start();
+        if line_head.starts_with("//") {
+            search_from = start + "thread_local!".len();
+            continue;
+        }
         let Some(open_rel) = src[start..].find('{') else {
             break;
         };
+        // Known limit: a brace inside a string literal or comment WITHIN a
+        // block would end the extraction early and silently skip later
+        // statics in that block (none exist today; review finding). Full
+        // lexing is not worth it for a doc gate — revisit if a block ever
+        // legitimately contains a braced literal.
         let mut depth = 0usize;
         let mut end = start + open_rel;
         for (i, ch) in src[start + open_rel..].char_indices() {
@@ -139,10 +173,17 @@ fn the_doc_inventory_matches_the_source() {
         doc_entries.len()
     );
 
-    // Source side: every thread_local! static in both crates.
+    // Source side: every thread_local! static in EVERY workspace crate —
+    // nsl-cli housed the last MIGRATE-class offenders (the WRGA trio), so a
+    // two-crate scope would leave the historical bug class unmonitored
+    // (review finding).
     let mut files = Vec::new();
-    rs_files(&root.join("crates/nsl-runtime/src"), &mut files);
-    rs_files(&root.join("crates/nsl-codegen/src"), &mut files);
+    for entry in std::fs::read_dir(root.join("crates")).expect("crates dir") {
+        let src = entry.unwrap().path().join("src");
+        if src.is_dir() {
+            rs_files(&src, &mut files);
+        }
+    }
     let mut src_entries: Vec<(String, String)> = Vec::new();
     for f in &files {
         let src = std::fs::read_to_string(f).unwrap();
@@ -179,12 +220,22 @@ fn the_doc_inventory_matches_the_source() {
         undocumented.join("\n")
     );
 
-    // Direction 2: every doc name still exists in the file its row names.
+    // Direction 2: every doc name still exists in the file its row names —
+    // IDENT-FENCED, not substring (raw contains let a deleted `WS` pass
+    // forever on `SR_WS`, and `TAPE` on its own comment mentions; review
+    // finding). A deletion whose name survives only in prose is still
+    // caught unless the prose uses the exact identifier, which reads as a
+    // doc bug worth a failure anyway.
     let mut stale: Vec<String> = Vec::new();
     for (path, name) in &doc_entries {
+        assert!(
+            path.contains("/src/"),
+            "inventory row path `{path}` is not a crate-relative src path — \
+             a bare filename would suffix-match the wrong file"
+        );
         let full = root.join("crates").join(path);
         let ok = std::fs::read_to_string(&full)
-            .map(|s| s.contains(name.as_str()))
+            .map(|s| contains_ident(&s, name))
             .unwrap_or(false);
         if !ok {
             stale.push(format!("  {name} (listed for {path})"));

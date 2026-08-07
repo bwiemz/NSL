@@ -26,7 +26,9 @@ impl KirToHirPass {
         module_name: &str,
     ) -> Result<HirModule, FpgaLoweringError> {
         // M57.1 wire-array mini §6 (snapshot stability): WireId / RegisterId /
-        // GenvarId counters are process-global atomics. Without this reset, the
+        // GenvarId counters are thread-local Cells (see hir/ids.rs — NOT
+        // process-global atomics, which would bleed across parallel test
+        // threads). Without this reset, the
         // `_gv<N>` numbering in HIR snapshots depends on test discovery order
         // — running `full_v1_mlp_composition` alone produces different IDs
         // than running it as part of the full suite. Resetting at the entry

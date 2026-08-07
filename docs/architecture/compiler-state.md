@@ -72,7 +72,7 @@ Classification key:
   eventually move into an explicit context. Do not add more of these.
 
 The table is MACHINE-CHECKED: `thread_local_inventory_drift.rs` (nsl-runtime
-integration tests) scans both crates for `thread_local!` statics and diffs
+integration tests) scans EVERY workspace crate for `thread_local!` statics and diffs
 them against the rows between the markers below. A new thread-local that is
 not added here — with a class and a reason — fails CPU CI. (The 2026-08-06
 refresh found the previous hand-maintained table had drifted by ~20 statics,
@@ -83,7 +83,7 @@ including the autodiff `TAPE` itself.)
 |----------|-------|-------|-------|
 | `nsl-codegen/src/lib.rs` | `ADJOINT_OPS_DROPPED`, `ALLOC_SLOTS_PRE_HINT`, `ALLOC_SLOTS_POST_HINT`, `CONSUME_HINTS_CALLS` | TEST | Source-AD / allocator instrumentation counters, read via `debug_*` accessors by tests only. |
 | `nsl-codegen/src/hir/ids.rs` | `WIRE_ID_COUNTER`, `REGISTER_ID_COUNTER`, `GENVAR_ID_COUNTER` | TEST | FPGA HIR id generation (macro-declared), reset by `KirToHirPass::lower`. Per-thread BY DESIGN: a process-global atomic would break snapshot tests under parallel sharding. Note: these do shape emitted HIR id values, so they are the one TEST entry with artifact influence — a lowering-context field is the eventual home. |
-| `nsl-codegen/src/pass_trace.rs` | `CURRENT_PHASE` | TEST | Active driver phase for trace attribution. "A compile never spans threads" (its own doc); diagnostic only. |
+| `nsl-codegen/src/pass_trace.rs` | `CURRENT_PHASE` | FFI/RUNTIME-OK | Active driver phase for trace attribution — written during every production compile and read by `NSL_PASS_TRACE` reporting, so not test-only; diagnostic-only either way. |
 | `nsl-runtime/src/pca_rope_runtime.rs` | `PACKING_METADATA` | **MIGRATE** | Device pointers for `segment_ids`/`doc_starts` set per training step — the "explicit step input" migration target (Phase 3). Real runtime behavior via a global; races if a step's data prep and its FA call ever land on different threads. |
 | `nsl-runtime/src/autodiff/mod.rs` | `TAPE` | MIGRATE (runtime) | THE autodiff tape — the heaviest behavioral thread-local in the codebase (27 access sites). Missing from every previous version of this table. |
 | `nsl-runtime/src/tensor/mod.rs` | `TENSOR_SCOPE`, `TRAINING_MODE` | MIGRATE (runtime) | Scope-stack pointer and the global train/eval flag that gates tape recording. |
@@ -101,7 +101,7 @@ including the autodiff `TAPE` itself.)
 | `nsl-runtime/src/sampling.rs` | `RNG` | FFI/RUNTIME-OK | Per-thread RNG seeded by `nsl_manual_seed`; per-thread seeding is the determinism model. |
 | `nsl-runtime/src/tensor/mod.rs` | `STAGING_REGISTRY` | FFI/RUNTIME-OK | Write-once-at-init custom-dtype registry. |
 | `nsl-runtime/src/tensor_trace.rs` | `RECORDER` | TEST | Tensor-op trace recorder; records only when armed. |
-| `nsl-runtime/src/muon_prof.rs` | `OPEN` | TEST | Muon profiling scope stack. |
+| `nsl-runtime/src/muon_prof.rs` | `OPEN` | FFI/RUNTIME-OK | Muon profiling scope stack — armed in production by `NSL_MUON_PROF` via the extern-C begin/end pair, so not test-only. |
 | `nsl-runtime/src/trace.rs` | `TRACE_TEST_RECORDING` | TEST | `#[cfg(test)]`; exists precisely because a process-global flag let parallel test threads inject stray ops (the bug class this whole doc is about). |
 | `nsl-runtime/src/memory.rs` | `ALLOC_COUNT`, `FREE_COUNT`, `ALLOC_BYTES`, `FREE_BYTES`, `CUDA_ALLOC_COUNT`, `CUDA_FREE_COUNT`, `CUDA_ALLOC_BYTES`, `CUDA_FREE_BYTES` | TEST | `#[cfg(test)]` fuzz counters (NOT feature-gated, as previously claimed). |
 <!-- TL-INVENTORY-END -->
