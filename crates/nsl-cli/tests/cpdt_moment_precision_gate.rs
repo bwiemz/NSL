@@ -313,26 +313,67 @@ fn a_stale_loop_bound_plan_refuses_with_the_in_place_cause() {
         .stderr(predicate::str::contains("graph fingerprint no longer matches").not());
 }
 
+fn distill_fixture() -> PathBuf {
+    workspace_root()
+        .join("crates/nsl-codegen/tests/fixtures/cpdt_precision_fp16_distill.nsl")
+}
+
 /// Distill's synthetic train block reaches the same wrapper and gets the
-/// same weights-only offer — but its synthetic config drops
-/// `grad_accumulation`, so the FASE-Deferred envelope is absent and
-/// arbitration lowers nothing. This arm pins the current honest state:
-/// planning happens, the not-active notice says why, and nothing activates.
-/// (Forwarding grad_accumulation through the synthetic block is the
-/// recorded follow-up that would light this up.)
+/// same weights-only offer. Until the distill header could carry
+/// `grad_accumulation` the synthetic config was EMPTY, so the block planned
+/// FASE Passthrough, the Deferred envelope never existed, and arbitration
+/// lowered nothing — planning with no effect, the same shape as this file's
+/// defect 2. With the window forwarded the student's moments get their
+/// designed dtypes.
+///
+/// Six buffers, not twelve: the teacher's params are frozen Input leaves
+/// (I-11) and are not in the block's parameter list at all, so the join sees
+/// the student only. A regression that started training the teacher would
+/// show up here as a changed count.
 #[test]
-fn a_distill_block_plans_weights_only_but_stays_fp32_without_the_envelope() {
-    let distill = workspace_root()
-        .join("crates/nsl-codegen/tests/fixtures/cpkd_distill_basic.nsl");
-    let mut cmd = cmd_without_wggo(distill);
+fn a_distill_block_activates_weights_only_under_the_accumulation_window() {
+    let mut cmd = cmd_without_wggo(distill_fixture());
+    cmd.env("NSL_PASS_TRACE", "1");
     cmd.assert()
         .success()
         .stderr(predicate::str::contains(
             "[cpdt] planned without a WGGO plan for this block (weights-only)",
         ))
         .stderr(predicate::str::contains(
-            "arbitration lowered nothing",
+            "[cpdt] optimizer-moment precision active (CPDT per-param plan): \
+             6 moment buffer(s) in FP16 storage",
         ))
+        // Same channel health as the train-block weights-only arm: one
+        // publish (the wrapper's offer), read full by the consult and the
+        // staleness re-check, never empty.
+        .stderr(predicate::str::contains(
+            "[pass-bus] cpdt_plan: published 1x by CPDT, read 2x full, 0x empty",
+        ))
+        .stderr(predicate::str::contains("arbitration lowered nothing").not())
+        .stderr(predicate::str::contains("DEAD OUTPUT: cpdt_plan").not());
+}
+
+/// The control for the arm above, and the reason it means anything: the SAME
+/// fixture with the window token deleted must plan identically and activate
+/// NOTHING. One token is the only difference, so the parameter join, the
+/// weight map and the tier split are all held fixed — the window is the
+/// cause. (Comparing two different distill fixtures could not say that.)
+#[test]
+fn the_same_distill_block_stays_fp32_when_the_window_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = std::fs::read_to_string(distill_fixture()).unwrap();
+    let no_window = src.replace(", grad_accumulation = 4)", ")");
+    assert_ne!(src, no_window, "the rewrite matched nothing — fixture drifted");
+    let path = tmp.path().join("no_window.nsl");
+    std::fs::write(&path, no_window).unwrap();
+
+    let mut cmd = cmd_without_wggo(path);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "[cpdt] planned without a WGGO plan for this block (weights-only)",
+        ))
+        .stderr(predicate::str::contains("arbitration lowered nothing"))
         .stderr(predicate::str::contains("optimizer-moment precision active").not());
 }
 
@@ -349,6 +390,14 @@ fn the_report_caveats_the_zero_model_zero_halves() {
     cmd.current_dir(tmp.path());
     cmd.arg("build")
         .arg(fixture())
+        // -o into the temp dir. WITHOUT it `nsl build` derives the output
+        // path from the SOURCE stem, so this arm dropped a ~128 MB unstripped
+        // ELF into crates/nsl-codegen/tests/fixtures/ — extensionless, and
+        // therefore sitting among the .nsl files where `git add -A` stages it
+        // (it reached a commit once). `current_dir(tmp)` does not help,
+        // because the default is relative to the source, not the cwd.
+        .arg("-o")
+        .arg(tmp.path().join("cpdt_report_probe"))
         .arg("--source-ad")
         .arg("--weights")
         .arg(weights())

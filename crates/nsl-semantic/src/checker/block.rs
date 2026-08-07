@@ -198,10 +198,35 @@ impl<'a> TypeChecker<'a> {
                 "epochs" => {
                     self.check_expr(&arg.value);
                 }
+                "grad_accumulation" => {
+                    // Distillation IS a training loop over the student, so the
+                    // accumulation window means exactly what it means on a train
+                    // block. It is refused by VALUE here rather than clamped:
+                    // codegen reads the window as a compile-time constant, and a
+                    // silent clamp to 1 reproduces the pre-fix shape (FASE
+                    // Passthrough, hence no CPDT optimizer-moment precision) with
+                    // no diagnostic to explain why the envelope never engaged.
+                    match arg.value.kind {
+                        ExprKind::IntLiteral(n) if n >= 1 => {}
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "distill 'grad_accumulation' must be a positive \
+                                     integer literal",
+                                )
+                                .with_label(arg.span, "expected an integer literal >= 1"),
+                            );
+                        }
+                    }
+                    self.check_expr(&arg.value);
+                }
                 other => {
                     self.diagnostics.push(
                         Diagnostic::error(format!("unknown distill config key '{other}'"))
-                            .with_label(arg.span, "expected teacher=, student=, or epochs="),
+                            .with_label(
+                                arg.span,
+                                "expected teacher=, student=, epochs=, or grad_accumulation=",
+                            ),
                     );
                 }
             }

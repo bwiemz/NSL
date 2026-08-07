@@ -416,6 +416,12 @@ Semantics and constraints (v1):
   a tape would record teacher ops and allocate teacher gradient buffers.
 - `optimizer:` / `scheduler:` / `data:` / `step()` / `callbacks:` behave
   exactly as in `train`. `distribute:` is refused (CPDT composition deferred).
+- `grad_accumulation = N` is accepted on the header and means exactly what it
+  means on `train`: the step body runs per micro-batch and the optimizer fires
+  every `N`. Unlike `train` it is refused rather than clamped when it is not a
+  positive integer literal — a silently-clamped window is indistinguishable
+  from having no window, which strands the FASE-Deferred envelope (and with
+  it CPDT's optimizer-moment precision plan) with no diagnostic.
 - `fused_kl_ce(x_s, W_s, b_s, x_t, W_t, b_t, targets, alpha, T)` computes
   `alpha*CE(student, targets) + (1-alpha)*T^2*KL(softmax(t/T) || softmax(s/T))`
   in ONE kernel without materializing either `[rows, vocab]` logit tensor in
