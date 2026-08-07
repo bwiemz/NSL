@@ -107,16 +107,18 @@ fn parse_integrity(stderr: &str) -> Option<(u64, u64, u64, u64, u64, usize)> {
 /// The contribution-count fields, APPENDED after the frozen six-line prefix:
 /// `(notes_expected, notes_observed, under_noted, over_noted)`.
 ///
-/// Deliberately parsed from the whole tail of the block rather than a fixed
-/// window, and every field is anchored on its label — the six-line window
-/// above is what pins the prefix's position, so duplicating that fragility
-/// here would only make a future append break two parsers instead of none.
+/// Every field is anchored on its LABEL, inside a deliberately generous
+/// bounded window (the report is 10 lines today; 32 leaves slack). The
+/// six-line window above is what pins the legacy fields' positions —
+/// duplicating that exactness here would make a future append break two
+/// parsers instead of none, which is the whole reason the new fields were
+/// appended rather than inserted.
 fn parse_notes(stderr: &str) -> Option<(u64, String, Vec<u64>, Vec<u64>)> {
     let block: Vec<&str> = stderr
         .lines()
         .skip_while(|l| l.trim() != "[grad-integrity]")
         .skip(1)
-        .take(10)
+        .take(32)
         .collect();
     let idx_list = |key: &str| -> Option<Vec<u64>> {
         let rest = block
@@ -166,6 +168,13 @@ fn grad_integrity_fullbuffer_all_params_finite_and_nonzero() {
         .unwrap_or_else(|| panic!("no contribution-count fields:\n{}", r.stderr));
     assert_eq!(n_exp, 1, "the composite scan declares one contribution/param");
     assert_eq!(n_obs, "1..1", "every param was scanned exactly once");
+    // TAUTOLOGICAL ON THIS PATH, and kept deliberately as a shape check
+    // rather than a detection claim: `nsl_grad_integrity_check` visits each
+    // index exactly once, so a FullBuffer count can only be 0 (which
+    // `missing` owns) or 1 (which equals `expected`). Neither verdict list
+    // is reachable here. The detection this feature exists for is proven on
+    // the paths where a param CAN receive several contributions — the
+    // fault-injected arms below and the CSLA window arms.
     assert!(under.is_empty() && over.is_empty(), "under={under:?} over={over:?}");
 }
 

@@ -1345,13 +1345,14 @@ fn grad_integrity_report(stderr: &str) -> Option<(i64, i64, i64, i64, i64, bool)
 /// gradients visible at all: the window bracket merges repeat notes, so
 /// present/finite/nonzero cannot tell k<N from N, while `fase_emit_accumulate`
 /// scales by 1/N per note — so such a param trains on k/N of its gradient,
-/// silently. Parsed by LABEL over the block tail, never by line position.
+/// silently. Parsed by LABEL inside a generous bounded window (the report is
+/// 10 lines today; 32 leaves slack), never by line position.
 fn grad_integrity_notes(stderr: &str) -> Option<(i64, String, Vec<i64>, Vec<i64>)> {
     let block: Vec<&str> = stderr
         .lines()
         .skip_while(|l| l.trim() != "[grad-integrity]")
         .skip(1)
-        .take(10)
+        .take(32)
         .collect();
     let idx_list = |key: &str| -> Option<Vec<i64>> {
         let rest = block
