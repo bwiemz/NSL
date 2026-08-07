@@ -744,6 +744,9 @@ fn bf16sr_multi_impl(
         // Coherence refreshes deferred until after the batched launches:
         // (mirror ptr, resident f32 view ptr, len).
         let mut refreshes: Vec<(u64, u64, usize)> = Vec::new();
+        // Item 7 histograms: (mirror ptr, pre-step bf16 sample) per batched
+        // param, recorded after the launches complete.
+        let mut hist_pre: Vec<(u64, Vec<u16>)> = Vec::new();
         // Review-A1 guard, mirrored from `fase_multi_impl`: two idx entries
         // aliasing ONE mirror inside a single launch would race
         // last-writer-wins across grid slices, where the per-param loop
@@ -832,6 +835,20 @@ fn bf16sr_multi_impl(
                     b.mp.push(mp.data as u64);
                     b.n.push(u32::try_from(len).expect("param exceeds u32 elements"));
                     b.ctr.push(param_idx << SR_PARAM_SHIFT);
+                    // Item 7 histograms: without this, batched dispatch
+                    // would silently take NSL_SR_HIST's sampling surface to
+                    // (almost) zero — only the aliased-mirror fallback goes
+                    // through the per-param entry that samples.
+                    if sr_hist_enabled() {
+                        let hn = len.min(SR_HIST_SAMPLE);
+                        let mut before = vec![0u16; hn];
+                        crate::cuda::inner::memcpy_dtoh(
+                            before.as_mut_ptr() as *mut std::ffi::c_void,
+                            dev_bf16 as *const std::ffi::c_void,
+                            hn * 2,
+                        );
+                        hist_pre.push((dev_bf16, before));
+                    }
                     if !th.data.is_null() {
                         refreshes.push((dev_bf16, th.data as u64, len));
                     }
@@ -862,6 +879,19 @@ fn bf16sr_multi_impl(
         };
         launch(&decayed, true);
         launch(&exempt, false);
+
+        // Item 7 histograms, after both launches: the D2H read synchronizes
+        // with the enqueued step kernels, so `after` is post-update.
+        for (dev_bf16, before) in &hist_pre {
+            let mut after = vec![0u16; before.len()];
+            crate::cuda::inner::memcpy_dtoh(
+                after.as_mut_ptr() as *mut std::ffi::c_void,
+                *dev_bf16 as *const std::ffi::c_void,
+                before.len() * 2,
+            );
+            sr_hist_record(before, &after);
+            SR_HIST.lock().unwrap().steps += 1;
+        }
 
         // Coherence refresh, after the steps are enqueued: the resident f32
         // working view must equal widen(mirror) so callbacks / model_save /

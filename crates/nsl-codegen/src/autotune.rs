@@ -394,13 +394,11 @@ pub fn find_best_variant(
             }
             return Ok(rec.winner);
         }
-        Ok(Some(_)) => {
-            if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                eprintln!(
-                    "[autotune] {kernel_name}: cost-model record present — measuring \
-                     (measurement replaces estimates, never the reverse)"
-                );
-            }
+        Ok(Some(_)) if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() => {
+            eprintln!(
+                "[autotune] {kernel_name}: cost-model record present — measuring \
+                 (measurement replaces estimates, never the reverse)"
+            );
         }
         _ => {}
     }
