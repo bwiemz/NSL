@@ -672,7 +672,24 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
                       and the train block see no pre-computed decisions",
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
-        applied_implies_published: Invariant::Enforced,
+        // Stated as Enforced this cries wolf: "WGGO applied" conflates the
+        // producer's TWO invocation sites, and only the prepass publishes
+        // pre-plans. A block the prepass structurally cannot plan — a
+        // loop-bound model var, whose type resolves only during codegen —
+        // is planned by the IN-PLACE site, which applies rewrites while
+        // this channel legitimately stays empty; the loop-bound fixture
+        // witnessed the false SILENT DEFAULT on every fully-correct
+        // compile (found by this PR's own review — the same
+        // false-reporting class as the PHASE MISMATCH it fixed, one
+        // finding over). The real invariant would be "a prepass that
+        // PLANNED published", which the finding's evidence (pass-level
+        // Applied) cannot express.
+        applied_implies_published: Invariant::Exempt(
+            "WGGO has two invocation sites and only the prepass publishes \
+             pre-plans; the in-place replan applies on exactly the blocks \
+             the prepass cannot plan (loop-bound model vars), where empty \
+             is this channel's correct answer, not a silent default",
+        ),
         // Within one compile the ordering holds (the pre-pass fills it
         // during kernel synthesis, both readers run after, and a pre-pass
         // that produced nothing never publishes). Across module compiles it
@@ -1282,7 +1299,21 @@ pub fn findings() -> Vec<BusFinding> {
 /// revisited; the exposure otherwise matches
 /// [`crate::pass_trace::stage_order_violation`]'s.
 pub fn dependency_order_violations() -> Vec<(&'static str, &'static str, Channel)> {
-    let seen = crate::pass_trace::observed();
+    dependency_order_violations_in(&crate::pass_trace::observed())
+}
+
+/// The shared core: `InvocationOrdered` edges inverted within `seen`, an
+/// invocation sequence in first-invocation order. Two callers, two scopes,
+/// ONE edge semantics: the process-global advisory above (its `seen` is
+/// [`crate::pass_trace::observed`], subject to the cross-compile caveat in
+/// its doc), and the per-compile ENFORCED check
+/// (`crate::pass_manager::PassManager::dependency_order_violations`, whose
+/// `seen` is one epoch's view and therefore refusable evidence). Splitting
+/// the core out is what keeps the two answers from drifting: a new edge or
+/// claim is judged identically by both.
+pub(crate) fn dependency_order_violations_in(
+    seen: &[&'static str],
+) -> Vec<(&'static str, &'static str, Channel)> {
     let pos = |p: &str| seen.iter().position(|s| *s == p);
     let mut v = Vec::new();
     for d in CHANNELS {

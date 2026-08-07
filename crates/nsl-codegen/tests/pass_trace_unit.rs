@@ -455,16 +455,24 @@ fn a_pass_running_in_the_wrong_phase_is_reported() {
     }
     assert!(phase_mismatches().is_empty(), "correct phase flagged as a mismatch");
 
+    // TrainBlock stopped being usable as WGGO's "wrong phase" example when
+    // the registry declared it (step 6: the in-place replan is real, the
+    // loop-bound fixture proved it). Lowering remains undeclared for WGGO —
+    // no driver invokes it there.
     reset();
     {
-        let _p = enter_phase(CompilePhase::TrainBlock);
+        let _p = enter_phase(CompilePhase::Lowering);
         record("WGGO");
     }
     let m = phase_mismatches();
     assert_eq!(m.len(), 1, "expected exactly one mismatch, got {m:?}");
     assert_eq!(m[0].0, "WGGO");
-    assert_eq!(m[0].1, &[CompilePhase::KernelPrepass][..], "declared");
-    assert_eq!(m[0].2, Some(CompilePhase::TrainBlock), "observed");
+    assert_eq!(
+        m[0].1,
+        &[CompilePhase::KernelPrepass, CompilePhase::TrainBlock][..],
+        "declared"
+    );
+    assert_eq!(m[0].2, Some(CompilePhase::Lowering), "observed");
     reset();
 }
 

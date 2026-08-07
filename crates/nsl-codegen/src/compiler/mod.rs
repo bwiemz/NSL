@@ -640,6 +640,16 @@ pub struct Compiler<'a> {
     /// counters catch.
     pub bus: crate::pass_bus::PassBus,
 
+    /// The per-compile pass-ordering authority (roadmap item 2, step 6).
+    /// Constructing it anchors this compile's epoch, which every
+    /// `pass_trace::record` stamps — so `passes.per_compile_trace()` is THIS
+    /// compile's invocation history and the declared dependency edges become
+    /// enforceable per compile instead of advisory per process. The
+    /// train-block wrapper consults `passes.enforce_dependency_order()` at
+    /// its single exit. Dropped with the Compiler, restoring the previous
+    /// epoch (RAII, so nested compiles cannot cross-attribute).
+    pub passes: crate::pass_manager::PassManager,
+
     // ── Interprocedural analyses ─────────────────────────────────────
     /// Parameter escape facts for every function and model method with a
     /// visible body. Computed once, before any body is compiled, and read at
@@ -1121,6 +1131,7 @@ impl<'a> Compiler<'a> {
             func_index: 0,
             next_cuda_graph_region_id: 0,
             bus: crate::pass_bus::PassBus::default(),
+            passes: crate::pass_manager::PassManager::begin(),
             registry: FunctionRegistry::new(),
             escape: crate::escape::EscapeAnalysis::disabled(),
             types: TypeRegistry::new(),
