@@ -276,6 +276,69 @@ fn ccr_frees(stderr: &str) -> Option<u64> {
     })
 }
 
+/// A build that will NOT fuse must keep every CCR free marker it had.
+///
+/// The fix above lets CCR delete the `FreeTensor` markers for intermediates
+/// a fused chain elides. That is only sound when the LOWERER goes on to
+/// elide them — and the two sides plan from different gates: the lowerer
+/// requires the FASE hook, while `--fuse-wgrad-accum` alone does not imply
+/// it. `grad_accumulation == 1` makes FASE `Passthrough` for EVERY
+/// optimizer, and `--pretrain-optimized` sets the flag with no accumulation
+/// precondition — so on such a build CCR deleted markers for chains nobody
+/// fused. Not a leak (the transpose result is a view the end-of-backward
+/// bulk free sweeps) but it pins the base activation's buffer until then,
+/// in exactly the pass whose purpose is cutting the adjoint peak.
+/// Adversarial review caught it; measured at 3 lost markers.
+///
+/// Pinned by COUNT EQUALITY rather than an absolute number, so the arm
+/// survives any change in how many frees the fixture warrants.
+#[test]
+fn a_non_fusing_build_keeps_every_ccr_free_marker() {
+    let src = ccr_fixture_src()
+        // SGD + no `grad_accumulation` ⇒ FASE Passthrough ⇒ no hook ⇒ the
+        // lowerer never plans, so nothing may be elided.
+        .replace(
+            "train(model=m, epochs=8, grad_accumulation=4):",
+            "train(model=m, epochs=8):",
+        )
+        .replace(
+            "optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)",
+            "optimizer: SGD(lr=0.01)",
+        );
+    assert!(
+        src.contains("optimizer: SGD") && !src.contains("grad_accumulation"),
+        "the fixture rewrite matched nothing — this arm would silently test \
+         the fusing configuration instead"
+    );
+    let p = std::env::temp_dir().join("nsl_wgrad_accum_gate_ccr_nofuse.nsl");
+    std::fs::write(&p, src).expect("write fixture");
+
+    let off = run(&p, false, &["--checkpoint-blocks"]);
+    assert!(off.ok, "flag-off run failed:\n{}", off.stderr);
+    let on = run(&p, false, &["--fuse-wgrad-accum", "--checkpoint-blocks"]);
+    assert!(on.ok, "flag-on run failed:\n{}", on.stderr);
+
+    // Premise: this configuration really does not fuse. If it ever starts
+    // to, the equality below stops being the property under test.
+    assert_eq!(
+        fused_chains(&on.stderr),
+        None,
+        "this arm requires a NON-fusing build; the lowerer planned:\n{}",
+        on.stderr
+    );
+
+    let frees_off = ccr_frees(&off.stderr).expect("CCR must run (flag off)");
+    let frees_on = ccr_frees(&on.stderr).expect("CCR must run (flag on)");
+    assert!(frees_off > 0, "CCR inserted no frees — nothing to compare");
+    assert_eq!(
+        frees_on, frees_off,
+        "--fuse-wgrad-accum removed {} CCR free marker(s) on a build that \
+         fuses NOTHING — those activations now live to the end-of-backward \
+         bulk free",
+        frees_off.saturating_sub(frees_on)
+    );
+}
+
 /// `--checkpoint-blocks` must not silently switch the fusion off.
 ///
 /// CCR's adjoint last-use freeing computes `last_use[a_t] = matmul_idx` and

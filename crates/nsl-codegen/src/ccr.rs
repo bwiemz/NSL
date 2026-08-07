@@ -329,6 +329,101 @@ pub fn extend_last_use_through_lists(
 /// - the lowering-side FreeTensor guard (I64 + Tensor-typed only) remains
 ///   the final authority on what actually emits a free.
 ///
+/// Returns the number of markers inserted.
+pub fn insert_adjoint_last_use_frees(
+    adjoint: &mut WengertList,
+    protect: &HashSet<VarId>,
+    fresh: &mut VarId,
+    wgrad_chains: Option<&crate::wgrad_fusion::WgradFusionPlan>,
+) -> usize {
+    // Vars produced in the adjoint region (only these are candidates —
+    // primal values are owned by the primal cleanup path).
+    let produced: HashMap<VarId, usize> = adjoint
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(i, op)| (op.result, i))
+        .collect();
+    let already_freed: HashSet<VarId> = adjoint
+        .ops
+        .iter()
+        .filter(|op| matches!(op.op, PrimalOp::FreeTensor))
+        .map(|op| op.inputs[0])
+        .collect();
+
+    // Last use per var (tape-level), extended through list membership.
+    let mut last_use: HashMap<VarId, usize> = HashMap::new();
+    for (idx, op) in adjoint.ops.iter().enumerate() {
+        for input in &op.inputs {
+            last_use.insert(*input, idx);
+        }
+    }
+    extend_last_use_through_lists(adjoint, &mut last_use);
+    extend_last_use_through_wgrad_chains(adjoint, &mut last_use, wgrad_chains);
+
+    // Collect (insert_after_idx, victim) — free at last use, or right
+    // after production for dead results.
+    // Intermediates a fused weight-gradient chain ELIDES (`a_t`, `raw_grad`):
+    // their producing ops emit nothing, so there is no tensor to free — and a
+    // `FreeTensor` marker would be worse than useless, because it counts as a
+    // READER of `a_t` and so trips `wgrad_fusion::plan`'s single-reader
+    // precondition, rejecting the very chain it was inserted around. Moving
+    // the marker (below) fixes contiguity but not this; the marker must not
+    // exist at all.
+    //
+    // This is the ONE half that is unsafe to over-apply: deleting a marker
+    // for a chain the lowerer does not go on to elide costs a real early
+    // free. The caller is therefore responsible for supplying a plan only
+    // when the lowerer will plan too (it mirrors the hook gate); the
+    // post-insertion re-plan it runs afterwards checks the opposite
+    // direction — that the placement did not KILL an admissible chain — and
+    // cannot see a seed divergence, because both of its sides use the
+    // caller's seed.
+    let elided: HashSet<VarId> = wgrad_chains
+        .map(|p| p.suppressed.clone())
+        .unwrap_or_default();
+    let mut pending: Vec<(usize, VarId)> = Vec::new();
+    for (var, &prod_idx) in &produced {
+        if protect.contains(var) || already_freed.contains(var) || elided.contains(var) {
+            continue;
+        }
+        if matches!(adjoint.ops[prod_idx].op, PrimalOp::FreeTensor) {
+            continue;
+        }
+        // Only Tensor-typed (or untyped-defaulting-to-tensor) results; the
+        // lowering guard re-checks against the actual SSA value type.
+        if let Some(ty) = adjoint.var_types.get(var) {
+            if !matches!(ty, WengertType::Tensor) {
+                continue;
+            }
+        }
+        let at = last_use.get(var).copied().unwrap_or(prod_idx).max(prod_idx);
+        pending.push((at, *var));
+    }
+    // Insert from the back so earlier indices stay valid.
+    pending.sort_by_key(|p| std::cmp::Reverse(p.0));
+    let inserted = pending.len();
+    for (at, victim) in pending {
+        let result = *fresh;
+        *fresh += 1;
+        adjoint.ops.insert(
+            at + 1,
+            WengertOp {
+                id: 0,
+                result,
+                op: PrimalOp::FreeTensor,
+                inputs: vec![victim],
+                saved_for_backward: false,
+                checkpointed: false,
+            },
+        );
+    }
+    for (i, op) in adjoint.ops.iter_mut().enumerate() {
+        op.id = i as u32;
+    }
+    inserted
+}
+
 /// Push every last-use that falls INSIDE a fusable weight-gradient chain out
 /// to that chain's `reduce_to_shape`, so last-use freeing cannot insert a
 /// `FreeTensor` between the chain's three ops.
@@ -395,94 +490,6 @@ fn extend_last_use_through_wgrad_chains(
             *lu = target.max(*lu);
         }
     }
-}
-
-/// Returns the number of markers inserted.
-pub fn insert_adjoint_last_use_frees(
-    adjoint: &mut WengertList,
-    protect: &HashSet<VarId>,
-    fresh: &mut VarId,
-    wgrad_chains: Option<&crate::wgrad_fusion::WgradFusionPlan>,
-) -> usize {
-    // Vars produced in the adjoint region (only these are candidates —
-    // primal values are owned by the primal cleanup path).
-    let produced: HashMap<VarId, usize> = adjoint
-        .ops
-        .iter()
-        .enumerate()
-        .map(|(i, op)| (op.result, i))
-        .collect();
-    let already_freed: HashSet<VarId> = adjoint
-        .ops
-        .iter()
-        .filter(|op| matches!(op.op, PrimalOp::FreeTensor))
-        .map(|op| op.inputs[0])
-        .collect();
-
-    // Last use per var (tape-level), extended through list membership.
-    let mut last_use: HashMap<VarId, usize> = HashMap::new();
-    for (idx, op) in adjoint.ops.iter().enumerate() {
-        for input in &op.inputs {
-            last_use.insert(*input, idx);
-        }
-    }
-    extend_last_use_through_lists(adjoint, &mut last_use);
-    extend_last_use_through_wgrad_chains(adjoint, &mut last_use, wgrad_chains);
-
-    // Collect (insert_after_idx, victim) — free at last use, or right
-    // after production for dead results.
-    // Intermediates a fused weight-gradient chain ELIDES (`a_t`, `raw_grad`):
-    // their producing ops emit nothing, so there is no tensor to free — and a
-    // `FreeTensor` marker would be worse than useless, because it counts as a
-    // READER of `a_t` and so trips `wgrad_fusion::plan`'s single-reader
-    // precondition, rejecting the very chain it was inserted around. Moving
-    // the marker (below) fixes contiguity but not this; the marker must not
-    // exist at all. When a chain is admitted here the lowerer re-derives the
-    // same plan and elides it too — an invariant the caller checks and
-    // reports on, rather than assumes.
-    let elided: HashSet<VarId> = wgrad_chains
-        .map(|p| p.suppressed.clone())
-        .unwrap_or_default();
-    let mut pending: Vec<(usize, VarId)> = Vec::new();
-    for (var, &prod_idx) in &produced {
-        if protect.contains(var) || already_freed.contains(var) || elided.contains(var) {
-            continue;
-        }
-        if matches!(adjoint.ops[prod_idx].op, PrimalOp::FreeTensor) {
-            continue;
-        }
-        // Only Tensor-typed (or untyped-defaulting-to-tensor) results; the
-        // lowering guard re-checks against the actual SSA value type.
-        if let Some(ty) = adjoint.var_types.get(var) {
-            if !matches!(ty, WengertType::Tensor) {
-                continue;
-            }
-        }
-        let at = last_use.get(var).copied().unwrap_or(prod_idx).max(prod_idx);
-        pending.push((at, *var));
-    }
-    // Insert from the back so earlier indices stay valid.
-    pending.sort_by_key(|p| std::cmp::Reverse(p.0));
-    let inserted = pending.len();
-    for (at, victim) in pending {
-        let result = *fresh;
-        *fresh += 1;
-        adjoint.ops.insert(
-            at + 1,
-            WengertOp {
-                id: 0,
-                result,
-                op: PrimalOp::FreeTensor,
-                inputs: vec![victim],
-                saved_for_backward: false,
-                checkpointed: false,
-            },
-        );
-    }
-    for (i, op) in adjoint.ops.iter_mut().enumerate() {
-        op.id = i as u32;
-    }
-    inserted
 }
 
 /// Effective Wengert type of a result (falls back to the op default).

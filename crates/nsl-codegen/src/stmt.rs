@@ -9667,14 +9667,33 @@ impl Compiler<'_> {
                     // lets the inserter keep those chains adjacent; the lowerer
                     // re-derives the same plan from VarIds afterwards.
                     //
-                    // The seed is the param-adjoint set (before the input
-                    // expansion below widens it). That is a SUPERSET of the
-                    // FASE hook's `param_adj_set`, which additionally requires
-                    // an accum slot and a primal value — both built later. Over-
-                    // inclusion is safe here and cannot mis-fuse anything: it
-                    // only delays a free past a chain that turns out not to
-                    // fuse.
-                    let wgrad_chains = if self.compile_options.fuse_wgrad_accum {
+                    // GATED ON `fase_hook_active` TOO, mirroring the lowerer:
+                    // it plans only when `on_param_grad` is present
+                    // (wengert_lower.rs), which requires the FASE hook. Without
+                    // this the two sides diverge on any `--checkpoint-blocks`
+                    // build that will NOT fuse — accumulation == 1 makes FASE
+                    // Passthrough for EVERY optimizer, and
+                    // `--pretrain-optimized` turns `fuse_wgrad_accum` on with no
+                    // accumulation precondition — and CCR would then delete
+                    // `FreeTensor(a_t)` markers for chains nobody fuses. That is
+                    // not a leak (the transpose result is a view, swept by the
+                    // end-of-backward bulk free) but it pins the base
+                    // activation's buffer until then, a regression in exactly
+                    // the pass whose purpose is cutting the adjoint peak.
+                    // Found by adversarial review, measured at 3 lost markers on
+                    // an SGD/no-accumulation build.
+                    //
+                    // The seed is still the param-adjoint set (before the input
+                    // expansion below widens it), a SUPERSET of the hook's
+                    // `param_adj_set`, which additionally requires an accum slot
+                    // and a primal value — both built later. That residual
+                    // over-inclusion is bounded and one-directional: at worst a
+                    // param with no accum slot loses its `a_t` marker to the
+                    // bulk free. It cannot mis-fuse anything, because the
+                    // lowerer's plan — not this one — decides what is elided.
+                    let wgrad_chains = if self.compile_options.fuse_wgrad_accum
+                        && fase_hook_active
+                    {
                         Some(crate::wgrad_fusion::plan(&adjoint, &ccr_protect))
                     } else {
                         None
