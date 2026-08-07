@@ -243,6 +243,10 @@ fn csla_block_tables_build_once_per_shape_list_gpu() {
         builds <= 3,
         "{builds} block-table builds on a 6-window run with 2 distinct shape \
          lists — the per-list cache is not caching (the old rekeyed slot \
-         rebuilt >= 12 times here)"
+         rebuilt >= 12 times here). Note: a workspace capacity-growth \
+         teardown also frees the cache and re-counts its rebuilds, so a \
+         legitimate third distinct list PLUS a growth event can trip this \
+         bound — check `[fase-fused] block-table builds` across a longer \
+         run before blaming the cache"
     );
 }

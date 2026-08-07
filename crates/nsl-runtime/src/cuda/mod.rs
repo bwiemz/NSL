@@ -3868,9 +3868,18 @@ pub(crate) fn gpu_fase_fused_adamw_step_raw(
 /// uploaded ONCE per run and found by linear scan after that.
 ///
 /// Append-only on purpose: entries are never freed until the owning
-/// workspace is torn down (capacity growth), so the build path needs NO
-/// quiesce — a freshly allocated table cannot be read by any in-flight
-/// launch, unlike the old rekey-in-place slot whose free forced the sync.
+/// workspace is torn down (capacity growth), so the build path needs no
+/// quiesce of its own. The precise safety argument (review, 2026-08-07):
+/// `alloc_managed` can return a RECYCLED pool block whose previous owner's
+/// kernels are notionally in flight, so "fresh allocation" alone is NOT the
+/// guarantee. What makes it safe here: (a) every call to either twin runs
+/// `cuStreamSynchronize(current_stream())` before the pinned-stage rewrite,
+/// and get_or_build runs after that quiesce; (b) the synchronous
+/// `cuMemcpyHtoD_v2` issues on the legacy NULL stream, a two-way barrier
+/// against every blocking stream (compute streams are
+/// CU_STREAM_DEFAULT-blocking). Do NOT copy this pattern into a context
+/// without both invariants. Entries live until process exit (the
+/// pre-existing workspace convention).
 #[cfg(feature = "cuda")]
 struct BlkTables {
     lens: Vec<u32>,

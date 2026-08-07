@@ -54,18 +54,30 @@ fn codegen_sites_share_the_one_predicate() {
 #[test]
 fn runtime_filter_keeps_the_skip_abort_asymmetry() {
     let src = read("../nsl-runtime/src/muon_batch.rs");
-    // Bound the scan to the admission loop of nsl_muon_step_batch: from the
-    // fn to the grouping-key insertion that ends the filter.
+    // Bound the scan to nsl_muon_step_batch: from the fn to the EARLIEST
+    // following top-of-line item, whichever spelling it uses (review
+    // finding: preferring "\nfn " over "\npub" regardless of position
+    // silently swallowed everything after the fn if the next item ever
+    // became pub — including the test module's own continues/aborts).
     let start = src
         .find("fn nsl_muon_step_batch")
         .expect("nsl_muon_step_batch not found — renamed? Update this gate");
     let body = &src[start..];
-    let end = body
-        .find("fn ")
-        .and_then(|_| body[1..].find("\nfn ").or_else(|| body[1..].find("\npub")))
-        .map(|i| i + 1)
-        .unwrap_or(body.len());
-    let filter = &body[..end.min(body.len())];
+    let next_fn = body[1..].find("\nfn ");
+    let next_pub = body[1..].find("\npub");
+    let end = match (next_fn, next_pub) {
+        (Some(a), Some(b)) => a.min(b) + 1,
+        (Some(a), None) | (None, Some(a)) => a + 1,
+        (None, None) => body.len(),
+    };
+    let filter = &body[..end];
+    // Bound proof: a mis-extracted span that ran into the test module would
+    // carry its own continues/aborts and pass by coincidence.
+    assert!(
+        !filter.contains("mod tests") && !filter.contains("#[cfg(test)]"),
+        "the extracted span ran past the function into the test module — \
+         the bounding heuristic no longer matches the file's layout"
+    );
 
     let continues = filter.matches("continue;").count();
     assert_eq!(
@@ -80,9 +92,19 @@ fn runtime_filter_keeps_the_skip_abort_asymmetry() {
         filter.contains("route != 0") || filter.contains("route == 0"),
         "the route test vanished from the filter:\n{filter:.400}"
     );
+    // Count aborts strictly AFTER the last graceful skip — the fn also
+    // aborts on bad ns_steps BEFORE the filter, and counting it let a
+    // single post-filter abort→return conversion slip through (review
+    // finding: exactly the failure class this gate exists to catch).
+    let after_last_skip = filter
+        .rfind("continue;")
+        .map(|i| &filter[i..])
+        .unwrap_or(filter);
     assert!(
-        filter.matches("std::process::abort()").count() >= 2,
+        after_last_skip.matches("std::process::abort()").count() >= 2,
         "the operand-shape violations past the route/ndim tests must ABORT, \
-         never skip (the skip/abort asymmetry is the contract)"
+         never skip (the skip/abort asymmetry is the contract) — expected \
+         both the device/dtype/contiguity abort and the empty-matrix abort \
+         after the last graceful skip"
     );
 }
