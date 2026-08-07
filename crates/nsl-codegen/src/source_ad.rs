@@ -2947,6 +2947,12 @@ impl<'a> WengertExtractor<'a> {
                 ));
             }
         }
+        // Commit-point belt (see WengertList::assert_unique_op_ids): this
+        // prune deletes WITHOUT renumbering — deliberately, since id-space
+        // references depend on id stability — and it runs BEFORE every
+        // scan-and-claim pass, so from here on `op.id != index` and only
+        // ids may outlive a scan.
+        list.assert_unique_op_ids("fused-LCE dead-chain prune");
         Ok(removed)
     }
 

@@ -1223,10 +1223,20 @@ pub fn append_compressed_saves(
         other => panic!("[ccr] unsupported compress dtype '{other}' (fp16|bf16)"),
     };
     let mut map = HashMap::new();
+    // fresh_op_id, NOT ops.len(): the primal reaching this point has been
+    // through deletions (the fused-LCE prune, WGGO's sub-block prune) that
+    // do not renumber, so len sits BELOW the surviving max id and a
+    // len-minted id collides with a live op — at which point the id-keyed
+    // claim tables (CSHA's dispatch map, CCR's own exemption set) can
+    // match the appended cast instead of the op they claimed. Hoisted to a
+    // running counter (one max-scan, not one per push); uniqueness is
+    // re-asserted at the end of this function.
+    let mut next_id = primal.fresh_op_id();
     for &v in &plan.compress {
         let half = *fresh;
         *fresh += 1;
-        let id = primal.ops.len() as u32;
+        let id = next_id;
+        next_id += 1;
         primal.ops.push(WengertOp {
             id,
             result: half,
@@ -1241,7 +1251,8 @@ pub fn append_compressed_saves(
         }
         let free_result = *fresh;
         *fresh += 1;
-        let id = primal.ops.len() as u32;
+        let id = next_id;
+        next_id += 1;
         primal.ops.push(WengertOp {
             id,
             result: free_result,
@@ -1252,6 +1263,7 @@ pub fn append_compressed_saves(
         });
         map.insert(v, half);
     }
+    primal.assert_unique_op_ids("ccr::append_compressed_saves");
     map
 }
 
