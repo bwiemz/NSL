@@ -4581,6 +4581,41 @@ impl Compiler<'_> {
         Ok(builder.block_params(merge_b)[0])
     }
 
+    /// THE Muon-route predicate: `route_flag == 0 && runtime_rank == 2` —
+    /// the one definition of "this parameter is stepped by Muon's matrix
+    /// path". Item 8 (dispatcher unification): this rule was previously
+    /// hand-spelled at three emission sites (batch-skip, resident-momentum,
+    /// v-allocation — the last as its own De Morgan inverse) plus twice in
+    /// the runtime, with a comment at each pleading that they stay equal.
+    ///
+    /// It must mirror, EXACTLY:
+    ///   - `nsl_muon_step_batch`'s filter (muon_batch.rs): `route != 0` →
+    ///     skip, `ndim != 2` → skip, and every LATER exit (device / dtype /
+    ///     contiguity / empty matrix) is an ABORT, never a skip. That
+    ///     asymmetry is load-bearing: a graceful `continue` added past the
+    ///     first two tests would silently DROP params the batch-skip site
+    ///     already jumped over. `muon_route_contract_drift` pins both sides.
+    ///   - the stdlib branch (`stdlib/nsl/optim/muon.nsl`:
+    ///     `adamw_route > 0.5 or len(s) != 2`).
+    ///
+    /// Callers needing the negation (v-allocation) invert the returned
+    /// value (`icmp_imm == 0`) rather than re-deriving the inverse.
+    fn emit_muon_route_predicate(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        route_list: Value,
+        idx: Value,
+        param: Value,
+    ) -> Result<Value, CodegenError> {
+        let flag_i = self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
+        let ndim = self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param])?;
+        let zero_c = builder.ins().iconst(cl_types::I64, 0);
+        let two_c = builder.ins().iconst(cl_types::I64, 2);
+        let is_muon = builder.ins().icmp(IntCC::Equal, flag_i, zero_c);
+        let is_r2 = builder.ins().icmp(IntCC::Equal, ndim, two_c);
+        Ok(builder.ins().band(is_muon, is_r2))
+    }
+
     /// Item 12: how a train-loop callback body touches the streamed model θ.
     /// Under `--weight-stream` params are EVICTED (`t.data == null`) when a
     /// callback runs, so a model-field read launches on a null pointer (the
@@ -6877,15 +6912,8 @@ impl Compiler<'_> {
             let buf1 = if muon_resident_m {
                 let route_list = muon_route_list
                     .expect("muon route list is built before state buffers (4a)");
-                let flag_i =
-                    self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
-                let ndim_m =
-                    self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_i])?;
-                let two_c = builder.ins().iconst(cl_types::I64, 2);
-                let zero_c = builder.ins().iconst(cl_types::I64, 0);
-                let is_muon = builder.ins().icmp(IntCC::Equal, flag_i, zero_c);
-                let is_r2 = builder.ins().icmp(IntCC::Equal, ndim_m, two_c);
-                let resident = builder.ins().band(is_muon, is_r2);
+                let resident =
+                    self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
                 let dev_b = builder.create_block();
                 let host_b = builder.create_block();
                 let merge_b = builder.create_block();
@@ -6938,15 +6966,12 @@ impl Compiler<'_> {
                 let buf2 = if muon_cond_v {
                     let route_list = muon_route_list
                         .expect("muon route list is built before state buffers (4a)");
-                    let flag_i = self
-                        .compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
-                    let ndim_v =
-                        self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_i])?;
-                    let two_c = builder.ins().iconst(cl_types::I64, 2);
-                    let zero_c = builder.ins().iconst(cl_types::I64, 0);
-                    let flag_set = builder.ins().icmp(IntCC::NotEqual, flag_i, zero_c);
-                    let rank_not2 = builder.ins().icmp(IntCC::NotEqual, ndim_v, two_c);
-                    let needs_v = builder.ins().bor(flag_set, rank_not2);
+                    // needs_v == NOT(muon-routed): inverted from the shared
+                    // predicate instead of hand-spelling the De Morgan form
+                    // (`flag != 0 || rank != 2`) a fourth time.
+                    let routed =
+                        self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
+                    let needs_v = builder.ins().icmp_imm(IntCC::Equal, routed, 0);
                     let alloc_b = builder.create_block();
                     let skip_b = builder.create_block();
                     let merge_b = builder.create_block();
@@ -15125,18 +15150,13 @@ impl Compiler<'_> {
             // --muon-batch-ns: params the pre-loop batch call already
             // updated are skipped here. Eligibility must mirror
             // nsl_muon_step_batch's filter EXACTLY (route flag 0 AND
-            // runtime rank 2) or a param would be double-stepped/dropped.
+            // runtime rank 2) or a param would be double-stepped/dropped —
+            // the shared predicate IS that mirror (see its doc for why the
+            // runtime side must abort, never skip, past those two tests).
             let batch_skip_join = if muon_batch_active {
                 let route_list = muon_route_list.expect("refused above when None");
-                let flag_i =
-                    self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
-                let ndim =
-                    self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_val])?;
-                let zero_i = builder.ins().iconst(cl_types::I64, 0);
-                let two_i = builder.ins().iconst(cl_types::I64, 2);
-                let is_muon = builder.ins().icmp(IntCC::Equal, flag_i, zero_i);
-                let is_r2 = builder.ins().icmp(IntCC::Equal, ndim, two_i);
-                let both = builder.ins().band(is_muon, is_r2);
+                let both =
+                    self.emit_muon_route_predicate(builder, route_list, idx, param_val)?;
                 let do_block = builder.create_block();
                 let join = builder.create_block();
                 builder.ins().brif(both, join, &[], do_block, &[]);
