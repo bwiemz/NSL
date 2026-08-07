@@ -4173,6 +4173,10 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
         let nbase = (ws.stage as usize + 5 * ws.cap * 8) as *mut u32;
         std::ptr::copy_nonoverlapping(lens.as_ptr(), nbase, k);
         let up = |dst: u64, src_off: usize, bytes: usize| {
+            // PCIe accounting: tiny per-launch pointer tables, but the
+            // counter's contract is EVERY crossing copy or the benchmark
+            // matrix's figure is a silent undercount.
+            crate::host_profile::record_h2d(bytes);
             let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 dst,
                 (ws.stage as usize + src_off) as *const c_void,
@@ -4210,6 +4214,9 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
             ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
             ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
             let cp = |dst: u64, src: &[u32]| {
+                // PCIe accounting — same contract as the pointer-table
+                // upload above.
+                crate::host_profile::record_h2d(src.len() * 4);
                 let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
                     dst,
                     src.as_ptr() as *const c_void,
@@ -9258,6 +9265,13 @@ mod dtype_guard_drift {
         (
             "gpu_fase_fused_adamw_step",
             "theta/m/v/mp validated f32 by the caller at fase_step.rs:137-141",
+        ),
+        (
+            "gpu_fase_fused_adamw_step_bf16sr_multi",
+            "bare u64 device-pointer columns (bf16 mirrors + f32 m/v/mp), no \
+             NslTensor and so no dtype to read; the batched caller asserts \
+             m/v/mp f32-contiguous-GPU per param in sr_bf16.rs before \
+             bucketing",
         ),
         (
             "gpu_fase_fused_adamw_step_multi",
