@@ -211,6 +211,11 @@ pub struct ModelMetadata {
     /// derivable same-named field in another model can never win the
     /// name-keyed bridge uncontested and mis-size this one's params.
     pub tensor_fields_without_dims: std::collections::HashSet<String>,
+    /// Item 5: constructor-folded VALUES of 1-element config fields
+    /// (`_n_heads` = 8.0), `model_type -> field -> value`. Filled only via
+    /// the imported channel (ctor_fold); read at the extractor's Param
+    /// registration to seed `known_scalar_values`.
+    pub model_field_scalar_values: HashMap<String, HashMap<String, f64>>,
     /// P1 Muon item 6: explicit `@param_role("embedding"|"head"|"hidden")`
     /// decorators on model tensor fields, keyed `model_name -> field_name
     /// -> role`. The authoritative override for mixed Muon/AdamW routing
@@ -260,6 +265,7 @@ impl ModelMetadata {
             model_field_ranks: HashMap::new(),
             model_field_dims: HashMap::new(),
             tensor_fields_without_dims: std::collections::HashSet::new(),
+            model_field_scalar_values: HashMap::new(),
             model_field_roles: HashMap::new(),
             export_method_impls: std::collections::HashMap::new(),
             agent_var_types: HashMap::new(),
@@ -275,6 +281,23 @@ impl ModelMetadata {
     /// name while `model_field_dims` is keyed by model TYPE; threading the
     /// root model type through the arena call site is Stage-2B work.
     pub fn unique_field_elems(&self) -> HashMap<String, u64> {
+        self.unique_field_dims()
+            .into_iter()
+            .filter_map(|(name, dims)| {
+                let elems = dims
+                    .iter()
+                    .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))?;
+                Some((name, elems))
+            })
+            .collect()
+    }
+
+    /// Full-dims sibling of [`Self::unique_field_elems`], with the identical
+    /// uniqueness/veto/positivity rules. The arena's shape propagation needs
+    /// the dims themselves: an element count cannot cross a matmul (the
+    /// output numel is a function of the SHAPES), which is why numel-only
+    /// propagation sized 0 of 1321 transients on coder50m.
+    pub fn unique_field_dims(&self) -> HashMap<String, Vec<i64>> {
         let mut seen: HashMap<&str, Option<&Vec<i64>>> = HashMap::new();
         for fields in self.model_field_dims.values() {
             for (fname, dims) in fields {
@@ -299,10 +322,7 @@ impl ModelMetadata {
                 if dims.iter().any(|&d| d <= 0) {
                     return None;
                 }
-                let elems = dims
-                    .iter()
-                    .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))?;
-                Some((name.to_string(), elems))
+                Some((name.to_string(), dims.clone()))
             })
             .collect()
     }
@@ -861,6 +881,25 @@ pub struct Compiler<'a> {
     /// so a second `@fused_lm_ce` on a different train block no longer
     /// leaks the first block's dtype hint.
     pub active_fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
+    /// Item 4: the proven token-row count for a compiler-inferred fused LM
+    /// head, or the reason it could not be proven. Installed once per compile
+    /// by `install_per_compile_program_facts`; read by the train-block
+    /// prologue and the WGGO pre-pass, which must agree.
+    ///
+    /// Defaults to `Unproven` so a compiler built by a path that never
+    /// installed it declines rather than inferring from a stale or absent
+    /// scan.
+    pub lm_head_loader_scan: crate::lm_head_inference::LoaderScan,
+    /// Stage-2B: adjoint VarId -> its planned arena slot, for the train block
+    /// currently being lowered.
+    ///
+    /// Lives on the compiler rather than being threaded through
+    /// `compile_wengert_ops_range` because that function already takes
+    /// `&mut Compiler` and has several callers; a new parameter would be a
+    /// wider diff for the same reachability. Cleared at the end of each train
+    /// block so one block's offsets cannot be applied to the next block's
+    /// VarIds — the counter is per-extraction, so the ids WOULD collide.
+    pub arena_placements: HashMap<crate::wengert::VarId, crate::transient_arena::Placement>,
 
     // ── CPKD side-channel ─────────────────────────────────────────────
     /// The distill block currently being lowered, if any.  Installed by
@@ -1167,6 +1206,11 @@ impl<'a> Compiler<'a> {
             fused_ce_configs: options.fused_ce_configs.clone(),
             fused_kl_ce_configs: options.fused_kl_ce_configs.clone(),
             active_fused_ce_config: None,
+            lm_head_loader_scan: crate::lm_head_inference::LoaderScan::Unproven(
+                "the compilation unit was never scanned for its DataLoader shape"
+                    .to_string(),
+            ),
+            arena_placements: HashMap::new(),
             active_distill_context: None,
             pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
@@ -1230,6 +1274,44 @@ impl<'a> Compiler<'a> {
                 .cloned()
         };
         saved
+    }
+
+    /// Item 4: the inference authorization for one train block, or `None` when
+    /// the compiler must not install a fused head here.
+    ///
+    /// Refuses in three cases, each for a different reason:
+    ///
+    /// * `--fuse-lm-head off` (the default) — nobody authorized a rewrite.
+    /// * `--training-reference` — the reference arm exists to be an
+    ///   independent baseline for the fused numerics; inferring the fused
+    ///   kernel into it would make it a baseline for itself. This mirrors what
+    ///   `set_active_fused_ce_config_for_train_block` already does to the
+    ///   decorator, and the two must agree or `--training-reference` would
+    ///   suppress an explicit fusion while admitting an inferred one.
+    /// * an `@fused_lm_ce` decorator is present on this block — including
+    ///   `enabled = false`, which is a deliberate opt-out that inference must
+    ///   not quietly overturn. `enabled = true` needs no help.
+    pub fn lm_head_inference_for_train_block(
+        &self,
+        stmt_id: nsl_ast::NodeId,
+    ) -> Option<crate::source_ad::LmHeadInferenceCtx> {
+        if !self.compile_options.lm_head_fusion.is_on() {
+            return None;
+        }
+        if self.compile_options.training_reference {
+            return None;
+        }
+        if self
+            .fused_ce_configs
+            .iter()
+            .any(|c| c.train_block_stmt_id == stmt_id)
+        {
+            return None;
+        }
+        Some(crate::source_ad::LmHeadInferenceCtx {
+            mode: self.compile_options.lm_head_fusion,
+            loader: self.lm_head_loader_scan.clone(),
+        })
     }
 
     /// CFTP v10 (item 3): restore the `active_fused_ce_config` slot to a

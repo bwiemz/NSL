@@ -66,6 +66,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             checkpoint_stride,
             fuse_rmsnorm_backward,
             fuse_wgrad_accum,
+            fuse_lm_head,
+            transient_arena,
             checkpoint_compress,
             layerwise_accum,
             weight_stream,
@@ -98,24 +100,31 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     std::env::set_var("NSL_COLLECTIVES", &collectives);
 
     // Meta-flag expansion (roadmap 3.3) — see the twin call in build/options.rs.
-    let mut wggo = wggo;
-    let mut csha = csha;
-    let mut source_ad = source_ad;
-    let mut fuse_rmsnorm_backward = fuse_rmsnorm_backward;
-    let mut fuse_wgrad_accum = fuse_wgrad_accum;
+    let mut bundle = crate::meta_flags::PretrainBundle {
+        wggo,
+        csha,
+        source_ad,
+        fuse_rmsnorm_backward,
+        fuse_wgrad_accum,
+        fuse_lm_head,
+    };
     crate::meta_flags::expand_pretrain_optimized(
         pretrain_optimized,
-        &mut wggo,
-        &mut csha,
-        &mut source_ad,
-        &mut fuse_rmsnorm_backward,
-        &mut fuse_wgrad_accum,
+        &mut bundle,
         &crate::meta_flags::WgradFusionBlockers {
             grad_integrity,
             optim_state_offload,
             layerwise_accum,
         },
     );
+    let crate::meta_flags::PretrainBundle {
+        wggo,
+        csha,
+        source_ad,
+        fuse_rmsnorm_backward,
+        fuse_wgrad_accum,
+        fuse_lm_head,
+    } = bundle;
 
     // Dev Tools paper completion (PDF section 4.3): --health-interval
     // validation. The value reaches codegen via
@@ -471,6 +480,21 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 debug_training,
                 grad_integrity,
                 training_reference,
+                transient_arena,
+                // Item 4: filled by the multi-file build path after dependency
+                // resolution; empty here because the entry module's own models
+                // come from `collect_models` directly.
+                imported_model_field_dims: Default::default(),
+                imported_model_field_ranks: Default::default(),
+                imported_tensor_fields_without_dims: Default::default(),
+                imported_model_field_values: Default::default(),
+                // Item 4: unset means off. `--pretrain-optimized` has already
+                // filled `auto` above, so an explicit `off` reaching here is a
+                // decision the bundle deliberately did not override.
+                lm_head_fusion: fuse_lm_head
+                    .as_deref()
+                    .and_then(nsl_codegen::lm_head_inference::LmHeadFusion::parse)
+                    .unwrap_or_default(),
                 shared_lib: false,
                 emit_export_table: false,
                 wrga_inputs: None,

@@ -346,6 +346,9 @@ pub(crate) fn srbf16_evict_all() {
 /// tensors), report anti-vacuity counters, free the mirrors, drop the mode.
 #[no_mangle]
 pub extern "C" fn nsl_sr_bf16_teardown() {
+    // Item 7: certification histograms ride the teardown so every SR run
+    // that ends cleanly reports them (no-op unless NSL_SR_HIST=1).
+    nsl_sr_bf16_hist_report();
     #[cfg(feature = "cuda")]
     {
         srbf16_upload_all();
@@ -368,6 +371,108 @@ pub extern "C" fn nsl_sr_bf16_teardown() {
     SRBF16_ACTIVE.store(false, Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Item 7: update-magnitude / stall histograms (NSL_SR_HIST=1)
+// ---------------------------------------------------------------------------
+//
+// Certification instrumentation, not production telemetry: under
+// `NSL_SR_HIST=1` every fused SR step samples the FIRST
+// `SR_HIST_SAMPLE` bf16 elements of each mirrored parameter before and
+// after the update, widens both, and buckets `|delta theta|` by binary
+// exponent. An element whose bf16 bits did not change counts as STALLED.
+// NOTE what that includes: sub-ULP updates whose SR coin came up zero (the
+// underflow signal this exists for) AND updates that were exactly zero in
+// f32 (untouched embedding rows under wd=0 have zero grad, zero moments,
+// zero update). The report says "bf16 bits unchanged", not "underflowed";
+// interpret the rate against the run's expected zero-update surface.
+// Reported at teardown.
+#[cfg(feature = "cuda")]
+const SR_HIST_SAMPLE: usize = 16384;
+/// `buckets[i]` counts updates with 2^(i-48) <= |delta| < 2^(i-47);
+/// index 0 also absorbs everything smaller, 63 everything larger.
+struct SrHist {
+    buckets: [u64; 64],
+    stalled: u64,
+    sampled: u64,
+    steps: u64,
+}
+static SR_HIST: Mutex<SrHist> = Mutex::new(SrHist {
+    buckets: [0; 64],
+    stalled: 0,
+    sampled: 0,
+    steps: 0,
+});
+
+fn sr_hist_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_SR_HIST").ok().as_deref() == Some("1"))
+}
+
+#[cfg(feature = "cuda")]
+#[inline]
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+#[cfg(feature = "cuda")]
+fn sr_hist_record(before: &[u16], after: &[u16]) {
+    let mut h = SR_HIST.lock().unwrap();
+    for (&o, &n) in before.iter().zip(after) {
+        h.sampled += 1;
+        if o == n {
+            h.stalled += 1;
+            continue;
+        }
+        let d = (bf16_to_f32(n) - bf16_to_f32(o)).abs();
+        if !d.is_finite() || d == 0.0 {
+            // Equal after widening (e.g. -0.0 vs +0.0) or non-finite:
+            // count the former as a stall, drop the latter.
+            if d == 0.0 {
+                h.stalled += 1;
+            }
+            continue;
+        }
+        // f32 exponent bits give floor(log2 d) without a libm call.
+        let exp = ((d.to_bits() >> 23) & 0xff) as i32 - 127;
+        let idx = (exp + 48).clamp(0, 63) as usize;
+        h.buckets[idx] += 1;
+    }
+}
+
+/// Print the histogram (teardown, and callable from gates).
+#[no_mangle]
+pub extern "C" fn nsl_sr_bf16_hist_report() {
+    if !sr_hist_enabled() {
+        return;
+    }
+    let h = SR_HIST.lock().unwrap();
+    if h.sampled == 0 {
+        eprintln!("[sr-hist] enabled but nothing sampled (no mirrored steps ran)");
+        return;
+    }
+    eprintln!(
+        "[sr-hist] |dtheta| over {} sampled element-updates across {} step-param launches:",
+        h.sampled, h.steps
+    );
+    for (i, &c) in h.buckets.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        eprintln!(
+            "[sr-hist]   2^{:>3} : {:>12}  ({:.3}%)",
+            i as i32 - 48,
+            c,
+            100.0 * c as f64 / h.sampled as f64
+        );
+    }
+    eprintln!(
+        "[sr-hist]   stalled (bf16 bits unchanged — includes exactly-zero f32 \
+         updates, e.g. untouched embedding rows): {} ({:.3}%)",
+        h.stalled,
+        100.0 * h.stalled as f64 / h.sampled as f64
+    );
+}
+
 /// P4 item 17: the ONLY sanctioned weight mutation under bf16-sr — fused
 /// AdamW step against the bf16 mirror with counter-based SR, then a refresh
 /// of the resident f32 working view so the coherence invariant holds.
@@ -375,8 +480,8 @@ pub extern "C" fn nsl_sr_bf16_teardown() {
 /// Mirrors `nsl_fase_fused_adamw_step`'s scalar contract (f64 scalars,
 /// bc1/bc2 precomputed by codegen); adds `step` (the optimizer step counter
 /// the SR stream is keyed on). Seed comes from the global `--seed` store.
-#[no_mangle]
 #[allow(clippy::too_many_arguments)]
+#[no_mangle]
 pub extern "C" fn nsl_sr_bf16_step_adamw(
     theta_ptr: i64,
     m_ptr: i64,
@@ -441,6 +546,16 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
         let key = seed ^ (step as u64).wrapping_mul(SR_STEP_SALT);
         let ctr_base = param_idx << SR_PARAM_SHIFT;
         let has_wd = wd != 0.0;
+        // Item 7 histograms: capture the bf16 sample BEFORE the update.
+        let hist_n = if sr_hist_enabled() { len.min(SR_HIST_SAMPLE) } else { 0 };
+        let mut hist_before: Vec<u16> = vec![0; hist_n];
+        if hist_n > 0 {
+            crate::cuda::inner::memcpy_dtoh(
+                hist_before.as_mut_ptr() as *mut std::ffi::c_void,
+                dev_bf16 as *const std::ffi::c_void,
+                hist_n * 2,
+            );
+        }
         crate::cuda::gpu_fase_fused_adamw_step_bf16sr(
             dev_bf16, m_ptr, v_ptr, mp_ptr, len,
             beta1 as f32,
@@ -456,6 +571,17 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
             key,
             ctr_base,
         );
+        // Item 7 histograms: sample AFTER the update and record the deltas.
+        if hist_n > 0 {
+            let mut hist_after: Vec<u16> = vec![0; hist_n];
+            crate::cuda::inner::memcpy_dtoh(
+                hist_after.as_mut_ptr() as *mut std::ffi::c_void,
+                dev_bf16 as *const std::ffi::c_void,
+                hist_n * 2,
+            );
+            sr_hist_record(&hist_before, &hist_after);
+            SR_HIST.lock().unwrap().steps += 1;
+        }
         // Coherence refresh: the resident f32 working view must equal
         // widen(mirror) at all times so callbacks / model_save / the next
         // forward all read post-update values.
@@ -618,6 +744,9 @@ fn bf16sr_multi_impl(
         // Coherence refreshes deferred until after the batched launches:
         // (mirror ptr, resident f32 view ptr, len).
         let mut refreshes: Vec<(u64, u64, usize)> = Vec::new();
+        // Item 7 histograms: (mirror ptr, pre-step bf16 sample) per batched
+        // param, recorded after the launches complete.
+        let mut hist_pre: Vec<(u64, Vec<u16>)> = Vec::new();
         // Review-A1 guard, mirrored from `fase_multi_impl`: two idx entries
         // aliasing ONE mirror inside a single launch would race
         // last-writer-wins across grid slices, where the per-param loop
@@ -706,6 +835,20 @@ fn bf16sr_multi_impl(
                     b.mp.push(mp.data as u64);
                     b.n.push(u32::try_from(len).expect("param exceeds u32 elements"));
                     b.ctr.push(param_idx << SR_PARAM_SHIFT);
+                    // Item 7 histograms: without this, batched dispatch
+                    // would silently take NSL_SR_HIST's sampling surface to
+                    // (almost) zero — only the aliased-mirror fallback goes
+                    // through the per-param entry that samples.
+                    if sr_hist_enabled() {
+                        let hn = len.min(SR_HIST_SAMPLE);
+                        let mut before = vec![0u16; hn];
+                        crate::cuda::inner::memcpy_dtoh(
+                            before.as_mut_ptr() as *mut std::ffi::c_void,
+                            dev_bf16 as *const std::ffi::c_void,
+                            hn * 2,
+                        );
+                        hist_pre.push((dev_bf16, before));
+                    }
                     if !th.data.is_null() {
                         refreshes.push((dev_bf16, th.data as u64, len));
                     }
@@ -736,6 +879,19 @@ fn bf16sr_multi_impl(
         };
         launch(&decayed, true);
         launch(&exempt, false);
+
+        // Item 7 histograms, after both launches: the D2H read synchronizes
+        // with the enqueued step kernels, so `after` is post-update.
+        for (dev_bf16, before) in &hist_pre {
+            let mut after = vec![0u16; before.len()];
+            crate::cuda::inner::memcpy_dtoh(
+                after.as_mut_ptr() as *mut std::ffi::c_void,
+                *dev_bf16 as *const std::ffi::c_void,
+                before.len() * 2,
+            );
+            sr_hist_record(before, &after);
+            SR_HIST.lock().unwrap().steps += 1;
+        }
 
         // Coherence refresh, after the steps are enqueued: the resident f32
         // working view must equal widen(mirror) so callbacks / model_save /

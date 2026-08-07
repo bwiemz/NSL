@@ -744,6 +744,17 @@ fn plan_train_block(
         extractor.set_model_method_bodies(compiler.models.model_method_bodies.clone());
         extractor.set_model_field_types(compiler.models.model_field_types.clone());
         extractor.set_model_field_ranks(compiler.models.model_field_ranks.clone());
+        // Item 4: the prepass must see the SAME fusion decision the real
+        // extraction will make. The fused substitution removes three ops from
+        // the tape, and this prepass's whole job is to fingerprint that tape —
+        // planning against an unfused graph would reject its own plan.
+        extractor.set_model_field_dims(compiler.models.model_field_dims.clone());
+        extractor.set_model_field_scalar_values(
+            compiler.models.model_field_scalar_values.clone(),
+        );
+        if let Some(ctx) = compiler.lm_head_inference_for_train_block(train_block_stmt_id) {
+            extractor.set_lm_head_inference(ctx);
+        }
         extractor.set_synth_call_names(compiler.synth_call_names.clone());
         extractor.set_synth_member_names(compiler.synth_member_names.clone());
         extractor.register_model_instance(model_sym, &model_type_name);

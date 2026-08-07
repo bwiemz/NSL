@@ -106,7 +106,8 @@ def curve_delta(a: RunResult, b: RunResult) -> tuple[int, float, float]:
 SCALES = {
     # scale: (model dir, batch, seq, accum-in-program, per-micro budget s)
     "50m": ("coder50m", 1, 1024, 2, 4.0),
-    "500m": ("coder500m", 2, 512, 8, 10.0),
+    "500m": ("coder500m", 1, 512, 8, 10.0),
+    "1b": ("coder1b", 1, 512, 8, 20.0),
 }
 
 
@@ -120,6 +121,17 @@ def main() -> None:
                         help="reload-continuation optimizer steps (0 skips)")
     parser.add_argument("--skip-f32", action="store_true",
                         help="only run the bf16-sr arms")
+    parser.add_argument("--corpus", type=Path, default=None,
+                        help="REAL u16 token corpus to slice instead of the "
+                             "synthetic gen_tokens stream (item 7's "
+                             "real-corpus trajectory arm)")
+    parser.add_argument("--tag", default="",
+                        help="suffix appended to every arm name so a real-"
+                             "corpus campaign does not overwrite the "
+                             "synthetic one's logs")
+    parser.add_argument("--sr-hist", action="store_true",
+                        help="run the bf16-sr arms under NSL_SR_HIST=1 "
+                             "(update-magnitude/stall histograms in stderr)")
     args = parser.parse_args()
 
     model_dir, batch, seq, accum, per_micro_s = SCALES[args.scale]
@@ -132,14 +144,37 @@ def main() -> None:
         )
 
     micro_per_step = accum
-    tok = TOKENS_DIR / f"srbf16_{args.scale}_{args.steps}.bin"
-    gen_tokens(tok, args.steps * tokens_per_step_for(batch, seq, micro_per_step))
+    need = args.steps * tokens_per_step_for(batch, seq, micro_per_step)
+    kind = "real" if args.corpus is not None else "syn"
+    if args.corpus is not None:
+        # Slice the REAL corpus to length. Refusing a short corpus beats
+        # silently wrapping it (which would train on repeats and report a
+        # memorization curve as a real-data curve).
+        raw = args.corpus.read_bytes()
+        if len(raw) < need * 2:
+            raise SystemExit(
+                f"corpus {args.corpus} has {len(raw) // 2} tokens, need {need}")
+        # The kind is in the FILENAME, not just the tag: gen_tokens has a
+        # size-check cache, so a same-named synthetic run would silently
+        # reuse the corpus bytes as its "synthetic" stream.
+        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{kind}_{args.steps}.bin"
+        tok.parent.mkdir(parents=True, exist_ok=True)
+        tok.write_bytes(raw[: need * 2])
+    else:
+        tok = TOKENS_DIR / f"srbf16_{args.scale}{args.tag}_{kind}_{args.steps}.bin"
+        gen_tokens(tok, need)
     timeout_s = int(args.steps * micro_per_step * per_micro_s * 1.6) + 900
 
     env = {"NSL_WS_COUNTER": "1"}
     # run_arm writes under p0's LOGS constant — repoint it at ours.
     import p0_campaign as p0
 
+    # Per-SCALE log namespace: arm names carry only tag+seed, so without
+    # this a 1b run overwrites a 500m run's per-arm dirs and summary (it
+    # did, on 2026-08-06 — the 500m-synthetic stderr logs were lost and
+    # only the captured stdout tables survive).
+    global LOGS
+    LOGS = LOGS / args.scale
     p0.LOGS = LOGS
     LOGS.mkdir(parents=True, exist_ok=True)
 
@@ -148,20 +183,25 @@ def main() -> None:
     save_paths: dict[str, Path] = {}
 
     for seed in args.seeds:
-        arm_pairs = [] if args.skip_f32 else [(f"f32_s{seed}", BASE_FLAGS)]
+        arm_pairs = [] if args.skip_f32 else [
+            (f"f32{args.tag}_s{seed}", BASE_FLAGS)
+        ]
         arm_pairs.append(
-            (f"bf16sr_s{seed}", [*BASE_FLAGS, "--param-dtype", "bf16-sr"])
+            (f"bf16sr{args.tag}_s{seed}", [*BASE_FLAGS, "--param-dtype", "bf16-sr"])
         )
         for name, flags in arm_pairs:
             save = LOGS / name / "final.nslm"
             save.parent.mkdir(parents=True, exist_ok=True)
             print(f"=== {name}: {' '.join(flags)}")
+            arm_env = dict(env)
+            if args.sr_hist and "bf16sr" in name:
+                arm_env["NSL_SR_HIST"] = "1"
             res = run_arm(
                 name,
                 program,
                 tok,
                 [*flags, "--seed", str(seed)],
-                env,
+                arm_env,
                 rewrites=[("CERT_SAVE_PATH", save.as_posix())],
                 timeout_s=timeout_s,
             )
@@ -173,26 +213,41 @@ def main() -> None:
 
     # Reload-continuation under bf16-sr from the first seed's checkpoint.
     if args.continue_steps > 0:
-        parent = f"bf16sr_s{args.seeds[0]}"
+        parent = f"bf16sr{args.tag}_s{args.seeds[0]}"
         parent_save = save_paths.get(parent)
         if parent_save is None or not parent_save.exists():
             raise SystemExit(f"continuation parent checkpoint missing: {parent}")
-        cont_tok = TOKENS_DIR / f"srbf16_{args.scale}_cont_{args.continue_steps}.bin"
-        gen_tokens(
-            cont_tok,
-            args.continue_steps * tokens_per_step_for(batch, seq, micro_per_step),
-        )
-        name = "bf16sr_continue"
+        cont_need = args.continue_steps * tokens_per_step_for(
+            batch, seq, micro_per_step)
+        cont_tok = TOKENS_DIR / (
+            f"srbf16_{args.scale}{args.tag}_{kind}_cont_{args.continue_steps}.bin")
+        if args.corpus is not None:
+            # FRESH real data from past the parent's consumed range — a
+            # continuation that replays the parent's tokens would grade
+            # memorization, and one on the synthetic stream would grade a
+            # different distribution than the checkpoint was trained on.
+            raw = args.corpus.read_bytes()
+            if len(raw) < (need + cont_need) * 2:
+                raise SystemExit(
+                    f"corpus too short for continuation: have {len(raw) // 2} "
+                    f"tokens, need {need + cont_need}")
+            cont_tok.write_bytes(raw[need * 2 : (need + cont_need) * 2])
+        else:
+            gen_tokens(cont_tok, cont_need)
+        name = f"bf16sr{args.tag}_continue"
         save = LOGS / name / "final.nslm"
         save.parent.mkdir(parents=True, exist_ok=True)
         print(f"=== {name}: reload {parent_save}")
+        cont_env = dict(env)
+        if args.sr_hist:
+            cont_env["NSL_SR_HIST"] = "1"
         res = run_arm(
             name,
             cont_program,
             cont_tok,
             [*BASE_FLAGS, "--param-dtype", "bf16-sr", "--seed",
              str(args.seeds[0])],
-            env,
+            cont_env,
             rewrites=[
                 ("CERT_LOAD_PATH", parent_save.as_posix()),
                 ("CERT_SAVE_PATH", save.as_posix()),
@@ -234,7 +289,8 @@ def main() -> None:
         print("| seed | steps | mean |dL| | max |dL| | f32 final | bf16sr final |")
         print("|---|---|---|---|---|---|")
         for seed in args.seeds:
-            a, b = results.get(f"f32_s{seed}"), results.get(f"bf16sr_s{seed}")
+            a = results.get(f"f32{args.tag}_s{seed}")
+            b = results.get(f"bf16sr{args.tag}_s{seed}")
             if not a or not b:
                 continue
             n, mean_d, max_d = curve_delta(a, b)
@@ -246,9 +302,10 @@ def main() -> None:
     # Seed spread within each arm family (final losses).
     for fam in ("f32", "bf16sr"):
         finals = [
-            results[f"{fam}_s{s}"].losses[-1][1]
+            results[f"{fam}{args.tag}_s{s}"].losses[-1][1]
             for s in args.seeds
-            if f"{fam}_s{s}" in results and results[f"{fam}_s{s}"].losses
+            if f"{fam}{args.tag}_s{s}" in results
+            and results[f"{fam}{args.tag}_s{s}"].losses
         ]
         if len(finals) > 1:
             print(
@@ -256,7 +313,7 @@ def main() -> None:
                 f"max={max(finals):.4f} range={max(finals) - min(finals):.4f}"
             )
 
-    (LOGS / "campaign_summary.json").write_text(
+    (LOGS / f"campaign_summary{args.tag}_{kind}.json").write_text(
         json.dumps(
             {
                 name: {

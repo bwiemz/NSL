@@ -2024,6 +2024,21 @@ pub struct WengertExtractor<'a> {
     /// closes the fused-LCE matcher's LATENT 3-D+ RISK on weights
     /// accessed via `self.field` (e.g. an MoE expert stack).
     model_field_ranks: HashMap<String, HashMap<String, usize>>,
+    /// Item 4: FULL literal dims of model fields, `model_type -> field_name ->
+    /// dims`. Mirrors `Compiler::models.model_field_dims`, installed by
+    /// `set_model_field_dims` from the same prologue as the rank map above.
+    ///
+    /// Ranks were enough to REFUSE a bad `W`; inferring a fused LM head needs
+    /// to *affirm* one, and `[V, H]` is only readable from the dims. The two
+    /// maps come from one `extract_shape_from_tensor_init` site in
+    /// `collection.rs`, so they cannot disagree about a field's rank.
+    model_field_dims: HashMap<String, HashMap<String, Vec<i64>>>,
+    /// Item 5: constructor-folded VALUES of 1-element config fields,
+    /// `model_type -> field_name -> value` (`_n_heads` = 8.0). Same two
+    /// registration sites as the dims; feeds `known_scalar_values`, which
+    /// is what lets the arena's shape propagation fold
+    /// `int(self._n_heads.item())` and with it every attention reshape.
+    model_field_scalar_values: HashMap<String, HashMap<String, f64>>,
     /// Context prefix -> model type name mapping (e.g., "m" -> "NSLCoder", "m.blocks.0" -> "TransformerBlock")
     context_to_model_type: HashMap<String, String>,
     /// Override resolved names for symbols (loop var -> "m.blocks.0")
@@ -2093,6 +2108,35 @@ pub struct WengertExtractor<'a> {
     /// use unannotated `Tensor` params while structurally rejecting
     /// programs that DID annotate a non-2D `W`.
     known_ranks: HashMap<VarId, usize>,
+    /// Item 4: declared dims per VarId, for the model-field weights the
+    /// inference path has to size `[V, H]` from.
+    ///
+    /// Absent-key semantics are the OPPOSITE of `known_ranks`: a missing entry
+    /// makes the matcher fire conservatively, but makes *inference* decline.
+    /// Inference is installing a rewrite nobody asked for by name, so it may
+    /// only proceed on what it can actually read.
+    known_dims: HashMap<VarId, Vec<i64>>,
+    /// Item 5: per-var VALUES of 1-element config tensors, resolved
+    /// through the owning model type like `known_dims`.
+    known_scalar_values: HashMap<VarId, f64>,
+    /// Item 4: `None` disables inference entirely (the pre-item-4 behaviour,
+    /// and what every non-`--pretrain-optimized` compile gets).
+    lm_head_inference: Option<LmHeadInferenceCtx>,
+    /// Item 4: one entry per head this compile INFERRED (not per decorator),
+    /// read by the train-block lowering to print the execution marker.
+    ///
+    /// Keyed by the fused op's result VarId rather than kept as a bare list:
+    /// a rolled-back inference has to remove ITS entry, and a step body with
+    /// two inferred losses would otherwise have the rollback pop whichever
+    /// happened to be last.
+    inferred_heads: Vec<(VarId, InferredHead)>,
+    /// Item 4: why inference declined, one line per `cross_entropy` it looked
+    /// at and passed on. `Auto` prints these; `Require` refuses on them.
+    ///
+    /// Separate from `fused_lce_declines`, which feeds the decorator's
+    /// nothing-fused refusal — merging the two would make a program with no
+    /// decorator at all trip a refusal written for programs that have one.
+    inference_declines: Vec<String>,
     /// CFTP §4.4 G3 (Sprint v3-1, review Finding 1): each successful
     /// `cross_entropy → FusedLinearCe` auto-substitution records its
     /// dead upstream chain (`Transpose → Matmul → Add`) here.  The
@@ -2100,7 +2144,7 @@ pub struct WengertExtractor<'a> {
     /// tape is complete, so the "is this VarId still consumed by
     /// anything else?" check is exact (no false negatives from
     /// substitution-time scans that haven't yet seen later uses).
-    pending_fused_lce_prunes: Vec<FusedLceMatch>,
+    pending_fused_lce_prunes: Vec<PendingFusedLcePrune>,
     /// Item 6: every `cross_entropy` call this extractor saw while an
     /// `@fused_lm_ce(enabled = true)` decorator was active, paired with the
     /// reason the fused substitution did NOT happen.
@@ -2356,6 +2400,99 @@ impl FusedLceMatch {
     }
 }
 
+/// One queued dead-chain prune, plus what it takes to UNDO the substitution
+/// that queued it.
+///
+/// Item 4: an explicit `@fused_lm_ce` that leaves the composite chain live is
+/// a broken promise and must be a hard error — the user named the kernel. An
+/// *inferred* fusion is a different contract: the program compiled fine
+/// yesterday, and `--pretrain-optimized` turning it into a compile error would
+/// be a regression caused entirely by the compiler's own initiative. So an
+/// inferred substitution that turns out to have a live logits consumer is
+/// rolled back to the composite `CrossEntropyLoss` instead.
+///
+/// The rollback is exact because the prune is DEFERRED: nothing has been
+/// removed from the tape yet, so restoring the op's kind and inputs restores
+/// the pre-substitution tape byte for byte.
+#[derive(Debug, Clone)]
+struct PendingFusedLcePrune {
+    m: FusedLceMatch,
+    /// `false` for an explicit decorator — a live consumer is then fatal.
+    inferred: bool,
+    /// Result VarId of the emitted `FusedLinearCe` op (== the `cross_entropy`
+    /// result), so the undo can find the one op to rewrite.
+    fused_result_var: VarId,
+    /// The two operands the composite `CrossEntropyLoss` had.
+    logits_var: VarId,
+    targets_var: VarId,
+    /// `Some([B, S, V])` when the pre-reshape logits' shape is proven and
+    /// `.shape` reads of it may be folded to a constant. `None` for the
+    /// explicit-decorator path, which must keep declining on a live consumer:
+    /// the decorator's hints are the user's assertion about the head, not a
+    /// derivation the compiler made, so folding on them would put a number
+    /// nobody checked into a shape the program then reshapes by.
+    logits_dims: Option<Vec<i64>>,
+}
+
+/// The four numbers `PrimalOp::FusedLinearCe` is built from.
+///
+/// A named struct rather than four positional `u32`s because `batch_size` and
+/// `seq_len` are adjacent, same-typed, and only ever consumed as a product —
+/// transposing them is invisible everywhere downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FusedHeadDims {
+    vocab_size: u32,
+    hidden_size: u32,
+    batch_size: u32,
+    seq_len: u32,
+}
+
+/// A proven inference, ready to emit.
+#[derive(Debug, Clone, Copy)]
+struct InferredSubstitution {
+    m: FusedLceMatch,
+    dims: FusedHeadDims,
+    /// Chosen, not defaulted: the codegen default (1024) exceeds any vocab
+    /// below 1024 and `validate` would reject it as a hard CodegenError with
+    /// no source span. A decorator's author can pass `vocab_tile=`; inference
+    /// has to pick one that is valid for the vocab it just read.
+    vocab_tile: u32,
+}
+
+/// What an inferred head resolved to, for the execution marker.
+///
+/// Item 4: the marker is not decoration. `[fused-lm-ce]` declines were already
+/// visible, but a SILENT success is indistinguishable from the fusion never
+/// having been considered — which is the exact ambiguity that let the 8.5%
+/// live only in a benchmark harness. Printing the four numbers also makes an
+/// inference bug legible: a wrong `rows` shows up here before the runtime
+/// target-length guard fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferredHead {
+    pub vocab_size: u32,
+    pub hidden_size: u32,
+    pub batch_size: u32,
+    pub seq_len: u32,
+    pub has_bias: bool,
+}
+
+/// Everything the `cross_entropy` arm needs to decide whether it may install a
+/// fused head the user did not ask for by name.
+#[derive(Debug, Clone)]
+pub struct LmHeadInferenceCtx {
+    pub mode: crate::lm_head_inference::LmHeadFusion,
+    /// Proven row count, or the reason it could not be proven.
+    pub loader: crate::lm_head_inference::LoaderScan,
+}
+
+// There is deliberately no dtype field here. The decorator's `dtype=` is an
+// opt-in DOWNCAST (CFTP v6 inserts `nsl_tensor_to_bf16` on x/W/bias), which
+// trades numerics for bandwidth. An inferred head leaves
+// `active_fused_ce_config` unset, so `fused_ce_dtype_for_compiler` resolves
+// tag 0 = f32 — the byte-identity path. Inferring a downcast the user did not
+// ask for would change training numerics on the strength of a flag whose
+// stated job is to pick the best VALIDATED stack.
+
 impl<'a> WengertExtractor<'a> {
     pub fn new(interner: &'a Interner) -> Self {
         WengertExtractor {
@@ -2374,6 +2511,8 @@ impl<'a> WengertExtractor<'a> {
             model_method_bodies: HashMap::new(),
             model_field_types: HashMap::new(),
             model_field_ranks: HashMap::new(),
+            model_field_dims: HashMap::new(),
+            model_field_scalar_values: HashMap::new(),
             context_to_model_type: HashMap::new(),
             symbol_name_overrides: HashMap::new(),
             model_instance_types: HashMap::new(),
@@ -2384,6 +2523,11 @@ impl<'a> WengertExtractor<'a> {
             next_subgraph_id: 0,
             fused_ce_config: None,
             known_ranks: HashMap::new(),
+            known_dims: HashMap::new(),
+            known_scalar_values: HashMap::new(),
+            lm_head_inference: None,
+            inferred_heads: Vec::new(),
+            inference_declines: Vec::new(),
             pending_fused_lce_prunes: Vec::new(),
             fused_lce_declines: Vec::new(),
             fp8_compute_methods: HashSet::new(),
@@ -2568,6 +2712,193 @@ impl<'a> WengertExtractor<'a> {
         let ty = type_for_op(&op.op);
         self.list.var_types.insert(op.result, ty);
         self.list.ops.push(op);
+    }
+
+    /// Item 4: the four numbers a fused head is built from, whether they came
+    /// from a hand-written decorator or from inference.
+    ///
+    /// Bundled so `emit_fused_lce_substitution` cannot be called with the
+    /// batch and sequence arguments transposed — they are both `u32`, they are
+    /// adjacent, and only their PRODUCT is ever used downstream, so swapping
+    /// them is both easy and undetectable at runtime.
+    fn emit_fused_lce_substitution(
+        &mut self,
+        result: VarId,
+        dims: FusedHeadDims,
+        vocab_tile: Option<u32>,
+        m: FusedLceMatch,
+        logits_var: VarId,
+        targets_var: VarId,
+        inferred: bool,
+    ) {
+        let vt = vocab_tile.unwrap_or(
+            crate::fused_linear_ce::FusedLinearCEConfig::default().vocab_tile,
+        );
+        let is_large = dims.vocab_size > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+        // Sprint 2.5: a biasless head has no bias VarId — carry w_var as a
+        // never-read placeholder so the 4-wide input convention (and targets
+        // at inputs[3]) survives.
+        let has_bias = m.bias_var.is_some();
+        let four = vec![
+            m.x_var,
+            m.w_var,
+            m.bias_var.unwrap_or(m.w_var),
+            targets_var,
+        ];
+        self.push_op(WengertOp {
+            id: self.list.ops.len() as u32,
+            result,
+            op: PrimalOp::FusedLinearCe {
+                vocab_size: dims.vocab_size,
+                hidden_size: dims.hidden_size,
+                batch_size: dims.batch_size,
+                seq_len: dims.seq_len,
+                vocab_tile: vt,
+                ignore_index: -100,
+                is_large,
+                has_bias,
+                x_rank3: m.saw_reshape(),
+            },
+            inputs: four,
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        // Review Finding 1: defer the prune of the now-dead upstream composite
+        // chain (Transpose → Matmul → Add) until finalize(). By then the whole
+        // tape is built, so the "is this VarId consumed elsewhere?" check is
+        // exact — no false-positive prunes from later ops that haven't been
+        // pushed yet.
+        // Only an INFERRED head folds shape reads, and only when the matcher
+        // saw a reshape (so the pre-reshape logits are rank-3 `[B, S, V]`).
+        let logits_dims = (inferred && m.saw_reshape()).then(|| {
+            vec![
+                dims.batch_size as i64,
+                dims.seq_len as i64,
+                dims.vocab_size as i64,
+            ]
+        });
+        self.pending_fused_lce_prunes.push(PendingFusedLcePrune {
+            m,
+            inferred,
+            fused_result_var: result,
+            logits_var,
+            targets_var,
+            logits_dims,
+        });
+        self.fused_lce_substitutions += 1;
+    }
+
+    /// Item 4 — decide whether this `cross_entropy` may become a fused head
+    /// that nobody wrote a decorator for.
+    ///
+    /// Every "no" is recorded with its reason, because the whole failure mode
+    /// this closes is a fusion that quietly does not happen. `Auto` prints the
+    /// reasons; `Require` refuses on them.
+    fn try_infer_fused_lm_head(&mut self, logits_var: VarId) -> Option<InferredSubstitution> {
+        let ctx = self.lm_head_inference.clone()?;
+        if !ctx.mode.is_on() {
+            return None;
+        }
+
+        // Order matters for the diagnostic, not for correctness: check the
+        // CHAIN first, so a program whose loss is not an LM head at all (an
+        // auxiliary classifier, a distillation term) reports "this is not an
+        // LM head" rather than complaining about its DataLoader.
+        let m = match self.try_match_fused_linear_ce_pattern(logits_var) {
+            Ok(m) => m,
+            Err(reason) => {
+                self.inference_declines.push(reason.describe());
+                return None;
+            }
+        };
+
+        let Some(dims) = self.known_dims.get(&m.w_var) else {
+            self.inference_declines.push(
+                "the LM-head weight's dimensions are not derivable at compile time \
+                 (its model field has no shape-literal initializer or Tensor<[..]> \
+                 annotation), so vocab_size and hidden_size cannot be proven"
+                    .to_string(),
+            );
+            return None;
+        };
+        // The matcher's `known_ranks` guard already refuses a non-rank-2 W when
+        // the rank is known — but it FIRES when the rank is unknown, and this
+        // is the affirming direction, so re-check rather than inherit.
+        if dims.len() != 2 {
+            self.inference_declines.push(format!(
+                "the LM-head weight is rank {}; the fused kernel strides it as a \
+                 2-D [V, H] matrix",
+                dims.len()
+            ));
+            return None;
+        }
+        let (Ok(vocab_size), Ok(hidden_size)) =
+            (u32::try_from(dims[0]), u32::try_from(dims[1]))
+        else {
+            self.inference_declines.push(format!(
+                "the LM-head weight's dims {:?} are not representable as the u32 \
+                 (vocab_size, hidden_size) the fused op carries",
+                dims
+            ));
+            return None;
+        };
+        // `FusedLinearCEConfig::validate` rejects these deeper in the pipeline,
+        // as a CodegenError with no source location. A decorator earns that:
+        // the user asserted the shape. Inference has to check them here, or
+        // `--fuse-lm-head auto` would turn "this head is not eligible" into a
+        // hard build failure for a program that compiled fine before the flag.
+        if !hidden_size.is_multiple_of(32) {
+            self.inference_declines.push(format!(
+                "the LM-head hidden size is {hidden_size}; the fused kernel needs \
+                 a multiple of 32"
+            ));
+            return None;
+        }
+        if vocab_size > crate::fused_linear_ce::MAX_VOCAB_HARD_CEILING {
+            self.inference_declines.push(format!(
+                "the LM-head vocab is {vocab_size}, above the fused kernel's hard \
+                 ceiling of {}",
+                crate::fused_linear_ce::MAX_VOCAB_HARD_CEILING
+            ));
+            return None;
+        }
+        // The inner vocab-tile fill is done by 128 threads in lockstep, so the
+        // tile must be a positive multiple of 128 that fits in the vocab —
+        // which no vocab below 128 admits.
+        const TILE_GRANULE: u32 = 128;
+        let default_tile =
+            crate::fused_linear_ce::FusedLinearCEConfig::default().vocab_tile;
+        let vocab_tile = default_tile.min(vocab_size - vocab_size % TILE_GRANULE);
+        if vocab_tile == 0 {
+            self.inference_declines.push(format!(
+                "the LM-head vocab is {vocab_size}; the fused kernel's vocab tile \
+                 must be a multiple of {TILE_GRANULE} and fit inside the vocab, \
+                 which no vocab below {TILE_GRANULE} allows"
+            ));
+            return None;
+        }
+
+        // The row count is the one fact the tape cannot supply.
+        let Some(facts) = ctx.loader.facts() else {
+            self.inference_declines.push(
+                ctx.loader
+                    .reason()
+                    .unwrap_or("the token-row count could not be proven")
+                    .to_string(),
+            );
+            return None;
+        };
+
+        Some(InferredSubstitution {
+            m,
+            dims: FusedHeadDims {
+                vocab_size,
+                hidden_size,
+                batch_size: facts.batch_size,
+                seq_len: facts.seq_len,
+            },
+            vocab_tile,
+        })
     }
 
     /// CFTP §4.4 G3 (Sprint v3-1) — auto-substitution pattern matcher.
@@ -2899,11 +3230,48 @@ impl<'a> WengertExtractor<'a> {
             true
         };
 
-        let mut removed = 0usize;
+        // Item 4: decide EVERYTHING before removing ANYTHING.
+        //
+        // This loop used to remove each dead member as it went and only then
+        // scan for survivors, so the live-consumer error was raised from a
+        // half-pruned tape. That was survivable while the only caller threw
+        // the whole extraction away on `Err` — but an inferred substitution
+        // rolls back and keeps compiling, and the CE op it restores points at
+        // a reshape result the partial prune had already deleted ("source AD:
+        // loss VarId not found in compiled forward graph", reproduced on
+        // `models/coder50m/pretrain.nsl`). `is_dead` ignores in-chain
+        // consumers, so its answer never depended on removal order and
+        // hoisting the check changes nothing else.
         for &target in &chain_results {
-            if !is_dead(target, list) {
+            if is_dead(target, list) {
                 continue;
             }
+            let op = list
+                .ops
+                .iter()
+                .find(|op| op.result == target)
+                .map(|op| describe_primal_op(&op.op))
+                .unwrap_or_else(|| "an already-removed op".to_string());
+            let consumer = list
+                .ops
+                .iter()
+                .find(|c| !chain_results.contains(&c.result) && c.inputs.contains(&target))
+                .map(|c| describe_primal_op(&c.op))
+                .unwrap_or_else(|| "the function output".to_string());
+            return Err(format!(
+                "@fused_lm_ce substituted the loss, but the composite logits \
+                 chain is still LIVE: {op} (VarId {target}) is consumed by \
+                 {consumer} outside the chain. A live consumer forces the \
+                 [batch*seq, vocab] logits to materialize every step, defeating \
+                 the fusion, and its backward would corrupt gradient \
+                 accumulation. Replace runtime reads of the logits (e.g. `let \
+                 ls = logits.shape` before the flatten) with compile-time dims, \
+                 or set enabled = false on @fused_lm_ce."
+            ));
+        }
+
+        let mut removed = 0usize;
+        for &target in &chain_results {
             // Remove the op producing `target`.  Linear scan is O(N)
             // but we run this at most once per cross_entropy
             // substitution; N is bounded by the per-fn op count.
@@ -2918,35 +3286,14 @@ impl<'a> WengertExtractor<'a> {
                 // happen to share an entry.
             }
         }
-        // Sprint 2.5: a chain op that SURVIVED the prune means a live
-        // consumer outside the chain (e.g. `let ls = logits.shape`). With
-        // the substitution already emitted this is unrecoverable, not
-        // conservative: the surviving ops get ghost adjoints during the
-        // backward sweep, which either poison the shared gradient
-        // accumulation Adds (hard unresolved-adjoint error downstream,
-        // with a diagnostic that points HERE) or would silently drop
-        // parameter gradients pre-#396. And semantically, a live consumer
-        // forces the [batch*seq, vocab] logits to materialize every step
-        // anyway — the fusion's entire point is defeated. Refuse with the
-        // consumer named so the fix is one line away.
-        for &target in &chain_results {
-            if let Some(op) = list.ops.iter().find(|op| op.result == target) {
-                let consumer = list
-                    .ops
-                    .iter()
-                    .find(|c| {
-                        !chain_results.contains(&c.result) && c.inputs.contains(&target)
-                    })
-                    .map(|c| describe_primal_op(&c.op))
-                    .unwrap_or_else(|| "the function output".to_string());
-                return Err(format!(
-                    "@fused_lm_ce substituted the loss, but the composite                      logits chain is still LIVE: {} (VarId {}) is consumed by                      {} outside the chain. A live consumer forces the                      [batch*seq, vocab] logits to materialize every step,                      defeating the fusion, and its backward would corrupt                      gradient accumulation. Replace runtime reads of the                      logits (e.g. `let ls = logits.shape` before the                      flatten) with the decorator's compile-time dims, or                      set enabled = false on @fused_lm_ce.",
-                    describe_primal_op(&op.op),
-                    target,
-                    consumer
-                ));
-            }
-        }
+        // No survivor scan here: the pre-check above returns before anything
+        // is removed, and this loop removes every chain member unconditionally,
+        // so a chain op cannot outlive it. A second scan would read as an
+        // independent backstop while being unreachable — which is worse than
+        // no backstop, because it invites the next reader to believe two
+        // checks exist. (The live-consumer refusal lives in the PRE-check,
+        // with the same consumer-naming diagnostic.)
+        //
         // Commit-point belt (see WengertList::assert_unique_op_ids): this
         // prune deletes WITHOUT renumbering — deliberately, since id-space
         // references depend on id stability — and it runs BEFORE every
@@ -3088,6 +3435,47 @@ impl<'a> WengertExtractor<'a> {
         self.model_field_ranks = ranks;
     }
 
+    /// Item 4: install per-model-field literal dims so the two model-field
+    /// `Param` registration sites can populate `known_dims`, which is what
+    /// lets an inferred head read `[V, H]` off the weight instead of taking
+    /// it on faith from a hand-written decorator.
+    pub fn set_model_field_dims(
+        &mut self,
+        dims: HashMap<String, HashMap<String, Vec<i64>>>,
+    ) {
+        self.model_field_dims = dims;
+    }
+
+    /// Item 5: install constructor-folded scalar VALUES of 1-element config
+    /// fields (`_n_heads` = 8.0), same keying and same registration sites
+    /// as the dims map above.
+    pub fn set_model_field_scalar_values(
+        &mut self,
+        values: HashMap<String, HashMap<String, f64>>,
+    ) {
+        self.model_field_scalar_values = values;
+    }
+
+    /// Item 4: authorize compiler-inferred LM-head fusion for this
+    /// extraction. Absent (the default) means inference never runs.
+    pub fn set_lm_head_inference(&mut self, ctx: LmHeadInferenceCtx) {
+        self.lm_head_inference = Some(ctx);
+    }
+
+    /// Item 4: heads this extraction inferred, for the execution marker.
+    /// Rolled-back inferences are already gone from this list.
+    pub fn inferred_heads(&self) -> Vec<InferredHead> {
+        self.inferred_heads.iter().map(|(_, h)| *h).collect()
+    }
+
+    /// Item 4: one line per `cross_entropy` that inference looked at and
+    /// passed on, in tape order. Empty when inference was off, when it
+    /// succeeded everywhere, or when there was no `cross_entropy` at all —
+    /// the caller distinguishes those with `inferred_heads()`.
+    pub fn inference_declines(&self) -> &[String] {
+        &self.inference_declines
+    }
+
     /// WRGA B.3.2 Option 3: install the compiler's synth_call_names map so
     /// the Call extractor can resolve sentinel-Ident callees back to their
     /// real FFI name (e.g. `nsl_adapter_fused_gatedlora_matmul`).
@@ -3152,6 +3540,22 @@ impl<'a> WengertExtractor<'a> {
     /// Returns (compound_name, VarId) pairs for gradient collection.
     pub fn named_param_var_ids(&self) -> &[(String, VarId)] {
         &self.named_param_vars
+    }
+
+    /// Per-var literal dims resolved through the owning MODEL TYPE at the
+    /// `Param` registration sites. Item 5 seeds the arena's shape
+    /// propagation from this map first: unlike the bare-leaf-name field
+    /// bridge, a field called `weight` in five different modules resolves
+    /// to five different vars with five different (correct) dims here
+    /// instead of being dropped as ambiguous.
+    pub fn known_param_dims(&self) -> &HashMap<VarId, Vec<i64>> {
+        &self.known_dims
+    }
+
+    /// Item 5: per-var constructor-folded scalar values of 1-element config
+    /// tensors — see [`Self::known_param_dims`] for the resolution story.
+    pub fn known_param_scalar_values(&self) -> &HashMap<VarId, f64> {
+        &self.known_scalar_values
     }
 
     /// Extract statements into the Wengert list.
@@ -3449,6 +3853,23 @@ impl<'a> WengertExtractor<'a> {
                             {
                                 self.known_ranks.insert(var, r);
                             }
+                            // Item 4: same key, same site — a weight whose
+                            // rank is known here is exactly the weight whose
+                            // dims an inferred head must read.
+                            if let Some(d) = self
+                                .model_field_dims
+                                .get(pt)
+                                .and_then(|fields| fields.get(&field_name))
+                            {
+                                self.known_dims.insert(var, d.clone());
+                            }
+                            if let Some(&sv) = self
+                                .model_field_scalar_values
+                                .get(pt)
+                                .and_then(|fields| fields.get(&field_name))
+                            {
+                                self.known_scalar_values.insert(var, sv);
+                            }
                         }
                         if self.is_frozen_compound(&compound) {
                             // CPKD (I-11): frozen (teacher) model field —
@@ -3588,6 +4009,25 @@ impl<'a> WengertExtractor<'a> {
                                             .and_then(|fields| fields.get(&ident_name))
                                         {
                                             self.known_ranks.insert(var, r);
+                                        }
+                                        // Item 4: mirror the dims for the
+                                        // pipe form too, or a head written
+                                        // `x |> lm_head` would be inferable
+                                        // through one syntax and not the
+                                        // other.
+                                        if let Some(d) = self
+                                            .model_field_dims
+                                            .get(&pt)
+                                            .and_then(|fields| fields.get(&ident_name))
+                                        {
+                                            self.known_dims.insert(var, d.clone());
+                                        }
+                                        if let Some(&sv) = self
+                                            .model_field_scalar_values
+                                            .get(&pt)
+                                            .and_then(|fields| fields.get(&ident_name))
+                                        {
+                                            self.known_scalar_values.insert(var, sv);
                                         }
                                     }
                                     if self.is_frozen_compound(&compound) {
@@ -4268,65 +4708,68 @@ impl<'a> WengertExtractor<'a> {
                             } else {
                                 // All four hints present — the `expect`s cannot
                                 // fire, `missing_shape_hints` just checked each.
-                                let v = cfg.vocab_size.expect("checked above");
-                                let h = cfg.hidden_size.expect("checked above");
-                                let b = cfg.batch_size.expect("checked above");
-                                let s = cfg.seq_len.expect("checked above");
+                                let dims = FusedHeadDims {
+                                    vocab_size: cfg.vocab_size.expect("checked above"),
+                                    hidden_size: cfg.hidden_size.expect("checked above"),
+                                    batch_size: cfg.batch_size.expect("checked above"),
+                                    seq_len: cfg.seq_len.expect("checked above"),
+                                };
                                 let logits_var = input_vars[0];
                                 let targets_var = input_vars[1];
                                 match self.try_match_fused_linear_ce_pattern(logits_var) {
                                     Ok(m) => {
-                                        let vt = cfg.vocab_tile.unwrap_or(
-                                            crate::fused_linear_ce::FusedLinearCEConfig::default(
-                                            ).vocab_tile,
-                                        );
-                                        let is_large = v
-                                            > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
-                                        // Sprint 2.5: a biasless head has
-                                        // no bias VarId — carry w_var as a
-                                        // never-read placeholder so the
-                                        // 4-wide input convention (and
-                                        // targets at inputs[3]) survives.
-                                        let has_bias = m.bias_var.is_some();
-                                        let four = vec![
-                                            m.x_var,
-                                            m.w_var,
-                                            m.bias_var.unwrap_or(m.w_var),
-                                            targets_var,
-                                        ];
-                                        self.push_op(WengertOp {
-                                            id: self.list.ops.len() as u32,
+                                        self.emit_fused_lce_substitution(
                                             result,
-                                            op: PrimalOp::FusedLinearCe {
-                                                vocab_size: v,
-                                                hidden_size: h,
-                                                batch_size: b,
-                                                seq_len: s,
-                                                vocab_tile: vt,
-                                                ignore_index: -100,
-                                                is_large,
-                                                has_bias,
-                                                x_rank3: m.saw_reshape(),
-                                            },
-                                            inputs: four,
-                                            saved_for_backward: false,
-                                            checkpointed: false,
-                                        });
-                                        // Review Finding 1: defer the prune of the
-                                        // now-dead upstream composite chain
-                                        // (Transpose → Matmul → Add) until finalize().
-                                        // By then the whole tape is built, so the
-                                        // "is this VarId consumed elsewhere?" check is
-                                        // exact — no false-positive prunes from later
-                                        // ops that haven't been pushed yet.
-                                        self.pending_fused_lce_prunes.push(m);
-                                        self.fused_lce_substitutions += 1;
+                                            dims,
+                                            cfg.vocab_tile,
+                                            m,
+                                            logits_var,
+                                            targets_var,
+                                            false,
+                                        );
                                         return Some(result);
                                     }
                                     Err(reason) => {
                                         self.fused_lce_declines.push(reason);
                                     }
                                 }
+                            }
+                        } else if args.len() == 2 && input_vars.len() == 2 {
+                            // Item 4 — compiler inference. Reached only when no
+                            // ENABLED decorator claimed this loss, so it can
+                            // never override an explicit `enabled = false`
+                            // opt-out or an explicit hint the user wrote.
+                            //
+                            // An `Arity` mismatch is deliberately NOT a decline
+                            // here: `cross_entropy(logits, targets,
+                            // label_smoothing=...)` is a perfectly good program
+                            // that this fusion simply does not cover, and
+                            // nobody asked for the fusion.
+                            let logits_var = input_vars[0];
+                            let targets_var = input_vars[1];
+                            if let Some(sub) =
+                                self.try_infer_fused_lm_head(logits_var)
+                            {
+                                self.emit_fused_lce_substitution(
+                                    result,
+                                    sub.dims,
+                                    Some(sub.vocab_tile),
+                                    sub.m,
+                                    logits_var,
+                                    targets_var,
+                                    true,
+                                );
+                                self.inferred_heads.push((
+                                    result,
+                                    InferredHead {
+                                        vocab_size: sub.dims.vocab_size,
+                                        hidden_size: sub.dims.hidden_size,
+                                        batch_size: sub.dims.batch_size,
+                                        seq_len: sub.dims.seq_len,
+                                        has_bias: sub.m.bias_var.is_some(),
+                                    },
+                                ));
+                                return Some(result);
                             }
                         }
                         PrimalOp::CrossEntropyLoss
@@ -5499,10 +5942,134 @@ impl<'a> WengertExtractor<'a> {
     pub fn apply_pending_fused_lce_prunes(&mut self) -> Result<usize, String> {
         let prunes = std::mem::take(&mut self.pending_fused_lce_prunes);
         let mut removed = 0usize;
-        for m in &prunes {
-            removed += Self::prune_fused_lce_dead_chain(&mut self.list, m)?;
+        for p in &prunes {
+            if let Some(dims) = p.logits_dims.as_deref() {
+                Self::fold_chain_shape_reads(&mut self.list, &p.m, dims);
+            }
+            match Self::prune_fused_lce_dead_chain(&mut self.list, &p.m) {
+                Ok(n) => removed += n,
+                // Item 4: a live logits consumer under an EXPLICIT decorator
+                // stays fatal — the user named the kernel and is entitled to
+                // learn that they did not get it. Under inference the compiler
+                // volunteered, so it takes the substitution back rather than
+                // failing a build that would have succeeded without the flag.
+                Err(msg) if p.inferred => {
+                    self.undo_fused_lce_substitution(p);
+                    // `saturating_sub` rather than `-`: the counter was
+                    // incremented by the emit that queued this prune, so it
+                    // cannot be zero — but a release build wraps instead of
+                    // panicking, and a wrapped counter would make the
+                    // decorator's nothing-fused refusal read as "plenty
+                    // fused" forever after.
+                    self.fused_lce_substitutions =
+                        self.fused_lce_substitutions.saturating_sub(1);
+                    self.inferred_heads
+                        .retain(|(v, _)| *v != p.fused_result_var);
+                    // Keep the rejected diagnostic verbatim: it names the exact
+                    // surviving op and its consumer, which is the only part a
+                    // reader can act on.
+                    self.inference_declines.push(msg);
+                }
+                Err(msg) => return Err(msg),
+            }
         }
         Ok(removed)
+    }
+
+    /// Item 4: replace `logits.shape` with the shape the compiler proved.
+    ///
+    /// # Why this exists
+    ///
+    /// Every pretraining script in this repo flattens the logits like this:
+    ///
+    /// ```text
+    ///   let ls = logits.shape
+    ///   let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+    /// ```
+    ///
+    /// That `.shape` is a live consumer of the `[B, S, V]` logits, so the
+    /// fusion cannot delete them and declines — on the house style, which
+    /// would have left `--fuse-lm-head` firing only on programs that already
+    /// hard-code their dims. The read is the ONLY thing keeping the tensor
+    /// alive, and its answer is `[B, S, V]`: `B` and `S` from the DataLoader,
+    /// `V` from the weight. So the compiler answers it directly and the
+    /// tensor becomes dead.
+    ///
+    /// # Why `[B, S, V]` is the right answer and not a guess
+    ///
+    /// Only the pre-reshape members (the matmul result, and the add result on
+    /// a head with a bias) are folded, and only when the matcher descended
+    /// through a reshape — the same fact that sets `x_rank3` on the emitted
+    /// op. A rank-2 `[B*S, V]` logits tensor makes `ls[2]` an out-of-bounds
+    /// read, so any program written this way already required rank-3 logits
+    /// to work at all.
+    ///
+    /// The reshape RESULTS are never folded: their shape is whatever the
+    /// runtime list said, which the tape does not carry. A `.shape` read on a
+    /// reshape result therefore still declines, as it should.
+    ///
+    /// # If the row count were wrong anyway
+    ///
+    /// The same constants also size `batch.labels.reshape([ls[0] * ls[1]])`,
+    /// which fails loudly on an element-count mismatch, and
+    /// `nsl_fused_lce_targets_i64_alloc` refuses when the label count
+    /// disagrees with the pinned `rows`. A wrong fold is a hard runtime
+    /// refusal, not a silent miscompile.
+    fn fold_chain_shape_reads(list: &mut WengertList, m: &FusedLceMatch, dims: &[i64]) {
+        let foldable: Vec<VarId> = [Some(m.matmul_result_var), m.add_result_var]
+            .into_iter()
+            .flatten()
+            .collect();
+        let name = crate::lm_head_inference::const_shape_name(dims);
+        let mut folded: Vec<VarId> = Vec::new();
+        for op in list.ops.iter_mut() {
+            let is_shape_read =
+                matches!(&op.op, PrimalOp::Passthrough(n) if n == "shape");
+            if is_shape_read && op.inputs.iter().any(|i| foldable.contains(i)) {
+                op.op = PrimalOp::Passthrough(name.clone());
+                // Clearing the inputs is what actually kills the liveness —
+                // rewriting the op kind alone would leave the chain member in
+                // `op.inputs` and `is_dead` would still see a consumer.
+                op.inputs.clear();
+                folded.push(op.result);
+            }
+        }
+        // `push_op` stamps `var_types` when an op is CREATED; this rewrite
+        // happens afterwards, so the type has to be restamped by hand. Both
+        // names map to `List`, so this is currently a no-op — but leaving the
+        // stamp to a coincidence between two independent `match` arms is how
+        // the next rename gets a `Tensor`-typed list handed to
+        // `nsl_tensor_free`.
+        let ty = type_for_op(&PrimalOp::Passthrough(name));
+        for v in folded {
+            list.var_types.insert(v, ty);
+        }
+    }
+
+    /// Item 4: put a `FusedLinearCe` op back the way it was.
+    ///
+    /// Sound because the prune is deferred: the composite `Transpose → Matmul
+    /// → Add [→ reshape]` ops are all still on the tape at this point (that is
+    /// precisely what "still live" means), so restoring the loss op's kind and
+    /// its two original operands restores the pre-substitution tape exactly.
+    /// The op's *position* is unchanged, and `FusedLinearCe` and
+    /// `CrossEntropyLoss` both produce a scalar, so no downstream index or
+    /// type moves.
+    fn undo_fused_lce_substitution(&mut self, p: &PendingFusedLcePrune) {
+        if let Some(op) = self
+            .list
+            .ops
+            .iter_mut()
+            .find(|op| op.result == p.fused_result_var)
+        {
+            op.op = PrimalOp::CrossEntropyLoss;
+            op.inputs = vec![p.logits_var, p.targets_var];
+        }
+        // `push_op` tagged the result with `type_for_op(FusedLinearCe)`; retag
+        // so a downstream type query does not see the fused op's type on an op
+        // that is no longer fused.
+        let ty = type_for_op(&PrimalOp::CrossEntropyLoss);
+        self.list.var_types.insert(p.fused_result_var, ty);
     }
 
     /// Check if the computation graph is static (no dynamic control flow).

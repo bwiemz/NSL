@@ -892,12 +892,23 @@ where
         ) {
             return None;
         }
-        let is_scalar_lit =
-            |e: &Expr| matches!(e.kind, ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_));
-        if is_scalar_lit(right) {
+        // Item 4: a ONE-ELEMENT tensor init counts as the scalar side too.
+        // `randn([49152, 512]) * full([1], 0.02)` is what
+        // `models/coder50m/model.nsl` actually writes, and the literal-only
+        // rule derived no shape for it — so the production LM head's dims were
+        // invisible to every consumer of `model_field_dims`, including the
+        // inference this item adds. Broadcasting a 1-element tensor over the
+        // other operand yields the other operand's shape, so taking that side
+        // is exact rather than approximate.
+        let is_scalar_side = |e: &Expr| {
+            matches!(e.kind, ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_))
+                || extract_shape_from_tensor_init(e, resolve)
+                    .is_some_and(|s| s.iter().product::<i64>() == 1)
+        };
+        if is_scalar_side(right) {
             return extract_shape_from_tensor_init(left, resolve);
         }
-        if is_scalar_lit(left) {
+        if is_scalar_side(left) {
             return extract_shape_from_tensor_init(right, resolve);
         }
         return None;

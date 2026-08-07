@@ -439,6 +439,16 @@ pub(crate) mod inner {
     pub(crate) fn try_alloc_managed(size_bytes: usize) -> Option<*mut c_void> {
         if size_bytes == 0 { return None; }
 
+        // Stage-2B: an armed arena pin wins over every other path — HERE as
+        // well as in `alloc_managed`, because the elementwise kernels
+        // allocate their outputs through this function directly. With the
+        // consult only in `alloc_managed`, every planned elementwise
+        // transient bypassed its pin and the reconciliation reported the
+        // whole plan as fiction (0 placements from 7240 binds, measured).
+        if let Some(ptr) = crate::transient_arena::take_pin(size_bytes) {
+            return Some(ptr);
+        }
+
         // Async alloc path (opt-in, bypasses caching allocator)
         if async_alloc_enabled() {
             let ptr = alloc_async_inner(size_bytes);
@@ -485,6 +495,14 @@ pub(crate) mod inner {
         if size_bytes == 0 { return std::ptr::null_mut(); }
 
         let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Stage-2B: an armed arena pin wins over every other path. Consulted
+        // FIRST because the point is a stable address — a cache hit that
+        // happened to be free would give a correct pointer at a different
+        // place each step, which is exactly what the arena exists to stop.
+        if let Some(ptr) = crate::transient_arena::take_pin(size_bytes) {
+            return ptr;
+        }
 
         // Async alloc path: use cuMemAllocAsync when enabled (avoids device-wide sync)
         if async_alloc_enabled() {
@@ -552,6 +570,12 @@ pub(crate) mod inner {
     /// Routes async-allocated pointers to cuMemFreeAsync.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
+        // Stage-2B: an arena interior pointer was never handed out by the
+        // caching allocator and must never reach `cuMemFree`. A range check
+        // rather than a per-tensor flag: a flag has to be set correctly at
+        // every NslTensor construction site, and the cost of missing one is a
+        // free of an interior pointer.
+        if crate::transient_arena::owns(ptr) { return; }
         // Check if this was async-allocated before removing from general set
         if is_async_alloc(ptr) {
             free_async(ptr);
@@ -677,6 +701,37 @@ pub(crate) mod inner {
 
     /// Allocate device-only memory (not accessible from host without explicit copy).
     /// On OOM, attempts sync + pool drain recovery before panicking.
+    /// Non-panicking sibling of [`alloc_device`] for OPTIONAL allocations
+    /// (the transient arena): OOM — after the same sync + drain recovery —
+    /// returns null instead of aborting the run, because the caller has a
+    /// correct fallback (the caching allocator) and "no stable addresses"
+    /// must degrade the feature, not kill a near-capacity training run.
+    /// Non-OOM errors still panic (they mean the context is broken).
+    pub(crate) fn try_alloc_device(size_bytes: usize) -> *mut c_void {
+        ensure_context();
+        unsafe {
+            let mut ptr: CUdeviceptr = 0;
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+            if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                return account_direct_device(ptr as *mut c_void, size_bytes);
+            }
+            if result != CUresult::CUDA_SUCCESS
+                && !matches!(result, CUresult::CUDA_ERROR_OUT_OF_MEMORY)
+            {
+                panic!("cuMemAlloc({size_bytes} bytes) failed: {result:?}");
+            }
+            cuCtxSynchronize();
+            drain_completed_frees();
+            let _ = pool_drain();
+            ptr = 0;
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+            if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                return account_direct_device(ptr as *mut c_void, size_bytes);
+            }
+            std::ptr::null_mut()
+        }
+    }
+
     pub(crate) fn alloc_device(size_bytes: usize) -> *mut c_void {
         ensure_context();
         unsafe {
@@ -1059,6 +1114,7 @@ pub(crate) mod inner {
             eprintln!("[copy] H2D {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
         }
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
+        crate::host_profile::record_h2d(size_bytes);
         ensure_context();
         // cuda-graphs: uploads inside a region are pseudo-ops — the payload
         // flows through a graph-owned pinned staging buffer (see `on_htod`).
@@ -1105,6 +1161,7 @@ pub(crate) mod inner {
         size_bytes: usize,
     ) {
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
+        crate::host_profile::record_h2d(size_bytes);
         ensure_context();
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
@@ -1123,6 +1180,7 @@ pub(crate) mod inner {
             eprintln!("[copy] D2H {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
         }
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
+        crate::host_profile::record_d2h(size_bytes);
         super::graph_capture::taint("sync DtoH readback");
         ensure_context();
         unsafe {
@@ -1240,6 +1298,7 @@ pub(crate) mod inner {
     /// `src_device` alive until `transfer_stream_synchronize()` (the
     /// offload drain list in `tensor/mod.rs` owns that deferral).
     pub(crate) fn memcpy_dtoh_async(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        crate::host_profile::record_d2h(size_bytes);
         ensure_context();
         let stream = transfer_stream();
         unsafe {
@@ -1272,6 +1331,7 @@ pub(crate) mod inner {
     /// NULL-stream readers, or must drain before reuse.
     #[allow(dead_code)]
     pub(crate) fn memcpy_htod_async(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        crate::host_profile::record_h2d(size_bytes);
         ensure_context();
         let stream = transfer_stream();
         unsafe {
@@ -1310,6 +1370,7 @@ pub(crate) mod inner {
         src_host: *const c_void,
         size_bytes: usize,
     ) -> u64 {
+        crate::host_profile::record_h2d(size_bytes);
         ensure_context();
         let stream = transfer_stream();
         unsafe {
@@ -1353,6 +1414,7 @@ pub(crate) mod inner {
         src_device: *const c_void,
         size_bytes: usize,
     ) -> u64 {
+        crate::host_profile::record_d2h(size_bytes);
         ensure_context();
         let stream = transfer_stream();
         unsafe {
@@ -1472,6 +1534,27 @@ pub(crate) mod inner {
                 );
             }
         })
+    }
+
+    /// Fill device memory with an arbitrary byte.
+    ///
+    /// Deliberately NOT graph-aware, unlike `memset_d8`: its only caller is
+    /// the transient arena's guard fill, which runs once at init — before any
+    /// capture region exists — and must actually reach the device rather than
+    /// becoming a recorded node that replays later.
+    pub(crate) fn memset_d8_value(device_ptr: *mut c_void, value: u8, size_bytes: usize) {
+        ensure_context();
+        unsafe {
+            let result = cuMemsetD8_v2(device_ptr as CUdeviceptr, value, size_bytes);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemsetD8_v2({} bytes, value {}) failed: {:?}",
+                size_bytes,
+                value,
+                result
+            );
+        }
     }
 
     /// Zero-fill device memory. Graph-aware: recorded as a pseudo-op inside
@@ -3888,6 +3971,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         let nbase = (ws.stage as usize + 4 * ws.cap * 8) as *mut u32;
         std::ptr::copy_nonoverlapping(lens.as_ptr(), nbase, k);
         let up = |dst: u64, src_off: usize, bytes: usize| {
+            crate::host_profile::record_h2d(bytes);
             let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 dst,
                 (ws.stage as usize + src_off) as *const c_void,
@@ -3925,6 +4009,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
             ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
             ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
             let cp = |dst: u64, src: &[u32]| {
+                crate::host_profile::record_h2d(src.len() * 4);
                 let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
                     dst,
                     src.as_ptr() as *const c_void,
@@ -4113,6 +4198,10 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
         let nbase = (ws.stage as usize + 5 * ws.cap * 8) as *mut u32;
         std::ptr::copy_nonoverlapping(lens.as_ptr(), nbase, k);
         let up = |dst: u64, src_off: usize, bytes: usize| {
+            // PCIe accounting: tiny per-launch pointer tables, but the
+            // counter's contract is EVERY crossing copy or the benchmark
+            // matrix's figure is a silent undercount.
+            crate::host_profile::record_h2d(bytes);
             let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 dst,
                 (ws.stage as usize + src_off) as *const c_void,
@@ -4150,6 +4239,9 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
             ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
             ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
             let cp = |dst: u64, src: &[u32]| {
+                // PCIe accounting — same contract as the pointer-table
+                // upload above.
+                crate::host_profile::record_h2d(src.len() * 4);
                 let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
                     dst,
                     src.as_ptr() as *const c_void,

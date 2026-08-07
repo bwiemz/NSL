@@ -113,12 +113,19 @@ fn run_profile_pre_pass(
     }
 }
 
-fn install_calibration_compile_bundle(
+/// Install the whole-program facts every codegen entry point needs, before any
+/// body lowering.
+///
+/// There are eight entry points and they all need the same two things, so they
+/// go in together rather than as two calls a ninth entry point could get half
+/// right. `entry_point_facts_drift` pins that every `Compiler::new` in this
+/// file is followed by this call.
+fn install_per_compile_program_facts(
     compiler: &mut Compiler<'_>,
     ast: &nsl_ast::Module,
     interner: &Interner,
     type_map: &TypeMap,
-) {
+) -> Result<(), crate::CodegenError> {
     compiler.compile_options.calibration_compile_bundle = Some(Arc::new(
         crate::calibration::CalibrationCompileBundle {
             ast: ast.clone(),
@@ -126,6 +133,27 @@ fn install_calibration_compile_bundle(
             type_map: type_map.clone(),
         },
     ));
+    // `--fuse-lm-head require` off the source-AD path can never fuse, so it
+    // must refuse HERE rather than compile a clean, plausible, unfused build
+    // (the same backstop posture as parameter_plan's dtype refusals). The
+    // in-compile check at the tape-fallback site covers extraction failure;
+    // this covers the lane that never enabled source AD at all.
+    if compiler.compile_options.lm_head_fusion
+        == crate::lm_head_inference::LmHeadFusion::Require
+        && !compiler.compile_options.source_ad
+    {
+        return Err(crate::CodegenError::new(
+            "--fuse-lm-head require needs --source-ad (or --pretrain-optimized):              the fused LM head only exists on the source-AD path, so without it              `require` would pass while fusing nothing",
+        ));
+    }
+    // Item 4: the token-row count an inferred fused LM head is sized from.
+    // Scanned ONCE here, not at the train block, so the WGGO pre-pass and the
+    // real extraction see the same answer — a pre-pass that planned against an
+    // unfused tape while the real tape fused would put WGGO's plan and the
+    // emitted graph out of step.
+    compiler.lm_head_loader_scan =
+        crate::lm_head_inference::scan_dataloaders(ast, interner);
+    Ok(())
 }
 
 /// Dev Tools Phase 2, Task 6: drain `Compiler.manifest_builder` (if set) and
@@ -578,7 +606,7 @@ pub fn compile_returning_splice_count_for_tests(
     options: &crate::CompileOptions,
 ) -> Result<u32, CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
-    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
 
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -668,7 +696,7 @@ fn compile_returning_plan_impl(
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.profile_capture_slot = capture_slot;
-    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
 
     // M52: load weights if --weights was provided.
     load_and_register_weights_if_needed(&mut compiler, options)?;
@@ -874,7 +902,11 @@ fn compile_with_zk_info_best_effort_plan(
         Ok(c) => c,
         Err(e) => return (Err(e), HashMap::new(), Vec::new(), None),
     };
-    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
+    if let Err(e) =
+        install_per_compile_program_facts(&mut compiler, ast, interner, type_map)
+    {
+        return (Err(e), HashMap::new(), Vec::new(), None);
+    }
 
     compiler.dump_ir = dump_ir;
 
@@ -1056,7 +1088,11 @@ fn compile_standalone_best_effort_plan(
         Ok(c) => c,
         Err(e) => return (Err(e), None),
     };
-    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
+    if let Err(e) =
+        install_per_compile_program_facts(&mut compiler, ast, interner, type_map)
+    {
+        return (Err(e), None);
+    }
     compiler.dump_ir = dump_ir;
     compiler.standalone_config = Some(config);
     let pre_finalize = (|| -> Result<(), CodegenError> {
@@ -1118,7 +1154,7 @@ pub fn compile_test(
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Vec<String>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
-    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
     compiler.dump_ir = dump_ir;
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -1326,7 +1362,11 @@ pub fn compile_module_with_imports_best_effort_plans(
         Ok(c) => c,
         Err(e) => return (Err(e), None, None),
     };
-    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
+    if let Err(e) =
+        install_per_compile_program_facts(&mut compiler, ast, interner, type_map)
+    {
+        return (Err(e), None, None);
+    }
     compiler.dump_ir = dump_ir;
     compiler.module_prefix = module_prefix.to_string();
     for (name, layout) in imported_struct_layouts {
@@ -1454,7 +1494,7 @@ pub fn compile_entry_returning_plan(
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
-    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
+    install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
     compiler.dump_ir = dump_ir;
 
     // M52 / CPDT Phase 1: load weights if --weights was provided.  Load-bearing
@@ -1512,6 +1552,51 @@ pub fn compile_entry_returning_plan(
             .model_field_types
             .entry(model_name)
             .or_insert(fields);
+    }
+    // Item 4: same merge, same precedence (a locally-defined model wins), for
+    // the two shape maps the multi-file path never propagated. Without this
+    // every imported model — which is every real model, since they all live in
+    // their own `model.nsl` — has no derivable weight dims, so the fused LM
+    // head can never be inferred and the CFTP v10 rank guard silently defaults
+    // to "fire".
+    // FIELD-level merge with local-wins, not whole-model `or_insert`: the
+    // ctor-fold channel adds fields (block weights) to model entries the
+    // local literal collection already created (with only the literal
+    // fields), and a whole-model insert would drop every one of them.
+    for (model_name, fields) in options.imported_model_field_dims.clone() {
+        let entry = compiler
+            .models
+            .model_field_dims
+            .entry(model_name)
+            .or_default();
+        for (field, dims) in fields {
+            entry.entry(field).or_insert(dims);
+        }
+    }
+    for (model_name, fields) in options.imported_model_field_ranks.clone() {
+        compiler
+            .models
+            .model_field_ranks
+            .entry(model_name)
+            .or_insert(fields);
+    }
+    // The veto set travels WITH the dims, or the uniqueness rule lies: an
+    // imported field whose dims were underivable must still block a
+    // derivable same-named twin from winning `unique_field_dims`. A set
+    // union (no precedence) is correct — a veto from anywhere is a veto.
+    compiler
+        .models
+        .tensor_fields_without_dims
+        .extend(options.imported_tensor_fields_without_dims.iter().cloned());
+    for (model_name, fields) in options.imported_model_field_values.clone() {
+        let entry = compiler
+            .models
+            .model_field_scalar_values
+            .entry(model_name)
+            .or_default();
+        for (field, value) in fields {
+            entry.entry(field).or_insert(value);
+        }
     }
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body

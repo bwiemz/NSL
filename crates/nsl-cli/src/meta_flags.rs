@@ -120,19 +120,60 @@ impl WgradFusionBlockers {
     }
 }
 
+/// The flags `--pretrain-optimized` expands into.
+///
+/// A struct rather than six `&mut` out-parameters: the sixth (item 4's
+/// `--fuse-lm-head`) tipped the signature past clippy's `too_many_arguments`,
+/// and six same-shaped `&mut`s in a row is exactly the argument list a caller
+/// transposes. Both dispatchers build one of these from their locals and
+/// destructure it back, so the shared-helper property that keeps `nsl run` and
+/// `nsl build` from drifting is unchanged.
+pub(crate) struct PretrainBundle {
+    pub(crate) wggo: Option<String>,
+    pub(crate) csha: Option<String>,
+    pub(crate) source_ad: bool,
+    pub(crate) fuse_rmsnorm_backward: bool,
+    pub(crate) fuse_wgrad_accum: bool,
+    pub(crate) fuse_lm_head: Option<String>,
+}
+
 pub(crate) fn expand_pretrain_optimized(
     pretrain_optimized: bool,
-    wggo: &mut Option<String>,
-    csha: &mut Option<String>,
-    source_ad: &mut bool,
-    fuse_rmsnorm_backward: &mut bool,
-    fuse_wgrad_accum: &mut bool,
+    b: &mut PretrainBundle,
     blockers: &WgradFusionBlockers,
 ) {
     if !pretrain_optimized {
         return;
     }
+    let PretrainBundle {
+        wggo,
+        csha,
+        source_ad,
+        fuse_rmsnorm_backward,
+        fuse_wgrad_accum,
+        fuse_lm_head,
+    } = b;
     *source_ad = true;
+
+    // Item 4: the fused LM head belongs in the bundle for the same reason the
+    // two backward fusions do — it is a measured win (~8.5% step time on
+    // Coder-50M) that until now required hand-editing four numbers into the
+    // model source. `auto`, not `require`: the bundle must not turn a program
+    // whose head the compiler cannot prove into a build failure.
+    //
+    // Same loud-override shape as --wggo/--csha below, and the same reason:
+    // an explicit `off` is a decision, and silently overriding it would make
+    // the bundle a worse citizen than the flags it expands to.
+    match fuse_lm_head.as_deref() {
+        None => *fuse_lm_head = Some("auto".to_string()),
+        Some("off") => eprintln!(
+            "note: --pretrain-optimized bundle partially disabled: \
+             --fuse-lm-head off (explicit flag wins; the [batch*seq, vocab] \
+             logits surface will be materialized unless a @fused_lm_ce \
+             decorator is present)"
+        ),
+        Some(_) => {}
+    }
 
     // The two backward fusions. Both are opt-in elsewhere because they change
     // the ARITHMETIC, not just the schedule — but "pretraining, optimized" is
@@ -220,6 +261,16 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     if opts.checkpoint_compress.is_some() {
         opts.checkpoint_compress = None;
         disabled.push("--checkpoint-compress (CCR)");
+    }
+    // Item 4: the reference arm is what the fused head's numerics are
+    // validated AGAINST, so it must not contain an inferred fused head — the
+    // baseline would be a baseline for itself. Codegen refuses independently
+    // (`lm_head_inference_for_train_block`); this arm exists so the override
+    // is announced like every other one, rather than being a silent
+    // difference between what was asked for and what ran.
+    if opts.lm_head_fusion.is_on() {
+        opts.lm_head_fusion = nsl_codegen::lm_head_inference::LmHeadFusion::Off;
+        disabled.push("--fuse-lm-head (compiler-inferred fused LM head)");
     }
     if !opts.disable_fusion {
         opts.disable_fusion = true;
@@ -326,10 +377,72 @@ mod tests {
         c: Option<&str>,
         blockers: WgradFusionBlockers,
     ) -> (Option<String>, Option<String>, bool, bool, bool) {
-        let (mut w, mut c) = (w.map(str::to_string), c.map(str::to_string));
-        let (mut s, mut fr, mut fw) = (false, false, false);
-        expand_pretrain_optimized(on, &mut w, &mut c, &mut s, &mut fr, &mut fw, &blockers);
+        let (w, c, s, fr, fw, _) = expand_all(on, w, c, None, blockers);
         (w, c, s, fr, fw)
+    }
+
+    /// Same, plus the item-4 `--fuse-lm-head` slot.
+    #[allow(clippy::type_complexity)]
+    fn expand_all(
+        on: bool,
+        w: Option<&str>,
+        c: Option<&str>,
+        lm: Option<&str>,
+        blockers: WgradFusionBlockers,
+    ) -> (Option<String>, Option<String>, bool, bool, bool, Option<String>) {
+        let mut b = PretrainBundle {
+            wggo: w.map(str::to_string),
+            csha: c.map(str::to_string),
+            source_ad: false,
+            fuse_rmsnorm_backward: false,
+            fuse_wgrad_accum: false,
+            fuse_lm_head: lm.map(str::to_string),
+        };
+        expand_pretrain_optimized(on, &mut b, &blockers);
+        (
+            b.wggo,
+            b.csha,
+            b.source_ad,
+            b.fuse_rmsnorm_backward,
+            b.fuse_wgrad_accum,
+            b.fuse_lm_head,
+        )
+    }
+
+    #[test]
+    fn the_bundle_fills_fuse_lm_head_with_auto() {
+        let (.., lm) = expand_all(true, None, None, None, clear());
+        assert_eq!(lm.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn an_explicit_fuse_lm_head_wins_over_the_bundle() {
+        // Both directions: `off` is a deliberate opt-out the bundle must not
+        // overturn, and `require` must not be softened to `auto`.
+        let (.., lm) = expand_all(true, None, None, Some("off"), clear());
+        assert_eq!(lm.as_deref(), Some("off"));
+        let (.., lm) = expand_all(true, None, None, Some("require"), clear());
+        assert_eq!(lm.as_deref(), Some("require"));
+    }
+
+    #[test]
+    fn without_the_bundle_fuse_lm_head_is_untouched() {
+        let (.., lm) = expand_all(false, None, None, None, clear());
+        assert_eq!(lm, None, "no bundle, no fill — the flag defaults to off");
+    }
+
+    #[test]
+    fn training_reference_turns_an_inferred_head_off() {
+        let mut opts = nsl_codegen::CompileOptions {
+            training_reference: true,
+            lm_head_fusion: nsl_codegen::lm_head_inference::LmHeadFusion::Require,
+            ..Default::default()
+        };
+        apply_training_reference(&mut opts);
+        assert!(
+            !opts.lm_head_fusion.is_on(),
+            "the reference arm must not contain the fusion it is the baseline for"
+        );
     }
 
     #[test]

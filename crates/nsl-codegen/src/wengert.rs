@@ -48,6 +48,14 @@ pub fn type_for_op(op: &PrimalOp) -> WengertType {
         PrimalOp::Constant(_) => WengertType::Tensor, // overridden by extractor when needed
         PrimalOp::Passthrough(name) => match name.as_str() {
             "shape" | "list" => WengertType::List,
+            // Item 4: a `.shape` read the compiler answered from proven dims.
+            // It yields the SAME `NslList` handle `nsl_tensor_shape` would
+            // have, so it must be typed `List` — the default `Tensor` arm
+            // sends the handle to `nsl_tensor_free` at scope exit, which is a
+            // `free(): invalid pointer` abort on the first step.
+            n if n.starts_with(crate::lm_head_inference::CONST_SHAPE_PREFIX) => {
+                WengertType::List
+            }
             "ndim" | "subscript" | "int" => WengertType::Integer,
             "float" => WengertType::Scalar,
             // "item" stays Tensor: the lowerer wraps the f64 back into a 0-dim

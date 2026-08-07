@@ -195,6 +195,140 @@ without declaring it fails
 
 Implementation: [`crates/nsl-codegen/src/pass_bus.rs`](../../crates/nsl-codegen/src/pass_bus.rs).
 
+## The fused LM head (`--fuse-lm-head`)
+
+The fused linear-CE kernel replaces `matmul(x, transpose(W)) [+ bias] →
+cross_entropy` with one op, so the `[batch*seq, vocab]` logits and their
+gradient are never materialized. On Coder-50M that surface is 1024 × 49152
+floats per step, and removing it is worth ~8.5% of step time.
+
+Reaching it used to require writing four numbers the compiler already knows
+onto the train block:
+
+```
+@fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=512, batch_size=1, seq_len=1024)
+train(model=m, ...):
+```
+
+No production pretraining script in this repo carried that decorator — only
+`models/benchmarks/mfu_bench.py`, which *generates* it into a throwaway
+program. `--fuse-lm-head` closes the gap by deriving all four:
+
+| number | derived from |
+| --- | --- |
+| `vocab_size`, `hidden_size` | the LM-head weight's declared dims (`model_field_dims`, from a shape-literal initializer or a `Tensor<[..]>` annotation) |
+| `batch_size`, `seq_len` | the `DataLoader(...)` construction — every keyword there is already required to be a compile-time constant |
+
+Three modes. `off` (the default) never infers; an explicit `@fused_lm_ce` still
+works. `auto` infers where the chain and the shapes can be proven and falls
+back to the composite path with a `[lm-head-fusion] declined:` line where they
+cannot. `require` makes that fallback a compile error — for a lane that would
+rather not discover at step 40,000 that it has been paying for the logits
+surface all along. `--pretrain-optimized` selects `auto`.
+
+**An explicit decorator always wins, including `enabled = false`**, which is a
+deliberate opt-out inference must not overturn. `--training-reference` forces
+the mode off: the reference arm is what the fused numerics are validated
+against, so it must not contain the fusion it is a baseline for.
+
+### The runtime shape read
+
+Every pretraining script here flattens the logits like this:
+
+```
+let ls = logits.shape
+let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+```
+
+That `.shape` is a live consumer of the `[B, S, V]` logits, so the fusion
+cannot delete them. Since the compiler has just proven `B`, `S` and `V`, it
+answers the read directly — the op becomes a `Passthrough("const_shape:B,S,V")`
+that builds the identical list `nsl_tensor_shape` would have returned, and the
+tensor becomes dead. Without this, `--fuse-lm-head` would fire only on programs
+that already hard-code their dims, which is none of the ones this repo ships.
+
+Only the PRE-reshape chain members are folded, and only when the matcher
+descended through a reshape (the same fact that sets `x_rank3` on the emitted
+op). A rank-2 `[B*S, V]` logits tensor makes `ls[2]` an out-of-bounds read, so
+any program written this way already required rank-3 logits to work at all.
+
+### What inference does not change
+
+The substitution itself is the pre-existing one. Measured on Coder-50M,
+195 steps, seed 1: an inferred head is **bit-identical** to the same head under
+an explicit `@fused_lm_ce` decorator, and the composite-vs-fused divergence
+(3.7e-2 relative by step 185, from the fused dW's atomic/GEMM-order
+accumulation) is identical for both routes. Inference selects a certified
+path; it does not add a second one.
+
+Gates: `crates/nsl-cli/tests/lm_head_inference_gate.rs` (which decision was
+made, including that `models/coder50m/pretrain{,_cert}.nsl` still infer),
+`crates/nsl-codegen/src/lm_head_inference.rs` unit tests (the DataLoader scan),
+`crates/nsl-codegen/tests/fused_linear_ce_numerical.rs` (the kernel itself).
+
+## The placed transient arena (`--transient-arena`)
+
+Backward temporaries normally flow through the runtime caching allocator,
+which recycles well but gives a tensor a different address whenever the
+free-list happens to differ — and address stability is the precondition for
+CUDA-graph replay. `--transient-arena` gives a conservative subset of
+backward temporaries fixed, planned device addresses.
+
+Three stages, all in `crates/nsl-codegen/src/transient_arena.rs`:
+
+1. **Shape propagation.** Dims (not element counts — a matmul's output numel
+   is a function of the *shapes*) propagate through the `[forward ; adjoint]`
+   tape from three seed sources: semantic-typed dims, model-field initializer
+   dims — including dims recovered by **constructor-argument folding**
+   (`ctor_fold.rs`: `randn([d_model, d_ff])` under `SwiGLUFFN(512, 1408, …)`
+   folds to `[512, 1408]`), and the `--fuse-lm-head` DataLoader proof for the
+   `[batch, seq]` batch fields. A constant lattice folds the house shape
+   idioms (`let s = x.shape; x.reshape([s[0]*s[1], nh*hd])`,
+   `int(self._n_heads.item())`) so the attention stack's runtime-value
+   reshapes resolve statically. Where dims die at a runtime-shaped op the
+   element *count* still carries (`SizeInfo::Numel`), and can even cross a
+   matmul against a rank-2 weight of known shape. On coder50m this sizes
+   1456 of 2159 tape values; the numel-only pass it replaced sized effectively
+   none (every elementwise chain sits downstream of a matmul).
+
+2. **Admission.** An allowlist, not a denylist. Placeable ops must be
+   backward-region, statically sized, not saved-for-backward, not
+   tape-escaping, non-aliasing, in the single-allocation elementwise family —
+   AND survive two rules that model measured runtime behavior: an op whose
+   input **dies at it** is refused (`can_mutate_inplace_gpu` mutates a dying
+   uniquely-owned input in place and allocates nothing), and a binary without
+   provably equal operand shapes or with a view operand is refused (the
+   broadcast/fallback routes allocate off the straight-line path). Both rules
+   were found by the bind/placement reconciliation, not by inspection.
+
+3. **Placement.** Sequential disjoint regions — deliberately not the M36 BFD
+   time-sharing engine, whose shared offsets alias under the runtime's
+   `payload = base + offset + REDZONE·(idx+1)` layout (caught by byte-identity
+   bisection: losses diverged at step 1 from slot 8 on). Every payload pair is
+   separated by exactly one 256-byte `0xA5` red zone.
+
+The runtime half (`crates/nsl-runtime/src/transient_arena.rs`) arms a
+single-shot, size-exact **pin** immediately before each admitted op and
+disarms it immediately after. The pin fires only on an allocation of exactly
+the planned size, so a wrong compile-time size degrades to a loud warning and
+a heap fallback, never corruption; teardown reconciles binds against
+placements and fails visibly on drift. Validation knobs: `NSL_ARENA_CHECK=1`
+verifies every red zone at each step's end, `NSL_ARENA_SLOT_LIMIT=k` places
+only the first `k` slots (bisection), `NSL_ARENA_DEBUG=1` prints seed/refusal
+provenance at compile time and pin diagnostics at runtime.
+
+Validated on coder50m (40 steps, `--deterministic --seed 4242`): planned and
+unplanned runs produce **byte-identical** loss streams and `.nslm`
+checkpoints; 7240 of 7240 binds placed; per-step guard checks clean. What it
+deliberately does **not** do yet: feed the stable offsets into CUDA-graph
+capture — that is the payoff this staging exists to unlock, and it lands
+separately now that the byte-identity gate is green.
+
+Gates: `crates/nsl-codegen/src/transient_arena.rs` unit tests (per-rule
+admission cases, shape-rule semantics, packing non-overlap),
+`crates/nsl-cli/tests/transient_arena_gpu_gate.rs` (report plumbing),
+`crates/nsl-runtime/src/transient_arena.rs` unit tests (pin exactness).
+
 ## Per-pass descriptions
 
 ### CCR — Compiler-Chosen Recomputation

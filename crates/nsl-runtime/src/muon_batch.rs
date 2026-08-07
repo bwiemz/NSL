@@ -605,6 +605,7 @@ fn upload_tables_3(ws: &GroupWs, m: &[u64], g: &[u64], p: &[u64]) {
     // stream): the batch kernels ride the compute stream and must be
     // ordered after these copies; cross-stream uploads would race them.
     let up = |table: u64, off: usize| unsafe {
+        crate::host_profile::record_h2d(k * 8);
         let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
             table,
             (ws.stage as usize + off * 8) as *const std::ffi::c_void,

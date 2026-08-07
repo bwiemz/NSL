@@ -481,7 +481,29 @@ pub fn compile_wengert_ops_range(
             var_types.insert(op.result, WengertType::Integer);
             continue;
         }
+        // Stage-2B: give this op's result its planned address.
+        //
+        // The pin is armed immediately before the op's own lowering and
+        // disarmed immediately after, so the window in which it can be
+        // consumed is one op wide. It is also size-exact on the runtime side,
+        // so an op that allocates something unexpected first leaves the pin
+        // armed rather than misplacing a buffer — and `nsl_arena_unbind` then
+        // reports the unconsumed bind instead of swallowing it.
+        let placement = compiler.arena_placements.get(&op.result).copied();
+        if let Some(p) = placement {
+            let slot = builder.ins().iconst(cl_types::I64, i64::from(p.slot_index));
+            let off = builder.ins().iconst(cl_types::I64, p.offset as i64);
+            let bytes = builder.ins().iconst(cl_types::I64, p.bytes as i64);
+            call(compiler, builder, "nsl_arena_bind", &[slot, off, bytes])?;
+        }
         let result_val = lower_single_op(compiler, builder, op, var_map, var_types)?;
+        if placement.is_some() {
+            // Verify-and-disarm: the pin's exact-size rule cannot tell the
+            // output from an output-sized interior allocation, so the
+            // runtime compares the RESULT's data pointer against where the
+            // pin landed and counts any mismatch (teardown: "N misplaced").
+            call(compiler, builder, "nsl_arena_unbind_verify", &[result_val])?;
+        }
         var_map.insert(op.result, result_val);
         // FASE hook: consume parameter gradients immediately during lowering.
         if let Some(ref mut hook) = on_param_grad {
@@ -3389,6 +3411,25 @@ fn lower_single_op(
                     call(compiler, builder, "nsl_set_inplace_suppressed", &[v])
                 }
                 "shape" => call(compiler, builder, "nsl_tensor_shape", &[inputs[0]]),
+                // Item 4: a `.shape` read whose answer the compiler proved,
+                // rewritten by the fused-LM-head inference so the tensor it
+                // used to read can be deleted. Builds the identical list
+                // `nsl_tensor_shape` would have returned — same ownership, so
+                // the existing scope sweep frees it the same way.
+                //
+                // The dims are baked into the op name because `PrimalOp`'s
+                // `Passthrough` payload is a String and adding a variant for
+                // this would need an entry in every `match` over PrimalOp
+                // across the AD rules, the saved-tensor analysis, the arena
+                // and the lowerer — for an op with no gradient and no inputs.
+                _ if name.starts_with(crate::lm_head_inference::CONST_SHAPE_PREFIX) => {
+                    let list = call(compiler, builder, "nsl_list_new", &[])?;
+                    for dim in crate::lm_head_inference::parse_const_shape_dims(name) {
+                        let d = builder.ins().iconst(cl_types::I64, dim);
+                        call(compiler, builder, "nsl_list_push", &[list, d])?;
+                    }
+                    Ok(list)
+                }
                 "ndim" => call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]]),
                 "reshape" => {
                     // inputs[0] = tensor, inputs[1] = shape_list
