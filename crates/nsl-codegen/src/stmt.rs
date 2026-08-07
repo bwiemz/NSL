@@ -9972,13 +9972,23 @@ impl Compiler<'_> {
                         }
                         // Item 11: the mark must precede the register that
                         // carves the slice — same plan-driven ordering
-                        // discipline as the SR note above.
+                        // discipline as the SR note above. The rc is asserted
+                        // (unlike the void SR note): a swallowed -1 here
+                        // would resurface one phase later as the elem step's
+                        // "never carved" abort, misattributing the cause.
                         if entry.is_elementwise() {
-                            self.compile_call_by_name(
+                            let mrc = self.compile_call_by_name(
                                 builder,
                                 "nsl_zero3_mark_elementwise",
                                 &[pw, iv],
                             )?;
+                            let mz = builder.ins().iconst(cl_types::I64, 0);
+                            let mok = builder.ins().icmp(IntCC::Equal, mrc, mz);
+                            let mmsg = "nsl: zero3 elementwise mark failed \
+                                        (ZeRO context missing?) — aborting";
+                            self.intern_string(mmsg)?;
+                            let mmp = self.compile_string_literal(builder, mmsg)?;
+                            self.compile_call_by_name(builder, "nsl_assert", &[mok, mmp])?;
                         }
                         self.compile_call_by_name(
                             builder,
@@ -12512,13 +12522,21 @@ impl Compiler<'_> {
                         )?;
                     }
                     // Item 11: mark-before-register, from the same plan entry
-                    // as the pre-forward belt.
+                    // as the pre-forward belt; rc asserted for the same
+                    // misattribution reason.
                     if needs_elem_mark {
-                        self.compile_call_by_name(
+                        let mrc = self.compile_call_by_name(
                             builder,
                             "nsl_zero3_mark_elementwise",
                             &[pw, iv],
                         )?;
+                        let mz = builder.ins().iconst(cl_types::I64, 0);
+                        let mok = builder.ins().icmp(IntCC::Equal, mrc, mz);
+                        let mmsg = "nsl: zero3 elementwise mark failed \
+                                    (ZeRO context missing?) — aborting";
+                        self.intern_string(mmsg)?;
+                        let mmp = self.compile_string_literal(builder, mmsg)?;
+                        self.compile_call_by_name(builder, "nsl_assert", &[mok, mmp])?;
                     }
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
                 }

@@ -435,24 +435,36 @@ fn zero3_elementwise_bit_exact_vs_single_rank_gpu() {
     // all_gather both nonzero on EVERY rank — and all_gather strictly
     // below the total gather count, which proves granular (broadcast)
     // gathers coexisted.
+    // `contains`, not `starts_with`: the counter line itself is single-write
+    // atomic, but a NEIGHBOR fragment without a trailing newline can land
+    // immediately before it (review nit).
     let zero_lines: Vec<&str> = z3
         .stderr
         .lines()
-        .filter(|l| l.starts_with("[zero] ws="))
+        .filter(|l| l.contains("[zero] ws="))
         .collect();
     assert_eq!(zero_lines.len(), 2, "expected 2 rank counter lines:\n{}", z3.stderr);
-    let mut all_gather_total = 0;
-    for l in &zero_lines {
-        let rs = counter_field(l, "reduce_scatter").expect("reduce_scatter field");
-        let ag = counter_field(l, "all_gather").expect("all_gather field");
-        assert!(rs > 0, "stage-3 elementwise must reduce_scatter: {l}");
-        assert!(ag > 0, "elementwise gathers must ride all_gather: {l}");
-        all_gather_total = ag; // identical on both ranks (symmetric schedule)
-    }
+    let ag_per_rank: Vec<u64> = zero_lines
+        .iter()
+        .map(|l| {
+            let rs = counter_field(l, "reduce_scatter").expect("reduce_scatter field");
+            let ag = counter_field(l, "all_gather").expect("all_gather field");
+            assert!(rs > 0, "stage-3 elementwise must reduce_scatter: {l}");
+            assert!(ag > 0, "elementwise gathers must ride all_gather: {l}");
+            ag
+        })
+        .collect();
+    // The schedule is symmetric — assert it instead of assuming it.
+    assert_eq!(
+        ag_per_rank[0], ag_per_rank[1],
+        "asymmetric all_gather counts across ranks:\n{}",
+        z3.stderr
+    );
     assert!(
-        all_gather_total < gathers,
+        ag_per_rank[0] < gathers,
         "no tensor-granular gathers — the mixed-mode arm went vacuous \
-         (all_gather={all_gather_total}, gathers={gathers})"
+         (all_gather={}, gathers={gathers})",
+        ag_per_rank[0]
     );
 }
 

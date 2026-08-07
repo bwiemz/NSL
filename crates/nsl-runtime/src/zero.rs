@@ -2234,6 +2234,19 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
     if e.elem_pending {
         if e.elem.is_none() {
             let numel = t.len.max(0) as usize;
+            // The one dtype guard on the elem path that runs BEFORE bytes
+            // move: a 2-byte dtype (bf16, id >= 256) would mis-slice here,
+            // and gather's f32-only check fires only at ws>1, after the
+            // carve already copied. Unreachable today (params are CPU-f64 /
+            // GPU-f32; bf16-sr x zero3 is refused) — belt.
+            if t.dtype != 0 && t.dtype != 1 {
+                eprintln!(
+                    "[zero3] FATAL: elementwise carve of dtype {} (param {}) — \
+                     only f64/f32 parameters shard elementwise",
+                    t.dtype, e.idx
+                );
+                std::process::abort();
+            }
             let elem_bytes = if t.dtype == 0 { 8 } else { 4 };
             let shard = numel / ws;
             let slice = ShardBuf::alloc(shard * elem_bytes, t.device);
@@ -2275,11 +2288,18 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
         } else if e.state == ParameterResidency::GatheredTemporary && !t.data.is_null() {
             // Window-start re-register of a still-materialized full copy:
             // drop it (the slice holds the truth), mirroring the non-owner
-            // re-evict below.
-            #[cfg(feature = "cuda")]
+            // re-evict below. Host transients pair with the gather's
+            // checked_alloc_zeroed, exactly like zero3_release's arm.
             if t.device != 0 {
-                crate::cuda::inner::ensure_context();
-                crate::cuda::inner::free_managed(t.data);
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::inner::ensure_context();
+                    crate::cuda::inner::free_managed(t.data);
+                }
+            } else {
+                unsafe {
+                    crate::memory::checked_free(t.data as *mut u8, t.data_byte_size());
+                }
             }
             t.data = std::ptr::null_mut();
             e.state = ParameterResidency::Evicted;
@@ -2468,7 +2488,7 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
 /// non-owners free their gathered copy. Safe on an already-evicted param.
 pub(crate) fn zero3_release(tensor_ptr: i64) {
     let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
-    let (is_owner, is_elem) = {
+    let (is_owner, elem_info) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
             eprintln!("[zero3] FATAL: release of untracked tensor {tensor_ptr}");
@@ -2480,8 +2500,14 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         }
         let guard = ZERO_CTX.lock().unwrap();
         let rank = guard.as_ref().map(|c| c.rank).unwrap_or(0);
-        (e.owner as usize == rank, e.elem.is_some())
+        (
+            e.owner as usize == rank,
+            e.elem
+                .as_ref()
+                .map(|s| (s.slice.ptr() as i64, s.shard, s.elem_bytes, rank)),
+        )
     };
+    let is_elem = elem_info.is_some();
     // Item 11 elementwise: the slice is the authoritative storage, so the
     // full transient is dropped on EVERY rank — the owner arm below is
     // tensor-granular-only.
@@ -2498,6 +2524,34 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         return;
     }
     if !t.data.is_null() {
+        // Elementwise: persist this rank's region into the slice BEFORE the
+        // free. On the normal schedule this is a no-op copy (the step
+        // already persisted), but a θ-MUTATING callback bracket writes the
+        // gathered full tensor after the step — tensor-granular keeps that
+        // write on the owner's replica, and without this copy elementwise
+        // would silently drop it on every rank (review finding, 2026-08-06).
+        if let Some((slice_ptr, shard, elem_bytes, rank)) = elem_info {
+            let off = rank * shard * elem_bytes;
+            unsafe {
+                if t.device != 0 {
+                    #[cfg(feature = "cuda")]
+                    {
+                        crate::cuda::inner::ensure_context();
+                        crate::cuda::inner::memcpy_dtod(
+                            slice_ptr as *mut std::ffi::c_void,
+                            (t.data as *const u8).add(off) as *const std::ffi::c_void,
+                            shard * elem_bytes,
+                        );
+                    }
+                } else {
+                    std::ptr::copy_nonoverlapping(
+                        (t.data as *const u8).add(off),
+                        slice_ptr as *mut u8,
+                        shard * elem_bytes,
+                    );
+                }
+            }
+        }
         if t.device != 0 {
             #[cfg(feature = "cuda")]
             {
@@ -2567,6 +2621,12 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
                 .and_then(|e| e.elem.as_mut())
             {
                 s.grad = Some(buf);
+            } else {
+                // Entry vanished between the lookup and the store (teardown
+                // race the single-threaded schedule never produces) — free
+                // rather than leak: ShardBuf::Dev has no Drop.
+                buf.free();
+                return -1;
             }
         }
         let grad_ptr = {
@@ -3091,6 +3151,12 @@ pub extern "C" fn nsl_zero3_teardown() -> i64 {
         let _ = std::io::stderr().lock().write_all(line.as_bytes());
     }
     ZERO3_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    // The NEW counters reset per train block so a second block's teardown
+    // line reports its own run, not a cumulative sum (an exact-count gate
+    // on a multi-block program would otherwise misfire). GATHERS/RELEASES
+    // keep their pre-existing cumulative convention untouched.
+    ZERO3_ELEM_PARAMS.store(0, std::sync::atomic::Ordering::Relaxed);
+    ZERO3_ELEM_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut guard = ZERO3_TABLE.lock().unwrap();
     // Item 11: device shard buffers are freed explicitly — entries live in a
     // static, so ShardBuf cannot carry a cfg(cuda) Drop.
@@ -3764,6 +3830,15 @@ mod tests {
             "second moment must match"
         );
 
+        // A θ-mutating callback writes the GATHERED full tensor after the
+        // step; release must persist this rank's region into the slice
+        // before freeing (review finding: tensor-granular keeps such writes
+        // on the owner's replica — dropping them only for elementwise
+        // params would half-mutate a mixed-mode model).
+        unsafe {
+            *(t.data as *mut f64) = 42.0;
+        }
+
         // Release frees the full transient on this (only) rank...
         zero3_release(tp);
         assert!(t.data.is_null());
@@ -3774,9 +3849,16 @@ mod tests {
         assert!(!t.data.is_null(), "teardown must leave full replicas");
         let final_theta: Vec<f64> =
             unsafe { std::slice::from_raw_parts(t.data as *const f64, 4) }.to_vec();
+        // Element 0 carries the callback-style mutation (release persisted
+        // it); the rest must be the post-step values bit-for-bit.
         assert_eq!(
-            final_theta.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-            theta2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            final_theta[0].to_bits(),
+            42.0f64.to_bits(),
+            "release dropped a post-step write to the gathered full tensor"
+        );
+        assert_eq!(
+            final_theta[1..].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            theta2[1..].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             "teardown gather must serve the post-step slice"
         );
         unsafe {
