@@ -175,9 +175,12 @@ fn sim_gpu_stage2_reduce_scatter_bit_exact() {
         // the stage-1 gate above: the second (CPU f64) group only existed
         // because `model.to(device)` skipped fields after an inline model
         // array, fixed in f1030f76. all_reduce=0 is the load-bearing half of
-        // this assertion and is unchanged.
+        // this assertion and is unchanged. (Label-anchored with delimiters —
+        // the original `ends_with("reduce_scatter=6")` broke the day item 11
+        // appended `all_gather=` to the line: positional/terminal anchors rot
+        // on append, labels do not.)
         assert!(
-            line.trim_end().ends_with("reduce_scatter=6") && line.contains("all_reduce=0 "),
+            line.contains(" reduce_scatter=6 ") && line.contains("all_reduce=0 "),
             "stage-2 GPU collective counts wrong: {line}"
         );
     }

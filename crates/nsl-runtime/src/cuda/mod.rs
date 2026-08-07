@@ -9191,13 +9191,23 @@ mod dtype_guard_drift {
              the ZeRO scatter caller owns the precondition",
         ),
         (
+            "gpu_fase_fused_adamw_step_raw",
+            "bare u64 device pointers, no NslTensor and so no dtype to read; both \
+             callers validate: the fase wrapper via fase_step.rs:137-141, the \
+             zero3 elementwise step via its th/m/v dtype asserts in zero.rs",
+        ),
+        (
+            "gpu_fase_fused_adamw_step_bf16sr_multi",
+            "members admitted by bf16sr_multi_impl only after the m/v/mp f32 \
+             asserts at sr_bf16.rs:693-697 (theta is the BF16 mirror by design, \
+             validated bf16 at registration). Pre-existing gap: this fn was \
+             never registered when item 8 added it — the gate only runs under \
+             --features cuda --lib, which CI never does",
+        ),
+        (
             "gpu_scalar_mul_add_inplace_f32",
             "operands validated by the caller at arithmetic.rs:906 before the \
              device dispatch",
-        ),
-        (
-            "gpu_fase_fused_adamw_step",
-            "theta/m/v/mp validated f32 by the caller at fase_step.rs:137-141",
         ),
         (
             "gpu_fase_fused_adamw_step_multi",

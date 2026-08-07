@@ -2133,7 +2133,7 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64) -> i64 {
     };
     let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
     let numel = t.len.max(0) as usize;
-    if numel == 0 || numel % ws != 0 {
+    if numel == 0 || !numel.is_multiple_of(ws) {
         // The plan's eligibility already excluded ragged params — reaching
         // here means codegen and runtime disagree about the shard layout.
         eprintln!(
