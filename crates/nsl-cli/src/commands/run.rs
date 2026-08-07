@@ -31,6 +31,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             seed,
             distribute: _distribute,
             zero_stage,
+            zero_elementwise,
             wcet,
             wcet_cert,
             gpu,
@@ -437,6 +438,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
                 ownership_info: std::collections::HashMap::new(),
                 zero_stage: zero_stage.map(|s| s as u8),
+                zero_elementwise,
                 optim_state_offload,
                 checkpoint_blocks,
                 checkpoint_selective,

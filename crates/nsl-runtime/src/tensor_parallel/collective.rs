@@ -504,6 +504,17 @@ impl CollectiveBackend for SimulatedBackend {
             }
             return 0;
         }
+        // Item 11: the guard broadcast/reduce_scatter always had — without
+        // it an oversized send silently overruns into the next rank's slot
+        // (shm corruption, not an error).
+        if !self.slot_fits(nbytes) {
+            eprintln!(
+                "nsl: all_gather: {nbytes}-byte send exceeds the per-rank shm \
+                 slot ({} ranks) — raise the --devices shm budget",
+                self.world_size
+            );
+            return -4;
+        }
 
         // Write local chunk into our slot.
         let slot = self.slot_ptr(self.rank, nbytes);

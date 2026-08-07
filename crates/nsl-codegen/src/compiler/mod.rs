@@ -466,6 +466,9 @@ pub struct FeatureConfigs {
     pub parallelism_config: Option<crate::pipeline::ParallelismConfig>,
     /// M43: ZeRO optimizer sharding stage.
     pub zero_stage: Option<u8>,
+    /// Item 11: elementwise 1/ws parameter sharding under stage 3
+    /// (`--zero-elementwise`).
+    pub zero_elementwise: bool,
     /// P4 item 17: SR-BF16 authoritative weights (`--param-dtype bf16-sr`).
     pub param_dtype_bf16sr: bool,
     /// P4 item 18 rung 2: BF16 Muon momentum (`--muon-state-dtype bf16`).
@@ -580,6 +583,7 @@ impl FeatureConfigs {
             pipeline_config: None,
             parallelism_config: None,
             zero_stage: options.zero_stage,
+            zero_elementwise: options.zero_elementwise,
             param_dtype_bf16sr: options.param_dtype_bf16sr,
             muon_state_bf16: options.muon_state_bf16,
             moe_configs: HashMap::new(),
