@@ -42,6 +42,19 @@ pub extern "C" fn nsl_fase_fused_step_count() -> i64 {
     FASE_FUSED_STEP_COUNT.load(Ordering::Relaxed) as i64
 }
 
+/// Item 8 follow-up: device block-table BUILDS in the multi launchers (one
+/// per distinct shape list per run once the per-list cache landed; was one
+/// per layer group per optimizer step under CSLA). Reported on its own
+/// `[fase-fused]` line under `NSL_FASE_FUSED_COUNTER=1` — the thrash gate
+/// asserts builds stays at the distinct-list count while launches grow with
+/// steps.
+pub static FASE_BLK_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn nsl_fase_blk_table_builds() -> i64 {
+    FASE_BLK_TABLE_BUILDS.load(Ordering::Relaxed) as i64
+}
+
 /// Global sum-of-squares over every tensor in an `NslList` — the FASE
 /// two-phase-clip Phase A norm, batched.
 ///

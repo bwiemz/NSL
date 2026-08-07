@@ -3855,6 +3855,93 @@ pub(crate) fn gpu_fase_fused_adamw_step_raw(
     inner::sync_after_kernel();
 }
 
+/// Item 8 follow-up: device block→(param, elem-base) tables, one entry per
+/// DISTINCT shape list. The previous single slot (`blk_lens` compared by
+/// `Vec` equality, rekeyed in place) was correct for the FullBuffer caller
+/// — one call per step, constant `lens` — and exactly inverted by the CSLA
+/// caller, which issues one call PER LAYER GROUP per window, each group
+/// with its own `lens`: every group missed every window, paying a full
+/// compute-stream stall (`cuStreamSynchronize`) plus two BLOCKING
+/// `cuMemcpyHtoD_v2` uploads per group per optimizer step, for tables that
+/// are static across the entire run. Shape lists are finite and small
+/// (layer groups + the epilogue), so each distinct list is now built and
+/// uploaded ONCE per run and found by linear scan after that.
+///
+/// Append-only on purpose: entries are never freed until the owning
+/// workspace is torn down (capacity growth), so the build path needs NO
+/// quiesce — a freshly allocated table cannot be read by any in-flight
+/// launch, unlike the old rekey-in-place slot whose free forced the sync.
+#[cfg(feature = "cuda")]
+struct BlkTables {
+    lens: Vec<u32>,
+    param: u64, // device u32[nblocks]
+    base: u64,  // device u32[nblocks]
+    count: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct BlkTableCache {
+    entries: Vec<BlkTables>,
+}
+
+#[cfg(feature = "cuda")]
+impl BlkTableCache {
+    /// (blk_param, blk_base, nblocks) for `lens`, building on first sight.
+    fn get_or_build(&mut self, lens: &[u32], block: u32, label: &str) -> (u64, u64, usize) {
+        if let Some(t) = self.entries.iter().find(|t| t.lens == lens) {
+            return (t.param, t.base, t.count);
+        }
+        let (bparam, bbase) = crate::fase_step::build_block_tables(lens, block);
+        let nblocks = bparam.len();
+        let (param, base) = unsafe {
+            inner::ensure_context();
+            let param = inner::alloc_managed(nblocks * 4) as u64;
+            let base = inner::alloc_managed(nblocks * 4) as u64;
+            // Synchronous H2D from the stack-owned Vecs is deliberate: it
+            // runs once per distinct shape list per RUN (not per step), and
+            // an async copy would need the host buffers to outlive the call.
+            let cp = |dst: u64, src: &[u32]| {
+                // PCIe accounting — main gained record_h2d on this upload
+                // while the cache was in flight; preserved here (rebase).
+                crate::host_profile::record_h2d(src.len() * 4);
+                let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
+                    dst,
+                    src.as_ptr() as *const c_void,
+                    src.len() * 4,
+                );
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "{label}: block table upload failed"
+                );
+            };
+            cp(param, &bparam);
+            cp(base, &bbase);
+            (param, base)
+        };
+        self.entries.push(BlkTables {
+            lens: lens.to_vec(),
+            param,
+            base,
+            count: nblocks,
+        });
+        crate::fase_step::FASE_BLK_TABLE_BUILDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (param, base, nblocks)
+    }
+
+    /// Free every device table (workspace teardown on capacity growth). The
+    /// caller owns the quiesce — this runs inside the existing
+    /// synchronized teardown blocks.
+    fn free_all(&mut self) {
+        for t in self.entries.drain(..) {
+            inner::free_managed(t.param as *mut c_void);
+            inner::free_managed(t.base as *mut c_void);
+        }
+    }
+}
+
 /// Fusion-queue item 1: MULTI-TENSOR fused AdamW step — one launch for k
 /// parameters via device pointer tables. `ptrs` slices carry raw DEVICE
 /// DATA pointers (already resolved from NslTensors by the FFI); `lens` the
@@ -3886,15 +3973,10 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         stage: u64,   // pinned host: 4*cap u64 + cap u32
         tabs: [u64; 4], // device u64 tables
         ntab: u64,    // device u32 table
-        /// Item 8: block -> (param index, element base) tables, and the shape
-        /// list they were built from. These depend ONLY on the shapes, which
-        /// are static across training steps, so rebuilding them every step
-        /// would be a pure per-step H2D cost (1.2 MB at Coder-50M). Cached and
-        /// rebuilt only when `lens` changes.
-        blk_lens: Vec<u32>,
-        blk_param: u64,  // device u32[nblocks]
-        blk_base: u64,   // device u32[nblocks]
-        blk_count: usize,
+        /// Item 8: block -> (param index, element base) tables per distinct
+        /// shape list (see `BlkTableCache` — the CSLA caller cycles through
+        /// several lists per optimizer step).
+        blk_cache: BlkTableCache,
     }
     thread_local! {
         static WS: std::cell::Cell<*mut MultiWs> = const { std::cell::Cell::new(std::ptr::null_mut()) };
@@ -3912,15 +3994,12 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                 let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
                 assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
                 if !cur.is_null() {
-                    let old = Box::from_raw(cur);
+                    let mut old = Box::from_raw(cur);
                     for t in old.tabs {
                         inner::free_managed(t as *mut c_void);
                     }
                     inner::free_managed(old.ntab as *mut c_void);
-                    if old.blk_param != 0 {
-                        inner::free_managed(old.blk_param as *mut c_void);
-                        inner::free_managed(old.blk_base as *mut c_void);
-                    }
+                    old.blk_cache.free_all();
                     cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
                 }
                 let mut stage: *mut c_void = std::ptr::null_mut();
@@ -3943,10 +4022,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                     stage: stage as u64,
                     tabs,
                     ntab,
-                    blk_lens: Vec::new(),
-                    blk_param: 0,
-                    blk_base: 0,
-                    blk_count: 0,
+                    blk_cache: BlkTableCache::default(),
                 }));
                 c.set(fresh);
             }
@@ -3990,43 +4066,12 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         up(ws.ntab, 4 * ws.cap * 8, k * 4);
     }
 
-    // Item 8: (re)build the block -> param / element-base tables when the
-    // shape list changes. `build_block_tables` is a pure function of `lens`
-    // and is unit-tested on the CPU (`fase_step::item8_tests`).
+    // Item 8: block -> param / element-base tables from the per-shape-list
+    // cache. `build_block_tables` is a pure function of `lens` and is
+    // unit-tested on the CPU (`fase_step::item8_tests`).
     let block = 256i64;
-    if ws.blk_lens != lens {
-        let (bparam, bbase) = crate::fase_step::build_block_tables(lens, block as u32);
-        let nblocks = bparam.len();
-        unsafe {
-            inner::ensure_context();
-            // The previous step's launch may still be reading these.
-            let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
-            assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
-            if ws.blk_param != 0 {
-                inner::free_managed(ws.blk_param as *mut c_void);
-                inner::free_managed(ws.blk_base as *mut c_void);
-            }
-            ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
-            ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
-            let cp = |dst: u64, src: &[u32]| {
-                crate::host_profile::record_h2d(src.len() * 4);
-                let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
-                    dst,
-                    src.as_ptr() as *const c_void,
-                    src.len() * 4,
-                );
-                assert_eq!(
-                    r,
-                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-                    "multi adamw: block table upload failed"
-                );
-            };
-            cp(ws.blk_param, &bparam);
-            cp(ws.blk_base, &bbase);
-        }
-        ws.blk_count = nblocks;
-        ws.blk_lens = lens.to_vec();
-    }
+    let (blk_param, blk_base, blk_count) =
+        ws.blk_cache.get_or_build(lens, block as u32, "multi adamw");
 
     let mut a0 = ws.tabs[0];
     let mut a1 = ws.tabs[1];
@@ -4037,8 +4082,8 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
         (eps, neg_lr, neg_lr_wd, bc1, bc2);
     let mut has_wd_val: u32 = u32::from(has_wd);
-    let mut a5 = ws.blk_param;
-    let mut a6 = ws.blk_base;
+    let mut a5 = blk_param;
+    let mut a6 = blk_base;
     let mut mp_scale_val = mp_scale;
     let args = [
         &mut a0 as *mut _ as *mut c_void,
@@ -4060,7 +4105,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         &mut a6 as *mut _ as *mut c_void,
         &mut mp_scale_val as *mut _ as *mut c_void,
     ];
-    let grid_x = ws.blk_count as i64;
+    let grid_x = blk_count as i64;
     let result = inner::kernel_launch(
         kernels::FASE_FUSED_ADAMW_MULTI_F32_PTX.as_ptr(),
         b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
@@ -4115,10 +4160,8 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
         stage: u64,     // pinned host: 5*cap u64 + cap u32
         tabs: [u64; 5], // device u64 tables: theta, m, v, mp, ctr
         ntab: u64,      // device u32 table
-        blk_lens: Vec<u32>,
-        blk_param: u64, // device u32[nblocks]
-        blk_base: u64,  // device u32[nblocks]
-        blk_count: usize,
+        /// Item 8: per-shape-list block tables (see `BlkTableCache`).
+        blk_cache: BlkTableCache,
     }
     thread_local! {
         static SR_WS: std::cell::Cell<*mut SrMultiWs> =
@@ -4137,15 +4180,12 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
                 let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
                 assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
                 if !cur.is_null() {
-                    let old = Box::from_raw(cur);
+                    let mut old = Box::from_raw(cur);
                     for t in old.tabs {
                         inner::free_managed(t as *mut c_void);
                     }
                     inner::free_managed(old.ntab as *mut c_void);
-                    if old.blk_param != 0 {
-                        inner::free_managed(old.blk_param as *mut c_void);
-                        inner::free_managed(old.blk_base as *mut c_void);
-                    }
+                    old.blk_cache.free_all();
                     cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
                 }
                 let mut stage: *mut c_void = std::ptr::null_mut();
@@ -4169,10 +4209,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
                     stage: stage as u64,
                     tabs,
                     ntab,
-                    blk_lens: Vec::new(),
-                    blk_param: 0,
-                    blk_base: 0,
-                    blk_count: 0,
+                    blk_cache: BlkTableCache::default(),
                 }));
                 c.set(fresh);
             }
@@ -4220,45 +4257,13 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
         up(ws.ntab, 5 * ws.cap * 8, k * 4);
     }
 
-    // Block tables: same pure function of `lens`, same cache-on-shape-list
-    // policy as the f32 multi. The `blockDim.x == build_block_tables block`
+    // Block tables: same pure function of `lens`, same per-shape-list cache
+    // as the f32 multi. The `blockDim.x == build_block_tables block`
     // contract is shared — one constant feeds both.
     let block = 256i64;
-    if ws.blk_lens != lens {
-        let (bparam, bbase) = crate::fase_step::build_block_tables(lens, block as u32);
-        let nblocks = bparam.len();
-        unsafe {
-            inner::ensure_context();
-            // The previous step's launch may still be reading these.
-            let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
-            assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
-            if ws.blk_param != 0 {
-                inner::free_managed(ws.blk_param as *mut c_void);
-                inner::free_managed(ws.blk_base as *mut c_void);
-            }
-            ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
-            ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
-            let cp = |dst: u64, src: &[u32]| {
-                // PCIe accounting — same contract as the pointer-table
-                // upload above.
-                crate::host_profile::record_h2d(src.len() * 4);
-                let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
-                    dst,
-                    src.as_ptr() as *const c_void,
-                    src.len() * 4,
-                );
-                assert_eq!(
-                    r,
-                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-                    "multi bf16sr adamw: block table upload failed"
-                );
-            };
-            cp(ws.blk_param, &bparam);
-            cp(ws.blk_base, &bbase);
-        }
-        ws.blk_count = nblocks;
-        ws.blk_lens = lens.to_vec();
-    }
+    let (blk_param, blk_base, blk_count) =
+        ws.blk_cache
+            .get_or_build(lens, block as u32, "multi bf16sr adamw");
 
     let mut a0 = ws.tabs[0];
     let mut a1 = ws.tabs[1];
@@ -4271,8 +4276,8 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
     let mut has_wd_val: u32 = u32::from(has_wd);
     let mut sr_key_val = sr_key;
     let mut a5 = ws.tabs[4];
-    let mut a6 = ws.blk_param;
-    let mut a7 = ws.blk_base;
+    let mut a6 = blk_param;
+    let mut a7 = blk_base;
     let args = [
         &mut a0 as *mut _ as *mut c_void,
         &mut a1 as *mut _ as *mut c_void,
@@ -4294,7 +4299,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
         &mut a6 as *mut _ as *mut c_void,
         &mut a7 as *mut _ as *mut c_void,
     ];
-    let grid_x = ws.blk_count as i64;
+    let grid_x = blk_count as i64;
     let result = inner::kernel_launch(
         kernels::FASE_FUSED_ADAMW_MULTI_BF16SR_PTX.as_ptr(),
         b"nsl_fase_fused_adamw_multi_bf16sr\0".as_ptr(),
