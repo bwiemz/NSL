@@ -187,6 +187,13 @@ extern "C" fn nsl_fase_fused_step_count_atexit() {
         "[fase-fused] optimizer fused-step launches: {}",
         crate::fase_step::nsl_fase_fused_step_count()
     );
+    // Item 8 follow-up: its OWN line — the launches line above is consumed
+    // by strip_prefix-then-parse gates, so appending a field there would
+    // break them (the append-breaks-terminal-anchors class).
+    eprintln!(
+        "[fase-fused] block-table builds: {}",
+        crate::fase_step::nsl_fase_blk_table_builds()
+    );
 }
 
 extern "C" fn nsl_wgrad_count_atexit() {

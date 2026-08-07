@@ -183,3 +183,70 @@ fn fused_step_matches_interpreted_bit_exact() {
         "[fase-fused-gate] OK: trained-param sums bit-exact (interpreted == fused, {fused_n} fused launches)\n{interp_sums}"
     );
 }
+
+/// Item 8 follow-up: the multi launchers' block tables are cached PER
+/// DISTINCT SHAPE LIST, not in a single rekeyed slot. Under CSLA the group
+/// update issues one multi_idx call per layer group per window, each with
+/// its own `lens` — the old slot missed on every call, paying a
+/// compute-stream stall + 2 blocking H2D per group per optimizer step. On
+/// the 2-block fixture (6 windows, identical block shapes → 2 distinct
+/// lists: layer group + epilogue) the OLD behavior rebuilt ~2x per window
+/// (>= 12 builds); the cache builds each list exactly once.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_block_tables_build_once_per_shape_list_gpu() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_blkcache_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("out.nslm");
+    let src = std::fs::read_to_string(
+        root.join("crates/nsl-cli/tests/fixtures/csla_layerwise_ffn.nsl"),
+    )
+    .expect("ffn fixture missing")
+    .replace(
+        "CSLA_SAVE_PATH",
+        &save.display().to_string().replace('\\', "/"),
+    )
+    .replace("# GPU_PLACEMENT", "m.to(cuda)");
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args([
+            "run",
+            "--source-ad",
+            "--deterministic",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--weight-stream",
+        ])
+        .arg(&prog)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .env("NSL_FASE_FUSED_COUNTER", "1")
+        .output()
+        .expect("spawn nsl run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "csla run failed:\n{stderr}");
+
+    let builds: u64 = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("[fase-fused] block-table builds: "))
+        .unwrap_or_else(|| panic!("missing block-table builds report:\n{stderr}"))
+        .trim()
+        .parse()
+        .expect("builds count parses");
+    assert!(
+        builds >= 1,
+        "0 block-table builds — the multi_idx path never ran (vacuous):\n{stderr}"
+    );
+    assert!(
+        builds <= 3,
+        "{builds} block-table builds on a 6-window run with 2 distinct shape \
+         lists — the per-list cache is not caching (the old rekeyed slot \
+         rebuilt >= 12 times here). Note: a workspace capacity-growth \
+         teardown also frees the cache and re-counts its rebuilds, so a \
+         legitimate third distinct list PLUS a growth event can trip this \
+         bound — check `[fase-fused] block-table builds` across a longer \
+         run before blaming the cache"
+    );
+}
