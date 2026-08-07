@@ -117,6 +117,7 @@ const CLI_OPTIONS: &str = "crates/nsl-cli/src/commands/build/options.rs";
 const CLI_CEP: &str = "crates/nsl-cli/src/commands/cep.rs";
 const WGGO_SCORER: &str = "crates/nsl-codegen/src/wggo_gradient_scorer.rs";
 const CPDT_CALIB: &str = "crates/nsl-codegen/src/bin/cpdt_calibrate.rs";
+const ENTRY_POINTS: &str = "crates/nsl-codegen/src/compiler/entry_points.rs";
 
 /// Every composition rule the compiler enforces, measured from the source
 /// rather than recalled. Ordered by subsystem so a reader can see the shape
@@ -148,6 +149,17 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
     clap_rule("--fuse-wgrad-accum", RuleKind::Conflicts, "grad_integrity"),
     clap_rule("--fuse-wgrad-accum", RuleKind::Conflicts, "optim_state_offload"),
     clap_rule("--fuse-wgrad-accum", RuleKind::Conflicts, "layerwise_accum"),
+    // Item 4 (`--fuse-lm-head`). A SOURCE refusal rather than a clap rule
+    // because it fires only on `--fuse-lm-head require`: the other modes
+    // degrade to an unfused head instead of refusing, so clap — which sees
+    // the flag but not its value's strictness — cannot express it.
+    src_rule(
+        "--fuse-lm-head",
+        RuleKind::Requires,
+        "--source-ad",
+        ENTRY_POINTS,
+        "--fuse-lm-head require needs --source-ad",
+    ),
     // ── CSLA (`--layerwise-accum`) envelope ────────────────────────────────
     src_rule(
         "--weight-stream",
