@@ -275,6 +275,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "item 7 reported how many weight-gradient chains the pre-pass fused",
     ),
     m(
+        "[ccr]",
+        &["crates/nsl-codegen/src/stmt.rs"],
+        "CCR reported its adjoint last-use free placement (NSL_CCR_DEBUG=1), \
+         and warns when that placement broke a weight-gradient fusion chain",
+    ),
+    m(
         "[fused-lm-ce]",
         &[
             // stmt.rs: the partial-decline warning, and the
@@ -354,6 +360,7 @@ pub mod tokens {
     pub const WEIGHT_STREAM: &str = "[weight-stream]";
     pub const WGRAD_ACCUM: &str = "[wgrad-accum]";
     pub const WGRAD_FUSION: &str = "[wgrad-fusion]";
+    pub const CCR: &str = "[ccr]";
 }
 
 /// A string a NEGATIVE assertion depends on.

@@ -334,6 +334,7 @@ pub fn insert_adjoint_last_use_frees(
     adjoint: &mut WengertList,
     protect: &HashSet<VarId>,
     fresh: &mut VarId,
+    wgrad_chains: Option<&crate::wgrad_fusion::WgradFusionPlan>,
 ) -> usize {
     // Vars produced in the adjoint region (only these are candidates —
     // primal values are owned by the primal cleanup path).
@@ -358,12 +359,32 @@ pub fn insert_adjoint_last_use_frees(
         }
     }
     extend_last_use_through_lists(adjoint, &mut last_use);
+    extend_last_use_through_wgrad_chains(adjoint, &mut last_use, wgrad_chains);
 
     // Collect (insert_after_idx, victim) — free at last use, or right
     // after production for dead results.
+    // Intermediates a fused weight-gradient chain ELIDES (`a_t`, `raw_grad`):
+    // their producing ops emit nothing, so there is no tensor to free — and a
+    // `FreeTensor` marker would be worse than useless, because it counts as a
+    // READER of `a_t` and so trips `wgrad_fusion::plan`'s single-reader
+    // precondition, rejecting the very chain it was inserted around. Moving
+    // the marker (below) fixes contiguity but not this; the marker must not
+    // exist at all.
+    //
+    // This is the ONE half that is unsafe to over-apply: deleting a marker
+    // for a chain the lowerer does not go on to elide costs a real early
+    // free. The caller is therefore responsible for supplying a plan only
+    // when the lowerer will plan too (it mirrors the hook gate); the
+    // post-insertion re-plan it runs afterwards checks the opposite
+    // direction — that the placement did not KILL an admissible chain — and
+    // cannot see a seed divergence, because both of its sides use the
+    // caller's seed.
+    let elided: HashSet<VarId> = wgrad_chains
+        .map(|p| p.suppressed.clone())
+        .unwrap_or_default();
     let mut pending: Vec<(usize, VarId)> = Vec::new();
     for (var, &prod_idx) in &produced {
-        if protect.contains(var) || already_freed.contains(var) {
+        if protect.contains(var) || already_freed.contains(var) || elided.contains(var) {
             continue;
         }
         if matches!(adjoint.ops[prod_idx].op, PrimalOp::FreeTensor) {
@@ -401,6 +422,74 @@ pub fn insert_adjoint_last_use_frees(
         op.id = i as u32;
     }
     inserted
+}
+
+/// Push every last-use that falls INSIDE a fusable weight-gradient chain out
+/// to that chain's `reduce_to_shape`, so last-use freeing cannot insert a
+/// `FreeTensor` between the chain's three ops.
+///
+/// # Why this exists
+///
+/// `wgrad_fusion::plan` admits a chain only when its ops sit at `i, i+1,
+/// i+2` with nothing in between, and that adjacency is load-bearing: it is
+/// what makes it safe to move the *consumption* of `X` and `G` forward from
+/// the matmul to the reduce, where the fused GEMM actually reads them.
+///
+/// Last-use freeing computes `last_use[a_t] = matmul_idx` and (usually)
+/// `last_use[G] = matmul_idx`, so it inserts their `FreeTensor` markers at
+/// `matmul_idx + 1` — exactly between the matmul and the reduce. That breaks
+/// the contiguity walk AND the single-reader precondition, and the failure is
+/// SILENT: the pattern simply stops matching, so `--fuse-wgrad-accum` fused
+/// ZERO chains on every `--checkpoint-blocks` build (measured: 4 chains
+/// without the flag, 0 with it) while still reporting success. No gate could
+/// see it because none passed both flags.
+///
+/// The fix is to the ORDER, not to the predicate — relaxing contiguity would
+/// mean admitting chains with a real `FreeTensor(G)` between the matmul and
+/// the reduce, and the fused GEMM would then read freed memory. Pushing the
+/// free out instead is correct for BOTH outcomes: when the chain fuses, the
+/// GEMM reads `X`/`G` at the reduce and the free follows it; when it does not
+/// fuse (the runtime decides that later, on shapes this module cannot see),
+/// the tensors simply live one or two ops longer.
+fn extend_last_use_through_wgrad_chains(
+    adjoint: &WengertList,
+    last_use: &mut HashMap<VarId, usize>,
+    plan: Option<&crate::wgrad_fusion::WgradFusionPlan>,
+) {
+    let Some(plan) = plan.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    // Re-derive each chain's position from the tape being freed rather than
+    // trusting the plan's recorded indices. Positions are valid only against
+    // the list state they were captured from (see `WengertList`'s
+    // reference-discipline header); VarIds are stable across every mutation,
+    // so the keys are the sound handle.
+    let pos_of: HashMap<VarId, usize> = adjoint
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(i, op)| (op.result, i))
+        .collect();
+    // interior position -> the reduce that must outlive it.
+    let mut push_to: HashMap<usize, usize> = HashMap::new();
+    for dw in plan.by_reduce_result.keys() {
+        let Some(&reduce_pos) = pos_of.get(dw) else {
+            continue;
+        };
+        // `plan` admits only `i, i+1, i+2`, so the chain starts two ops back.
+        let Some(start) = reduce_pos.checked_sub(2) else {
+            continue;
+        };
+        for interior in start..reduce_pos {
+            let slot = push_to.entry(interior).or_insert(reduce_pos);
+            *slot = (*slot).max(reduce_pos);
+        }
+    }
+    for lu in last_use.values_mut() {
+        if let Some(&target) = push_to.get(lu) {
+            *lu = target.max(*lu);
+        }
+    }
 }
 
 /// Effective Wengert type of a result (falls back to the op default).
