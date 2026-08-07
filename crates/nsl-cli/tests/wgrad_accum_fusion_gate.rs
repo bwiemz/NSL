@@ -140,7 +140,10 @@ fn run(fixture: &Path, cuda: bool, extra: &[&str]) -> Run {
         // Which path the RUNTIME took. The codegen line below only proves the
         // call was emitted; this proves the GEMM ran instead of the silent
         // decomposed fallback. Harmless in both arms.
-        .env("NSL_WGRAD_COUNTER", "1");
+        .env("NSL_WGRAD_COUNTER", "1")
+        // Lets the CCR arm prove checkpointing actually engaged. Both env vars
+        // only add stderr lines — no arm's arithmetic depends on either.
+        .env("NSL_CCR_DEBUG", "1");
     let out = cmd.output().expect("spawn nsl run");
     Run {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -217,6 +220,160 @@ fn write_fixture(name: &str, cuda: bool, batched: bool) -> PathBuf {
     let p = std::env::temp_dir().join(name);
     std::fs::write(&p, fixture_src(cuda, batched)).expect("write fixture");
     p
+}
+
+/// A `blocks.N`-shaped model, which `fixture_src`'s flat `Net` is NOT.
+///
+/// CCR refuses to checkpoint a tape with no `blocks.N`-style parameters
+/// ("running without checkpointing"), so passing `--checkpoint-blocks` to the
+/// flat fixture is a NO-OP — a CCR-interaction test written against it would
+/// pass identically on the broken code, which is exactly the vacuous-gate
+/// shape this file's header warns about. Three fused chains here: the two
+/// block weights and the head.
+fn ccr_fixture_src() -> String {
+    r#"from nsl.nn.losses import mse_loss
+
+model Block:
+    w: Tensor = (arange(16).reshape([4, 4])) * 0.02
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return gelu(h @ self.w)
+
+model Net:
+    blocks: [Block; 2] = Block()
+    head: Tensor = (arange(12).reshape([4, 3])) * 0.03
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for b in self.blocks:
+            h = b.forward(h)
+        return h @ self.head
+
+let m = Net()
+let x = (arange(40).reshape([2, 5, 4])) * 0.01
+let y = (arange(30).reshape([2, 5, 3])) * 0.01
+
+train(model=m, epochs=8, grad_accumulation=4):
+    optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+print("W1_BEGIN")
+print(m.head)
+print("W1_END")
+"#
+    .to_string()
+}
+
+/// Number of adjoint last-use `FreeTensor` markers CCR inserted, from the
+/// `NSL_CCR_DEBUG=1` line. `None` when CCR never ran.
+fn ccr_frees(stderr: &str) -> Option<u64> {
+    stderr.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("[ccr] adjoint last-use frees inserted: ")
+            .and_then(|n| n.trim().parse::<u64>().ok())
+    })
+}
+
+/// `--checkpoint-blocks` must not silently switch the fusion off.
+///
+/// CCR's adjoint last-use freeing computes `last_use[a_t] = matmul_idx` and
+/// so lands a `FreeTensor` at `matmul_idx + 1` — exactly between the matmul
+/// and the reduce. That breaks BOTH of `wgrad_fusion::plan`'s preconditions
+/// at once (the contiguity walk, and `a_t`'s single-reader count, since the
+/// marker is itself a reader). The failure was silent and total: on every
+/// checkpointed build the flag fused ZERO chains and emitted not one
+/// `nsl_tensor_wgrad_accum` call, while still reporting success — i.e. the
+/// shipped feature was inert on exactly the checkpointed pretraining
+/// configuration it was built for. Nothing in this file passed both flags,
+/// so no gate could see it.
+///
+/// Measured on this fixture: main = 0 chains / 0 runtime calls;
+/// fixed = 3 chains / 24 runtime calls.
+#[test]
+fn checkpoint_blocks_does_not_disable_the_fusion() {
+    let p = std::env::temp_dir().join("nsl_wgrad_accum_gate_ccr.nsl");
+    std::fs::write(&p, ccr_fixture_src()).expect("write fixture");
+
+    let off = run(&p, false, &["--checkpoint-blocks"]);
+    assert!(off.ok, "flag-off run failed:\n{}", off.stderr);
+    let on = run(&p, false, &["--fuse-wgrad-accum", "--checkpoint-blocks"]);
+    assert!(on.ok, "flag-on run failed:\n{}", on.stderr);
+
+    // ANTI-VACUITY 1 — CCR actually ran. If the fixture ever loses its
+    // `blocks.N` shape, CCR declines, `--checkpoint-blocks` becomes a no-op,
+    // and everything below would pass on the BROKEN code too.
+    let frees = ccr_frees(&on.stderr).unwrap_or_else(|| {
+        panic!(
+            "no `[ccr] adjoint last-use frees inserted` line — CCR did not run, \
+             so this arm is not testing the interaction it exists for.\n\
+             stderr:\n{}",
+            on.stderr
+        )
+    });
+    assert!(
+        frees > 0,
+        "CCR inserted no last-use frees, so nothing could have broken the \
+         chain's contiguity — the regression this arm pins is unreachable here"
+    );
+    assert!(
+        !on.stderr.contains("running without checkpointing"),
+        "CCR declined to checkpoint this fixture, so --checkpoint-blocks was a \
+         no-op:\n{}",
+        on.stderr
+    );
+
+    // ANTI-VACUITY 2 — the plan admitted the chains (0 on main).
+    let fired = fused_chains(&on.stderr).unwrap_or(0);
+    assert!(
+        fired >= 3,
+        "expected >= 3 fused chains under --checkpoint-blocks (two block \
+         weights + the head), got {fired}. This is the regression itself: \
+         CCR's free placement takes the count to 0.\nstderr:\n{}",
+        on.stderr
+    );
+
+    // ANTI-VACUITY 3 — and the FFI was actually CALLED. The codegen line
+    // above only proves the plan admitted a chain; this proves the emitted
+    // call ran. On main both read zero, which is what made the inertness
+    // invisible.
+    let (gemm, fallback) = wgrad_runtime_counts(&on.stderr).unwrap_or_else(|| {
+        panic!("no [wgrad-accum] counter line\nstderr:\n{}", on.stderr)
+    });
+    assert_eq!(gemm, 0, "the cuBLAS path fired in a non-cuda build");
+    assert!(
+        fallback >= 3,
+        "expected at least one decomposed-fallback call per fused chain, got \
+         {fallback} — the chains were planned but never executed"
+    );
+
+    // The protection must not merely move the breakage: the compiler's own
+    // invariant check reports any chain the free placement still kills.
+    assert!(
+        !on.stderr.contains("last-use freeing broke"),
+        "the compiler reported losing fusion chains to free placement:\n{}",
+        on.stderr
+    );
+
+    // Parity: on CPU every call takes the exact decomposed fallback, so the
+    // arithmetic is unchanged and any drift is a CODEGEN defect — a
+    // mis-planned chain, a mis-wired operand, or a gradient freed before the
+    // GEMM that consumes it reads it.
+    let (on_w1, on_w2) = weights(&on.stdout);
+    let (off_w1, off_w2) = weights(&off.stdout);
+    assert_eq!(on_w1.len(), 12, "expected the 12 head values, got {:?}", on_w1.len());
+    assert!(
+        on_w1[0].abs() > 1e-6,
+        "head[0] never moved off its 0.0 init — no gradient flowed, so this \
+         parity comparison would be vacuous"
+    );
+    assert_eq!(
+        on_w1, off_w1,
+        "the head weight differs under --checkpoint-blocks, where the fused \
+         path falls back to the exact decomposed chain — a codegen defect"
+    );
+    assert_eq!(on_w2, off_w2, "trailing parse block differs (see above)");
 }
 
 #[test]
