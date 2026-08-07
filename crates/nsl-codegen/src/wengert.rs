@@ -613,6 +613,20 @@ pub enum CompareKind {
 /// captures are DECLARED per pass in `pass_registry.rs` (`tape:` field) and
 /// drift-checked; every in-place structural mutator re-asserts id
 /// uniqueness at its commit point — see [`WengertList::assert_unique_op_ids`].
+///
+/// ## Ids are unique PER LIST, not per compile
+///
+/// The primal and the adjoint are separate `WengertList` instances with
+/// independent id spaces: the adjoint rewriters renumber their list back
+/// to `id == index` after every splice. A table keyed by PRIMAL ids that
+/// is consulted while lowering walks BOTH lists (the CSHA claim tables,
+/// via `compile_wengert_ops`) therefore relies on the consulting arm
+/// distinguishing which list an op came from — an adjoint op whose
+/// renumbered id collides with a claimed primal id (e.g. a CCR recompute
+/// clone of an unclaimed SDPA) is a known narrow alias hazard, named here
+/// so the discipline is complete rather than silently per-list. It
+/// predates this header; closing it needs either list-tagged claim keys
+/// or an adjoint id space disjoint from the primal's.
 #[derive(Debug, Clone)]
 pub struct WengertList {
     pub ops: Vec<WengertOp>,

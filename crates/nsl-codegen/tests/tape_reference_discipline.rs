@@ -40,9 +40,16 @@ fn op(id: OpId, result: VarId, op: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
 /// The `csha_apply` toy attention tape, with every op id shifted up by
 /// `skew` — exactly the shape a list takes after `skew` earlier ops were
 /// deleted without renumbering (the fused-LCE prune's effect): positions
-/// run 0..10, ids run skew..skew+10.
-fn skewed_attn_wengert(skew: u32) -> WengertList {
-    let ops = vec![
+/// run 0..10 (11 with SDPA), ids run skew..skew+10 (+11).
+///
+/// `with_sdpa` appends a `ScaledDotProductAttention` consuming the three
+/// chain outputs. That flips which `collect_chain_dispatch_map_with_wengert`
+/// arm runs: WITH a shared SDPA the GROUPED arm claims (SDPA primary +
+/// norm/matmuls/ropes secondary) — the arm a real transformer build routes
+/// through; WITHOUT it the legacy per-chain arm runs. The review found the
+/// first version of these tests only skew-covered the legacy arm.
+fn skewed_attn_wengert(skew: u32, with_sdpa: bool) -> WengertList {
+    let mut ops = vec![
         op(skew, 0, PrimalOp::Input("x".into()), vec![]),
         op(skew + 1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
         op(skew + 2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
@@ -54,9 +61,19 @@ fn skewed_attn_wengert(skew: u32) -> WengertList {
         op(skew + 8, 8, PrimalOp::Param("blocks.0.attn.wv".into()), vec![]),
         op(skew + 9, 9, PrimalOp::Matmul, vec![1, 8]),
     ];
+    let mut output = 9;
+    if with_sdpa {
+        ops.push(op(
+            skew + 10,
+            10,
+            PrimalOp::ScaledDotProductAttention { causal: true },
+            vec![4, 7, 9],
+        ));
+        output = 10;
+    }
     WengertList {
         ops,
-        output: 9,
+        output,
         var_names: HashMap::new(),
         var_types: HashMap::new(),
     }
@@ -89,7 +106,7 @@ fn plan_for(w: &WengertList) -> nsl_codegen::csha::CshaPlan {
 #[test]
 fn claims_are_op_ids_not_positions() {
     const SKEW: u32 = 7;
-    let w = skewed_attn_wengert(SKEW);
+    let w = skewed_attn_wengert(SKEW, false);
     let plan = plan_for(&w);
     assert!(
         !plan.boundary.chains.is_empty(),
@@ -107,32 +124,59 @@ fn claims_are_op_ids_not_positions() {
 
 /// Same discipline for the reverse-walk dispatch map: its keys are looked
 /// up by `op.id` at `source_ad`'s reverse walk and `wengert_lower`'s
-/// fused-forward arm, so on a skewed tape every key must be an id. (The
-/// grouped-SDPA path needs a fused SDPA primitive the toy tape doesn't
-/// carry, so this exercises the legacy per-chain path — which is exactly
-/// the arm whose keys went out unconverted.)
+/// fused-forward arm, so on a skewed tape every key must be an id — as an
+/// EXACT set, because under a skew several positions alias other ops'
+/// valid ids and a membership check would let a partial regression pass
+/// (review finding). Without an SDPA the LEGACY per-chain arm runs: keys
+/// are the norm, three matmuls, and two RoPEs, in id-space.
 #[test]
-fn dispatch_map_keys_are_op_ids_not_positions() {
+fn legacy_dispatch_map_keys_are_op_ids_not_positions() {
     const SKEW: u32 = 7;
-    let w = skewed_attn_wengert(SKEW);
+    let w = skewed_attn_wengert(SKEW, false);
     let plan = plan_for(&w);
     let br = bridge(&plan, 64, &mut Vec::new());
     let (op_to_chain, _marks) =
         collect_chain_dispatch_map_with_wengert(&plan, &br, Some(&w), None);
-    assert!(
-        !op_to_chain.is_empty(),
-        "the dispatch map came back empty — the premise died"
+    let keys: HashSet<u32> = op_to_chain.keys().copied().collect();
+    let expected: HashSet<u32> =
+        [1, 3, 4, 6, 7, 9].iter().map(|p| p + SKEW).collect();
+    assert_eq!(
+        keys, expected,
+        "legacy-arm dispatch keys must be exactly the chain ops' ids \
+         (positions + {SKEW}); a position-space key leaked past the \
+         conversion boundary"
     );
-    let ids: HashSet<u32> = w.ops.iter().map(|o| o.id).collect();
-    for key in op_to_chain.keys() {
-        assert!(
-            ids.contains(key),
-            "dispatch-map key {key} is not any op's id on this tape — it is \
-             a positional index that leaked past the conversion boundary \
-             (ids run {SKEW}..{})",
-            SKEW + 10
-        );
-    }
+}
+
+/// The GROUPED arm — the one a real transformer `@fused_lm_ce`+CSHA build
+/// routes through (all three chains share a detected SDPA) — under the
+/// same skew: SDPA is the primary claim, norm/matmuls/ropes secondary,
+/// all in id-space, as an exact set. The review found the first version
+/// of this suite left this arm skew-uncovered: a regression converting
+/// only the legacy arm would have passed every test while mis-keying
+/// every production claim.
+#[test]
+fn grouped_dispatch_map_keys_are_op_ids_not_positions() {
+    const SKEW: u32 = 7;
+    let w = skewed_attn_wengert(SKEW, true);
+    let plan = plan_for(&w);
+    let br = bridge(&plan, 64, &mut Vec::new());
+    let (op_to_chain, _marks) =
+        collect_chain_dispatch_map_with_wengert(&plan, &br, Some(&w), None);
+    let keys: HashSet<u32> = op_to_chain.keys().copied().collect();
+    let expected: HashSet<u32> = [1, 3, 4, 6, 7, 9, 10]
+        .iter()
+        .map(|p| p + SKEW)
+        .collect();
+    assert_eq!(
+        keys, expected,
+        "grouped-arm dispatch keys must be exactly the chain + SDPA ops' \
+         ids (positions + {SKEW}); a position-space key leaked past the \
+         conversion boundary"
+    );
+    // The premise that the GROUPED arm actually ran: the SDPA op's id is
+    // among the keys (the legacy arm never claims it).
+    assert!(keys.contains(&(10 + SKEW)));
 }
 
 /// After a deletion, `ops.len()` is at-or-below the surviving max id, so a

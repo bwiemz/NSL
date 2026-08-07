@@ -4,12 +4,18 @@
 //! The bus's `consumed_by_passes` edges cover values passed pass-to-pass;
 //! this covers the OTHER medium: passes that rewrite or scan the shared
 //! `WengertList`. A declaration nobody checks is prose with extra steps, so
-//! each `TapeAccess` claim is verified against the tree in both directions:
-//! a pass declaring `None` must have no code-level mention of the type in
-//! its registered sources, and a pass declaring access must point (`via`)
-//! at real files that actually mention it. The commit-point uniqueness
-//! belts and the id-minting rule are pinned textually — they are one-line
-//! calls a refactor could drop with nothing else noticing.
+//! each `TapeAccess` claim is verified against the tree: a pass declaring
+//! `None` must have no code-level mention of the type anywhere in its
+//! MODULE FAMILY (matched by name prefix, the module-ownership gate's
+//! convention — wider than `source_files`, which is a representative
+//! subset), and a pass declaring access must point (`via`) at real files
+//! that actually mention it. Honest scope note: the access KIND
+//! (Reads vs MutatesInPlace vs MutatesFork) and the `refs` list are
+//! checked for non-emptiness but their CONTENT is prose — a pass changing
+//! how it touches the tape without updating its declaration is caught
+//! only where a mention appears or disappears. The commit-point
+//! uniqueness belts and the id-minting rule are pinned textually — they
+//! are one-line calls a refactor could drop with nothing else noticing.
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +33,12 @@ fn repo_root() -> PathBuf {
 /// Drop `//` comment lines and trailing comments, then strip whitespace —
 /// the multi-line lesson, plus: `cfie.rs` states "CFIE never sees a
 /// WengertList" in prose, which must not count as an access.
+///
+/// Known limits, accepted: `/* block comments */` are not stripped (a
+/// block-commented mention would false-POSITIVE a None declaration —
+/// loud, the safe direction), and a line whose `//` follows a `"` keeps
+/// its trailing comment (same direction). Neither exists in the scanned
+/// files today.
 fn code_only(text: &str) -> String {
     text.lines()
         .map(|l| match l.find("//") {
@@ -48,20 +60,47 @@ fn mentions_tape(path: &Path) -> bool {
 #[test]
 fn every_tape_declaration_matches_the_tree() {
     let root = repo_root();
+    let src_dir = root.join("crates/nsl-codegen/src");
     for p in PASSES {
         match &p.tape {
             TapeAccess::None => {
-                for f in p.source_files {
-                    let path = root.join(f);
+                // Check the pass's whole MODULE FAMILY by name prefix (the
+                // same convention the module-ownership gate matches by),
+                // not just `source_files` — that list is a representative
+                // subset, and a tape access growing in an unlisted
+                // `cpkd_*.rs` must not slip past a subset check (review
+                // finding).
+                let prefix = p.name.to_lowercase();
+                let mut checked = 0usize;
+                for entry in std::fs::read_dir(&src_dir).unwrap().flatten() {
+                    let path = entry.path();
+                    let Some(stem) =
+                        path.file_stem().and_then(|s| s.to_str())
+                    else {
+                        continue;
+                    };
+                    if path.extension().is_none_or(|e| e != "rs") {
+                        continue;
+                    }
+                    if stem != prefix && !stem.starts_with(&format!("{prefix}_")) {
+                        continue;
+                    }
+                    checked += 1;
                     assert!(
                         !mentions_tape(&path),
                         "{}: declares TapeAccess::None but {} mentions \
                          WengertList in code — either the pass grew tape \
                          access (declare it) or the mention is dead",
                         p.name,
-                        f
+                        path.display()
                     );
                 }
+                assert!(
+                    checked > 0,
+                    "{}: no module matched prefix '{prefix}' — the family \
+                     scan went vacuous; fix the prefix mapping",
+                    p.name
+                );
             }
             TapeAccess::Reads { refs, via }
             | TapeAccess::MutatesInPlace { refs, via, .. }

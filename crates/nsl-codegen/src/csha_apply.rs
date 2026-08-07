@@ -432,13 +432,19 @@ pub struct CshaSavePointers {
 ///
 /// `wengert` must be the SAME list state the boundary scan ran on: the
 /// chain fields are positional indices, valid only against that state,
-/// and this function is the boundary where they convert to id-space —
-/// every consumer of a claim set compares against `op.id`
-/// (`source_ad`'s reverse walk, `wengert_lower`'s fused-forward lookup,
-/// CCR's exemption test at `claimed.contains(&op.id)`). Positions and
-/// ids agree only while `op.id == index`, which the fused-LCE prune
-/// breaks BEFORE this scan on any `@fused_lm_ce` build — publishing raw
-/// positions there mis-keys every claim.
+/// and this function is the boundary where they convert to id-space.
+/// This set's one consumer is the `csha_claimed_ops` bus channel, whose
+/// accessor (`is_csha_claimed`) has ZERO production callers today — a
+/// pinned negative in `pass_bus_drift`. The conversion still matters:
+/// the id-keyed comparison the accessor is built for would silently
+/// mis-key the moment it gains its first caller. (The LIVE id-keyed
+/// consumers — `source_ad`'s reverse walk, `wengert_lower`'s
+/// fused-forward lookup, CCR's exemption test at
+/// `claimed.contains(&op.id)` — consume the DISPATCH MAP built by
+/// `collect_chain_dispatch_map_with_wengert`, which converts at the same
+/// boundary.) Positions and ids agree only while `op.id == index`, which
+/// the fused-LCE prune breaks BEFORE this scan on any `@fused_lm_ce`
+/// build — publishing raw positions there mis-keys every claim.
 ///
 /// Factored as a free function so the population logic is pure and
 /// directly unit-testable without constructing a full `Compiler`.
