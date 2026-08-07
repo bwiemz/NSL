@@ -18,6 +18,13 @@
 # plan joins the student only — 6 buffers, not 12.
 #
 # FASE Deferred mode is activated by: optimizer AdamW + grad_accumulation > 1.
+#
+# epochs = 8 against a window of 4 so the accumulation window CLOSES TWICE.
+# There is no `data:` section, so one micro-batch per epoch: at the earlier
+# epochs = 2 the window never reached its boundary, the optimizer never ran,
+# and the FP16 moment envelope this fixture exists to exercise was only ever
+# PLANNED. Two closures also cover the second step, where the moments are
+# read back from FP16 storage rather than merely written to it.
 
 from nsl.nn.losses import mse_loss
 
@@ -44,7 +51,7 @@ let student = TinyNet()
 let x = ones([2, 8])
 let y = zeros([2, 64])
 
-distill(teacher = teacher, student = student, epochs = 2, grad_accumulation = 4):
+distill(teacher = teacher, student = student, epochs = 8, grad_accumulation = 4):
     optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
     loss:
         alpha = 0.5

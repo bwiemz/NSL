@@ -149,9 +149,20 @@ distill(student = student, epochs = 1):
 /// clamps a non-literal window to 1 silently; on distill that clamp is
 /// indistinguishable from the pre-fix behaviour (no FASE-Deferred envelope,
 /// so no CPDT optimizer-moment precision), so a bad window has to say so.
-/// Each spelling reaches the refusal by a different route — zero and the
-/// negation are the value check, the float and the string are the literal
-/// check — and a fixture whose window is simply ignored would pass none.
+///
+/// The refusal is a single match arm — `IntLiteral(n) if n >= 1` — with two
+/// ways to miss it, and the four spellings below do NOT split evenly across
+/// them. In EXPRESSION position the parser never folds a sign into the
+/// literal (only pattern position does), so `-2` is a `UnaryOp::Neg` wrapping
+/// `2` and misses on SHAPE, exactly as `2.5` and `"two"` do. That leaves `0`
+/// as the only witness of the VALUE half — it is the only integer literal
+/// below the bound that can be spelled at all. It is still worth feeding all
+/// four: `-2` is the likeliest thing a user actually types, and a fixture
+/// whose window were simply ignored would pass none of them.
+///
+/// `0` alone cannot distinguish `n >= 1` from an off-by-one `n > 1`, which
+/// would refuse every case here and still be wrong; the accepting side of the
+/// boundary is pinned by the companion test below.
 #[test]
 fn nsl_check_refuses_a_non_positive_or_non_literal_grad_accumulation() {
     let base = std::fs::read_to_string(fixture_path("cpkd_distill_basic.nsl")).unwrap();
@@ -174,6 +185,26 @@ fn nsl_check_refuses_a_non_positive_or_non_literal_grad_accumulation() {
             .and(predicate::str::contains("unknown distill config key").not()),
         );
     }
+}
+
+/// The accepting side of the `n >= 1` boundary, and the control that gives
+/// the refusal arm above its meaning: `grad_accumulation = 1` — the window
+/// that means "no accumulation" — must CHECK. Written `n > 1`, the guard
+/// would refuse every input the refusal test feeds it and pass that test
+/// while silently rejecting the one window a user is most likely to write
+/// explicitly.
+#[test]
+fn nsl_check_accepts_a_grad_accumulation_of_one() {
+    let base = std::fs::read_to_string(fixture_path("cpkd_distill_basic.nsl")).unwrap();
+    let src = base.replace("epochs = 1)", "epochs = 1, grad_accumulation = 1)");
+    assert_ne!(base, src, "fixture knobs not found — resync test");
+    let file = write_temp_fixture("accum_boundary_one", &src);
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("check").arg(&file);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("checked successfully"));
 }
 
 /// The accumulation window on a distill block must do what it does on a
@@ -283,13 +314,18 @@ fn distill_grad_accumulation_windows_the_optimizer_over_micro_batches() {
             "the student stopped learning at accum={accum}: {leaders:?}"
         );
         // N identical micro-batches averaged at 1/N reproduce the
-        // un-accumulated trajectory, sampled every N steps.
-        let expected: Vec<f64> = l1.iter().copied().take(leaders.len()).collect();
-        assert_eq!(
-            leaders, expected,
-            "accum={accum} window leaders diverged from the window-of-1 \
-             trajectory — the 1/N accumulation scale is wrong"
-        );
+        // un-accumulated trajectory, sampled every N steps. The accum=1 arm
+        // is EXCLUDED: there `leaders` IS `l1`, so the comparison is l1
+        // against itself and holds however wrong the scale factor is. Two
+        // arms witness this, not three.
+        if accum > 1 {
+            let expected: Vec<f64> = l1.iter().copied().take(leaders.len()).collect();
+            assert_eq!(
+                leaders, expected,
+                "accum={accum} window leaders diverged from the window-of-1 \
+                 trajectory — the 1/N accumulation scale is wrong"
+            );
+        }
     }
 }
 

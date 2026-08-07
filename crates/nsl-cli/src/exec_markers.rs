@@ -153,7 +153,11 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         ],
         "NSL_PHASE_TIMING instrumentation ran: one `fwd=/bwd=` line per \
          MICRO-batch and one `opt=` line per OPTIMIZER step, so the two counts \
-         together witness the accumulation window (stdout, not stderr)",
+         together witness the accumulation window (stdout, not stderr) — but \
+         SOURCE-AD PATH ONLY for the `fwd=/bwd=` half, which stmt.rs emits \
+         around the lowered adjoint; the tape path's backward is a single \
+         opaque nsl_tape_backward call and emits no such line, so a tape-AD \
+         run yields `opt=` lines alone and the micro-batch count is unwitnessed",
     ),
     m(
         "[tape-ad]",
