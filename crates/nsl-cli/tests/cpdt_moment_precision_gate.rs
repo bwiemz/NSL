@@ -390,6 +390,14 @@ fn the_report_caveats_the_zero_model_zero_halves() {
     cmd.current_dir(tmp.path());
     cmd.arg("build")
         .arg(fixture())
+        // -o into the temp dir. WITHOUT it `nsl build` derives the output
+        // path from the SOURCE stem, so this arm dropped a ~128 MB unstripped
+        // ELF into crates/nsl-codegen/tests/fixtures/ — extensionless, and
+        // therefore sitting among the .nsl files where `git add -A` stages it
+        // (it reached a commit once). `current_dir(tmp)` does not help,
+        // because the default is relative to the source, not the cwd.
+        .arg("-o")
+        .arg(tmp.path().join("cpdt_report_probe"))
         .arg("--source-ad")
         .arg("--weights")
         .arg(weights())

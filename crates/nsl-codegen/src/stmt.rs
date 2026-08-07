@@ -5283,9 +5283,12 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_cuda_graphs_enable", &[win])?;
         }
 
-        // CPKD: a distill block delegates here with an empty config — the
-        // student plays the `model=` role and epochs come from the distill
-        // header. (`compile_distill_block` installed the context.)
+        // CPKD: a distill block delegates here with a config carrying only
+        // the keys whose meaning is identical on both blocks — today just
+        // `grad_accumulation`, read by the loop above. The `model=` role and
+        // `epochs` deliberately do NOT travel that way: the context is their
+        // single source of truth, and a second copy is a divergence waiting
+        // for one side to be edited. (`compile_distill_block` installed it.)
         if let Some(distill) = &self.active_distill_context {
             model_sym = Some(distill.student_sym);
             epochs = distill.epochs;
