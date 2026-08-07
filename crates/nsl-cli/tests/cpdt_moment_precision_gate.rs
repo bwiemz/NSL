@@ -115,15 +115,11 @@ fn a_stale_precision_plan_refuses_rather_than_training_on_it() {
     ));
 }
 
-/// `--cpdt` without a WGGO plan used to skip planning SILENTLY — the code
-/// carried a comment asking a CLI layer to warn, and nothing did. The
-/// driver itself now says so.
-#[test]
-fn cpdt_without_wggo_warns_instead_of_silently_skipping() {
+fn cmd_without_wggo(fixture_path: PathBuf) -> Command {
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
     cmd.arg("run")
-        .arg(fixture())
+        .arg(fixture_path)
         .arg("--source-ad")
         .arg("--weights")
         .arg(weights())
@@ -131,9 +127,242 @@ fn cpdt_without_wggo_warns_instead_of_silently_skipping() {
         .arg("full")
         .arg("--cpdt-num-gpus")
         .arg("2");
-    cmd.assert().success().stderr(predicate::str::contains(
-        "[cpdt] skipped: CPDT planning requires a WGGO plan",
-    ));
+    cmd
+}
+
+/// `--cpdt` without a WGGO plan used to skip planning entirely (first
+/// silently, then — after #470 — with a "[cpdt] skipped" notice). The
+/// precision plan is a pure function of the weight map, so the skip was
+/// never necessary: the wrapper now plans WEIGHTS-ONLY on the no-pre-plan
+/// path and the moments get their designed dtypes with no WGGO plan at all.
+#[test]
+fn cpdt_without_wggo_activates_weights_only() {
+    let mut cmd = cmd_without_wggo(fixture());
+    cmd.env("NSL_PASS_TRACE", "1");
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "[cpdt] planned without a WGGO plan for this block (weights-only)",
+        ))
+        .stderr(predicate::str::contains(
+            "[cpdt] optimizer-moment precision active (CPDT per-param plan): \
+             6 moment buffer(s) in FP16 storage",
+        ))
+        // One publish (the wrapper's weights-only offer), read full by the
+        // consult AND the weights-only staleness re-check; never empty.
+        .stderr(predicate::str::contains(
+            "[pass-bus] cpdt_plan: published 1x by CPDT, read 2x full, 0x empty",
+        ))
+        // The pre-weights-only skip notice must be gone, and the channel
+        // must be healthy — the read_before_publish invariant on cpdt_plan
+        // is Enforced on the strength of exactly this path.
+        .stderr(predicate::str::contains("[cpdt] skipped").not())
+        .stderr(predicate::str::contains("DEAD OUTPUT: cpdt_plan").not())
+        .stderr(predicate::str::contains("READ BEFORE PUBLISH: cpdt_plan").not());
+}
+
+/// The weights-only path has the same staleness discipline as the pre-plan
+/// path: the moments are allocated, so a diverging re-derivation refuses.
+/// The forced-stale knob drives the arm; the needle pins WHICH refusal
+/// fired — the weights-only one, not the pre-plan-fingerprint one.
+#[test]
+fn a_stale_weights_only_plan_refuses_rather_than_training_on_it() {
+    let mut cmd = cmd_without_wggo(fixture());
+    cmd.env("NSL_CPDT_FORCE_STALE_PLAN", "1");
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing to execute a stale precision plan",
+        ))
+        .stderr(predicate::str::contains("weights-only CPDT offer"));
+}
+
+fn loop_fixture() -> PathBuf {
+    workspace_root()
+        .join("crates/nsl-codegen/tests/fixtures/cpdt_precision_fp16_loop.nsl")
+}
+
+/// The weights-only path cannot run `cpdt_sensitivity::validate` (there is
+/// no AppliedPlan to check the WeightMap against), so a checkpoint naming a
+/// DIFFERENT model used to sail through as "active: 0 moment buffer(s)" —
+/// activation with no effect, the exact shape the join defect had (this
+/// file's module doc calls it defect 2). The consult now refuses a
+/// non-empty precision plan that joins zero of the block's params.
+#[test]
+fn a_wrong_checkpoint_refuses_instead_of_activating_nothing() {
+    use safetensors::tensor::{serialize, TensorView};
+    use safetensors::Dtype;
+    use std::collections::HashMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let wrong = tmp.path().join("wrong_model.safetensors");
+    // Names that join NOTHING in the fixture's model (embed/blocks.N.w/
+    // final_norm), with values in the Medium-tier range so the plan is
+    // non-empty and carries sub-32 decisions — the maximally-misleading
+    // wrong checkpoint.
+    let mut raw: HashMap<String, Vec<u8>> = HashMap::new();
+    for name in ["foo.0.w", "foo.1.w"] {
+        raw.insert(
+            name.to_string(),
+            (0..64 * 64).flat_map(|_| 1e-4_f32.to_le_bytes()).collect(),
+        );
+    }
+    let views: HashMap<String, TensorView<'_>> = raw
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                TensorView::new(Dtype::F32, vec![64, 64], v.as_slice()).unwrap(),
+            )
+        })
+        .collect();
+    std::fs::write(&wrong, serialize(&views, &None).unwrap()).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+    cmd.arg("run")
+        .arg(fixture())
+        .arg("--source-ad")
+        .arg("--weights")
+        .arg(&wrong)
+        .arg("--cpdt")
+        .arg("full")
+        .arg("--cpdt-num-gpus")
+        .arg("2");
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "none of its parameter names join this train block's parameters",
+        ))
+        .stderr(predicate::str::contains("0 moment buffer(s)").not());
+}
+
+/// The structural case the weights-only offer exists for: a train block whose
+/// model variable is LOOP-BOUND (a `for` over a fixed model array), which the
+/// WGGO prepass cannot type — so no pre-plan can ever exist. Before the
+/// weights-only offer this printed the not-lowered notice and trained with
+/// FP32 moments; now the moments get their designed dtypes, the in-place
+/// WGGO site re-plans with the full model afterwards (the second publish),
+/// and the final-vs-final re-arbitration AGREES — empirical proof that the
+/// weights-only offer's precision equals the final plan's, which is exactly
+/// the property that makes the pre-body offer sound.
+#[test]
+fn a_loop_bound_train_block_activates_weights_only() {
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+    cmd.env("NSL_PASS_TRACE", "1");
+    cmd.arg("run")
+        .arg(loop_fixture())
+        .arg("--source-ad")
+        .arg("--wggo")
+        .arg("full")
+        .arg("--weights")
+        .arg(weights())
+        .arg("--cpdt")
+        .arg("full")
+        .arg("--cpdt-num-gpus")
+        .arg("2");
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "[cpdt] planned without a WGGO plan for this block (weights-only)",
+        ))
+        .stderr(predicate::str::contains(
+            "[cpdt] optimizer-moment precision active (CPDT per-param plan): \
+             6 moment buffer(s) in FP16 storage",
+        ))
+        // Wrapper weights-only publish + post-body full-model re-publish;
+        // consult read + re-arbitration read. A refusal here would mean the
+        // weights-only precision diverged from the final plan's — the
+        // property this arm exists to pin.
+        .stderr(predicate::str::contains(
+            "[pass-bus] cpdt_plan: published 2x by CPDT, read 2x full, 0x empty",
+        ))
+        .stderr(predicate::str::contains("DEAD OUTPUT: cpdt_plan").not())
+        .stderr(predicate::str::contains("READ BEFORE PUBLISH: cpdt_plan").not());
+}
+
+/// On the loop-bound path the forced-stale knob must produce the refusal
+/// that names the REAL cause — the weights-only offer preceding the
+/// in-place plan — not the pre-plan-fingerprint message (no pre-plan was
+/// ever offered; naming one sends the user at the wrong artifact).
+#[test]
+fn a_stale_loop_bound_plan_refuses_with_the_in_place_cause() {
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+    cmd.env("NSL_CPDT_FORCE_STALE_PLAN", "1");
+    cmd.arg("run")
+        .arg(loop_fixture())
+        .arg("--source-ad")
+        .arg("--wggo")
+        .arg("full")
+        .arg("--weights")
+        .arg(weights())
+        .arg("--cpdt")
+        .arg("full")
+        .arg("--cpdt-num-gpus")
+        .arg("2");
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing to execute a stale precision plan",
+        ))
+        .stderr(predicate::str::contains(
+            "before this block's in-place WGGO plan existed",
+        ))
+        .stderr(predicate::str::contains("graph fingerprint no longer matches").not());
+}
+
+/// Distill's synthetic train block reaches the same wrapper and gets the
+/// same weights-only offer — but its synthetic config drops
+/// `grad_accumulation`, so the FASE-Deferred envelope is absent and
+/// arbitration lowers nothing. This arm pins the current honest state:
+/// planning happens, the not-active notice says why, and nothing activates.
+/// (Forwarding grad_accumulation through the synthetic block is the
+/// recorded follow-up that would light this up.)
+#[test]
+fn a_distill_block_plans_weights_only_but_stays_fp32_without_the_envelope() {
+    let distill = workspace_root()
+        .join("crates/nsl-codegen/tests/fixtures/cpkd_distill_basic.nsl");
+    let mut cmd = cmd_without_wggo(distill);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "[cpdt] planned without a WGGO plan for this block (weights-only)",
+        ))
+        .stderr(predicate::str::contains(
+            "arbitration lowered nothing",
+        ))
+        .stderr(predicate::str::contains("optimizer-moment precision active").not());
+}
+
+/// `--cpdt-report` on a weights-only build must not present zero-model
+/// shard math as a recommendation: the ZeRO section's numbers describe an
+/// empty cost model (0.00 GB per GPU), and pre-caveat they rendered
+/// exactly like a real plan. The NOTE sits between the Mode line and the
+/// numbers it disclaims.
+#[test]
+fn the_report_caveats_the_zero_model_zero_halves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+    cmd.current_dir(tmp.path());
+    cmd.arg("build")
+        .arg(fixture())
+        .arg("--source-ad")
+        .arg("--weights")
+        .arg(weights())
+        .arg("--cpdt")
+        .arg("full")
+        .arg("--cpdt-num-gpus")
+        .arg("2")
+        .arg("--cpdt-report");
+    cmd.assert().success().stdout(
+        predicate::str::contains(
+            "NOTE: planned without a WGGO plan (weights-only).",
+        )
+        .and(predicate::str::contains("=== CPDT Training Plan ===")),
+    );
 }
 
 /// The FP16 moments must CHANGE training — activation without effect is
@@ -201,10 +430,22 @@ fn fp16_moments_change_training_rather_than_being_theater() {
 fn the_fixture_these_gates_use_exists() {
     assert!(fixture().exists(), "missing {:?}", fixture());
     assert!(weights().exists(), "missing {:?}", weights());
+    assert!(loop_fixture().exists(), "missing {:?}", loop_fixture());
     let src = std::fs::read_to_string(fixture()).unwrap();
     assert!(
         src.contains("Medium tier: blocks.1.w .. blocks.6.w"),
         "the fixture's documented tier split changed — re-derive the pinned \
          buffer count in cpdt_moment_precision_activates_through_the_driver"
+    );
+    // The loop twin must keep joining the SAME weights file: its param paths
+    // are `member.<key>` and the one-segment strip is what maps them onto
+    // the safetensors keys. A renamed loop variable is fine; a deeper
+    // nesting (two prefixes) would silently re-open defect 2's shape.
+    let loop_src = std::fs::read_to_string(loop_fixture()).unwrap();
+    assert!(
+        loop_src.contains("for member in ens.members:")
+            && loop_src.contains("train(model = member"),
+        "the loop fixture's binding shape changed — verify the param-path \
+         prefix still strips to the safetensors keys"
     );
 }

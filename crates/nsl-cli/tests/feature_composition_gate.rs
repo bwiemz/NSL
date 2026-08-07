@@ -1054,12 +1054,14 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
     // continues. The registry models refusals — RuleKind has no "advisory"
     // variant — so recording it here would overstate what is enforced.
     ("has no effect without --monitor", "advisory warning, run continues"),
-    // ADVISORY, same reasoning: --cpdt without a WGGO plan prints the skip
-    // notice and the compile SUCCEEDS (CPDT simply does not apply). This
-    // replaced a silent skip; registering it as a refusal would overstate it.
+    // ADVISORY, same reasoning: --cpdt on a block with no WGGO plan now
+    // plans weights-only; when arbitration still lowers nothing this notice
+    // says so and the compile SUCCEEDS. It replaced the pre-weights-only
+    // "CPDT planning requires a WGGO plan" skip notice (itself a replaced
+    // silent skip); registering it as a refusal would overstate it.
     (
-        "CPDT planning requires a WGGO plan",
-        "advisory skip notice, compile succeeds",
+        "arbitration lowered nothing",
+        "advisory not-active notice, compile succeeds",
     ),
     // A STALENESS refusal, not a composition rule: the flags compose fine —
     // what is refused is executing moment dtypes derived from a
