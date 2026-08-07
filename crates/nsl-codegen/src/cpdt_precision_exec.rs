@@ -86,6 +86,22 @@ fn precision_for_path<'a>(plan: &'a PrecisionPlan, path: &str) -> Option<&'a Par
 
 /// Build (m_dtype_codes, v_dtype_codes) in `param_paths` order. Each code is
 /// `DTYPE_F32` or `DTYPE_FP16`. Unmatched paths -> (F32, F32) (safe fallback).
+/// How many of this block's parameters the precision plan's names actually
+/// join (exact match or the one-segment strip). The weights-only path has
+/// no `cpdt_sensitivity::validate` (there is no AppliedPlan to check the
+/// WeightMap against), so a wrong checkpoint would otherwise sail through
+/// as "active: 0 moment buffer(s)" — activation with no effect, the exact
+/// shape the join defect had. A non-empty plan joining ZERO params is the
+/// certainly-wrong case the caller refuses on; partial joins are the
+/// documented residual gaps of `precision_for_path` and are not judged
+/// here.
+pub fn joined_param_count(plan: &PrecisionPlan, param_paths: &[String]) -> usize {
+    param_paths
+        .iter()
+        .filter(|p| precision_for_path(plan, p).is_some())
+        .count()
+}
+
 pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u16>, Vec<u16>) {
     let mut m = Vec::with_capacity(param_paths.len());
     let mut v = Vec::with_capacity(param_paths.len());

@@ -134,15 +134,34 @@ fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> b
 /// When a plan is produced, it is published to `compiler.bus.wrga_plan` for
 /// later observability (`nsl check --wrga-report`).
 /// CPDT driver bridge — mirrors `invoke_wrga_if_enabled`. Builds a `CpdtInput`
-/// from the WGGO `AppliedPlan`, the optional `@train` block (for AdamW hyper-
-/// parameters), and the cluster topology stashed on the Compiler, then stores
-/// the resulting plan on the `cpdt_plan` bus channel.
+/// from the WGGO `AppliedPlan` (when one exists), the optional `@train` block
+/// (for AdamW hyperparameters), and the cluster topology stashed on the
+/// Compiler, then stores the resulting plan on the `cpdt_plan` bus channel.
+///
+/// `applied_plan: None` is the weights-only path: the precision plan — the
+/// only CPDT product the moment consult reads — is a pure function of the
+/// WeightMap (`cpdt::run` step 4 never touches the applied plan), so blocks
+/// that get no WGGO plan (distill's synthetic train block, loop-bound train
+/// blocks) can still type their optimizer moments from CPDT. The plan-derived
+/// inputs degrade explicitly: the ZeRO/comm halves see an empty cost model,
+/// the shard recommendation is absent, and the weight-map/plan cross-check
+/// has no layers to check.
 ///
 /// No-op when `compiler.cpdt_mode == CpdtMode::Off` or when no cluster is
 /// configured.
+/// The staleness-refusal test knob, parsed in ONE place: both the
+/// pre-plan-path re-arbitration and the weights-only re-check honor it,
+/// and a drifted parse between the two arms would make one refusal
+/// gate-testable and the other silently not.
+fn cpdt_forced_stale_plan() -> bool {
+    std::env::var("NSL_CPDT_FORCE_STALE_PLAN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 pub(crate) fn invoke_cpdt_if_enabled(
     compiler: &mut crate::compiler::Compiler,
-    applied_plan: &crate::wggo_apply::AppliedPlan,
+    applied_plan: Option<&crate::wggo_apply::AppliedPlan>,
     train_block: Option<&nsl_ast::block::TrainBlock>,
 ) {
     // Experimental subsystem (CPDT). Compiled in by default; a build that opts
@@ -167,8 +186,15 @@ pub(crate) fn invoke_cpdt_if_enabled(
         return;
     };
 
-    let overrides = WggoOverrides::from_applied(applied_plan);
-    let mut model = ModelSize::from_applied_plan(applied_plan);
+    // Weights-only path: an absent plan contributes an empty override set and
+    // an empty cost model. `ModelSize::from_applied_plan` on the default
+    // (layerless) plan yields empty per-layer vectors, which every consumer
+    // treats as a zero-size model rather than an error.
+    let overrides = applied_plan.map(WggoOverrides::from_applied);
+    let mut model = match applied_plan {
+        Some(p) => ModelSize::from_applied_plan(p),
+        None => ModelSize::from_applied_plan(&crate::wggo_apply::AppliedPlan::default()),
+    };
     // Cost-model audit finding 3: tell the ZeRO evaluator whether
     // @checkpoint(policy=...) activation checkpointing is active for this
     // compile (non-empty checkpoint_policies map). Without it the evaluator
@@ -217,9 +243,12 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // entirely" at plan-time rather than letting CPDT produce corrupt tier
     // assignments for downstream consumers. See
     // docs/superpowers/specs/2026-04-20-cpdt-validate-body-design.md.
-    if let Some(wm) = weight_map_ref {
+    // On the weights-only path there is no plan to validate the WeightMap
+    // against — `validate` iterates the plan's layers, so an empty plan would
+    // vacuously pass; skipping is the same answer stated honestly.
+    if let (Some(wm), Some(plan_for_validation)) = (weight_map_ref, applied_plan) {
         if compiler.cpdt_mode == CpdtMode::Full {
-            if let Err(e) = crate::cpdt_sensitivity::validate(wm, applied_plan) {
+            if let Err(e) = crate::cpdt_sensitivity::validate(wm, plan_for_validation) {
                 // KNOWN LIMIT: on the pre-plan offer (compile_train_block),
                 // `applied_plan` is the pre-pass's — a plan the fingerprint
                 // check has not yet accepted. A checkpoint that would
@@ -251,10 +280,38 @@ pub(crate) fn invoke_cpdt_if_enabled(
         moe_roofline_slack: 0.0,
         expert_cfg: ExpertConfig::default(),
         joint_cfg: JointConfig::default(),
-        wggo_recommended_shard: overrides.min_shard_factor(),
+        wggo_recommended_shard: overrides.as_ref().and_then(|o| o.min_shard_factor()),
     };
 
-    let plan = cpdt_run(input);
+    let mut plan = cpdt_run(input);
+    plan.planned_without_wggo = applied_plan.is_none();
+
+    // Say which capacity CPDT planned in. The precision half, when one was
+    // built at all, is fully valid (it never reads the applied plan); the
+    // ZeRO/comm halves ran over an empty cost model and their numbers
+    // describe a zero-size model. Do not claim a weight-derived precision
+    // plan on configurations that build none (zero_only mode, or the
+    // @cpdt(weight_aware=false) opt-out) — the review caught the first
+    // wording overclaiming exactly that.
+    if applied_plan.is_none() {
+        if compiler.cpdt_mode == CpdtMode::Full && weights_present {
+            eprintln!(
+                "[cpdt] planned without a WGGO plan for this block \
+                 (weights-only): optimizer-moment precision derives from \
+                 the weight map; the ZeRO/comm halves saw an empty cost \
+                 model."
+            );
+        } else {
+            eprintln!(
+                "[cpdt] planned without a WGGO plan for this block: the \
+                 ZeRO/comm halves saw an empty cost model, and this \
+                 configuration builds no per-param precision plan (mode \
+                 {} / weight-aware {}).",
+                compiler.cpdt_mode.as_str(),
+                compiler.cpdt_weight_aware,
+            );
+        }
+    }
 
     // Tier-agreement diagnostic requires a populated precision plan, which
     // cpdt::run only builds under CpdtMode::Full. Under ZeroOnly the precision
@@ -4987,6 +5044,15 @@ impl Compiler<'_> {
                      pipelined train path (@pipeline). Drop one",
                 ));
             }
+            // The pipelined path returns before the pre-plan/weights-only
+            // offer below, so clear the channels it will never install —
+            // the enforcement argument on cpdt_plan ("every consult read
+            // follows a same-block publish") must not rest on the accident
+            // that this path has no consult today; a stale previous block's
+            // plan surviving into it would be exactly the leak the wrapper
+            // exists to prevent.
+            self.bus.clear_wggo_overrides();
+            self.bus.clear_cpdt_plan();
             return self.compile_train_block_pipelined(
                 builder,
                 state,
@@ -5053,15 +5119,25 @@ impl Compiler<'_> {
                 // Speculative in exactly the way the overrides install is;
                 // the planning site refuses if the fingerprint rejects this
                 // pre-plan and the consumed moment dtypes no longer match.
-                crate::stmt::invoke_cpdt_if_enabled(self, &applied, Some(train));
+                crate::stmt::invoke_cpdt_if_enabled(self, Some(&applied), Some(train));
             }
             // Explicitly cleared, never a previous block's leftovers — the
             // pre-restructure stale-leak this site exists to prevent. The
             // cpdt_plan clear closes the same leak one channel over: block
             // 2's moment consult must not consume block 1's plan.
+            //
+            // Then offer CPDT weights-only: the precision plan — the only
+            // CPDT product the moment consult reads — never reads the
+            // applied plan, so a block with no pre-plan (distill's synthetic
+            // train block, loop-bound train blocks) still gets its moments
+            // typed from the weight map instead of silently staying FP32.
+            // The post-body site re-arbitrates against the final bus state
+            // and refuses on divergence, exactly as it does for the
+            // speculative pre-plan offer above.
             None => {
                 self.bus.clear_wggo_overrides();
                 self.bus.clear_cpdt_plan();
+                crate::stmt::invoke_cpdt_if_enabled(self, None, Some(train));
             }
         }
         let result =
@@ -5076,7 +5152,21 @@ impl Compiler<'_> {
             self.arena_placements.clear();
             let _ = self.compile_call_by_name(builder, "nsl_arena_destroy", &[]);
         }
-        result
+        result?;
+        // Item 2 step 6: the ordering decision, enforced. Every pass on a
+        // declared InvocationOrdered edge (CSHA, WRGA — both invoked inside
+        // the inner function) has run by now if it is going to, so the
+        // per-compile evidence is complete here and the check is decidable.
+        // The manager's view is THIS compile's epoch, which is what makes a
+        // refusal sound where the process-scoped advisory could not be (a
+        // multi-module build interleaves compiles; see pass_manager.rs).
+        // This single-exit wrapper is the enforcement point for the same
+        // reason it hosts the fused-CE save/restore: every early-return path
+        // of the inner function funnels through it.
+        self.passes
+            .enforce_dependency_order()
+            .map_err(CodegenError::new)?;
+        Ok(())
     }
 
     /// CFTP v10 (item 3): pulled out so `compile_train_block` can wrap it
@@ -5828,6 +5918,17 @@ impl Compiler<'_> {
                      partitioning)",
                 )));
             }
+            // Item 11: refuse rather than silently ignore — stages 1/2 never
+            // shard parameters, so the flag would be inert (the
+            // declared-but-inert class the composition registry exists to
+            // kill).
+            if s != 3 && self.features.zero_elementwise {
+                return Err(CodegenError::new(format!(
+                    "--zero-elementwise requires --zero-stage 3 (got stage \
+                     {s}): stages 1/2 shard optimizer state and gradients, \
+                     never parameters — there is nothing to slice",
+                )));
+            }
             if s == 3 && !(csla_active && self.compile_options.weight_stream) {
                 return Err(CodegenError::new(
                     "--zero-stage 3 requires --layerwise-accum --weight-stream \
@@ -5844,6 +5945,22 @@ impl Compiler<'_> {
                      host-resident moments x owner-gated sharded updates is an \
                      untested composition (deferral-must-refuse). Drop one",
                 ));
+            }
+            // Item 11: elementwise slices are stepped by the fused-AdamW
+            // kernel on every rank — Muon's Newton-Schulz needs the WHOLE
+            // matrix (gather-before-NS is the documented follow-up), and
+            // SGD/Lion have no fused elementwise twin yet.
+            if s == 3
+                && self.features.zero_elementwise
+                && !matches!(optimizer_name.as_str(), "adamw" | "adam")
+            {
+                return Err(CodegenError::new(format!(
+                    "--zero-elementwise requires the AdamW/Adam optimizer \
+                     (train block uses '{optimizer_name}'): every rank steps \
+                     its 1/ws slice with the fused-AdamW kernel, and Muon's \
+                     Newton-Schulz needs whole matrices. Drop \
+                     --zero-elementwise, or switch the optimizer",
+                )));
             }
             // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
             // The all-reduce is emitted BEFORE the Deferred dispatch, but
@@ -6134,6 +6251,34 @@ impl Compiler<'_> {
                     .unwrap_or(false);
                 let cpdt_lists = if active {
                     let plan = plan.unwrap();
+                    // Wrong-checkpoint backstop (review finding on the
+                    // weights-only path): `cpdt_sensitivity::validate` needs
+                    // an AppliedPlan and so cannot run when the offer was
+                    // weights-only — a checkpoint naming a DIFFERENT model
+                    // would otherwise reach here and report "active: 0
+                    // moment buffer(s)", activation with no effect, the
+                    // exact shape the join defect had. A non-empty
+                    // precision plan whose names join ZERO of this block's
+                    // params is certainly wrong; refuse it. (Partial joins
+                    // are the join's documented residual gaps and are not
+                    // judged here; the WGGO-path validate, when it runs,
+                    // still checks the stronger every-layer property.)
+                    if crate::cpdt_precision_exec::joined_param_count(
+                        &plan.precision,
+                        &param_paths,
+                    ) == 0
+                    {
+                        return Err(CodegenError::new(
+                            "--cpdt full derived a per-param precision plan \
+                             from the weight map, but none of its parameter \
+                             names join this train block's parameters — \
+                             either the weight file describes a different \
+                             model, or the parameter paths nest deeper than \
+                             the join's one-segment strip accommodates (a \
+                             recorded join limitation). Pass the checkpoint \
+                             for THIS model, or drop --cpdt.",
+                        ));
+                    }
                     Some(crate::cpdt_precision_exec::build_dtype_lists(
                         &plan.precision,
                         &param_paths,
@@ -8319,14 +8464,21 @@ impl Compiler<'_> {
                             }
                             self.bus.publish_csha_bridge(bridge_out);
                             for d in diags { eprintln!("warning: {d}"); }
-                            // A.2.1d: record the Wengert op indices CSHA
-                            // has claimed across all boundary chains so
+                            // A.2.1d: record the Wengert OpIds CSHA has
+                            // claimed across all boundary chains so
                             // downstream passes (A.2.2 RMSNorm prologue,
                             // A.2.3 matmul projection, A.2.4 RoPE
                             // epilogue) can ask `is_csha_claimed(op)`
-                            // before emitting a redundant launch.
+                            // before emitting a redundant launch. The list
+                            // argument is the id-space conversion boundary:
+                            // chain fields are positions in the scanned
+                            // list, and positions stop equaling ids the
+                            // moment any earlier prune deleted an op.
                             self.bus.publish_csha_claimed_ops(
-                                crate::csha_apply::collect_claimed_ops(&plan),
+                                crate::csha_apply::collect_claimed_ops(
+                                    &plan,
+                                    extractor.wengert_list(),
+                                ),
                             );
                             // T7.1 / Gap D.1: build the chain-level dispatch
                             // map for the AD reverse walk. Gap D.1 passes the
@@ -8491,7 +8643,7 @@ impl Compiler<'_> {
                 // silently training with FP32 moments.
                 if let Some(ref applied) = wggo_applied {
                     if !wggo_preplan_offered || wggo_preplan_was_rejected {
-                        crate::stmt::invoke_cpdt_if_enabled(self, applied, Some(train));
+                        crate::stmt::invoke_cpdt_if_enabled(self, Some(applied), Some(train));
                     }
                     // Re-arbitrate what the moments WOULD be typed as under
                     // the CURRENT plan and overrides — the same pipeline the
@@ -8552,14 +8704,21 @@ impl Compiler<'_> {
                     // NSL_WGGO_FORCE_STALE_TABLE: force the divergence arm so
                     // the refusal is gate-testable without engineering a real
                     // fingerprint drift.
-                    let forced_stale_plan = std::env::var("NSL_CPDT_FORCE_STALE_PLAN")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
+                    let forced_stale_plan = crate::stmt::cpdt_forced_stale_plan();
                     match (&cpdt_moment_lists_consumed, &fresh_lists) {
                         (Some(consumed), fresh)
                             if fresh.as_ref() != Some(consumed) || forced_stale_plan =>
                         {
-                            return Err(CodegenError::new(
+                            // Two honest causes, one conservative outcome. The
+                            // moments are allocated; their dtypes cannot be
+                            // re-derived, so a divergent final arbitration can
+                            // only refuse. But WHICH offer went stale differs:
+                            // a fingerprint-rejected pre-plan, or — on a block
+                            // that never had one — the weights-only offer made
+                            // before this block's in-place WGGO plan (and its
+                            // moment-bit decisions) existed. Naming the wrong
+                            // one sends the user at the wrong artifact.
+                            return Err(CodegenError::new(if wggo_preplan_offered {
                                 "the optimizer moments were allocated from \
                                  dtype decisions derived from a WGGO pre-plan \
                                  whose graph fingerprint no longer matches, \
@@ -8568,27 +8727,52 @@ impl Compiler<'_> {
                                  refusing to execute a stale precision plan. \
                                  Recompile so the pre-plan regenerates against \
                                  the current graph, or drop --cpdt / \
-                                 --wggo-moment-precision for this block.",
-                            ));
+                                 --wggo-moment-precision for this block."
+                            } else {
+                                // Remedy check (review finding 3): the two
+                                // advised here are each FOLLOWABLE — dropping
+                                // --wggo removes the in-place plan so the
+                                // weights-only offer IS the final
+                                // arbitration, and dropping --cpdt removes
+                                // the offer. Do NOT advise dropping
+                                // --wggo-moment-precision: without it a real
+                                // divergence arbitrates to NotLoweredNoOptIn
+                                // (fresh = None ≠ consumed), so that advice
+                                // could never resolve the refusal.
+                                "the optimizer moments were typed from the \
+                                 weights-only CPDT offer made before this \
+                                 block's in-place WGGO plan existed, and \
+                                 re-arbitrating under the final plan (which \
+                                 now sees WGGO's moment-bit decisions) \
+                                 DISAGREES with the allocated moment dtypes — \
+                                 refusing to execute a stale precision plan. \
+                                 This block's precision cannot be settled \
+                                 before its in-place WGGO plan exists: drop \
+                                 --wggo so the weights-only offer is the \
+                                 final arbitration, or drop --cpdt."
+                            }));
                         }
                         (None, Some(_)) => {
                             // ROUTINELY reachable, not hypothetical: distill
                             // blocks and loop-bound train blocks get no
                             // pre-plan (the prepass walks only plain train
-                            // blocks), so on those paths CPDT-sourced moment
-                            // precision is structurally unavailable — the
-                            // original wart survives there, now loud instead
-                            // of silent.
+                            // blocks). CPDT-sourced precision now reaches them
+                            // through the weights-only pre-body offer, but
+                            // WGGO-SOURCED moment bits still cannot: the
+                            // in-place plan is born at this site, after the
+                            // moments were allocated. That residual gap is
+                            // what this arm reports.
                             eprintln!(
-                                "[cpdt] optimizer-moment precision NOT \
-                                 lowered: the plan arrived after the moments \
-                                 were allocated (no usable WGGO pre-plan for \
-                                 this block). Moments stay FP32."
+                                "[cpdt] optimizer-moment precision NOT fully \
+                                 lowered: WGGO's in-place plan (and its \
+                                 moment-bit decisions) arrived after the \
+                                 moments were allocated (no usable WGGO \
+                                 pre-plan for this block). Moments stay FP32."
                             );
                         }
                         _ => {}
                     }
-                } else if cpdt_moment_lists_consumed.is_some() {
+                } else if cpdt_moment_lists_consumed.is_some() && wggo_preplan_offered {
                     // The hole a review closed: the pre-plan was offered, the
                     // moments were typed from it, the fingerprint rejected it
                     // — and the in-place replan itself returned None (scorer
@@ -8606,18 +8790,104 @@ impl Compiler<'_> {
                          pre-plan regenerates against the current graph, or \
                          drop --cpdt for this block.",
                     ));
+                } else if let Some(ref consumed) = cpdt_moment_lists_consumed {
+                    // The weights-only path: no WGGO plan ever existed for
+                    // this block (no pre-plan, and the in-place site produced
+                    // none), and the moments were typed from the pre-body
+                    // weights-only CPDT offer. Nothing has re-planned since,
+                    // so this normally matches by construction — but the
+                    // moments are allocated, so the same final-vs-final
+                    // discipline applies as on the pre-plan path: re-derive
+                    // from the current bus state and refuse on divergence
+                    // rather than assume it.
+                    let fresh_weights_only: Option<(Vec<u16>, Vec<u16>)> = {
+                        use crate::cpdt_precision_exec::{
+                            arbitrate_moment_precision, MomentPrecisionArbitration as MPA,
+                        };
+                        let fresh_cpdt = self
+                            .bus
+                            .cpdt_plan()
+                            .filter(|p| {
+                                crate::cpdt_precision_exec::precision_active(
+                                    matches!(p.mode, crate::cpdt::CpdtMode::Full),
+                                    !p.precision.params.is_empty(),
+                                    true,
+                                    fase_deferred,
+                                    true,
+                                )
+                            })
+                            .map(|p| {
+                                crate::cpdt_precision_exec::build_dtype_lists(
+                                    &p.precision,
+                                    &param_paths,
+                                )
+                            });
+                        match arbitrate_moment_precision(
+                            None,
+                            fresh_cpdt,
+                            self.compile_options.wggo.moment_precision,
+                        ) {
+                            MPA::Merged(m, v) | MPA::WggoOnly(m, v) | MPA::CpdtOnly(m, v) => {
+                                Some((m, v))
+                            }
+                            MPA::NotLoweredNoOptIn | MPA::Inactive => None,
+                        }
+                    };
+                    let forced_stale_plan = crate::stmt::cpdt_forced_stale_plan();
+                    if fresh_weights_only.as_ref() != Some(consumed) || forced_stale_plan {
+                        return Err(CodegenError::new(
+                            "the optimizer moments were typed from the \
+                             weights-only CPDT offer and re-deriving that \
+                             offer from the current plan DISAGREES with the \
+                             allocated moment dtypes — refusing to execute a \
+                             stale precision plan. Recompile, or drop --cpdt \
+                             for this block.",
+                        ));
+                    }
                 } else if self.cpdt_mode != crate::cpdt::CpdtMode::Off
                     && self.cpdt_cluster.is_some()
                 {
-                    // The silent-skip case the previous NOTE asked a CLI
-                    // layer to surface: CPDT was requested, its cluster is
-                    // configured, and it will never run because WGGO
-                    // produced no plan for this block.
-                    eprintln!(
-                        "[cpdt] skipped: CPDT planning requires a WGGO plan \
-                         and this block has none (pass --wggo full, or drop \
-                         --cpdt). No CPDT decisions apply to this block."
-                    );
+                    // CPDT was requested but nothing lowered. Name the real
+                    // provenance (review findings: the first wording said
+                    // "planned weights-only" on a path where the plan came
+                    // from a pre-plan offer, and claimed planning happened
+                    // on feature-off builds where the bridge no-ops).
+                    if !cfg!(feature = "experimental-cpdt") {
+                        eprintln!(
+                            "[cpdt] requested, but this build omits the \
+                             experimental-cpdt feature — no planning ran. \
+                             No CPDT decisions apply to this block."
+                        );
+                    } else if wggo_preplan_offered {
+                        // Reachable: pre-plan offered, fingerprint rejected,
+                        // in-place replan produced no plan, and the consult
+                        // consumed nothing (e.g. the pre-plan's moment bits
+                        // arbitrated to NotLoweredNoOptIn).
+                        eprintln!(
+                            "[cpdt] optimizer-moment precision not active \
+                             for this block (planned from the WGGO pre-plan \
+                             offer; the fingerprint rejected it and the \
+                             in-place replan produced no plan): arbitration \
+                             lowered nothing. No CPDT decisions apply to \
+                             this block."
+                        );
+                    } else {
+                        // The weights-only offer ran and arbitration
+                        // lowered nothing: empty precision plan (zero_only
+                        // mode, weight-aware opt-out, no sub-32 decisions)
+                        // or no FASE-Deferred envelope (grad accumulation
+                        // < 2). The pre-#470 wording claimed CPDT
+                        // "requires a WGGO plan", which stopped being true
+                        // when the weights-only offer landed.
+                        eprintln!(
+                            "[cpdt] optimizer-moment precision not active \
+                             for this block (planned weights-only; no WGGO \
+                             plan): arbitration lowered nothing. Check \
+                             --cpdt full, --weights, and grad accumulation \
+                             >= 2 (FASE-Deferred). No CPDT decisions apply \
+                             to this block."
+                        );
+                    }
                 }
                 // Task 6: render any override-rejected diagnostics to stderr so
                 // the Phase 3 decision explainer and the user can see which
@@ -10385,13 +10655,24 @@ impl Compiler<'_> {
                         // the flags — the duplication that let the three
                         // residency tables be populated from three separate
                         // spellings of the same intent.
+                        // Item 11: static element counts, aligned with
+                        // param_paths (0 = symbolic — derive treats it as
+                        // elementwise-ineligible).
+                        let plan_elems: Vec<u64> = (0..param_paths.len())
+                            .map(|u| {
+                                elems_by_accum.get(&(u as i64)).copied().unwrap_or(0)
+                            })
+                            .collect();
                         let plan = crate::parameter_plan::ParameterPlan::derive(
                             &param_paths,
                             &ws_streamed_sorted,
+                            &plan_elems,
                             &crate::parameter_plan::PlanFeatures {
                                 weight_stream: self.compile_options.weight_stream,
                                 param_dtype_bf16sr: self.features.param_dtype_bf16sr,
                                 zero_stage: self.features.zero_stage,
+                                zero_elementwise: self.features.zero_elementwise,
+                                world_size: self.features.world_size as u32,
                             },
                         )
                         .map_err(|e| {
@@ -10490,6 +10771,26 @@ impl Compiler<'_> {
                                 "nsl_sr_bf16_note_param",
                                 &[pw, iv],
                             )?;
+                        }
+                        // Item 11: the mark must precede the register that
+                        // carves the slice — same plan-driven ordering
+                        // discipline as the SR note above. The rc is asserted
+                        // (unlike the void SR note): a swallowed -1 here
+                        // would resurface one phase later as the elem step's
+                        // "never carved" abort, misattributing the cause.
+                        if entry.is_elementwise() {
+                            let mrc = self.compile_call_by_name(
+                                builder,
+                                "nsl_zero3_mark_elementwise",
+                                &[pw, iv],
+                            )?;
+                            let mz = builder.ins().iconst(cl_types::I64, 0);
+                            let mok = builder.ins().icmp(IntCC::Equal, mrc, mz);
+                            let mmsg = "nsl: zero3 elementwise mark failed \
+                                        (ZeRO context missing?) — aborting";
+                            self.intern_string(mmsg)?;
+                            let mmp = self.compile_string_literal(builder, mmsg)?;
+                            self.compile_call_by_name(builder, "nsl_assert", &[mok, mmp])?;
                         }
                         self.compile_call_by_name(
                             builder,
@@ -12564,6 +12865,15 @@ impl Compiler<'_> {
                 // owner gate while resident/tied params update on every rank
                 // from the identical reduced gradients.
                 zero3: Option<&std::collections::HashSet<i64>>,
+                // Item 11: the ELEMENTWISE subset of `zero3` (plan-driven).
+                // These params reduce_scatter their slots (the runtime
+                // dispatches on the mark), skip the owner gate, and step via
+                // nsl_zero3_elem_adamw_step on EVERY rank.
+                zero3_elem: Option<&std::collections::HashSet<i64>>,
+                // Item 11: the fused-AdamW scalars for the elementwise step
+                // (Some iff zero3_elem is non-empty — enforced at the
+                // dispatcher, which refuses non-AdamW recipes).
+                elem_scalars: Option<&crate::stmt_fase::FusedAdamwScalars>,
                 // P4 item 17: Some(opt_step) under --param-dtype bf16-sr.
                 sr_step: Option<Value>,
                 // Item 8: Some(recipe scalars) admits collapsing this group
@@ -12586,6 +12896,7 @@ impl Compiler<'_> {
                     // emits per param.
                     if muon.is_none()
                         && zero3.is_none()
+                        && zero3_elem.is_none()
                         && !wrap_precision
                         && !wrap_offload
                     {
@@ -12724,13 +13035,16 @@ impl Compiler<'_> {
                     } else {
                         m
                     };
+                    // Item 11: elementwise params take their own step arm —
+                    // every rank updates its slice, so no owner gate.
+                    let is_elem = zero3_elem.is_some_and(|s| s.contains(&i));
                     // P3 ZeRO-3: owner-gate the update of a SHARDED param —
                     // non-owners' gathered copies are released right after
                     // this group and refetched (post-update) from the owner
                     // next window, so skipping their update is the sharded
                     // semantic, not a divergence.
                     let z3_gate: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Block)> =
-                        if zero3.is_some_and(|s| s.contains(&i)) {
+                        if !is_elem && zero3.is_some_and(|s| s.contains(&i)) {
                             let owns =
                                 c.compile_call_by_name(builder, "nsl_zero_owns_param", &[iv])?;
                             let one = builder.ins().iconst(cl_types::I64, 1);
@@ -12744,7 +13058,46 @@ impl Compiler<'_> {
                         } else {
                             None
                         };
-                    if let Some(mc) = muon {
+                    if is_elem {
+                        // Item 11: the elementwise fused step — every rank,
+                        // its own slice, the exact fused-AdamW kernel math.
+                        // The runtime already holds the reduce_scattered
+                        // gradient slice (the reduce loop above dispatched on
+                        // the mark), so m_partial is not an argument; codegen
+                        // frees it in the shared tail like every other arm.
+                        let sc = elem_scalars.ok_or_else(|| {
+                            CodegenError::new(
+                                "elementwise group update reached without \
+                                 fused-AdamW scalars — dispatcher must thread \
+                                 elem_scalars",
+                            )
+                        })?;
+                        let lr_v = builder.ins().f64const(sc.lr);
+                        let b1_v = builder.ins().f64const(sc.beta1);
+                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+                        let b2_v = builder.ins().f64const(sc.beta2);
+                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+                        let eps_v = builder.ins().f64const(sc.eps);
+                        // The recipe's flat λ — same as the per-param loop
+                        // and the multi arm (CSLA has no AdamW group
+                        // plumbing; grad_clip is refused by the schedule).
+                        let wd_v = builder.ins().f64const(sc.wd);
+                        let rc = c.compile_call_by_name(
+                            builder,
+                            "nsl_zero3_elem_adamw_step",
+                            &[
+                                theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v,
+                                omb2_v, eps_v, wd_v, bc.0, bc.1,
+                            ],
+                        )?;
+                        let z = builder.ins().iconst(cl_types::I64, 0);
+                        let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+                        let msg =
+                            "nsl: zero3 elementwise step failed — aborting";
+                        c.intern_string(msg)?;
+                        let mp = c.compile_string_literal(builder, msg)?;
+                        c.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
+                    } else if let Some(mc) = muon {
                         // Muon separate-accumulator mode: m_partial holds the
                         // RAW window gradient sum (accum_scale forced to 1.0),
                         // exactly what the non-CSLA FullBuffer path hands
@@ -12913,9 +13266,25 @@ impl Compiler<'_> {
                         .plan
                         .entries()
                         .iter()
-                        .filter(|e| {
-                            e.sharding == crate::parameter_plan::ParamSharding::Sharded
-                        })
+                        .filter(|e| e.sharding.is_sharded())
+                        .map(|e| e.idx)
+                        .collect()
+                });
+            // Item 11: the ELEMENTWISE subset — these params skip the owner
+            // gate (every rank steps its own slice) and their group update
+            // emits nsl_zero3_elem_adamw_step instead of the stdlib call.
+            // Same single-source rule as zero3_streamed: read the plan.
+            let zero3_elem: Option<std::collections::HashSet<i64>> = self
+                .features
+                .zero_stage
+                .filter(|&s| s == 3 && self.features.zero_elementwise)
+                .map(|_| {
+                    pending
+                        .schedule
+                        .plan
+                        .entries()
+                        .iter()
+                        .filter(|e| e.is_elementwise())
                         .map(|e| e.idx)
                         .collect()
                 });
@@ -12943,6 +13312,7 @@ impl Compiler<'_> {
                             ))
                         })?;
                     let needs_sr_note = entry.needs_sr_note();
+                    let needs_elem_mark = entry.is_elementwise();
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
@@ -12952,6 +13322,23 @@ impl Compiler<'_> {
                             "nsl_sr_bf16_note_param",
                             &[pw, iv],
                         )?;
+                    }
+                    // Item 11: mark-before-register, from the same plan entry
+                    // as the pre-forward belt; rc asserted for the same
+                    // misattribution reason.
+                    if needs_elem_mark {
+                        let mrc = self.compile_call_by_name(
+                            builder,
+                            "nsl_zero3_mark_elementwise",
+                            &[pw, iv],
+                        )?;
+                        let mz = builder.ins().iconst(cl_types::I64, 0);
+                        let mok = builder.ins().icmp(IntCC::Equal, mrc, mz);
+                        let mmsg = "nsl: zero3 elementwise mark failed \
+                                    (ZeRO context missing?) — aborting";
+                        self.intern_string(mmsg)?;
+                        let mmp = self.compile_string_literal(builder, mmsg)?;
+                        self.compile_call_by_name(builder, "nsl_assert", &[mok, mmp])?;
                     }
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
                 }
@@ -13081,6 +13468,39 @@ impl Compiler<'_> {
                     Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
                         &fase_plan.recipe,
                     ))
+                } else {
+                    None
+                };
+
+            // Item 11: the elementwise step re-runs the fused-AdamW math on a
+            // slice, so the update program must BE fused-AdamW-shaped. The
+            // optimizer-name refusal happened at setup; this is the belt for
+            // a recipe that drifted from the name (e.g. an adam variant
+            // emit_final_step no longer matches).
+            let zero3_elem_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
+                if zero3_elem.as_ref().is_some_and(|s| !s.is_empty()) {
+                    if wrap_precision || self.compile_options.training_reference {
+                        return Err(CodegenError::new(
+                            "--zero-elementwise does not compose with a CPDT \
+                             reduced-precision moment plan or \
+                             --training-reference: the elementwise step is the \
+                             fused f32 kernel on a slice, which those modes \
+                             replace. Drop the conflicting option",
+                        ));
+                    }
+                    let sc = Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
+                        &fase_plan.recipe,
+                    ));
+                    if sc.is_none() {
+                        return Err(CodegenError::new(
+                            "--zero-elementwise requires the fused-AdamW update \
+                             program (the elementwise step IS that math on a \
+                             slice) — this train block's optimizer recipe does \
+                             not match it. Use AdamW/Adam, or drop \
+                             --zero-elementwise",
+                        ));
+                    }
+                    sc
                 } else {
                     None
                 };
@@ -13749,6 +14169,8 @@ impl Compiler<'_> {
                     self.compile_options.optim_state_offload,
                     muon_csla_ctx.as_ref(),
                     zero3_streamed.as_ref(),
+                    zero3_elem.as_ref(),
+                    zero3_elem_scalars.as_ref(),
                     Some(opt_step),
                     csla_multi_scalars.as_ref(),
                     &layer_group[ri],
@@ -13824,6 +14246,8 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
                 muon_csla_ctx.as_ref(),
                 zero3_streamed.as_ref(),
+                zero3_elem.as_ref(),
+                zero3_elem_scalars.as_ref(),
                 Some(opt_step),
                 csla_multi_scalars.as_ref(),
                 global_group,

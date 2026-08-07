@@ -125,6 +125,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
     // ── clap-enforced (parse time; must match in BuildArgs AND RunArgs) ────
     // Item 10: the pin is meaningless without a DB to pin.
     clap_rule("--autotune-db-sha256", RuleKind::Requires, "autotune_db"),
+    clap_rule("--zero-elementwise", RuleKind::Requires, "zero_stage"),
     clap_rule("--checkpoint-selective", RuleKind::Requires, "checkpoint_blocks"),
     clap_rule("--checkpoint-budget-mib", RuleKind::Requires, "checkpoint_blocks"),
     clap_rule("--checkpoint-stride", RuleKind::Requires, "checkpoint_blocks"),
@@ -232,6 +233,28 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--wggo",
         STMT,
         "Drop --wggo mode overrides or --zero-stage",
+    ),
+    // ── Elementwise ZeRO-3 (item 11, `--zero-elementwise`) ─────────────────
+    src_rule(
+        "--zero-elementwise",
+        RuleKind::Requires,
+        "--zero-stage 3",
+        STMT,
+        "--zero-elementwise requires --zero-stage 3",
+    ),
+    src_rule(
+        "--zero-elementwise",
+        RuleKind::Requires,
+        "AdamW/Adam optimizer",
+        STMT,
+        "--zero-elementwise requires the AdamW/Adam optimizer",
+    ),
+    src_rule(
+        "--zero-elementwise",
+        RuleKind::Conflicts,
+        "--training-reference",
+        STMT,
+        "--zero-elementwise does not compose with a CPDT reduced-precision moment plan or --training-reference",
     ),
     // ── SR-BF16 (`--param-dtype bf16-sr`) envelope ─────────────────────────
     src_rule(

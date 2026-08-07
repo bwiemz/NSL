@@ -636,6 +636,15 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) zero_stage: Option<u32>,
 
+        /// Item 11: elementwise 1/ws parameter sharding under --zero-stage 3.
+        /// Eligible streamed params (static numel divisible by --devices)
+        /// live as per-rank slices: all_gather materializes the layer
+        /// window, gradients reduce_scatter, and every rank runs the fused
+        /// AdamW step on its own slice. Ineligible params stay
+        /// tensor-granular. AdamW/Adam only (Muon needs whole matrices).
+        #[arg(long, requires = "zero_stage")]
+        pub(crate) zero_elementwise: bool,
+
         /// M46: Enable deterministic mode (compile-time non-determinism detection)
         #[arg(long)]
         pub(crate) deterministic: bool,
@@ -1221,6 +1230,11 @@ pub(crate) struct RunArgs {
         /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
         #[arg(long)]
         pub(crate) zero_stage: Option<u32>,
+
+        /// Item 11: elementwise 1/ws parameter sharding under --zero-stage 3
+        /// (see `nsl build --help` for the full description).
+        #[arg(long, requires = "zero_stage")]
+        pub(crate) zero_elementwise: bool,
 
         /// M53: Enable WCET analysis for @real_time functions
         #[arg(long)]

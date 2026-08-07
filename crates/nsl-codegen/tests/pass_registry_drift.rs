@@ -689,6 +689,12 @@ const NOT_A_PASS: &[(&str, &str)] = &[
         "the typed inter-pass channels (roadmap item 2 step 4) — carries what \
          passes produce for each other, is not itself a pass",
     ),
+    (
+        "pass_manager",
+        "the per-compile ordering authority (roadmap item 2 step 6) — judges \
+         the driver's invocation order against the bus's declared edges, is \
+         not a stage in the pipeline",
+    ),
     ("pass_registry", "this registry"),
     (
         "pass_trace",

@@ -486,6 +486,9 @@ pub struct FeatureConfigs {
     pub parallelism_config: Option<crate::pipeline::ParallelismConfig>,
     /// M43: ZeRO optimizer sharding stage.
     pub zero_stage: Option<u8>,
+    /// Item 11: elementwise 1/ws parameter sharding under stage 3
+    /// (`--zero-elementwise`).
+    pub zero_elementwise: bool,
     /// P4 item 17: SR-BF16 authoritative weights (`--param-dtype bf16-sr`).
     pub param_dtype_bf16sr: bool,
     /// P4 item 18 rung 2: BF16 Muon momentum (`--muon-state-dtype bf16`).
@@ -600,6 +603,7 @@ impl FeatureConfigs {
             pipeline_config: None,
             parallelism_config: None,
             zero_stage: options.zero_stage,
+            zero_elementwise: options.zero_elementwise,
             param_dtype_bf16sr: options.param_dtype_bf16sr,
             muon_state_bf16: options.muon_state_bf16,
             moe_configs: HashMap::new(),
@@ -659,6 +663,16 @@ pub struct Compiler<'a> {
     /// its header for why privacy rather than convention, and for what the
     /// counters catch.
     pub bus: crate::pass_bus::PassBus,
+
+    /// The per-compile pass-ordering authority (roadmap item 2, step 6).
+    /// Constructing it anchors this compile's epoch, which every
+    /// `pass_trace::record` stamps — so `passes.per_compile_trace()` is THIS
+    /// compile's invocation history and the declared dependency edges become
+    /// enforceable per compile instead of advisory per process. The
+    /// train-block wrapper consults `passes.enforce_dependency_order()` at
+    /// its single exit. Dropped with the Compiler, restoring the previous
+    /// epoch (RAII, so nested compiles cannot cross-attribute).
+    pub passes: crate::pass_manager::PassManager,
 
     // ── Interprocedural analyses ─────────────────────────────────────
     /// Parameter escape facts for every function and model method with a
@@ -1160,6 +1174,7 @@ impl<'a> Compiler<'a> {
             func_index: 0,
             next_cuda_graph_region_id: 0,
             bus: crate::pass_bus::PassBus::default(),
+            passes: crate::pass_manager::PassManager::begin(),
             registry: FunctionRegistry::new(),
             escape: crate::escape::EscapeAnalysis::disabled(),
             types: TypeRegistry::new(),

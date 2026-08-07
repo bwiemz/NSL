@@ -39,6 +39,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             nan_analysis,
             distribute: _distribute,
             zero_stage,
+            zero_elementwise,
             deterministic: _deterministic,
             seed,
             dead_weight_threshold,
@@ -470,6 +471,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 linear_types_enabled: linear_types,
                 ownership_info: std::collections::HashMap::new(), // populated by loader
                 zero_stage: zero_stage.map(|s| s as u8),
+                zero_elementwise,
                 optim_state_offload,
                 checkpoint_blocks,
                 checkpoint_selective,

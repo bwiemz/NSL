@@ -3291,7 +3291,15 @@ impl<'a> WengertExtractor<'a> {
         // so a chain op cannot outlive it. A second scan would read as an
         // independent backstop while being unreachable — which is worse than
         // no backstop, because it invites the next reader to believe two
-        // checks exist.
+        // checks exist. (The live-consumer refusal lives in the PRE-check,
+        // with the same consumer-naming diagnostic.)
+        //
+        // Commit-point belt (see WengertList::assert_unique_op_ids): this
+        // prune deletes WITHOUT renumbering — deliberately, since id-space
+        // references depend on id stability — and it runs BEFORE every
+        // scan-and-claim pass, so from here on `op.id != index` and only
+        // ids may outlive a scan.
+        list.assert_unique_op_ids("fused-LCE dead-chain prune");
         Ok(removed)
     }
 

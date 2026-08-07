@@ -596,6 +596,45 @@ pub enum CompareKind {
 }
 
 /// Linearized forward computation graph.
+///
+/// # Reference discipline (item 2: tape-mediated ordering)
+///
+/// Three kinds of reference into this list coexist, with different
+/// staleness rules, and passes MUST know which they hold:
+///
+/// * **`VarId`** — stable. No pass renumbers VarIds; safe to hold across
+///   any mutation.
+/// * **`OpId`** — stable across DELETION (the in-place mutators delete
+///   without renumbering, precisely so id-space references survive), and
+///   unique as long as fresh ids are minted ABOVE the maximum
+///   ([`WengertList::fresh_op_id`] — minting from `ops.len()` after a
+///   deletion collides with surviving ids, which is how a claim table can
+///   silently route an appended op through a fused backward).
+/// * **Positional index** — valid only at capture time. Extraction pushes
+///   ops with `id == index`, and every in-place deletion breaks that
+///   equality for the tail, so a positional reference may only be consumed
+///   against the same list state it was captured from. A position that must
+///   OUTLIVE the scan must be converted to the op's `id` at the boundary
+///   (`csha_apply` converts its boundary-chain positions exactly there).
+///
+/// The passes that mutate a tape and the reference kinds each pass's plan
+/// captures are DECLARED per pass in `pass_registry.rs` (`tape:` field) and
+/// drift-checked; every in-place structural mutator re-asserts id
+/// uniqueness at its commit point — see [`WengertList::assert_unique_op_ids`].
+///
+/// ## Ids are unique PER LIST, not per compile
+///
+/// The primal and the adjoint are separate `WengertList` instances with
+/// independent id spaces: the adjoint rewriters renumber their list back
+/// to `id == index` after every splice. A table keyed by PRIMAL ids that
+/// is consulted while lowering walks BOTH lists (the CSHA claim tables,
+/// via `compile_wengert_ops`) therefore relies on the consulting arm
+/// distinguishing which list an op came from — an adjoint op whose
+/// renumbered id collides with a claimed primal id (e.g. a CCR recompute
+/// clone of an unclaimed SDPA) is a known narrow alias hazard, named here
+/// so the discipline is complete rather than silently per-list. It
+/// predates this header; closing it needs either list-tagged claim keys
+/// or an adjoint id space disjoint from the primal's.
 #[derive(Debug, Clone)]
 pub struct WengertList {
     pub ops: Vec<WengertOp>,
@@ -606,6 +645,33 @@ pub struct WengertList {
 }
 
 impl WengertList {
+    /// A fresh `OpId` strictly above every id currently in the list.
+    ///
+    /// NOT `ops.len()`: after any deletion the list is shorter than its
+    /// maximum id, so len-minted ids collide with surviving ops — and the
+    /// id-keyed claim tables (`csha_backward_claims`, CCR's exemption set)
+    /// would silently match the new op.
+    pub fn fresh_op_id(&self) -> OpId {
+        self.ops.iter().map(|o| o.id).max().map_or(0, |m| m + 1)
+    }
+
+    /// Assert every `op.id` is unique — the property that makes id-space
+    /// references sound across deletions. `context` names the mutation
+    /// site for the panic message. A real `assert!`, not `debug_assert!`
+    /// (CI ships release builds), and O(n) with a seen-set — trivial next
+    /// to codegen itself.
+    pub fn assert_unique_op_ids(&self, context: &str) {
+        let mut seen = std::collections::HashSet::with_capacity(self.ops.len());
+        for op in &self.ops {
+            assert!(
+                seen.insert(op.id),
+                "duplicate Wengert OpId {} after {context} — id-space \
+                 references (CSHA claims, CCR's exemption set) are unsound \
+                 the moment two ops share an id",
+                op.id
+            );
+        }
+    }
     pub fn defines(&self, var: VarId) -> bool {
         self.ops.iter().any(|op| op.result == var)
     }

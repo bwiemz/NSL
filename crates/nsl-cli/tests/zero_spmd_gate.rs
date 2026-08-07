@@ -542,7 +542,7 @@ fn zero_stage2_rank_aware_dp_parity() {
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", dp.stderr));
         assert!(
-            line.trim_end().ends_with("reduce_scatter=6") && line.contains("all_reduce=0 "),
+            line.contains(" reduce_scatter=6 ") && line.contains("all_reduce=0 "),
             "stage-2 collective counts wrong: {line}"
         );
     }
@@ -604,7 +604,7 @@ fn zero_stage2_two_rank_parity_reduce_scatter() {
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
         assert!(
-            line.trim_end().ends_with("reduce_scatter=6")
+            line.contains(" reduce_scatter=6 ")
                 && line.contains("all_reduce=0 ")
                 && line.contains("broadcast=12 "),
             "stage-2 collective counts wrong (want 6 scatters, 0 all_reduce, \

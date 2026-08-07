@@ -157,7 +157,7 @@ pub enum Channel {
     /// CSHA's per-layer bridge result: which layers were claimed and the
     /// `CshaExtras` each FlashAttention launch needs.
     CshaBridge,
-    /// The Wengert op indices CSHA claimed, so op lowering can skip emitting a
+    /// The Wengert OpIds CSHA claimed, so op lowering can skip emitting a
     /// redundant launch for an op the fused kernel already covers.
     CshaClaimedOps,
     /// The chain-level dispatch map the source-AD reverse walk uses to route
@@ -570,21 +570,26 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         // before the same block's publish, so CPDT-sourced moment precision
         // was structurally inert (proved: `published 1x, read 0x full, 1x
         // empty` + a DEAD OUTPUT finding on a fully-flag-enabled compile) —
-        // is FIXED by the pre-plan offer: `compile_train_block` now runs
-        // CPDT planning from the block's WGGO pre-plan before the body
-        // compiles, the same install/clear pairing as wggo_overrides. The
-        // empty-read-then-late-publish pattern remains reachable only on
-        // the NO-pre-plan path (distill and loop-bound train blocks, which
-        // the prepass does not walk) — on the rejected-fingerprint path the
-        // consult's read was FULL, rejection is decided later, and the
-        // planning site refuses on divergence rather than staying silent.
-        read_before_publish: Invariant::Exempt(
-            "reachable only where no pre-plan exists (distill and loop-bound \
-             train blocks): the late publish postdates the moment consult by \
-             construction there, and the planning site prints a not-lowered \
-             notice instead of silently training with FP32 moments the flags \
-             asked to narrow",
-        ),
+        // is FIXED by the pre-plan offer, and the residual no-pre-plan hole
+        // (distill and loop-bound train blocks, which the prepass does not
+        // walk) is closed by the weights-only offer: `compile_train_block`
+        // now publishes a plan before every body it compiles through the
+        // offer — from the block's WGGO pre-plan when one exists,
+        // weights-only otherwise. The one body that bypasses the offer,
+        // the `@pipeline` early return, CLEARS the channel instead: it has
+        // no consult today, and the clear keeps that a fact about state
+        // rather than a reliance on the absence.
+        // Enforcement argument, checked against the #466 recurrence class
+        // (multi-module builds, the profile pre-pass, multi-train-block
+        // programs, take/restore windows): the channel's only readers are
+        // the train-block consult and the post-body re-arbitrations, each
+        // of which follows its own block's wrapper publish whenever CPDT
+        // can publish at all; when CPDT is off (mode, feature, or absent
+        // cluster) no publish ever happens, and an empty read with no later
+        // publish is not READ BEFORE PUBLISH. No module epilogue reads this
+        // channel (consumers: stmt.rs only, drift-checked), and the profile
+        // pre-pass reads wrga_plan, not this.
+        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::CfiePlan,
@@ -667,7 +672,24 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
                       and the train block see no pre-computed decisions",
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
-        applied_implies_published: Invariant::Enforced,
+        // Stated as Enforced this cries wolf: "WGGO applied" conflates the
+        // producer's TWO invocation sites, and only the prepass publishes
+        // pre-plans. A block the prepass structurally cannot plan — a
+        // loop-bound model var, whose type resolves only during codegen —
+        // is planned by the IN-PLACE site, which applies rewrites while
+        // this channel legitimately stays empty; the loop-bound fixture
+        // witnessed the false SILENT DEFAULT on every fully-correct
+        // compile (found by this PR's own review — the same
+        // false-reporting class as the PHASE MISMATCH it fixed, one
+        // finding over). The real invariant would be "a prepass that
+        // PLANNED published", which the finding's evidence (pass-level
+        // Applied) cannot express.
+        applied_implies_published: Invariant::Exempt(
+            "WGGO has two invocation sites and only the prepass publishes \
+             pre-plans; the in-place replan applies on exactly the blocks \
+             the prepass cannot plan (loop-bound model vars), where empty \
+             is this channel's correct answer, not a silent default",
+        ),
         // Within one compile the ordering holds (the pre-pass fills it
         // during kernel synthesis, both readers run after, and a pre-pass
         // that produced nothing never publishes). Across module compiles it
@@ -931,7 +953,8 @@ impl PassBus {
 
     // ── CSHA claimed ops ─────────────────────────────────────────────
 
-    /// Publish the Wengert op indices CSHA claimed.
+    /// Publish the Wengert OpIds CSHA claimed (converted from boundary-chain
+    /// positions at `collect_claimed_ops` — the id-space boundary).
     ///
     /// An EMPTY set is not counted as a publish. "CSHA claimed no ops" is the
     /// absence of a claim, not a claim of nothing, and the two must not read
@@ -1277,7 +1300,21 @@ pub fn findings() -> Vec<BusFinding> {
 /// revisited; the exposure otherwise matches
 /// [`crate::pass_trace::stage_order_violation`]'s.
 pub fn dependency_order_violations() -> Vec<(&'static str, &'static str, Channel)> {
-    let seen = crate::pass_trace::observed();
+    dependency_order_violations_in(&crate::pass_trace::observed())
+}
+
+/// The shared core: `InvocationOrdered` edges inverted within `seen`, an
+/// invocation sequence in first-invocation order. Two callers, two scopes,
+/// ONE edge semantics: the process-global advisory above (its `seen` is
+/// [`crate::pass_trace::observed`], subject to the cross-compile caveat in
+/// its doc), and the per-compile ENFORCED check
+/// (`crate::pass_manager::PassManager::dependency_order_violations`, whose
+/// `seen` is one epoch's view and therefore refusable evidence). Splitting
+/// the core out is what keeps the two answers from drifting: a new edge or
+/// claim is judged identically by both.
+pub(crate) fn dependency_order_violations_in(
+    seen: &[&'static str],
+) -> Vec<(&'static str, &'static str, Channel)> {
     let pos = |p: &str| seen.iter().position(|s| *s == p);
     let mut v = Vec::new();
     for d in CHANNELS {

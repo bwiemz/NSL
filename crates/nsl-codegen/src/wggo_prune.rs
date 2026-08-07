@@ -182,6 +182,12 @@ pub fn run(
         ops_deleted += rewrite.ops_deleted;
         rewrites.push(rewrite);
     }
+    // Deletion never renumbers here (that stability is what id-space
+    // references rely on), so it cannot CREATE a duplicate — this assert is
+    // the commit-point belt every in-place structural mutator wears, so a
+    // future rewrite that mints ids cannot silently break the uniqueness
+    // the claim tables assume.
+    wengert.assert_unique_op_ids("wggo_prune::run (post-commit)");
 
     PruneRewriteResult {
         rewrites,

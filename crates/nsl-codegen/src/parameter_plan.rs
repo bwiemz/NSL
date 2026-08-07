@@ -45,7 +45,7 @@
 //! directly, which `feature_rules.rs` explicitly documents as a real caller
 //! class the clap layer does not protect.
 
-pub use nsl_runtime::param_plan::{PLAN_BF16_SR, PLAN_SHARDED, PLAN_STREAMED};
+pub use nsl_runtime::param_plan::{PLAN_BF16_SR, PLAN_ELEMENTWISE, PLAN_SHARDED, PLAN_STREAMED};
 
 /// Where a parameter lives between uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,22 @@ pub enum ParamSharding {
     /// Tensor-granular sharded (`--zero-stage 3`): the owner holds the
     /// authoritative bytes, non-owners gather per layer window.
     Sharded,
+    /// Item 11 (`--zero-elementwise`): each rank persistently holds a
+    /// contiguous 1/world_size slice; the full tensor is a window transient
+    /// reconstructed by all_gather, gradients reduce_scatter, and EVERY rank
+    /// runs the fused-AdamW step on its own slice. Eligibility (streamed,
+    /// static numel divisible by world_size) is decided here in `derive` —
+    /// ineligible streamed params fall back to `Sharded`.
+    ShardedElementwise,
+}
+
+impl ParamSharding {
+    /// Both zero-3 modes — the runtime residency table, the reduce site and
+    /// the registration redirects treat them identically; only the gather
+    /// primitive, the step dispatch and the owner gate differ.
+    pub fn is_sharded(self) -> bool {
+        matches!(self, ParamSharding::Sharded | ParamSharding::ShardedElementwise)
+    }
 }
 
 /// The plan for one parameter.
@@ -99,8 +115,11 @@ impl ParamPlanEntry {
         if self.storage == ParamStorage::Bf16Sr {
             f |= PLAN_BF16_SR;
         }
-        if self.sharding == ParamSharding::Sharded {
+        if self.sharding.is_sharded() {
             f |= PLAN_SHARDED;
+        }
+        if self.sharding == ParamSharding::ShardedElementwise {
+            f |= PLAN_ELEMENTWISE;
         }
         f
     }
@@ -110,6 +129,14 @@ impl ParamPlanEntry {
     /// an un-noted parameter, so this ordering is load-bearing.)
     pub fn needs_sr_note(&self) -> bool {
         self.storage == ParamStorage::Bf16Sr && self.residency == ParamResidency::Streamed
+    }
+
+    /// Item 11: does this parameter need `nsl_zero3_mark_elementwise` before
+    /// its first `nsl_weight_stream_register`? (The register carves the
+    /// slice, so mark-before-register is load-bearing in the same way as the
+    /// SR note.)
+    pub fn is_elementwise(&self) -> bool {
+        self.sharding == ParamSharding::ShardedElementwise
     }
 }
 
@@ -124,6 +151,13 @@ pub struct PlanFeatures {
     pub weight_stream: bool,
     pub param_dtype_bf16sr: bool,
     pub zero_stage: Option<u8>,
+    /// Item 11: `--zero-elementwise` — elementwise-shard every ELIGIBLE
+    /// streamed parameter (static numel divisible by `world_size`);
+    /// ineligible ones stay tensor-granular.
+    pub zero_elementwise: bool,
+    /// Compile-time world size (`--devices`), the shard divisor. 0 is
+    /// treated as 1 (the codegen setup emits `world_size.max(1)` too).
+    pub world_size: u32,
 }
 
 /// A plan that could not be derived, with a message in the repo's refusal
@@ -150,12 +184,34 @@ impl ParameterPlan {
     /// excludes view-rooted parameters and anything the layer grouping did
     /// not claim, so it is strictly narrower than "every parameter" even
     /// with `--weight-stream` on.
+    ///
+    /// `elems` carries each parameter's STATIC element count (0 = symbolic /
+    /// unknown), aligned with `names` — item 11's elementwise eligibility is
+    /// a divisibility fact about it. Only consulted under
+    /// `--zero-elementwise`.
     pub fn derive(
         names: &[String],
         streamed: &[i64],
+        elems: &[u64],
         f: &PlanFeatures,
     ) -> Result<Self, PlanError> {
         let sharding_on = f.zero_stage == Some(3);
+        if f.zero_elementwise && !sharding_on {
+            return Err(PlanError(
+                "--zero-elementwise requires --zero-stage 3: elementwise \
+                 slices are a refinement of the zero-3 residency backend"
+                    .into(),
+            ));
+        }
+        if f.zero_elementwise && elems.len() != names.len() {
+            return Err(PlanError(format!(
+                "--zero-elementwise: {} static element counts for {} \
+                 parameter(s) — the derivation inputs are misaligned",
+                elems.len(),
+                names.len()
+            )));
+        }
+        let ws = f.world_size.max(1) as u64;
 
         // ── Shape invariants (see the module header on scope) ──────────────
         if f.param_dtype_bf16sr && !f.weight_stream {
@@ -239,7 +295,20 @@ impl ParameterPlan {
                         ParamStorage::F32
                     },
                     sharding: if streamed && sharding_on {
-                        ParamSharding::Sharded
+                        // Item 11: elementwise where the static shape allows
+                        // an exact 1/ws split; tensor-granular otherwise
+                        // (ragged or symbolic numel). The fallback keeps the
+                        // whole streamed set sharded — the two modes coexist
+                        // in one run.
+                        let elem_ok = f.zero_elementwise
+                            && elems
+                                .get(u)
+                                .is_some_and(|&n| n > 0 && n % ws == 0);
+                        if elem_ok {
+                            ParamSharding::ShardedElementwise
+                        } else {
+                            ParamSharding::Sharded
+                        }
                     } else {
                         ParamSharding::Replicated
                     },
@@ -290,11 +359,17 @@ impl ParameterPlan {
         let sharded = self
             .entries
             .iter()
-            .filter(|e| e.sharding == ParamSharding::Sharded)
+            .filter(|e| e.sharding.is_sharded())
+            .count();
+        let elementwise = self
+            .entries
+            .iter()
+            .filter(|e| e.sharding == ParamSharding::ShardedElementwise)
             .count();
         let mut s = format!(
             "[param-plan] {total} parameter(s): {streamed} streamed \
-             ({bf16} bf16-sr, {sharded} sharded), {} resident\n",
+             ({bf16} bf16-sr, {sharded} sharded, {elementwise} elementwise), \
+             {} resident\n",
             total - streamed
         );
         let width = self
@@ -308,6 +383,7 @@ impl ParameterPlan {
             let mode = match (e.residency, e.storage, e.sharding) {
                 (ParamResidency::Resident, _, _) => "resident",
                 (_, ParamStorage::Bf16Sr, _) => "streamed bf16-sr",
+                (_, _, ParamSharding::ShardedElementwise) => "streamed sharded-elementwise",
                 (_, _, ParamSharding::Sharded) => "streamed sharded",
                 _ => "streamed",
             };
@@ -340,7 +416,7 @@ mod tests {
             weight_stream: true,
             ..Default::default()
         };
-        let p = ParameterPlan::derive(&names(4), &[1, 2], &f).unwrap();
+        let p = ParameterPlan::derive(&names(4), &[1, 2], &[], &f).unwrap();
         let res: Vec<_> = p.entries().iter().map(|e| e.residency).collect();
         assert_eq!(
             res,
@@ -370,7 +446,7 @@ mod tests {
             param_dtype_bf16sr: true,
             ..Default::default()
         };
-        let p = ParameterPlan::derive(&names(3), &[0], &f).unwrap();
+        let p = ParameterPlan::derive(&names(3), &[0], &[], &f).unwrap();
         assert_eq!(p.entries()[0].storage, ParamStorage::Bf16Sr);
         assert!(p.entries()[0].needs_sr_note());
         assert_eq!(p.entries()[1].storage, ParamStorage::F32);
@@ -389,7 +465,7 @@ mod tests {
             zero_stage: Some(stage),
             ..Default::default()
         };
-        let p3 = ParameterPlan::derive(&names(3), &[0, 1], &mk(3)).unwrap();
+        let p3 = ParameterPlan::derive(&names(3), &[0, 1], &[], &mk(3)).unwrap();
         assert_eq!(p3.entries()[0].sharding, ParamSharding::Sharded);
         assert_eq!(p3.entries()[2].sharding, ParamSharding::Replicated);
         assert_eq!(
@@ -398,12 +474,89 @@ mod tests {
         );
         // Stages 1 and 2 shard optimizer state / gradients, not parameters.
         for stage in [1, 2] {
-            let p = ParameterPlan::derive(&names(3), &[0, 1], &mk(stage)).unwrap();
+            let p = ParameterPlan::derive(&names(3), &[0, 1], &[], &mk(stage)).unwrap();
             assert!(p
                 .entries()
                 .iter()
                 .all(|e| e.sharding == ParamSharding::Replicated));
         }
+    }
+
+    /// Item 11: elementwise eligibility is a divisibility fact about the
+    /// STATIC element count — ragged and symbolic (0) params fall back to
+    /// tensor-granular, unstreamed ones stay replicated, and the flag off
+    /// means nobody is elementwise. Mixed-mode in one plan is the norm.
+    #[test]
+    fn elementwise_eligibility_is_static_divisibility_with_granular_fallback() {
+        let f = PlanFeatures {
+            weight_stream: true,
+            zero_stage: Some(3),
+            zero_elementwise: true,
+            world_size: 2,
+            ..Default::default()
+        };
+        // elems: [divisible, ragged, symbolic, divisible-but-unstreamed]
+        let p = ParameterPlan::derive(&names(4), &[0, 1, 2], &[8192, 127, 0, 64], &f).unwrap();
+        assert_eq!(p.entries()[0].sharding, ParamSharding::ShardedElementwise);
+        assert_eq!(p.entries()[1].sharding, ParamSharding::Sharded);
+        assert_eq!(p.entries()[2].sharding, ParamSharding::Sharded);
+        assert_eq!(p.entries()[3].sharding, ParamSharding::Replicated);
+        assert_eq!(
+            p.entries()[0].runtime_flags(),
+            PLAN_STREAMED | PLAN_SHARDED | PLAN_ELEMENTWISE
+        );
+        assert_eq!(
+            p.entries()[1].runtime_flags(),
+            PLAN_STREAMED | PLAN_SHARDED
+        );
+        assert!(p.entries()[0].is_elementwise());
+        assert!(!p.entries()[1].is_elementwise());
+        // The report names the mode (the GPU gate greps the runtime marker,
+        // this pins the compile-side spelling).
+        assert!(p.report().contains("streamed sharded-elementwise"), "{}", p.report());
+        assert!(p.report().contains("1 elementwise"), "{}", p.report());
+
+        // Flag off: identical inputs, nobody is elementwise.
+        let off = PlanFeatures {
+            zero_elementwise: false,
+            ..f
+        };
+        let p = ParameterPlan::derive(&names(4), &[0, 1, 2], &[8192, 127, 0, 64], &off).unwrap();
+        assert!(p.entries().iter().all(|e| !e.is_elementwise()));
+    }
+
+    /// Item 11: the flag's own shape invariants refuse loudly.
+    #[test]
+    fn elementwise_shape_invariants_refuse() {
+        // Without stage 3.
+        let e = ParameterPlan::derive(
+            &names(2),
+            &[],
+            &[],
+            &PlanFeatures {
+                weight_stream: true,
+                zero_elementwise: true,
+                world_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(e.0.contains("requires --zero-stage 3"), "{e}");
+        // Misaligned element counts.
+        let e = ParameterPlan::derive(
+            &names(2),
+            &[0],
+            &[64],
+            &PlanFeatures {
+                weight_stream: true,
+                zero_stage: Some(3),
+                zero_elementwise: true,
+                world_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(e.0.contains("misaligned"), "{e}");
     }
 
     #[test]
@@ -412,26 +565,27 @@ mod tests {
             param_dtype_bf16sr: true,
             ..Default::default()
         };
-        let e = ParameterPlan::derive(&names(2), &[], &bf16_no_ws).unwrap_err();
+        let e = ParameterPlan::derive(&names(2), &[], &[], &bf16_no_ws).unwrap_err();
         assert!(e.0.contains("requires --weight-stream"), "{e}");
 
         let z3_no_ws = PlanFeatures {
             zero_stage: Some(3),
             ..Default::default()
         };
-        let e = ParameterPlan::derive(&names(2), &[], &z3_no_ws).unwrap_err();
+        let e = ParameterPlan::derive(&names(2), &[], &[], &z3_no_ws).unwrap_err();
         assert!(e.0.contains("requires --weight-stream"), "{e}");
 
         let both = PlanFeatures {
             weight_stream: true,
             param_dtype_bf16sr: true,
             zero_stage: Some(3),
+            ..Default::default()
         };
-        let e = ParameterPlan::derive(&names(2), &[0], &both).unwrap_err();
+        let e = ParameterPlan::derive(&names(2), &[0], &[], &both).unwrap_err();
         assert!(e.0.contains("does not compose"), "{e}");
 
         let ws_off = PlanFeatures::default();
-        let e = ParameterPlan::derive(&names(2), &[0], &ws_off).unwrap_err();
+        let e = ParameterPlan::derive(&names(2), &[0], &[], &ws_off).unwrap_err();
         assert!(e.0.contains("--weight-stream is off"), "{e}");
     }
 
@@ -441,11 +595,11 @@ mod tests {
             weight_stream: true,
             ..Default::default()
         };
-        let e = ParameterPlan::derive(&names(2), &[5], &f).unwrap_err();
+        let e = ParameterPlan::derive(&names(2), &[5], &[], &f).unwrap_err();
         assert!(e.0.contains("has 2 parameter(s)"), "{e}");
-        let e = ParameterPlan::derive(&names(2), &[-1], &f).unwrap_err();
+        let e = ParameterPlan::derive(&names(2), &[-1], &[], &f).unwrap_err();
         assert!(e.0.contains("negative"), "{e}");
-        let e = ParameterPlan::derive(&names(2), &[0, 0], &f).unwrap_err();
+        let e = ParameterPlan::derive(&names(2), &[0, 0], &[], &f).unwrap_err();
         assert!(e.0.contains("twice"), "{e}");
     }
 
@@ -455,7 +609,7 @@ mod tests {
     #[test]
     fn a_featureless_plan_has_nothing_to_verify() {
         let p =
-            ParameterPlan::derive(&names(3), &[], &PlanFeatures::default()).unwrap();
+            ParameterPlan::derive(&names(3), &[], &[], &PlanFeatures::default()).unwrap();
         assert!(!p.has_streamed());
         assert!(!p.needs_sr_backend());
         assert!(p.entries().iter().all(|e| e.runtime_flags() == 0));
@@ -483,7 +637,7 @@ mod tests {
             (sr, &[0i64][..]),
             (sr, &[][..]),
         ] {
-            let p = ParameterPlan::derive(&names(3), streamed, &f).unwrap();
+            let p = ParameterPlan::derive(&names(3), streamed, &[], &f).unwrap();
             assert_eq!(
                 p.needs_sr_backend(),
                 p.entries().iter().any(|e| e.needs_sr_note()),
@@ -492,7 +646,7 @@ mod tests {
         }
         // And bf16-sr with an EMPTY schedule must not arm the backend: there
         // is no parameter to note, so arming it would guarantee the abort.
-        assert!(!ParameterPlan::derive(&names(3), &[], &sr)
+        assert!(!ParameterPlan::derive(&names(3), &[], &[], &sr)
             .unwrap()
             .needs_sr_backend());
     }
@@ -504,8 +658,10 @@ mod tests {
             param_dtype_bf16sr: true,
             ..Default::default()
         };
-        let r = ParameterPlan::derive(&names(2), &[1], &f).unwrap().report();
-        assert!(r.contains("2 parameter(s): 1 streamed (1 bf16-sr, 0 sharded), 1 resident"));
+        let r = ParameterPlan::derive(&names(2), &[1], &[], &f).unwrap().report();
+        assert!(r.contains(
+            "2 parameter(s): 1 streamed (1 bf16-sr, 0 sharded, 0 elementwise), 1 resident"
+        ));
         assert!(r.contains("blocks.0.w"), "{r}");
         assert!(r.contains("streamed bf16-sr"), "{r}");
     }

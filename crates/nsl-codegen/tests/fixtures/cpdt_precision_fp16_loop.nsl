@@ -1,0 +1,48 @@
+# Loop-bound twin of cpdt_precision_fp16.nsl: the SAME per-member model shape
+# and tier split, but the train block sits inside a `for` over a fixed model
+# array field, so the model variable is LOOP-BOUND and the WGGO prepass cannot
+# resolve its type (that only happens once compile_for_model_array runs,
+# during codegen — see wggo_prepass.rs's walk_stmts comment). Result: NO WGGO
+# pre-plan exists for this block — the structural no-pre-plan case the
+# weights-only CPDT offer exists for.
+#
+# Param paths are `member.blocks.N.w`; the one-segment-strip join maps them
+# onto the same safetensors keys (`blocks.N.w`) as the plain fixture, so both
+# fixtures share cpdt_precision_fp16_weights.safetensors and its designed tier
+# split (six Medium-tier FP16 moment buffers per member).
+#
+# FASE Deferred mode is activated by: optimizer AdamW + grad_accumulation > 1.
+
+from nsl.nn.losses import mse_loss
+
+model Block:
+    w: Tensor = ones([64, 64])
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return h @ self.w
+
+model TinyNet:
+    embed: Tensor = ones([8, 64])
+    blocks: [Block; 8] = Block()
+    final_norm: Tensor = ones([64])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.embed
+        for block in self.blocks:
+            h = block.forward(h)
+        let scale = self.final_norm
+        return h * scale
+
+model Ensemble:
+    members: [TinyNet; 2] = TinyNet()
+
+let ens = Ensemble()
+let x = ones([2, 8])
+let y = zeros([2, 64])
+
+for member in ens.members:
+    train(model = member, epochs = 2, grad_accumulation = 4):
+        optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+        step(batch):
+            let pred = member.forward(x)
+            let loss = mse_loss(pred, y)

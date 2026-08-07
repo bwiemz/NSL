@@ -213,6 +213,70 @@ pub struct PassDescriptor {
     /// Source-level decorators that activate the pass, without the `@`.
     pub decorator_triggers: &'static [&'static str],
     pub wiki: WikiCoverage,
+    /// How the pass touches the shared Wengert tape — the OTHER inter-pass
+    /// medium (item 2). The bus carries typed values pass-to-pass; the tape
+    /// is a shared mutable structure that some passes REWRITE and others
+    /// SCAN, and that dependency axis was declared nowhere: `PipelineStage`
+    /// records only which side of extraction a pass sits on, and five
+    /// passes share `OnWengert` while two of them (CPDT, CPKD) never touch
+    /// the tape at all. This field records actual access, with the
+    /// reference kinds each pass's product captures — the staleness rules
+    /// differ per kind (see `WengertList`'s header) and the CSHA claim
+    /// mis-keying survived precisely because nothing named which kind a
+    /// claim table held. Checked by `tape_access_drift.rs`.
+    pub tape: TapeAccess,
+}
+
+/// A kind of reference into the tape that a pass's product can hold.
+/// Staleness rules per kind are documented on `WengertList`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapeRef {
+    /// A position in `ops` — valid only against the list state it was
+    /// captured from; must convert to `OpId` to outlive the scan.
+    PositionalIndex,
+    /// Stable across deletion; unique only while fresh ids are minted above
+    /// the max (`WengertList::fresh_op_id`).
+    OpId,
+    /// Stable across every mutation; no pass renumbers VarIds.
+    VarId,
+    /// A structural fingerprint of the whole list (the WGGO pre-plan
+    /// check) — staleness is detected, not avoided.
+    ContentHash,
+}
+
+/// A pass's declared relationship to the Wengert tape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapeAccess {
+    /// Never sees a WengertList. The drift gate checks the pass's
+    /// registered source files carry no code-level mention of the type.
+    None,
+    /// Scans the tape to build its product; `refs` are the reference kinds
+    /// that product captures, `via` the files where the reads live (each
+    /// gate-checked to exist and mention the type — `via` exists because
+    /// `source_files` is a representative subset and a pass's tape reads
+    /// can live in a module it does not list, e.g. the MemoryPlanner's in
+    /// `transient_arena.rs`).
+    Reads {
+        refs: &'static [TapeRef],
+        via: &'static [&'static str],
+    },
+    /// Scans, and REWRITES the shared primal tape in place at its commit
+    /// point. Every such site re-asserts id uniqueness
+    /// (`WengertList::assert_unique_op_ids`); `what` names the rewrite.
+    MutatesInPlace {
+        refs: &'static [TapeRef],
+        via: &'static [&'static str],
+        what: &'static str,
+    },
+    /// Scans, and mutates a CLONE that the downstream pipeline forks onto —
+    /// the original list is untouched, but everything after the fork sees
+    /// the mutated copy, so this is a tape rewrite in effect if not in
+    /// place.
+    MutatesFork {
+        refs: &'static [TapeRef],
+        via: &'static [&'static str],
+        what: &'static str,
+    },
 }
 
 /// Every named optimization pass in the compiler.
@@ -247,6 +311,15 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[CompilePhase::TrainBlock],
         decorator_triggers: &["checkpoint"],
         wiki: WikiCoverage::Documented("CCR — Compiler-Chosen Recomputation"),
+        tape: TapeAccess::MutatesInPlace {
+            refs: &[TapeRef::PositionalIndex, TapeRef::VarId],
+            via: &["crates/nsl-codegen/src/ccr.rs"],
+            what: "appends the compressed-save tail to the primal (fresh \
+                   ids above the max — a len-minted id collides after any \
+                   deletion); its OnAdjoint half splices recompute clones \
+                   and decompress ops into the adjoint and renumbers that \
+                   list back to id == index",
+        },
     },
     PassDescriptor {
         name: "FASE",
@@ -263,6 +336,7 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[CompilePhase::TrainBlock, CompilePhase::Analysis],
         decorator_triggers: &["fase"],
         wiki: WikiCoverage::Documented("FASE — Fused Accumulation + Step + Epilogue"),
+        tape: TapeAccess::None,
     },
     PassDescriptor {
         name: "WGGO",
@@ -287,9 +361,36 @@ pub const PASSES: &[PassDescriptor] = &[
             f("wggo-weights", BR),
         ],
         stage: PipelineStage::OnWengert,
-        phases: &[CompilePhase::KernelPrepass],
+        // TWO phases, and the second is not theoretical: the prepass runs
+        // WGGO under KernelPrepass, but a train block whose pre-plan is
+        // missing or fingerprint-rejected re-invokes WGGO IN PLACE from the
+        // train-block driver (stmt.rs, the `reused_plan: None` arm). A block
+        // the prepass structurally cannot plan — a loop-bound model var,
+        // whose type only resolves once compile_for_model_array runs — hits
+        // that arm on EVERY compile, and WGGO's first record then lands in
+        // TrainBlock. Declaring only KernelPrepass survived as long as it
+        // did because `record` is idempotent and the prepass usually wins
+        // the first-invocation slot; the loop-bound fixture proved the
+        // declaration false (PHASE MISMATCH on a real compile).
+        // `pass_manager_gate.rs` pins the fix.
+        phases: &[CompilePhase::KernelPrepass, CompilePhase::TrainBlock],
         decorator_triggers: &["wggo", "wggo_target"],
         wiki: WikiCoverage::Documented("WGGO — Wengert Graph Global Optimization"),
+        tape: TapeAccess::MutatesInPlace {
+            refs: &[
+                TapeRef::PositionalIndex,
+                TapeRef::ContentHash,
+                TapeRef::VarId,
+            ],
+            via: &[
+                "crates/nsl-codegen/src/wggo_graph.rs",
+                "crates/nsl-codegen/src/wggo_prepass.rs",
+                "crates/nsl-codegen/src/wggo_prune.rs",
+            ],
+            what: "wggo_prune deletes pruned layer closures and repoints \
+                   consumers WITHOUT renumbering ids (dry-run-then-commit; \
+                   a refusal leaves the tape untouched)",
+        },
     },
     PassDescriptor {
         name: "CSHA",
@@ -307,6 +408,14 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[CompilePhase::TrainBlock],
         decorator_triggers: &["csha"],
         wiki: WikiCoverage::Documented("CSHA — Compiler-Synthesized Holistic Attention"),
+        tape: TapeAccess::Reads {
+            refs: &[TapeRef::OpId, TapeRef::VarId, TapeRef::PositionalIndex],
+            via: &[
+                "crates/nsl-codegen/src/csha.rs",
+                "crates/nsl-codegen/src/csha_boundary.rs",
+                "crates/nsl-codegen/src/csha_apply.rs",
+            ],
+        },
     },
     PassDescriptor {
         name: "WRGA",
@@ -332,6 +441,18 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[CompilePhase::TrainBlock],
         decorator_triggers: &["wrga"],
         wiki: WikiCoverage::Documented("WRGA — Wengert-Pruned Roofline-Guided Adaptation"),
+        tape: TapeAccess::MutatesFork {
+            refs: &[TapeRef::VarId, TapeRef::PositionalIndex],
+            via: &[
+                "crates/nsl-codegen/src/wrga.rs",
+                "crates/nsl-codegen/src/wrga_prune.rs",
+                "crates/nsl-codegen/src/wrga_memory.rs",
+            ],
+            what: "clones the primal and flips saved_for_backward on the \
+                   clone (wrga_prune); stmt.rs forks effective_primal onto \
+                   that clone, so everything downstream sees the mutated \
+                   copy while the original stays untouched",
+        },
     },
     PassDescriptor {
         name: "CPDT",
@@ -355,6 +476,10 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[CompilePhase::TrainBlock],
         decorator_triggers: &["cpdt"],
         wiki: WikiCoverage::Documented("CPDT — Compile-time Parallelism & Distributed Training"),
+        // Registered OnWengert by stage, yet never touches the tape — the
+        // mismatch is real (stage records pipeline position, not access)
+        // and is exactly why this field exists.
+        tape: TapeAccess::None,
     },
     PassDescriptor {
         name: "PCA",
@@ -380,6 +505,7 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[CompilePhase::KernelPrepass, CompilePhase::Analysis],
         decorator_triggers: &["pca"],
         wiki: WikiCoverage::Documented("PCA — Packed Causal Attention"),
+        tape: TapeAccess::None,
     },
     PassDescriptor {
         name: "CPKD",
@@ -397,6 +523,8 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[CompilePhase::TrainBlock],
         decorator_triggers: &["fused_kl_ce"],
         wiki: WikiCoverage::Documented("CPKD — Compiler-Planned Knowledge Distillation"),
+        // Same OnWengert-by-stage, no-tape-access shape as CPDT.
+        tape: TapeAccess::None,
     },
     PassDescriptor {
         name: "CEP",
@@ -426,6 +554,7 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[],
         decorator_triggers: &["cep_prune", "cep_search"],
         wiki: WikiCoverage::Documented("CEP — Compilation-Evaluated Pruning"),
+        tape: TapeAccess::None,
     },
     PassDescriptor {
         name: "CFIE",
@@ -443,10 +572,19 @@ pub const PASSES: &[PassDescriptor] = &[
         phases: &[],
         decorator_triggers: &["cfie"],
         wiki: WikiCoverage::Documented("CFIE — Compiler-Fused Inference Engine"),
+        // cfie.rs says it outright: "CFIE never sees a WengertList."
+        tape: TapeAccess::None,
     },
     PassDescriptor {
         name: "MemoryPlanner",
         full_name: "Compile-time memory planning",
+        tape: TapeAccess::Reads {
+            refs: &[TapeRef::PositionalIndex, TapeRef::VarId],
+            // Not in source_files: the train-path tape reads live in the
+            // transient arena (birth/death liveness over concatenated
+            // fwd+adjoint positions), which drives plan_slab.
+            via: &["crates/nsl-codegen/src/transient_arena.rs"],
+        },
         source_files: &["crates/nsl-codegen/src/memory_planner.rs"],
         // Build-only today. `nsl run` cannot request slab planning; whether
         // that is deliberate or an oversight is recorded, not asserted.

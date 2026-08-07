@@ -2716,6 +2716,20 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P3 ZeRO-3: tensor-granular parameter sharding (items 12-14).
     ("nsl_zero3_enable", &[], Some(types::I64)),
     ("nsl_zero3_note_param", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    // Item 11: elementwise 1/ws sharding (--zero-elementwise). Mark is
+    // plan-driven and precedes the registration belt (the sr-note pattern);
+    // the step runs on EVERY rank over its own slice — scalar order mirrors
+    // nsl_fase_fused_adamw_step.
+    ("nsl_zero3_mark_elementwise", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    (
+        "nsl_zero3_elem_adamw_step",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // theta, m, v, idx
+            types::F64, types::F64, types::F64, types::F64, types::F64, // lr, b1, omb1, b2, omb2
+            types::F64, types::F64, types::F64, types::F64, // eps, wd, bc1_inv, bc2_inv
+        ],
+        Some(types::I64),
+    ),
     // P5 item 19: opportunistic per-region CUDA graph capture/replay
     ("nsl_cuda_graphs_enable", &[types::I64], None), // (accum_window)
     ("nsl_cuda_graph_region_begin", &[types::I64], None), // (region_id)

@@ -176,6 +176,7 @@ pub mod inspect;
 pub mod memory_planner;
 /// Item 2 step 4: the typed inter-pass channels, and their traffic.
 pub mod pass_bus;
+pub mod pass_manager;
 pub mod pass_registry;
 /// Item 2 step 1: records which registered passes actually ran, in order.
 pub mod pass_trace;
@@ -1151,6 +1152,11 @@ pub struct CompileOptions {
     pub zk: ZkOptions,
     /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
     pub zero_stage: Option<u8>,
+    /// Item 11 (`--zero-elementwise`): elementwise 1/ws parameter sharding
+    /// under `--zero-stage 3` — eligible streamed params live as per-rank
+    /// slices (all_gather to materialize, reduce_scatter gradients, every
+    /// rank steps its own slice); ineligible ones stay tensor-granular.
+    pub zero_elementwise: bool,
     /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
     /// storage with counter-based stochastic rounding on the fused AdamW
     /// update — no FP32 master copy. Rides the weight-stream residency
@@ -1537,6 +1543,7 @@ impl Default for CompileOptions {
             ownership_info: HashMap::new(),
             zk: ZkOptions::default(),
             zero_stage: None,
+            zero_elementwise: false,
             param_dtype_bf16sr: false,
             muon_batch_ns: false,
             muon_resident_momentum: false,
