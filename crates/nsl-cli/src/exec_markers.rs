@@ -147,6 +147,15 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the multi-tensor FASE optimizer step fired",
     ),
     m(
+        "[phase]",
+        &[
+            "crates/nsl-runtime/src/math.rs",
+        ],
+        "NSL_PHASE_TIMING instrumentation ran: one `fwd=/bwd=` line per \
+         MICRO-batch and one `opt=` line per OPTIMIZER step, so the two counts \
+         together witness the accumulation window (stdout, not stderr)",
+    ),
+    m(
         "[tape-ad]",
         &[
             "crates/nsl-runtime/src/autodiff/backward.rs",
@@ -338,6 +347,7 @@ pub mod tokens {
     pub const PCA: &str = "[pca]";
     pub const PCA_PER_DOC: &str = "[pca-per-doc]";
     pub const FASE_MULTI: &str = "[fase-multi]";
+    pub const PHASE: &str = "[phase]";
     pub const TAPE_AD: &str = "[tape-ad]";
     pub const SR_BF16: &str = "[sr-bf16]";
     pub const PARAM_PLAN: &str = "[param-plan]";

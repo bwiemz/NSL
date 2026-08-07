@@ -4370,6 +4370,7 @@ impl Compiler<'_> {
         let mut teacher_sym: Option<nsl_ast::Symbol> = None;
         let mut student_sym: Option<nsl_ast::Symbol> = None;
         let mut epochs: i64 = 1;
+        let mut forwarded_config: Vec<nsl_ast::expr::Arg> = Vec::new();
         for arg in &distill.config {
             if let Some(name_sym) = arg.name {
                 match self.resolve_sym(name_sym) {
@@ -4386,6 +4387,27 @@ impl Compiler<'_> {
                     "epochs" => {
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             epochs = *n;
+                        }
+                    }
+                    "grad_accumulation" => {
+                        // Mirrors the 'epochs' contract: the window is a
+                        // compile-time constant. The train path CLAMPS a
+                        // non-literal to 1 silently; on distill that clamp is
+                        // indistinguishable from the pre-fix behaviour (no
+                        // FASE-Deferred envelope, so no CPDT moment precision),
+                        // so refuse instead. The semantic checker produces the
+                        // span-labelled diagnostic; this is the backstop for
+                        // callers that lower an AST without checking it.
+                        match arg.value.kind {
+                            ExprKind::IntLiteral(n) if n >= 1 => {
+                                forwarded_config.push(arg.clone());
+                            }
+                            _ => {
+                                return Err(CodegenError::new(
+                                    "distill 'grad_accumulation' must be a positive \
+                                     integer literal",
+                                ));
+                            }
                         }
                     }
                     _ => {}
@@ -4455,10 +4477,27 @@ impl Compiler<'_> {
             }
         }
 
-        // ── Synthetic TrainBlock: empty config (the context seeds
-        //    model/epochs), shared sections. ─────────────────────────────
+        // ── Synthetic TrainBlock: the DistillContext seeds model/epochs, so
+        //    the config carries ONLY the keys the context cannot express.
+        //
+        //    Today that is exactly `grad_accumulation`: it is consumed solely
+        //    by `compile_train_block_inner` (the accumulation gate and the
+        //    FASE plan's `accumulation` field), has no DistillContext home,
+        //    and its absence pinned every distill block to FASE Passthrough —
+        //    which is why the CPDT optimizer-moment precision plan planned
+        //    weights-only and then lowered nothing on this path.
+        //
+        //    `teacher`/`student`/`epochs` stay OUT deliberately: the context
+        //    is their single source of truth (`model_sym = student_sym`,
+        //    `epochs = distill.epochs`, applied AFTER this config loop runs),
+        //    so a second copy here would be a divergence waiting for one of
+        //    the two to be edited. Blanket-forwarding is refused for a
+        //    sharper reason: the train config loop ignores keys it does not
+        //    know, so any future distill-only key that later becomes a train
+        //    key would silently activate a train feature nobody declared for
+        //    distillation. Each key gets forwarded when it is justified.
         let synthetic = nsl_ast::block::TrainBlock {
-            config: Vec::new(),
+            config: forwarded_config,
             sections: distill.sections.clone(),
             span: distill.span,
         };

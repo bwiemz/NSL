@@ -1,0 +1,55 @@
+# Distill twin of cpdt_precision_fp16.nsl: the SAME model shape and tier
+# split, driven by a `distill(...)` block instead of a `train(...)` block.
+#
+# Why it exists: a distill block lowers through a SYNTHETIC TrainBlock, and
+# until `grad_accumulation` could be carried on the distill header that
+# synthetic config was empty — so every distill block planned FASE
+# Passthrough, the FASE-Deferred envelope never existed, and the weights-only
+# CPDT precision plan lowered nothing ("arbitration lowered nothing"). With
+# the window forwarded, the student's moments get their designed dtypes.
+#
+# The student's param paths are `student.blocks.N.w`; the one-segment-strip
+# join maps them onto the same safetensors keys (`blocks.N.w`) as the plain
+# fixture, so this shares cpdt_precision_fp16_weights.safetensors and its
+# designed tier split: six Medium-tier FP16 moment buffers.
+#
+# The TEACHER's params are NOT in the block's parameter list at all (I-11:
+# teacher fields are frozen Input leaves with no adjoints), so the precision
+# plan joins the student only — 6 buffers, not 12.
+#
+# FASE Deferred mode is activated by: optimizer AdamW + grad_accumulation > 1.
+
+from nsl.nn.losses import mse_loss
+
+model Block:
+    w: Tensor = ones([64, 64])
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return h @ self.w
+
+model TinyNet:
+    embed: Tensor = ones([8, 64])
+    blocks: [Block; 8] = Block()
+    final_norm: Tensor = ones([64])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.embed
+        for block in self.blocks:
+            h = block.forward(h)
+        let scale = self.final_norm
+        return h * scale
+
+let teacher = TinyNet()
+let student = TinyNet()
+let x = ones([2, 8])
+let y = zeros([2, 64])
+
+distill(teacher = teacher, student = student, epochs = 2, grad_accumulation = 4):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    loss:
+        alpha = 0.5
+        temperature = 2.0
+    step(batch):
+        let t_out = teacher.forward(x)
+        let s_out = student.forward(x)
+        let loss = mse_loss(s_out, y) + mse_loss(s_out, t_out)
