@@ -68,10 +68,13 @@ exit 1. Both are gated now (`seed_gate.rs`, `monitor_fase_gate.rs`).
 - ~3.5 h sustained streaming training, loss 11.22 → 2.08 and still
   descending at cutoff; allocator peak flat at 10.08 GB across all 150
   windows (no leak); 12 weight-norm snapshots recorded.
-- `--grad-integrity` is **not wired** under `--layerwise-accum` and says so
-  loudly (checks=0 = "not measured", pre-existing documented limitation) —
-  gradient coverage at 1B rides on the 500M certification plus the CSLA
-  bit-exactness gates.
+- `--grad-integrity` was **not wired** under `--layerwise-accum` when this
+  run was taken (checks=0 = "not measured"), so gradient coverage at 1B
+  rides on the 500M certification plus the CSLA bit-exactness gates. PR #417
+  since wired it: the windowed replay now brackets each accumulation window
+  (`checks` counts optimizer steps), and `csla_grad_integrity_layerwise_cpu`
+  asserts the old "not wired" warning is gone. Re-running this arm would
+  report real coverage.
 
 ## Certification verdict
 

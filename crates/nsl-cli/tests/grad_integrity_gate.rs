@@ -104,6 +104,49 @@ fn parse_integrity(stderr: &str) -> Option<(u64, u64, u64, u64, u64, usize)> {
     ))
 }
 
+/// The contribution-count fields, APPENDED after the frozen six-line prefix:
+/// `(notes_expected, notes_observed, under_noted, over_noted)`.
+///
+/// Deliberately parsed from the whole tail of the block rather than a fixed
+/// window, and every field is anchored on its label — the six-line window
+/// above is what pins the prefix's position, so duplicating that fragility
+/// here would only make a future append break two parsers instead of none.
+fn parse_notes(stderr: &str) -> Option<(u64, String, Vec<u64>, Vec<u64>)> {
+    let block: Vec<&str> = stderr
+        .lines()
+        .skip_while(|l| l.trim() != "[grad-integrity]")
+        .skip(1)
+        .take(10)
+        .collect();
+    let idx_list = |key: &str| -> Option<Vec<u64>> {
+        let rest = block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix(key))?
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if rest.trim().is_empty() {
+            return Some(Vec::new());
+        }
+        rest.split(',').map(|s| s.trim().parse().ok()).collect()
+    };
+    Some((
+        block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix("notes_expected="))?
+            .trim()
+            .parse()
+            .ok()?,
+        block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix("notes_observed="))?
+            .trim()
+            .to_string(),
+        idx_list("under_noted=")?,
+        idx_list("over_noted=")?,
+    ))
+}
+
 #[test]
 fn grad_integrity_fullbuffer_all_params_finite_and_nonzero() {
     let r = run("grad_integrity_fullbuffer.nsl", &["--grad-integrity"], &[]);
@@ -118,6 +161,12 @@ fn grad_integrity_fullbuffer_all_params_finite_and_nonzero() {
     assert_eq!(finite, 4, "every gradient must be finite (no NaN/Inf)");
     assert_eq!(nonzero, 4, "every gradient must be nonzero on this fixture");
     assert_eq!(missing, 0, "no param may be missing a gradient");
+    // The composite scan sees each param's gradient exactly once per step.
+    let (n_exp, n_obs, under, over) = parse_notes(&r.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields:\n{}", r.stderr));
+    assert_eq!(n_exp, 1, "the composite scan declares one contribution/param");
+    assert_eq!(n_obs, "1..1", "every param was scanned exactly once");
+    assert!(under.is_empty() && over.is_empty(), "under={under:?} over={over:?}");
 }
 
 #[test]
@@ -126,13 +175,83 @@ fn grad_integrity_fase_deferred_feeds_per_param() {
     assert!(r.ok, "run failed:\nstdout:\n{}\nstderr:\n{}", r.stdout, r.stderr);
     let (checks, expected, gradient, finite, nonzero, missing) =
         parse_integrity(&r.stderr).unwrap_or_else(|| panic!("no [grad-integrity] block:\n{}", r.stderr));
-    // 12 epochs, grad_accumulation=4 → the optimizer (and a step_end) fires 3×.
+    // 12 epochs, grad_accumulation=4 → the optimizer fires 3×, but a step_end
+    // fires per MICRO-batch (the bracket wraps one adjoint lowering, not the
+    // window), so `checks` is 12 — pinned below.
     assert!(checks >= 1, "the FASE feed path must finalize at least one step");
     assert_eq!(expected, 2, "expected 2 trainable params (w1, w2)");
     assert_eq!(gradient, 2, "both params must be noted every step");
     assert_eq!(finite, 2, "both gradients must be finite");
     assert_eq!(nonzero, 2, "both gradients must be nonzero");
     assert_eq!(missing, 0, "no param may be missing a gradient");
+    // The FASE-interleaved bracket wraps ONE micro-batch, so the emitter
+    // declares one contribution per param and the hook must deliver exactly
+    // that. `checks` counting micro-batches (12 = epochs) rather than
+    // optimizer steps (3) is what makes that declaration correct.
+    assert_eq!(checks, 12, "the baseline bracket is per MICRO-batch");
+    let (n_exp, n_obs, under, over) = parse_notes(&r.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields:\n{}", r.stderr));
+    assert_eq!(n_exp, 1, "per-micro-batch bracket declares 1 note/param");
+    assert_eq!(n_obs, "1..1", "each param's gradient is consumed once/micro-batch");
+    assert!(under.is_empty() && over.is_empty(), "under={under:?} over={over:?}");
+}
+
+/// Anti-vacuity for the contribution counter: the one-note-per-(param,
+/// micro-batch) invariant is structurally true on every fixture in the tree,
+/// so `under_noted`/`over_noted` read `[]` everywhere and a stub that always
+/// printed `[]` would be indistinguishable from the real check. Drive the
+/// announced fault hook to make the failing arm reachable.
+///
+/// The load-bearing part is the SECOND assertion block: with the fault on,
+/// all six pre-existing fields still read fully green. A gradient consumed
+/// twice — double-counted into `m_partial` at the same 1/N scale — is exactly
+/// the class of silent corruption this gate exists to catch, and before the
+/// count it was invisible.
+#[test]
+fn double_consumed_gradient_is_reported_and_the_control_run_is_clean() {
+    let faulted = run(
+        "grad_integrity_fase.nsl",
+        &["--grad-integrity"],
+        &[("NSL_GRAD_INTEGRITY_FAULT", "double:1")],
+    );
+    assert!(faulted.ok, "fault run failed:\n{}", faulted.stderr);
+    assert!(
+        faulted.stderr.contains("FAULT INJECTION ACTIVE"),
+        "the fault hook must announce itself (an unannounced one would let a \
+         faulted run be mistaken for a real one):\n{}",
+        faulted.stderr
+    );
+    let (_, n_obs, under, over) = parse_notes(&faulted.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields:\n{}", faulted.stderr));
+    assert_eq!(over, vec![1], "param 1 was consumed twice per bracket");
+    assert!(under.is_empty(), "a doubled note is not an under-note: {under:?}");
+    assert_eq!(n_obs, "1..2", "param 0 kept 1 contribution, param 1 got 2");
+
+    let (checks, expected, gradient, finite, nonzero, missing) = parse_integrity(&faulted.stderr)
+        .unwrap_or_else(|| panic!("no [grad-integrity] block:\n{}", faulted.stderr));
+    assert_eq!(
+        (checks, expected, gradient, finite, nonzero, missing),
+        (12, 2, 2, 2, 2, 0),
+        "the six legacy fields must be BLIND to a double-consumed gradient — \
+         if this ever fails they grew a signal and the claim above is stale:\n{}",
+        faulted.stderr
+    );
+
+    // Control: same program, no fault. Proves the verdict is not stuck on.
+    let clean = run("grad_integrity_fase.nsl", &["--grad-integrity"], &[]);
+    assert!(clean.ok, "control run failed:\n{}", clean.stderr);
+    assert!(
+        !clean.stderr.contains("FAULT INJECTION ACTIVE"),
+        "the control run must not have the fault hook armed:\n{}",
+        clean.stderr
+    );
+    let (_, c_obs, c_under, c_over) = parse_notes(&clean.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields:\n{}", clean.stderr));
+    assert_eq!(c_obs, "1..1");
+    assert!(
+        c_under.is_empty() && c_over.is_empty(),
+        "control run must be clean: under={c_under:?} over={c_over:?}"
+    );
 }
 
 #[test]

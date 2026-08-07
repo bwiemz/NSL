@@ -68,6 +68,17 @@ struct RunOutput {
 }
 
 fn run_program(source: &str, tag: &str, cuda: bool, deterministic: bool, extra_args: &[&str]) -> RunOutput {
+    run_program_env(source, tag, cuda, deterministic, extra_args, &[])
+}
+
+fn run_program_env(
+    source: &str,
+    tag: &str,
+    cuda: bool,
+    deterministic: bool,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+) -> RunOutput {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_csla_gate_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -95,6 +106,9 @@ fn run_program(source: &str, tag: &str, cuda: bool, deterministic: bool, extra_a
         .env("NSL_CSLA_COUNTER", "1")
         .env("NSL_WS_COUNTER", "1")
         .env("NSL_EMBEDDING_BWD_CPU", "1");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     let output = cmd.output().expect("spawn nsl run");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -1324,6 +1338,50 @@ fn grad_integrity_report(stderr: &str) -> Option<(i64, i64, i64, i64, i64, bool)
     ))
 }
 
+/// The per-parameter contribution-count fields, APPENDED after the six-line
+/// prefix above: `(notes_expected, notes_observed, under_noted, over_noted)`.
+///
+/// These are what make a param that received k of the window's N micro-batch
+/// gradients visible at all: the window bracket merges repeat notes, so
+/// present/finite/nonzero cannot tell k<N from N, while `fase_emit_accumulate`
+/// scales by 1/N per note — so such a param trains on k/N of its gradient,
+/// silently. Parsed by LABEL over the block tail, never by line position.
+fn grad_integrity_notes(stderr: &str) -> Option<(i64, String, Vec<i64>, Vec<i64>)> {
+    let block: Vec<&str> = stderr
+        .lines()
+        .skip_while(|l| l.trim() != "[grad-integrity]")
+        .skip(1)
+        .take(10)
+        .collect();
+    let idx_list = |key: &str| -> Option<Vec<i64>> {
+        let rest = block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix(key))?
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if rest.trim().is_empty() {
+            return Some(Vec::new());
+        }
+        rest.split(',').map(|s| s.trim().parse().ok()).collect()
+    };
+    Some((
+        block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix("notes_expected="))?
+            .trim()
+            .parse()
+            .ok()?,
+        block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix("notes_observed="))?
+            .trim()
+            .to_string(),
+        idx_list("under_noted=")?,
+        idx_list("over_noted=")?,
+    ))
+}
+
 /// P0.3 wiring gate: `--grad-integrity` must feed from the CSLA windowed
 /// replay. Before the wiring it reported checks=0 there (with a loud
 /// warning); a gate reading that report would have passed vacuously.
@@ -1403,6 +1461,21 @@ fn csla_grad_integrity_layerwise_cpu() {
     assert_eq!(nonzero, expected, "some param gradient was all-zero on some window");
     assert!(missing_empty, "missing list not empty:\n{}", flagged.stderr);
 
+    // Per-micro-batch resolution INSIDE the window bracket. The fixture runs
+    // grad_accumulation=2, and every param's adjoint op lives in exactly one
+    // replay range, so each param must be consumed exactly twice per window.
+    // notes_expected==2 is the anti-vacuity witness that the emitter's
+    // declaration actually reached the runtime (0 would mean undeclared, and
+    // the two verdict lines would then be empty for free).
+    let (n_exp, n_obs, under, over) = grad_integrity_notes(&flagged.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields in:\n{}", flagged.stderr));
+    assert_eq!(n_exp, 2, "the window must declare grad_accumulation notes/param");
+    assert_eq!(n_obs, "2..2", "every param got exactly both micro-batches");
+    assert!(
+        under.is_empty() && over.is_empty(),
+        "clean run must have no count deviation: under={under:?} over={over:?}"
+    );
+
     // Observe-only: the diagnostic must not perturb training. Byte-compare
     // the saved models too — a perturbation in the FINAL window's update is
     // invisible to the printed losses.
@@ -1422,4 +1495,103 @@ fn csla_grad_integrity_layerwise_cpu() {
         let first_f = flagged.loss_stream.lines().next().unwrap_or("");
         assert_eq!(first_p, first_f, "first loss must match even in nondeterministic envs");
     }
+}
+
+/// Anti-vacuity for the CSLA contribution counter — the item's dominant risk.
+///
+/// One-note-per-(param, micro-batch) is STRUCTURALLY true today:
+/// `partition_ranges` is a proven partition (its own unit test asserts no gap
+/// or overlap) and a Wengert result VarId has exactly one producing op, so the
+/// FASE hook fires once per param per replay. `under_noted`/`over_noted`
+/// therefore read `[]` on every fixture in the tree, and a stub printing a
+/// constant `[]` would be indistinguishable from the real check. The announced
+/// `NSL_GRAD_INTEGRITY_FAULT` hook is what makes the failing arm reachable.
+///
+/// The load-bearing assertion is that in the `drop` arm ALL SIX pre-existing
+/// report fields still read fully green while param 0 received one of the
+/// window's two micro-batch gradients. `fase_emit_accumulate` applies the 1/N
+/// scale PER NOTE, so that param trains on half its gradient, biased toward
+/// the micro-batch that did contribute — the #396-class silent loss this gate
+/// exists to convert into a signal, and invisible here before the count.
+#[test]
+fn csla_grad_integrity_detects_partial_and_double_contributions() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_gi_fault_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let args = ["--checkpoint-blocks", "--layerwise-accum", "--grad-integrity"];
+
+    // (a) drop: param 0 loses its FIRST contribution in every window (1 of 2).
+    let dropped = run_program_env(
+        &program("csla_layerwise_ffn.nsl", false, &tmp.join("gi_drop.nslm"), &[]),
+        "gi_fault_drop",
+        false,
+        false,
+        &args,
+        &[("NSL_GRAD_INTEGRITY_FAULT", "drop:0")],
+    );
+    assert!(dropped.success, "drop-fault run failed:\n{}", dropped.stderr);
+    assert!(
+        dropped.stderr.contains("FAULT INJECTION ACTIVE"),
+        "the fault hook must announce itself — an unannounced one would let a \
+         faulted run be mistaken for a real certification:\n{}",
+        dropped.stderr
+    );
+    let (checks, expected, gradient, finite, nonzero, missing_empty) =
+        grad_integrity_report(&dropped.stderr)
+            .unwrap_or_else(|| panic!("no [grad-integrity] report in:\n{}", dropped.stderr));
+    assert_eq!(
+        (checks, expected, gradient, finite, nonzero, missing_empty),
+        (6, 8, 8, 8, 8, true),
+        "the six legacy fields must be BLIND to a k-of-N gradient loss — if \
+         this ever fails they grew a signal and the rationale above is stale:\n{}",
+        dropped.stderr
+    );
+    let (n_exp, n_obs, under, over) = grad_integrity_notes(&dropped.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields in:\n{}", dropped.stderr));
+    assert_eq!(n_exp, 2);
+    assert_eq!(under, vec![0], "param 0 got 1 of 2 micro-batch gradients");
+    assert!(over.is_empty(), "a dropped note is not an over-note: {over:?}");
+    assert_eq!(n_obs, "1..2", "the surviving params still got both");
+
+    // (b) double: param 3's gradient is consumed twice per micro-batch, so it
+    // double-counts into m_partial at the same 1/N scale.
+    let doubled = run_program_env(
+        &program("csla_layerwise_ffn.nsl", false, &tmp.join("gi_dbl.nslm"), &[]),
+        "gi_fault_double",
+        false,
+        false,
+        &args,
+        &[("NSL_GRAD_INTEGRITY_FAULT", "double:3")],
+    );
+    assert!(doubled.success, "double-fault run failed:\n{}", doubled.stderr);
+    let (_, d_obs, d_under, d_over) = grad_integrity_notes(&doubled.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields in:\n{}", doubled.stderr));
+    assert_eq!(d_over, vec![3], "param 3 was consumed 4 times, not 2");
+    assert!(d_under.is_empty(), "a doubled note is not an under-note: {d_under:?}");
+    assert_eq!(d_obs, "2..4");
+
+    // (c) control: same program, same args, no fault. Proves the verdict is
+    // not simply stuck on (and that the two arms above differ because of the
+    // injected fault, not because of the flag combination).
+    let clean = run_program_env(
+        &program("csla_layerwise_ffn.nsl", false, &tmp.join("gi_ctl.nslm"), &[]),
+        "gi_fault_control",
+        false,
+        false,
+        &args,
+        &[],
+    );
+    assert!(clean.success, "control run failed:\n{}", clean.stderr);
+    assert!(
+        !clean.stderr.contains("FAULT INJECTION ACTIVE"),
+        "the control run must not have the fault hook armed:\n{}",
+        clean.stderr
+    );
+    let (c_exp, c_obs, c_under, c_over) = grad_integrity_notes(&clean.stderr)
+        .unwrap_or_else(|| panic!("no contribution-count fields in:\n{}", clean.stderr));
+    assert_eq!(c_exp, 2);
+    assert_eq!(c_obs, "2..2");
+    assert!(
+        c_under.is_empty() && c_over.is_empty(),
+        "control run must be clean: under={c_under:?} over={c_over:?}"
+    );
 }
