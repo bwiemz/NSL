@@ -11657,12 +11657,17 @@ impl Compiler<'_> {
                     };
                     // P0.3: bracket the FASE backward with a grad-integrity step
                     // (the hook notes each parameter's gradient between these).
+                    // This bracket wraps ONE micro-batch's adjoint lowering, so
+                    // every trainable param must be noted exactly once inside
+                    // it — anything else is a dropped or double-consumed
+                    // gradient, which is what the declared expectation catches.
                     let gi = self.compile_options.grad_integrity;
                     if gi {
+                        let one_note = builder.ins().iconst(cl_types::I64, 1);
                         self.compile_call_by_name(
                             builder,
                             "nsl_grad_integrity_step_begin",
-                            &[num_params_val],
+                            &[num_params_val, one_note],
                         )?;
                     }
                     // P0.2: arm the gradient-integrity guard for the FASE
@@ -13611,11 +13616,27 @@ impl Compiler<'_> {
             // update closes the bracket — so one begin/end pair per window
             // gives exactly "every optimizer step, every trainable param got
             // a usable gradient", the property the gate documents.
+            //
+            // The window bracket merges every (param, micro-batch) note into
+            // one verdict, so present/finite/nonzero cannot tell a param that
+            // got all N contributions from one that got k<N — and since
+            // `fase_emit_accumulate` scales by 1/N PER NOTE, the latter's
+            // gradient is k/N of its true magnitude and biased toward the
+            // micro-batches that did contribute. Declaring the expected count
+            // is what restores that resolution: the b-loop below replays the
+            // range for each of the window's `grad_accumulation_steps`
+            // buffered micro-batches (the `nsl_assert` above pins the buffer
+            // to exactly that length), and each param's adjoint op lives in
+            // exactly one range, so the hook must fire exactly N times per
+            // param per window.
             if self.compile_options.grad_integrity {
+                let expected_notes = builder
+                    .ins()
+                    .iconst(cl_types::I64, grad_accumulation_steps.max(1));
                 self.compile_call_by_name(
                     builder,
                     "nsl_grad_integrity_step_begin",
-                    &[num_params_val],
+                    &[num_params_val, expected_notes],
                 )?;
             }
 
