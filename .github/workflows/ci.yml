@@ -9,6 +9,35 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+  # ── Why this workspace does not fit on a hosted runner by default ────────
+  #
+  # `cargo test --workspace` builds ~576 test executables, and each one
+  # statically links the whole workspace. With the default dev/test profile
+  # (debug = full) that tree measured 59 GB locally, of which 51 GB is
+  # `debug/deps` and 7.3 GB is `debug/incremental`. A hosted ubuntu runner has
+  # roughly 14 GB free. The result was not a slow lane, it was a WRONG one:
+  # the run died mid-suite with
+  #
+  #     ##[warning]You are running out of disk space. Free space left: 86 MB
+  #     /usr/bin/ld: final link failed: No space left on device
+  #
+  # and the tests whose fixtures link a program (ccr_periodic_stride_gate,
+  # awq_full_pipeline, …) reported as FAILED. Every recent PR carried that red,
+  # which is worse than a broken lane — it is a lane nobody can read, so a real
+  # regression and an out-of-disk look identical.
+  #
+  # Debuginfo is the whole difference and CI never opens a debugger. Measured
+  # on this workspace, same command, two clean target dirs:
+  #
+  #     cargo test --workspace --no-run                     50 GB
+  #     + CARGO_INCREMENTAL/DEV_DEBUG/TEST_DEBUG = 0        3.1 GB
+  #
+  # 16x, and 3.1 GB fits a hosted runner with room for the run itself.
+  # Backtraces keep their frames; only file/line goes.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
 jobs:
   build-and-test:
     strategy:
@@ -43,6 +72,19 @@ jobs:
           toolchain: 1.95.0
           components: clippy
 
+      # Reclaim the preinstalled toolchains this repo never uses. Worth ~25 GB
+      # on ubuntu — headroom for the ~128 MB binaries the NSL fixtures link
+      # into TMPDIR during the run, which the cargo profile settings above do
+      # not shrink.
+      - name: Free runner disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+          echo "after:"; df -h / | tail -1
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -50,7 +92,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # `v2` is load-bearing, not decoration. The v1 caches hold a ~10 GB
+          # full-debuginfo `target/` built under the old profile: restoring one
+          # spends 2.5 min untarring 10 GB onto a 14 GB disk, and cargo then
+          # rebuilds anyway because the profile fingerprint changed. Bumping
+          # the key starts cold once and saves a small cache from then on.
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
         run: cargo build --workspace

@@ -201,6 +201,40 @@ pub(crate) fn srbf16_is_registered(tensor_ptr: i64) -> bool {
     guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr))
 }
 
+/// Item 16×11: the noted stable index for a param that a residency backend
+/// OTHER than the mirror table will own. The zero-3 elementwise carve reads
+/// this to decide whether its slice is bf16-authoritative (composed
+/// `--param-dtype bf16-sr --zero-elementwise` runs) and which SR counter
+/// block the slice's dither draws from. Non-consuming on purpose: the carve
+/// is idempotent across window re-registrations, and `srbf16_register`
+/// never runs for zero3-dispatched params (the weight-stream dispatch is
+/// first-match-wins), so nothing else races for the entry.
+pub(crate) fn pending_param_idx(tensor_ptr: i64) -> Option<u64> {
+    let guard = SRBF16_PENDING_IDX.lock().unwrap();
+    guard.as_ref().and_then(|g| g.get(&tensor_ptr).copied())
+}
+
+/// Histogram surface for the composed elementwise-SR step (zero.rs): the
+/// #468 lesson is that a new dispatch path silently shrinks an instrument's
+/// surface to zero unless it samples through the same entry. Returns the
+/// sample length (0 = histograms off).
+#[cfg(feature = "cuda")]
+pub(crate) fn sr_hist_sample_len(len: usize) -> usize {
+    if sr_hist_enabled() {
+        len.min(SR_HIST_SAMPLE)
+    } else {
+        0
+    }
+}
+
+/// Record one composed-step sample pair and count the step event, exactly
+/// like the per-param and batched mirror paths do.
+#[cfg(feature = "cuda")]
+pub(crate) fn sr_hist_record_step(before: &[u16], after: &[u16]) {
+    sr_hist_record(before, after);
+    SR_HIST.lock().unwrap().steps += 1;
+}
+
 // Non-CUDA builds: the residency backend is GPU-only; codegen refuses
 // `--param-dtype bf16-sr` off-GPU, so reaching any of these without the
 // cuda feature is a wiring bug — abort loudly (deferral-must-refuse).
@@ -354,14 +388,23 @@ pub extern "C" fn nsl_sr_bf16_teardown() {
         srbf16_upload_all();
         let mut guard = SRBF16_TABLE.lock().unwrap();
         if let Some(table) = guard.take() {
-            eprintln!(
+            // Format first, write once: composed elementwise-SR runs are
+            // multi-rank, and `eprintln!` issues one write(2) per format
+            // fragment — concurrent ranks tear each other's lines mid-string
+            // the first time a gate parses a field (the args.rs [zero]
+            // pattern; observed on item 11's teardown line).
+            let line = format!(
                 "[sr-bf16] teardown: {} bf16-authoritative param(s), {} SR \
-                 optimizer step(s), {} widen-upload(s), {} batched launch(es)",
+                 optimizer step(s), {} widen-upload(s), {} batched launch(es)\n",
                 table.len(),
                 SRBF16_STEPS.load(Ordering::Relaxed),
                 SRBF16_UPLOADS.load(Ordering::Relaxed),
                 SRBF16_BATCHED_LAUNCHES.load(Ordering::Relaxed),
             );
+            {
+                use std::io::Write;
+                let _ = std::io::stderr().lock().write_all(line.as_bytes());
+            }
             crate::cuda::inner::ensure_context();
             for (_, m) in table {
                 crate::cuda::inner::free_managed(m.dev_bf16 as *mut std::ffi::c_void);
