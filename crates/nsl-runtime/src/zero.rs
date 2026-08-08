@@ -3484,8 +3484,8 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
 
 /// Item 16×11: the composed elementwise step under `--param-dtype bf16-sr`
 /// — EVERY rank updates its bf16-AUTHORITATIVE slice with the same fused SR
-/// kernel the mirror backend launches, against its region of the full
-/// replicated f32 moments and the reduce_scattered gradient slice. The SR
+/// kernel the mirror backend launches, against its OWN slice-sized f32
+/// moments and the reduce_scattered gradient slice. The SR
 /// counter base carries the rank's flat element offset on top of the
 /// param's counter block, so every element draws the dither the single-rank
 /// mirror baseline draws at the same global index — which is what makes a
@@ -3498,6 +3498,15 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
 /// checkpoint save — see updated θ). Never the reverse direction: the
 /// release-persist is skipped for SR slices, because the SR step is the
 /// only sanctioned θ writer (plain SR's evict-never-writes-back contract).
+///
+/// Item C: m/v are SLICE-sized and slice-LOCAL, exactly as in the plain
+/// twin — the deferred fill routes on `is_elementwise()` alone, so an
+/// SR-carved param gets the same `nsl_zero3_alloc_elem_moment` buffer.
+/// `off_bytes` therefore rides ONLY the two full-tensor traffics that
+/// remain: the θ coherence widen below, and (via `rank * shard`) the SR
+/// counter base. Re-adding it to the moment pointers would read a
+/// rank-1 shard's worth of bytes past the end of a `shard`-sized
+/// allocation.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
@@ -3581,10 +3590,17 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
             );
             std::process::abort();
         }
-        let n = th.len.max(0) as usize;
+        // Item C: m/v are SLICE-sized, same as the plain twin. A full-sized
+        // buffer here means the deferred fill fell back to `zeros_like` (or
+        // a caller kept the old replicated allocation) — refuse rather than
+        // silently index the first `shard` elements of a replicated buffer,
+        // which is arithmetically fine on rank 0 and WRONG on every other
+        // rank.
         assert!(
-            m.len.max(0) as usize == n && v.len.max(0) as usize == n,
-            "zero3 sr elem step: m/v length mismatch (theta={}, m={}, v={})",
+            m.len.max(0) as usize == shard && v.len.max(0) as usize == shard,
+            "zero3 sr elem step: m/v must be this rank's slice, not a full \
+             replica (shard={}, theta={}, m={}, v={})",
+            shard,
             th.len,
             m.len,
             v.len
@@ -3613,6 +3629,20 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
             let guard = ZERO_CTX.lock().unwrap();
             guard.as_ref().map(|c| c.rank).unwrap_or(0)
         };
+        // Same bound proof the plain twin carries, for the same reason: this
+        // is now the ONLY consumer of `off_bytes`, and it feeds a raw
+        // `th.data.add(off_bytes)` write in the coherence widen below.
+        // Saturating on BOTH the test and the message — a debug build would
+        // otherwise panic with "attempt to multiply with overflow" while
+        // formatting, replacing the drift diagnostic with an arithmetic one.
+        let region_lo = rank.saturating_mul(shard);
+        let region_hi = region_lo.saturating_add(shard);
+        assert!(
+            region_hi <= th.len.max(0) as usize,
+            "zero3 sr elem step: region [{region_lo}, {region_hi}) escapes \
+             theta (len={})",
+            th.len
+        );
         let off_bytes = rank * shard * elem_bytes;
         let has_wd = wd != 0.0;
 
@@ -3644,8 +3674,10 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
         }
         crate::cuda::gpu_fase_fused_adamw_step_bf16sr_raw(
             slice_ptr,
-            (m.data as u64) + off_bytes as u64,
-            (v.data as u64) + off_bytes as u64,
+            // Item C: slice-sized moments start at their own base (the
+            // plain twin's convention). `off_bytes` stays on θ only.
+            m.data as u64,
+            v.data as u64,
             grad_ptr as u64,
             shard,
             beta1 as f32,
@@ -4582,6 +4614,208 @@ mod tests {
             crate::memory::checked_free(t.data as *mut u8, 32);
         }
         crate::list::nsl_list_free(list);
+        nsl_zero_destroy();
+    }
+
+    /// Item C at ws=2, rank 1 — the half of the elementwise contract the
+    /// ws=1 lifecycle above CANNOT see. At ws=1 the region offset is
+    /// `rank * shard == 0` and the shard IS the whole tensor, so
+    /// slice-local `m[i]` and region-offset `m[off + i]` are the same
+    /// address, and `m.len == shard` and `m.len == theta.len` are the same
+    /// predicate. Restore either of main's replicated conventions and that
+    /// test stays green — including its `optim_elems` delta, because at
+    /// ws=1 a full replica IS shard-sized. This test runs the only rank
+    /// where the two conventions disagree and pins the split directly:
+    ///
+    ///   * moments are indexed at their OWN base (`m[0..shard]` carries
+    ///     this rank's update, not `m[shard..2*shard]`),
+    ///   * θ is written ONLY inside `[rank*shard, (rank+1)*shard)`,
+    ///   * `optim_elems` credits `shard`, not `theta.len`.
+    ///
+    /// The two collective-dependent stages are SUBSTITUTED, not faked. At
+    /// ws=2 with both ranks holding identical values — which is exactly
+    /// what the composed sim-gpu gates run, and why they are bit-exact —
+    /// a correct all_gather reproduces the original full vector, and
+    /// reduce_scatter with the 1/ws average reproduces this rank's region
+    /// of the full gradient. The transient is allocated through the same
+    /// `checked_alloc_zeroed` gather's host arm uses. Everything else —
+    /// the carve, the moment allocator, the step, the persist — is the
+    /// production path.
+    #[test]
+    fn elementwise_rank1_of_2_indexes_moments_slice_locally() {
+        let _g = zero_serial_lock();
+        nsl_zero_destroy();
+        // `nsl_zero_init(3, 2)` returns -3 without NSL_TP_SHM_PATH (ws>1
+        // opens the spawner's shared-memory file and blocks on a second
+        // process). Init at ws=1 and retarget the context: the CPU
+        // elementwise carve and step read nothing from it but
+        // `(rank, world_size)`.
+        assert_eq!(nsl_zero_init(3, 1), 0);
+        {
+            let mut g = ZERO_CTX.lock().unwrap();
+            let c = g.as_mut().expect("context");
+            c.rank = 1;
+            c.world_size = 2;
+        }
+        nsl_zero3_enable();
+
+        let full0 = [0.5f64, -1.25, 2.0, 3.75, -0.75, 1.5, -2.5, 0.25];
+        let grad_full = [0.1f64, -0.2, 0.3, -0.4, 0.05, -0.15, 0.35, -0.45];
+        let mut theta = full0.to_vec();
+        let mut shape = vec![8i64];
+        let mut strides = vec![1i64];
+        let t = owned_cpu_tensor(
+            theta.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            8,
+        );
+        let tp = &t as *const NslTensor as i64;
+
+        assert_eq!(nsl_zero3_note_param(tp, 0), 0);
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
+        zero3_register(tp); // REAL carve — rank 1 takes theta[4..8]
+        assert!(t.data.is_null(), "carve must drop the full replica");
+
+        // Substituted all_gather (see the note above).
+        let full_bytes = 8 * std::mem::size_of::<f64>();
+        let transient = crate::memory::checked_alloc_zeroed(full_bytes) as *mut f64;
+        unsafe { std::ptr::copy_nonoverlapping(full0.as_ptr(), transient, 8) };
+        crate::tensor::NslTensor::from_ptr(tp).data = transient as *mut c_void;
+
+        // Substituted reduce_scatter, plus the shard/handshake state it sets.
+        {
+            let mut g = ZERO3_TABLE.lock().unwrap();
+            let e = g.as_mut().unwrap().get_mut(&tp).unwrap();
+            e.state = ParameterResidency::GatheredTemporary;
+            let s = e.elem.as_mut().expect("carved");
+            assert_eq!(s.shard, 4, "ws=2 carve must halve an 8-element param");
+            assert_eq!(s.elem_bytes, 8, "f64 param");
+            let buf = ShardBuf::alloc(s.shard * s.elem_bytes, 0);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    grad_full.as_ptr().add(4),
+                    buf.ptr() as *mut f64,
+                    4,
+                );
+            }
+            s.grad = Some(buf);
+            s.grad_ready = true;
+        }
+
+        // Real allocator: SHARD-sized, and `optim_elems` credited with the
+        // shard — 8, not the 16 a replicated pair would credit. Unlike the
+        // ws=1 test's identical-looking delta, this one discriminates.
+        let elems_before = ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed);
+        let m_ptr = nsl_zero3_alloc_elem_moment(tp, 0);
+        let v_ptr = nsl_zero3_alloc_elem_moment(tp, 0);
+        for (name, p) in [("m", m_ptr), ("v", v_ptr)] {
+            assert_eq!(
+                crate::tensor::NslTensor::from_ptr(p).len,
+                4,
+                "{name}: at ws=2 the moment must be the SHARD, not the parameter"
+            );
+        }
+        assert_eq!(
+            ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed) - elems_before,
+            8,
+            "2 moments x 4 shard elements; 16 means the fill handed back \
+             full replicas and ZeRO-3 removed nothing"
+        );
+
+        let (lr, b1, b2, eps, wd) = (0.002f64, 0.9f64, 0.95f64, 1e-8f64, 0.01f64);
+        let (bc1, bc2) = (1.0 / (1.0 - b1), 1.0 / (1.0 - b2)); // t=1
+        assert_eq!(
+            nsl_zero3_elem_adamw_step(
+                tp, m_ptr, v_ptr, 0, lr, b1, 1.0 - b1, b2, 1.0 - b2, eps, wd, bc1, bc2,
+            ),
+            0
+        );
+
+        let bits = |xs: &[f64]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let m: Vec<f64> = unsafe {
+            std::slice::from_raw_parts(
+                crate::tensor::NslTensor::from_ptr(m_ptr).data as *const f64,
+                4,
+            )
+        }
+        .to_vec();
+        let v: Vec<f64> = unsafe {
+            std::slice::from_raw_parts(
+                crate::tensor::NslTensor::from_ptr(v_ptr).data as *const f64,
+                4,
+            )
+        }
+        .to_vec();
+        let stepped: Vec<f64> =
+            unsafe { std::slice::from_raw_parts(transient as *const f64, 8) }.to_vec();
+        let persisted: Vec<f64> = {
+            let g = ZERO3_TABLE.lock().unwrap();
+            let s = g.as_ref().unwrap()[&tp].elem.as_ref().unwrap();
+            unsafe { std::slice::from_raw_parts(s.slice.ptr() as *const f64, 4) }.to_vec()
+        };
+        crate::tensor::nsl_tensor_free(m_ptr);
+        crate::tensor::nsl_tensor_free(v_ptr);
+
+        // Twin: the fused step over THIS RANK'S region only.
+        let mut theta2 = full0[4..].to_vec();
+        let mut grad2 = grad_full[4..].to_vec();
+        let mut m2 = vec![0.0f64; 4];
+        let mut v2 = vec![0.0f64; 4];
+        let mut shape4 = vec![4i64];
+        let (sh4, st) = (shape4.as_mut_ptr(), strides.as_mut_ptr());
+        let mk = |d: *mut f64| owned_cpu_tensor(d as *mut c_void, sh4, st, 4);
+        let (t2, m2t, v2t, g2) = (
+            mk(theta2.as_mut_ptr()),
+            mk(m2.as_mut_ptr()),
+            mk(v2.as_mut_ptr()),
+            mk(grad2.as_mut_ptr()),
+        );
+        crate::fase_step::nsl_fase_fused_adamw_step(
+            &t2 as *const NslTensor as i64,
+            &m2t as *const NslTensor as i64,
+            &v2t as *const NslTensor as i64,
+            &g2 as *const NslTensor as i64,
+            lr,
+            b1,
+            1.0 - b1,
+            b2,
+            1.0 - b2,
+            eps,
+            wd,
+            bc1,
+            bc2,
+        );
+
+        // The decisive pair. Moments at their OWN base: with `m[off + i]`
+        // the shard-sized buffer would keep its zeros here (and scribble
+        // past its end).
+        assert_eq!(
+            bits(&m),
+            bits(&m2),
+            "first moment must be written at the SLICE base — m[0..shard] \
+             holds rank 1's update, not m[rank*shard..]"
+        );
+        assert_eq!(bits(&v), bits(&v2), "second moment must be slice-local");
+        // θ at the region offset, and NOWHERE else.
+        assert_eq!(
+            bits(&stepped[..4]),
+            bits(&full0[..4]),
+            "rank 1 wrote into rank 0's region of the gathered tensor"
+        );
+        assert_eq!(
+            bits(&stepped[4..]),
+            bits(&theta2),
+            "rank 1's region must be BIT-identical to the fused step"
+        );
+        assert_eq!(
+            bits(&persisted),
+            bits(&theta2),
+            "the step must persist its region into the slice"
+        );
+
+        unsafe { crate::memory::checked_free(transient as *mut u8, full_bytes) };
+        crate::tensor::NslTensor::from_ptr(tp).data = std::ptr::null_mut();
         nsl_zero_destroy();
     }
 

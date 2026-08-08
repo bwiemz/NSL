@@ -661,10 +661,21 @@ fn zero3_tensor_granular_moments_are_owner_only_gpu() {
 /// m only.
 ///
 /// Deliberately does NOT carry the θ-probing callback that
-/// `zero3_muon_overlap_and_callback_touch_gpu` uses: that test's SINGLE-RANK
-/// baseline aborts with a glibc "double free or corruption" on main today
-/// (pre-existing, reproduced at f9d0e02 with no ZeRO flags in play), so it
-/// cannot certify anything about this composition.
+/// `zero3_muon_overlap_and_callback_touch_gpu` uses — because that gate
+/// ALREADY certifies it. It runs the same owner-only deferred fill with a
+/// per-micro-batch `on_step` that reads gathered θ, and its whole-stream
+/// parity assertion compares those probe values, so a fill that dropped a
+/// non-owner's `m` or mis-timed against the callback's read breaks it.
+/// What this gate adds on top is the RAGGED (63-dim) shape and the
+/// `optim_elems` partition number, neither of which that gate asserts.
+///
+/// (An earlier revision of this comment claimed the sibling gate was
+/// broken on main with a glibc "double free or corruption". It is not:
+/// it passes, and the composition it covers passes with it. The abort
+/// that prompted the claim was a stale `libnsl_runtime.a` in a shared
+/// CARGO_TARGET_DIR — see the mtime fallback at
+/// `crates/nsl-codegen/src/linker.rs` — which surfaces as
+/// "CUDA support not compiled", not as a double free.)
 #[test]
 #[ignore = "requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)"]
 fn zero3_muon_moments_are_owner_only_gpu() {
@@ -913,6 +924,15 @@ fn srbf16_zero3_refuses_without_elementwise_and_on_ragged_params() {
 /// global element. Un-oddified fixture: every streamed param divides by 2,
 /// so the whole streamed set is elementwise (mixed mode is REFUSED under
 /// SR — that is the ragged refusal above, not this gate).
+///
+/// Item C also carries the moment-partition instrument here. Two distinct
+/// regressions hide from parity alone on this arm: (a) a fill that kept
+/// full replicated moments for SR params — parity green, `optim_elems`
+/// never shrinks, and the PR's headline claim is false for the composed
+/// config; (b) an SR step that reads slice-sized moments at `+ off_bytes`
+/// — every rank aborts, which parity DOES catch, but only because the
+/// length assert exists. The `full` baseline is the same composed config
+/// at `--devices 1`, where each slice is the whole parameter.
 #[test]
 #[ignore = "requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)"]
 fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
@@ -997,6 +1017,7 @@ fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
         "some elementwise steps took the plain f32 arm:\n{teardown}"
     );
 
+<<<<<<< HEAD
     // The SR backend's OWN teardown must run on a composed run. It did not
     // before review: nsl_weight_stream_teardown returned after the zero3
     // arm, so SRBF16_ACTIVE leaked past the train block (inverting the
@@ -1029,5 +1050,48 @@ fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
         "the SR backend reports 0 steps on a run that executed {sr_steps} \
          composed SR steps — tooling keyed on this counter would conclude \
          stochastic rounding never ran:\n{sr_line}"
+    );
+
+
+    // Item C: the SLICE allocator ran for the SR-carved params too — one m
+    // and one v each. A fill that special-cased bf16-sr back onto a full
+    // `zeros_like` (to keep the un-converted SR step happy) reads 0 here
+    // while every assertion above stays green.
+    let elem_moments = counter_field(teardown, "elem_moments").expect("elem_moments field");
+    assert_eq!(
+        elem_moments,
+        elem_params * 2,
+        "expected one m and one v SLICE per bf16-sr elementwise param — a \
+         fill that kept replicated moments for SR reads 0 here:\n{teardown}"
+    );
+
+    // `full` = the same composed config at ws=1, where every streamed param
+    // is a 1/1 slice and rank 0 therefore allocates the WHOLE sharded
+    // optimizer surface. This is the only number that moves when the SR
+    // moments stop being sharded — parity is invariant to it.
+    let save_ws1 = tmp.join("sr_ws1.nslm");
+    let mut ws1_args: Vec<&str> = flags_common.to_vec();
+    ws1_args.extend_from_slice(&[
+        "--zero-stage",
+        "3",
+        "--devices",
+        "1",
+        "--collectives",
+        "sim-gpu",
+        "--zero-elementwise",
+    ]);
+    let ws1 = run_nsl_with_env(
+        &program(&save_ws1, true),
+        "sr_ws1",
+        &ws1_args,
+        &[("NSL_ZERO_COUNTER", "1")],
+        600,
+    );
+    assert!(ws1.success, "ws=1 composed SR run failed:\n{}", ws1.stderr);
+    assert_moment_partition(
+        optim_elems(&ws1.stderr, 1, 0),
+        optim_elems(&sr.stderr, 2, 0),
+        optim_elems(&sr.stderr, 2, 1),
+        "bf16-sr x zero3 elementwise moments",
     );
 }

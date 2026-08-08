@@ -4872,18 +4872,34 @@ impl Compiler<'_> {
     ///
     /// **`owner_gated_moments` is the STAGES-1/2 predicate, not "ZeRO is
     /// on".** That is the whole invariant: the subset is valid exactly when
-    /// the moments were owner-gated, and stage 3 deliberately does the
-    /// opposite — it keeps optimizer state REPLICATED (see the note at the
-    /// allocation site), so a stage-3 program reaching this arm would step
-    /// only its byte-balanced share and zero every other parameter's
-    /// accumulator, freezing most of the model per rank with the post-step
-    /// broadcast hiding it. Stage 3 cannot reach here today, but only via
-    /// two unrelated guards (it is refused unless `--layerwise-accum`, and
-    /// the layerwise arm short-circuits above this one) — nothing pins that
-    /// coupling, so the predicate names the invariant instead of relying on
-    /// it. The old `&& !zero_enabled` exclusion was safe under `>= 1` only
-    /// because it disabled batching for EVERY stage; narrowing the exclusion
-    /// without narrowing the predicate is what opened the gap.
+    /// every parameter's moments were owner-gated, which is true for stages
+    /// 1/2 and for no other configuration. The old `&& !zero_enabled`
+    /// exclusion was safe under `>= 1` only because it disabled batching for
+    /// EVERY stage; narrowing the exclusion without narrowing the predicate
+    /// is what opened the gap.
+    ///
+    /// **Stage 3 is not a third value of this boolean — it has no correct
+    /// value.** Item C made stage-3 moments per-parameter: the deferred fill
+    /// (`emit_deferred_moment_fill`, see the note at the allocation site)
+    /// picks `MomentFill::Elementwise` (a 1/ws SLICE), `OwnerGated` (NULL on
+    /// non-owners) or `Full` (replicated — tied / view-rooted / epilogue
+    /// params every rank must step) per entry. `nsl_zero_owned_step_indices`
+    /// describes none of those three, so `true` would skip the replicated
+    /// params on non-owner ranks — the very freeze this paragraph used to
+    /// warn about — while `false` hands the launcher the null placeholders
+    /// its own assert exists to reject. The invariant for stage 3 is
+    /// therefore "must not reach this launcher at all", not "must be
+    /// correctly parameterised".
+    ///
+    /// That is structural, not incidental: stage 3 is refused unless
+    /// `csla_active` (and `--weight-stream`, itself requiring
+    /// `--layerwise-accum`), and both call sites sit in the `!csla_active`
+    /// sub-arm — the SAME local, so `stage 3 => csla_active => short-circuit`
+    /// is one implication, not a coincidence of two guards. The CSLA
+    /// in-window batched arm is independently gated on
+    /// `zero3.is_none() && zero3_elem.is_none()`. Verified by construction:
+    /// a hard refusal planted at the top of this function never fires under
+    /// any shipped stage-3 configuration.
     #[allow(clippy::too_many_arguments)]
     fn emit_fused_multi_launch(
         &mut self,
