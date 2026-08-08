@@ -139,7 +139,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
 }
 
 extern "C" fn nsl_zero_count_atexit() {
-    let (rank, ws, all_reduce, broadcast, optim_elems, bucket_members) =
+    let (rank, ws, all_reduce, broadcast, optim_elems, bucket_members, repl_optim_elems) =
         crate::zero::zero_counter_snapshot();
     // EVERY rank prints this line to the SAME inherited stderr pipe, often
     // exiting simultaneously. `eprintln!` issues one write(2) per format
@@ -149,8 +149,15 @@ extern "C" fn nsl_zero_count_atexit() {
     // write_all under PIPE_BUF is atomic on POSIX pipes.
     let rs = crate::zero::ZERO_REDUCE_SCATTER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let ag = crate::zero::ZERO_ALL_GATHER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    // `repl_optim_elems` is APPENDED, never inserted: every live parser in the
+    // gates is label-anchored with a trailing space (` optim_elems=` etc.)
+    // precisely so this line stays extensible, and the one historical
+    // `ends_with("reduce_scatter=6")` parser broke the day item 11 appended
+    // `all_gather=`. Keep new fields at the end and keep the trailing space
+    // before `\n` implicit — a label anchored as ` label=` needs the SPACE
+    // that precedes it, which only holds for non-first fields.
     let line = format!(
-        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems} bucket_members={bucket_members} reduce_scatter={rs} all_gather={ag}\n"
+        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems} bucket_members={bucket_members} reduce_scatter={rs} all_gather={ag} repl_optim_elems={repl_optim_elems}\n"
     );
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(line.as_bytes());
@@ -233,7 +240,7 @@ extern "C" fn nsl_fase_fused_step_count_atexit() {
     // writes one, and a gate pairing them by ARRIVAL ORDER against per-rank
     // facts (which parameters that rank owns) would silently cross them
     // whenever the ranks happen to exit in the other order.
-    let (rank, _ws, _ar, _bc, _oe, _bm) = crate::zero::zero_counter_snapshot();
+    let (rank, _ws, _ar, _bc, _oe, _bm, _repl) = crate::zero::zero_counter_snapshot();
     let report = format!(
         "[fase-fused] optimizer fused-step launches: {}\n\
          [fase-fused] block-table builds: {}\n\

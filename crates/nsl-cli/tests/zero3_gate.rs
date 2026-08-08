@@ -355,13 +355,65 @@ fn counter_field(line: &str, label: &str) -> Option<u64> {
 /// trailing newline can land immediately before the (single-write) counter
 /// line — same reason the all_gather parser below uses `contains`.
 fn optim_elems(stderr: &str, ws: u64, rank: u64) -> u64 {
+    zero_line_field(stderr, ws, rank, "optim_elems")
+}
+
+/// `repl_optim_elems=N` — the moment elements this rank holds as a FULL
+/// REPLICA (the `MomentFill::Full` arm: tied / view-rooted / epilogue params).
+///
+/// This is the half `optim_elems` deliberately excludes, and until it was
+/// counted NOTHING in the tree could see it: `assert_moment_partition` below
+/// stays green for an arbitrarily large replicated remainder, because `Full`
+/// drops out of BOTH sides of the `r0 + r1 == full` identity.
+fn repl_optim_elems(stderr: &str, ws: u64, rank: u64) -> u64 {
+    zero_line_field(stderr, ws, rank, "repl_optim_elems")
+}
+
+/// Read a `label=N` field off the `[zero] ws=W rank=R ...` atexit line.
+///
+/// The needle carries a LEADING SPACE on purpose. `counter_field` matches by
+/// substring, and `optim_elems=` is a substring of `repl_optim_elems=` — the
+/// unanchored form reads the right value today only because `optim_elems`
+/// happens to appear first on the line. Reorder the fields and every
+/// partition assertion in this file would silently compare the replica count
+/// against itself and stay green. This file already carries two scars from
+/// exactly that class of parser (`ends_with` on an appendable counter line,
+/// and `elem_params=` being a substring of `sr_elem_params=`), so anchor it.
+fn zero_line_field(stderr: &str, ws: u64, rank: u64, label: &str) -> u64 {
     let needle = format!("[zero] ws={ws} rank={rank}");
     let line = stderr
         .lines()
         .find(|l| l.contains(&needle))
         .unwrap_or_else(|| panic!("no '{needle}' line in stderr:\n{stderr}"));
-    counter_field(line, "optim_elems")
-        .unwrap_or_else(|| panic!("no optim_elems= field in line: {line}"))
+    counter_field(line, &format!(" {label}"))
+        .unwrap_or_else(|| panic!("no {label}= field in line: {line}"))
+}
+
+/// The replicated moment surface does NOT shrink with world size — every rank
+/// holds a full copy — so its identity is `r0 == r1 == full`, not
+/// `r0 + r1 == full`.
+///
+/// Asserting `> 0` is the anti-vacuity half and it is doing real work: it
+/// pins that the shipped fixture genuinely HAS replicated params (embedding +
+/// final norm, 8320 elements measured on this box). Without it, a future
+/// change that made every param elementwise would drive this to 0 and the
+/// equality assertions would hold vacuously.
+fn assert_replica_surface_is_flat(full: u64, r0: u64, r1: u64, ctx: &str) {
+    assert!(
+        full > 0,
+        "{ctx}: the ws=1 run reported NO replicated moments — either the \
+         fixture has no epilogue params (making this assertion vacuous) or \
+         nsl_zero_note_replicated_optim_alloc is not being emitted"
+    );
+    assert_eq!(
+        (r0, r1),
+        (full, full),
+        "{ctx}: replicated moments must be a FULL copy on every rank \
+         (r0={r0} r1={r1} full={full}). If this shrank, the replicated set \
+         started sharding — a real improvement, but it changes the \
+         `optim_elems` denominator too and both identities must be revisited \
+         together."
+    );
 }
 
 /// Item C's shared assertion: the sharded moment surface is a COMPLETE,
@@ -559,6 +611,26 @@ fn zero3_elementwise_bit_exact_vs_single_rank_gpu() {
         optim_elems(&z3.stderr, 2, 0),
         optim_elems(&z3.stderr, 2, 1),
         "zero3 elementwise moments",
+    );
+
+    // The OTHER half of the moment surface, which the partition above cannot
+    // see. Under `--zero-elementwise` the streamed set shards exactly (the
+    // assertion above), but every param with no `blocks.N` key — embedding,
+    // final norm, LM head — keeps FULL m and v on EVERY rank, and `Full` is
+    // excluded from `optim_elems` on both sides of the identity precisely so
+    // that identity keeps holding. Measured on this fixture: the sharded half
+    // halves 65792 -> 32896+32896 while this one sits at 8320 per rank
+    // regardless of world size. That is 11% of the moment surface at ws=1 and
+    // 20% of each rank's at ws=2, and the fraction GROWS with ws because only
+    // the counted half shrinks.
+    //
+    // Pinning it here means the remainder can never again grow unobserved,
+    // and it is the before-measurement for sharding it.
+    assert_replica_surface_is_flat(
+        repl_optim_elems(&ws1.stderr, 1, 0),
+        repl_optim_elems(&z3.stderr, 2, 0),
+        repl_optim_elems(&z3.stderr, 2, 1),
+        "zero3 elementwise replicated remainder",
     );
 }
 

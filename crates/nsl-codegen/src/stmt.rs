@@ -4691,8 +4691,23 @@ impl Compiler<'_> {
             // full m/v. Deliberately NOT noted against `optim_elems` — see
             // that counter's doc for why counting them would break the
             // `r0 + r1 == full` partition identity.
+            //
+            // It IS noted against the replica counter. Before that counter
+            // existed this arm was invisible to every instrument in the tree:
+            // the partition assertion the ZeRO-3 gates rest on stayed green
+            // for an arbitrarily large replicated remainder, because `Full`
+            // dropped out of BOTH sides of the identity. The epilogue set is
+            // not a corner case — it is every parameter with no `blocks.N`
+            // key, i.e. embedding / final norm / LM head.
             MomentFill::Full => {
-                self.emit_moment_zeros_like(builder, param_i, idx, precision_list, offload)?
+                let real =
+                    self.emit_moment_zeros_like(builder, param_i, idx, precision_list, offload)?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_zero_note_replicated_optim_alloc",
+                    &[real],
+                )?;
+                real
             }
         })
     }

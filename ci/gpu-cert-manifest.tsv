@@ -24,6 +24,8 @@ crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_parity_fused_lmce_gpu	gpu	requi
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_fused_lmce_streams_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_weight_stream_offload_parity_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_mpartial_surface_shrinks_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/csla_layerwise_gate.rs	weight_stream_residency_is_bit_exact_and_moves_no_bytes_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/csla_layerwise_gate.rs	weight_stream_residency_composes_with_arena_pack_paths_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_capture_replay_bitexact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_bf16_storage_captures_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_survives_forced_first_op_divergence_gpu	gpu	requires CUDA GPU
@@ -364,6 +366,10 @@ crates/nsl-runtime/src/tensor/activation.rs	swiglu_gate_backward_gpu_f32_bit_exa
 crates/nsl-runtime/src/tensor/ad_ops.rs	embedding_backward_deterministic_gpu_matches_cpu_and_is_stable	gpu	GPU: requires CUDA device
 crates/nsl-runtime/src/tensor/ad_ops.rs	test_gpu_ce_backward_matches_cpu_bounce	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/mod.rs	sum_sq_gpu_matches_cpu_reference	gpu	GPU: requires CUDA device
+crates/nsl-runtime/src/tensor_parallel/collective.rs	a_real_one_rank_communicator_initializes_and_destroys	gpu	requires CUDA GPU + a real libnccl (--features nccl)
+crates/nsl-runtime/src/tensor_parallel/collective.rs	nccl_device_collectives_actually_execute_on_this_gpu	gpu	requires CUDA GPU + a real libnccl (--features nccl)
+crates/nsl-runtime/src/tensor_parallel/collective.rs	unmapped_dtypes_are_refused_before_reaching_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
+crates/nsl-runtime/src/tensor_parallel/collective.rs	the_trait_methods_short_circuit_at_ws1_without_entering_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/tests/dlpack_unsupported_dtype_refusal.rs	zz_dlpack_refusal_child	unclassified	child process — driven by the gates below via re-exec
 crates/nsl-runtime/tests/fp8_dispatcher.rs	cuda_feature_required	cpu-stub	FP8 dispatcher tests require the cuda feature + sm_89+
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_cast_of_a_gpu_tensor_matches_the_cpu_run	gpu	requires CUDA GPU

@@ -131,11 +131,22 @@ fn sim_gpu_two_rank_parity_bit_exact() {
             "wrong collective counts: {line}"
         );
     }
+    // Token-exact, not substring: the `[zero]` line also carries
+    // `repl_optim_elems=` (the replicated-moment remainder), and
+    // `optim_elems=` is a SUBSTRING of it. `split("optim_elems=").nth(1)`
+    // returns the right value today only because `optim_elems` happens to
+    // appear first on the line — reorder the fields and this silently reads
+    // the replica count instead, with `r0 + r1 == full` then comparing a
+    // constant against itself. Splitting on whitespace first makes
+    // `repl_optim_elems=8320` a token that simply does not start with
+    // `optim_elems=`. (zero_spmd_gate.rs's twin already does it this way.)
     let elems = |s: &str, pat: &str| -> u64 {
         s.lines()
             .find(|l| l.contains(pat))
-            .and_then(|l| l.split("optim_elems=").nth(1))
-            .and_then(|r| r.split_whitespace().next())
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find_map(|tok| tok.strip_prefix("optim_elems="))
+            })
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     };
@@ -283,6 +294,20 @@ fn sim_gpu_stage2_chunked_subgroups_bit_exact() {
 /// single-GPU box NCCL refuses multiple ranks per device — the run must
 /// fail FAST with the documented symmetric ncclInvalidUsage refusal on
 /// every rank (never a hang, never a silent success).
+///
+/// The `cfg!(feature = "nccl")` split is load-bearing, not decoration. This
+/// gate used to accept `contains("ncclInvalidUsage") || contains("NCCL
+/// backend init failed")` on the failure arm, and the second disjunct is
+/// EXACTLY what the `#[cfg(not(feature = "nccl"))]` stub in
+/// `zero.rs::make_nccl_backend` prints ("built WITHOUT the nccl feature").
+/// `scripts/gpu-cert.sh` builds the cert lane with `cuda` and no `nccl`, so
+/// the gate reported PASS in the one lane that runs it while certifying
+/// nothing whatsoever about NCCL — it never linked libnccl, never minted a
+/// unique id, never called ncclCommInitRank. A missing libnccl.so.2, a
+/// bootstrap-socket failure and a `-3` missing-shm-path all produced the
+/// same green. Splitting on the feature makes the non-NCCL build assert the
+/// stub EXACTLY and say out loud that it certified nothing, so the two
+/// outcomes can never be confused again.
 #[test]
 #[ignore = "requires CUDA GPU + nccl-featured build"]
 fn nccl_two_rank_parity_or_documented_refusal() {
@@ -290,6 +315,37 @@ fn nccl_two_rank_parity_or_documented_refusal() {
     assert!(base.success, "GPU baseline failed:\n{}", base.stderr);
 
     let spmd = run_gpu("nccl2", &["--devices", "2", "--collectives", "nccl"]);
+
+    if !cfg!(feature = "nccl") {
+        // This binary cannot reach NCCL at all. Pin the stub verbatim so the
+        // run cannot be mistaken for a certified same-device refusal, and
+        // refuse to let the ncclInvalidUsage string appear (it would mean the
+        // feature detection here is lying about the build).
+        assert!(
+            !spmd.success,
+            "a build without --features nccl must refuse --collectives nccl, \
+             not succeed:\n{}",
+            spmd.stderr
+        );
+        assert!(
+            spmd.stderr.contains("built WITHOUT the nccl feature"),
+            "expected the not-built-with-nccl stub refusal, got:\n{}",
+            spmd.stderr
+        );
+        assert!(
+            !spmd.stderr.contains("ncclInvalidUsage"),
+            "a non-nccl build reported a real NCCL error code — the cfg! \
+             feature split disagrees with the linked runtime:\n{}",
+            spmd.stderr
+        );
+        eprintln!(
+            "[cert] NCCL NOT CERTIFIED by this run: binary built without \
+             --features nccl. Rebuild with `--features nccl` and \
+             NSL_NCCL_LIB_DIR set to certify the transport."
+        );
+        return;
+    }
+
     if spmd.success {
         // Multi-GPU hardware: demand full parity + counters.
         assert_eq!(
@@ -307,24 +363,36 @@ fn nccl_two_rank_parity_or_documented_refusal() {
                 .lines()
                 .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
                 .unwrap_or_else(|| panic!("no [zero] line for rank {rank}"));
+            // 6/12, NOT the 12/18 this arm carried since 2026-07-20. Those
+            // were the pre-`f1030f76` counts from the `model.to(device)` bug
+            // that left one CPU f64 group alongside the GPU bucket; the
+            // sim-gpu twin above corrected to 6/12 and this arm was missed
+            // because single-GPU hardware never takes it. It has never
+            // executed, so the staleness could not surface as a failure.
             assert!(
-                line.contains("all_reduce=12 ") && line.contains("broadcast=18 "),
+                line.contains("all_reduce=6 ") && line.contains("broadcast=12 "),
                 "wrong collective counts: {line}"
             );
         }
     } else {
-        // Single-GPU hardware: the documented loud, symmetric refusal.
+        // Single-GPU hardware: the documented loud, symmetric refusal. With
+        // the feature compiled in, only the REAL NCCL error code is
+        // acceptable — "NCCL backend init failed" alone is the shape the
+        // stub also produces.
         assert!(
-            spmd.stderr.contains("ncclInvalidUsage")
-                || spmd.stderr.contains("NCCL backend init failed"),
-            "expected the documented NCCL same-device refusal, got:\n{}",
+            spmd.stderr.contains("ncclInvalidUsage"),
+            "expected the documented NCCL same-device refusal \
+             (ncclInvalidUsage), got:\n{}",
             spmd.stderr
         );
-        assert!(
-            spmd.stderr.contains("rank 0") && spmd.stderr.contains("rank 1"),
-            "refusal must be symmetric across ranks:\n{}",
-            spmd.stderr
-        );
+        for rank in 0..2 {
+            assert!(
+                spmd.stderr
+                    .contains(&format!("NCCL backend init failed on rank {rank}")),
+                "refusal must be symmetric across ranks (rank {rank} missing):\n{}",
+                spmd.stderr
+            );
+        }
     }
 }
 
