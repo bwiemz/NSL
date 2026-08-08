@@ -27,7 +27,9 @@
 //! * `void nsl_model_destroy(NslModel*)` against `-> i64`.
 
 use nsl_abi::{parse_c_prototypes, parse_externs_in_file, AbiScalar, ParsedType};
-use nsl_codegen::c_header::emit;
+use nsl_codegen::c_header::{
+    emit, ExportDevice, ExportDtype, ExportInfo, ExportParamInfo, ExportTypeInfo,
+};
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -80,16 +82,49 @@ fn generated_header_prototypes_agree_with_runtime_externs() {
         externs.len()
     );
 
+    // The header is OURS: every spelling in it is one `c_header.rs` chose, so
+    // an unmodelled one means `abi_from_c` cannot see a type we emit — a hole
+    // in the gate, not a "cannot verify". (The runtime side keeps
+    // cannot-verify semantics: it legitimately contains types this crate does
+    // not model.)
+    let unmodelled: Vec<String> = protos
+        .iter()
+        .flat_map(|p| {
+            p.params
+                .iter()
+                .chain(p.ret.iter())
+                .filter_map(move |t| match t {
+                    ParsedType::Unknown(s) if !s.contains('*') => {
+                        Some(format!("  {}: `{s}`", p.name))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    assert!(
+        unmodelled.is_empty(),
+        "the generated header uses {} C type spelling(s) `abi_from_c` does not \
+         model, so nothing checks them — teach the mapping or change the \
+         emitter:\n{}",
+        unmodelled.len(),
+        unmodelled.join("\n")
+    );
+
     let mut checked = 0usize;
     let mut problems = Vec::new();
     for p in &protos {
-        let Some(imp) = externs.iter().find(|e| e.name == p.name) else {
+        // ALL same-name externs, not the first: `#[cfg]` variants of one
+        // symbol must agree with the header individually (nsl-abi learned this
+        // the same way — see its `every_same_name_variant_must_agree_not_just_one`).
+        let impls: Vec<_> = externs.iter().filter(|e| e.name == p.name).collect();
+        if impls.is_empty() {
             // Not every header name is an `extern "C"` in this one file (the
             // `NslExportFn` typedef is checked by the test below). Names that
             // match nothing are reported by the coverage assert, not here.
             continue;
-        };
+        }
         checked += 1;
+        for imp in impls {
         if p.params.len() != imp.params.len() {
             problems.push(format!(
                 "  {}: header declares {} param(s) [{}], runtime takes {} [{}]",
@@ -145,13 +180,35 @@ fn generated_header_prototypes_agree_with_runtime_externs() {
             }
             (None, None) => {}
         }
+        }
     }
 
-    // Non-vacuity, part 2: matching zero names would make the loop above a
-    // no-op. Every lifecycle/error prototype in the fixed surface is an
-    // `extern "C"` in c_api/mod.rs, so the floor is the size of that set.
+    // Non-vacuity, part 2 — by NAME, not by count. A floor set just under the
+    // current value (the first draft said `>= 5`) lets a symbol silently drop
+    // out of the header, which is the other half of the drift this gate is
+    // for: the runtime keeps the function, the header stops describing it,
+    // and a host writing its own extern declaration is back to guessing.
+    for required in [
+        "nsl_abi_version",
+        "nsl_model_create",
+        "nsl_model_destroy",
+        "nsl_model_call",
+        "nsl_get_last_error",
+        "nsl_clear_error",
+    ] {
+        assert!(
+            protos.iter().any(|p| p.name == required),
+            "the generated header no longer declares `{required}` — either it was \
+             dropped from the emitter, or the parser stopped seeing it"
+        );
+        assert!(
+            externs.iter().any(|e| e.name == required),
+            "`{required}` is declared in the header but is no longer an extern \"C\" \
+             in c_api/mod.rs"
+        );
+    }
     assert!(
-        checked >= 5,
+        checked >= 6,
         "only {checked} header prototype(s) matched a runtime extern — the \
          names diverged, so this gate compared almost nothing"
     );
@@ -247,4 +304,183 @@ fn the_c_type_mapping_does_not_silently_accept_nonsense() {
     // Unmodelled spellings must be None (-> Unknown -> "cannot verify"),
     // never a guess.
     assert_eq!(abi_from_c("NslModel"), None);
+}
+
+/// One `@export` per scalar dtype, so every arm of the slot mapping is
+/// rendered into a real prototype.
+fn every_scalar_dtype_export() -> ExportInfo {
+    let dtypes = [
+        ExportDtype::I8,
+        ExportDtype::I16,
+        ExportDtype::I32,
+        ExportDtype::I64,
+        ExportDtype::U8,
+        ExportDtype::U16,
+        ExportDtype::U32,
+        ExportDtype::U64,
+        ExportDtype::F32,
+        ExportDtype::F64,
+        ExportDtype::F16,
+        ExportDtype::BF16,
+        ExportDtype::Bool,
+    ];
+    let mut params = vec![ExportParamInfo {
+        name: "x".into(),
+        ty: ExportTypeInfo::Tensor {
+            shape: vec!["B".into(), "8".into()],
+            dtype: ExportDtype::F32,
+            device: ExportDevice::Any,
+        },
+    }];
+    for (i, dt) in dtypes.iter().enumerate() {
+        params.push(ExportParamInfo {
+            name: format!("s{i}"),
+            ty: ExportTypeInfo::Scalar(*dt),
+        });
+    }
+    ExportInfo {
+        symbol_name: "forward".into(),
+        raw_name: "forward".into(),
+        params,
+        return_type: ExportTypeInfo::Tensor {
+            shape: vec!["B".into(), "4".into()],
+            dtype: ExportDtype::F32,
+            device: ExportDevice::Any,
+        },
+    }
+}
+
+/// The `@export` prototypes must describe the slots their wrapper reads.
+///
+/// This is the half the first version of this gate could not see: it built the
+/// header with an EMPTY export list, so `emit_prototype`/`emit_param` never
+/// ran. A review found a live drift hiding there — `c_type_for_scalar` mapped
+/// `ExportDtype` independently of `c_wrapper::cranelift_type_for_scalar`,
+/// which collapses everything but I32/I64/F32/F64 into a 64-bit slot, so
+/// `@export fn f(..., k: u8)` was declared `uint8_t k` against a callee
+/// reading a full register. Same defect as the `NslExportFn` typedef, one
+/// function away from it.
+#[test]
+fn export_prototypes_agree_with_the_wrapper_signature_codegen_builds() {
+    use cranelift_codegen::ir::types;
+    use cranelift_codegen::isa::CallConv;
+
+    let info = every_scalar_dtype_export();
+    let header = emit(std::slice::from_ref(&info), "exports");
+    let protos = parse_c_prototypes(&header);
+    let proto = protos
+        .iter()
+        .find(|p| p.name == info.symbol_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "no prototype for the `{}` export in:\n{header}",
+                info.symbol_name
+            )
+        });
+
+    let sig = nsl_codegen::c_wrapper::build_c_abi_wrapper_signature(&info, CallConv::SystemV);
+
+    assert_eq!(
+        proto.params.len(),
+        sig.params.len(),
+        "prototype declares {} param(s) [{}]; the wrapper takes {}",
+        proto.params.len(),
+        render_all(&proto.params),
+        sig.params.len()
+    );
+
+    let mut problems = Vec::new();
+    for (i, (h, emitted)) in proto.params.iter().zip(sig.params.iter()).enumerate() {
+        let want = match emitted.value_type {
+            types::I8 => AbiScalar::Int(8),
+            types::I16 => AbiScalar::Int(16),
+            types::I32 => AbiScalar::Int(32),
+            types::I64 => AbiScalar::Int(64),
+            types::F32 => AbiScalar::Float(32),
+            types::F64 => AbiScalar::Float(64),
+            other => panic!("teach this gate the new slot type {other:?} at param {i}"),
+        };
+        // Unknown here would mean the parser could not read a spelling the
+        // emitter produced — a gate hole, not a pass.
+        match h {
+            ParsedType::Known(k) if *k == want => {}
+            ParsedType::Known(k) => problems.push(format!(
+                "  param {i}: header says {}, wrapper reads {}",
+                render(&ParsedType::Known(*k)),
+                render(&ParsedType::Known(want))
+            )),
+            ParsedType::Unknown(s) => problems.push(format!(
+                "  param {i}: header spelling `{s}` is not modelled by abi_from_c, so \
+                 nothing checks it"
+            )),
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "{} @export prototype disagreement(s) with the wrapper signature — a C host \
+         passes the declared width into a callee reading the slot width:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+
+    let ret = proto.ret.as_ref().expect("prototype must return a status");
+    assert_eq!(sig.returns.len(), 1);
+    assert_eq!(
+        *ret,
+        ParsedType::Known(AbiScalar::Int(32)),
+        "@export status is {} in the header, I32 in the wrapper",
+        render(ret)
+    );
+}
+
+/// The header's convenience inlines must not shadow runtime symbols.
+///
+/// They were emitted as `static inline int32_t nsl_model_forward(...)` /
+/// `nsl_model_backward(...)`, both of which the runtime exports with different
+/// signatures — `nsl_model_backward` takes a `GradContext*` first argument.
+/// A host that included the header and called either name silently bound to
+/// the file-local inline instead of the library symbol.
+#[test]
+fn header_inlines_do_not_shadow_runtime_symbols() {
+    let mut info = every_scalar_dtype_export();
+    info.symbol_name = "forward".into();
+    let mut backward = info.clone();
+    backward.symbol_name = "backward".into();
+    let header = emit(&[info, backward], "shadow");
+
+    let capi = workspace_root().join("crates/nsl-runtime/src/c_api/mod.rs");
+    let grad = workspace_root().join("crates/nsl-runtime/src/grad_context.rs");
+    let mut runtime_names: Vec<String> = Vec::new();
+    for f in [&capi, &grad] {
+        let src = std::fs::read_to_string(f).unwrap_or_default();
+        runtime_names.extend(
+            parse_externs_in_file(&src, "runtime")
+                .into_iter()
+                .map(|s| s.name),
+        );
+    }
+    assert!(
+        runtime_names.iter().any(|n| n == "nsl_model_forward")
+            && runtime_names.iter().any(|n| n == "nsl_model_backward"),
+        "the two symbols this test exists to protect are no longer exported — \
+         re-target it rather than deleting it"
+    );
+
+    for name in &runtime_names {
+        let defined_as_inline = header.contains(&format!("static inline int64_t {name}("))
+            || header.contains(&format!("static inline int32_t {name}("));
+        assert!(
+            !defined_as_inline,
+            "the generated header DEFINES `{name}` as a static inline, shadowing the \
+             runtime symbol of the same name for every host that includes it"
+        );
+    }
+
+    // And the convenience inlines are still emitted, under their own names —
+    // otherwise this test passes by the header having no inlines at all.
+    assert!(
+        header.contains("static inline int64_t nsl_export_forward(")
+            && header.contains("static inline int64_t nsl_export_backward("),
+        "the convenience inlines vanished; this test would then be vacuous:\n{header}"
+    );
 }

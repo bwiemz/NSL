@@ -33,7 +33,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   SR's contract (dropped — the SR step is the only sanctioned θ writer), and
   the `[sr-bf16]` teardown line converts to single-write formatting (it can
   now print from multiple ranks).
+### Fixed — the generated C header described an ABI the runtime does not have
 
+**Regenerate `model.h` and recompile any C/C++ host that includes it.** The
+runtime ABI has not changed and `NSL_ABI_VERSION` is unchanged (a version bump
+would tell correct hosts to refuse an unchanged runtime, and tells a host with
+a stale header nothing — see the note in `docs/abi/README.md`). What changed is
+that the header now describes the ABI correctly. A host built against the old
+header emitted wrong calls:
+
+- `NslExportFn` declared its return value and both count parameters as
+  `int32_t` against a runtime that has always taken and returned `int64_t`.
+  Calls through it passed counts whose upper halves the callee reads as
+  caller-undefined, and truncated the status.
+- `@export` prototypes declared narrow scalar parameters (`uint8_t`,
+  `int16_t`, …) against wrapper slots that are 64-bit — the same defect, on
+  any `@export` taking a scalar that is not `i32`/`i64`/`f32`/`f64`. The
+  header's spelling is now derived from the slot rather than mapped
+  independently, so a widened parameter reads `int64_t /* NSL u8, widened to
+  its ABI slot */`.
+- `nsl_model_destroy` was declared `void`; it returns `int64_t`.
+- The convenience inlines are renamed `nsl_model_forward`/`_backward`/
+  `_forward_with_saves` → **`nsl_export_forward`/`_backward`/
+  `_forward_with_saves`**. The old names shadowed real runtime symbols with
+  different signatures — `nsl_model_backward` takes a `GradContext*` — so a
+  host calling them bound to a file-local inline instead of the library
+  symbol. Hosts using these helpers must rename their call sites.
+- `nsl_get_last_error` / `nsl_clear_error` are now declared (the error
+  contract already told hosts to call them), with the borrowed, thread-local
+  lifetime of the returned string stated; and the `NslTensorDesc` dtype
+  comment lists all ten accepted tags instead of six.
+
+`crates/nsl-codegen/tests/c_header_agreement.rs` now cross-checks every
+generated prototype against the runtime externs and the wrapper signatures
+codegen actually builds, so this class fails CI instead of shipping.
 ### Added — `--fuse-lm-head`: the fused LM head joins the production profile
 
 - **An ~8.5% measured step-time win no longer depends on hand-editing model
