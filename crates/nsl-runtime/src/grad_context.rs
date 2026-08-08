@@ -357,8 +357,16 @@ pub extern "C" fn nsl_model_forward_grad(
     } else {
         Vec::new()
     };
-    // Same refusal as the input side: a 0 here becomes `ctx.output_ptrs[k]`,
-    // which `nsl_model_backward` dereferences for the loss seed.
+    // TRIP-WIRE, not a live null site — unlike its INPUT-side twin above,
+    // which reads caller-supplied descs and really is reachable. These descs
+    // were just written by `nsl_model_call`, and reaching here requires
+    // `rc == 0` from it: the codegen dispatch wrapper's only non-negative
+    // return is `nsl_dispatch_apply_result`'s, and that function refuses any
+    // `src.dtype` outside 0..=9 BEFORE mirroring `dst.dtype = src.dtype`. So
+    // the tag here is always in range and `desc_to_nsl_tensor` cannot return 0.
+    // Kept because a 0 WOULD become `ctx.output_ptrs[k]`, which
+    // `nsl_model_backward` dereferences for the loss seed, and the invariant
+    // lives in a different crate's emitter than this guard does.
     if let Some(i) = output_ptrs.iter().position(|&p| p == 0) {
         for &p in input_ptrs.iter().chain(output_ptrs.iter()) {
             crate::tensor::nsl_tensor_free(p);

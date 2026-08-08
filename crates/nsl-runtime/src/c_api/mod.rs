@@ -191,6 +191,23 @@ fn set_error(msg: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(cstr));
 }
 
+/// The thread-local error text, or `""` if none is set. Lets a caller that
+/// wants to ADD context to a callee's refusal read it first instead of
+/// clobbering it.
+///
+/// Note this reads THIS image's thread-local. A `.so` produced by
+/// `nsl build --shared-lib` statically links its own copy of the runtime, so a
+/// refusal raised inside the emitted wrapper is not visible here — see the
+/// module docs of `tests/dlpack_unsupported_dtype_refusal.rs`.
+fn last_error_text() -> String {
+    LAST_ERROR.with(|e| {
+        e.borrow()
+            .as_ref()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
+}
+
 /// Spec B §5.2/§5.5 helper: set the thread-local error from an already-
 /// constructed `CString`. Used by `grad_context.rs` to avoid the
 /// `String → CString` allocation churn for the small set of static
@@ -584,6 +601,17 @@ pub extern "C" fn nsl_model_call(
 /// DLPack variant of `nsl_model_call`. Bridges `DLManagedTensor*`-ABI
 /// inputs and outputs to the `NslTensorDesc*`-ABI export entry-point
 /// and reuses the same dispatcher.
+///
+/// **Known gap — the output path is unimplemented.** This function builds its
+/// output descs with [`NslTensorDesc::default()`], so `dst.data` is null and
+/// `nsl_dispatch_apply_result` refuses the null caller buffer. It therefore
+/// **cannot return 0 for a tensor-returning export**; every such call comes
+/// back `-1`. Fixing it needs an output-allocation strategy the C ABI does not
+/// have today. Until then, use [`nsl_model_call`] with preallocated
+/// `NslTensorDesc` outputs — the note appended to the error below says the same
+/// thing to the host, because the underlying refusal ("null data pointer
+/// (caller buffer or impl result)") otherwise blames a buffer this ABI gives
+/// the caller no way to supply.
 #[no_mangle]
 pub extern "C" fn nsl_model_call_dlpack(
     model_ptr: i64,
@@ -607,8 +635,26 @@ pub extern "C" fn nsl_model_call_dlpack(
     // SEGFAULTED the embedding process instead of returning -1. Refuse here,
     // naming the input INDEX and the offending code/bits so the caller can
     // fix the one argument that is wrong.
+    //
+    // A caller that declares an arity but hands over no array is refused HERE,
+    // before anything is built. Merely SKIPPING the import loop (what the
+    // `dl_inputs_ptr != 0` conjunct below used to do on its own) left
+    // `input_descs` empty while still forwarding the caller's `num_inputs` to
+    // `nsl_model_call` — and `Vec::as_mut_ptr()` on an empty `Vec` is
+    // `NonNull::dangling()`, i.e. 0x8. The dispatch wrapper then called
+    // `nsl_desc_to_tensor(8)`, whose `desc_ptr == 0` check does not catch 8,
+    // and `desc_to_nsl_tensor` read `desc.ndim` off address 8: SIGSEGV, from a
+    // caller that passed an honest NULL. This is the one path that converted a
+    // NULL into a dangling pointer before the emitted null guard could see it.
+    if num_inputs > 0 && dl_inputs_ptr == 0 {
+        set_error(format!(
+            "nsl_model_call_dlpack: num_inputs={num_inputs} but the DLPack input \
+             array is null\0"
+        ));
+        return -1;
+    }
     let mut input_tensor_ptrs: Vec<i64> = Vec::new();
-    if num_inputs > 0 && dl_inputs_ptr != 0 {
+    if num_inputs > 0 {
         let dlpacks = unsafe {
             std::slice::from_raw_parts(
                 dl_inputs_ptr as *const *mut DLManagedTensor,
@@ -663,12 +709,44 @@ pub extern "C" fn nsl_model_call_dlpack(
         output_descs.as_mut_ptr() as i64,
         num_outputs,
     );
+    // The output descs above are `NslTensorDesc::default()`, so `dst.data` is
+    // null and `nsl_dispatch_apply_result` refuses with "null data pointer
+    // (caller buffer or impl result)" — a message that blames a caller buffer
+    // this ABI gives the caller no way to supply, sending a correct host off to
+    // debug its own code. Say what is actually wrong.
+    //
+    // APPENDED, not substituted: an arity or registry refusal on the same call
+    // is still the caller's to read, and this note is true alongside it (the
+    // output path is unimplemented regardless of why the dispatch stopped).
+    // Placed AFTER the dispatch on purpose — an early return here would skip
+    // `nsl_model_call`'s `model_call name=` trace, which is the observable the
+    // gate uses to prove the int64 refusal happens BEFORE dispatch. Delete this
+    // block in the same change that gives the DLPack path an output allocator.
+    if rc != 0 && num_outputs > 0 {
+        let prev = last_error_text();
+        let sep = if prev.is_empty() { "" } else { " — " };
+        set_error(format!(
+            "{prev}{sep}note: nsl_model_call_dlpack cannot allocate DLPack \
+             outputs, so it passes zero-initialised output descs and a \
+             tensor-returning export always refuses here. Use nsl_model_call \
+             with preallocated NslTensorDesc outputs.\0"
+        ));
+    }
     if rc == 0 && dl_outputs_ptr != 0 {
         let out_slot = dl_outputs_ptr as *mut *mut DLManagedTensor;
         for (i, desc) in output_descs.iter().enumerate() {
-            // `desc_to_nsl_tensor` can now return 0 (unrecognized dtype tag)
-            // instead of aborting the process, so this is a real null site:
-            // `NslTensor::from_ptr` would deref it in release.
+            // TRIP-WIRE, not a live null site. `desc_to_nsl_tensor` returns 0
+            // only for a dtype tag outside 0..=9, and reaching this loop
+            // requires `rc == 0` from `nsl_model_call` — which can only come
+            // from a codegen dispatch wrapper (`ExportRegistry` binds
+            // `<name>__nsl_dispatch` and has no fallback), whose sole
+            // non-negative return is `nsl_dispatch_apply_result`'s. That
+            // function validates `src.dtype` against 0..=9 and returns -1
+            // otherwise BEFORE mirroring `dst.dtype = src.dtype`, so on
+            // `rc == 0` the tag here is always in range. Kept as a trip-wire
+            // for a future registry entry that writes caller descs directly,
+            // the same way `nsl_dtype_to_capi`'s dead abort branch is kept and
+            // documented above; nothing gates it, because nothing can reach it.
             let tensor_ptr = desc_to_nsl_tensor(desc);
             if tensor_ptr == 0 {
                 // Unwind the outputs already exported so a refusal does not
@@ -791,7 +869,10 @@ pub extern "C" fn nsl_model_forward(
 /// `*num_outputs_ptr` slots before the call and writing the actual count
 /// back afterwards.
 ///
-/// Returns 0 on success, -1 on error.
+/// Returns 0 on success, -1 on error — but see the **known gap** on
+/// [`nsl_model_call_dlpack`]: that path cannot allocate DLPack outputs, so a
+/// tensor-returning `forward` always comes back `-1` today. This shim inherits
+/// the limitation verbatim.
 #[no_mangle]
 pub extern "C" fn nsl_model_forward_dlpack(
     model_ptr: i64,

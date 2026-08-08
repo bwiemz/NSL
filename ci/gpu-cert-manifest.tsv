@@ -348,6 +348,7 @@ crates/nsl-codegen/tests/tier_b_tile_skip_gpu_parity.rs	tier_b_aligned_docs_s409
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_d_model_128_rejected_by_validator	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_head_dim_128_d_model_32_launches	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_hook_populates_wggo_head_gradients	broken	requires cfg(test) BSS stub injection; covered by mod.rs unit test
+crates/nsl-runtime/src/c_api/mod.rs	zz_tensor_to_desc_null_child	unclassified	child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref
 crates/nsl-runtime/src/data/gds.rs	mmap_fallback_h2d_copies_bytes_to_device	gpu-inferred	
 crates/nsl-runtime/src/fase_step.rs	unaligned_parameter_lengths_are_numerically_correct	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	flat_grid_multi_adamw_step_at_coder50m_shapes	gpu	requires CUDA GPU
@@ -361,6 +362,7 @@ crates/nsl-runtime/src/tensor/activation.rs	swiglu_gate_backward_gpu_f32_bit_exa
 crates/nsl-runtime/src/tensor/ad_ops.rs	embedding_backward_deterministic_gpu_matches_cpu_and_is_stable	gpu	GPU: requires CUDA device
 crates/nsl-runtime/src/tensor/ad_ops.rs	test_gpu_ce_backward_matches_cpu_bounce	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/mod.rs	sum_sq_gpu_matches_cpu_reference	gpu	GPU: requires CUDA device
+crates/nsl-runtime/tests/dlpack_unsupported_dtype_refusal.rs	zz_dlpack_refusal_child	unclassified	child process — driven by the gates below via re-exec
 crates/nsl-runtime/tests/fp8_dispatcher.rs	cuda_feature_required	cpu-stub	FP8 dispatcher tests require the cuda feature + sm_89+
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_cast_of_a_gpu_tensor_matches_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_scale_probes_of_gpu_tensors_match_the_cpu_run	gpu	requires CUDA GPU
