@@ -312,6 +312,18 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          not this marker)",
     ),
     m(
+        "[fused-lce]",
+        &[
+            "crates/nsl-codegen/src/wengert_lower.rs",
+        ],
+        "item 6 named the fused linear-CE KERNEL FAMILY this compile chose \
+         (route=gemm | v1 | v1-large) with the inputs that decided it. \
+         Distinct from `[fused-lm-ce]`, which reports a substitution that did \
+         NOT happen: this one reports which kernels a substitution that DID \
+         happen will run, a decision worth 335x/504x at production shape and \
+         previously reported by nothing",
+    ),
+    m(
         "[lm-head-fusion]",
         &[
             "crates/nsl-codegen/src/stmt.rs",

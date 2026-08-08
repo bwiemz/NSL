@@ -1,0 +1,105 @@
+# Item 6 — the fused linear-CE combination that used to be SILENT.
+#
+# A 16-bit `dtype=` hint at a vocabulary above LARGE_VOCAB_THRESHOLD (8192).
+# `use_gemm` requires `dtype_tag == 0`, so this routes to the v1 per-row-CTA
+# kernels: 335x (forward) and 504x (backward) slower than the GEMM-chunked
+# path at production shape. Every neighbouring bad routing already refused —
+# a biasless head in either direction, and CSLA — this one compiled clean and
+# said nothing.
+#
+# Derived from `csla_fused_lmce.nsl` by changing EXACTLY three things: the
+# embedding rows, the bias length, and the decorator (vocab 128 -> 16384,
+# dtype f32 -> bf16). Deriving from the fixture that is known to fuse is the
+# point: an ad-hoc fixture whose step body source-AD cannot extract never
+# reaches the routing decision at all, and an arm asserting a refusal on it
+# passes or fails for the wrong reason.
+#
+# Compile-only: the routing decision is made during lowering, so
+# `nsl build --emit-obj` reaches it with no GPU and no shape-hint pin.
+
+# Window shape is the parent's, unchanged: 1664 tokens / (batch 2 x seq 64)
+# = 13 micro-batches, grad_accumulation=2. The head is the parent's canonical
+# Add(Matmul(x, Transpose(W)), bias) chain, which is what the auto-substitution
+# matcher requires — a bare matmul head is refused.
+
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_f: Tensor = ones([64])
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let f = (rmsnorm(h, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h + f
+
+model TinyLM:
+    embed: Tensor = randn([16384, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+    lm_bias: Tensor = zeros([16384])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            h = block.forward(h)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        let flat_hn = hn.reshape([batch_size * seq_len, 64])
+        return (flat_hn @ self.embed.transpose(0, 1)) + self.lm_bias
+
+let m = TinyLM()
+# GPU_PLACEMENT
+
+# 13 DISTINCT micro-batch blocks of 128 tokens (content values (1..7)+k per
+# block, trailing 0 kept) — identical micro-batches would make the window
+# buffer's per-b slot binding vacuous (any slot for any b would pass).
+let u0 = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let b0 = u0.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u1 = tensor_cat([arange(7) + full([7], 2.0), zeros([1])], 0)
+let b1 = u1.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u2 = tensor_cat([arange(7) + full([7], 3.0), zeros([1])], 0)
+let b2 = u2.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u3 = tensor_cat([arange(7) + full([7], 4.0), zeros([1])], 0)
+let b3 = u3.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u4 = tensor_cat([arange(7) + full([7], 5.0), zeros([1])], 0)
+let b4 = u4.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u5 = tensor_cat([arange(7) + full([7], 6.0), zeros([1])], 0)
+let b5 = u5.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u6 = tensor_cat([arange(7) + full([7], 7.0), zeros([1])], 0)
+let b6 = u6.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u7 = tensor_cat([arange(7) + full([7], 8.0), zeros([1])], 0)
+let b7 = u7.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u8 = tensor_cat([arange(7) + full([7], 9.0), zeros([1])], 0)
+let b8 = u8.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u9 = tensor_cat([arange(7) + full([7], 10.0), zeros([1])], 0)
+let b9 = u9.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u10 = tensor_cat([arange(7) + full([7], 11.0), zeros([1])], 0)
+let b10 = u10.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u11 = tensor_cat([arange(7) + full([7], 12.0), zeros([1])], 0)
+let b11 = u11.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u12 = tensor_cat([arange(7) + full([7], 13.0), zeros([1])], 0)
+let b12 = u12.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let tokens = tensor_cat([b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12], 0).reshape([1664])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+@fused_lm_ce(enabled=true, dtype="bf16", vocab_size=16384, hidden_size=64, batch_size=2, seq_len=64, vocab_tile=1024)
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let flat_labels = batch.labels.reshape([128])
+        let loss = cross_entropy(logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+model_save(m, "CSLA_SAVE_PATH")
