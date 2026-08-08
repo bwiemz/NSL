@@ -189,6 +189,12 @@ impl Compiler<'_> {
             // is just "Verifier errors", swallowing the per-instruction list
             // that makes these actionable.
             .map_err(|e| CodegenError::new(format!("failed to define main: {e:?}")))?;
+        // Item 7 (`--fuse-wgrad-accum`): every train block in this program has
+        // been lowered by now, so "did the flag do anything ANYWHERE" is
+        // finally decidable. Deliberately after `define_function` rather than
+        // before it — a compile that is going to fail for a real reason should
+        // fail with that reason, not with an optimization-admission note.
+        self.finish_wgrad_admission()?;
         Ok(())
     }
 

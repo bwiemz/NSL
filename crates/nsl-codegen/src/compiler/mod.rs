@@ -649,6 +649,41 @@ pub struct Compiler<'a> {
     /// identity is its code location — stable across steps and epochs.
     pub next_cuda_graph_region_id: i64,
 
+    /// Item 7 (`--fuse-wgrad-accum`): how many train blocks in THIS compile
+    /// reached the FASE-Deferred `on_param_grad` hook — the fusion's one and
+    /// only lowering path.
+    ///
+    /// The flag is per COMPILE but its precondition (`grad_accumulation >= 2`
+    /// plus a Deferred optimizer) is per TRAIN BLOCK, so the two scopes have
+    /// to be reconciled somewhere. Deciding the refusal inside
+    /// `compile_train_block_inner` reconciled them the wrong way: the first
+    /// block that could not fuse aborted the whole compile, including builds
+    /// where an earlier block had already fused real chains and printed
+    /// `[wgrad-fusion] N chain(s) fused` two lines above the fatal error. The
+    /// stated justification ("a flag the user typed that cannot do anything")
+    /// is a statement about the PROGRAM, and it was false for such a program.
+    ///
+    /// `--layerwise-accum` below the same admission keeps its per-block abort
+    /// deliberately: it changes the optimizer-step SCHEDULE, so a block that
+    /// silently runs the interleaved baseline under it is a correctness lie.
+    /// A missing wgrad fusion only costs speed, so the weaker remedy is
+    /// available here and the stronger one is not warranted.
+    ///
+    /// So the NOTE stays per block — it names which block is inert, which is
+    /// the diagnostic the user needs — and the REFUSAL moved to the end of
+    /// `compile_main` / `compile_standalone_main`, where "did this flag do
+    /// anything anywhere" is decidable. That keeps deferral-must-refuse for
+    /// the case it was written for (a typed flag that fused nothing at all)
+    /// and additionally covers two paths the per-block check could never see:
+    /// a program with no train block, and the `@pipeline` train path, which
+    /// returns before the admission is ever evaluated.
+    pub wgrad_hook_blocks: usize,
+    /// `(reason, remedy)` for every train block in this compile that could
+    /// NOT reach the hook, in source order. Quoted back by the compile-scoped
+    /// refusal; deduplicated there, since a multi-block program usually
+    /// declines for one repeated reason.
+    pub wgrad_declines: Vec<(String, &'static str)>,
+
     // ── Function registry ────────────────────────────────────────────
     pub registry: FunctionRegistry,
 
@@ -1191,6 +1226,8 @@ impl<'a> Compiler<'a> {
             dump_ir: false,
             func_index: 0,
             next_cuda_graph_region_id: 0,
+            wgrad_hook_blocks: 0,
+            wgrad_declines: Vec::new(),
             bus: crate::pass_bus::PassBus::default(),
             passes: crate::pass_manager::PassManager::begin(),
             registry: FunctionRegistry::new(),
@@ -1955,6 +1992,96 @@ impl<'a> Compiler<'a> {
             crate::c_export_table::emit_export_table(self, &exports)?;
         }
         Ok(())
+    }
+
+    /// Item 7 (`--fuse-wgrad-accum`): the COMPILE-scoped half of the
+    /// admission whose per-block half lives in `compile_train_block_inner`.
+    ///
+    /// Called at the end of `compile_main` and `compile_standalone_main` —
+    /// the two drivers that lower a whole user program's top-level statements,
+    /// and therefore every one of its train blocks. Imported modules do NOT
+    /// route through either (they go through
+    /// `compile_module_with_imports_best_effort_plans`, which never emits a
+    /// main), so a `from nsl.nn import ...` compile cannot trip this.
+    ///
+    /// Fires only when NO train block anywhere in the compile reached the
+    /// hook. A program where one block fused and another did not keeps its
+    /// per-block `[wgrad-fusion] declined:` note and BUILDS, which is what it
+    /// did before this admission existed and what `--pretrain-optimized` on
+    /// the same program still does.
+    /// 1-based position of the train block currently being lowered, among the
+    /// train blocks this compile has reached. Every such block increments
+    /// exactly one of the two counters, so the sum is the number already seen.
+    ///
+    /// Only meaningful while `--fuse-wgrad-accum` is on (nothing counts
+    /// otherwise), which is the only context that prints it — a decline note
+    /// in a multi-block program is not actionable without it.
+    pub(crate) fn wgrad_block_ordinal(&self) -> usize {
+        self.wgrad_hook_blocks + self.wgrad_declines.len() + 1
+    }
+
+    pub(crate) fn finish_wgrad_admission(&self) -> Result<(), CodegenError> {
+        if !self.compile_options.fuse_wgrad_accum || self.wgrad_hook_blocks > 0 {
+            return Ok(());
+        }
+        // Dedup: an N-block program that declines for one repeated reason
+        // must not print that reason N times in the refusal.
+        let mut reasons: Vec<&str> = Vec::new();
+        let mut remedies: Vec<&str> = Vec::new();
+        for (reason, remedy) in &self.wgrad_declines {
+            if !reasons.contains(&reason.as_str()) {
+                reasons.push(reason.as_str());
+            }
+            if !remedies.contains(remedy) {
+                remedies.push(remedy);
+            }
+        }
+        if reasons.is_empty() {
+            // No train block recorded a decline, and none reached the hook —
+            // so this program has no train block at all. Nothing printed the
+            // instrument line yet, so print it here: the whole point of the
+            // admission is that a flag which does nothing never goes quiet.
+            let reason = "this program has no train block, so the FASE-Deferred \
+                          on_param_grad hook — the fusion's only lowering path — \
+                          is never built";
+            eprintln!("[wgrad-fusion] declined: {reason}");
+            reasons.push(reason);
+            remedies.push(
+                "Add a train block with grad_accumulation >= 2, or drop \
+                 --fuse-wgrad-accum.",
+            );
+        }
+        let reason = reasons.join("; also: ");
+        let remedy = remedies.join(" ");
+        if self.compile_options.fuse_wgrad_accum_from_bundle {
+            // Bundle provenance: WARN. `--pretrain-optimized` sets the flag on
+            // programs that never asked for it — including both shipped
+            // `models/coder50m/pretrain*.nsl`, which declare no
+            // `grad_accumulation` — so erroring here would turn the flagship
+            // configuration into a build failure.
+            eprintln!(
+                "note: --pretrain-optimized bundle partially disabled: \
+                 --fuse-wgrad-accum fused nothing in this compile ({reason}); \
+                 the rest of the bundle still applies"
+            );
+            Ok(())
+        } else {
+            // Explicit provenance: REFUSE. A flag the user typed that did
+            // nothing ANYWHERE in the program is the deferral-must-refuse
+            // case — and, unlike the per-block form this replaced, that
+            // statement is now true whenever it is made.
+            // Wording is REGISTERED. `feature_rules.rs` pins
+            // "--fuse-wgrad-accum requires grad_accumulation >= 2 and a
+            // FASE-Deferred plan" as this rule's refusal fragment, and
+            // `feature_composition_gate`'s deleted-refusal arm reads it out of
+            // THIS file — reword the leading clause and the composition is
+            // reported as silently permitted.
+            Err(CodegenError::new(format!(
+                "--fuse-wgrad-accum requires grad_accumulation >= 2 and a \
+                 FASE-Deferred plan in at least one train block, and this \
+                 compile has none: {reason}. {remedy}"
+            )))
+        }
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {

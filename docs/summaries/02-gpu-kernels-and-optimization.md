@@ -110,6 +110,22 @@ weight-gradient accumulation (`--fuse-wgrad-accum`). Those are separate
 emitters reached from `stmt.rs` and `wengert_lower.rs`, not from a general
 fusion-graph framework.
 
+`--fuse-wgrad-accum` has exactly one reachable path: the FASE-**Deferred**
+`on_param_grad` hook, which requires `grad_accumulation >= 2` in the train
+block. Below that FASE is `Passthrough` for every optimizer, no hook exists,
+zero chains fuse — and until 2026-08-07 nothing said so, because the
+`[wgrad-fusion] N chain(s) fused` counter was gated on the same hook.
+
+Every train block that cannot reach the hook is now named on stderr —
+`[wgrad-fusion] declined: train block #N — <reason>` — including one on the
+`@pipeline` train path, which returns before the ordinary admission and used to
+be the one place the flag stayed completely silent. The *refusal* is
+compile-scoped, not per block: a typed `--fuse-wgrad-accum` fails the build only
+when NO train block in the program could fuse, so a program that accumulates in
+one block and not another still builds (and still gets the note). A
+bundle-filled flag — `--pretrain-optimized` sets it on programs that never asked
+— warns instead of failing in the same state.
+
 ---
 
 ## Memory Planning (M36)

@@ -254,6 +254,12 @@ impl Compiler<'_> {
             // Debug-format so verifier error lists aren't swallowed (see
             // compiler/main_entry.rs).
             .map_err(|e| CodegenError::new(format!("failed to define main: {e:?}")))?;
+        // Item 7 (`--fuse-wgrad-accum`): the SECOND train-block driver —
+        // `--standalone` does not filter `TrainBlock` statements, so a
+        // standalone build lowers train blocks through here and would
+        // otherwise skip the compile-scoped admission entirely. Same placement
+        // and rationale as `compile_main`.
+        self.finish_wgrad_admission()?;
         Ok(())
     }
 }
