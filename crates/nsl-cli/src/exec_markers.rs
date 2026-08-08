@@ -442,6 +442,18 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         parts: &[("[tape-ad] FATAL", "crates/nsl-runtime/src/autodiff/backward.rs")],
     },
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/cuda_graph_gate.rs",
+        asserts: "NSL_ASYNC_ALLOC=1 refused capture BEFORE any region armed — \
+                  the teardown banner must be absent, not merely zeroed, \
+                  because `enable()` returns before ENABLED is set and a run \
+                  that armed and captured nothing would print `captured=0`",
+        // The banner's own prefix, from the one file that formats it.
+        parts: &[(
+            "[cuda-graph] regions=",
+            "crates/nsl-runtime/src/cuda/graph_capture.rs",
+        )],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/pass_trace_gate.rs",
         asserts: "the pass trace stayed silent without NSL_PASS_TRACE=1",
         // The bare token is the whole needle (the test asserts no

@@ -59,6 +59,27 @@ pub const SR_STEP_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 /// (param, element) counters never collide across parameters.
 pub const SR_PARAM_SHIFT: u32 = 40;
 
+/// The launch key for one optimizer step. THE definition — every dispatch
+/// path (per-param mirror, batched mirror, composed zero-3 slice) must key
+/// its kernel from here. Bit-exactness across paths is the whole contract,
+/// and it holds only while they compute the same key from the same inputs;
+/// a hand-copied `seed ^ step*SALT` in another module silently desyncs that
+/// path's dither stream the day the schedule changes.
+#[inline]
+pub fn sr_step_key(seed: u64, step: u64) -> u64 {
+    seed ^ step.wrapping_mul(SR_STEP_SALT)
+}
+
+/// The counter base for a parameter's dither block. `elem_offset` is the
+/// flat index, within the parameter, of the first element this launch
+/// covers — 0 for a whole-tensor launch, `rank * shard` for a per-rank
+/// slice. That offset is what makes a sharded slice draw the same dither
+/// the unsharded baseline draws at the same GLOBAL element.
+#[inline]
+pub fn sr_param_ctr_base(param_idx: u64, elem_offset: u64) -> u64 {
+    (param_idx << SR_PARAM_SHIFT) + elem_offset
+}
+
 /// splitmix64 finalizer — the same three multiply/xorshift rounds the PTX
 /// kernel performs. Stateless: mixes (key, counter) into 64 uniform bits.
 #[inline]
@@ -72,7 +93,7 @@ pub fn sr_mix64(key: u64, counter: u64) -> u64 {
 /// The 16-bit dither for (seed, step, param_base + element).
 #[inline]
 pub fn sr_dither16(seed: u64, step: u64, counter: u64) -> u16 {
-    sr_mix64(seed ^ step.wrapping_mul(SR_STEP_SALT), counter) as u16
+    sr_mix64(sr_step_key(seed, step), counter) as u16
 }
 
 /// Stochastically round an f32 to bf16 storage bits using a caller-supplied
@@ -199,19 +220,6 @@ pub extern "C" fn nsl_sr_bf16_registered_count() -> i64 {
 pub(crate) fn srbf16_is_registered(tensor_ptr: i64) -> bool {
     let guard = SRBF16_TABLE.lock().unwrap();
     guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr))
-}
-
-/// Item 16×11: the noted stable index for a param that a residency backend
-/// OTHER than the mirror table will own. The zero-3 elementwise carve reads
-/// this to decide whether its slice is bf16-authoritative (composed
-/// `--param-dtype bf16-sr --zero-elementwise` runs) and which SR counter
-/// block the slice's dither draws from. Non-consuming on purpose: the carve
-/// is idempotent across window re-registrations, and `srbf16_register`
-/// never runs for zero3-dispatched params (the weight-stream dispatch is
-/// first-match-wins), so nothing else races for the entry.
-pub(crate) fn pending_param_idx(tensor_ptr: i64) -> Option<u64> {
-    let guard = SRBF16_PENDING_IDX.lock().unwrap();
-    guard.as_ref().and_then(|g| g.get(&tensor_ptr).copied())
 }
 
 /// Histogram surface for the composed elementwise-SR step (zero.rs): the
@@ -386,32 +394,55 @@ pub extern "C" fn nsl_sr_bf16_teardown() {
     #[cfg(feature = "cuda")]
     {
         srbf16_upload_all();
-        let mut guard = SRBF16_TABLE.lock().unwrap();
-        if let Some(table) = guard.take() {
-            // Format first, write once: composed elementwise-SR runs are
-            // multi-rank, and `eprintln!` issues one write(2) per format
-            // fragment — concurrent ranks tear each other's lines mid-string
-            // the first time a gate parses a field (the args.rs [zero]
-            // pattern; observed on item 11's teardown line).
-            let line = format!(
-                "[sr-bf16] teardown: {} bf16-authoritative param(s), {} SR \
-                 optimizer step(s), {} widen-upload(s), {} batched launch(es)\n",
-                table.len(),
-                SRBF16_STEPS.load(Ordering::Relaxed),
-                SRBF16_UPLOADS.load(Ordering::Relaxed),
-                SRBF16_BATCHED_LAUNCHES.load(Ordering::Relaxed),
-            );
-            {
-                use std::io::Write;
-                let _ = std::io::stderr().lock().write_all(line.as_bytes());
-            }
+        let table = SRBF16_TABLE.lock().unwrap().take();
+        // The line prints whenever the MODE was armed, not only when this
+        // backend held the mirrors: under composed `bf16-sr x
+        // --zero-elementwise` the zero-3 backend owns every param (the
+        // slices are the bf16 storage), so the table is empty while
+        // thousands of SR steps ran. Keying the report on the table made
+        // `nsl_sr_bf16_step_count()` and this line read "SR never armed"
+        // for exactly the runs SR was composed into.
+        //
+        // Format first, write once: composed elementwise-SR runs are
+        // multi-rank, and `eprintln!` issues one write(2) per format
+        // fragment — concurrent ranks tear each other's lines mid-string
+        // the first time a gate parses a field (the args.rs [zero]
+        // pattern; observed on item 11's teardown line).
+        let line = format!(
+            "[sr-bf16] teardown: {} bf16-authoritative param(s), {} SR \
+             optimizer step(s), {} widen-upload(s), {} batched launch(es)\n",
+            table.as_ref().map_or(0, |t| t.len()),
+            SRBF16_STEPS.load(Ordering::Relaxed),
+            SRBF16_UPLOADS.load(Ordering::Relaxed),
+            SRBF16_BATCHED_LAUNCHES.load(Ordering::Relaxed),
+        );
+        {
+            use std::io::Write;
+            let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        }
+        if let Some(table) = table {
             crate::cuda::inner::ensure_context();
             for (_, m) in table {
                 crate::cuda::inner::free_managed(m.dev_bf16 as *mut std::ffi::c_void);
             }
         }
     }
+    // The pending notes are keyed by TENSOR POINTER and the tensors die with
+    // the train block; leaving them behind lets a later block's param land
+    // on a recycled address and inherit this block's counter block. Cleared
+    // with the mode that created them.
+    SRBF16_PENDING_IDX.lock().unwrap().take();
     SRBF16_ACTIVE.store(false, Ordering::Relaxed);
+}
+
+/// Item 16×11: count one SR optimizer step executed by a DIFFERENT backend's
+/// step entry (the composed zero-3 elementwise slice update). Without this,
+/// `nsl_sr_bf16_step_count()` and the teardown line report 0 for composed
+/// runs — a false "stochastic rounding never ran" for every certification
+/// consumer that keys off the SR backend's own counters.
+#[cfg(feature = "cuda")]
+pub(crate) fn note_external_sr_step() {
+    SRBF16_STEPS.fetch_add(1, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,11 +617,11 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
             "[sr-bf16] m/v/mp must be contiguous"
         );
         let seed = crate::deterministic_ops::get_rng_seed();
-        let key = seed ^ (step as u64).wrapping_mul(SR_STEP_SALT);
-        let ctr_base = param_idx << SR_PARAM_SHIFT;
+        let key = sr_step_key(seed, step as u64);
+        let ctr_base = sr_param_ctr_base(param_idx, 0);
         let has_wd = wd != 0.0;
         // Item 7 histograms: capture the bf16 sample BEFORE the update.
-        let hist_n = if sr_hist_enabled() { len.min(SR_HIST_SAMPLE) } else { 0 };
+        let hist_n = sr_hist_sample_len(len);
         let mut hist_before: Vec<u16> = vec![0; hist_n];
         if hist_n > 0 {
             crate::cuda::inner::memcpy_dtoh(
@@ -622,8 +653,7 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
                 dev_bf16 as *const std::ffi::c_void,
                 hist_n * 2,
             );
-            sr_hist_record(&hist_before, &hist_after);
-            SR_HIST.lock().unwrap().steps += 1;
+            sr_hist_record_step(&hist_before, &hist_after);
         }
         // Coherence refresh: the resident f32 working view must equal
         // widen(mirror) at all times so callbacks / model_save / the next
@@ -804,7 +834,7 @@ fn bf16sr_multi_impl(
             std::collections::HashSet::new();
 
         let seed = crate::deterministic_ops::get_rng_seed();
-        let key = seed ^ (step as u64).wrapping_mul(SR_STEP_SALT);
+        let key = sr_step_key(seed, step as u64);
 
         for i in sel {
             let (tp, mp_, vp, ap) = unsafe {
@@ -877,13 +907,13 @@ fn bf16sr_multi_impl(
                     b.v.push(v.data as u64);
                     b.mp.push(mp.data as u64);
                     b.n.push(u32::try_from(len).expect("param exceeds u32 elements"));
-                    b.ctr.push(param_idx << SR_PARAM_SHIFT);
+                    b.ctr.push(sr_param_ctr_base(param_idx, 0));
                     // Item 7 histograms: without this, batched dispatch
                     // would silently take NSL_SR_HIST's sampling surface to
                     // (almost) zero — only the aliased-mirror fallback goes
                     // through the per-param entry that samples.
                     if sr_hist_enabled() {
-                        let hn = len.min(SR_HIST_SAMPLE);
+                        let hn = sr_hist_sample_len(len);
                         let mut before = vec![0u16; hn];
                         crate::cuda::inner::memcpy_dtoh(
                             before.as_mut_ptr() as *mut std::ffi::c_void,
@@ -932,8 +962,7 @@ fn bf16sr_multi_impl(
                 *dev_bf16 as *const std::ffi::c_void,
                 before.len() * 2,
             );
-            sr_hist_record(before, &after);
-            SR_HIST.lock().unwrap().steps += 1;
+            sr_hist_record_step(before, &after);
         }
 
         // Coherence refresh, after the steps are enqueued: the resident f32
@@ -1009,8 +1038,8 @@ pub extern "C" fn nsl_muon_state_sr_store(
         "[muon-state] parameter exceeds the per-param SR counter block"
     );
     let seed = crate::deterministic_ops::get_rng_seed() ^ SR_MUON_STATE_SALT;
-    let key = seed ^ (step as u64).wrapping_mul(SR_STEP_SALT);
-    let ctr_base = (param_idx as u64) << SR_PARAM_SHIFT;
+    let key = sr_step_key(seed, step as u64);
+    let ctr_base = sr_param_ctr_base(param_idx as u64, 0);
     if src.device > 0 {
         #[cfg(feature = "cuda")]
         crate::cuda::gpu_sr_bf16_round_probe(
@@ -1055,7 +1084,7 @@ pub fn sr_bf16_gpu_probe_host(vals: &[f32], seed: u64, step: u64, ctr_base: u64)
     let src = crate::cuda::inner::alloc_managed(n * 4);
     crate::cuda::inner::memcpy_htod(src, vals.as_ptr() as *const std::ffi::c_void, n * 4);
     let dst = crate::cuda::inner::alloc_managed(n * 2);
-    let key = seed ^ step.wrapping_mul(SR_STEP_SALT);
+    let key = sr_step_key(seed, step);
     crate::cuda::gpu_sr_bf16_round_probe(src as u64, dst as u64, n, key, ctr_base);
     let mut out = vec![0u16; n];
     crate::cuda::inner::memcpy_dtoh(out.as_mut_ptr() as *mut std::ffi::c_void, dst, n * 2);

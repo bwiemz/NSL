@@ -2734,7 +2734,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // plan-driven and precedes the registration belt (the sr-note pattern);
     // the step runs on EVERY rank over its own slice — scalar order mirrors
     // nsl_fase_fused_adamw_step.
-    ("nsl_zero3_mark_elementwise", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    // (tensor, idx, sr) — `sr` is the plan entry's storage decision (item 16x11)
+    ("nsl_zero3_mark_elementwise", &[types::I64, types::I64, types::I64], Some(types::I64)),
     (
         "nsl_zero3_elem_adamw_step",
         &[

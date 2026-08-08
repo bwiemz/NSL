@@ -322,20 +322,34 @@ impl ParameterPlan {
         // streamed param whose numel is not an exact 1/ws split would fall
         // back to TENSOR-GRANULAR sharding — whose owner-gated update leaves
         // non-owner bf16 state stale (the exact hazard the stage-3 refusal
-        // names). Refuse loudly with the param and the arithmetic rather
-        // than train it without stochastic rounding.
+        // names). Refuse loudly rather than train it without stochastic
+        // rounding, and name the CAUSE: `plan_elems` spells an unknown
+        // (symbolic) element count as 0, which is a different user fix from
+        // a ragged one — "pad the parameter" is wrong advice for a shape the
+        // compiler could not read.
         if f.param_dtype_bf16sr && f.zero_elementwise {
             for e in plan.entries().iter() {
                 if e.storage == ParamStorage::Bf16Sr && e.sharding == ParamSharding::Sharded {
+                    let n = elems.get(e.idx as usize).copied().unwrap_or(0);
+                    let (cause, fix) = if n == 0 {
+                        (
+                            "its element count is not statically known".to_string(),
+                            "give the parameter a static shape",
+                        )
+                    } else {
+                        (
+                            format!("{n} elements is not divisible by world size {ws}"),
+                            "pad the parameter",
+                        )
+                    };
                     return Err(PlanError(format!(
                         "--param-dtype bf16-sr composes with --zero-stage 3 only \
                          under --zero-elementwise, and parameter '{}' cannot \
-                         shard elementwise ({} elements is not divisible by \
-                         world size {ws}) — it would fall back to the \
-                         tensor-granular owner-gated path. Pad the parameter \
-                         or drop a flag",
+                         shard elementwise ({cause}) — it would fall back to the \
+                         tensor-granular owner-gated path, whose owner gate would \
+                         leave every non-owner's bf16 state un-stepped. {fix}, or \
+                         drop a flag",
                         e.name,
-                        elems.get(e.idx as usize).copied().unwrap_or(0),
                     )));
                 }
             }

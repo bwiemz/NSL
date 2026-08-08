@@ -310,10 +310,21 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         STMT,
         "--param-dtype bf16-sr does not compose with --zero-stage 1/2",
     ),
+    // Encoded as a CONFLICT against tensor-granular stage 3, not as
+    // "--param-dtype Requires --zero-elementwise": Requires is defined above
+    // as unconditional, and plain bf16-sr with no ZeRO flag is the feature's
+    // primary shipped configuration. The real constraint is conditional
+    // (bf16-sr AND stage 3 => elementwise), which is what the partner spells.
+    // The partner deliberately does NOT lead with `--`: this is a conflict
+    // with a MODE of --zero-stage 3 (tensor-granular, i.e. stage 3 without
+    // --zero-elementwise), not with the flag. Encoding it as
+    // "--param-dtype Requires --zero-elementwise" would state something
+    // false about plain bf16-sr, the feature's primary shipped config,
+    // since Requires is defined above as unconditional.
     src_rule(
         "--param-dtype",
-        RuleKind::Requires,
-        "--zero-elementwise",
+        RuleKind::Conflicts,
+        "tensor-granular --zero-stage 3",
         STMT,
         "--param-dtype bf16-sr composes with --zero-stage 3 only under --zero-elementwise",
     ),
