@@ -4671,11 +4671,26 @@ impl Compiler<'_> {
     /// `m_partial` zero that the per-param loop's skip arm used to do.
     /// Handing the launcher only owners leaves its null assert intact as a
     /// belt rather than something to relax.
+    ///
+    /// **`owner_gated_moments` is the STAGES-1/2 predicate, not "ZeRO is
+    /// on".** That is the whole invariant: the subset is valid exactly when
+    /// the moments were owner-gated, and stage 3 deliberately does the
+    /// opposite — it keeps optimizer state REPLICATED (see the note at the
+    /// allocation site), so a stage-3 program reaching this arm would step
+    /// only its byte-balanced share and zero every other parameter's
+    /// accumulator, freezing most of the model per rank with the post-step
+    /// broadcast hiding it. Stage 3 cannot reach here today, but only via
+    /// two unrelated guards (it is refused unless `--layerwise-accum`, and
+    /// the layerwise arm short-circuits above this one) — nothing pins that
+    /// coupling, so the predicate names the invariant instead of relying on
+    /// it. The old `&& !zero_enabled` exclusion was safe under `>= 1` only
+    /// because it disabled batching for EVERY stage; narrowing the exclusion
+    /// without narrowing the predicate is what opened the gap.
     #[allow(clippy::too_many_arguments)]
     fn emit_fused_multi_launch(
         &mut self,
         builder: &mut FunctionBuilder,
-        zero_enabled: bool,
+        owner_gated_moments: bool,
         num_params_val: Value,
         lists: (Value, Value, Value, Value),
         sc: &crate::stmt_fase::FusedAdamwScalars,
@@ -4692,7 +4707,7 @@ impl Compiler<'_> {
         let eps_v = builder.ins().f64const(sc.eps);
         let wd_v = builder.ins().f64const(sc.wd);
 
-        if zero_enabled {
+        if owner_gated_moments {
             let il = self.compile_call_by_name(
                 builder,
                 "nsl_zero_owned_step_indices",
@@ -14944,7 +14959,7 @@ impl Compiler<'_> {
                         );
                         self.emit_fused_multi_launch(
                             builder,
-                            zero_enabled,
+                            zero_monolithic,
                             num_params_val,
                             (param_list, state_list_1, state_list_2, accum),
                             &sc,
@@ -15090,7 +15105,7 @@ impl Compiler<'_> {
                         let one_scale = builder.ins().f64const(1.0);
                         self.emit_fused_multi_launch(
                             builder,
-                            zero_enabled,
+                            zero_monolithic,
                             num_params_val,
                             (param_list, state_list_1, state_list_2, accum),
                             &sc,
