@@ -4385,6 +4385,73 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr(
     inner::sync_after_kernel();
 }
 
+/// The raw-pointer launcher behind `gpu_fase_fused_adamw_step_bf16sr` —
+/// item 16×11's composed elementwise ZeRO-3 step launches the SAME SR
+/// kernel on a slice region (bf16 theta = the rank's authoritative slice,
+/// m/v at a byte offset into the full replicated moments, gradient from the
+/// reduce_scattered slice). `sr_ctr_base` carries the rank's flat element
+/// offset on top of the param's counter block, which is what makes each
+/// rank's dither identical to the single-rank baseline's at the same global
+/// element.
+///
+/// PRECONDITION (unenforceable here): `th_bf16` addresses `n` contiguous
+/// bf16 device elements and m/v/mp address `n` contiguous f32 device
+/// elements — no `NslTensor` in the signature, so the caller owns the
+/// dtype/contiguity/device guarantees (the `gpu_scale_raw_f32` discipline).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_raw(
+    th_bf16: u64, m_data: u64, v_data: u64, mp_data: u64, n: usize,
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+    sr_key: u64, sr_ctr_base: u64,
+) {
+    if n == 0 {
+        return;
+    }
+    let mut th_data = th_bf16;
+    let mut m_data = m_data;
+    let mut v_data = v_data;
+    let mut mp_data = mp_data;
+    let mut n_val = n as u64;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let (mut key_val, mut ctr_val) = (sr_key, sr_ctr_base);
+    let args = [
+        &mut th_data as *mut _ as *mut std::ffi::c_void,
+        &mut m_data as *mut _ as *mut std::ffi::c_void,
+        &mut v_data as *mut _ as *mut std::ffi::c_void,
+        &mut mp_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut b1 as *mut _ as *mut std::ffi::c_void,
+        &mut omb1 as *mut _ as *mut std::ffi::c_void,
+        &mut b2 as *mut _ as *mut std::ffi::c_void,
+        &mut omb2 as *mut _ as *mut std::ffi::c_void,
+        &mut eps as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr_wd as *mut _ as *mut std::ffi::c_void,
+        &mut bc1 as *mut _ as *mut std::ffi::c_void,
+        &mut bc2 as *mut _ as *mut std::ffi::c_void,
+        &mut has_wd_val as *mut _ as *mut std::ffi::c_void,
+        &mut key_val as *mut _ as *mut std::ffi::c_void,
+        &mut ctr_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_STEP_BF16SR_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_step_bf16sr\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_step_bf16sr_raw kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
 /// P4 item 17: SR-BF16 rounding-tail probe over raw device buffers — parity
 /// gate hook only (see `SR_BF16_ROUND_PROBE_PTX`).
 #[cfg(feature = "cuda")]
@@ -9309,6 +9376,13 @@ mod dtype_guard_drift {
              validated bf16 at registration). Pre-existing gap: this fn was \
              never registered when item 8 added it — the gate only runs under \
              --features cuda --lib, which CI never does",
+        ),
+        (
+            "gpu_fase_fused_adamw_step_bf16sr_raw",
+            "bare u64 device pointers, no NslTensor and so no dtype to read; \
+             the sole caller (the composed elementwise-SR step in zero.rs) \
+             asserts th/m/v are f32 tensors before offsetting, and the bf16 \
+             slice it passes as theta was carved by a validated f32→bf16 cast",
         ),
         (
             "gpu_scalar_mul_add_inplace_f32",

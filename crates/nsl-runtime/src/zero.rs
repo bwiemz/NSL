@@ -2036,7 +2036,17 @@ struct ElemShard {
     grad_ready: bool,
     /// Elements per rank.
     shard: usize,
+    /// Element size of the FULL working tensor (8 = f64, 4 = f32) — the
+    /// region-offset unit for the gathered transient and the moments. The
+    /// SLICE's element size can differ: see [`ElemShard::slice_elem_bytes`].
     elem_bytes: usize,
+    /// Item 16×11 composed mode (`--param-dtype bf16-sr --zero-elementwise`):
+    /// the param's stable SR counter-block index. When set, the SLICE is the
+    /// bf16 AUTHORITATIVE storage (2 bytes/elem, sized at carve) — the
+    /// gathered full tensor stays an f32 working transient (widened at
+    /// gather, never written back), and the step is the SR kernel against
+    /// the slice.
+    sr_param_idx: Option<u64>,
 }
 
 struct Zero3Entry {
@@ -2061,6 +2071,13 @@ static ZERO3_RELEASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// elementwise machinery ran (and, in the tensor-granular arm, did not).
 static ZERO3_ELEM_PARAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ZERO3_ELEM_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Item 16×11 anti-vacuity: bf16-SR-authoritative slices carved / composed
+/// SR steps executed. Separate from the plain elementwise counters so the
+/// composed gate can assert the SR machinery ran (a composed run whose
+/// params all silently took the plain f32 arm would train without
+/// stochastic rounding and read green on every other counter).
+static ZERO3_SR_ELEM_PARAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ZERO3_SR_ELEM_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Codegen calls this once per train block when `--zero-stage 3` is baked.
 #[no_mangle]
@@ -2237,8 +2254,9 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
             // The one dtype guard on the elem path that runs BEFORE bytes
             // move: a 2-byte dtype (bf16, id >= 256) would mis-slice here,
             // and gather's f32-only check fires only at ws>1, after the
-            // carve already copied. Unreachable today (params are CPU-f64 /
-            // GPU-f32; bf16-sr x zero3 is refused) — belt.
+            // carve already copied. The PARAM tensor is always f64/f32 —
+            // under composed bf16-sr the tensor stays a plain f32 working
+            // transient and only the SLICE storage below is bf16.
             if t.dtype != 0 && t.dtype != 1 {
                 eprintln!(
                     "[zero3] FATAL: elementwise carve of dtype {} (param {}) — \
@@ -2247,20 +2265,63 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
                 );
                 std::process::abort();
             }
+            // Item 16×11: under composed `--param-dtype bf16-sr`, the slice
+            // is the bf16 AUTHORITATIVE storage. Carve by the same f32→bf16
+            // cast `srbf16_register` applies to the full mirror, so every
+            // rank's slice equals the single-rank mirror's region
+            // bit-for-bit. GPU/f32-only, exactly like the mirror backend.
+            let sr_param_idx = if crate::sr_bf16::srbf16_active() {
+                crate::sr_bf16::pending_param_idx(tensor_ptr)
+            } else {
+                None
+            };
+            if sr_param_idx.is_some() {
+                if t.device == 0 || t.dtype != 1 {
+                    eprintln!(
+                        "[zero3] FATAL: bf16-sr elementwise carve of param {} \
+                         requires a GPU-resident f32 tensor (device={}, \
+                         dtype={}) — the SR backend is GPU-only",
+                        e.idx, t.device, t.dtype
+                    );
+                    std::process::abort();
+                }
+                if numel as u64 >= 1u64 << crate::sr_bf16::SR_PARAM_SHIFT {
+                    // The rank offset rides inside the param's counter
+                    // block; an oversized param would alias the next
+                    // param's dither stream (same guard as register's).
+                    eprintln!(
+                        "[zero3] FATAL: bf16-sr elementwise param {} has {} \
+                         elements — the SR counter block holds 2^{}",
+                        e.idx,
+                        numel,
+                        crate::sr_bf16::SR_PARAM_SHIFT
+                    );
+                    std::process::abort();
+                }
+            }
             let elem_bytes = if t.dtype == 0 { 8 } else { 4 };
+            let slice_bytes = if sr_param_idx.is_some() { 2 } else { elem_bytes };
             let shard = numel / ws;
-            let slice = ShardBuf::alloc(shard * elem_bytes, t.device);
+            let slice = ShardBuf::alloc(shard * slice_bytes, t.device);
             let off = rank * shard * elem_bytes;
             unsafe {
                 if t.device != 0 {
                     #[cfg(feature = "cuda")]
                     {
                         crate::cuda::inner::ensure_context();
-                        crate::cuda::inner::memcpy_dtod(
-                            slice.ptr(),
-                            (t.data as *const u8).add(off) as *const std::ffi::c_void,
-                            shard * elem_bytes,
-                        );
+                        if sr_param_idx.is_some() {
+                            crate::cuda::gpu_cast_raw_f32_to_bf16(
+                                (t.data as *const u8).add(off) as u64,
+                                slice.ptr() as u64,
+                                shard,
+                            );
+                        } else {
+                            crate::cuda::inner::memcpy_dtod(
+                                slice.ptr(),
+                                (t.data as *const u8).add(off) as *const std::ffi::c_void,
+                                shard * elem_bytes,
+                            );
+                        }
                         crate::cuda::inner::free_managed(t.data);
                     }
                 } else {
@@ -2282,9 +2343,13 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
                 grad_ready: false,
                 shard,
                 elem_bytes,
+                sr_param_idx,
             });
             e.state = ParameterResidency::Evicted;
             ZERO3_ELEM_PARAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if sr_param_idx.is_some() {
+                ZERO3_SR_ELEM_PARAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         } else if e.state == ParameterResidency::GatheredTemporary && !t.data.is_null() {
             // Window-start re-register of a still-materialized full copy:
             // drop it (the slice holds the truth), mirroring the non-owner
@@ -2340,7 +2405,9 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
 /// (silent corruption / barrier timeout; review finding 1).
 pub(crate) fn zero3_gather(tensor_ptr: i64) {
     let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
-    // (owner, is_owner, Some((slice_ptr, shard, elem_bytes)) for elementwise)
+    // (owner, is_owner, Some((slice_ptr, shard, elem_bytes, sr)) for
+    // elementwise — `sr` marks a bf16-authoritative slice that must be
+    // widened to f32 before it can feed the (f32) local copy / collective)
     let (owner, is_owner, elem_info) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
@@ -2364,7 +2431,7 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
             e.owner as usize == rank,
             e.elem
                 .as_ref()
-                .map(|s| (s.slice.ptr() as i64, s.shard, s.elem_bytes)),
+                .map(|s| (s.slice.ptr() as i64, s.shard, s.elem_bytes, s.sr_param_idx.is_some())),
         )
     };
     // Materialize the full buffer. Tensor-granular: non-owners only (the
@@ -2417,19 +2484,34 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
         } else {
             t.dtype as crate::tensor_parallel::collective::DtypeId
         };
-        if let Some((slice_ptr, shard, elem_bytes)) = elem_info {
+        if let Some((slice_ptr, shard, elem_bytes, sr)) = elem_info {
             // Elementwise: reconstruct the full tensor from every rank's
             // slice. all_gather's recv layout is rank-ordered concatenation
             // (pinned by the sim impl), which is exactly the slicing rule.
+            //
+            // Item 16×11: a bf16-authoritative slice widens to f32 FIRST —
+            // the full tensor is always an f32 working transient and the
+            // collective stays DTYPE_F32 (reduce_scatter and the backends
+            // never see a 2-byte dtype). The widen is the same D2D cast as
+            // the mirror backend's upload, so gather(slices) equals the
+            // single-rank working view bit-for-bit.
             if ctx.world_size <= 1 {
                 unsafe {
                     if t.device != 0 {
                         #[cfg(feature = "cuda")]
-                        crate::cuda::inner::memcpy_dtod(
-                            t.data,
-                            slice_ptr as *const std::ffi::c_void,
-                            shard * elem_bytes,
-                        );
+                        if sr {
+                            crate::cuda::gpu_cast_raw_bf16_to_f32(
+                                slice_ptr as u64,
+                                t.data as u64,
+                                shard,
+                            );
+                        } else {
+                            crate::cuda::inner::memcpy_dtod(
+                                t.data,
+                                slice_ptr as *const std::ffi::c_void,
+                                shard * elem_bytes,
+                            );
+                        }
                     } else {
                         std::ptr::copy_nonoverlapping(
                             slice_ptr as *const u8,
@@ -2444,13 +2526,46 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
                     .backend
                     .as_ref()
                     .expect("world_size > 1 implies a backend");
+                // Widened f32 staging for a bf16 slice: freed right after
+                // the collective — the slice itself never enters a backend.
+                // (Annotated: the Some arm is cfg(cuda)-only, so a non-cuda
+                // build has nothing to infer the Option's payload from.)
+                let sr_staging: Option<ShardBuf> = if sr {
+                    #[cfg(feature = "cuda")]
+                    {
+                        let buf = ShardBuf::alloc(shard * elem_bytes, t.device);
+                        crate::cuda::gpu_cast_raw_bf16_to_f32(
+                            slice_ptr as u64,
+                            buf.ptr() as u64,
+                            shard,
+                        );
+                        Some(buf)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        eprintln!(
+                            "[zero3] FATAL: bf16-sr elementwise gather in a \
+                             non-cuda build"
+                        );
+                        std::process::abort();
+                    }
+                } else {
+                    None
+                };
+                let send_ptr = sr_staging
+                    .as_ref()
+                    .map(|b| b.ptr() as *const std::ffi::c_void)
+                    .unwrap_or(slice_ptr as *const std::ffi::c_void);
                 let rc = backend.all_gather(
-                    slice_ptr as *const std::ffi::c_void,
+                    send_ptr,
                     t.data,
                     shard,
                     dtype_id,
                     std::ptr::null_mut(),
                 );
+                if let Some(buf) = sr_staging {
+                    buf.free();
+                }
                 if rc == 0 {
                     ZERO_ALL_GATHER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2504,7 +2619,7 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
             e.owner as usize == rank,
             e.elem
                 .as_ref()
-                .map(|s| (s.slice.ptr() as i64, s.shard, s.elem_bytes, rank)),
+                .map(|s| (s.slice.ptr() as i64, s.shard, s.elem_bytes, rank, s.sr_param_idx.is_some())),
         )
     };
     let is_elem = elem_info.is_some();
@@ -2530,25 +2645,34 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         // gathered full tensor after the step — tensor-granular keeps that
         // write on the owner's replica, and without this copy elementwise
         // would silently drop it on every rank (review finding, 2026-08-06).
-        if let Some((slice_ptr, shard, elem_bytes, rank)) = elem_info {
-            let off = rank * shard * elem_bytes;
-            unsafe {
-                if t.device != 0 {
-                    #[cfg(feature = "cuda")]
-                    {
-                        crate::cuda::inner::ensure_context();
-                        crate::cuda::inner::memcpy_dtod(
-                            slice_ptr as *mut std::ffi::c_void,
-                            (t.data as *const u8).add(off) as *const std::ffi::c_void,
+        //
+        // Item 16×11: NOT for a bf16-authoritative slice. Under bf16-sr the
+        // fused SR step is the ONLY sanctioned θ writer — plain SR already
+        // drops callback writes to the f32 working view (evict never writes
+        // back), and the composed path must match plain SR, not plain
+        // elementwise. A narrow here would also round the freshly-stepped
+        // slice through f32 values the step never produced.
+        if let Some((slice_ptr, shard, elem_bytes, rank, sr)) = elem_info {
+            if !sr {
+                let off = rank * shard * elem_bytes;
+                unsafe {
+                    if t.device != 0 {
+                        #[cfg(feature = "cuda")]
+                        {
+                            crate::cuda::inner::ensure_context();
+                            crate::cuda::inner::memcpy_dtod(
+                                slice_ptr as *mut std::ffi::c_void,
+                                (t.data as *const u8).add(off) as *const std::ffi::c_void,
+                                shard * elem_bytes,
+                            );
+                        }
+                    } else {
+                        std::ptr::copy_nonoverlapping(
+                            (t.data as *const u8).add(off),
+                            slice_ptr as *mut u8,
                             shard * elem_bytes,
                         );
                     }
-                } else {
-                    std::ptr::copy_nonoverlapping(
-                        (t.data as *const u8).add(off),
-                        slice_ptr as *mut u8,
-                        shard * elem_bytes,
-                    );
                 }
             }
         }
@@ -2866,6 +2990,18 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
             );
             std::process::abort();
         }
+        if s.sr_param_idx.is_some() {
+            // Item 16×11 belt: this entry's f32 kernel + persist would
+            // update θ WITHOUT stochastic rounding and then overrun the
+            // 2-byte slice with a 4-byte copy. The composed dispatch emits
+            // `nsl_zero3_elem_sr_adamw_step` for SR-carved params.
+            eprintln!(
+                "[zero3] FATAL: bf16-sr-carved param {idx} routed to the \
+                 plain elementwise step — the emitted dispatch and the carve \
+                 have drifted"
+            );
+            std::process::abort();
+        }
         (
             s.shard,
             s.elem_bytes,
@@ -3043,6 +3179,215 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
     0
 }
 
+/// Item 16×11: the composed elementwise step under `--param-dtype bf16-sr`
+/// — EVERY rank updates its bf16-AUTHORITATIVE slice with the same fused SR
+/// kernel the mirror backend launches, against its region of the full
+/// replicated f32 moments and the reduce_scattered gradient slice. The SR
+/// counter base carries the rank's flat element offset on top of the
+/// param's counter block, so every element draws the dither the single-rank
+/// mirror baseline draws at the same global index — which is what makes a
+/// multi-rank composed run bit-identical to plain SR.
+///
+/// Scalar order mirrors `nsl_zero3_elem_adamw_step`, plus the trailing
+/// `step` the SR stream is keyed on (the `nsl_sr_bf16_step_adamw` shape).
+/// After the kernel, the rank's region of the still-live f32 working
+/// transient is REFRESHED by widening (post-step readers — callbacks,
+/// checkpoint save — see updated θ). Never the reverse direction: the
+/// release-persist is skipped for SR slices, because the SR step is the
+/// only sanctioned θ writer (plain SR's evict-never-writes-back contract).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
+    theta_ptr: i64,
+    m_ptr: i64,
+    v_ptr: i64,
+    idx: i64,
+    lr: f64,
+    beta1: f64,
+    one_minus_beta1: f64,
+    beta2: f64,
+    one_minus_beta2: f64,
+    eps: f64,
+    wd: f64,
+    bc1_inv: f64,
+    bc2_inv: f64,
+    step: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let th = unsafe { &*(theta_ptr as *const crate::tensor::NslTensor) };
+        let m = unsafe { &*(m_ptr as *const crate::tensor::NslTensor) };
+        let v = unsafe { &*(v_ptr as *const crate::tensor::NslTensor) };
+
+        let (shard, elem_bytes, grad_ptr, slice_ptr, sr_idx) = {
+            let tbl = ZERO3_TABLE.lock().unwrap();
+            let Some(e) = tbl.as_ref().and_then(|map| map.get(&theta_ptr)) else {
+                eprintln!(
+                    "[zero3] FATAL: bf16-sr elementwise step of untracked \
+                     tensor {theta_ptr} (param {idx})"
+                );
+                std::process::abort();
+            };
+            if e.idx != idx as usize {
+                eprintln!(
+                    "[zero3] FATAL: bf16-sr elementwise step param-index \
+                     mismatch (tensor says {}, codegen says {idx})",
+                    e.idx
+                );
+                std::process::abort();
+            }
+            let Some(s) = e.elem.as_ref() else {
+                eprintln!(
+                    "[zero3] FATAL: bf16-sr elementwise step of param {idx}, \
+                     which was never carved — the plan and the emitted step \
+                     dispatch have drifted"
+                );
+                std::process::abort();
+            };
+            let Some(sr_idx) = s.sr_param_idx else {
+                // The inverse of the plain step's belt: a plain-carved
+                // param stepped here would draw a dither stream nothing
+                // noted, and its 4-byte slice would be read as bf16.
+                eprintln!(
+                    "[zero3] FATAL: param {idx} was carved WITHOUT bf16-sr \
+                     but routed to the SR elementwise step — the emitted \
+                     dispatch and the carve have drifted"
+                );
+                std::process::abort();
+            };
+            if !s.grad_ready {
+                eprintln!(
+                    "[zero3] FATAL: bf16-sr elementwise step of param {idx} \
+                     before its window gradient was reduce_scattered"
+                );
+                std::process::abort();
+            }
+            (
+                s.shard,
+                s.elem_bytes,
+                s.grad.as_ref().map(|g| g.ptr() as i64).unwrap_or(0),
+                s.slice.ptr() as u64,
+                sr_idx,
+            )
+        };
+        if th.data.is_null() || grad_ptr == 0 {
+            eprintln!(
+                "[zero3] FATAL: bf16-sr elementwise step of param {idx} \
+                 without a materialized full tensor (gather must precede \
+                 the group update)"
+            );
+            std::process::abort();
+        }
+        let n = th.len.max(0) as usize;
+        assert!(
+            m.len.max(0) as usize == n && v.len.max(0) as usize == n,
+            "zero3 sr elem step: m/v length mismatch (theta={}, m={}, v={})",
+            th.len,
+            m.len,
+            v.len
+        );
+        assert!(
+            th.device > 0 && m.device == th.device && v.device == th.device,
+            "zero3 sr elem step: all tensors must be GPU-resident"
+        );
+        assert!(
+            th.dtype == 1 && m.dtype == 1 && v.dtype == 1,
+            "zero3 sr elem step: th/m/v must be f32 (got {}/{}/{})",
+            th.dtype,
+            m.dtype,
+            v.dtype
+        );
+        let rank = {
+            let guard = ZERO_CTX.lock().unwrap();
+            guard.as_ref().map(|c| c.rank).unwrap_or(0)
+        };
+        let off_bytes = rank * shard * elem_bytes;
+        let has_wd = wd != 0.0;
+
+        let seed = crate::deterministic_ops::get_rng_seed();
+        let key = seed ^ (step as u64).wrapping_mul(crate::sr_bf16::SR_STEP_SALT);
+        let ctr_base =
+            (sr_idx << crate::sr_bf16::SR_PARAM_SHIFT) + (rank * shard) as u64;
+
+        // NSL_SR_HIST rides the composed path too — a new dispatch path
+        // must not shrink the instrument's surface (the #468 batched-arm
+        // lesson). Each rank samples the head of ITS slice, i.e. a
+        // rank-offset window of the global element space.
+        let hist_n = crate::sr_bf16::sr_hist_sample_len(shard);
+        let mut hist_before: Vec<u16> = vec![0; hist_n];
+        if hist_n > 0 {
+            crate::cuda::inner::ensure_context();
+            crate::cuda::inner::memcpy_dtoh(
+                hist_before.as_mut_ptr() as *mut std::ffi::c_void,
+                slice_ptr as *const std::ffi::c_void,
+                hist_n * 2,
+            );
+        }
+        crate::cuda::gpu_fase_fused_adamw_step_bf16sr_raw(
+            slice_ptr,
+            (m.data as u64) + off_bytes as u64,
+            (v.data as u64) + off_bytes as u64,
+            grad_ptr as u64,
+            shard,
+            beta1 as f32,
+            one_minus_beta1 as f32,
+            beta2 as f32,
+            one_minus_beta2 as f32,
+            eps as f32,
+            (-lr) as f32,
+            ((-lr) * wd) as f32,
+            bc1_inv as f32,
+            bc2_inv as f32,
+            has_wd,
+            key,
+            ctr_base,
+        );
+        if hist_n > 0 {
+            let mut hist_after: Vec<u16> = vec![0; hist_n];
+            crate::cuda::inner::memcpy_dtoh(
+                hist_after.as_mut_ptr() as *mut std::ffi::c_void,
+                slice_ptr as *const std::ffi::c_void,
+                hist_n * 2,
+            );
+            crate::sr_bf16::sr_hist_record_step(&hist_before, &hist_after);
+        }
+        // Coherence refresh: the rank's region of the live f32 working
+        // transient must equal widen(slice) after the step — the same
+        // direction and cast as the mirror backend's refresh.
+        unsafe {
+            crate::cuda::gpu_cast_raw_bf16_to_f32(
+                slice_ptr,
+                (th.data as *const u8).add(off_bytes) as u64,
+                shard,
+            );
+        }
+
+        let mut tbl = ZERO3_TABLE.lock().unwrap();
+        if let Some(s) = tbl
+            .as_mut()
+            .and_then(|map| map.get_mut(&theta_ptr))
+            .and_then(|e| e.elem.as_mut())
+        {
+            s.grad_ready = false;
+        }
+        ZERO3_ELEM_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ZERO3_SR_ELEM_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        0
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            theta_ptr, m_ptr, v_ptr, idx, lr, beta1, one_minus_beta1, beta2,
+            one_minus_beta2, eps, wd, bc1_inv, bc2_inv, step,
+        );
+        eprintln!(
+            "[zero3] FATAL: the bf16-sr elementwise step requires the cuda \
+             feature (the SR backend is GPU-only)"
+        );
+        std::process::abort();
+    }
+}
+
 /// Copy the just-updated host theta region into the persistent slice.
 fn persist_host_slice(
     theta_ptr: i64,
@@ -3141,11 +3486,13 @@ pub extern "C" fn nsl_zero3_teardown() -> i64 {
         // gate parsed a field from it).
         let line = format!(
             "[zero3] teardown: full residency restored (gathers={} releases={} \
-             elem_params={} elem_steps={})\n",
+             elem_params={} elem_steps={} sr_elem_params={} sr_elem_steps={})\n",
             ZERO3_GATHERS.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_RELEASES.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_ELEM_PARAMS.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_ELEM_STEPS.load(std::sync::atomic::Ordering::Relaxed),
+            ZERO3_SR_ELEM_PARAMS.load(std::sync::atomic::Ordering::Relaxed),
+            ZERO3_SR_ELEM_STEPS.load(std::sync::atomic::Ordering::Relaxed),
         );
         use std::io::Write;
         let _ = std::io::stderr().lock().write_all(line.as_bytes());
@@ -3157,6 +3504,8 @@ pub extern "C" fn nsl_zero3_teardown() -> i64 {
     // keep their pre-existing cumulative convention untouched.
     ZERO3_ELEM_PARAMS.store(0, std::sync::atomic::Ordering::Relaxed);
     ZERO3_ELEM_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
+    ZERO3_SR_ELEM_PARAMS.store(0, std::sync::atomic::Ordering::Relaxed);
+    ZERO3_SR_ELEM_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut guard = ZERO3_TABLE.lock().unwrap();
     // Item 11: device shard buffers are freed explicitly — entries live in a
     // static, so ShardBuf cannot carry a cfg(cuda) Drop.
@@ -3939,6 +4288,155 @@ mod tests {
         nsl_zero3_teardown();
         if !t.data.is_null() {
             unsafe { crate::memory::checked_free(t.data as *mut u8, 16) };
+        }
+        crate::list::nsl_list_free(list);
+        nsl_zero_destroy();
+    }
+
+    /// Item 16×11: the composed bf16-sr elementwise lifecycle at ws=1,
+    /// diffed BIT-FOR-BIT against the plain SR mirror path on an identical
+    /// twin. At ws=1 the slice is the whole tensor and `ctr_base` carries a
+    /// zero rank offset, so the composed carve/gather/step must reproduce
+    /// register/upload/step exactly: same f32→bf16 carve cast as the
+    /// mirror's register, same widen at gather as the mirror's upload, same
+    /// SR kernel with the same (seed, step, param, element) counters at the
+    /// step. Any divergence in the composed plumbing shows up here without
+    /// a second rank. (The rank-offset half of the counter claim is the
+    /// 2-rank CLI gate's job — rank is 0 here by construction.)
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn srbf16_elementwise_ws1_matches_the_mirror_path_bitwise() {
+        let _g = zero_serial_lock();
+        const N: usize = 8;
+        let init: [f32; N] = [0.5, -1.25, 2.0, 3.75, -0.001, 7.5, -42.0, 0.375];
+        let grad: [f32; N] = [0.1, -0.2, 0.3, -0.4, 0.05, -0.6, 0.7, -0.008];
+
+        fn gpu_f32_tensor(
+            vals: &[f32],
+            shape: *mut i64,
+            strides: *mut i64,
+        ) -> NslTensor {
+            crate::cuda::inner::ensure_context();
+            let bytes = vals.len() * 4;
+            let dev = crate::cuda::inner::alloc_managed(bytes);
+            crate::cuda::inner::memcpy_htod(dev, vals.as_ptr() as *const c_void, bytes);
+            let mut t = owned_cpu_tensor(dev, shape, strides, vals.len() as i64);
+            t.device = 1;
+            t.dtype = 1; // f32 (GPU params)
+            t
+        }
+        fn read_gpu_f32(ptr: *const c_void, n: usize) -> Vec<u32> {
+            let mut host = vec![0f32; n];
+            crate::cuda::inner::memcpy_dtoh(
+                host.as_mut_ptr() as *mut c_void,
+                ptr,
+                n * 4,
+            );
+            host.iter().map(|x| x.to_bits()).collect()
+        }
+
+        nsl_zero_destroy();
+        assert_eq!(nsl_zero_init(3, 1), 0);
+        nsl_zero3_enable();
+        crate::sr_bf16::nsl_sr_bf16_enable();
+
+        let mut shape = vec![N as i64];
+        let mut strides = vec![1i64];
+
+        // ── Composed side: SR note + elementwise mark + carve ──────────────
+        let t = gpu_f32_tensor(&init, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let tp = &t as *const NslTensor as i64;
+        crate::sr_bf16::nsl_sr_bf16_note_param(tp, 0);
+        assert_eq!(nsl_zero3_note_param(tp, 0), 0);
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
+        zero3_register(tp);
+        assert!(t.data.is_null(), "carve must drop the full replica");
+        {
+            let tbl = ZERO3_TABLE.lock().unwrap();
+            let sr = tbl
+                .as_ref()
+                .and_then(|m| m.get(&tp))
+                .and_then(|e| e.elem.as_ref())
+                .and_then(|s| s.sr_param_idx);
+            assert_eq!(sr, Some(0), "carve must record the SR counter block");
+        }
+
+        // Gather widens the bf16 slice into the f32 working transient.
+        zero3_gather(tp);
+        assert!(!t.data.is_null());
+
+        let gt = gpu_f32_tensor(&grad, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(list, &gt as *const NslTensor as i64);
+        assert_eq!(nsl_zero3_reduce_grad_slot(list, 0), 0);
+
+        let zeros = [0f32; N];
+        let ms = gpu_f32_tensor(&zeros, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let vs = gpu_f32_tensor(&zeros, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let (lr, b1, b2, eps, wd) = (0.002f64, 0.9f64, 0.95f64, 1e-8f64, 0.01f64);
+        let (bc1, bc2) = (1.0 / (1.0 - b1), 1.0 / (1.0 - b2)); // t=1
+        assert_eq!(
+            nsl_zero3_elem_sr_adamw_step(
+                tp,
+                &ms as *const NslTensor as i64,
+                &vs as *const NslTensor as i64,
+                0,
+                lr, b1, 1.0 - b1, b2, 1.0 - b2, eps, wd, bc1, bc2,
+                1, // step
+            ),
+            0
+        );
+        // Post-step the working transient region is refreshed by widening.
+        let composed_theta = read_gpu_f32(t.data, N);
+        let composed_m = read_gpu_f32(ms.data, N);
+        let composed_v = read_gpu_f32(vs.data, N);
+
+        // ── Plain SR twin: note + register (mirror) + fused SR step ────────
+        let t2 = gpu_f32_tensor(&init, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let t2p = &t2 as *const NslTensor as i64;
+        crate::sr_bf16::nsl_sr_bf16_note_param(t2p, 0);
+        crate::sr_bf16::srbf16_register(t2p);
+        assert!(t2.data.is_null(), "register must free the f32 storage");
+        let m2 = gpu_f32_tensor(&zeros, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let v2 = gpu_f32_tensor(&zeros, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let mp2 = gpu_f32_tensor(&grad, shape.as_mut_ptr(), strides.as_mut_ptr());
+        crate::sr_bf16::nsl_sr_bf16_step_adamw(
+            t2p,
+            &m2 as *const NslTensor as i64,
+            &v2 as *const NslTensor as i64,
+            &mp2 as *const NslTensor as i64,
+            lr, b1, 1.0 - b1, b2, 1.0 - b2, eps, wd, bc1, bc2,
+            1, // step
+        );
+        // Materialize the twin's working view = widen(mirror).
+        crate::sr_bf16::srbf16_upload(t2p);
+        assert!(!t2.data.is_null());
+        let plain_theta = read_gpu_f32(t2.data, N);
+        let plain_m = read_gpu_f32(m2.data, N);
+        let plain_v = read_gpu_f32(v2.data, N);
+
+        assert_eq!(
+            composed_theta, plain_theta,
+            "composed slice (widened) must equal the mirror (widened) BIT-FOR-BIT"
+        );
+        assert_eq!(composed_m, plain_m, "first moment must match bitwise");
+        assert_eq!(composed_v, plain_v, "second moment must match bitwise");
+
+        // ── Teardown both backends; free what they left resident ──────────
+        zero3_release(tp);
+        nsl_zero3_teardown();
+        assert!(!t.data.is_null(), "teardown must restore a full replica");
+        let restored = read_gpu_f32(t.data, N);
+        assert_eq!(
+            restored, plain_theta,
+            "teardown gather must serve the post-step slice"
+        );
+        crate::sr_bf16::nsl_sr_bf16_teardown();
+        crate::cuda::inner::ensure_context();
+        for tt in [&t, &t2, &gt, &ms, &vs, &m2, &v2, &mp2] {
+            if !tt.data.is_null() {
+                crate::cuda::inner::free_managed(tt.data);
+            }
         }
         crate::list::nsl_list_free(list);
         nsl_zero_destroy();

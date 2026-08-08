@@ -298,12 +298,24 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         CLI_OPTIONS,
         "--autotune-db does not compose with --no-autotune",
     ),
+    // Item 16×11: bf16-sr composes with elementwise stage 3 (every rank
+    // SR-steps its own bf16 slice); stages 1/2 and tensor-granular 3 stay
+    // refused. The 1/2 arm is defense-in-depth — bf16-sr's --weight-stream
+    // requirement already clap-chains to --layerwise-accum, which refuses
+    // stages 1/2 first.
     src_rule(
         "--param-dtype",
         RuleKind::Conflicts,
-        "--zero-stage",
+        "--zero-stage 1/2",
         STMT,
-        "--param-dtype bf16-sr does not compose with --zero-stage",
+        "--param-dtype bf16-sr does not compose with --zero-stage 1/2",
+    ),
+    src_rule(
+        "--param-dtype",
+        RuleKind::Requires,
+        "--zero-elementwise",
+        STMT,
+        "--param-dtype bf16-sr composes with --zero-stage 3 only under --zero-elementwise",
     ),
     src_rule(
         "--param-dtype",
