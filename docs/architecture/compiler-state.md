@@ -84,12 +84,14 @@ including the autodiff `TAPE` itself.)
 | `nsl-codegen/src/lib.rs` | `ADJOINT_OPS_DROPPED`, `ALLOC_SLOTS_PRE_HINT`, `ALLOC_SLOTS_POST_HINT`, `CONSUME_HINTS_CALLS` | TEST | Source-AD / allocator instrumentation counters, read via `debug_*` accessors by tests only. |
 | `nsl-codegen/src/hir/ids.rs` | `WIRE_ID_COUNTER`, `REGISTER_ID_COUNTER`, `GENVAR_ID_COUNTER` | TEST | FPGA HIR id generation (macro-declared), reset by `KirToHirPass::lower`. Per-thread BY DESIGN: a process-global atomic would break snapshot tests under parallel sharding. Note: these do shape emitted HIR id values, so they are the one TEST entry with artifact influence — a lowering-context field is the eventual home. |
 | `nsl-codegen/src/pass_trace.rs` | `CURRENT_PHASE` | FFI/RUNTIME-OK | Active driver phase for trace attribution — written during every production compile and read by `NSL_PASS_TRACE` reporting, so not test-only; diagnostic-only either way. |
+| `nsl-codegen/src/pass_trace.rs` | `CURRENT_EPOCH` | MIGRATE (compile) | Per-compile attribution scope, added with the pass manager's ordering decision. Thread-local strictly BEATS the process-global counter it replaced (a compile never spans threads, and a process-global let one thread's compile claim another's pass invocations) — but unlike `CURRENT_PHASE` it is not diagnostic-only: `per_compile_view` is what the manager ENFORCES ordering from, so a wrong epoch is a wrong refusal. The only compile-side MIGRATE row; last in priority, not first, because its explicit home (an epoch owned by `PassManager` and handed to `record`) means threading a parameter through 32 ambient call sites in unrelated passes. |
 | `nsl-runtime/src/pca_rope_runtime.rs` | `PACKING_METADATA` | **MIGRATE** | Device pointers for `segment_ids`/`doc_starts` set per training step — the "explicit step input" migration target (Phase 3). Real runtime behavior via a global; races if a step's data prep and its FA call ever land on different threads. |
 | `nsl-runtime/src/autodiff/mod.rs` | `TAPE` | MIGRATE (runtime) | THE autodiff tape — the heaviest behavioral thread-local in the codebase (27 access sites). Missing from every previous version of this table. |
 | `nsl-runtime/src/tensor/mod.rs` | `TENSOR_SCOPE`, `TRAINING_MODE` | MIGRATE (runtime) | Scope-stack pointer and the global train/eval flag that gates tape recording. |
 | `nsl-runtime/src/tensor/mod.rs` | `INPLACE_SUPPRESS_DEPTH` | MIGRATE (runtime) | FBIP in-place-suppression depth. Its only production readers were the (permanently disabled) refcount-elision predicates — writers are still emitted; the live reads are one test. A migration should first decide whether it still earns its writes. |
 | `nsl-runtime/src/cuda/caching_allocator.rs` | `CURRENT_POOL` | MIGRATE (runtime) | Persistent-vs-transient pool selector; has RAII (`PoolGuard`, 2026-08-06) but is still a global channel. |
 | `nsl-runtime/src/cuda/graph_capture.rs` | `ACTIVE`, `REGIONS`, `OCCURRENCE`, `NESTED_SKIP` | MIGRATE (runtime) | The CUDA-graph capture state machine (record vs replay vs skip). Self-contained cluster — a capture-context struct is the natural shape. |
+| `nsl-runtime/src/transient_arena.rs` | `PIN`, `PLACED_AT` | MIGRATE (runtime) | The placed transient arena's single-shot placement channel: `PIN` arms `(payload_ptr, bytes, slot)` for the NEXT arena allocation, `PLACED_AT` records the payload pointer it was actually consumed at so the verify/unbind step can prove the binding rather than assume it. Thread-local because the allocation it steers happens inside an `extern "C"` whose signature has no room for an out-parameter — the same shape as `CURRENT_POOL`, and the same eventual fix (an explicit placement argument on the allocation path). |
 | `nsl-runtime/src/tensor/mod.rs` | `OFFLOAD_DRAIN_TENSORS`, `OFFLOAD_DRAIN_DEVICE_BUFS` | RUNTIME-OK | In-flight async DtoH copy-back queues, deliberately paired with the per-thread `TRANSFER_STREAM` — converting to shared state would be a regression. |
 | `nsl-runtime/src/memory.rs` | `ALLOC_REGISTRY` | RUNTIME-OK | ptr→size map that reconstructs the `Layout` for `nsl_free`. CORRECTNESS-CRITICAL and thread-affine (a cross-thread free cannot reconstruct the layout) — previously misfiled as test-only accounting. |
 | `nsl-runtime/src/cuda/caching_allocator.rs` | `CURRENT_SURFACE`, `CURRENT_ALLOC_IDENTITY` | RUNTIME-OK | VRAM-surface tag and (op, tensor) attribution for allocation reports; RAII via `SurfaceGuard`. Metadata only. |
@@ -132,9 +134,11 @@ a stack-local `CompileOptions` that drops on return/panic, so it can no longer
 leak across in-process CLI calls. Internal to the CLI→codegen boundary, so no
 public C-ABI changes.
 
-**Phase 3 — runtime contexts (larger).** The MIGRATE set is entirely
-runtime-side now (the compile-side well ran dry with Phase 2), and it splits
-into three independent clusters — do NOT build one mega-context:
+**Phase 3 — runtime contexts (larger).** The MIGRATE set is almost entirely
+runtime-side: Phase 2 drained the compile-side well, and `CURRENT_EPOCH`
+refilled exactly one row of it (see its note — it is deliberately last, and it
+replaced something worse). The runtime side splits into three independent
+clusters — do NOT build one mega-context:
 
 1. **Per-train-step inputs**: `PACKING_METADATA`. Smallest and cleanest —
    the first target. The obstacle every cluster shares: these are reached
@@ -146,7 +150,10 @@ into three independent clusters — do NOT build one mega-context:
    `INPLACE_SUPPRESS_DEPTH` (decide the last one's fate first — its
    production reader is dead).
 3. **Capture/allocator state machines**: `graph_capture`'s four cells;
-   `CURRENT_POOL` (RAII-guarded already).
+   `CURRENT_POOL` (RAII-guarded already); the transient arena's `PIN` /
+   `PLACED_AT` pair, which is the same "steer the next allocation through a
+   global because the FFI has no out-parameter" shape and should be solved
+   once for all three.
 
 Not a prerequisite for the compile-side cleanup, and the RUNTIME-OK rows are
 not targets at all — several (`ALLOC_REGISTRY`, `OFFLOAD_DRAIN_*`, the CUDA
