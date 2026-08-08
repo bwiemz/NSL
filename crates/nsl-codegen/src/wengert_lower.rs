@@ -2264,9 +2264,20 @@ fn lower_single_op(
             // a claimed chain, that's a bug to fix.  We never silently
             // fall back to decomposition — that would reintroduce the
             // dual-path drift class the user explicitly rejected.
+            // `op` may belong to EITHER tape — this lowerer walks the primal
+            // and the adjoint through the same match. `op_to_chain` is keyed
+            // by primal ids, so consult it only for a primal op: an adjoint
+            // op (a CCR recompute clone of an unclaimed SDPA is the live
+            // case) must decompose, never inherit a claimed layer's fused
+            // forward and its save buffers. The id split makes the lookup
+            // miss on its own; this makes the reason legible at the site
+            // rather than implicit in the numbering.
             let claim_layer = compiler
                 .bus
                 .csha_backward_claims()
+                .filter(|_| {
+                    crate::wengert::id_space(op.id) == crate::wengert::IdSpace::Primal
+                })
                 .and_then(|claims| {
                     claims
                         .op_to_chain

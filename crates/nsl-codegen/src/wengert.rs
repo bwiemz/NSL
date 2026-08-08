@@ -5,6 +5,106 @@ use std::collections::HashMap;
 pub type OpId = u32;
 pub type VarId = u32;
 
+/// The low bound of the ADJOINT half of the `OpId` space.
+///
+/// # Why the two tapes may not share an id space
+///
+/// The primal and the adjoint are separate [`WengertList`]s, and until this
+/// split they both numbered from 0 — the adjoint rewriters renumber their
+/// list to `id == index` after every splice, so adjoint id `k` and primal id
+/// `k` were the same `u32`. That is only safe while no id-keyed table built
+/// from ONE list is consulted against ops from the OTHER, and the lowerer
+/// does exactly that: [`crate::wengert_lower::compile_wengert_ops`] lowers
+/// both lists and looks up `claims.op_to_chain.get(&op.id)` — a map keyed by
+/// PRIMAL ids — on every op it walks. A CCR recompute clone of an unclaimed
+/// SDPA, renumbered into a claimed primal id, would take the claimed
+/// chain's fused-forward path under another layer's save buffers.
+///
+/// Today that is held off by a single `bus.clear_csha_backward_claims()`
+/// placed between the forward and adjoint lowerings — a TEMPORAL invariant
+/// at one call site, with nothing enforcing it against a new call site, an
+/// early return, or a reordering. Splitting the space makes the collision
+/// unrepresentable instead: primal ids stay below this bound, adjoint ids
+/// start at it, so a primal-keyed lookup structurally cannot match an
+/// adjoint op no matter when it runs.
+///
+/// `1 << 31` (not `u32::MAX / 2`) so the discriminator is a single high bit:
+/// each half holds 2^31 ops, ~5 orders of magnitude above the largest tape
+/// this compiler has ever built. [`adjoint_op_id`] refuses to wrap.
+pub const ADJOINT_ID_BASE: OpId = 1 << 31;
+
+/// Which tape an [`OpId`] belongs to. Recoverable from the id alone — that
+/// is the point of the split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdSpace {
+    Primal,
+    Adjoint,
+}
+
+/// The tape an id belongs to, from the id alone.
+pub fn id_space(id: OpId) -> IdSpace {
+    if id >= ADJOINT_ID_BASE {
+        IdSpace::Adjoint
+    } else {
+        IdSpace::Primal
+    }
+}
+
+/// The adjoint-space id for positional index `index`.
+///
+/// Panics rather than wrapping: a wrapped index would land back in the
+/// PRIMAL half, which is precisely the collision this split exists to make
+/// unrepresentable. A silent wrap here would be worse than the bug it
+/// replaces, because the header would then promise a disjointness that no
+/// longer held.
+pub fn adjoint_op_id(index: usize) -> OpId {
+    let off = u32::try_from(index).unwrap_or_else(|_| {
+        panic!(
+            "adjoint tape index {index} exceeds the u32 id space — the \
+             adjoint/primal id split cannot be maintained"
+        )
+    });
+    ADJOINT_ID_BASE.checked_add(off).unwrap_or_else(|| {
+        panic!(
+            "adjoint tape index {index} overflows the adjoint id half \
+             (base {ADJOINT_ID_BASE}) — ids would wrap into the primal \
+             space and alias a claim key"
+        )
+    })
+}
+
+/// Renumber an adjoint op slice to `ADJOINT_ID_BASE + index`.
+///
+/// THE ONLY sanctioned way to renumber an adjoint tape. The adjoint
+/// rewriters each used to write `op.id = i as u32` inline; every one of
+/// those was a site that could silently reintroduce the primal collision,
+/// so they now funnel through here and a static gate
+/// (`tests/adjoint_id_space_gate.rs`) refuses new raw ones.
+///
+/// Ids stay positional WITHIN the adjoint (the property `ccr.rs`'s splice
+/// renumbering relies on) — only the base moves.
+pub fn renumber_adjoint_ops(ops: &mut [WengertOp]) {
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.id = adjoint_op_id(i);
+    }
+}
+
+/// Slice form of [`WengertList::assert_ids_in_space`], for the rewriters
+/// that hold a bare `Vec<WengertOp>` rather than a whole list.
+pub fn assert_ids_in_space(ops: &[WengertOp], space: IdSpace, context: &str) {
+    for op in ops {
+        let actual = id_space(op.id);
+        assert!(
+            actual == space,
+            "Wengert op id {} is in the {actual:?} id space after \
+             {context}, expected {space:?} — an id-keyed table built from \
+             the other tape (CSHA claims, CCR's exemption set) can alias \
+             this op the moment the two halves overlap",
+            op.id
+        );
+    }
+}
+
 /// Paper §5.3 checkpointing-aware backward: identifier for a
 /// "recompute subgraph" — a connected slice of the forward Wengert list
 /// whose values are intentionally NOT persisted across the forward /
@@ -622,19 +722,27 @@ pub enum CompareKind {
 /// drift-checked; every in-place structural mutator re-asserts id
 /// uniqueness at its commit point — see [`WengertList::assert_unique_op_ids`].
 ///
-/// ## Ids are unique PER LIST, not per compile
+/// ## Ids carry their tape: the primal and adjoint halves are DISJOINT
 ///
-/// The primal and the adjoint are separate `WengertList` instances with
-/// independent id spaces: the adjoint rewriters renumber their list back
-/// to `id == index` after every splice. A table keyed by PRIMAL ids that
-/// is consulted while lowering walks BOTH lists (the CSHA claim tables,
-/// via `compile_wengert_ops`) therefore relies on the consulting arm
-/// distinguishing which list an op came from — an adjoint op whose
-/// renumbered id collides with a claimed primal id (e.g. a CCR recompute
-/// clone of an unclaimed SDPA) is a known narrow alias hazard, named here
-/// so the discipline is complete rather than silently per-list. It
-/// predates this header; closing it needs either list-tagged claim keys
-/// or an adjoint id space disjoint from the primal's.
+/// The primal and the adjoint are separate `WengertList` instances, and
+/// their ids no longer overlap: primal ids number from 0, adjoint ids from
+/// [`ADJOINT_ID_BASE`] (see that constant for why). The adjoint rewriters
+/// still renumber their list positionally after every splice — through
+/// [`renumber_adjoint_ops`], which keeps the base — so adjoint ids remain
+/// `base + index` and nothing that relied on adjoint ids being positional
+/// changed.
+///
+/// This is what makes a table keyed by PRIMAL ids safe to consult while
+/// lowering walks BOTH lists (the CSHA claim tables, via
+/// `compile_wengert_ops`): a claim key is a primal id by construction, so
+/// it cannot match an adjoint op — including a CCR recompute clone of an
+/// unclaimed SDPA, which is the case that used to be able to route an
+/// adjoint op through another layer's fused backward. Before the split,
+/// the only thing preventing that was a `clear_csha_backward_claims()`
+/// call placed between the two lowerings; the split replaces that timing
+/// argument with a structural one. Enforced by
+/// [`WengertList::assert_ids_in_space`] at the mutators' commit points and
+/// by `tests/adjoint_id_space_gate.rs`.
 #[derive(Debug, Clone)]
 pub struct WengertList {
     pub ops: Vec<WengertOp>,
@@ -672,6 +780,16 @@ impl WengertList {
             );
         }
     }
+    /// Assert every op id lies in `space` — the property that makes an
+    /// id-keyed table built from one tape safe to consult against the
+    /// other. `context` names the mutation site for the panic message.
+    ///
+    /// A real `assert!`, not `debug_assert!` (CI ships release builds), and
+    /// O(n) with no allocation.
+    pub fn assert_ids_in_space(&self, space: IdSpace, context: &str) {
+        assert_ids_in_space(&self.ops, space, context);
+    }
+
     pub fn defines(&self, var: VarId) -> bool {
         self.ops.iter().any(|op| op.result == var)
     }
