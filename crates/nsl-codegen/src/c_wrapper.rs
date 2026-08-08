@@ -20,7 +20,15 @@ pub struct ExportWrapper {
     pub is_model_method: bool,
 }
 
-fn cranelift_type_for_scalar(dtype: ExportDtype) -> cranelift_codegen::ir::Type {
+/// The ABI slot a scalar `@export` parameter occupies.
+///
+/// Everything that is not exactly I32/I64/F32/F64 is widened to a 64-bit
+/// slot. `c_header::c_type_for_scalar` DERIVES the header's spelling from this
+/// function rather than mapping `ExportDtype` a second time — the two used to
+/// map independently, so `u8` was declared `uint8_t` in the header against a
+/// callee reading a full 64-bit register whose upper half the C caller never
+/// set.
+pub(crate) fn cranelift_type_for_scalar(dtype: ExportDtype) -> cranelift_codegen::ir::Type {
     match dtype {
         ExportDtype::I32 => types::I32,
         ExportDtype::I64 => types::I64,

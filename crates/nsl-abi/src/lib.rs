@@ -98,6 +98,229 @@ pub fn abi_from_rust(ty: &str) -> Option<AbiScalar> {
     })
 }
 
+/// Map a C type as written in a generated header to an [`AbiScalar`].
+///
+/// Pointers of any spelling become `Int(64)` — same rule as [`abi_from_rust`],
+/// same reason. `void` used as a return type is *absence* of a value, not a
+/// type, so it is handled by the caller and returns `None` here.
+///
+/// This exists because the emitted header is the one host-facing surface the
+/// `RUNTIME_FUNCTIONS` cross-check structurally cannot see: that check iterates
+/// the declared table, and the header is hand-written text in `c_header.rs`
+/// with no table entry at all.
+pub fn abi_from_c(ty: &str) -> Option<AbiScalar> {
+    let mut t = ty.trim();
+    // Qualifiers and tags carry no ABI meaning.
+    for prefix in ["const ", "volatile ", "struct ", "enum ", "union "] {
+        while let Some(rest) = t.strip_prefix(prefix) {
+            t = rest.trim_start();
+        }
+    }
+    let t = t.trim_end();
+    if t.ends_with('*') {
+        return Some(AbiScalar::Int(64));
+    }
+    Some(match t {
+        "int64_t" | "uint64_t" | "size_t" | "ssize_t" | "ptrdiff_t" | "intptr_t"
+        | "uintptr_t" | "long long" | "unsigned long long" => AbiScalar::Int(64),
+        "int32_t" | "uint32_t" | "int" | "unsigned" | "unsigned int" => AbiScalar::Int(32),
+        "int16_t" | "uint16_t" | "short" | "unsigned short" => AbiScalar::Int(16),
+        "int8_t" | "uint8_t" | "char" | "signed char" | "unsigned char" | "_Bool" | "bool" => {
+            AbiScalar::Int(8)
+        }
+        "double" => AbiScalar::Float(64),
+        "float" => AbiScalar::Float(32),
+        _ => return None,
+    })
+}
+
+fn classify_c(ty: &str) -> ParsedType {
+    match abi_from_c(ty) {
+        Some(s) => ParsedType::Known(s),
+        None => ParsedType::Unknown(ty.trim().to_string()),
+    }
+}
+
+/// Replace every balanced `{ … }` region with `;`, so a declaration that
+/// follows a function or struct body still lands in its own `;`-delimited
+/// chunk.
+///
+/// A SEMICOLON, not a space: a function definition carries no trailing `;`, so
+/// blanking its body would glue `static inline T f(…)` to whatever declaration
+/// comes next, and the merged chunk parses as `f` alone — the following
+/// declaration disappears exactly as it did before the elision was added.
+///
+/// The `extern "C" {` linkage block is dropped first, and that is not a
+/// detail: it wraps EVERY declaration in the header, so counting its brace
+/// elides the entire file and the gate silently checks nothing. Its now
+/// unmatched closing brace falls out harmlessly — a `}` at depth 0 is simply
+/// not copied.
+fn elide_brace_regions(src: &str) -> String {
+    let src = src.replace("extern \"C\" {", " ");
+    let mut out = String::with_capacity(src.len());
+    let mut depth = 0usize;
+    for c in src.chars() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    out.push(';');
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Strip `/* … */` and `// …` from C text, preserving token separation.
+///
+/// Both helpers it delegates to document preconditions written for the
+/// `RUNTIME_FUNCTIONS` table ("contains no string literals embedding `/*`").
+/// A generated C header satisfies them for a different reason: `c_header::emit`
+/// writes no `//` comments at all, and its only string literals are the export
+/// names inside `nsl_model_call(...)` bodies, which `elide_brace_regions`
+/// removes before any of this is parsed.
+fn strip_c_comments(src: &str) -> String {
+    let no_block = strip_block_comments(src);
+    no_block
+        .lines()
+        .map(strip_line_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Split off the trailing parameter NAME from a C parameter declaration,
+/// leaving the type. `int64_t n_inputs` -> `int64_t`; `const NslTensorDesc*
+/// inputs` -> `const NslTensorDesc*`; `int64_t` and `int64_t*` (unnamed) are
+/// returned unchanged.
+fn c_param_type(param: &str) -> String {
+    let p = param.trim();
+    if p.ends_with('*') {
+        return p.to_string();
+    }
+    let last = match p.rsplit(|c: char| c.is_whitespace() || c == '*').next() {
+        Some(l) if !l.is_empty() => l,
+        _ => return p.to_string(),
+    };
+    // A single-token param IS the type (`void`, `int64_t`).
+    if last == p {
+        return p.to_string();
+    }
+    // Multi-word type spellings whose last token is still part of the type.
+    if matches!(last, "int" | "char" | "long" | "short" | "double" | "float" | "unsigned") {
+        return p.to_string();
+    }
+    p[..p.len() - last.len()].trim_end().to_string()
+}
+
+/// Parse the function declarations and function-pointer typedefs out of a
+/// generated C header.
+///
+/// Deliberately narrow: it understands the two forms `c_header::emit` produces
+/// (`RET name(params);` and `typedef RET (*Name)(params);`).
+///
+/// Brace-enclosed regions — struct bodies and `static inline` function bodies —
+/// are ELIDED before splitting, not used as a skip condition. Skipping any
+/// `;`-chunk containing a brace looked equivalent and was not: a declaration
+/// following a function body shares that body's closing brace in its chunk, so
+/// it was silently dropped. `emit_static_inline_wrappers` runs last, which
+/// makes "after the inlines" exactly where a new lifecycle prototype would
+/// naturally be added — the one place the parser could not see. (Eliding also
+/// means a `static inline` DEFINITION now parses as a declaration, which is
+/// correct: its declarator is well-formed and worth checking.)
+///
+/// Callers should assert on the names they expect rather than a count: a
+/// parser that silently degrades makes its gate vacuous, and a floor set just
+/// under the current value still lets one declaration disappear.
+pub fn parse_c_prototypes(header: &str) -> Vec<FnSig> {
+    let src = strip_c_comments(header);
+    // Preprocessor lines are not declarations and do not end in `;`.
+    let src: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let src = elide_brace_regions(&src);
+
+    let mut out = Vec::new();
+    for stmt in src.split(';') {
+        let s = stmt.trim();
+        if s.is_empty() || !s.contains('(') {
+            continue;
+        }
+        let is_typedef = s.starts_with("typedef");
+        let body = if is_typedef {
+            s["typedef".len()..].trim_start()
+        } else {
+            s
+        };
+
+        let (name, ret_txt, params_txt) = if is_typedef {
+            // `RET (*Name)(params)` — the first group names the pointer, the
+            // second holds the parameters.
+            let (ptr_group, after) = match balanced(body, 0, '(', ')') {
+                Some(x) => x,
+                None => continue,
+            };
+            let name = ptr_group.trim().trim_start_matches('*').trim().to_string();
+            let (params, _) = match balanced(body, after, '(', ')') {
+                Some(x) => x,
+                None => continue,
+            };
+            let open = match body.find('(') {
+                Some(i) => i,
+                None => continue,
+            };
+            (name, body[..open].trim().to_string(), params.to_string())
+        } else {
+            let (params, _) = match balanced(body, 0, '(', ')') {
+                Some(x) => x,
+                None => continue,
+            };
+            let open = match body.find('(') {
+                Some(i) => i,
+                None => continue,
+            };
+            let head = body[..open].trim();
+            let name = match head.rsplit(|c: char| c.is_whitespace() || c == '*').next() {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => continue,
+            };
+            let ret = head[..head.len() - name.len()].trim().to_string();
+            (name, ret, params.to_string())
+        };
+
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+
+        let params: Vec<ParsedType> = split_top_level(&params_txt)
+            .iter()
+            .map(|p| c_param_type(p))
+            .filter(|t| t != "void")
+            .map(|t| classify_c(&t))
+            .collect();
+        let ret = if ret_txt.trim() == "void" {
+            None
+        } else {
+            Some(classify_c(&ret_txt))
+        };
+
+        out.push(FnSig {
+            name,
+            params,
+            ret,
+            source: "generated C header".to_string(),
+        });
+    }
+    out
+}
+
 fn classify_cranelift(ident: &str) -> ParsedType {
     match abi_from_cranelift(ident) {
         Some(s) => ParsedType::Known(s),
@@ -859,5 +1082,84 @@ mod tests {
         assert_eq!(macros[0].name, "nsl_tensor_relu_inplace");
         assert_eq!(macros[0].params, vec![ParsedType::Known(AbiScalar::Int(64))]);
         assert_eq!(macros[0].ret, Some(ParsedType::Known(AbiScalar::Int(64))));
+    }
+
+    /// The two ways this parser silently degraded to checking NOTHING, both
+    /// found the hard way.
+    #[test]
+    fn c_prototype_parsing_survives_the_shapes_a_real_header_has() {
+        let header = r#"
+#ifndef NSL_M_H
+#define NSL_M_H
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct NslModel NslModel;
+typedef struct {
+    void*    data;
+    int32_t  ndim;
+} NslTensorDesc;
+
+typedef int64_t (*NslExportFn)(NslModel* model, const NslTensorDesc* inputs,
+                               int64_t n_inputs);
+
+int64_t   nsl_abi_version(void);
+int64_t   nsl_model_call(NslModel* model, const char* name, int64_t n);
+
+static inline int64_t nsl_export_forward(NslModel* model, int64_t n) {
+    return nsl_model_call(model, "forward", n);
+}
+
+int64_t   nsl_added_after_the_inline(NslModel* model);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+"#;
+        let sigs = parse_c_prototypes(header);
+        let names: Vec<&str> = sigs.iter().map(|s| s.name.as_str()).collect();
+
+        // 1. `extern "C" {` wraps EVERY declaration. Counting its brace as a
+        //    region elided the entire file — the gate stayed green while
+        //    checking zero prototypes.
+        assert!(
+            names.contains(&"nsl_abi_version") && names.contains(&"nsl_model_call"),
+            "the extern \"C\" linkage block swallowed the declarations: {names:?}"
+        );
+
+        // 2. A declaration AFTER a function body shares that body's closing
+        //    brace in its `;`-chunk. Skipping brace-bearing chunks dropped it,
+        //    and the inline wrappers are emitted LAST — so "after the inlines"
+        //    is exactly where a new lifecycle prototype would be added.
+        assert!(
+            names.contains(&"nsl_added_after_the_inline"),
+            "a declaration following a function body was dropped: {names:?}"
+        );
+
+        // 3. The struct body must not become a bogus signature.
+        assert!(
+            !names.contains(&"NslTensorDesc"),
+            "a struct definition parsed as a function: {names:?}"
+        );
+
+        // 4. The function-pointer typedef keeps its own name and widths.
+        let ef = sigs.iter().find(|s| s.name == "NslExportFn").expect("typedef");
+        assert_eq!(ef.ret, Some(ParsedType::Known(AbiScalar::Int(64))));
+        assert_eq!(
+            ef.params,
+            vec![
+                ParsedType::Known(AbiScalar::Int(64)),
+                ParsedType::Known(AbiScalar::Int(64)),
+                ParsedType::Known(AbiScalar::Int(64)),
+            ]
+        );
+
+        // 5. `void` is absence, not a parameter.
+        let v = sigs.iter().find(|s| s.name == "nsl_abi_version").unwrap();
+        assert!(v.params.is_empty(), "`(void)` produced a parameter: {:?}", v.params);
     }
 }
