@@ -437,6 +437,15 @@ const PRINT_MARKERS: &[&str] = &[
 fn anchored_text(path: &std::path::Path, markers: &[&str]) -> String {
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    // CRLF FIRST. The continuation unwrap below matches `\` immediately
+    // followed by `\n`; under a Windows checkout (`core.autocrlf` is on by
+    // default there) the bytes are `\` `\r` `\n`, no match, and every
+    // multi-line refusal literal stays wrapped — so the registered fragment
+    // no longer occurs in the text and the sweep reports a REGISTERED refusal
+    // as missing. That is what red-lined windows-latest on #481's
+    // `--fuse-lm-head` rule while linux stayed green: not a rule that was
+    // absent, a gate that could not read it.
+    let raw = raw.replace("\r\n", "\n");
     let code = strip_comments(&raw);
     let unwrapped = code.replace("\\\n", " ");
 

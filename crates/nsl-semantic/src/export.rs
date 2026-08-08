@@ -576,8 +576,13 @@ fn validate_fn_signature(
         if !is_c_abi_compatible(ret_ty, interner) {
             diagnostics.push(
                 Diagnostic::error(
-                    "@export function must return a tensor, scalar, or tuple of those"
-                        .to_string(),
+                    format!(
+                        "@export function must return a tensor, a tuple of those, or one \
+                         of the C-ABI scalars {} (other scalar spellings lower \
+                         inconsistently across the header, the wrapper and the function \
+                         body — see C_ABI_SCALARS)",
+                        C_ABI_SCALARS.join("/")
+                    ),
                 )
                 .with_label(ret_ty.span, "non-ABI return type"),
             );
@@ -614,8 +619,10 @@ fn validate_param(param: &Param, interner: &Interner, diagnostics: &mut Vec<Diag
     } else if !is_c_abi_compatible(type_ann, interner) {
         diagnostics.push(
             Diagnostic::error(format!(
-                "@export function parameter '{}' must be a tensor, scalar, or tuple of those",
-                interner.resolve(param.name.0).unwrap_or("<unknown>")
+                "@export function parameter '{}' must be a tensor, a tuple of those, \
+                 or one of the C-ABI scalars {}",
+                interner.resolve(param.name.0).unwrap_or("<unknown>"),
+                C_ABI_SCALARS.join("/")
             ))
             .with_label(type_ann.span, "non-ABI parameter type"),
         );
@@ -948,6 +955,38 @@ fn is_closure_type(ty: &TypeExpr) -> bool {
     matches!(ty.kind, TypeExprKind::Function { .. })
 }
 
+/// Scalar type spellings an `@export` signature may use.
+///
+/// The admitted set is exactly those whose THREE independent lowerings agree:
+///
+/// | spelling | header (`c_header::lower_dtype_name`) | wrapper slot (`c_wrapper::cranelift_type_for_scalar`) | impl slot (`Compiler::resolve_type_name_to_cl`) |
+/// |---|---|---|---|
+/// | `f32` / `f64` / `i32` / `int32` / `i64` / `int64` / `long` | exact | same | same |
+/// | `u8` / `u16` / `u32` / `u64` | widened to the 64-bit slot | I64 | I64 (fall-through) |
+///
+/// Every other previously-admitted spelling disagreed with itself, and the
+/// disagreement is not cosmetic:
+///
+/// * `bool`, `i8`, `i16` — wrapper slot I64, impl slot I8/I8/I16. As a
+///   PARAMETER the wrapper hands a 64-bit value to a call expecting a narrow
+///   one; as a RETURN the impl stores 1-2 bytes through a pointer the header
+///   declares wider, so the host reads uninitialized bytes.
+/// * `f16` / `fp16` / `bf16` — impl slot F32, wrapper slot I64: an integer
+///   register where a float is expected, which is a different register CLASS,
+///   not just a width.
+/// * `int` — header lowers it to I32, the impl to I64.
+/// * `float` — header F32, impl F64. `double` — header F64, impl I64.
+/// * `fp32` / `fp64` — the impl's mapping does not know these spellings and
+///   falls through to I64.
+///
+/// Refusing is the honest option: none of these could have worked, no in-tree
+/// program uses one, and the alternative is a header that describes a call
+/// nobody can make correctly. Widening the three lowerings into agreement is a
+/// real feature, not a bug fix, and needs its own change.
+const C_ABI_SCALARS: &[&str] = &[
+    "f32", "f64", "i32", "int32", "i64", "int64", "long", "u8", "u16", "u32", "u64",
+];
+
 fn is_c_abi_compatible(ty: &TypeExpr, interner: &Interner) -> bool {
     match &ty.kind {
         TypeExprKind::Tensor { .. }
@@ -955,14 +994,7 @@ fn is_c_abi_compatible(ty: &TypeExpr, interner: &Interner) -> bool {
         | TypeExprKind::Buffer { .. } => true,
         TypeExprKind::Named(sym) => {
             let name = interner.resolve(sym.0).unwrap_or("");
-            matches!(
-                name,
-                "f32" | "f64" | "f16" | "bf16" | "fp32" | "fp64" | "fp16"
-                    | "i8" | "i16" | "i32" | "i64"
-                    | "u8" | "u16" | "u32" | "u64"
-                    | "int" | "long" | "bool"
-                    | "float" | "double"
-            )
+            matches!(name, n if C_ABI_SCALARS.contains(&n))
         }
         TypeExprKind::Tuple(elems) => elems.iter().all(|e| is_c_abi_compatible(e, interner)),
         _ => false,

@@ -216,7 +216,7 @@ typedef struct {
 
 /* Lifecycle (provided by libnsl_runtime, declared here for convenience) */
 NslModel* nsl_model_create(const char* weights_path);
-void      nsl_model_destroy(NslModel* model);
+int64_t   nsl_model_destroy(NslModel* model);
 
 /* @export functions */
 int forward(NslModel* model,

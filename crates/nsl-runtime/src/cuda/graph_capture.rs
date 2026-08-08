@@ -1579,6 +1579,19 @@ mod imp {
             eprintln!("[cuda-graph] disabled: NSL_LEGACY_NULL_STREAM=1 (the NULL stream cannot be captured)");
             return;
         }
+        if crate::cuda::inner::async_alloc_enabled() {
+            // cuMemAllocAsync/cuMemFreeAsync are issued on the NULL stream
+            // and the alloc path carries no taint hook — an allocation
+            // inside a capture region would be recorded into the graph (or
+            // fail the capture) with nothing self-healing it. Every other
+            // stream-touching primitive taints; until this one does, the
+            // composition is refused up front rather than left to corrupt.
+            eprintln!(
+                "[cuda-graph] disabled: NSL_ASYNC_ALLOC=1 (stream-ordered \
+                 allocation on the NULL stream is not capture-safe)"
+            );
+            return;
+        }
         LOGGING.store(
             std::env::var("NSL_CUDA_GRAPH_LOG").ok().as_deref() == Some("1"),
             Ordering::Relaxed,

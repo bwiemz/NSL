@@ -3914,6 +3914,67 @@ fn fused_ce_dtype_for_compiler(
     }
 }
 
+/// Say which fused linear-CE kernel family this compile chose, and on what.
+///
+/// The routing decision is worth three orders of magnitude at production
+/// shape (the GEMM-chunked path against the v1 per-row-CTA kernels: 486 ms vs
+/// 1.45 ms forward, 2222 ms vs 4.41 ms backward at rows=1024, V=49152,
+/// H=512) and NOTHING reported it. Both `use_gemm` predicates could have
+/// inverted and every gate in the tree would have stayed green while
+/// coder50m's loss head quietly became 504x slower: the numerical tests call
+/// the FFI directly and are `#[ignore]`d, and the one end-to-end fixture that
+/// reads the launch counters exercises the small-vocab v1 path and asserts
+/// nothing about them.
+///
+/// Compile-time, so it lands in BUILD stderr, not the run's.
+fn emit_fused_lce_route_note(
+    phase: &str,
+    use_gemm: bool,
+    is_large: bool,
+    has_bias: bool,
+    dtype_tag: i64,
+    vocab_size: u32,
+) {
+    let route = if use_gemm {
+        "gemm"
+    } else if is_large {
+        "v1-large"
+    } else {
+        "v1"
+    };
+    eprintln!(
+        "[fused-lce] {phase} route={route} vocab={vocab_size} bias={} dtype_tag={dtype_tag}",
+        if has_bias { "yes" } else { "no" }
+    );
+
+    // 16-bit storage above the threshold: the one route choice worth three
+    // orders of magnitude that a user cannot see coming. `use_gemm` requires
+    // `dtype_tag == 0`, so a `dtype=` hint sends a production-sized vocabulary
+    // to the v1 per-row-CTA kernels.
+    //
+    // A WARNING, not a refusal. The first version of this refused, and that
+    // was wrong: `fused_linear_ce_precision_cast_lowering.rs` pins
+    // "Large-vocab forward path -> same three-cast insertion" as a CONTRACT,
+    // Sprint v6 built the cast insertion precisely so this combination works,
+    // and it is numerically certified at this shape. Every sibling refusal at
+    // these two sites is a CORRECTNESS refusal (the v1 PTX dereferences bias
+    // unconditionally; CSLA's shadow casts are step-scoped) — this one would
+    // have been a performance opinion breaking a working, certified, and
+    // deliberately-supported configuration. Making the cost impossible to
+    // miss is the whole ask; refusing to compile it is not mine to decide.
+    if !use_gemm && is_large && dtype_tag != 0 {
+        eprintln!(
+            "[fused-lce] warning: {phase} takes the v1 per-row-CTA kernels because \
+             @fused_lm_ce carries a 16-bit `dtype=` hint and vocab_size {vocab_size} \
+             is above {} — there is no GEMM-chunked path for 16-bit storage. \
+             Measured at production shape (rows=1024, V=49152, H=512) the v1 kernels \
+             are 335x slower in forward and 504x in backward. Drop the `dtype=` hint \
+             to route f32 storage through the GEMM path, or keep it deliberately.",
+            crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD
+        );
+    }
+}
+
 /// CFTP v6 — Inline precision-cast for fused_linear_ce inputs.
 ///
 /// Given the `dtype_tag` resolved from `fused_ce_dtype_for_compiler` and the
@@ -4190,14 +4251,38 @@ fn lower_fused_linear_ce_forward(
     // keep their byte-identity domain: small-vocab WITH-bias f32 (every
     // existing fixture) and all 16-bit storage configs. Kill-switch
     // NSL_FUSED_LCE_GEMM=0 (compile-time) restores v1 for large vocab.
-    let use_gemm = dtype_tag == 0
-        && (is_large || !has_bias)
-        && std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() != Some("0");
+    let gemm_off = std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() == Some("0");
+    // DERIVE `is_large`, do not trust the tape field — the backward already
+    // derives it (`vocab_size > LARGE_VOCAB_THRESHOLD`) while this site took
+    // whatever the op carried, so the pair agreed only by convention. That
+    // convention is already broken in-tree: `build_forward_plus_backward_
+    // wengert` hardcodes `is_large: false` at a 16384-wide vocabulary, which
+    // makes this site synthesize the SMALL-vocab single-kernel PTX for a
+    // vocabulary it cannot serve while the backward takes gemm.
+    //
+    // The route note this change added prints both phases, so their agreement
+    // is now an observable, asserted property — which is exactly why it should
+    // hold by construction rather than by convention. The parameter is kept
+    // and cross-checked so a caller that disagrees fails loudly instead of
+    // being silently overridden.
+    let derived_large = vocab_size > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+    if is_large != derived_large {
+        return Err(CodegenError::new(format!(
+            "fused_linear_ce: the op says is_large={is_large} for vocab_size \
+             {vocab_size}, but the threshold ({}) says {derived_large}. The forward \
+             and backward lowerings would pick different kernel families for one \
+             substitution — fix the producer of this op rather than this check",
+            crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD
+        )));
+    }
+    let is_large = derived_large;
+    let use_gemm = dtype_tag == 0 && (is_large || !has_bias) && !gemm_off;
     if !use_gemm && !has_bias {
         return Err(CodegenError::new(
             "fused_linear_ce: a biasless head requires the GEMM path (dtype              f32 and NSL_FUSED_LCE_GEMM enabled) — the v1 PTX kernels read              bias unconditionally",
         ));
     }
+    emit_fused_lce_route_note("forward", use_gemm, is_large, has_bias, dtype_tag, vocab_size);
     let cfg = build_fused_ce_cfg(
         vocab_size,
         hidden_size,
@@ -4572,14 +4657,14 @@ fn lower_fused_linear_ce_backward_extract(
         // Sprint 2.5: mirror the forward's routing decision (same inputs:
         // dtype, vocab size vs threshold, biaslessness, env kill-switch).
         let is_large = vocab_size > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
-        let use_gemm = dtype_tag == 0
-            && (is_large || !has_bias)
-            && std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() != Some("0");
+        let gemm_off = std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() == Some("0");
+        let use_gemm = dtype_tag == 0 && (is_large || !has_bias) && !gemm_off;
         if !use_gemm && !has_bias {
             return Err(CodegenError::new(
                 "fused_linear_ce backward: a biasless head requires the GEMM                  path — the v1 PTX kernels write dbias unconditionally",
             ));
         }
+        emit_fused_lce_route_note("backward", use_gemm, is_large, has_bias, dtype_tag, vocab_size);
 
         // Allocate output tensors. dx is `[B, S, H]` when the matcher saw
         // through a logits reshape (x on the tape is 3-D there — same

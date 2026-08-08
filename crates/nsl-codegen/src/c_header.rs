@@ -238,31 +238,58 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str("    int64_t* shape;\n");
     out.push_str("    int64_t* strides;     /* NULL = contiguous */\n");
     out.push_str("    int32_t  ndim;\n");
-    out.push_str("    int32_t  dtype;       /* canonical NSL tags: 0=f64, 1=f32, 2=f16, 3=bf16, 4=i8, 9=i32 */\n");
+    // The full accepted set, not a subset. `capi_dtype_to_nsl` aborts the
+    // process outside 0..=9, so a host reading this comment as the menu would
+    // have believed 5..=8 were invalid.
+    out.push_str("    int32_t  dtype;       /* canonical NSL tags: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8,\n");
+    out.push_str("                           * 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32 */\n");
     out.push_str("    int32_t  device_type; /* 0=CPU, 1=CUDA */\n");
     out.push_str("    int32_t  device_id;\n");
     out.push_str("    int64_t  tape_id;     /* autodiff identity (0 = untracked) */\n");
     out.push_str("} NslTensorDesc;\n\n");
 
+    // Every count and every status here is 64-bit, because that is what the
+    // emitted code and the runtime actually use: `build_dispatch_wrapper_
+    // signature` emits five I64 params returning I64, and `ExportFnPtr` in
+    // `nsl-runtime/src/c_api/exports.rs` spells the same thing in Rust. This
+    // typedef declared `int32_t` for the return and both counts until the
+    // agreement gate below caught it — a host calling through it passed counts
+    // whose upper halves the callee reads as caller-undefined garbage.
     out.push_str(
         "/* Function-pointer type for the runtime-dispatched export ABI.\n\
          * Matches the signature of `nsl_model_call` minus the name pointer. */\n",
     );
     out.push_str(
-        "typedef int32_t (*NslExportFn)(\n    \
+        "typedef int64_t (*NslExportFn)(\n    \
               NslModel* model,\n    \
-              const NslTensorDesc* inputs, int32_t n_inputs,\n    \
-              NslTensorDesc* outputs, int32_t n_outputs\n\
+              const NslTensorDesc* inputs, int64_t n_inputs,\n    \
+              NslTensorDesc* outputs, int64_t n_outputs\n\
           );\n\n",
     );
 
     out.push_str("/* Lifecycle (provided by libnsl_runtime) */\n");
     out.push_str("int64_t   nsl_abi_version(void); /* (major<<16)|minor; cf. NSL_ABI_VERSION */\n");
     out.push_str("NslModel* nsl_model_create(const char* weights_path);\n");
-    out.push_str("void      nsl_model_destroy(NslModel* model);\n");
+    out.push_str("int64_t   nsl_model_destroy(NslModel* model); /* returns 0 */\n");
     out.push_str("int64_t   nsl_model_call(NslModel* model, const char* name,\n");
     out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
     out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs);\n\n");
+
+    // The error contract in docs/abi/README.md tells hosts that detail is
+    // "retrievable via nsl_get_last_error(); clear with nsl_clear_error()" —
+    // so a host following the documented contract needs these declared. They
+    // were not, which left C callers to write their own extern declarations
+    // for two functions this header exists to describe.
+    // Self-contained wording: this header ships next to the .so to hosts who
+    // do not have the repository, so a comment that only cites a repo path
+    // tells them nothing.
+    out.push_str("/* Errors. Status is returned by value; detail is retrieved here.\n");
+    out.push_str(" * The returned string is BORROWED and thread-local: it is owned by the\n");
+    out.push_str(" * runtime, valid only until the next call that sets or clears the error\n");
+    out.push_str(" * on THIS thread, and must not be freed. Copy it if you need to keep it.\n");
+    out.push_str(" * Never NULL — \"\" when no error is set. */\n");
+    out.push_str("const char* nsl_get_last_error(void);\n");
+    out.push_str("int64_t     nsl_clear_error(void); /* returns 0 */\n\n");
 
     out.push_str("/* @export functions */\n");
     for info in exports {
@@ -280,23 +307,46 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out
 }
 
-/// Emit static-inline `nsl_model_forward`, `nsl_model_backward`, and
-/// `nsl_model_forward_with_saves` wrappers when the corresponding export
-/// names are present. These let C callers invoke the conventional named
-/// exports without explicitly threading the name through `nsl_model_call`.
+/// Emit `nsl_export_forward` / `_backward` / `_forward_with_saves` convenience
+/// inlines when the corresponding export names are present. These let C
+/// callers invoke the conventional named exports without threading the name
+/// through `nsl_model_call` by hand.
+///
+/// **They are named `nsl_export_*`, not `nsl_model_*`.** The previous names
+/// SHADOWED real runtime symbols with different signatures and different
+/// semantics, in a header whose own prototype comment tells hosts to "use
+/// `nsl_model_forward` for training autograd":
+///
+/// * the runtime exports `nsl_model_forward(i64 × 5) -> i64`
+///   (`c_api/mod.rs`), so a host that included this header and called
+///   `nsl_model_forward` silently bound to a file-local inline instead of the
+///   library symbol it meant — and truncated the i64 status to `int32_t`;
+/// * the runtime's `nsl_model_backward` (`grad_context.rs`) takes a
+///   `GradContext*` as its first argument. A host reaching for the
+///   grad-context FFI through this header got a function that reinterprets
+///   its `GradContext*` as an `NslModel*`. That exact confusion is already
+///   documented as a real failure mode at the runtime definition.
+///
+/// The counts and the status are `int64_t` here for the same reason they are
+/// on `nsl_model_call`: that is what the callee reads and returns.
 fn emit_static_inline_wrappers(out: &mut String, exports: &[ExportInfo]) {
     for conv in &["forward", "backward", "forward_with_saves"] {
         if exports.iter().any(|e| e.symbol_name == *conv) {
             out.push_str(&format!(
-                "static inline int32_t nsl_model_{conv}(\n    \
+                "/* Convenience wrapper for the `{conv}` @export. Deliberately NOT named\n \
+                 * nsl_model_{conv}: the runtime exports a symbol by that name with a\n \
+                 * different signature, and a header-local inline would shadow it. */\n"
+            ));
+            out.push_str(&format!(
+                "static inline int64_t nsl_export_{conv}(\n    \
                      NslModel* model,\n    \
-                     const NslTensorDesc* inputs, int32_t n_inputs,\n    \
-                     NslTensorDesc* outputs, int32_t n_outputs\n\
+                     const NslTensorDesc* inputs, int64_t n_inputs,\n    \
+                     NslTensorDesc* outputs, int64_t n_outputs\n\
                  ) {{\n    \
-                     return (int32_t)nsl_model_call(\n        \
+                     return nsl_model_call(\n        \
                          model, \"{conv}\",\n        \
-                         inputs, (int64_t)n_inputs,\n        \
-                         outputs, (int64_t)n_outputs\n    \
+                         inputs, n_inputs,\n        \
+                         outputs, n_outputs\n    \
                      );\n\
                  }}\n\n"
             ));
@@ -330,6 +380,9 @@ fn emit_param(out: &mut String, name: &str, ty: &ExportTypeInfo) {
         }
         ExportTypeInfo::Scalar(dtype) => {
             out.push_str(&format!("{} {name}", c_type_for_scalar(*dtype)));
+            if let Some(nsl) = narrowed_dtype_note(*dtype) {
+                out.push_str(&format!(" /* NSL {nsl}, widened to its ABI slot */"));
+            }
         }
         ExportTypeInfo::Tuple(_) => {
             out.push_str(&format!("const NslTensorDesc* {name}_items, int32_t {name}_count"));
@@ -351,20 +404,51 @@ fn emit_return_arg(out: &mut String, ty: &ExportTypeInfo) {
     }
 }
 
+/// The C spelling of a scalar `@export` parameter — DERIVED from the ABI slot
+/// the wrapper actually reads, never mapped independently.
+///
+/// This used to be its own `match` over `ExportDtype`, faithfully emitting
+/// `int8_t` / `uint16_t` / `uint32_t` / `int32_t`(bool) while
+/// `c_wrapper::cranelift_type_for_scalar` collapsed every one of those to a
+/// 64-bit slot. A host compiling against the header then passed a narrow
+/// value into a callee reading the full register — the same defect as the old
+/// `NslExportFn` typedef, one function away from it, and reachable by any
+/// `@export fn f(..., k: u8)`.
+///
+/// Deriving costs the header some documentation value (`u8` now reads
+/// `int64_t`), which `emit_param` repays with a trailing comment naming the
+/// NSL dtype. Widening the description is the safe direction: narrowing the
+/// SLOT instead would change the ABI of already-emitted wrappers.
 fn c_type_for_scalar(dtype: ExportDtype) -> &'static str {
+    use cranelift_codegen::ir::types;
+    match crate::c_wrapper::cranelift_type_for_scalar(dtype) {
+        types::I32 => "int32_t",
+        types::I64 => "int64_t",
+        types::F32 => "float",
+        types::F64 => "double",
+        // Unreachable via the mapping above; a new slot type must be taught
+        // here rather than silently emitting a wrong C spelling.
+        other => panic!(
+            "c_type_for_scalar: no C spelling for ABI slot {other:?} (dtype {dtype:?}) — \
+             teach this mapping when cranelift_type_for_scalar grows a type"
+        ),
+    }
+}
+
+/// The NSL dtype a widened slot came from, for the header comment. `None`
+/// when the C spelling already says it exactly.
+fn narrowed_dtype_note(dtype: ExportDtype) -> Option<&'static str> {
     match dtype {
-        ExportDtype::I8  => "int8_t",
-        ExportDtype::I16 => "int16_t",
-        ExportDtype::I32 => "int32_t",
-        ExportDtype::I64 => "int64_t",
-        ExportDtype::U8  => "uint8_t",
-        ExportDtype::U16 => "uint16_t",
-        ExportDtype::U32 => "uint32_t",
-        ExportDtype::U64 => "uint64_t",
-        ExportDtype::F32 => "float",
-        ExportDtype::F64 => "double",
-        ExportDtype::F16 | ExportDtype::BF16 => "uint16_t",
-        ExportDtype::Bool => "int32_t",
+        ExportDtype::I32 | ExportDtype::I64 | ExportDtype::F32 | ExportDtype::F64 => None,
+        ExportDtype::I8 => Some("i8"),
+        ExportDtype::I16 => Some("i16"),
+        ExportDtype::U8 => Some("u8"),
+        ExportDtype::U16 => Some("u16"),
+        ExportDtype::U32 => Some("u32"),
+        ExportDtype::U64 => Some("u64"),
+        ExportDtype::F16 => Some("f16 bits"),
+        ExportDtype::BF16 => Some("bf16 bits"),
+        ExportDtype::Bool => Some("bool"),
     }
 }
 

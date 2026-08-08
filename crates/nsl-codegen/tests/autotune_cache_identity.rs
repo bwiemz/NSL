@@ -764,11 +764,20 @@ fn autotune_selection_method_is_honest() {
                 };
                 // `find_best_variant_cost_model(` also contains
                 // `find_best_variant`, so match on the exact call opener.
+                // Forward slashes, always. The assertions below are `str`
+                // suffix matches against `nsl-cli/src/commands/autotune.rs`,
+                // and a raw `display()` on Windows yields
+                // `D:\a\NSL\NSL\crates\nsl-cli\src\commands\autotune.rs`,
+                // which matches nothing — the gate then reports the offline
+                // command as having MOVED on every windows-latest run while
+                // linux stays green. (`Path::ends_with` above is immune: it
+                // compares components, not bytes.)
+                let path = path.display().to_string().replace('\\', "/");
                 if text.contains("find_best_variant(") {
-                    fbv_callers.push(path.display().to_string());
+                    fbv_callers.push(path.clone());
                 }
                 if text.contains("measure_variants(") {
-                    mv_callers.push(path.display().to_string());
+                    mv_callers.push(path);
                 }
             }
         }

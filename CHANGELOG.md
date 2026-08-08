@@ -6,6 +6,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — arena × CUDA graphs: the composition measured, gated, and one hole closed
+
+- **`--transient-arena` composes with `--cuda-graphs` by construction, now
+  proven and pinned.** The arena's allocator pin returns the same device
+  pointer every step — exactly what the graph recorder's digest-stability
+  streak needs — so no separate "offset feeding" mechanism was ever
+  required. Measured on coder50m: the composed run is byte-identical to
+  eager (loss stream + `.nslm`), reconciles 7240/7240 binds with **0
+  misplaced** (the precondition for a captured graph never baking an
+  op-local scratch address), and stabilizes capture one window earlier
+  than graphs-alone (36 vs 35 replays). The canonical graph fixture shows
+  no delta — its transients are exactly the classes arena admission
+  refuses (forward-region, unsized, tape-escaping) — so the composition
+  gate lives in `scripts/arena-parity.sh` (two new arms: capture
+  non-vacuity, `mismatches=0`, replays ≥ graphs-alone, `0 misplaced`).
+- **`NSL_ASYNC_ALLOC=1` now disables `--cuda-graphs` up front.**
+  `cuMemAllocAsync` issues on the NULL stream with no taint hook, so an
+  allocation inside a capture region would be recorded into the graph (or
+  fail the capture) with nothing self-healing it — every other
+  stream-touching primitive taints. Refused loudly at `enable()` (the
+  `NSL_LEGACY_NULL_STREAM` shape); training continues eager
+  (`cuda_graphs_refuse_async_alloc_env`).
+
+### Added — SR-BF16 composes with elementwise ZeRO-3 (`--param-dtype bf16-sr --zero-stage 3 --zero-elementwise`)
+
+- **The two memory features stack**: bf16 authoritative weights (2 bytes/elem)
+  AND 1/ws elementwise sharding, so each rank persistently holds
+  `numel/ws × 2` bytes per streamed param. The elementwise slice IS the bf16
+  authoritative storage — carved by the same f32→bf16 cast as the mirror
+  backend's register, widened to f32 at gather (collectives stay f32), and
+  stepped in place by the same fused SR kernel with the counter base offset
+  by `rank * shard`, which makes every element's dither identical to the
+  single-rank baseline's at the same global index. **Validated bit-exact**:
+  2-rank sim-gpu composed training equals single-rank plain SR — loss stream
+  and saved `.nslm` bytes (`srbf16_elementwise_bit_exact_vs_plain_sr_gpu`),
+  and the composed ws=1 lifecycle equals the mirror path bitwise at the unit
+  level (`srbf16_elementwise_ws1_matches_the_mirror_path_bitwise`).
+- **Everything else stays refused, loudly**: stages 1/2 (defense-in-depth —
+  the layerwise chain refuses them first), tensor-granular stage 3 (the
+  owner-gated update would leave non-owner slices un-stepped), and — new
+  fail-closed arm — a streamed param whose numel does not divide the world
+  size, which would silently fall back to the tensor-granular path and train
+  without stochastic rounding. The plan refusal names the param and the
+  arithmetic.
+- The `[zero3] teardown:` line gains `sr_elem_params`/`sr_elem_steps`
+  (label-anchored; appended fields), the composed step samples `NSL_SR_HIST`
+  histograms like both mirror paths, θ-mutating callback writes follow plain
+  SR's contract (dropped — the SR step is the only sanctioned θ writer), and
+  the `[sr-bf16]` teardown line converts to single-write formatting (it can
+  now print from multiple ranks).
+### Fixed — the generated C header described an ABI the runtime does not have
+
+**Regenerate `model.h` and recompile any C/C++ host that includes it.** The
+runtime ABI has not changed and `NSL_ABI_VERSION` is unchanged (a version bump
+would tell correct hosts to refuse an unchanged runtime, and tells a host with
+a stale header nothing — see the note in `docs/abi/README.md`). What changed is
+that the header now describes the ABI correctly. A host built against the old
+header emitted wrong calls:
+
+- `NslExportFn` declared its return value and both count parameters as
+  `int32_t` against a runtime that has always taken and returned `int64_t`.
+  Calls through it passed counts whose upper halves the callee reads as
+  caller-undefined, and truncated the status.
+- `@export` prototypes declared narrow scalar parameters (`uint8_t`,
+  `int16_t`, …) against wrapper slots that are 64-bit — the same defect, on
+  any `@export` taking a scalar that is not `i32`/`i64`/`f32`/`f64`. The
+  header's spelling is now derived from the slot rather than mapped
+  independently, so a widened parameter reads `int64_t /* NSL u8, widened to
+  its ABI slot */`.
+- `nsl_model_destroy` was declared `void`; it returns `int64_t`.
+- The convenience inlines are renamed `nsl_model_forward`/`_backward`/
+  `_forward_with_saves` → **`nsl_export_forward`/`_backward`/
+  `_forward_with_saves`**. The old names shadowed real runtime symbols with
+  different signatures — `nsl_model_backward` takes a `GradContext*` — so a
+  host calling them bound to a file-local inline instead of the library
+  symbol. Hosts using these helpers must rename their call sites.
+- `nsl_get_last_error` / `nsl_clear_error` are now declared (the error
+  contract already told hosts to call them), with the borrowed, thread-local
+  lifetime of the returned string stated; and the `NslTensorDesc` dtype
+  comment lists all ten accepted tags instead of six.
+
+`crates/nsl-codegen/tests/c_header_agreement.rs` now cross-checks every
+generated prototype against the runtime externs and the wrapper signatures
+codegen actually builds, so this class fails CI instead of shipping.
 ### Changed — item 17 phase 3a: packing metadata becomes dataflow on the fused-AD path
 
 - **The `@flash_attention` reads inside a train block no longer consult the
@@ -42,6 +126,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Fixed en route: the multi-file build dropped `model_field_dims`/`ranks` on
   the floor for every imported model, which had silently disarmed the CFTP
   v10 rank guard for every real model since it landed.
+
+### Added — `--fuse-lm-head`: the fused LM head joins the production profile
 
 ### Added — `--transient-arena` Stage 2B/2C: placed backward temporaries
 

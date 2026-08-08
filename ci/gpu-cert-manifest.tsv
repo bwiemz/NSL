@@ -41,6 +41,7 @@ crates/nsl-cli/tests/dict_local_lifetime_gate.rs	loop_local_dicts_are_cleared_pe
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	unallowlisted_dispatch_results_do_not_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	identity_shaped_dispatch_does_not_steal_bindings	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact	gpu	requires a CUDA GPU (2 FASE training runs)
+crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	csla_block_tables_build_once_per_shape_list_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/feature_composition_gate.rs	registered_refusals_actually_fire_on_gpu_only_configurations	gpu	requires a CUDA GPU (--weight-stream needs device-resident params)
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	loop_carried_borrow_seed_does_not_strand_per_iteration	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	naive_sdpa_chain_transients_are_released	gpu	requires CUDA GPU
@@ -136,10 +137,12 @@ crates/nsl-cli/tests/ws_prefetch_gate.rs	prefetch_bit_exact_packed_gqa_gpu	gpu	r
 crates/nsl-cli/tests/zero3_gate.rs	zero3_bit_exact_vs_single_rank_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
 crates/nsl-cli/tests/zero3_gate.rs	zero3_elementwise_bit_exact_vs_single_rank_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
 crates/nsl-cli/tests/zero3_gate.rs	zero3_muon_overlap_and_callback_touch_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
+crates/nsl-cli/tests/zero3_gate.rs	srbf16_elementwise_bit_exact_vs_plain_sr_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
 crates/nsl-cli/tests/zero_gpu_collectives_gate.rs	sim_gpu_two_rank_parity_bit_exact	gpu	requires CUDA GPU
 crates/nsl-cli/tests/zero_gpu_collectives_gate.rs	sim_gpu_stage2_reduce_scatter_bit_exact	gpu	requires CUDA GPU
 crates/nsl-cli/tests/zero_gpu_collectives_gate.rs	sim_gpu_stage2_chunked_subgroups_bit_exact	gpu	requires CUDA GPU
 crates/nsl-cli/tests/zero_gpu_collectives_gate.rs	nccl_two_rank_parity_or_documented_refusal	gpu	requires CUDA GPU + nccl-featured build
+crates/nsl-cli/tests/zero_gpu_collectives_gate.rs	zero_stage1_batches_the_owner_subset_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/zero_grad_accum_gpu_e2e.rs	gpu_grad_accumulation_full_buffer_updates_params	gpu	requires a CUDA-capable GPU
 crates/nsl-cli/tests/zero_spmd_gate.rs	zero_stage1_two_rank_parity	multiproc	spawns multiple processes; run explicitly
 crates/nsl-cli/tests/zero_spmd_gate.rs	zero_stage1_optim_state_is_sharded	multiproc	spawns multiple processes; run explicitly
