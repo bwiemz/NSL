@@ -8,11 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed — weight streaming is now a capacity-aware DECISION (1B@2048: +18.6% tokens/s)
 
-- **`--weight-stream` streamed unconditionally, and at 1B that cost 15.7% of
+- **`--weight-stream` streamed unconditionally, and at 1B that cost ~16% of
   step time for under 1 GiB of memory.** Measured on this 32 GB card, same
-  harness and cell as the 2026-08-06 matrix: 912.0 → **768.9 ms/step**,
-  2,246 → **2,663 tokens/s**, MFU 17.5% → **20.8%** (the highest in the
-  matrix), for **+935 MB** of peak device memory. The streaming stack was
+  harness and cell as the 2026-08-06 matrix, at **identical flags** with the
+  policy off vs on: 912.0 → **765.2 ms/step**, 2,246 → **2,676 tokens/s**,
+  for **+935 MB** of peak device memory. Dropping `--weight-stream` entirely
+  lands in the same place (768.9 ms, 20.8% MFU — the highest in the matrix),
+  confirming the pinned path costs nothing over not streaming at all. The streaming stack was
   designed for a 16 GiB card where weights (3.9 GiB) + moments (7.7 GiB)
   left nothing for activations; on 32 GB it re-uploaded the whole parameter
   set every step — ~3.7 GiB/step of H2D — while ~18 GB of VRAM sat unused.
@@ -43,6 +45,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   the same binary and flags with only `NSL_WS_RESIDENT` differing and
   requires identical loss streams and `.nslm` bytes, zero uploads/evicts/
   writebacks, and a streaming control arm as the non-vacuity witness.
+- **The arena pack paths needed the same treatment, and adversarial review
+  found three defects there that no gate could see** (the residency gate did
+  not pass `--stream-arena`, and the gates that do were pinned policy-off):
+  `evict_pack_async` carried a second copy of the "resident but not
+  arena-backed" abort with no pinned skip — a hard crash on the first async
+  writeback under `--stream-async-writeback`; `await_pack` aborted when a
+  pack was entirely pinned, since it acquires no slot while codegen still
+  emits the await from compile-time info; and `upload_pack` charged the
+  arena slot for ALL members while `evict_pack` released only the streamed
+  ones, stranding one device + pinned-host buffer per upload of a
+  partially-pinned pack — unbounded growth in exactly the new middle regime
+  the policy introduces. All three are fixed and now covered by
+  `weight_stream_residency_composes_with_arena_pack_paths_gpu`.
 - Three hazards the pinned path introduced are refused rather than risked:
   `upload` of a pinned-but-evicted param aborts (it has no mirror, so the old
   code would have memcpy'd from null and filled θ with garbage); `evict_pack`

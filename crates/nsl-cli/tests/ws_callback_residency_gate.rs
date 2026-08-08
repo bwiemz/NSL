@@ -171,6 +171,12 @@ fn callback_model_read_runs_on_gpu_without_crash() {
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .env("NSL_WS_COUNTER", "1")
+        // This gate's whole subject is the Item-12 hazard: a callback or
+        // mid-loop model_save dereferencing an EVICTED param. Under the
+        // capacity-aware residency policy nothing is ever evicted on a card
+        // with headroom, so the hazard cannot arise and the gate would pass
+        // while testing nothing. Pin the policy off so it keeps testing it.
+        .env("NSL_WS_RESIDENT", "0")
         .output()
         .expect("spawn nsl run");
     let stdout = String::from_utf8_lossy(&output.stdout);

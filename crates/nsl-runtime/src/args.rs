@@ -182,16 +182,26 @@ extern "C" fn nsl_weight_stream_count_atexit() {
         let registered =
             crate::weight_stream::WS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed);
         if registered > 0 {
+            // EXACT bytes, not just MiB: a small model's whole parameter set
+            // is a few hundred KiB, and `{:.0}` MiB rounds that to "0" — a
+            // counter that reads zero on exactly the fixtures the gates use
+            // is worse than no counter (caught by the residency gate).
+            // MiB is kept alongside for humans reading a 1B run.
+            let pinned_b = crate::weight_stream::WS_PINNED_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let streamed_b = crate::weight_stream::WS_STREAMED_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed);
             let mib = |b: u64| b as f64 / 1048576.0;
             let line = format!(
                 "[weight-stream] residency: pinned={} of {} param(s) \
-                 pinned_mib={:.0} streamed_mib={:.0} {}\n",
+                 pinned_bytes={} streamed_bytes={} \
+                 pinned_mib={:.1} streamed_mib={:.1} {}\n",
                 pinned,
                 registered,
-                mib(crate::weight_stream::WS_PINNED_BYTES
-                    .load(std::sync::atomic::Ordering::Relaxed)),
-                mib(crate::weight_stream::WS_STREAMED_BYTES
-                    .load(std::sync::atomic::Ordering::Relaxed)),
+                pinned_b,
+                streamed_b,
+                mib(pinned_b),
+                mib(streamed_b),
                 crate::weight_stream::residency_summary().unwrap_or_default(),
             );
             use std::io::Write;

@@ -210,10 +210,17 @@ fn residency_admit(bytes: usize) -> bool {
     true
 }
 
-/// One-line residency posture for the teardown report. `None` when the
-/// policy never ran (no registrations, or disabled).
+/// The last decided plan's posture, SNAPSHOTTED as text before the plan is
+/// cleared. The posture line is printed at `atexit`, which always runs after
+/// train-block teardown clears `RESIDENCY` — reading the live plan there
+/// would report an empty tail on every normal run, hiding exactly the four
+/// fields that let anyone audit why the policy decided what it did.
 #[cfg(feature = "cuda")]
-pub fn residency_summary() -> Option<String> {
+static RESIDENCY_LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Render the CURRENT plan's posture (used to take the snapshot).
+#[cfg(feature = "cuda")]
+fn residency_posture() -> Option<String> {
     let guard = RESIDENCY.lock().unwrap();
     let p = guard.as_ref()?;
     let mib = |b: usize| b as f64 / 1048576.0;
@@ -225,6 +232,17 @@ pub fn residency_summary() -> Option<String> {
         mib(p.reserve),
         mib(p.must_free),
     ))
+}
+
+/// One-line residency posture for the teardown report. `None` when the
+/// policy never ran (no registrations, or disabled). Survives the per-train-
+/// block plan reset via the snapshot above.
+#[cfg(feature = "cuda")]
+pub fn residency_summary() -> Option<String> {
+    if let Some(live) = residency_posture() {
+        return Some(live);
+    }
+    RESIDENCY_LAST.lock().unwrap().clone()
 }
 
 /// Register a GPU-resident f32 parameter for streaming: allocate a pinned
@@ -834,7 +852,13 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
         drain_writebacks_for_params(&ptrs);
     }
 
-    let (slot_idx, dev, host_stage) = arena_acquire(total, n);
+    // `layout.len()`, NOT `n`: pinned-resident members were filtered out
+    // above and are skipped by evict_pack, which releases `regions.len()`.
+    // Passing the full member count would leave the slot permanently at
+    // `live == pinned_count > 0`, so `arena_acquire`'s `live == 0` reuse
+    // predicate would never match it again — one leaked device buffer AND
+    // pinned host staging buffer per upload of a partially-pinned pack.
+    let (slot_idx, dev, host_stage) = arena_acquire(total, layout.len());
 
     // Gather each mirror into the contiguous pinned host buffer, then ONE HtoD
     // for the whole pack — synchronous for `upload_pack`, async (overlapping
@@ -894,7 +918,24 @@ pub extern "C" fn nsl_weight_stream_await_pack(pw_list_ptr: i64) {
         if list.len == 0 {
             return;
         }
-        let first = unsafe { *list.data };
+        // Skip pinned-resident members when picking the representative: they
+        // never acquire a slot, so a pack whose FIRST member is pinned would
+        // otherwise look like a prefetch/await desync. A pack that is
+        // ENTIRELY pinned uploaded nothing and has no event to await.
+        // (Codegen decides `was_prefetched` from compile-time info alone, so
+        // it calls await for packs the runtime chose to keep resident.)
+        let Some(first) = (0..list.len as usize)
+            .map(|i| unsafe { *list.data.add(i) })
+            .find(|p| {
+                let guard = MIRRORS.lock().unwrap();
+                !guard
+                    .as_ref()
+                    .and_then(|g| g.get(p))
+                    .is_some_and(|m| m.pinned)
+            })
+        else {
+            return;
+        };
         let slot = {
             let guard = MIRRORS.lock().unwrap();
             match guard.as_ref().and_then(|g| g.get(&first)) {
@@ -1206,6 +1247,14 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
                 eprintln!("[weight-stream] FATAL: evict_pack_async of unregistered tensor {ptr}");
                 std::process::abort();
             };
+            // Pinned-resident: same reasoning as the synchronous evict_pack —
+            // arena_slot is -1 AND data is non-null by construction, which is
+            // exactly the shape the abort below treats as a grouping slip.
+            // (This is the SECOND copy of that check; the two must stay in
+            // step, which is why both carry this skip.)
+            if m.pinned {
+                continue;
+            }
             if m.arena_slot < 0 {
                 if !NslTensor::from_ptr(ptr).data.is_null() {
                     eprintln!(
@@ -1469,7 +1518,11 @@ fn teardown_mirrors() {
         // reuse a `free_at_decision` measured before this block's surfaces
         // existed — and a second block with a larger model (or a first block
         // that has not released everything) would inherit a debt computed
-        // for a different footprint.
+        // for a different footprint. Snapshot the posture FIRST so the
+        // atexit report (which always runs after this) can still print it.
+        if let Some(s) = residency_posture() {
+            *RESIDENCY_LAST.lock().unwrap() = Some(s);
+        }
         *RESIDENCY.lock().unwrap() = None;
     }
 }

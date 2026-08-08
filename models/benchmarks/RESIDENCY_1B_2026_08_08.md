@@ -17,19 +17,43 @@ fits on this card, and the 3.7 GiB/step was buying almost nothing.
 
 ## Measured
 
-| arm | flags beyond `--source-ad` | ms/step | tokens/s | MFU% | peak alloc MB | peak driver MB |
-|---|---|---|---|---|---|---|
-| `layerwise` | `--checkpoint-blocks --layerwise-accum --weight-stream` | 912.0 | 2,246 | 17.5 (tf32) | 12,304 | 13,463 |
-| `layerwise_resident` | `--checkpoint-blocks --layerwise-accum` | **768.9** | **2,663** | **20.8 (tf32)** | 13,239 | 14,655 |
-| `layerwise_resident_srbf16` | `… --weight-stream --param-dtype bf16-sr` | 775.9 | 2,639 | 9.0 (bf16)¹ | 12,304 | 13,502 |
+The comparison that judges the policy is **`layerwise` vs `layerwise_policy`**:
+identical flags, `NSL_WS_RESIDENT` off vs on. `layerwise_resident` drops
+`--weight-stream` entirely and is the reference for what residency is worth
+intrinsically — it does **not** exercise the pinned code path.
 
-Per-round, to show the gap is not noise:
-`layerwise` 914.6 / 912.0 / 916.0 · `layerwise_resident` 770.8 / 773.5 / 768.9.
-Within-arm spread is under 1%; the gap between arms is ~144 ms.
+| arm | flags beyond `--source-ad` | policy | ms/step | tokens/s | MFU% | peak alloc MB |
+|---|---|---|---|---|---|---|
+| `layerwise` | `--checkpoint-blocks --layerwise-accum --weight-stream` | off | 912.0 | 2,246 | 17.5 (tf32) | 12,304 |
+| **`layerwise_policy`** | **same flags** | **on** | **765.2** | **2,676** | — | — |
+| `layerwise_resident` | `--checkpoint-blocks --layerwise-accum` | n/a | 768.9 | 2,663 | 20.8 (tf32) | 13,239 |
+| `layerwise_resident_srbf16` | `… --weight-stream --param-dtype bf16-sr` | n/a² | 775.9 | 2,639 | 9.0 (bf16)¹ | 12,304 |
+
+Per-round, to show the gaps are not noise. The two policy states were
+measured in separate processes (the policy is a code change, not a flag the
+old binary understood), so compare medians across runs and within-round
+inside each run:
+
+- policy **off**: 914.6 / 912.0 / 916.0 → median 912.0
+- policy **on**: 765.2 / 766.0 / 743.3 → median 765.2
+- flag absent, same run as policy-on: 787.1 / 764.8 / 732.4
+
+Within-arm spread is under 1% in the policy-off run; the policy-on run drifts
+downward across rounds (all arms fastest in round 3), which is why the
+harness interleaves and why `layerwise_policy` ≈ `layerwise_resident`
+*within* each round is the load-bearing observation: **765.2 vs 764.8 in
+round 2**, i.e. the pinned path costs nothing measurable over not passing the
+flag at all. Reproducing this table needs a binary with the policy; the
+`layerwise` arm now pins `NSL_WS_RESIDENT=0` so the streaming baseline stays
+obtainable from the harness on any binary.
 
 ¹ MFU is quoted against the arm's own roofline, so the bf16 figure has a
 different denominator and is **not** comparable to the tf32 ones. Compare
-`tokens/s` across these three rows, not `MFU%`.
+`tokens/s`.
+
+² bf16-sr dispatches to its own residency backend *before* the policy is
+consulted, so the policy neither helps nor hinders it — its mirrors were
+already device-resident.
 
 ## What it establishes
 
