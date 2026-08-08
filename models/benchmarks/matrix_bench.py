@@ -33,6 +33,17 @@ throughput with either on measures the instrumentation.
 
 * **Pass A (timing)** — no instrumentation. Yields tokens/s, MFU, allocator and
   driver peak memory, and the loss stream.
+
+  The two memory columns are STEP-BOUNDARY SAMPLES and are not the peak.
+  `[gpu-mem]` prints once per step, after the step's transients have been
+  released, so `peak_alloc_mb`/`peak_driver_mb` describe the persistent
+  surface between steps and miss the intra-step high-water mark entirely.
+  Measured at 1b@2048 microbatch 1: this column reports 12,304 MB where the
+  allocator's own high-water mark is 20.62 GB and nvidia-smi sees 23.6 GB for
+  the process — a factor of 1.9. Do NOT reason about whether a configuration
+  fits from these numbers; that is what `residency_probe.py` is for
+  (`NSL_MEMSTATS=1` high-water marks, per-surface at-global-peak attribution,
+  and per-PID nvidia-smi sampling).
 * **Pass B (attribution)** — one extra run per arm with `NSL_HOST_PROFILE=1`
   and `NSL_PASS_TRACE=1`. Yields time by region, PCIe bytes, pass dispositions,
   and fast-path admission counts. Its step times are deliberately discarded.
@@ -206,12 +217,45 @@ ARMS = {
         Arm("layerwise_resident_srbf16",
             ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
              "--weight-stream", "--param-dtype", "bf16-sr"),
-            (), "bf16",
+            # ROOFLINE IS tf32, NOT bf16: `--param-dtype bf16-sr` is a STORAGE
+            # dtype. The mirror is widened to an f32 working view before the
+            # GEMM (`sr_bf16.rs` srbf16_upload), and these arms set no matmul
+            # env, so the GEMM runs on the TF32 default — the run log says so
+            # verbatim: "[nsl-matmul] cuBLAS math mode: TF32 tensor cores".
+            # Quoting these against the 200.3 TFLOPS bf16 peak understated
+            # their MFU by 2.29x (e.g. 1b@2048 read 9.1% where it is 20.8%).
+            (), "tf32",
             what="bf16-authoritative weights: the mirrors are DEVICE-resident, "
                  "so --weight-stream here names the residency backend and "
                  "moves no host bytes (0 uploads measured at 500M). Halves "
                  "the weight surface (2 vs 4 GiB at 1B) on top of that. Its "
                  "loss stream is not bit-comparable to the f32 arms",
+            accum=2, grad_clip=False),
+        Arm("layerwise_srbf16_fusedce",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--param-dtype", "bf16-sr",
+             "--fuse-lm-head", "require"),
+            # ROOFLINE IS tf32, NOT bf16: `--param-dtype bf16-sr` is a STORAGE
+            # dtype. The mirror is widened to an f32 working view before the
+            # GEMM (`sr_bf16.rs` srbf16_upload), and these arms set no matmul
+            # env, so the GEMM runs on the TF32 default — the run log says so
+            # verbatim: "[nsl-matmul] cuBLAS math mode: TF32 tensor cores".
+            # Quoting these against the 200.3 TFLOPS bf16 peak understated
+            # their MFU by 2.29x (e.g. 1b@2048 read 9.1% where it is 20.8%).
+            (), "tf32",
+            what="`layerwise_resident_srbf16` plus the fused LM head. The "
+                 "2026-08-08 capacity probe found the microbatch-2 OOM to be "
+                 "a 768 MB `matmul_f32` — exactly batch x seq x vocab x f32, "
+                 "the materialized CE logits — while activations were 51% of "
+                 "a peak that weights contribute 11% to. This arm removes "
+                 "that surface, so it tests whether the microbatch ceiling is "
+                 "set by the logits chain. `require` NOT `auto` deliberately: "
+                 "auto falls back to the composite path with a note on "
+                 "stderr, which would silently measure the unfused arm again "
+                 "under a fused name. The model header's claim that "
+                 "@fused_lm_ce is refused under --layerwise-accum is stale — "
+                 "csla_layerwise_gate asserts `fused-ce tape-carry: 1 slots` "
+                 "on layerwise arms",
             accum=2, grad_clip=False),
         Arm("fp32", ("--source-ad",), (("NSL_MATMUL_TF32", "0"),), "fp32",
             what="full-f32 matmul (TF32 tensor cores off)"),
@@ -222,7 +266,14 @@ ARMS = {
         Arm("srbf16",
             ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
              "--weight-stream", "--param-dtype", "bf16-sr"),
-            (), "bf16",
+            # ROOFLINE IS tf32, NOT bf16: `--param-dtype bf16-sr` is a STORAGE
+            # dtype. The mirror is widened to an f32 working view before the
+            # GEMM (`sr_bf16.rs` srbf16_upload), and these arms set no matmul
+            # env, so the GEMM runs on the TF32 default — the run log says so
+            # verbatim: "[nsl-matmul] cuBLAS math mode: TF32 tensor cores".
+            # Quoting these against the 200.3 TFLOPS bf16 peak understated
+            # their MFU by 2.29x (e.g. 1b@2048 read 9.1% where it is 20.8%).
+            (), "tf32",
             what="BF16-authoritative parameters with stochastic-rounded AdamW. "
                  "Trains with grad_accumulation=2 and NO grad_clip (both "
                  "required by --layerwise-accum), so its loss stream is not "
@@ -239,7 +290,8 @@ MATRIX = [
     ("1b", 512, None, ["reference", "optimized", "layerwise"]),
     ("1b", 2048, None, ["reference", "optimized", "layerwise",
                         "layerwise_policy", "layerwise_resident",
-                        "layerwise_resident_srbf16"]),
+                        "layerwise_resident_srbf16",
+                        "layerwise_srbf16_fusedce"]),
 ]
 
 
@@ -633,6 +685,14 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=REPO / "target/matrix_logs")
     ap.add_argument("--cells", default="all",
                     help="comma-separated <scale>@<seq> selectors, or 'all'")
+    ap.add_argument("--arms", default=None,
+                    help="comma-separated arm keys to restrict every selected "
+                         "cell to. CHANGES WHAT THE MICROBATCH PROBE MEANS: "
+                         "`largest_fitting` returns the largest batch that fits "
+                         "every arm STILL IN the cell, so restricting to the "
+                         "arms that fit at 1B raises the probed batch above the "
+                         "full matrix's. Results are tagged `arms_filter` so a "
+                         "restricted run is not mistaken for the matrix")
     ap.add_argument("--rounds", type=int, default=3,
                     help="interleaved rounds per cell; 1 is a smoke run and is "
                          "labelled not-comparable in the output")
@@ -675,8 +735,47 @@ def main() -> None:
             sys.exit(f"no cells matched {args.cells!r}; available: "
                      + ", ".join(f"{c[0]}@{c[1]}" for c in MATRIX))
 
+    arms_filter: list[str] | None = None
+    if args.arms is not None:
+        arms_filter = [a.strip() for a in args.arms.split(",") if a.strip()]
+        unknown = [a for a in arms_filter if a not in ARMS]
+        if unknown:
+            sys.exit(f"unknown arm(s) {unknown}; known: {sorted(ARMS)}")
+        keep = set(arms_filter)
+        # Preserve each cell's own arm ORDER: the probe tests arms in list
+        # order and breaks on the first OOM, so reordering them would change
+        # which arm's ceiling the probe output reports.
+        selected = [(s, q, mb, [a for a in arm_keys if a in keep])
+                    for (s, q, mb, arm_keys) in selected]
+        dropped = [f"{s}@{q}" for (s, q, _, arm_keys) in selected if not arm_keys]
+        selected = [c for c in selected if c[3]]
+        if not selected:
+            sys.exit(f"--arms {args.arms!r} left every selected cell empty")
+        if dropped:
+            print(f"NOTE: --arms left no arms in {', '.join(dropped)}; "
+                  f"those cells were skipped", flush=True)
+        # A requested arm that exists globally but is not IN a selected cell
+        # would otherwise vanish silently — the exact failure the per-arm
+        # "build refused" entries below were added to stop (the 2026-08-02
+        # matrix lost three arms because a missing key reads as not-requested).
+        never_ran = [a for a in arms_filter
+                     if not any(a in c[3] for c in selected)]
+        if never_ran:
+            print(f"NOTE: --arms named {never_ran}, which appear in no "
+                  f"selected cell — they were NOT run", flush=True)
+        # `--arms` also reassigns the loss-divergence baseline, which is
+        # `live[0]`. In the full matrix that is `reference` (accum 1), so the
+        # comparability check below never fires across schedules; a filtered
+        # run can make an accum-2 arm the baseline and invite a comparison
+        # between loss streams the arms' own docs call non-comparable.
+        if len(arms_filter) > 1:
+            print("NOTE: --arms reassigns the loss-divergence baseline to the "
+                  "first surviving arm; check it is comparable before reading "
+                  "loss_divergence_vs_first_arm", flush=True)
+
     report = {
         "gpu": gpu,
+        "arms_filter": arms_filter,
         "rounds": args.rounds,
         "comparable": args.rounds >= 2,
         "max_steps": args.max_steps,

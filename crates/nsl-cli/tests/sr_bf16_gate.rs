@@ -434,3 +434,110 @@ fn srbf16_tracks_f32_baseline_gpu() {
     }
     assert!(lf.last().unwrap() < lf.first().unwrap(), "baseline loss did not decrease");
 }
+
+/// The bf16-sr parameter surface must be accounted as `weights`, not folded
+/// into `activations` / `other`.
+///
+/// This is an ACCOUNTING gate, and it exists because the defect it pins was
+/// invisible to every other test in this file. `alloc_managed` inherits
+/// whatever allocation surface is ambient, and `srbf16_register` /
+/// `srbf16_upload` run from the register belt inside the step body where
+/// codegen has set `activations`. Before the fix, the 1B@2048 memory report
+/// read `weights 400 MB / activations 12.23 GB` — bf16-sr appeared to make
+/// activations 1.81 GB WORSE while "saving" 3.62 GB of weights, which is the
+/// opposite of what it does. Correctness gates cannot catch this: the bytes
+/// are in the right place, only the label is wrong.
+///
+/// Asserted as a RATIO against the run's own total rather than an absolute
+/// byte count, so the fixture may change size freely. The failure mode being
+/// pinned is "the parameter surface reports as ~0", so the bar is low and
+/// one-directional on purpose.
+#[test]
+#[ignore = "requires GPU"]
+fn srbf16_parameter_surface_is_accounted_as_weights_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_srbf16_surf_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("surf.nslm");
+
+    let r = run_nsl_env(
+        &program(&save, true),
+        "surface",
+        &FULL_FLAGS
+            .iter()
+            .copied()
+            .chain(["--seed", "4242"])
+            .collect::<Vec<_>>(),
+        // NSL_MEMSTATS prints the end-of-run per-surface table; without it the
+        // only surface output is the per-step line, which has no `weights`
+        // reading at the moment the parameters are actually resident.
+        &[("NSL_MEMSTATS", "1")],
+        600,
+    );
+    assert!(r.success, "bf16-sr run failed:\n{}", r.stderr);
+
+    // Non-vacuity first: this must be a real bf16-sr run, or "weights > 0"
+    // would be satisfied by a plain f32 run that never took this path.
+    let (params, steps, _uploads) = teardown_counts(&r.stderr)
+        .unwrap_or_else(|| panic!("no [sr-bf16] teardown counters:\n{}", r.stderr));
+    assert!(params > 0 && steps > 0, "vacuous bf16-sr run: {params} params, {steps} steps");
+
+    // Rows look like:
+    //   weights   current   16.5 KB  peak  145.5 KB  at-global-peak  81.0 KB
+    //
+    // The CURRENT column is the discriminating one and the PEAK column is
+    // not: `weights` peak includes the initial f32 parameter allocation that
+    // codegen tags correctly at train setup, in BOTH the fixed and broken
+    // cases, so a peak-based assertion passes either way (verified — it did).
+    // What the bug changes is where the bytes live once bf16-sr has replaced
+    // that allocation with a mirror plus a widened view.
+    let col = |name: &str, which: usize| -> Option<f64> {
+        let line = r
+            .stderr
+            .lines()
+            .find(|l| l.trim_start().starts_with(name) && l.contains("at-global-peak"))?;
+        // ["current", V, U, "peak", V, U, "at-global-peak", V, U]
+        let f: Vec<&str> = line.split_whitespace().skip(1).collect();
+        let (v, u) = match which {
+            0 => (f.get(1)?, f.get(2)?),
+            1 => (f.get(4)?, f.get(5)?),
+            _ => (f.get(7)?, f.get(8)?),
+        };
+        let scale = match *u {
+            "GB" => 1024.0 * 1024.0 * 1024.0,
+            "MB" => 1024.0 * 1024.0,
+            "KB" => 1024.0,
+            "B" => 1.0,
+            _ => return None,
+        };
+        Some(v.parse::<f64>().ok()? * scale)
+    };
+
+    let weights_cur = col("weights", 0)
+        .unwrap_or_else(|| panic!("no `weights` surface row in:\n{}", r.stderr));
+    let other_cur = col("other", 0).unwrap_or(0.0);
+    // One f32 copy of every trainable parameter — a size-independent yardstick
+    // that scales with the fixture instead of a hard-coded byte count.
+    let m_peak = col("optim_m", 1)
+        .unwrap_or_else(|| panic!("no `optim_m` surface row in:\n{}", r.stderr));
+    assert!(m_peak > 0.0, "optim_m never allocated — vacuous run:\n{}", r.stderr);
+
+    // The widened f32 working views come from `srbf16_upload`. Untagged they
+    // land on whatever is ambient there, which is `other`.
+    assert!(
+        weights_cur > other_cur,
+        "`other` ({other_cur} B) holds more than `weights` ({weights_cur} B) \
+         under bf16-sr — the widened f32 working views are untagged again \
+         (measured pre-fix: weights 16.5 KB vs other 129 KB)\n{}",
+        r.stderr
+    );
+    // The mirrors come from `srbf16_register`. Untagged they land in
+    // `activations`, which drops resident `weights` to a small remainder.
+    assert!(
+        weights_cur >= 0.5 * m_peak,
+        "resident `weights` ({weights_cur} B) is under half of one f32 \
+         parameter copy ({m_peak} B) under bf16-sr — the authoritative bf16 \
+         mirrors are being tagged as `activations` again (measured pre-fix: \
+         16.5 KB against a 145.5 KB optim_m)\n{}",
+        r.stderr
+    );
+}

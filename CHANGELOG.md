@@ -6,6 +6,102 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Measured — SR-BF16 at 1B@2048: streaming is gone; the fused LM head is what moves the ceiling
+
+- **bf16-sr eliminates parameter streaming at 1B@2048 completely** — 0.5 MiB
+  of H2D per step (the DataLoader's batch) against the streaming baseline's
+  3,712 MiB. `[weight-stream] registered: 0`: `nsl_weight_stream_register`
+  redirects to `srbf16_register` before the capacity policy is consulted, so
+  the mirrors are device-resident bf16 and the 12,672 widen-uploads are
+  device-to-device casts. **This is no longer a differentiator**, though —
+  `layerwise_policy` (plain f32, same flags) also moves 0.5 MiB/step, because
+  the residency policy pins all 144 parameters on this card.
+- **Throughput is a dead heat**: 772.2 ms/step / 2,652 tok/s (bf16-sr) vs
+  771.5 ms / 2,655 tok/s (f32 resident), 0.09% apart, inside the 5.8% spread
+  of bf16-sr's own rounds.
+- **The microbatch ceiling at seq 2048 is 1, for both arms** (both OOM at 2,
+  4, 8 and 16). Each arm was probed alone — the "microbatch 1" in previous 1B
+  matrices was `largest_fitting` falling back because `reference`/`optimized`
+  OOM in the same cell, so no srbf16 ceiling had ever been measured. At the
+  peak that decides fit: activations 10.41 GB (51%), f32 optimizer moments
+  8.00 GB (39%), weights 2.20 GB (11%). **bf16-sr saves exactly 1.81 GB, and
+  a microbatch costs ~10.4 GB of activations** — the rung is six times taller
+  than the saving. At microbatch 2 the failing allocation is 768.0 MB for
+  `matmul_f32`, which is `2 × 2048 × 49152 × 4`: the materialized CE logits
+  tensor — exactly what a fused LM head removes.
+- **Acting on that: microbatch 2 now runs.** `pretrain_layerwise_fit.nsl`'s
+  header claims `@fused_lm_ce` is refused under `--layerwise-accum` "until
+  its cast cache is tape-carried". That is **stale** — `csla_layerwise_gate`
+  already asserts `fused-ce tape-carry: 1 slots` on layerwise arms, and no
+  rule pairs them in `feature_rules.rs`. New arm `layerwise_srbf16_fusedce`
+  composes `--fuse-lm-head require` with `--layerwise-accum` and
+  `--param-dtype bf16-sr`; it compiles, fuses (witnessed: `1 slots`, where
+  every other arm reads `0`), and **runs at microbatch 2**, where both arms
+  measured there OOM. Peak allocated 28.94 GB of 31.39 GB usable, activations
+  down 1.14 GB at microbatch 1, 2,695.6 tok/s, and 8,192 tokens per optimizer
+  step instead of 4,096. Loss 11.20 -> 7.88 over 14 optimizer steps.
+  `require` not `auto` deliberately: `auto` silently falls back to the
+  composite path, which would have re-measured the unfused arm under a fused
+  name.
+- **Caveat on every throughput delta here.** `matrix_bench` interleaves arms
+  *within one invocation*; `--arms` restricts a run to one arm, so these
+  figures are cross-process, which is the confound interleaving exists to
+  remove. Sub-few-percent deltas are "indistinguishable", not measurements.
+  The capacity results do not depend on clocks.
+- **MFU roofline corrected for every bf16-sr arm.** `--param-dtype bf16-sr`
+  is a STORAGE dtype — the mirror is widened to f32 before the GEMM and these
+  arms set no matmul env, so the GEMM runs TF32 (`[nsl-matmul] cuBLAS math
+  mode: TF32 tensor cores`). They were quoted against the 200.3 TFLOPS bf16
+  peak, understating MFU by 2.29x (1b@2048 read 9.1%; it is 20.7%). This also
+  corrects the 500M `srbf16` row in MATRIX_2026_08_06.
+  Full write-up in `models/benchmarks/SRBF16_1B_2026_08_08.md`.
+
+### Fixed — bf16-sr's parameter surface was accounted as `activations`
+
+- `alloc_managed` inherits the ambient allocation surface, and
+  `srbf16_register` / `srbf16_upload` run from the register belt inside the
+  step body where codegen has set `activations`; `sr_bf16.rs` set no tag of
+  its own. bf16-sr's entire parameter surface — the authoritative mirrors and
+  the widened f32 working views — therefore landed in the activation bucket,
+  and the memory report read `weights 400 MB / activations 12.23 GB`, making
+  bf16-sr look like it made activations **1.81 GB worse**. Both sites now tag
+  `weights`, restored through a Drop guard because `alloc_managed` panics on
+  OOM. Pure accounting: `Peak allocated` is 20.62 GB before and after, and the
+  1.81 GB that moved puts activations at 10.41 GB against the f32 arm's
+  10.42 GB. Pinned by a new gate,
+  `srbf16_parameter_surface_is_accounted_as_weights_gpu`, which was verified
+  to FAIL with the fix reverted (`other` 132,096 B vs `weights` 16,896 B) —
+  it asserts on the surface table's `current` column, because the `peak`
+  column includes the correctly-tagged initial f32 allocation and so passes
+  either way.
+- **Scope:** this covers the two `sr_bf16.rs` sites that hold theta (the
+  authoritative mirror and its widened f32 working view). The batched SR
+  optimizer's small device pointer/block tables
+  (`cuda/mod.rs:4209-4215`, ~7 KB at k=144, allocated once and never freed)
+  still inherit the ambient surface. Left alone deliberately: they are
+  immaterial at every measured scale and wrapping them would mean touching a
+  hot dispatch path for a rounding error in a diagnostic.
+
+### Added — `residency_probe.py`, and `--arms` for `matrix_bench.py`
+
+- `matrix_bench.py` cannot answer capacity questions: it kills each run after
+  `--max-steps` (so no `atexit` reporter ever fires), its microbatch probe
+  returns the largest batch fitting *every* arm in the cell, and it discards
+  run stderr — where the per-surface attribution and the OOM diagnostic live.
+  `residency_probe.py` runs a short token stream to completion with
+  `NSL_WS_COUNTER=1` / `NSL_MEMSTATS=1`, samples per-PID VRAM while the run is
+  in flight, and reports the at-global-peak surface table. It treats an OOM as
+  a result, not a failure.
+- **`matrix_bench.py`'s `peak_alloc_mb` / `peak_driver_mb` are step-boundary
+  samples, not peaks.** `[gpu-mem]` prints after each step's transients are
+  released, so at 1b@2048 they report 12,304 MB where the allocator's own
+  high-water mark is 20.62 GB and nvidia-smi sees 23.6 GB — which is how
+  "12.3 GB on a 32 GB card" coexisted with an OOM at microbatch 2. Both
+  columns now carry the caveat in the harness docstring.
+- `--arms` restricts every selected cell to the named arms, so the microbatch
+  probe reports a ceiling for the arms under study. Restricted runs are tagged
+  `arms_filter` in the JSON so they cannot be mistaken for the full matrix.
+
 ### Changed — weight streaming is now a capacity-aware DECISION (1B@2048: +18.6% tokens/s)
 
 - **`--weight-stream` streamed unconditionally, and at 1B that cost ~16% of
