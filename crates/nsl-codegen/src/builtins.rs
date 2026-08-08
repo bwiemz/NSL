@@ -2793,6 +2793,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // D3 v2: record an owned optimizer-moment allocation's element count so the
     // G3 gate can prove per-rank optimizer state shrank to ~1/world_size.
     ("nsl_zero_note_optim_alloc", &[types::I64], Some(types::I64)), // (tensor_ptr) -> running elems
+    // (tensor_ptr) -> running REPLICA elems; the MomentFill::Full half that
+    // nsl_zero_note_optim_alloc deliberately excludes.
+    (
+        "nsl_zero_note_replicated_optim_alloc",
+        &[types::I64],
+        Some(types::I64),
+    ),
     // --- M43: Gradient accumulation (ABI-fixed) ---
     (
         "nsl_grad_accumulate_add",

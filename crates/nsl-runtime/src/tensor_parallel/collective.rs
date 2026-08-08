@@ -1169,6 +1169,268 @@ impl CollectiveBackend for NcclBackend {
 }
 
 // ---------------------------------------------------------------------------
+// NCCL certification — the only place NcclBackend is ever executed
+// ---------------------------------------------------------------------------
+
+/// Certification for the REAL NCCL transport, at world_size 1.
+///
+/// Why this module exists. Before it, `NcclBackend` had **never executed** —
+/// not once, anywhere. `rg NcclBackend` over the tree matched only its own
+/// definition and the `make_nccl_backend` call in `zero.rs`; no test
+/// constructed one. Two independent structural facts kept it that way:
+///
+///   1. `zero.rs`'s backend factory skips backend construction entirely when
+///      `world_size == 1` ("NCCL would be a 1-rank identity clique — skip
+///      it"), so `--collectives nccl --devices 1` performs zero NCCL calls.
+///   2. `--devices 2` needs two GPUs. NCCL refuses two ranks on one device
+///      with `ncclInvalidUsage` — measured on this box, NCCL 2.30.7 /
+///      RTX PRO 4500 Blackwell, both ranks symmetric, in under a second.
+///
+/// So on single-GPU hardware every line of `NcclBackend` was unreachable
+/// through the product path, and the one gate that mentioned NCCL passed
+/// without libnccl being linked at all.
+///
+/// These tests take the third route: construct the backend DIRECTLY at
+/// ws=1 (legal — `SimulatedBackend::broadcast` returns 0 at ws==1 without
+/// dereferencing shm, so a null mapping is fine) and drive real
+/// `ncclAllReduce` / `ncclAllGather` / `ncclReduceScatter` calls against it.
+///
+/// What this certifies: that we link a real libnccl, that `ncclCommInitRank`
+/// succeeds and `ncclCommDestroy` tears down cleanly, that our dtype mapping
+/// / element counts / stream handle are well-formed enough for NCCL to
+/// ACCEPT the calls, execute them on our stream, and return the correct
+/// bytes. That is precisely the part most likely to be wrong in code that
+/// has never run.
+///
+/// It does NOT prove an NCCL device KERNEL ran. At nRanks==1 AllReduce-SUM,
+/// AllGather and ReduceScatter are all the identity, and NCCL is free to
+/// service them with a copy (or nothing) rather than a collective kernel —
+/// no assertion here can tell those apart, because the only observable is
+/// the receive buffer and every implementation of the identity agrees on it.
+/// The claim is "our calls into NCCL are well-formed and NCCL honoured
+/// them", not "NCCL's ring kernels are exercised".
+///
+/// What it does NOT certify, and no test on this box can: inter-rank
+/// transport, ring reduction ORDER (the one property `reduce_scatter_sum`
+/// documents as per-backend and NOT shared with `SimulatedBackend`), or any
+/// ZeRO parity number under NCCL. Those need ≥2 physical GPUs.
+///
+/// The public trait methods are deliberately NOT the vehicle here: they all
+/// short-circuit at `world_size == 1` before reaching NCCL — three to a
+/// `memcpy_dtod`, and `broadcast` to a bare `return 0` with no copy at all
+/// (correct: NCCL broadcast is in-place on one buffer). Testing through them
+/// would certify our memcpy, not NCCL. Each
+/// test therefore calls the raw `nccl::*` entry point with the backend's own
+/// `comm` and `compute_stream()`, and separately asserts the wrapper's
+/// short-circuit really is a short-circuit.
+#[cfg(all(test, feature = "nccl"))]
+mod nccl_cert {
+    use super::*;
+    use cudarc::nccl::sys as nccl;
+
+    /// Device round-trip helper: upload `src`, run `body` against the device
+    /// pointers, sync, and read `recv` back. `recv` is pre-filled with a
+    /// SENTINEL so a collective that silently does nothing is distinguishable
+    /// from one that wrote the right answer — without it, "all_reduce over 1
+    /// rank is the identity" would pass on a no-op.
+    fn with_device_bufs<F>(send: &[f32], sentinel: f32, body: F) -> Vec<f32>
+    where
+        F: FnOnce(*const c_void, *mut c_void, usize),
+    {
+        crate::cuda::inner::ensure_context();
+        let n = send.len();
+        let bytes = n * 4;
+        let d_send = crate::cuda::inner::alloc_managed(bytes);
+        let d_recv = crate::cuda::inner::alloc_managed(bytes);
+        assert!(!d_send.is_null() && !d_recv.is_null(), "device alloc failed");
+
+        let poison = vec![sentinel; n];
+        crate::cuda::inner::memcpy_htod(d_send, send.as_ptr() as *const c_void, bytes);
+        crate::cuda::inner::memcpy_htod(d_recv, poison.as_ptr() as *const c_void, bytes);
+
+        body(d_send as *const c_void, d_recv, n);
+
+        assert!(
+            crate::cuda::inner::sync_compute_stream_with_deadline(60, "nccl cert"),
+            "compute stream did not drain within 60s"
+        );
+
+        let mut out = vec![0.0f32; n];
+        crate::cuda::inner::memcpy_dtoh(out.as_mut_ptr() as *mut c_void, d_recv, bytes);
+        crate::cuda::inner::free_managed(d_send);
+        crate::cuda::inner::free_managed(d_recv);
+        out
+    }
+
+    fn one_rank_comm() -> NcclBackend {
+        NcclBackend::new(0, 1, std::ptr::null_mut(), 0).unwrap_or_else(|e| {
+            panic!(
+                "ncclCommInitRank(0/1) failed: {e}\n\
+                 A 1-rank communicator needs no peers, so this is a real \
+                 libnccl/driver failure, not the same-device refusal."
+            )
+        })
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU + a real libnccl (--features nccl)"]
+    fn a_real_one_rank_communicator_initializes_and_destroys() {
+        let b = one_rank_comm();
+        assert_eq!(b.rank(), 0);
+        assert_eq!(b.world_size(), 1);
+        assert!(!b.comm.is_null(), "ncclCommInitRank returned a null comm");
+        // Drop runs ncclCommDestroy; a double-destroy or a destroy on an
+        // aborted comm is the documented way to hang process teardown, so
+        // reaching the end of this test at all is part of the assertion.
+        drop(b);
+    }
+
+    /// The real thing: NCCL device code executing on this GPU.
+    #[test]
+    #[ignore = "requires CUDA GPU + a real libnccl (--features nccl)"]
+    fn nccl_device_collectives_actually_execute_on_this_gpu() {
+        let b = one_rank_comm();
+        let src: Vec<f32> = (0..1024).map(|i| i as f32 * 0.5 - 7.0).collect();
+
+        // ncclAllReduce over 1 rank == identity, but it is a REAL launch:
+        // the sentinel proves NCCL wrote every element.
+        let got = with_device_bufs(&src, f32::NAN, |s, r, n| {
+            let rc = unsafe {
+                nccl::ncclAllReduce(
+                    s,
+                    r,
+                    n,
+                    NcclBackend::nccl_dtype(DTYPE_F32).expect("f32 must map"),
+                    nccl::ncclRedOp_t::ncclSum,
+                    b.comm,
+                    b.compute_stream(),
+                )
+            };
+            assert_eq!(rc, nccl::ncclResult_t::ncclSuccess, "ncclAllReduce rc");
+        });
+        assert_eq!(got, src, "ncclAllReduce(1 rank) must reproduce the input");
+
+        // ncclAllGather: 1 rank contributes n elements, recv holds n.
+        let got = with_device_bufs(&src, f32::NAN, |s, r, n| {
+            let rc = unsafe {
+                nccl::ncclAllGather(
+                    s,
+                    r,
+                    n,
+                    NcclBackend::nccl_dtype(DTYPE_F32).expect("f32 must map"),
+                    b.comm,
+                    b.compute_stream(),
+                )
+            };
+            assert_eq!(rc, nccl::ncclResult_t::ncclSuccess, "ncclAllGather rc");
+        });
+        assert_eq!(got, src, "ncclAllGather(1 rank) must reproduce the input");
+
+        // ncclReduceScatter with recvcount == count/1.
+        let got = with_device_bufs(&src, f32::NAN, |s, r, n| {
+            let rc = unsafe {
+                nccl::ncclReduceScatter(
+                    s,
+                    r,
+                    n,
+                    NcclBackend::nccl_dtype(DTYPE_F32).expect("f32 must map"),
+                    nccl::ncclRedOp_t::ncclSum,
+                    b.comm,
+                    b.compute_stream(),
+                )
+            };
+            assert_eq!(rc, nccl::ncclResult_t::ncclSuccess, "ncclReduceScatter rc");
+        });
+        assert_eq!(
+            got, src,
+            "ncclReduceScatter(1 rank) must reproduce the input"
+        );
+
+        // No async error accumulated across the three launches.
+        let mut aerr = nccl::ncclResult_t::ncclSuccess;
+        unsafe { nccl::ncclCommGetAsyncError(b.comm, &mut aerr) };
+        assert_eq!(
+            aerr,
+            nccl::ncclResult_t::ncclSuccess,
+            "NCCL reported an async error after the collectives"
+        );
+    }
+
+    /// The dtype table is ours, not NCCL's — an unmapped dtype must be
+    /// refused with -2 BEFORE any NCCL call, or we would hand NCCL a garbage
+    /// enum. This is pure wrapper logic and needs no peers.
+    #[test]
+    #[ignore = "requires CUDA GPU + a real libnccl (--features nccl)"]
+    fn unmapped_dtypes_are_refused_before_reaching_nccl() {
+        let b = one_rank_comm();
+        for dt in [DTYPE_I8, DTYPE_FP8, 999] {
+            assert_eq!(
+                b.all_reduce_sum(std::ptr::null(), std::ptr::null_mut(), 4, dt, std::ptr::null_mut()),
+                -2,
+                "dtype {dt} must be refused with -2, not forwarded to NCCL"
+            );
+        }
+        // The mapped ones resolve; DTYPE_F32 is the one every ZeRO path uses.
+        for dt in [DTYPE_F64, DTYPE_F32, DTYPE_F16, DTYPE_BF16] {
+            assert!(
+                NcclBackend::nccl_dtype(dt).is_some(),
+                "dtype {dt} must map to an NCCL dtype"
+            );
+        }
+    }
+
+    /// Pins the documented ws==1 bypass, so the claim in this module's header
+    /// ("the trait methods do not reach NCCL at ws=1") is CHECKED rather than
+    /// asserted.
+    ///
+    /// The discriminator is a deliberately NULL communicator. Driving a real
+    /// one proves nothing: over a 1-rank comm `ncclAllReduce` is the identity,
+    /// so the NCCL path and the memcpy path produce byte-identical output and
+    /// deleting the short-circuit would leave the test green. With a null
+    /// `comm`, the short-circuit is the ONLY way this can succeed — reaching
+    /// NCCL passes a null handle and dies.
+    ///
+    /// `aborted: true` keeps `Drop` from calling `ncclCommDestroy` on the null
+    /// handle. Constructing the struct directly is why this module is a unit
+    /// test rather than an integration test.
+    #[test]
+    #[ignore = "requires CUDA GPU + a real libnccl (--features nccl)"]
+    fn the_trait_methods_short_circuit_at_ws1_without_entering_nccl() {
+        let src: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let b = NcclBackend {
+            host: SimulatedBackend::new(0, 1, std::ptr::null_mut(), 0),
+            comm: std::ptr::null_mut(),
+            aborted: std::sync::atomic::AtomicBool::new(true),
+        };
+
+        for (label, call) in [
+            ("all_reduce_sum", 0usize),
+            ("all_gather", 1),
+            ("reduce_scatter_sum", 2),
+        ] {
+            let got = with_device_bufs(&src, f32::NAN, |s, r, n| {
+                let rc = match call {
+                    0 => b.all_reduce_sum(s, r, n, DTYPE_F32, std::ptr::null_mut()),
+                    1 => b.all_gather(s, r, n, DTYPE_F32, std::ptr::null_mut()),
+                    _ => b.reduce_scatter_sum(s, r, n, DTYPE_F32, std::ptr::null_mut()),
+                };
+                assert_eq!(rc, 0, "{label} must succeed on the ws=1 bypass");
+            });
+            assert_eq!(got, src, "{label}: the ws=1 path must still move the data");
+        }
+
+        // broadcast is the odd one out: its ws==1 arm returns 0 with NO copy,
+        // because NCCL broadcast is in-place on a single buffer and the root's
+        // buffer already holds the data. Asserting a copy here would be wrong.
+        assert_eq!(
+            b.broadcast(std::ptr::null_mut(), 4, DTYPE_F32, 0, std::ptr::null_mut()),
+            0,
+            "broadcast's ws=1 arm must be a no-op, not a copy"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

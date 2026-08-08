@@ -119,12 +119,39 @@ pub static ZERO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 =
 /// view-rooted) are deliberately NOT counted on any rank — counting them
 /// would break the `r0 + r1 == full` partition identity the gates assert,
 /// since every rank holds a full copy of those by construction.
+///
+/// That exclusion is correct for the identity and BLINDING for everything
+/// else: it is why `assert_moment_partition` stays green no matter how large
+/// the replicated remainder grows. `ZERO_REPL_OPTIM_ELEMS` below exists so
+/// the excluded half is still measured.
 pub static ZERO_OPTIM_ELEMS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Read `(rank, world_size, all_reduce_count, broadcast_count, optim_elems)`
-/// for the atexit report. rank/ws are -1 when no context was initialized.
-pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64, u64) {
+/// The moment elements this rank holds as a FULL REPLICA — the half
+/// `ZERO_OPTIM_ELEMS` deliberately drops.
+///
+/// Why a second counter instead of folding these into the first: the gates
+/// assert `r0 + r1 == full` over `optim_elems`, and a replicated param
+/// contributes `numel` to EVERY rank but only `numel` to the ws=1 reference,
+/// so counting it there breaks the identity by exactly one replica per extra
+/// rank. Keeping the two surfaces in separate counters preserves the
+/// partition proof AND makes the unsharded remainder observable, which it
+/// was not before: under `--zero-elementwise` the epilogue set (embedding /
+/// final norm / LM head — every param with no `blocks.N` key, so not a
+/// corner case) keeps full f32 m and v on every rank, and no instrument in
+/// the tree reported it. On the shipped test fixture that is 8320 of 74112
+/// moment elements (11%) at ws=2, and the fraction GROWS with world size
+/// because the counted half shrinks as 1/ws while this one is constant.
+///
+/// Unlike `ZERO_OPTIM_ELEMS` this is a per-rank replica count, so the
+/// identity to assert on it is `r0 == r1 == full`, not `r0 + r1 == full`.
+pub static ZERO_REPL_OPTIM_ELEMS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read `(rank, world_size, all_reduce_count, broadcast_count, optim_elems,
+/// bucket_members, repl_optim_elems)` for the atexit report. rank/ws are -1
+/// when no context was initialized.
+pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64, u64, u64) {
     let guard = ZERO_CTX.lock().unwrap();
     let (rank, ws) = guard
         .as_ref()
@@ -137,6 +164,7 @@ pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64, u64) {
         ZERO_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed),
         ZERO_BUCKET_MEMBERS.load(std::sync::atomic::Ordering::Relaxed),
+        ZERO_REPL_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -153,6 +181,53 @@ pub extern "C" fn nsl_zero_note_optim_alloc(tensor_ptr: i64) -> i64 {
     }
     let numel = crate::tensor::NslTensor::from_ptr(tensor_ptr).len.max(0) as u64;
     (ZERO_OPTIM_ELEMS.fetch_add(numel, std::sync::atomic::Ordering::Relaxed) + numel) as i64
+}
+
+/// Record a moment tensor this rank holds as a FULL REPLICA (the
+/// `MomentFill::Full` arm: tied / view-rooted / epilogue params).
+///
+/// Deliberately a SEPARATE counter from `nsl_zero_note_optim_alloc` — see
+/// `ZERO_REPL_OPTIM_ELEMS` for why folding the two would break the
+/// `r0 + r1 == full` partition identity. Emitted unconditionally on the
+/// replicated arm (there is no owner gate to sit inside), so a null pointer
+/// here means the moment allocation itself failed rather than that this rank
+/// legitimately skipped it — it still contributes nothing, matching its
+/// sibling's convention.
+#[no_mangle]
+pub extern "C" fn nsl_zero_note_replicated_optim_alloc(tensor_ptr: i64) -> i64 {
+    if tensor_ptr == 0 {
+        return ZERO_REPL_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed) as i64;
+    }
+    let numel = crate::tensor::NslTensor::from_ptr(tensor_ptr).len.max(0) as u64;
+    (ZERO_REPL_OPTIM_ELEMS.fetch_add(numel, std::sync::atomic::Ordering::Relaxed) + numel) as i64
+}
+
+/// Write one pre-formatted line to stderr in a SINGLE `write_all`.
+///
+/// Every per-rank message in `nsl_zero_init`'s `ws > 1` arms is emitted by
+/// all ranks simultaneously into the SAME inherited stderr pipe, and
+/// `eprintln!` issues one write(2) per format FRAGMENT. Two ranks therefore
+/// interleave mid-string. This is not theoretical — the NCCL same-device
+/// refusal came out as
+///
+/// ```text
+/// ...init failed on rank nsl_zero_init: ...failed on rank 1: 0: nccl...
+/// ```
+///
+/// so the substring "on rank 0" did not exist anywhere in the output and a
+/// gate asserting per-rank symmetry failed on a run where both ranks HAD
+/// refused correctly. It is nondeterministic, so it presents as a flake.
+///
+/// `args.rs`'s `[zero]` counter line and the `[zero3]` teardown line already
+/// solved this the same way; the init-path messages were simply never
+/// converted, because until NCCL was actually exercised nothing parsed them.
+/// A single `write_all` under PIPE_BUF is atomic on POSIX pipes.
+fn emit_rank_line(mut line: String) {
+    use std::io::Write;
+    if !line.ends_with('\n') {
+        line.push('\n');
+    }
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 struct ZeROContext {
@@ -283,11 +358,11 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         .map(|v| v == "1")
         .unwrap_or(true);
     if !simulated && ws > 1 {
-        eprintln!(
-            "nsl_zero_init: NSL_SIMULATED_TP=0 requests a real collective \
-             backend, but no NCCL/inter-device transport is built into this \
-             runtime — refusing rather than silently simulating."
-        );
+        emit_rank_line(format!(
+            "nsl_zero_init: rank {rank}: NSL_SIMULATED_TP=0 requests a real \
+             collective backend, but no NCCL/inter-device transport is built \
+             into this runtime — refusing rather than silently simulating."
+        ));
         return -2;
     }
 
@@ -307,10 +382,10 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         "sim-gpu" => WantBackend::SimGpu,
         "nccl" => WantBackend::Nccl,
         other => {
-            eprintln!(
-                "nsl_zero_init: unknown NSL_COLLECTIVES backend '{other}' \
-                 (expected 'sim', 'sim-gpu', or 'nccl')"
-            );
+            emit_rank_line(format!(
+                "nsl_zero_init: rank {rank}: unknown NSL_COLLECTIVES backend \
+                 '{other}' (expected 'sim', 'sim-gpu', or 'nccl')"
+            ));
             return -2;
         }
     };
@@ -320,42 +395,42 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         bool,
     ) = if ws > 1 {
         let Ok(shm_path) = std::env::var("NSL_TP_SHM_PATH") else {
-            eprintln!(
+            emit_rank_line(format!(
                 "nsl_zero_init: world_size={ws} but NSL_TP_SHM_PATH is not \
                  set — run through `nsl run --devices {ws}` (the spawner \
                  creates the shared-memory file and sets the rank env)"
-            );
+            ));
             return -3;
         };
         let (shm_ptr, shm_len) = crate::tensor_parallel::ffi::open_shm(&shm_path);
         match want {
             WantBackend::Nccl => match make_nccl_backend(rank, ws, shm_ptr, shm_len) {
                 Ok(b) => {
-                    eprintln!(
+                    emit_rank_line(format!(
                         "[zero] rank {rank}: NCCL communicator up \
                          (ws={ws}, CUDA-aware collectives)"
-                    );
+                    ));
                     (Some(b), true)
                 }
                 Err(e) => {
-                    eprintln!(
+                    emit_rank_line(format!(
                         "nsl_zero_init: NCCL backend init failed on rank {rank}: {e}"
-                    );
+                    ));
                     return -2;
                 }
             },
             WantBackend::SimGpu => match make_sim_gpu_backend(rank, ws, shm_ptr, shm_len) {
                 Ok(b) => {
-                    eprintln!(
+                    emit_rank_line(format!(
                         "[zero] rank {rank}: sim-gpu staged collectives up \
                          (ws={ws}, CUDA-aware TEST backend)"
-                    );
+                    ));
                     (Some(b), true)
                 }
                 Err(e) => {
-                    eprintln!(
+                    emit_rank_line(format!(
                         "nsl_zero_init: sim-gpu backend init failed on rank {rank}: {e}"
-                    );
+                    ));
                     return -2;
                 }
             },
