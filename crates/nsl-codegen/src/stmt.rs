@@ -4406,13 +4406,13 @@ impl Compiler<'_> {
 
         // ── Present the distill header as a train header ────────────────
         // `cpkd::distill_as_train_block` is the ONE place that says which
-        // header keys travel and how. It is shared with the module-level AST
-        // scans (`training_report`, `pca_activation`), which is the point: a
-        // distill block is a training loop, and before this every such scan
-        // matched `StmtKind::TrainBlock` and saw nothing at all — reporting
-        // "Training blocks found: 0" for a block that trains, and computing
-        // `segment_masked = false` for a packed corpus. Extracting here
-        // rather than there would have re-opened exactly that divergence.
+        // header keys travel and how, shared with `training_report` — which
+        // is the point: a distill block is a training loop, and before this
+        // the module-level AST scans matched `StmtKind::TrainBlock` and saw
+        // nothing at all, reporting "Training blocks found: 0" for a block
+        // that trains and computing `segment_masked = false` for a packed
+        // corpus. Keeping the extraction here, private to codegen, is what
+        // left those scans nothing to read.
         let presented = crate::cpkd::distill_as_train_block(distill, self.interner)
             .map_err(CodegenError::new)?;
         let epochs = presented.epochs;

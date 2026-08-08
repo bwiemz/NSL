@@ -409,6 +409,7 @@ mod tests {
         TrainingReport {
             source_path: "pretrain.nsl".to_string(),
             train_blocks: vec![TrainBlockReport {
+                kind: BlockKind::Train,
                 model_name: Some("NSLCoder".to_string()),
                 fase: FaseSection { plan, memory: None },
                 pca: None,

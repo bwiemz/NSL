@@ -223,8 +223,13 @@ pub struct DistillContext {
 /// `segment_masked = false` for a packed corpus, which is cross-document
 /// attention contamination on a program that asked for packing.
 ///
-/// Both sides now build the presentation here, so they cannot disagree about
-/// the accumulation window (or anything else in the header).
+/// Every consumer that needs a distill block's HEADER now reads it here — the
+/// lowering path (`compile_distill_block`) and the training report — so they
+/// cannot disagree about the accumulation window or anything else in it. A
+/// consumer that needs only the block's SECTIONS does not come through this
+/// function at all: `pca_activation` matches `StmtKind::DistillBlock` and reads
+/// `distill.sections` directly, under the verbatim guarantee stated below,
+/// rather than cloning a step body to answer a boolean.
 ///
 /// **Which keys travel as train config, and why each is justified alone.**
 /// Blanket-forwarding is refused: `compile_train_block_inner`'s config loop
