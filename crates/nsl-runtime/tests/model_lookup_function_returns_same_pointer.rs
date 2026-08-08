@@ -39,8 +39,34 @@ fn identity(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
         ])
         .status()
         .unwrap();
-    assert!(status.success(), "nsl build --shared-lib failed");
+    // A full TMPDIR makes the LINKER fail here, and the failure is
+    // indistinguishable from a compile refusal unless you read the child's
+    // stderr — which is exactly how this file's two tests presented when /tmp
+    // (a 31 GB tmpfs) filled up: as if an @export signature had been
+    // rejected.
+    assert!(
+        status.success(),
+        "nsl build --shared-lib failed (exit {:?}). If TMPDIR is full the \
+         linker fails here and it looks like a compile refusal — check the \
+         child's stderr above and `df -h` on TMPDIR before suspecting the \
+         compiler.",
+        status.code()
+    );
     (lib, weights)
+}
+
+/// Remove the ~138 MB scratch dir this test's shared library links into.
+///
+/// This file is the only one of its four siblings with no cleanup, so its
+/// directories accumulated one per suite run. On a machine where TMPDIR is a
+/// tmpfs that eventually exhausts it, and the linker then starts failing
+/// across the WHOLE workspace — a failure that looks like anything except a
+/// disk problem. `NSL_KEEP_TEMP=1` keeps them, matching the siblings.
+fn cleanup_scratch(dir: &std::path::Path) {
+    if std::env::var("NSL_KEEP_TEMP").as_deref() == Ok("1") {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -58,6 +84,7 @@ fn lookup_returns_non_null_for_existing_export() {
     assert_ne!(ptr1, 0);
     assert_eq!(ptr1, ptr2, "lookup must be deterministic (cache hit)");
     nsl_runtime::c_api::nsl_model_destroy(model);
+    cleanup_scratch(lib.parent().expect("lib sits in its scratch dir"));
 }
 
 #[test]
@@ -73,6 +100,7 @@ fn lookup_returns_zero_for_unknown_export() {
     let ptr = nsl_runtime::c_api::nsl_model_lookup_function(model, unk.as_ptr() as i64);
     assert_eq!(ptr, 0);
     nsl_runtime::c_api::nsl_model_destroy(model);
+    cleanup_scratch(lib.parent().expect("lib sits in its scratch dir"));
 }
 /// Path to the `nsl` binary built by `cargo test --workspace`.
 ///
