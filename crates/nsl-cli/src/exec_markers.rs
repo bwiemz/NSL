@@ -293,10 +293,17 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
             // exactly the shipped pretraining configuration. Pinning only
             // wengert_lower.rs would let the decline be renamed silently.
             "crates/nsl-codegen/src/stmt.rs",
+            // compiler/mod.rs: the SAME `declined:` note for the one case
+            // stmt.rs structurally cannot reach — a program with no train
+            // block, where `compile_train_block_inner` never runs, so
+            // `finish_wgrad_admission` is the only thing left to say the flag
+            // did nothing.
+            "crates/nsl-codegen/src/compiler/mod.rs",
         ],
         "item 7 reported what `--fuse-wgrad-accum` did: `N chain(s) fused` \
          counts the chains the pre-pass collapsed, `declined:` names the \
-         precondition that kept the fusion from firing at all",
+         precondition that kept the fusion from firing at all (and which \
+         train block, since a decline no longer implies a failed build)",
     ),
     m(
         "[ccr]",

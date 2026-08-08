@@ -874,6 +874,12 @@ pub(crate) struct BuildArgs {
         /// Requires source-AD (`--source-ad`, or `--pretrain-optimized`, which
         /// enables this too) and a FASE-Deferred plan.
         ///
+        /// A Deferred plan needs `grad_accumulation >= 2` in the train block.
+        /// Every block that cannot reach it is named on stderr
+        /// (`[wgrad-fusion] declined: train block #N — ...`); the flag is
+        /// REFUSED only when no block in the whole program could fuse, so a
+        /// program that accumulates in one block and not another still builds.
+        ///
         /// NOT bit-exact: products are summed in cuBLAS's order rather than
         /// rounding each per-batch partial first. Measured against an f64
         /// reference it is closer to the true gradient than the chain it
@@ -1458,6 +1464,12 @@ pub(crate) struct RunArgs {
         /// the parameter — and the reduce's full read-back over it.
         /// Requires source-AD (`--source-ad`, or `--pretrain-optimized`, which
         /// enables this too) and a FASE-Deferred plan.
+        ///
+        /// A Deferred plan needs `grad_accumulation >= 2` in the train block.
+        /// Every block that cannot reach it is named on stderr
+        /// (`[wgrad-fusion] declined: train block #N — ...`); the flag is
+        /// REFUSED only when no block in the whole program could fuse, so a
+        /// program that accumulates in one block and not another still builds.
         ///
         /// NOT bit-exact: products are summed in cuBLAS's order rather than
         /// rounding each per-batch partial first. Measured against an f64

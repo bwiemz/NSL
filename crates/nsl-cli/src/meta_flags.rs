@@ -18,8 +18,10 @@
 //! `grad_accumulation >= 2` in the train block; the measured run declared none,
 //! so the wgrad half fused zero chains and the number belongs to
 //! `--fuse-rmsnorm-backward` and the rest of the bundle. Codegen now emits
-//! `[wgrad-fusion] declined: ...` per train block rather than leaving that
-//! invisible. `--training-reference` strips both back out. Because the bundle sets
+//! `[wgrad-fusion] declined: train block #N — ...` for every train block that
+//! cannot fuse — including the `@pipeline` path, which returns before the
+//! ordinary admission — rather than leaving that invisible.
+//! `--training-reference` strips both back out. Because the bundle sets
 //! them AFTER clap has finished validating, clap can no longer enforce
 //! `--fuse-wgrad-accum`'s conflicts — [`WgradFusionBlockers`] is what replaces
 //! that enforcement, with a matching hard error in `stmt.rs` as the backstop.
@@ -205,9 +207,18 @@ pub(crate) fn expand_pretrain_optimized(
     // `--fuse-wgrad-accum` fused ZERO chains. The number belongs to
     // `--fuse-rmsnorm-backward` (plus whatever else the bundle turns on); the
     // wgrad half contributed nothing to it and cannot until a train block
-    // declares `grad_accumulation >= 2`. Codegen now says so out loud per
-    // train block (`[wgrad-fusion] declined:` in stmt.rs) rather than leaving
-    // this comment as the only record.
+    // declares `grad_accumulation >= 2`. Codegen now says so out loud —
+    // `[wgrad-fusion] declined: train block #N` from `stmt.rs`, or from
+    // `Compiler::finish_wgrad_admission` when the program has no train block
+    // at all — rather than leaving this comment as the only record.
+    //
+    // MEMBERSHIP IS MIRRORED IN A GATE. `a_non_fusing_build_keeps_every_ccr_free_marker`
+    // in `crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs` must compare two
+    // builds that differ ONLY in `--fuse-wgrad-accum`, so it spells out every
+    // OTHER member of this bundle by hand. Adding a member here without adding
+    // it there silently reintroduces a confound into that arm's free-marker
+    // equality; a field-count drift check on `PretrainBundle` is what makes
+    // the omission fail loudly instead.
     //
     // Neither is filled destructively: they are already `false` unless the user
     // asked for them, so setting them here cannot override an explicit choice
