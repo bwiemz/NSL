@@ -141,7 +141,50 @@ fn classify_c(ty: &str) -> ParsedType {
     }
 }
 
+/// Replace every balanced `{ … }` region with `;`, so a declaration that
+/// follows a function or struct body still lands in its own `;`-delimited
+/// chunk.
+///
+/// A SEMICOLON, not a space: a function definition carries no trailing `;`, so
+/// blanking its body would glue `static inline T f(…)` to whatever declaration
+/// comes next, and the merged chunk parses as `f` alone — the following
+/// declaration disappears exactly as it did before the elision was added.
+///
+/// The `extern "C" {` linkage block is dropped first, and that is not a
+/// detail: it wraps EVERY declaration in the header, so counting its brace
+/// elides the entire file and the gate silently checks nothing. Its now
+/// unmatched closing brace falls out harmlessly — a `}` at depth 0 is simply
+/// not copied.
+fn elide_brace_regions(src: &str) -> String {
+    let src = src.replace("extern \"C\" {", " ");
+    let mut out = String::with_capacity(src.len());
+    let mut depth = 0usize;
+    for c in src.chars() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    out.push(';');
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Strip `/* … */` and `// …` from C text, preserving token separation.
+///
+/// Both helpers it delegates to document preconditions written for the
+/// `RUNTIME_FUNCTIONS` table ("contains no string literals embedding `/*`").
+/// A generated C header satisfies them for a different reason: `c_header::emit`
+/// writes no `//` comments at all, and its only string literals are the export
+/// names inside `nsl_model_call(...)` bodies, which `elide_brace_regions`
+/// removes before any of this is parsed.
 fn strip_c_comments(src: &str) -> String {
     let no_block = strip_block_comments(src);
     no_block
@@ -179,11 +222,21 @@ fn c_param_type(param: &str) -> String {
 /// generated C header.
 ///
 /// Deliberately narrow: it understands the two forms `c_header::emit` produces
-/// (`RET name(params);` and `typedef RET (*Name)(params);`) and skips anything
-/// containing braces — struct definitions and the `static inline` host wrappers,
-/// which are C source with no runtime counterpart to agree with. Callers should
-/// assert a floor on the count, because a parser that silently degrades to zero
-/// declarations would make its gate vacuous.
+/// (`RET name(params);` and `typedef RET (*Name)(params);`).
+///
+/// Brace-enclosed regions — struct bodies and `static inline` function bodies —
+/// are ELIDED before splitting, not used as a skip condition. Skipping any
+/// `;`-chunk containing a brace looked equivalent and was not: a declaration
+/// following a function body shares that body's closing brace in its chunk, so
+/// it was silently dropped. `emit_static_inline_wrappers` runs last, which
+/// makes "after the inlines" exactly where a new lifecycle prototype would
+/// naturally be added — the one place the parser could not see. (Eliding also
+/// means a `static inline` DEFINITION now parses as a declaration, which is
+/// correct: its declarator is well-formed and worth checking.)
+///
+/// Callers should assert on the names they expect rather than a count: a
+/// parser that silently degrades makes its gate vacuous, and a floor set just
+/// under the current value still lets one declaration disappear.
 pub fn parse_c_prototypes(header: &str) -> Vec<FnSig> {
     let src = strip_c_comments(header);
     // Preprocessor lines are not declarations and do not end in `;`.
@@ -192,12 +245,12 @@ pub fn parse_c_prototypes(header: &str) -> Vec<FnSig> {
         .filter(|l| !l.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
+    let src = elide_brace_regions(&src);
 
     let mut out = Vec::new();
     for stmt in src.split(';') {
         let s = stmt.trim();
-        // Braces mean a struct definition or a function body, not a prototype.
-        if s.is_empty() || s.contains('{') || s.contains('}') || !s.contains('(') {
+        if s.is_empty() || !s.contains('(') {
             continue;
         }
         let is_typedef = s.starts_with("typedef");
@@ -1029,5 +1082,84 @@ mod tests {
         assert_eq!(macros[0].name, "nsl_tensor_relu_inplace");
         assert_eq!(macros[0].params, vec![ParsedType::Known(AbiScalar::Int(64))]);
         assert_eq!(macros[0].ret, Some(ParsedType::Known(AbiScalar::Int(64))));
+    }
+
+    /// The two ways this parser silently degraded to checking NOTHING, both
+    /// found the hard way.
+    #[test]
+    fn c_prototype_parsing_survives_the_shapes_a_real_header_has() {
+        let header = r#"
+#ifndef NSL_M_H
+#define NSL_M_H
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct NslModel NslModel;
+typedef struct {
+    void*    data;
+    int32_t  ndim;
+} NslTensorDesc;
+
+typedef int64_t (*NslExportFn)(NslModel* model, const NslTensorDesc* inputs,
+                               int64_t n_inputs);
+
+int64_t   nsl_abi_version(void);
+int64_t   nsl_model_call(NslModel* model, const char* name, int64_t n);
+
+static inline int64_t nsl_export_forward(NslModel* model, int64_t n) {
+    return nsl_model_call(model, "forward", n);
+}
+
+int64_t   nsl_added_after_the_inline(NslModel* model);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+"#;
+        let sigs = parse_c_prototypes(header);
+        let names: Vec<&str> = sigs.iter().map(|s| s.name.as_str()).collect();
+
+        // 1. `extern "C" {` wraps EVERY declaration. Counting its brace as a
+        //    region elided the entire file — the gate stayed green while
+        //    checking zero prototypes.
+        assert!(
+            names.contains(&"nsl_abi_version") && names.contains(&"nsl_model_call"),
+            "the extern \"C\" linkage block swallowed the declarations: {names:?}"
+        );
+
+        // 2. A declaration AFTER a function body shares that body's closing
+        //    brace in its `;`-chunk. Skipping brace-bearing chunks dropped it,
+        //    and the inline wrappers are emitted LAST — so "after the inlines"
+        //    is exactly where a new lifecycle prototype would be added.
+        assert!(
+            names.contains(&"nsl_added_after_the_inline"),
+            "a declaration following a function body was dropped: {names:?}"
+        );
+
+        // 3. The struct body must not become a bogus signature.
+        assert!(
+            !names.contains(&"NslTensorDesc"),
+            "a struct definition parsed as a function: {names:?}"
+        );
+
+        // 4. The function-pointer typedef keeps its own name and widths.
+        let ef = sigs.iter().find(|s| s.name == "NslExportFn").expect("typedef");
+        assert_eq!(ef.ret, Some(ParsedType::Known(AbiScalar::Int(64))));
+        assert_eq!(
+            ef.params,
+            vec![
+                ParsedType::Known(AbiScalar::Int(64)),
+                ParsedType::Known(AbiScalar::Int(64)),
+                ParsedType::Known(AbiScalar::Int(64)),
+            ]
+        );
+
+        // 5. `void` is absence, not a parameter.
+        let v = sigs.iter().find(|s| s.name == "nsl_abi_version").unwrap();
+        assert!(v.params.is_empty(), "`(void)` produced a parameter: {:?}", v.params);
     }
 }

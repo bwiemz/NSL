@@ -66,9 +66,16 @@ declared its return and both counts as `int32_t` against a runtime that has
 always taken and returned `int64_t`, and `nsl_model_destroy` was declared
 `void` against `-> i64`. No correct program could have depended on either —
 a host calling through that typedef was already passing counts whose upper
-halves the callee reads as caller-undefined. `nsl-codegen/tests/c_header_
-agreement.rs` now machine-checks the header against the runtime externs so
-this class cannot recur silently.
+halves the callee reads as caller-undefined.
+
+`nsl-codegen/tests/c_header_agreement.rs` machine-checks the header against
+the runtime externs, the `@export` prototypes against the wrapper signatures
+codegen builds, and that no emitted inline shadows a runtime symbol. Its
+limits, stated so nobody reads more into a green run than is there: it
+compares register-class-level types (every pointer is `Int(64)`, so a wrong
+POINTEE type is invisible), it indexes externs from `c_api/mod.rs` and
+`grad_context.rs` only, and it says nothing about semantics — ownership,
+nullability and lifetime are still contract text a reviewer has to check.
 
 ## Internal codegen ↔ runtime signature agreement
 

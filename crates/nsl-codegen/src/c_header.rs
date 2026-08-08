@@ -280,7 +280,10 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     // so a host following the documented contract needs these declared. They
     // were not, which left C callers to write their own extern declarations
     // for two functions this header exists to describe.
-    out.push_str("/* Errors — see the error contract in docs/abi/README.md.\n");
+    // Self-contained wording: this header ships next to the .so to hosts who
+    // do not have the repository, so a comment that only cites a repo path
+    // tells them nothing.
+    out.push_str("/* Errors. Status is returned by value; detail is retrieved here.\n");
     out.push_str(" * The returned string is BORROWED and thread-local: it is owned by the\n");
     out.push_str(" * runtime, valid only until the next call that sets or clears the error\n");
     out.push_str(" * on THIS thread, and must not be freed. Copy it if you need to keep it.\n");
