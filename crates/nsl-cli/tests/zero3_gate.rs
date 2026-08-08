@@ -703,4 +703,38 @@ fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
         sr_steps, elem_steps,
         "some elementwise steps took the plain f32 arm:\n{teardown}"
     );
+
+    // The SR backend's OWN teardown must run on a composed run. It did not
+    // before review: nsl_weight_stream_teardown returned after the zero3
+    // arm, so SRBF16_ACTIVE leaked past the train block (inverting the
+    // first-match-wins dispatch for every later weight-stream call) and
+    // every NSL_SR_HIST sample the composed step recorded was discarded.
+    // Both surfaces are pinned here — the line's existence, and that its
+    // step count reflects the composed steps rather than reading 0 (the
+    // false "stochastic rounding never ran" a certification consumer sees).
+    let sr_line = sr
+        .stderr
+        .lines()
+        .find(|l| l.contains("[sr-bf16] teardown:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no [sr-bf16] teardown line on a composed run — the SR \
+                 backend never tore down:\n{}",
+                sr.stderr
+            )
+        });
+    // Label-anchored on the field's own suffix, then the token immediately
+    // before it (the line reads "..., N SR optimizer step(s), ...").
+    let sr_reported: u64 = sr_line
+        .split(" SR optimizer step(s)")
+        .next()
+        .and_then(|p| p.split_whitespace().next_back())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("unparseable SR step count:\n{sr_line}"));
+    assert!(
+        sr_reported > 0,
+        "the SR backend reports 0 steps on a run that executed {sr_steps} \
+         composed SR steps — tooling keyed on this counter would conclude \
+         stochastic rounding never ran:\n{sr_line}"
+    );
 }

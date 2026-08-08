@@ -2134,7 +2134,9 @@ struct ElemShard {
     shard: usize,
     /// Element size of the FULL working tensor (8 = f64, 4 = f32) — the
     /// region-offset unit for the gathered transient and the moments. The
-    /// SLICE's element size can differ: see [`ElemShard::slice_elem_bytes`].
+    /// SLICE's element size can DIFFER: it is 2 (bf16) whenever
+    /// `sr_param_idx` is set, `elem_bytes` otherwise. Any code sizing slice
+    /// bytes must branch on `sr_param_idx`, not reuse this field.
     elem_bytes: usize,
     /// Item 16×11 composed mode (`--param-dtype bf16-sr --zero-elementwise`):
     /// the param's stable SR counter-block index. When set, the SLICE is the
@@ -2143,6 +2145,13 @@ struct ElemShard {
     /// gather, never written back), and the step is the SR kernel against
     /// the slice.
     sr_param_idx: Option<u64>,
+    /// Item 16×11: f32 staging for the bf16 slice's all_gather SEND buffer
+    /// at ws>1 (the collective never sees a 2-byte dtype). Allocated on the
+    /// first gather and reused across windows — the shard size never
+    /// changes — exactly like `grad` above. A per-window alloc/free would
+    /// pay two allocator-lock round trips per param per window for a buffer
+    /// of constant size. Freed with the entry at teardown.
+    sr_send: Option<ShardBuf>,
 }
 
 struct Zero3Entry {
@@ -2154,6 +2163,11 @@ struct Zero3Entry {
     /// Item 11: set by `nsl_zero3_mark_elementwise` (plan-driven, before the
     /// first registration); the register carves the slice.
     elem_pending: bool,
+    /// Item 16×11: the plan entry's storage decision, carried by the same
+    /// mark — true means the carved slice is bf16-authoritative and the
+    /// update is the fused SR step. Pinned once the slice exists (a re-mark
+    /// that disagrees aborts): slice bytes cannot change dtype mid-schedule.
+    elem_sr: bool,
     /// Present once the first registration carved this rank's slice.
     elem: Option<ElemShard>,
 }
@@ -2222,6 +2236,7 @@ pub extern "C" fn nsl_zero3_note_param(tensor_ptr: i64, idx: i64) -> i64 {
             owner,
             state: ParameterResidency::Replicated,
             elem_pending: false,
+            elem_sr: false,
             elem: None,
         },
     );
@@ -2234,8 +2249,18 @@ pub extern "C" fn nsl_zero3_note_param(tensor_ptr: i64, idx: i64) -> i64 {
 /// exactly like `nsl_sr_bf16_note_param`. Idempotent (the belt re-runs every
 /// micro-batch). The slice itself is carved at the first registration, where
 /// the admission guard has already vetted the tensor.
+///
+/// Item 16×11: `sr` (0/1) carries the plan entry's STORAGE decision — 1 means
+/// this param's slice is bf16-authoritative and its update is the fused SR
+/// step. It is an argument rather than something the carve infers, because
+/// the plan is the single source of truth for storage (the same doctrine as
+/// `needs_sr_note`); inferring it from the SR backend's pointer-keyed pending
+/// map would couple two backends through a heap address that outlives the
+/// tensor. The SR counter block is `idx` — the same value
+/// `nsl_sr_bf16_note_param` records for the mirror path, which is what makes
+/// a composed slice's dither stream identical to the baseline's.
 #[no_mangle]
-pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64) -> i64 {
+pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64) -> i64 {
     let ws = {
         let guard = ZERO_CTX.lock().unwrap();
         let Some(ctx) = guard.as_ref() else {
@@ -2277,6 +2302,27 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64) -> i64 {
         });
         e.elem_pending = true;
     }
+    // Item 16×11: recorded on every mark (not just the arming one) so a
+    // re-mark can never silently disagree with the first about storage.
+    let sr = sr != 0;
+    if sr && !crate::sr_bf16::srbf16_active() {
+        eprintln!(
+            "[zero3] FATAL: param {idx} marked bf16-sr elementwise but the SR \
+             backend was never enabled — the plan's storage decision and the \
+             emitted enable belt have drifted"
+        );
+        std::process::abort();
+    }
+    if e.elem.is_some() && e.elem_sr != sr {
+        eprintln!(
+            "[zero3] FATAL: param {idx} re-marked with storage sr={sr} after \
+             its slice was carved as sr={} — the slice bytes cannot change \
+             dtype under a live schedule",
+            e.elem_sr
+        );
+        std::process::abort();
+    }
+    e.elem_sr = sr;
     0
 }
 
@@ -2366,11 +2412,14 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
             // cast `srbf16_register` applies to the full mirror, so every
             // rank's slice equals the single-rank mirror's region
             // bit-for-bit. GPU/f32-only, exactly like the mirror backend.
-            let sr_param_idx = if crate::sr_bf16::srbf16_active() {
-                crate::sr_bf16::pending_param_idx(tensor_ptr)
-            } else {
-                None
-            };
+            //
+            // The decision (and the counter block) come from the plan via
+            // the mark, NOT from the SR backend's pointer-keyed pending map:
+            // that map outlives its tensors, so a recycled heap address in a
+            // later train block could hand this carve another parameter's
+            // dither stream. `e.idx` is the same index the mirror path's
+            // note records, which is what keeps the streams identical.
+            let sr_param_idx = if e.elem_sr { Some(e.idx as u64) } else { None };
             if sr_param_idx.is_some() {
                 if t.device == 0 || t.dtype != 1 {
                     eprintln!(
@@ -2440,6 +2489,7 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
                 shard,
                 elem_bytes,
                 sr_param_idx,
+                sr_send: None,
             });
             e.state = ParameterResidency::Evicted;
             ZERO3_ELEM_PARAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2622,20 +2672,30 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
                     .backend
                     .as_ref()
                     .expect("world_size > 1 implies a backend");
-                // Widened f32 staging for a bf16 slice: freed right after
-                // the collective — the slice itself never enters a backend.
-                // (Annotated: the Some arm is cfg(cuda)-only, so a non-cuda
-                // build has nothing to infer the Option's payload from.)
-                let sr_staging: Option<ShardBuf> = if sr {
+                // A bf16 slice widens into its CACHED f32 send buffer (the
+                // collective never sees a 2-byte dtype); the buffer lives on
+                // the entry and is reused every window, like `grad`. The
+                // send pointer is read back out of the table because the
+                // buffer may have just been created there.
+                let send_ptr = if sr {
                     #[cfg(feature = "cuda")]
                     {
-                        let buf = ShardBuf::alloc(shard * elem_bytes, t.device);
+                        let mut tbl = ZERO3_TABLE.lock().unwrap();
+                        let s = tbl
+                            .as_mut()
+                            .and_then(|m| m.get_mut(&tensor_ptr))
+                            .and_then(|e| e.elem.as_mut())
+                            .expect("elementwise entry verified above");
+                        if s.sr_send.is_none() {
+                            s.sr_send = Some(ShardBuf::alloc(shard * elem_bytes, t.device));
+                        }
+                        let buf = s.sr_send.as_ref().expect("just created").ptr();
                         crate::cuda::gpu_cast_raw_bf16_to_f32(
                             slice_ptr as u64,
-                            buf.ptr() as u64,
+                            buf as u64,
                             shard,
                         );
-                        Some(buf)
+                        buf as *const std::ffi::c_void
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
@@ -2646,12 +2706,13 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
                         std::process::abort();
                     }
                 } else {
-                    None
+                    slice_ptr as *const std::ffi::c_void
                 };
-                let send_ptr = sr_staging
-                    .as_ref()
-                    .map(|b| b.ptr() as *const std::ffi::c_void)
-                    .unwrap_or(slice_ptr as *const std::ffi::c_void);
+                // NOTE: the send buffer stays alive past this call by
+                // construction (it is owned by the table, not this scope) —
+                // which is also what a future stream-async all_gather will
+                // need; a scope-local staging buffer freed on return would
+                // be recycled while the collective still read it.
                 let rc = backend.all_gather(
                     send_ptr,
                     t.data,
@@ -2659,9 +2720,6 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
                     dtype_id,
                     std::ptr::null_mut(),
                 );
-                if let Some(buf) = sr_staging {
-                    buf.free();
-                }
                 if rc == 0 {
                     ZERO_ALL_GATHER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -3393,6 +3451,15 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
             m.dtype,
             v.dtype
         );
+        // The mirror path asserts this too, and here it is load-bearing for
+        // the POINTER ARITHMETIC below: `m.data + rank*shard*4` addresses
+        // logical elements only for a contiguous tensor. A strided m/v would
+        // pass every check above and silently update the wrong positions.
+        assert!(
+            th.is_contiguous() && m.is_contiguous() && v.is_contiguous(),
+            "zero3 sr elem step: th/m/v must be contiguous (the region offset \
+             is flat element arithmetic)"
+        );
         let rank = {
             let guard = ZERO_CTX.lock().unwrap();
             guard.as_ref().map(|c| c.rank).unwrap_or(0)
@@ -3401,14 +3468,21 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
         let has_wd = wd != 0.0;
 
         let seed = crate::deterministic_ops::get_rng_seed();
-        let key = seed ^ (step as u64).wrapping_mul(crate::sr_bf16::SR_STEP_SALT);
-        let ctr_base =
-            (sr_idx << crate::sr_bf16::SR_PARAM_SHIFT) + (rank * shard) as u64;
+        let key = crate::sr_bf16::sr_step_key(seed, step as u64);
+        // The rank's flat element offset rides inside the param's counter
+        // block, so element j of this slice draws the dither the unsharded
+        // baseline draws at global element rank*shard + j.
+        let ctr_base = crate::sr_bf16::sr_param_ctr_base(sr_idx, (rank * shard) as u64);
 
         // NSL_SR_HIST rides the composed path too — a new dispatch path
         // must not shrink the instrument's surface (the #468 batched-arm
-        // lesson). Each rank samples the head of ITS slice, i.e. a
-        // rank-offset window of the global element space.
+        // lesson). Each rank samples the head of ITS slice, i.e. global
+        // elements [rank*shard, rank*shard + hist_n) — NOT the same window
+        // the mirror paths sample (their first min(len, 16384) of the FULL
+        // param), and each rank reports its own accumulator. Stall RATES
+        // stay comparable; absolute sample populations and per-rank
+        // windows do not — read a composed histogram against the baseline
+        // as per-rank evidence, not as one pooled distribution.
         let hist_n = crate::sr_bf16::sr_hist_sample_len(shard);
         let mut hist_before: Vec<u16> = vec![0; hist_n];
         if hist_n > 0 {
@@ -3468,6 +3542,10 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
         }
         ZERO3_ELEM_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ZERO3_SR_ELEM_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Also count it on the SR backend's own surface: tooling that proves
+        // "stochastic rounding ran" from nsl_sr_bf16_step_count() or the
+        // [sr-bf16] teardown line must not read 0 on a composed run.
+        crate::sr_bf16::note_external_sr_step();
         0
     }
     #[cfg(not(feature = "cuda"))]
@@ -3611,6 +3689,9 @@ pub extern "C" fn nsl_zero3_teardown() -> i64 {
                 s.slice.free();
                 if let Some(g) = s.grad {
                     g.free();
+                }
+                if let Some(b) = s.sr_send {
+                    b.free();
                 }
             }
         }
@@ -4194,8 +4275,8 @@ mod tests {
         let tp = &t as *const NslTensor as i64;
 
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
-        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
-        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0, "mark must be idempotent");
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0, 0), 0);
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0, 0), 0, "mark must be idempotent");
         zero3_register(tp);
         assert!(t.data.is_null(), "carve must drop the full replica");
         assert_eq!(nsl_zero3_residency(tp), ParameterResidency::Evicted as i64);
@@ -4334,7 +4415,7 @@ mod tests {
         );
         let tp = &t as *const NslTensor as i64;
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
-        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0, 0), 0);
         zero3_register(tp);
         zero3_gather(tp);
 
@@ -4444,7 +4525,8 @@ mod tests {
         let tp = &t as *const NslTensor as i64;
         crate::sr_bf16::nsl_sr_bf16_note_param(tp, 0);
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
-        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
+        // sr=1: the plan's storage decision travels with the mark.
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0, 1), 0);
         zero3_register(tp);
         assert!(t.data.is_null(), "carve must drop the full replica");
         {

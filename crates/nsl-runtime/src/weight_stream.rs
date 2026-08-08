@@ -1197,15 +1197,27 @@ pub extern "C" fn nsl_weight_stream_reevict_all(writeback: i64) {
 /// are released.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_teardown() {
-    if crate::zero::zero3_active() {
+    // Item 16×11: teardown is NOT first-match-wins the way register/upload
+    // are. Under composed `bf16-sr x --zero-elementwise` BOTH backends are
+    // armed — zero3 owns the params, SR owns the mode flag, the histogram
+    // accumulator and the pending-note map. Returning after the zero3 arm
+    // (as this did) left SRBF16_ACTIVE true past the train block, which
+    // INVERTS the first-match-wins dispatch for every later weight-stream
+    // call, and silently discarded every NSL_SR_HIST sample the composed
+    // step recorded. Each armed backend gets its teardown, zero3 first so
+    // full residency is restored before SR reports.
+    let z3 = crate::zero::zero3_active();
+    if z3 {
         // Restore full residency everywhere (model_save/eval end state),
         // then drop the zero3 mode.
         crate::zero::nsl_zero3_teardown();
-        return;
     }
     if crate::sr_bf16::srbf16_active() {
         // Re-materialize plain f32 tensors, free mirrors, drop the mode.
         crate::sr_bf16::nsl_sr_bf16_teardown();
+        return;
+    }
+    if z3 {
         return;
     }
     teardown_mirrors();

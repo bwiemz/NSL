@@ -11052,10 +11052,18 @@ impl Compiler<'_> {
                         // would resurface one phase later as the elem step's
                         // "never carved" abort, misattributing the cause.
                         if entry.is_elementwise() {
+                            // Item 16x11: the slice's STORAGE travels with
+                            // the mark, from this same plan entry - the
+                            // carve must not infer it from another
+                            // backend's pointer-keyed state.
+                            let srv = builder.ins().iconst(
+                                cl_types::I64,
+                                i64::from(entry.needs_sr_note()),
+                            );
                             let mrc = self.compile_call_by_name(
                                 builder,
                                 "nsl_zero3_mark_elementwise",
-                                &[pw, iv],
+                                &[pw, iv, srv],
                             )?;
                             let mz = builder.ins().iconst(cl_types::I64, 0);
                             let mok = builder.ins().icmp(IntCC::Equal, mrc, mz);
@@ -13365,32 +13373,28 @@ impl Compiler<'_> {
                         // a distinct entry (it needs the optimizer step for
                         // the SR counter key, and the runtime belts abort on
                         // a carve/dispatch mismatch in either direction).
-                        let rc = if c.features.param_dtype_bf16sr {
-                            let step_v = sr_step.ok_or_else(|| {
+                        // One arg list, built once: the SR entry's contract
+                        // is "the plain entry's scalar order plus a trailing
+                        // step", so spelling the shared prefix twice invites
+                        // a future scalar landing in one copy only — which
+                        // type-checks and shifts every f64 on the other path.
+                        let mut step_args = vec![
+                            theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v, omb2_v,
+                            eps_v, wd_v, bc.0, bc.1,
+                        ];
+                        let elem_callee = if c.features.param_dtype_bf16sr {
+                            step_args.push(sr_step.ok_or_else(|| {
                                 CodegenError::new(
                                     "bf16-sr elementwise group update reached \
                                      without an opt_step value — dispatcher \
                                      must thread sr_step",
                                 )
-                            })?;
-                            c.compile_call_by_name(
-                                builder,
-                                "nsl_zero3_elem_sr_adamw_step",
-                                &[
-                                    theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v,
-                                    omb2_v, eps_v, wd_v, bc.0, bc.1, step_v,
-                                ],
-                            )?
+                            })?);
+                            "nsl_zero3_elem_sr_adamw_step"
                         } else {
-                            c.compile_call_by_name(
-                                builder,
-                                "nsl_zero3_elem_adamw_step",
-                                &[
-                                    theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v,
-                                    omb2_v, eps_v, wd_v, bc.0, bc.1,
-                                ],
-                            )?
+                            "nsl_zero3_elem_adamw_step"
                         };
+                        let rc = c.compile_call_by_name(builder, elem_callee, &step_args)?;
                         let z = builder.ins().iconst(cl_types::I64, 0);
                         let ok = builder.ins().icmp(IntCC::Equal, rc, z);
                         let msg =
@@ -13628,10 +13632,15 @@ impl Compiler<'_> {
                     // as the pre-forward belt; rc asserted for the same
                     // misattribution reason.
                     if needs_elem_mark {
+                        // Item 16x11: storage decision from the SAME plan
+                        // entry that drove the note above.
+                        let srv = builder
+                            .ins()
+                            .iconst(cl_types::I64, i64::from(needs_sr_note));
                         let mrc = self.compile_call_by_name(
                             builder,
                             "nsl_zero3_mark_elementwise",
-                            &[pw, iv],
+                            &[pw, iv, srv],
                         )?;
                         let mz = builder.ins().iconst(cl_types::I64, 0);
                         let mok = builder.ins().icmp(IntCC::Equal, mrc, mz);

@@ -356,8 +356,11 @@ mod tests {
             Observed::Sharded
         );
         // zero3 wins over srbf16, exactly as nsl_weight_stream_register does.
-        // (The composition matrix refuses this pair at the CLI; the tie-break
-        // is pinned anyway so the two chains cannot drift apart unnoticed.)
+        // Item 16×11 made this the PRODUCTION expectation, not a defensive
+        // tie-break: under composed `bf16-sr x --zero-elementwise` the zero-3
+        // table owns every streamed param (its slices ARE the bf16 storage),
+        // so a run whose verify demanded Bf16Sr here would abort every
+        // composed step. Do not "simplify" this arm away.
         assert_eq!(
             expected(PLAN_STREAMED | PLAN_BF16_SR | PLAN_SHARDED),
             Observed::Sharded

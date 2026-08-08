@@ -4342,47 +4342,11 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr(
     let m = unsafe { &*(m_ptr as *const NslTensor) };
     let v = unsafe { &*(v_ptr as *const NslTensor) };
     let mp = unsafe { &*(mp_ptr as *const NslTensor) };
-    let mut th_data = theta_dev;
-    let mut m_data = m.data as u64;
-    let mut v_data = v.data as u64;
-    let mut mp_data = mp.data as u64;
-    let mut n_val = n as u64;
-    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
-    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
-        (eps, neg_lr, neg_lr_wd, bc1, bc2);
-    let mut has_wd_val: u32 = u32::from(has_wd);
-    let (mut key_val, mut ctr_val) = (sr_key, sr_ctr_base);
-    let args = [
-        &mut th_data as *mut _ as *mut std::ffi::c_void,
-        &mut m_data as *mut _ as *mut std::ffi::c_void,
-        &mut v_data as *mut _ as *mut std::ffi::c_void,
-        &mut mp_data as *mut _ as *mut std::ffi::c_void,
-        &mut n_val as *mut _ as *mut std::ffi::c_void,
-        &mut b1 as *mut _ as *mut std::ffi::c_void,
-        &mut omb1 as *mut _ as *mut std::ffi::c_void,
-        &mut b2 as *mut _ as *mut std::ffi::c_void,
-        &mut omb2 as *mut _ as *mut std::ffi::c_void,
-        &mut eps as *mut _ as *mut std::ffi::c_void,
-        &mut neg_lr as *mut _ as *mut std::ffi::c_void,
-        &mut neg_lr_wd as *mut _ as *mut std::ffi::c_void,
-        &mut bc1 as *mut _ as *mut std::ffi::c_void,
-        &mut bc2 as *mut _ as *mut std::ffi::c_void,
-        &mut has_wd_val as *mut _ as *mut std::ffi::c_void,
-        &mut key_val as *mut _ as *mut std::ffi::c_void,
-        &mut ctr_val as *mut _ as *mut std::ffi::c_void,
-    ];
-    let block = 256i64;
-    let grid = ((n as i64) + block - 1) / block;
-    let result = inner::kernel_launch(
-        kernels::FASE_FUSED_ADAMW_STEP_BF16SR_PTX.as_ptr(),
-        b"nsl_fase_fused_adamw_step_bf16sr\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+    gpu_fase_fused_adamw_step_bf16sr_raw(
+        theta_dev, m.data as u64, v.data as u64, mp.data as u64, n,
+        b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2, has_wd,
+        sr_key, sr_ctr_base,
     );
-    assert_eq!(
-        result as u32, 0,
-        "GPU fase_fused_adamw_step_bf16sr kernel failed: {}", result as u32
-    );
-    inner::sync_after_kernel();
 }
 
 /// The raw-pointer launcher behind `gpu_fase_fused_adamw_step_bf16sr` —
@@ -9380,9 +9344,11 @@ mod dtype_guard_drift {
         (
             "gpu_fase_fused_adamw_step_bf16sr_raw",
             "bare u64 device pointers, no NslTensor and so no dtype to read; \
-             the sole caller (the composed elementwise-SR step in zero.rs) \
-             asserts th/m/v are f32 tensors before offsetting, and the bf16 \
-             slice it passes as theta was carved by a validated f32→bf16 cast",
+             both callers validate — the composed elementwise-SR step in \
+             zero.rs asserts th/m/v are f32 before offsetting (and its bf16 \
+             theta slice was carved by a validated f32→bf16 cast), and the \
+             gpu_fase_fused_adamw_step_bf16sr wrapper derefs m/v/mp whose f32 \
+             dtype sr_bf16.rs asserts before the call",
         ),
         (
             "gpu_scalar_mul_add_inplace_f32",
@@ -9431,11 +9397,6 @@ mod dtype_guard_drift {
         (
             "gpu_dequant_fp8_e4m3_f32",
             "raw device pointers only, as gpu_dequant_int8_per_head_f32",
-        ),
-        (
-            "gpu_fase_fused_adamw_step_bf16sr",
-            "the BF16 stochastic-rounding step: its parameter buffer is bf16 BY \
-             DESIGN and the kernel reads it as such",
         ),
         (
             "gpu_sr_bf16_round_probe",
