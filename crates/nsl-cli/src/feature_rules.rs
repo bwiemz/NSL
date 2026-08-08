@@ -702,6 +702,24 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         CALIB,
         "--fuse-wgrad-accum cannot be used when emitting a calibration binary",
     ),
+    // Flag x TRAIN-BLOCK ARGUMENT, not flag x flag — same shape as the
+    // `--muon-state-dtype` x "muon optimizer" entry above, and recorded with a
+    // non-flag `other` for the same reason: `RuleKind` has no direction for
+    // "flag needs a source construct", but the refusal still needs the
+    // deleted-refusal gate. `--fuse-wgrad-accum` can only fire through the
+    // FASE-Deferred `on_param_grad` hook, and `grad_accumulation` defaults to
+    // 1 (⇒ FASE Passthrough ⇒ no hook ⇒ zero chains fused AND no counter line,
+    // because the counter is gated on the same hook). It shipped silently
+    // inert on exactly that configuration; a typed flag now refuses. The
+    // `--pretrain-optimized` path only warns and is NOT this rule — a bundle
+    // that errors would break both shipped pretrain scripts.
+    src_rule(
+        "--fuse-wgrad-accum",
+        RuleKind::Requires,
+        "grad_accumulation >= 2 (train block)",
+        STMT,
+        "--fuse-wgrad-accum requires grad_accumulation >= 2 and a FASE-Deferred plan",
+    ),
     // ── Item 9 phase 2: `@fp8_compute` × source AD — added 2026-07-28 ──────
     // The decorator's only effect is routing matmuls to
     // `nsl_fp8_matmul_training` on the TAPE path (`expr/advanced.rs`); source

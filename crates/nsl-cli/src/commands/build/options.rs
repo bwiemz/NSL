@@ -159,6 +159,9 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
         source_ad: _source_ad,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
+        // Out-parameter: `expand_pretrain_optimized` raises it only when the
+        // BUNDLE turned the fusion on. Never true for a typed flag.
+        fuse_wgrad_accum_from_bundle: false,
         fuse_lm_head,
     };
     crate::meta_flags::expand_pretrain_optimized(
@@ -176,6 +179,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
         source_ad: _source_ad,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
+        fuse_wgrad_accum_from_bundle,
         fuse_lm_head,
     } = bundle;
 
@@ -479,6 +483,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 checkpoint_stride: crate::meta_flags::parse_checkpoint_stride(&checkpoint_stride),
                 fuse_rmsnorm_backward,
                 fuse_wgrad_accum,
+                fuse_wgrad_accum_from_bundle,
                 checkpoint_compress,
                 layerwise_accum,
                 weight_stream,

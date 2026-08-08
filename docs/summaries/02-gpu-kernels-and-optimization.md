@@ -110,6 +110,15 @@ weight-gradient accumulation (`--fuse-wgrad-accum`). Those are separate
 emitters reached from `stmt.rs` and `wengert_lower.rs`, not from a general
 fusion-graph framework.
 
+`--fuse-wgrad-accum` has exactly one reachable path: the FASE-**Deferred**
+`on_param_grad` hook, which requires `grad_accumulation >= 2` in the train
+block. Below that FASE is `Passthrough` for every optimizer, no hook exists,
+zero chains fuse — and until 2026-08-07 nothing said so, because the
+`[wgrad-fusion] N chain(s) fused` counter was gated on the same hook. A typed
+`--fuse-wgrad-accum` now refuses in that state; `--pretrain-optimized`, which
+sets the flag on programs that never asked, emits
+`[wgrad-fusion] declined: ...` and continues.
+
 ---
 
 ## Memory Planning (M36)

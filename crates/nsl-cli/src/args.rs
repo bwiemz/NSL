@@ -601,10 +601,15 @@ pub(crate) struct BuildArgs {
         /// The two fusions change the ARITHMETIC, not just the schedule — that
         /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
         /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
-        /// steps with an identical trend. `--training-reference` strips them
-        /// back out for a reference run, and `--fuse-wgrad-accum` is skipped
-        /// (with a note) when `--grad-integrity`, `--optim-state-offload` or
-        /// `--layerwise-accum` is set, since it refuses those.
+        /// steps with an identical trend — a number produced by
+        /// `--fuse-rmsnorm-backward` and the rest of the bundle, NOT by
+        /// `--fuse-wgrad-accum`, which needs `grad_accumulation >= 2` in the
+        /// train block and fused nothing in that run (codegen says so per
+        /// train block: `[wgrad-fusion] declined: ...`).
+        /// `--training-reference` strips them back out for a reference run,
+        /// and `--fuse-wgrad-accum` is skipped (with a note) when
+        /// `--grad-integrity`, `--optim-state-offload` or `--layerwise-accum`
+        /// is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 
@@ -1185,10 +1190,15 @@ pub(crate) struct RunArgs {
         /// The two fusions change the ARITHMETIC, not just the schedule — that
         /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
         /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
-        /// steps with an identical trend. `--training-reference` strips them
-        /// back out for a reference run, and `--fuse-wgrad-accum` is skipped
-        /// (with a note) when `--grad-integrity`, `--optim-state-offload` or
-        /// `--layerwise-accum` is set, since it refuses those.
+        /// steps with an identical trend — a number produced by
+        /// `--fuse-rmsnorm-backward` and the rest of the bundle, NOT by
+        /// `--fuse-wgrad-accum`, which needs `grad_accumulation >= 2` in the
+        /// train block and fused nothing in that run (codegen says so per
+        /// train block: `[wgrad-fusion] declined: ...`).
+        /// `--training-reference` strips them back out for a reference run,
+        /// and `--fuse-wgrad-accum` is skipped (with a note) when
+        /// `--grad-integrity`, `--optim-state-offload` or `--layerwise-accum`
+        /// is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 

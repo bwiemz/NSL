@@ -6012,6 +6012,76 @@ impl Compiler<'_> {
         }
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
+        // ── Item 7 (`--fuse-wgrad-accum`) admission ─────────────────────
+        // The fusion has exactly ONE way to fire: the FASE-Deferred
+        // `on_param_grad` hook. `wengert_lower` plans only when that hook is
+        // present, the sole `nsl_tensor_wgrad_accum` emission site sits inside
+        // it, and — the part that made this invisible — the
+        // `[wgrad-fusion] N chain(s) fused` counter is gated on it too. So a
+        // build with the flag on and no hook produced no count, no warning and
+        // no error: the user was told nothing at all.
+        //
+        // `grad_accumulation` defaults to 1 when the train block omits it, and
+        // `fase::plan` returns `Passthrough` unconditionally at accumulation 1
+        // for EVERY optimizer. That is the state `models/coder50m/pretrain.nsl`
+        // and `pretrain_cert.nsl` are in, and `--pretrain-optimized` sets the
+        // flag with no accumulation precondition — so the shipped pretraining
+        // configuration fused zero chains while reporting success.
+        //
+        // NOT fixed by making the fusion work at accumulation 1: there is no
+        // `m_partial` for the beta=1 GEMM to write into, so that needs a
+        // beta=0 dW-output variant and a non-hook lowering path. What is fixed
+        // here is the SILENCE.
+        let fase_hook_reachable = fase_deferred && self.features.source_ad_enabled;
+        if self.compile_options.fuse_wgrad_accum && !fase_hook_reachable {
+            let reason = if !self.features.source_ad_enabled {
+                "source-AD is off, so there is no compile-time adjoint tape to \
+                 fuse and no FASE accumulate hook to fold into"
+                    .to_string()
+            } else if grad_accumulation_steps <= 1 {
+                format!(
+                    "grad_accumulation is {grad_accumulation_steps} (the \
+                     default when the train block omits it), so FASE is \
+                     Passthrough and there is no m_partial for the beta=1 \
+                     GEMM to accumulate into"
+                )
+            } else {
+                format!(
+                    "optimizer `{optimizer_name}` resolved to FASE \
+                     {:?}, not Deferred — only a Deferred plan owns the \
+                     per-parameter accumulate this fusion folds into",
+                    fase_plan.mode
+                )
+            };
+            // The instrument. Emitted on BOTH provenances, because the whole
+            // defect was that the inert case said nothing; the refusal below
+            // is only reachable on one of them.
+            eprintln!("[wgrad-fusion] declined: {reason}");
+            if self.compile_options.fuse_wgrad_accum_from_bundle {
+                // Bundle provenance: WARN. `--pretrain-optimized` sets the flag
+                // on programs that never asked for it, so erroring here would
+                // break both shipped pretrain scripts and the benchmark matrix.
+                // Same wording as the bundle's other partial-disable notes.
+                eprintln!(
+                    "note: --pretrain-optimized bundle partially disabled: \
+                     --fuse-wgrad-accum fuses nothing on this train block \
+                     ({reason}); the rest of the bundle still applies"
+                );
+            } else {
+                // Explicit provenance: REFUSE. A flag the user typed that
+                // cannot do anything is the deferral-must-refuse case, and the
+                // two siblings gated on this same precondition
+                // (`--layerwise-accum` below, `--param-dtype bf16-sr`) both
+                // refuse loudly.
+                return Err(CodegenError::new(format!(
+                    "--fuse-wgrad-accum requires grad_accumulation >= 2 and a \
+                     FASE-Deferred plan: {reason}. Raise grad_accumulation, \
+                     switch to an Adam-family or SGD optimizer, or drop \
+                     --fuse-wgrad-accum"
+                )));
+            }
+        }
+
         // ── CSLA Stage-2 (`--layerwise-accum`) admission ────────────────
         // Window-buffered scheduling only composes with the exact set of
         // paths it was validated on; everything else refuses loudly (the

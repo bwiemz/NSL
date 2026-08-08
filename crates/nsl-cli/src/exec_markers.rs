@@ -284,8 +284,19 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     ),
     m(
         "[wgrad-fusion]",
-        &["crates/nsl-codegen/src/wengert_lower.rs"],
-        "item 7 reported how many weight-gradient chains the pre-pass fused",
+        &[
+            "crates/nsl-codegen/src/wengert_lower.rs",
+            // stmt.rs: the `declined:` note. Registered separately because the
+            // two lines are mutually exclusive by construction — the COUNT is
+            // gated on the FASE-Deferred hook, so a build without that hook
+            // emitted nothing at all and the feature was invisibly inert on
+            // exactly the shipped pretraining configuration. Pinning only
+            // wengert_lower.rs would let the decline be renamed silently.
+            "crates/nsl-codegen/src/stmt.rs",
+        ],
+        "item 7 reported what `--fuse-wgrad-accum` did: `N chain(s) fused` \
+         counts the chains the pre-pass collapsed, `declined:` names the \
+         precondition that kept the fusion from firing at all",
     ),
     m(
         "[ccr]",
@@ -480,6 +491,21 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         parts: &[(
             "[param-plan] param[",
             "crates/nsl-codegen/src/parameter_plan.rs",
+        )],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs",
+        asserts: "a build that DID fuse reported no decline — the two outcomes \
+                  share one token, so a run that both fused and declined would \
+                  mean the admission check and the lowerer disagree",
+        // The `declined:` suffix, not the bare token: the same token also
+        // carries the `N chain(s) fused` count, so pinning `[wgrad-fusion]`
+        // alone would stay green if the decline were renamed — and the decline
+        // is the whole point, because without it a non-fusing build printed
+        // NOTHING (the count is gated on the same FASE hook the fusion needs).
+        parts: &[(
+            "[wgrad-fusion] declined:",
+            "crates/nsl-codegen/src/stmt.rs",
         )],
     },
     NegativeNeedle {

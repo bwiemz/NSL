@@ -11,7 +11,15 @@
 //! they are opt-in everywhere else. They belong here because this bundle IS the
 //! "I want pretraining throughput" request: measured +14% tok/s on Coder-50M at
 //! a max relative loss divergence of 1.2e-5 over 24 micro-batches, identical
-//! trend. `--training-reference` strips both back out. Because the bundle sets
+//! trend.
+//!
+//! That +14% is NOT "both fusions" (corrected 2026-08-07). `--fuse-wgrad-accum`
+//! fires only through the FASE-*Deferred* `on_param_grad` hook, which needs
+//! `grad_accumulation >= 2` in the train block; the measured run declared none,
+//! so the wgrad half fused zero chains and the number belongs to
+//! `--fuse-rmsnorm-backward` and the rest of the bundle. Codegen now emits
+//! `[wgrad-fusion] declined: ...` per train block rather than leaving that
+//! invisible. `--training-reference` strips both back out. Because the bundle sets
 //! them AFTER clap has finished validating, clap can no longer enforce
 //! `--fuse-wgrad-accum`'s conflicts — [`WgradFusionBlockers`] is what replaces
 //! that enforcement, with a matching hard error in `stmt.rs` as the backstop.
@@ -134,6 +142,11 @@ pub(crate) struct PretrainBundle {
     pub(crate) source_ad: bool,
     pub(crate) fuse_rmsnorm_backward: bool,
     pub(crate) fuse_wgrad_accum: bool,
+    /// OUT-parameter, always built as `false`: set here when the bundle — not
+    /// the user — turned `fuse_wgrad_accum` on. Codegen refuses a flag the
+    /// user typed that cannot fire, and only warns for one the bundle filled
+    /// in; see `CompileOptions::fuse_wgrad_accum_from_bundle`.
+    pub(crate) fuse_wgrad_accum_from_bundle: bool,
     pub(crate) fuse_lm_head: Option<String>,
 }
 
@@ -151,6 +164,7 @@ pub(crate) fn expand_pretrain_optimized(
         source_ad,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
+        fuse_wgrad_accum_from_bundle,
         fuse_lm_head,
     } = b;
     *source_ad = true;
@@ -179,16 +193,35 @@ pub(crate) fn expand_pretrain_optimized(
     // the ARITHMETIC, not just the schedule — but "pretraining, optimized" is
     // exactly the context where that trade is intended, `--training-reference`
     // strips them back out for a reference run, and an explicit flag still
-    // wins. Measured on Coder-50M (batch 4, seq 1024, RTX PRO 4500):
-    // 32,925 -> 36,662 tok/s, max relative loss divergence 1.2e-5 over 24
-    // steps with an identical trend.
+    // wins.
+    //
+    // ATTRIBUTION, corrected 2026-08-07. The measurement is real: Coder-50M
+    // (batch 4, seq 1024, RTX PRO 4500), 32,925 -> 36,662 tok/s, max relative
+    // loss divergence 1.2e-5 over 24 steps with an identical trend. It was
+    // credited to "both backward fusions". It was not: that run — like both
+    // shipped pretrain scripts and `models/benchmarks/matrix_bench.py`'s
+    // `optimized` arm — declares no `grad_accumulation`, so FASE is
+    // Passthrough, the `on_param_grad` hook never exists, and
+    // `--fuse-wgrad-accum` fused ZERO chains. The number belongs to
+    // `--fuse-rmsnorm-backward` (plus whatever else the bundle turns on); the
+    // wgrad half contributed nothing to it and cannot until a train block
+    // declares `grad_accumulation >= 2`. Codegen now says so out loud per
+    // train block (`[wgrad-fusion] declined:` in stmt.rs) rather than leaving
+    // this comment as the only record.
     //
     // Neither is filled destructively: they are already `false` unless the user
     // asked for them, so setting them here cannot override an explicit choice
     // (there is no `--no-fuse-*` to lose).
     *fuse_rmsnorm_backward = true;
     match blockers.first() {
-        None => *fuse_wgrad_accum = true,
+        None => {
+            // Read the clap value BEFORE overwriting it: `--pretrain-optimized
+            // --fuse-wgrad-accum` is an explicit request and must keep the
+            // hard refusal when the fusion cannot fire, while a bundle-filled
+            // flag only warns (it lands on programs that never asked).
+            *fuse_wgrad_accum_from_bundle = !*fuse_wgrad_accum;
+            *fuse_wgrad_accum = true;
+        }
         Some(flag) => eprintln!(
             "note: --pretrain-optimized bundle partially disabled: \
              --fuse-wgrad-accum not enabled because {flag} is set ({flag} needs \
@@ -396,6 +429,7 @@ mod tests {
             source_ad: false,
             fuse_rmsnorm_backward: false,
             fuse_wgrad_accum: false,
+            fuse_wgrad_accum_from_bundle: false,
             fuse_lm_head: lm.map(str::to_string),
         };
         expand_pretrain_optimized(on, &mut b, &blockers);
@@ -407,6 +441,51 @@ mod tests {
             b.fuse_wgrad_accum,
             b.fuse_lm_head,
         )
+    }
+
+    /// `(fuse_wgrad_accum, fuse_wgrad_accum_from_bundle)` for a given starting
+    /// value of the clap flag. The provenance bit is what decides whether an
+    /// inert fusion refuses (typed) or warns (bundle-filled), so both
+    /// directions are pinned here rather than only end-to-end.
+    fn wgrad_provenance(on: bool, explicit: bool, blockers: WgradFusionBlockers) -> (bool, bool) {
+        let mut b = PretrainBundle {
+            wggo: None,
+            csha: None,
+            source_ad: false,
+            fuse_rmsnorm_backward: false,
+            fuse_wgrad_accum: explicit,
+            fuse_wgrad_accum_from_bundle: false,
+            fuse_lm_head: None,
+        };
+        expand_pretrain_optimized(on, &mut b, &blockers);
+        (b.fuse_wgrad_accum, b.fuse_wgrad_accum_from_bundle)
+    }
+
+    #[test]
+    fn the_bundle_marks_its_own_wgrad_provenance() {
+        // Bundle filled it in: the program never asked, so an inert fusion is
+        // a warning.
+        assert_eq!(wgrad_provenance(true, false, clear()), (true, true));
+        // The user typed `--fuse-wgrad-accum` too: an inert fusion is a hard
+        // refusal, so the bundle must NOT launder the provenance.
+        assert_eq!(wgrad_provenance(true, true, clear()), (true, false));
+        // No bundle at all.
+        assert_eq!(wgrad_provenance(false, true, clear()), (true, false));
+        assert_eq!(wgrad_provenance(false, false, clear()), (false, false));
+        // A blocker suppresses the bundle's fill entirely — nothing is turned
+        // on, so nothing can claim bundle provenance.
+        assert_eq!(
+            wgrad_provenance(
+                true,
+                false,
+                WgradFusionBlockers {
+                    grad_integrity: true,
+                    optim_state_offload: false,
+                    layerwise_accum: false,
+                }
+            ),
+            (false, false)
+        );
     }
 
     #[test]

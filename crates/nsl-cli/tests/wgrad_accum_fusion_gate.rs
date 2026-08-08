@@ -152,6 +152,16 @@ fn run(fixture: &Path, cuda: bool, extra: &[&str]) -> Run {
     }
 }
 
+/// The loud decline. Emitted whenever `--fuse-wgrad-accum` is on and the
+/// FASE-Deferred `on_param_grad` hook — the fusion's ONLY lowering path — is
+/// absent. Before it existed such a build printed nothing at all: no count (the
+/// `N chain(s) fused` line is gated on the same hook), no warning, no error.
+///
+/// A distinct suffix on the same token as the count, deliberately: the two are
+/// mutually exclusive outcomes of one flag, and `fused_chains` below must keep
+/// returning `None` for a decline rather than parsing it as a zero count.
+const DECLINED: &str = "[wgrad-fusion] declined:";
+
 /// Total chains fused, summed over every adjoint lowering in the compile.
 /// `None` when the flag was off (the line is only emitted when it is on).
 fn fused_chains(stderr: &str) -> Option<u64> {
@@ -292,6 +302,15 @@ fn ccr_frees(stderr: &str) -> Option<u64> {
 ///
 /// Pinned by COUNT EQUALITY rather than an absolute number, so the arm
 /// survives any change in how many frees the fixture warrants.
+///
+/// The flag-on arm goes through `--pretrain-optimized`, NOT an explicit
+/// `--fuse-wgrad-accum`: a typed flag on a build that cannot fuse is now a
+/// hard refusal (see `an_explicitly_typed_flag_refuses_where_the_bundle_only_warns`),
+/// so the bundle is the only remaining way to reach flag-on-without-hook —
+/// and the bundle is exactly where the defect was found. The
+/// `[wgrad-fusion] declined:` assertion below is what keeps that honest: if a
+/// future edit stops the bundle from setting the flag, this arm would silently
+/// become a comparison of two identical builds.
 #[test]
 fn a_non_fusing_build_keeps_every_ccr_free_marker() {
     let src = ccr_fixture_src()
@@ -315,9 +334,21 @@ fn a_non_fusing_build_keeps_every_ccr_free_marker() {
 
     let off = run(&p, false, &["--checkpoint-blocks"]);
     assert!(off.ok, "flag-off run failed:\n{}", off.stderr);
-    let on = run(&p, false, &["--fuse-wgrad-accum", "--checkpoint-blocks"]);
+    let on = run(&p, false, &["--pretrain-optimized", "--checkpoint-blocks"]);
     assert!(on.ok, "flag-on run failed:\n{}", on.stderr);
 
+    // ANTI-VACUITY: the bundle really did turn the fusion on, and it really
+    // could not fire. Both halves matter — a bundle that stopped setting the
+    // flag, or a train block that started reaching the hook, would each make
+    // the free-count equality below a tautology.
+    assert!(
+        on.stderr.contains(DECLINED),
+        "the bundle arm shows no `{DECLINED}` line, so either \
+         --pretrain-optimized no longer sets --fuse-wgrad-accum or this \
+         fixture now reaches the FASE hook; either way the comparison below \
+         no longer tests anything:\n{}",
+        on.stderr
+    );
     // Premise: this configuration really does not fuse. If it ever starts
     // to, the equality below stops being the property under test.
     assert_eq!(
@@ -437,6 +468,205 @@ fn checkpoint_blocks_does_not_disable_the_fusion() {
          path falls back to the exact decomposed chain — a codegen defect"
     );
     assert_eq!(on_w2, off_w2, "trailing parse block differs (see above)");
+}
+
+// ─────────── The silent-inertness pair: accum >= 2 vs accum == 1 ───────────
+
+/// `grad_accumulation` is the whole difference between a fusion that fires and
+/// one that cannot, and until now the second case said NOTHING.
+///
+/// `--fuse-wgrad-accum` has exactly one lowering path: the FASE-Deferred
+/// `on_param_grad` hook. `fase::plan` returns `Passthrough` unconditionally at
+/// `accumulation == 1`, and a train block that omits `grad_accumulation`
+/// defaults to 1 — so the hook never exists, `wgrad_fusion::plan` is never
+/// called, the sole `nsl_tensor_wgrad_accum` emission site is unreachable, and
+/// the `[wgrad-fusion] N chain(s) fused` counter (the anti-vacuity instrument
+/// for every other arm in this file) is ITSELF gated on the hook. Measured on
+/// the unmodified branch: `nsl run --source-ad --fuse-wgrad-accum` on the
+/// accum-1 form of this fixture exited 0 with not one `wgrad` line on stderr.
+///
+/// The two arms are the SAME fixture differing ONLY in `grad_accumulation`, so
+/// neither can pass for the wrong reason: whatever makes one green is exactly
+/// what makes the other red.
+#[test]
+fn removing_grad_accumulation_turns_the_fusion_from_firing_into_a_refusal() {
+    let fusing = ccr_fixture_src();
+    let inert = fusing.replace(
+        "train(model=m, epochs=8, grad_accumulation=4):",
+        "train(model=m, epochs=8):",
+    );
+    assert!(
+        fusing.contains("grad_accumulation=4") && !inert.contains("grad_accumulation"),
+        "the fixture rewrite matched nothing — the two arms would be identical"
+    );
+
+    // ARM 1 — the POSITIVE control. Three trainable weights (two block
+    // weights + the head) ⇒ three chains. If the decline path ever swallowed
+    // the working configuration this goes red first.
+    let p_fusing = std::env::temp_dir().join("nsl_wgrad_accum_gate_accum4.nsl");
+    std::fs::write(&p_fusing, &fusing).expect("write fixture");
+    let ok = run(&p_fusing, false, &["--fuse-wgrad-accum"]);
+    assert!(ok.ok, "the accum=4 arm must still build:\n{}", ok.stderr);
+    let fired = fused_chains(&ok.stderr).unwrap_or(0);
+    assert!(
+        fired >= 3,
+        "expected >= 3 fused chains at grad_accumulation=4, got {fired} — the \
+         decline path broke the working case\nstderr:\n{}",
+        ok.stderr
+    );
+    assert!(
+        !ok.stderr.contains(DECLINED),
+        "a build that FUSED must not also report a decline:\n{}",
+        ok.stderr
+    );
+
+    // ARM 2 — RED ON REVERT. Same fixture, `grad_accumulation` gone, flag
+    // typed explicitly. On the unmodified branch this exits 0 in silence.
+    let p_inert = std::env::temp_dir().join("nsl_wgrad_accum_gate_accum1.nsl");
+    std::fs::write(&p_inert, &inert).expect("write fixture");
+    let refused = run(&p_inert, false, &["--fuse-wgrad-accum"]);
+    assert!(
+        !refused.ok,
+        "an explicit --fuse-wgrad-accum on a train block with no \
+         grad_accumulation must REFUSE — it can fuse nothing, and a flag that \
+         silently does nothing is the exact defect this gate exists for.\n\
+         stderr:\n{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("grad_accumulation"),
+        "the refusal must name grad_accumulation — that is the one thing the \
+         user has to change:\n{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains(DECLINED),
+        "the refusal must be preceded by the `{DECLINED}` note, which is the \
+         line the bundle path relies on:\n{}",
+        refused.stderr
+    );
+    assert_eq!(
+        fused_chains(&refused.stderr),
+        None,
+        "the decline note must not parse as a chain count — `fused_chains` is \
+         what every other arm's non-vacuity check reads:\n{}",
+        refused.stderr
+    );
+}
+
+/// The shipped pretraining script, in the exact state it ships in.
+///
+/// `models/coder50m/pretrain_cert.nsl` declares `train(model=m, epochs=1,
+/// grad_clip=1.0)` — no `grad_accumulation` — and `--pretrain-optimized` turns
+/// `--fuse-wgrad-accum` on with no accumulation precondition. So the flagship
+/// "optimized pretraining" configuration fused ZERO chains and said nothing
+/// about it, which is how a +11% tok/s measurement came to be credited to
+/// "both backward fusions" when only one of them ran.
+///
+/// Two properties, and the pairing is the point:
+///
+/// * the decline NOTE is present — the inertness is now on the record; and
+/// * the exit code is ZERO — the bundle warns rather than refusing, because
+///   erroring would break both shipped scripts and the benchmark matrix.
+///
+/// The day someone adds `grad_accumulation` to this script the first assertion
+/// goes red, which is the correct outcome: the pin exists to be re-examined,
+/// not to freeze the script.
+#[test]
+fn the_shipped_pretraining_script_declines_the_wgrad_fusion_without_failing() {
+    let dir = repo_root().join("models").join("coder50m");
+    let tmp = tempfile::TempDir::new().unwrap();
+    // `-o` into a temp dir: `nsl build` with no `-o` derives its output path
+    // from the SOURCE stem, which drops a multi-MB object into the repo.
+    let out = tmp.path().join("pretrain_cert.o");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--manifest-path"])
+        .arg(repo_root().join("Cargo.toml"))
+        .args(["--", "build", "pretrain_cert.nsl", "--pretrain-optimized", "--emit-obj", "-o"])
+        .arg(&out)
+        .current_dir(&dir)
+        .env("NSL_STDLIB_PATH", repo_root().join("stdlib"))
+        .output()
+        .expect("spawn nsl build");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(
+        output.status.success(),
+        "the BUNDLE must not turn a shipped script into a build failure:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(DECLINED),
+        "models/coder50m/pretrain_cert.nsl under --pretrain-optimized reports \
+         no `{DECLINED}` line. Either the fusion now fires here (add \
+         grad_accumulation to this assertion's reasoning and pin the chain \
+         count instead) or the decline went silent again:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("bundle partially disabled"),
+        "the decline must be phrased as a bundle partial-disable, matching the \
+         bundle's other notes:\n{stderr}"
+    );
+    assert_eq!(
+        fused_chains(&stderr),
+        None,
+        "this pin asserts the shipped script is INERT; it fused something:\n{stderr}"
+    );
+}
+
+/// EXPLICIT vs BUNDLE, on ONE program. This is what stops a later edit from
+/// collapsing the two paths into whichever is easier.
+///
+/// Same source file, same precondition failure, opposite outcomes: typed →
+/// non-zero exit, bundle-filled → zero. Adding `--fuse-wgrad-accum` to a
+/// `--pretrain-optimized` invocation must flip it, because
+/// `expand_pretrain_optimized` reads the clap value before overwriting it.
+#[test]
+fn an_explicitly_typed_flag_refuses_where_the_bundle_only_warns() {
+    let dir = repo_root().join("models").join("coder50m");
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let build = |extra: &[&str], stem: &str| {
+        let out = tmp.path().join(format!("{stem}.o"));
+        let output = Command::new(env!("CARGO"))
+            .args(["run", "-q", "-p", "nsl-cli", "--manifest-path"])
+            .arg(repo_root().join("Cargo.toml"))
+            .args(["--", "build", "pretrain_cert.nsl", "--pretrain-optimized"])
+            .args(extra)
+            .args(["--emit-obj", "-o"])
+            .arg(&out)
+            .current_dir(&dir)
+            .env("NSL_STDLIB_PATH", repo_root().join("stdlib"))
+            .output()
+            .expect("spawn nsl build");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    let (bundle_ok, bundle_err) = build(&[], "bundle");
+    let (typed_ok, typed_err) = build(&["--fuse-wgrad-accum"], "typed");
+
+    assert!(
+        bundle_ok,
+        "bundle-only must succeed (it is what the shipped scripts run):\n{bundle_err}"
+    );
+    assert!(
+        !typed_ok,
+        "`--pretrain-optimized --fuse-wgrad-accum` must REFUSE: the user typed \
+         the flag, and it cannot fuse anything on this train block. If this \
+         passes, the bundle laundered the provenance and every explicit \
+         --fuse-wgrad-accum is now a silent no-op again:\n{typed_err}"
+    );
+    // Both arms must have reached the same decline — otherwise the exit-code
+    // difference could come from some unrelated failure.
+    for (label, err) in [("bundle", &bundle_err), ("typed", &typed_err)] {
+        assert!(
+            err.contains(DECLINED),
+            "{label} arm never reached the decline, so the exit-code contrast \
+             above proves nothing:\n{err}"
+        );
+    }
 }
 
 #[test]

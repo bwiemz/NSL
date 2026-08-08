@@ -1393,6 +1393,24 @@ pub struct CompileOptions {
     /// (host-resident `m_partial`, which the device GEMM cannot write).
     /// See [`crate::wgrad_fusion`].
     pub fuse_wgrad_accum: bool,
+    /// PROVENANCE of `fuse_wgrad_accum`: `true` when `--pretrain-optimized`
+    /// turned it on rather than the user typing `--fuse-wgrad-accum`.
+    ///
+    /// The two have to behave differently when the fusion cannot fire. The
+    /// flag has exactly ONE lowering path — the FASE-*Deferred*
+    /// `on_param_grad` hook — and `grad_accumulation` defaults to 1, at which
+    /// point `fase::plan` returns `Passthrough` for every optimizer. An
+    /// explicitly typed flag must then REFUSE (the repo's deferral-must-refuse
+    /// doctrine; `--layerwise-accum` and `--param-dtype bf16-sr` both refuse on
+    /// this identical precondition). The bundle must only WARN, because it sets
+    /// the flag unconditionally on programs that never asked for it — including
+    /// `models/coder50m/pretrain{,_cert}.nsl`, which declare no
+    /// `grad_accumulation` at all and would stop building.
+    ///
+    /// `--pretrain-optimized --fuse-wgrad-accum` is EXPLICIT, not bundle:
+    /// `expand_pretrain_optimized` reads the clap value before overwriting it,
+    /// so a user who typed the flag still gets the refusal.
+    pub fuse_wgrad_accum_from_bundle: bool,
     /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
     /// Selective policy's saved matmul-class interiors to half precision
     /// between forward and backward (cast-on-save, dequant-on-load via the
@@ -1582,6 +1600,7 @@ impl Default for CompileOptions {
             checkpoint_stride: CheckpointStride::default(),
             fuse_rmsnorm_backward: false,
             fuse_wgrad_accum: false,
+            fuse_wgrad_accum_from_bundle: false,
             checkpoint_compress: None,
             layerwise_accum: false,
             weight_stream: false,

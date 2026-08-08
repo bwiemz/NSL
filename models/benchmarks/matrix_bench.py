@@ -145,9 +145,23 @@ ARMS = {
     for a in [
         Arm("reference", ("--source-ad", "--training-reference"),
             what="composite everything — the independent baseline"),
+        # accum STAYS 1 deliberately. Raising it to 2 would make the wgrad
+        # fusion live, but it would also move this arm off the (accum=1,
+        # grad_clip=True) group the loss-comparability check below keys on —
+        # `optimized` would stop being comparable to `reference`/`fp32`/`bf16`,
+        # which is the comparison this matrix exists for. The honest fix is to
+        # say what the arm actually measures.
         Arm("optimized", ("--pretrain-optimized",),
-            what="the shipped bundle: source-AD, WGGO greedy, CSHA auto, both "
-                 "backward fusions, and the inferred fused LM head"),
+            what="the shipped bundle: source-AD, WGGO greedy, CSHA auto, "
+                 "--fuse-rmsnorm-backward, and the inferred fused LM head. "
+                 "NOTE: the bundle also sets --fuse-wgrad-accum, but that "
+                 "fusion is INERT here — it fires only through the "
+                 "FASE-Deferred on_param_grad hook, which needs "
+                 "grad_accumulation >= 2, and this arm runs at 1. The build "
+                 "stderr carries a `[wgrad-fusion] declined:` line saying so. "
+                 "Any tok/s delta this arm shows over `reference` therefore "
+                 "belongs to the OTHER bundle members, not to the weight-"
+                 "gradient fusion"),
         Arm("layerwise",
             ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
              "--weight-stream"),
