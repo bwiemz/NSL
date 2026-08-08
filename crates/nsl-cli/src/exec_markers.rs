@@ -514,4 +514,18 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         asserts: "the multi-tensor FASE step did NOT fire with the flag off",
         parts: &[("[fase-multi]", "crates/nsl-runtime/src/fase_step.rs")],
     },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/cuda_graph_gate.rs",
+        asserts: "the NSL_ASYNC_ALLOC=1 refusal disabled capture — no summary \
+                  banner was printed, i.e. capture never ran",
+        // The `regions=` suffix, not the bare `[cuda-graph]` token: the same
+        // test asserts POSITIVELY on `[cuda-graph] disabled:`, so a
+        // bare-token needle would stay satisfied by that line alone even if
+        // the summary banner were renamed — exactly the rot this gate exists
+        // to catch. One emitting site: the end-of-run report.
+        parts: &[(
+            "[cuda-graph] regions=",
+            "crates/nsl-runtime/src/cuda/graph_capture.rs",
+        )],
+    },
 ];

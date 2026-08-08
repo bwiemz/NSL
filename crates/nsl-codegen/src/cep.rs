@@ -996,9 +996,29 @@ mod tests {
             granularity: Granularity::Head,
             roofline_slack: RooflineSlackTable::default(),
         };
+        // Strip the MEASURED wall-clock lines: they depend on the clock, not
+        // on the plan, and this test is about the plan. `render_report` prints
+        // "Search time: {:.2} seconds" (Prune/Joint) or "Compilation time:
+        // {:.2} seconds" (Search) — `{:.2}` on SECONDS quantizes to 10 ms, so
+        // a >= 5 ms scheduler stall inside either call flips one to "0.01"
+        // and this assertion fails on a plan that is in fact identical. The
+        // sibling WGGO determinism test strips its "Solve time" line for the
+        // same reason.
+        //
+        // Only "Search time:" is reachable from `run_prune` today (the two
+        // are mutually exclusive branches), but the identical hazard sits one
+        // branch over, so both are stripped rather than leaving it armed for
+        // whoever next changes report formatting.
+        let strip = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.starts_with("Search time:"))
+                .filter(|l| !l.starts_with("Compilation time:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let r1 = run_prune(input()).render_report();
         let r2 = run_prune(input()).render_report();
-        assert_eq!(r1, r2);
+        assert_eq!(strip(&r1), strip(&r2));
     }
 
     #[test]
