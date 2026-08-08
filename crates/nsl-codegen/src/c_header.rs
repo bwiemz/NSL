@@ -238,31 +238,51 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str("    int64_t* shape;\n");
     out.push_str("    int64_t* strides;     /* NULL = contiguous */\n");
     out.push_str("    int32_t  ndim;\n");
-    out.push_str("    int32_t  dtype;       /* canonical NSL tags: 0=f64, 1=f32, 2=f16, 3=bf16, 4=i8, 9=i32 */\n");
+    // The full accepted set, not a subset. `capi_dtype_to_nsl` aborts the
+    // process outside 0..=9, so a host reading this comment as the menu would
+    // have believed 5..=8 were invalid.
+    out.push_str("    int32_t  dtype;       /* canonical NSL tags: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8,\n");
+    out.push_str("                           * 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32 */\n");
     out.push_str("    int32_t  device_type; /* 0=CPU, 1=CUDA */\n");
     out.push_str("    int32_t  device_id;\n");
     out.push_str("    int64_t  tape_id;     /* autodiff identity (0 = untracked) */\n");
     out.push_str("} NslTensorDesc;\n\n");
 
+    // Every count and every status here is 64-bit, because that is what the
+    // emitted code and the runtime actually use: `build_dispatch_wrapper_
+    // signature` emits five I64 params returning I64, and `ExportFnPtr` in
+    // `nsl-runtime/src/c_api/exports.rs` spells the same thing in Rust. This
+    // typedef declared `int32_t` for the return and both counts until the
+    // agreement gate below caught it — a host calling through it passed counts
+    // whose upper halves the callee reads as caller-undefined garbage.
     out.push_str(
         "/* Function-pointer type for the runtime-dispatched export ABI.\n\
          * Matches the signature of `nsl_model_call` minus the name pointer. */\n",
     );
     out.push_str(
-        "typedef int32_t (*NslExportFn)(\n    \
+        "typedef int64_t (*NslExportFn)(\n    \
               NslModel* model,\n    \
-              const NslTensorDesc* inputs, int32_t n_inputs,\n    \
-              NslTensorDesc* outputs, int32_t n_outputs\n\
+              const NslTensorDesc* inputs, int64_t n_inputs,\n    \
+              NslTensorDesc* outputs, int64_t n_outputs\n\
           );\n\n",
     );
 
     out.push_str("/* Lifecycle (provided by libnsl_runtime) */\n");
     out.push_str("int64_t   nsl_abi_version(void); /* (major<<16)|minor; cf. NSL_ABI_VERSION */\n");
     out.push_str("NslModel* nsl_model_create(const char* weights_path);\n");
-    out.push_str("void      nsl_model_destroy(NslModel* model);\n");
+    out.push_str("int64_t   nsl_model_destroy(NslModel* model); /* returns 0 */\n");
     out.push_str("int64_t   nsl_model_call(NslModel* model, const char* name,\n");
     out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
     out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs);\n\n");
+
+    // The error contract in docs/abi/README.md tells hosts that detail is
+    // "retrievable via nsl_get_last_error(); clear with nsl_clear_error()" —
+    // so a host following the documented contract needs these declared. They
+    // were not, which left C callers to write their own extern declarations
+    // for two functions this header exists to describe.
+    out.push_str("/* Errors — thread-local; see the error contract in docs/abi/README.md */\n");
+    out.push_str("const char* nsl_get_last_error(void); /* \"\" when no error is set */\n");
+    out.push_str("int64_t     nsl_clear_error(void);\n\n");
 
     out.push_str("/* @export functions */\n");
     for info in exports {

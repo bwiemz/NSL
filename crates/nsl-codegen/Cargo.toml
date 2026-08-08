@@ -69,6 +69,12 @@ experimental-wrga = []
 experimental-cpdt = []
 
 [dev-dependencies]
+# Test-only: `c_header_agreement` reuses the ABI crate's type lowering and
+# extern parser to check the generated header against the runtime. nsl-abi is
+# deliberately dependency-free, so this costs the build graph nothing, and it
+# stays a dev-dependency so the validator cannot become a compile-time
+# dependency of the compiler it validates.
+nsl-abi = { path = "../nsl-abi" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
 libloading = "0.8"

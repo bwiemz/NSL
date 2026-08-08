@@ -48,6 +48,28 @@ on either the Rust or the generated-header side is caught:
 
 If either test fails, you are making a **major** ABI change.
 
+**Correcting a wrong prototype is not a bump.** The generated header is a
+*description* of the runtime ABI; when the two disagree, the runtime is right
+by definition and the header is a bug. Fixing it does not change what any
+symbol accepts or returns, so it is neither major nor minor:
+
+- a **major** bump would tell every correct host to refuse to run against an
+  unchanged runtime;
+- a **minor** bump communicates nothing to the host that actually has a
+  problem, because the compatibility rule reads a *stale* header's macros as
+  older-and-therefore-safe.
+
+The version mechanism cannot signal "the header you compiled against was
+wrong"; only regenerating the header can. Say so in the changelog and leave
+the version alone. This is the recorded precedent: the `NslExportFn` typedef
+declared its return and both counts as `int32_t` against a runtime that has
+always taken and returned `int64_t`, and `nsl_model_destroy` was declared
+`void` against `-> i64`. No correct program could have depended on either —
+a host calling through that typedef was already passing counts whose upper
+halves the callee reads as caller-undefined. `nsl-codegen/tests/c_header_
+agreement.rs` now machine-checks the header against the runtime externs so
+this class cannot recur silently.
+
 ## Internal codegen ↔ runtime signature agreement
 
 Distinct from the host-facing contract above: the codegen emits calls to the
