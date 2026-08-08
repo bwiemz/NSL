@@ -86,18 +86,39 @@ pub struct NslTensorDesc {
 // greppable chokepoint — and so an unknown tag fails loudly here instead of
 // the historical silent fall-back-to-f64, which mislabeled every unmapped
 // dtype (e.g. the old C-API int64/uint8 slots) as f64.
+//
+// The two directions fail DIFFERENTLY, on purpose:
+//
+//   * `capi_dtype_to_nsl` reads a HOST-CONTROLLED tag off an `NslTensorDesc`
+//     that arrived through the exported `nsl_desc_to_tensor`. Bad input from
+//     across an FFI boundary is an error to report, not a reason to kill the
+//     embedding process, so it returns `Option` and its callers refuse. Do
+//     not reintroduce the `abort()` it used to have.
+//   * `nsl_dtype_to_capi` reads an INTERNAL tag. Its abort branch is
+//     structurally dead — `tensor/mod.rs` assigns 0..=9 and DTYPE_CUSTOM_START
+//     is 256, so no tag in 10..=255 exists — and is kept only as a trip-wire
+//     for a future tag added outside that range. Nothing gates it, because
+//     nothing can reach it.
+
+/// Human-readable list of the canonical dtype tags, shared by every
+/// refusal message that reports an out-of-range tag.
+pub(crate) const CAPI_DTYPE_TAGS: &str = "0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, \
+     5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32";
 
 /// Validate a C API dtype tag and return it as the canonical internal tag.
-pub fn capi_dtype_to_nsl(capi_dtype: i32) -> u16 {
+///
+/// Returns `None` for a tag outside `0..=9`. This input is HOST-CONTROLLED —
+/// it arrives on an `NslTensorDesc` handed to the exported `nsl_desc_to_tensor`
+/// — so it must not be able to take the process down. Until this returned
+/// `Option` it called `std::process::abort()`, which killed the embedding
+/// process (a Python interpreter, under the nslpy bridge) on a mislabeled
+/// desc. `nsl_dispatch_apply_result` treats the identical input as a plain
+/// `-1` + `set_error` eighty lines below; this now mirrors it.
+pub fn capi_dtype_to_nsl(capi_dtype: i32) -> Option<u16> {
     if !(0..=9).contains(&capi_dtype) {
-        eprintln!(
-            "nsl: C API dtype tag {capi_dtype} is not a canonical NSL dtype \
-             (valid: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, 5=fp8e4m3, \
-             6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32)"
-        );
-        std::process::abort();
+        return None;
     }
-    capi_dtype as u16
+    Some(capi_dtype as u16)
 }
 
 /// Validate a canonical internal dtype tag for export through the C API.
@@ -168,6 +189,23 @@ fn set_error(msg: String) {
     let cleaned: String = msg.chars().filter(|c| *c != '\0').collect();
     let cstr = std::ffi::CString::new(cleaned).expect("CString::new after \\0 strip");
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(cstr));
+}
+
+/// The thread-local error text, or `""` if none is set. Lets a caller that
+/// wants to ADD context to a callee's refusal read it first instead of
+/// clobbering it.
+///
+/// Note this reads THIS image's thread-local. A `.so` produced by
+/// `nsl build --shared-lib` statically links its own copy of the runtime, so a
+/// refusal raised inside the emitted wrapper is not visible here — see the
+/// module docs of `tests/dlpack_unsupported_dtype_refusal.rs`.
+fn last_error_text() -> String {
+    LAST_ERROR.with(|e| {
+        e.borrow()
+            .as_ref()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
 }
 
 /// Spec B §5.2/§5.5 helper: set the thread-local error from an already-
@@ -563,6 +601,17 @@ pub extern "C" fn nsl_model_call(
 /// DLPack variant of `nsl_model_call`. Bridges `DLManagedTensor*`-ABI
 /// inputs and outputs to the `NslTensorDesc*`-ABI export entry-point
 /// and reuses the same dispatcher.
+///
+/// **Known gap — the output path is unimplemented.** This function builds its
+/// output descs with [`NslTensorDesc::default()`], so `dst.data` is null and
+/// `nsl_dispatch_apply_result` refuses the null caller buffer. It therefore
+/// **cannot return 0 for a tensor-returning export**; every such call comes
+/// back `-1`. Fixing it needs an output-allocation strategy the C ABI does not
+/// have today. Until then, use [`nsl_model_call`] with preallocated
+/// `NslTensorDesc` outputs — the note appended to the error below says the same
+/// thing to the host, because the underlying refusal ("null data pointer
+/// (caller buffer or impl result)") otherwise blames a buffer this ABI gives
+/// the caller no way to supply.
 #[no_mangle]
 pub extern "C" fn nsl_model_call_dlpack(
     model_ptr: i64,
@@ -577,20 +626,71 @@ pub extern "C" fn nsl_model_call_dlpack(
         return -1;
     }
     // Import DLPack inputs to NslTensors via the existing bridge.
-    let input_tensor_ptrs: Vec<i64> = if num_inputs > 0 && dl_inputs_ptr != 0 {
+    //
+    // `dlpack_to_nsl_tensor` returns 0 for any DLPack dtype outside
+    // {f64, f32, f16, bf16, int8, int32} — and torch's DEFAULT integer dtype
+    // is int64, so `NslModel.forward(torch.tensor([1, 2, 3]))` lands here.
+    // Before this check the 0 was collected like any other pointer and fed
+    // straight to `nsl_tensor_to_desc`, which dereferenced it: the bridge
+    // SEGFAULTED the embedding process instead of returning -1. Refuse here,
+    // naming the input INDEX and the offending code/bits so the caller can
+    // fix the one argument that is wrong.
+    //
+    // A caller that declares an arity but hands over no array is refused HERE,
+    // before anything is built. Merely SKIPPING the import loop (what the
+    // `dl_inputs_ptr != 0` conjunct below used to do on its own) left
+    // `input_descs` empty while still forwarding the caller's `num_inputs` to
+    // `nsl_model_call` — and `Vec::as_mut_ptr()` on an empty `Vec` is
+    // `NonNull::dangling()`, i.e. 0x8. The dispatch wrapper then called
+    // `nsl_desc_to_tensor(8)`, whose `desc_ptr == 0` check does not catch 8,
+    // and `desc_to_nsl_tensor` read `desc.ndim` off address 8: SIGSEGV, from a
+    // caller that passed an honest NULL. This is the one path that converted a
+    // NULL into a dangling pointer before the emitted null guard could see it.
+    if num_inputs > 0 && dl_inputs_ptr == 0 {
+        set_error(format!(
+            "nsl_model_call_dlpack: num_inputs={num_inputs} but the DLPack input \
+             array is null\0"
+        ));
+        return -1;
+    }
+    let mut input_tensor_ptrs: Vec<i64> = Vec::new();
+    if num_inputs > 0 {
         let dlpacks = unsafe {
             std::slice::from_raw_parts(
                 dl_inputs_ptr as *const *mut DLManagedTensor,
                 num_inputs as usize,
             )
         };
-        dlpacks
-            .iter()
-            .map(|&dl| crate::dlpack::dlpack_to_nsl_tensor(unsafe { &*dl }))
-            .collect()
-    } else {
-        Vec::new()
-    };
+        for (i, &dl) in dlpacks.iter().enumerate() {
+            if dl.is_null() {
+                for &p in &input_tensor_ptrs {
+                    crate::tensor::nsl_tensor_free(p);
+                }
+                set_error(format!(
+                    "nsl_model_call_dlpack: input {i} is a null DLManagedTensor*\0"
+                ));
+                return -1;
+            }
+            let managed = unsafe { &*dl };
+            let ptr = crate::dlpack::dlpack_to_nsl_tensor(managed);
+            if ptr == 0 {
+                let dt = managed.dl_tensor.dtype;
+                // Free the inputs imported before the bad one — an early
+                // return must not leak the tensors that already succeeded.
+                for &p in &input_tensor_ptrs {
+                    crate::tensor::nsl_tensor_free(p);
+                }
+                set_error(format!(
+                    "nsl_model_call_dlpack: input {i} has an unsupported DLPack dtype \
+                     (code={}, bits={}, lanes={}); supported: float64/float32/float16, \
+                     bfloat16, int8, int32 (DLPack code 0=int, 1=uint, 2=float, 4=bfloat)\0",
+                    dt.code, dt.bits, dt.lanes
+                ));
+                return -1;
+            }
+            input_tensor_ptrs.push(ptr);
+        }
+    }
     let mut input_descs: Vec<NslTensorDesc> = input_tensor_ptrs
         .iter()
         .map(|&p| {
@@ -609,10 +709,67 @@ pub extern "C" fn nsl_model_call_dlpack(
         output_descs.as_mut_ptr() as i64,
         num_outputs,
     );
+    // The output descs above are `NslTensorDesc::default()`, so `dst.data` is
+    // null and `nsl_dispatch_apply_result` refuses with "null data pointer
+    // (caller buffer or impl result)" — a message that blames a caller buffer
+    // this ABI gives the caller no way to supply, sending a correct host off to
+    // debug its own code. Say what is actually wrong.
+    //
+    // APPENDED, not substituted: an arity or registry refusal on the same call
+    // is still the caller's to read, and this note is true alongside it (the
+    // output path is unimplemented regardless of why the dispatch stopped).
+    // Placed AFTER the dispatch on purpose — an early return here would skip
+    // `nsl_model_call`'s `model_call name=` trace, which is the observable the
+    // gate uses to prove the int64 refusal happens BEFORE dispatch. Delete this
+    // block in the same change that gives the DLPack path an output allocator.
+    if rc != 0 && num_outputs > 0 {
+        let prev = last_error_text();
+        let sep = if prev.is_empty() { "" } else { " — " };
+        set_error(format!(
+            "{prev}{sep}note: nsl_model_call_dlpack cannot allocate DLPack \
+             outputs, so it passes zero-initialised output descs and a \
+             tensor-returning export always refuses here. Use nsl_model_call \
+             with preallocated NslTensorDesc outputs.\0"
+        ));
+    }
     if rc == 0 && dl_outputs_ptr != 0 {
         let out_slot = dl_outputs_ptr as *mut *mut DLManagedTensor;
         for (i, desc) in output_descs.iter().enumerate() {
+            // TRIP-WIRE, not a live null site. `desc_to_nsl_tensor` returns 0
+            // only for a dtype tag outside 0..=9, and reaching this loop
+            // requires `rc == 0` from `nsl_model_call` — which can only come
+            // from a codegen dispatch wrapper (`ExportRegistry` binds
+            // `<name>__nsl_dispatch` and has no fallback), whose sole
+            // non-negative return is `nsl_dispatch_apply_result`'s. That
+            // function validates `src.dtype` against 0..=9 and returns -1
+            // otherwise BEFORE mirroring `dst.dtype = src.dtype`, so on
+            // `rc == 0` the tag here is always in range. Kept as a trip-wire
+            // for a future registry entry that writes caller descs directly,
+            // the same way `nsl_dtype_to_capi`'s dead abort branch is kept and
+            // documented above; nothing gates it, because nothing can reach it.
             let tensor_ptr = desc_to_nsl_tensor(desc);
+            if tensor_ptr == 0 {
+                // Unwind the outputs already exported so a refusal does not
+                // hand the caller half a result set to free.
+                for k in 0..i {
+                    unsafe {
+                        crate::dlpack::nsl_dlpack_free(*out_slot.add(k) as i64);
+                        *out_slot.add(k) = std::ptr::null_mut();
+                    }
+                }
+                unsafe {
+                    *out_slot.add(i) = std::ptr::null_mut();
+                }
+                for &p in &input_tensor_ptrs {
+                    crate::tensor::nsl_tensor_free(p);
+                }
+                set_error(format!(
+                    "nsl_model_call_dlpack: output {i} carries an unrecognized dtype \
+                     tag {} (valid: {})\0",
+                    desc.dtype, CAPI_DTYPE_TAGS
+                ));
+                return -1;
+            }
             let tensor = NslTensor::from_ptr(tensor_ptr);
             let dl_ptr = crate::dlpack::nsl_tensor_to_dlpack(tensor, tensor_ptr);
             unsafe {
@@ -712,7 +869,10 @@ pub extern "C" fn nsl_model_forward(
 /// `*num_outputs_ptr` slots before the call and writing the actual count
 /// back afterwards.
 ///
-/// Returns 0 on success, -1 on error.
+/// Returns 0 on success, -1 on error — but see the **known gap** on
+/// [`nsl_model_call_dlpack`]: that path cannot allocate DLPack outputs, so a
+/// tensor-returning `forward` always comes back `-1` today. This shim inherits
+/// the limitation verbatim.
 #[no_mangle]
 pub extern "C" fn nsl_model_forward_dlpack(
     model_ptr: i64,
@@ -1128,7 +1288,20 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
 /// regression that violates it.
 pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     let ndim = desc.ndim as usize;
-    let nsl_dtype = capi_dtype_to_nsl(desc.dtype);
+    // Returns 0 (not abort) on an out-of-range tag — see `capi_dtype_to_nsl`.
+    // Every caller must treat 0 as a failure; the codegen-emitted `@export`
+    // wrappers do so via the null guard `c_wrapper::emit_null_tensor_guard`
+    // emits after each `nsl_desc_to_tensor` call.
+    let nsl_dtype = match capi_dtype_to_nsl(desc.dtype) {
+        Some(d) => d,
+        None => {
+            set_error(format!(
+                "desc_to_nsl_tensor: unrecognized dtype tag {} (valid: {})\0",
+                desc.dtype, CAPI_DTYPE_TAGS
+            ));
+            return 0;
+        }
+    };
 
     let shape_ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
     for i in 0..ndim {
@@ -1197,6 +1370,14 @@ pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
 /// Copies `tape_id` verbatim so that a subsequent `desc_to_nsl_tensor`
 /// reconstructs the autodiff identity (Spec B per-call grad context).
 pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
+    // Null guard, matching the extern-C sibling `nsl_tensor_to_desc_ffi`.
+    // `NslTensor::from_ptr` only checks the magic sentinel under a
+    // `debug_assert!`, which is a NO-OP in the release builds CI and the
+    // shared library ship — so a 0 here dereferenced address 0 on the very
+    // next line and took the host process down.
+    if tensor_ptr == 0 {
+        return;
+    }
     let tensor = NslTensor::from_ptr(tensor_ptr);
     desc.data = tensor.data;
     desc.ndim = tensor.ndim as i32;
@@ -1312,11 +1493,88 @@ mod tests {
         // P4 item 16: the C API tag space IS the canonical tag space — both
         // chokepoints are validating identity maps.
         for capi_d in 0..=9 {
-            let nsl_d = capi_dtype_to_nsl(capi_d);
+            let nsl_d = capi_dtype_to_nsl(capi_d)
+                .unwrap_or_else(|| panic!("tag {capi_d} must be accepted"));
             assert_eq!(nsl_d as i32, capi_d, "C API tag must equal canonical tag");
             let back = nsl_dtype_to_capi(nsl_d);
             assert_eq!(back, capi_d, "Roundtrip failed for C API dtype {capi_d}");
         }
+        // Out-of-range tags are REFUSED, not aborted on. `-1` and `10` bracket
+        // the accepted window; `42` is the tag the interop gate drives.
+        for bad in [-1_i32, 10, 42, i32::MAX] {
+            assert_eq!(
+                capi_dtype_to_nsl(bad),
+                None,
+                "tag {bad} is outside 0..=9 and must be refused"
+            );
+        }
+    }
+
+    /// Child of `nsl_tensor_to_desc_null_ptr_does_not_deref`.
+    ///
+    /// `nsl_tensor_to_desc` is `pub(crate)`, so this cannot live in
+    /// `tests/` alongside the rest of the M62 dtype gates. It re-execs
+    /// through the lib test binary instead. The scenario runs in a CHILD
+    /// because the failure mode is a SIGSEGV: `NslTensor::from_ptr` only
+    /// checks the magic sentinel under `debug_assert!`, a NO-OP in the
+    /// release builds CI ships, so the next line reads address 0 and no
+    /// `#[should_panic]` can observe it.
+    #[test]
+    #[ignore = "child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref"]
+    fn zz_tensor_to_desc_null_child() {
+        if std::env::var("NSL_TENSOR_TO_DESC_NULL_CHILD").is_err() {
+            return;
+        }
+        // Pre-poison every field so "untouched" is observable rather than
+        // indistinguishable from a zeroed default.
+        let mut sentinel_shape: Vec<i64> = vec![7];
+        let mut desc = NslTensorDesc {
+            data: 0x5A5A_5A5A_usize as *mut c_void,
+            shape: sentinel_shape.as_mut_ptr(),
+            strides: std::ptr::null_mut(),
+            ndim: 99,
+            dtype: 7,
+            device_type: 5,
+            device_id: 6,
+            tape_id: 1234,
+        };
+        nsl_tensor_to_desc(0, &mut desc);
+        assert_eq!(desc.ndim, 99, "a null tensor must leave the desc untouched");
+        assert_eq!(desc.dtype, 7, "a null tensor must leave the desc untouched");
+        assert_eq!(desc.tape_id, 1234, "a null tensor must leave the desc untouched");
+        assert_eq!(desc.data as usize, 0x5A5A_5A5A);
+        println!("CHILD-SURVIVED-NULL-DESC");
+    }
+
+    #[test]
+    fn nsl_tensor_to_desc_null_ptr_does_not_deref() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "c_api::tests::zz_tensor_to_desc_null_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--include-ignored",
+            ])
+            .env("NSL_TENSOR_TO_DESC_NULL_CHILD", "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .expect("re-exec the lib test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child exited {:?} — nsl_tensor_to_desc dereferenced a null tensor \
+             pointer (139 = SIGSEGV).\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status
+        );
+        assert!(
+            stdout.contains("CHILD-SURVIVED-NULL-DESC"),
+            "child exited 0 but never reached the end of the scenario — the \
+             filter may have selected no test.\n--- stdout ---\n{stdout}\n\
+             --- stderr ---\n{stderr}"
+        );
     }
 
     #[test]

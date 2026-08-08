@@ -501,6 +501,22 @@ class NslModel:
     def forward(self, *inputs):
         """Run the model forward pass.
 
+        .. warning::
+
+           **The DLPack path this method uses cannot currently return a
+           result.** ``nsl_model_call_dlpack`` has no way to allocate output
+           buffers, so it passes zero-initialised output descs and the
+           dispatcher refuses them: any tensor-returning export comes back
+           ``-1`` and this method raises :class:`NslError`. Use
+           :meth:`call` (the ``NslTensorDesc`` ABI, which preallocates the
+           output buffer) until the DLPack output path is implemented.
+
+           Separately, ``torch.int8``/``torch.int32`` inputs are NOT refused
+           here: they map onto NSL dtype tags, clear every boundary guard, and
+           then abort the interpreter inside the compiled kernel. Only dtypes
+           with no NSL mapping (``torch.int64`` — torch's *default* integer
+           dtype — ``uint8``, ``bool``, …) are refused with an error code.
+
         Args:
             *inputs: Input tensors. Accepts torch.Tensor (via DLPack),
                      numpy arrays, or raw ctypes pointers.

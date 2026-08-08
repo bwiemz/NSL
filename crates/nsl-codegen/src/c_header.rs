@@ -238,9 +238,11 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str("    int64_t* shape;\n");
     out.push_str("    int64_t* strides;     /* NULL = contiguous */\n");
     out.push_str("    int32_t  ndim;\n");
-    // The full accepted set, not a subset. `capi_dtype_to_nsl` aborts the
-    // process outside 0..=9, so a host reading this comment as the menu would
-    // have believed 5..=8 were invalid.
+    // The full accepted set, not a subset. `capi_dtype_to_nsl` REFUSES a tag
+    // outside 0..=9 (returns None, and `desc_to_nsl_tensor` then returns 0 +
+    // set_error; it used to `abort()` the process instead), so this list is the
+    // host's only reference for what will be accepted — a reader who trimmed it
+    // to a subset would have hosts believing 5..=8 were invalid.
     out.push_str("    int32_t  dtype;       /* canonical NSL tags: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8,\n");
     out.push_str("                           * 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32 */\n");
     out.push_str("    int32_t  device_type; /* 0=CPU, 1=CUDA */\n");

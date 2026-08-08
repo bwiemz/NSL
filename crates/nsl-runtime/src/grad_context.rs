@@ -45,6 +45,14 @@ fn set_error_static(msg: &'static str) {
     crate::c_api::set_error_cstring(cstr);
 }
 
+/// Same, for messages that must interpolate a runtime value (an input index).
+/// Interior NULs are stripped rather than panicking in an FFI surface.
+fn set_error_owned(msg: String) {
+    let cleaned: String = msg.chars().filter(|c| *c != '\0').collect();
+    let cstr = std::ffi::CString::new(cleaned).expect("CString::new after NUL strip");
+    crate::c_api::set_error_cstring(cstr);
+}
+
 /// Per-call gradient context.
 ///
 /// **Send + !Sync** by Spec B §5.4 contract: a `*mut GradContext` may
@@ -285,6 +293,18 @@ pub extern "C" fn nsl_model_forward_grad(
     } else {
         Vec::new()
     };
+    // `desc_to_nsl_tensor` returns 0 on an unrecognized dtype tag (it used to
+    // `abort()` the process). A 0 left in `input_ptrs` would be dereferenced
+    // by `run_backward_core`'s tape_id lookup, so refuse here.
+    if let Some(i) = input_ptrs.iter().position(|&p| p == 0) {
+        for &p in &input_ptrs {
+            crate::tensor::nsl_tensor_free(p);
+        }
+        set_error_owned(format!(
+            "nsl_model_forward_grad: input {i} carries an unrecognized dtype tag"
+        ));
+        return -1;
+    }
 
     // Dispatch via Spec A: nsl_model_call(model, "forward", ...).
     // The packed-array dispatch wrapper unpacks input/output descs and
@@ -337,6 +357,25 @@ pub extern "C" fn nsl_model_forward_grad(
     } else {
         Vec::new()
     };
+    // TRIP-WIRE, not a live null site — unlike its INPUT-side twin above,
+    // which reads caller-supplied descs and really is reachable. These descs
+    // were just written by `nsl_model_call`, and reaching here requires
+    // `rc == 0` from it: the codegen dispatch wrapper's only non-negative
+    // return is `nsl_dispatch_apply_result`'s, and that function refuses any
+    // `src.dtype` outside 0..=9 BEFORE mirroring `dst.dtype = src.dtype`. So
+    // the tag here is always in range and `desc_to_nsl_tensor` cannot return 0.
+    // Kept because a 0 WOULD become `ctx.output_ptrs[k]`, which
+    // `nsl_model_backward` dereferences for the loss seed, and the invariant
+    // lives in a different crate's emitter than this guard does.
+    if let Some(i) = output_ptrs.iter().position(|&p| p == 0) {
+        for &p in input_ptrs.iter().chain(output_ptrs.iter()) {
+            crate::tensor::nsl_tensor_free(p);
+        }
+        set_error_owned(format!(
+            "nsl_model_forward_grad: output {i} carries an unrecognized dtype tag"
+        ));
+        return -1;
+    }
 
     // Snapshot the tape's param_set into a stable Vec. We collect from
     // the live tape (rather than reusing weight_ptrs) so future hooks
