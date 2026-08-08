@@ -2020,6 +2020,35 @@ impl<'a> Compiler<'a> {
         self.wgrad_hook_blocks + self.wgrad_declines.len() + 1
     }
 
+    /// How to NAME the block currently being lowered, in a diagnostic emitted
+    /// from the shared `compile_train_block_inner` path.
+    ///
+    /// A `distill(...)` block lowers through a synthetic `TrainBlock`, so
+    /// EVERY diagnostic on that path speaks about a "train block", and a
+    /// distill program has no train block to edit.
+    /// `active_distill_context` is `Some` for exactly the span of the
+    /// delegation, which is exactly the span over which the answer is
+    /// "distill".
+    ///
+    /// **Scope, stated so the next reader does not mistake partial wiring for
+    /// full coverage:** only the ACCUMULATION-WINDOW diagnostics call this —
+    /// the `[wgrad-fusion] declined:` note, its two provenance strings and its
+    /// remedy, and the two `--layerwise-accum` refusals. Those are the ones
+    /// whose remedy tells the user to go set `grad_accumulation` somewhere, so
+    /// naming the wrong block makes the remedy unfollowable. Other shared-path
+    /// diagnostics (the Muon optimizer-name refusals, "train block requires a
+    /// step section", the ZeRO optimizer refusal, the model-resolution errors)
+    /// still say "train block" and are reachable from a distill program; they
+    /// are describing a property rather than prescribing an edit, so they are
+    /// less wrong, but they are not right.
+    pub(crate) fn training_block_noun(&self) -> &'static str {
+        if self.active_distill_context.is_some() {
+            "distill block"
+        } else {
+            "train block"
+        }
+    }
+
     pub(crate) fn finish_wgrad_admission(&self) -> Result<(), CodegenError> {
         if !self.compile_options.fuse_wgrad_accum || self.wgrad_hook_blocks > 0 {
             return Ok(());
@@ -2078,8 +2107,8 @@ impl<'a> Compiler<'a> {
             // reported as silently permitted.
             Err(CodegenError::new(format!(
                 "--fuse-wgrad-accum requires grad_accumulation >= 2 and a \
-                 FASE-Deferred plan in at least one train block, and this \
-                 compile has none: {reason}. {remedy}"
+                 FASE-Deferred plan in at least one training block (`train` \
+                 or `distill`), and this compile has none: {reason}. {remedy}"
             )))
         }
     }

@@ -1,11 +1,19 @@
 //! Training-pipeline decision audit emitted by `nsl check --training-report`.
 //!
-//! Walks the AST for `train(...)` blocks, invokes the FASE and PCA
-//! planners for each, and produces a report suitable for text display
-//! or JSON serialization.  Pure data computation — no codegen.
+//! Walks the AST for training blocks — `train(...)` **and** `distill(...)` —
+//! invokes the FASE and PCA planners for each, and produces a report suitable
+//! for text display or JSON serialization.  Pure data computation — no codegen.
 //!
 //! Task 2 establishes data structures + text formatter.  Task 3 adds
 //! the AST walker (`build_report`).
+//!
+//! A `distill(...)` block is a training loop over the student, and it reaches
+//! the planners through the same synthetic `TrainBlock` codegen lowers it
+//! through ([`crate::cpkd::distill_as_train_block`]). Before that it matched
+//! nothing here, so the audit whose entire job is explaining the accumulation
+//! decision answered "Training blocks found: 0" for a `distill(..., epochs = 8,
+//! grad_accumulation = 4)` block that was, in fact, planning FASE-Deferred
+//! with a window of 4.
 
 use std::collections::HashMap;
 
@@ -28,9 +36,33 @@ pub struct TrainingReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainBlockReport {
+    /// Which block spelling produced this entry. Rendered for BOTH kinds:
+    /// showing it only for `distill` would read as "train blocks are the
+    /// untyped default", and a JSON consumer diffing two reports needs to
+    /// know which block moved.
+    pub kind: BlockKind,
+    /// For a `distill` block this is the STUDENT — the teacher's fields are
+    /// frozen `Input` leaves with no adjoints (invariant I-11) and are not in
+    /// the block's parameter list at all.
     pub model_name: Option<String>,
     pub fase: FaseSection,
     pub pca: Option<PcaSection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockKind {
+    Train,
+    Distill,
+}
+
+impl BlockKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            BlockKind::Train => "train",
+            BlockKind::Distill => "distill",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,7 +79,8 @@ pub struct PcaSection {
 
 // ─── AST walker ─────────────────────────────────────────────────────────────
 
-/// Walk an AST's top-level items for `train(...)` blocks; build a report.
+/// Walk an AST's top-level items for training blocks — `train(...)` and
+/// `distill(...)` — and build a report.
 ///
 /// Pure-data traversal — no codegen, no semantic re-analysis.  Each train
 /// block's config is extracted from its AST args and optimizer section, fed
@@ -73,13 +106,47 @@ pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &st
     let dataset_configs = collect_dataset_configs(&ast.stmts, interner);
     let mut blocks = Vec::new();
     for stmt in &ast.stmts {
-        match &stmt.kind {
+        // Both spellings, and both bare and decorated — a train block often
+        // sits inside a test/bench decorator.
+        let inner = match &stmt.kind {
+            StmtKind::Decorated { stmt: inner, .. } => &inner.kind,
+            other => other,
+        };
+        match inner {
             StmtKind::TrainBlock(train) => {
-                blocks.push(build_block_report(train, interner, &dataset_configs));
+                blocks.push(build_block_report(
+                    BlockKind::Train,
+                    train,
+                    None,
+                    interner,
+                    &dataset_configs,
+                ));
             }
-            StmtKind::Decorated { stmt: inner, .. } => {
-                if let StmtKind::TrainBlock(train) = &inner.kind {
-                    blocks.push(build_block_report(train, interner, &dataset_configs));
+            StmtKind::DistillBlock(distill) => {
+                // A header the presentation refuses cannot compile either (the
+                // semantic checker refuses the same spellings with a span), so
+                // no successful build reaches here with one. But `build_report`
+                // is `pub` and runs no semantic analysis, so a caller that
+                // hands it an unchecked AST would otherwise get "Training
+                // blocks found: 0" — character for character the defect this
+                // arm exists to fix. Say why instead of dropping it silently.
+                match crate::cpkd::distill_as_train_block(distill, interner) {
+                    Ok(presented) => {
+                        let student = presented
+                            .student_sym
+                            .map(|s| resolve(interner, s).to_string());
+                        blocks.push(build_block_report(
+                            BlockKind::Distill,
+                            &presented.train,
+                            student,
+                            interner,
+                            &dataset_configs,
+                        ));
+                    }
+                    Err(why) => eprintln!(
+                        "note: --training-report skipped a distill block whose \
+                         header cannot be planned: {why}"
+                    ),
                 }
             }
             _ => {}
@@ -91,12 +158,19 @@ pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &st
     }
 }
 
+/// `model_name_override` carries the name a synthetic block cannot express in
+/// its config: a distill block trains the STUDENT, and `student =` is not a
+/// train config key, so the presentation returns the symbol separately rather
+/// than smuggling it in under `model =` (see
+/// [`crate::cpkd::distill_as_train_block`]).
 fn build_block_report(
+    kind: BlockKind,
     train: &TrainBlock,
+    model_name_override: Option<String>,
     interner: &Interner,
     datasets: &HashMap<String, DatasetPackingConfig>,
 ) -> TrainBlockReport {
-    let model_name = extract_model_name(train, interner);
+    let model_name = model_name_override.or_else(|| extract_model_name(train, interner));
     let fase_config = extract_fase_config(train, interner);
     let plan = fase::plan(&fase_config);
 
@@ -113,6 +187,7 @@ fn build_block_report(
         });
 
     TrainBlockReport {
+        kind,
         model_name,
         fase: FaseSection { plan, memory },
         pca,
@@ -197,16 +272,17 @@ impl std::fmt::Display for TrainingReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=== Training Pipeline Report ===")?;
         writeln!(f, "File: {}", self.source_path)?;
-        writeln!(f, "Train blocks found: {}", self.train_blocks.len())?;
+        writeln!(f, "Training blocks found: {}", self.train_blocks.len())?;
         writeln!(f)?;
 
         if self.train_blocks.is_empty() {
-            writeln!(f, "No train blocks found in {}.", self.source_path)?;
+            writeln!(f, "No training blocks found in {}.", self.source_path)?;
             return Ok(());
         }
 
         for (i, block) in self.train_blocks.iter().enumerate() {
             writeln!(f, "[Block {}]", i + 1)?;
+            writeln!(f, "  Kind: {}", block.kind.as_str())?;
             if let Some(name) = &block.model_name {
                 writeln!(f, "  Model: {}", name)?;
             }
@@ -342,6 +418,7 @@ mod tests {
         TrainingReport {
             source_path: "pretrain.nsl".to_string(),
             train_blocks: vec![TrainBlockReport {
+                kind: BlockKind::Train,
                 model_name: Some("NSLCoder".to_string()),
                 fase: FaseSection { plan, memory: None },
                 pca: None,
@@ -394,7 +471,7 @@ mod tests {
         };
         let text = format!("{}", r);
         assert!(
-            text.contains("No train blocks found"),
+            text.contains("No training blocks found"),
             "empty report text missing the no-blocks message:\n{}",
             text
         );

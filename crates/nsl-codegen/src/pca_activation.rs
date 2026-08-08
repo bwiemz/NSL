@@ -21,61 +21,65 @@ use nsl_lexer::Interner;
 
 use crate::pca_detect::{self, DatasetPackingConfig, PcaDetectConfig, PcaStrategy};
 
-/// Returns true iff the module contains a train block whose referenced
+/// Returns true iff the module contains a training block whose referenced
 /// dataset selects a packing strategy. Conservative: any resolution
 /// failure → false.
+///
+/// "Training block" means `train(...)` **or** `distill(...)`. That is not a
+/// generalization for its own sake: `compiler::kernel`'s PCA Tier-A synthesis
+/// guards itself with `stmts_contain_train_block`, which has counted a distill
+/// block since CSHA ("a distill block is a training loop over the student"),
+/// and then computes `segment_masked` from THIS function twelve lines later.
+/// While this walker matched `TrainBlock` alone, those two lines disagreed
+/// about whether a distill block trains: the synthesis ran, and it emitted
+/// UNMASKED training kernels for a packed corpus — cross-document attention
+/// on a program that explicitly asked for packing, with nothing on stderr.
 pub fn detect_packing_for_stmts(stmts: &[Stmt], interner: &Interner) -> bool {
     let datasets = collect_dataset_configs(stmts, interner);
     for stmt in stmts {
-        match &stmt.kind {
-            StmtKind::TrainBlock(train)
-                if check_train_packs(train, &datasets, interner) =>
-            {
-                return true;
-            }
-            StmtKind::TrainBlock(_) => {}
-            StmtKind::Decorated { stmt: inner, .. } => {
-                if let StmtKind::TrainBlock(train) = &inner.kind {
-                    if check_train_packs(train, &datasets, interner) {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
+        let inner = match &stmt.kind {
+            StmtKind::Decorated { stmt: inner, .. } => &inner.kind,
+            other => other,
+        };
+        let sections = match inner {
+            StmtKind::TrainBlock(train) => &train.sections,
+            StmtKind::DistillBlock(distill) => &distill.sections,
+            _ => continue,
+        };
+        if check_sections_pack(sections, &datasets, interner) {
+            return true;
         }
     }
     false
 }
 
-/// CFTP §4.3 G2 Strategy 3 (Item 4): resolve the first train block's
-/// referenced `DatasetPackingConfig`. Returns `None` when no train block
+/// CFTP §4.3 G2 Strategy 3 (Item 4): resolve the first training block's
+/// referenced `DatasetPackingConfig`. Returns `None` when no training block
 /// is present, when its dataset reference cannot be resolved, or when
 /// the resolved dataset has `enabled = false`. Mirrors the resolution
-/// path used by [`detect_packing_for_stmts`] but returns the concrete
-/// config so the planner site can pass it to `pca_per_doc::admit`.
+/// path used by [`detect_packing_for_stmts`] — including its `distill(...)`
+/// arm, so the admission decision and the mask decision see the same
+/// blocks — but returns the concrete config so the planner site can pass
+/// it to `pca_per_doc::admit`.
 pub fn resolve_packing_config_for_stmts(
     stmts: &[Stmt],
     interner: &Interner,
 ) -> Option<DatasetPackingConfig> {
     let datasets = collect_dataset_configs(stmts, interner);
     for stmt in stmts {
-        let train_opt = match &stmt.kind {
-            StmtKind::TrainBlock(train) => Some(train),
-            StmtKind::Decorated { stmt: inner, .. } => {
-                if let StmtKind::TrainBlock(train) = &inner.kind {
-                    Some(train)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        let inner = match &stmt.kind {
+            StmtKind::Decorated { stmt: inner, .. } => &inner.kind,
+            other => other,
         };
-        if let Some(train) = train_opt {
-            if let Some(ds_name) = extract_dataset_ref(train, interner) {
-                if let Some(cfg) = datasets.get(&ds_name) {
-                    if cfg.enabled {
-                        return Some(cfg.clone());
-                    }
+        let sections = match inner {
+            StmtKind::TrainBlock(train) => &train.sections,
+            StmtKind::DistillBlock(distill) => &distill.sections,
+            _ => continue,
+        };
+        if let Some(ds_name) = extract_dataset_ref_in(sections, interner) {
+            if let Some(cfg) = datasets.get(&ds_name) {
+                if cfg.enabled {
+                    return Some(cfg.clone());
                 }
             }
         }
@@ -83,12 +87,12 @@ pub fn resolve_packing_config_for_stmts(
     None
 }
 
-fn check_train_packs(
-    train: &TrainBlock,
+fn check_sections_pack(
+    sections: &[TrainSection],
     datasets: &std::collections::HashMap<String, DatasetPackingConfig>,
     interner: &Interner,
 ) -> bool {
-    if let Some(ds_name) = extract_dataset_ref(train, interner) {
+    if let Some(ds_name) = extract_dataset_ref_in(sections, interner) {
         if let Some(cfg) = datasets.get(&ds_name) {
             let det = pca_detect::detect(cfg, &PcaDetectConfig::default(), 2);
             return det.strategy != PcaStrategy::NoPacking;
@@ -120,7 +124,15 @@ pub(crate) fn collect_dataset_configs(
 /// renders `source = ds_name` as a `StmtKind::Assign` with a plain-ident
 /// target and plain-ident value, or alternatively as a `StmtKind::VarDecl`.
 pub(crate) fn extract_dataset_ref(train: &TrainBlock, interner: &Interner) -> Option<String> {
-    for section in &train.sections {
+    extract_dataset_ref_in(&train.sections, interner)
+}
+
+/// Sections-only form. A `distill(...)` block's sections ARE train sections
+/// (`TrainSection` is the shared type), so the distill arms of the walkers
+/// above read `distill.sections` directly rather than cloning a whole step
+/// body into a synthetic `TrainBlock` just to answer a boolean.
+fn extract_dataset_ref_in(sections: &[TrainSection], interner: &Interner) -> Option<String> {
+    for section in sections {
         if let TrainSection::Data(stmts) = section {
             for stmt in stmts {
                 // Pattern: `source = <ident>` → StmtKind::Assign

@@ -57,9 +57,10 @@ Expected report shape:
 ```
 === Training Pipeline Report ===
 File: models/coder7b/pretrain_fase.nsl
-Train blocks found: 1
+Training blocks found: 1
 
 [Block 1]
+  Kind: train
   Model: m
 
   FASE (Fused Accumulation-Step Elimination):
@@ -67,7 +68,7 @@ Train blocks found: 1
     optimizer:         AdamW
     mode:              Deferred
     rationale:         AdamW supports deferred first-moment accumulation with batch-variance v approximation
-    backward_phases:   AccumulateOnly × 7, FinalTwoPhase × 1
+    backward_phases:   AccumulateOnly x 7, FinalTwoPhase
     two_phase_clip:    true
 ```
 
