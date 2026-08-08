@@ -2720,6 +2720,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_zero_sync_params", &[types::I64, types::I64], Some(types::I64)), // (param_list, num_params)
     ("nsl_zero_destroy", &[], Some(types::I64)),
     ("nsl_zero_owns_param", &[types::I64], Some(types::I64)), // (param_idx) -> 1 if owned
+    // (accum_list, num_params) -> NslList of owned indices; zeroes non-owners'
+    // m_partial. Caller frees the list.
+    (
+        "nsl_zero_owned_step_indices",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     // P3 ZeRO-3: tensor-granular parameter sharding (items 12-14).
     ("nsl_zero3_enable", &[], Some(types::I64)),
     ("nsl_zero3_note_param", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)

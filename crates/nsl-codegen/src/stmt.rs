@@ -4655,6 +4655,120 @@ impl Compiler<'_> {
         Ok(builder.ins().band(is_muon, is_r2))
     }
 
+    /// Item 8: emit ONE batched fused-AdamW launch over the FullBuffer
+    /// parameter list — the whole list normally, this rank's OWNER SUBSET
+    /// under `--zero-stage 1/2`.
+    ///
+    /// Both Phase-B forks (clipped and unclipped) call this so the ZeRO
+    /// decision cannot drift between them; they differ only in `mp_scale`
+    /// (the clip factor, folded into the kernel's `m_partial` read, vs 1.0).
+    ///
+    /// Under ZeRO the subset is not an optimization, it is the correctness
+    /// condition: a non-owned parameter's moment buffers are NULL
+    /// placeholders (`emit_owner_gated_moment` allocates nothing for
+    /// non-owners), so the batched launcher must never be handed one — and
+    /// `nsl_zero_owned_step_indices` also performs the non-owner
+    /// `m_partial` zero that the per-param loop's skip arm used to do.
+    /// Handing the launcher only owners leaves its null assert intact as a
+    /// belt rather than something to relax.
+    ///
+    /// **`owner_gated_moments` is the STAGES-1/2 predicate, not "ZeRO is
+    /// on".** That is the whole invariant: the subset is valid exactly when
+    /// the moments were owner-gated, and stage 3 deliberately does the
+    /// opposite — it keeps optimizer state REPLICATED (see the note at the
+    /// allocation site), so a stage-3 program reaching this arm would step
+    /// only its byte-balanced share and zero every other parameter's
+    /// accumulator, freezing most of the model per rank with the post-step
+    /// broadcast hiding it. Stage 3 cannot reach here today, but only via
+    /// two unrelated guards (it is refused unless `--layerwise-accum`, and
+    /// the layerwise arm short-circuits above this one) — nothing pins that
+    /// coupling, so the predicate names the invariant instead of relying on
+    /// it. The old `&& !zero_enabled` exclusion was safe under `>= 1` only
+    /// because it disabled batching for EVERY stage; narrowing the exclusion
+    /// without narrowing the predicate is what opened the gap.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fused_multi_launch(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        owner_gated_moments: bool,
+        num_params_val: Value,
+        lists: (Value, Value, Value, Value),
+        sc: &crate::stmt_fase::FusedAdamwScalars,
+        bc: (Value, Value),
+        groups: (Value, Value),
+        mp_scale: Value,
+    ) -> Result<(), CodegenError> {
+        let (param_list, state_list_1, state_list_2, accum) = lists;
+        let lr_v = builder.ins().f64const(sc.lr);
+        let b1_v = builder.ins().f64const(sc.beta1);
+        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+        let b2_v = builder.ins().f64const(sc.beta2);
+        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+        let eps_v = builder.ins().f64const(sc.eps);
+        let wd_v = builder.ins().f64const(sc.wd);
+
+        if owner_gated_moments {
+            let il = self.compile_call_by_name(
+                builder,
+                "nsl_zero_owned_step_indices",
+                &[accum, num_params_val],
+            )?;
+            self.compile_call_by_name(
+                builder,
+                "nsl_fase_fused_adamw_step_multi_idx",
+                &[
+                    param_list,
+                    state_list_1,
+                    state_list_2,
+                    accum,
+                    il,
+                    lr_v,
+                    b1_v,
+                    omb1_v,
+                    b2_v,
+                    omb2_v,
+                    eps_v,
+                    wd_v,
+                    bc.0,
+                    bc.1,
+                    // Parameter-group arguments stay ORIGINAL-position
+                    // indexed; the subset launcher documents that it resolves
+                    // λ by the caller's numbering, which is why the exempt
+                    // list is passed unfiltered alongside a filtered index
+                    // list.
+                    groups.0,
+                    groups.1,
+                    mp_scale,
+                ],
+            )?;
+            self.compile_call_by_name(builder, "nsl_list_free", &[il])?;
+        } else {
+            self.compile_call_by_name(
+                builder,
+                "nsl_fase_fused_adamw_step_multi",
+                &[
+                    param_list,
+                    state_list_1,
+                    state_list_2,
+                    accum,
+                    lr_v,
+                    b1_v,
+                    omb1_v,
+                    b2_v,
+                    omb2_v,
+                    eps_v,
+                    wd_v,
+                    bc.0,
+                    bc.1,
+                    groups.0,
+                    groups.1,
+                    mp_scale,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Item 12: how a train-loop callback body touches the streamed model θ.
     /// Under `--weight-stream` params are EVICTED (`t.data == null`) when a
     /// callback runs, so a model-field read launches on a null pointer (the
@@ -14739,7 +14853,13 @@ impl Compiler<'_> {
                     && !self.compile_options.training_reference
                     && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
                     && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
-                    && !zero_enabled
+                    // ZeRO 1/2 no longer excludes: the launch below goes
+                    // through the OWNER SUBSET (see
+                    // `emit_fused_multi_launch`). It used to, which meant
+                    // every `--zero-stage` run silently reverted the item-8
+                    // batching to the per-param loop with no diagnostic
+                    // anywhere — a shipped optimization that was 100% off in
+                    // a supported configuration.
                     && !self.compile_options.optim_state_offload
                     // Belt only: bf16-sr structurally cannot reach this
                     // FullBuffer path (it requires --weight-stream, which
@@ -14869,48 +14989,30 @@ impl Compiler<'_> {
                     // 74 nsl_tensor_mul_scalar_inplace + 74 fused-step
                     // launches (+ the per-param list traffic) at Coder-50M.
                     if let Some(sc) = multi_scalars {
-                        let lr_v = builder.ins().f64const(sc.lr);
-                        let b1_v = builder.ins().f64const(sc.beta1);
-                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
-                        let b2_v = builder.ins().f64const(sc.beta2);
-                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
-                        let eps_v = builder.ins().f64const(sc.eps);
-                        let wd_v = builder.ins().f64const(sc.wd);
                         // The parameter-group arguments are as load-bearing here
                         // as in the unclipped arm below. Omitting them does not
                         // fail to compile — it shifts `clip_factor` into the
                         // `wd_exempt_list` slot, so the runtime would read a
                         // float bit-pattern as an NslList pointer while the clip
-                        // silently stopped being applied.
+                        // silently stopped being applied. (Passing them through
+                        // one shared emitter is now what keeps that true.)
                         let exempt_list_v = decay_exempt_list
                             .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
                         let exempt_nr2_v = builder.ins().iconst(
                             cl_types::I64,
                             i64::from(no_decay_scope.exempt_non_rank2),
                         );
-                        self.compile_call_by_name(
+                        self.emit_fused_multi_launch(
                             builder,
-                            "nsl_fase_fused_adamw_step_multi",
-                            &[
-                                param_list,
-                                state_list_1,
-                                state_list_2,
-                                accum,
-                                lr_v,
-                                b1_v,
-                                omb1_v,
-                                b2_v,
-                                omb2_v,
-                                eps_v,
-                                wd_v,
-                                bc1_inv,
-                                bc2_inv,
-                                exempt_list_v,
-                                exempt_nr2_v,
-                                // mp_scale: the clip factor, folded into the
-                                // m_partial read in-kernel.
-                                clip_factor,
-                            ],
+                            zero_monolithic,
+                            num_params_val,
+                            (param_list, state_list_1, state_list_2, accum),
+                            &sc,
+                            (bc1_inv, bc2_inv),
+                            (exempt_list_v, exempt_nr2_v),
+                            // mp_scale: the clip factor, folded into the
+                            // m_partial read in-kernel.
+                            clip_factor,
                         )?;
                     } else {
                     // ── Phase B: scale m_partial in place, then fused optimizer step ──
@@ -15033,13 +15135,10 @@ impl Compiler<'_> {
                     // m_partial zero). Admission (`multi_scalars`) is hoisted
                     // above the clip fork and shared with the clip arm.
                     if let Some(sc) = multi_scalars {
-                        let lr_v = builder.ins().f64const(sc.lr);
-                        let b1_v = builder.ins().f64const(sc.beta1);
-                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
-                        let b2_v = builder.ins().f64const(sc.beta2);
-                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
-                        let eps_v = builder.ins().f64const(sc.eps);
-                        let wd_v = builder.ins().f64const(sc.wd);
+                        // The recipe constants are materialized inside
+                        // `emit_fused_multi_launch` now — emitting them here
+                        // too would leave four dead Cranelift values and a
+                        // `-D warnings` clippy failure.
                         let exempt_list_v = decay_exempt_list
                             .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
                         let exempt_nr2_v = builder.ins().iconst(
@@ -15049,30 +15148,18 @@ impl Compiler<'_> {
                         // mp_scale = 1.0: unclipped path (the kernel branches
                         // around the multiply, keeping exact bit-identity).
                         let one_scale = builder.ins().f64const(1.0);
-                        self.compile_call_by_name(
+                        self.emit_fused_multi_launch(
                             builder,
-                            "nsl_fase_fused_adamw_step_multi",
-                            &[
-                                param_list,
-                                state_list_1,
-                                state_list_2,
-                                accum,
-                                lr_v,
-                                b1_v,
-                                omb1_v,
-                                b2_v,
-                                omb2_v,
-                                eps_v,
-                                wd_v,
-                                bc1_inv,
-                                bc2_inv,
-                                // AdamW parameter groups. 0 = no no_decay,
-                                // in which case the runtime takes wd_v for
-                                // every param exactly as before.
-                                exempt_list_v,
-                                exempt_nr2_v,
-                                one_scale,
-                            ],
+                            zero_monolithic,
+                            num_params_val,
+                            (param_list, state_list_1, state_list_2, accum),
+                            &sc,
+                            (bc1_inv, bc2_inv),
+                            // AdamW parameter groups. 0 = no no_decay, in
+                            // which case the runtime takes `wd` for every
+                            // param exactly as before.
+                            (exempt_list_v, exempt_nr2_v),
+                            one_scale,
                         )?;
                     } else {
                     let fs_i_var = state.new_variable();
