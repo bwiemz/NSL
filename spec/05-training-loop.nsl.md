@@ -415,13 +415,26 @@ Semantics and constraints (v1):
 - `distill` requires source AD (`--source-ad`). The tape fallback is REFUSED:
   a tape would record teacher ops and allocate teacher gradient buffers.
 - `optimizer:` / `scheduler:` / `data:` / `step()` / `callbacks:` behave
-  exactly as in `train`. `distribute:` is refused (CPDT composition deferred).
+  exactly as in `train`. `distribute:` is refused — as it is on `train`, which
+  refuses the same section; distribution is configured via the `@pipeline`
+  decorator and CLI options. (This line used to attribute the refusal to a
+  deferred CPDT composition. CPDT × `distill` is NOT deferred: `--cpdt full
+  --cpdt-num-gpus N` plans weights-only for a `distill` block and lowers the
+  student's optimizer-moment precision.)
 - `grad_accumulation = N` is accepted on the header and means exactly what it
   means on `train`: the step body runs per micro-batch and the optimizer fires
   every `N`. Unlike `train` it is refused rather than clamped when it is not a
   positive integer literal — a silently-clamped window is indistinguishable
   from having no window, which strands the FASE-Deferred envelope (and with
   it CPDT's optimizer-moment precision plan) with no diagnostic.
+- `epochs = N` must likewise be an integer literal, and is refused rather than
+  defaulted. `train` already hard-errors on a non-literal; `distill` used to
+  accept the expression and then train ONE epoch, reporting `Epochs: 1`.
+- A `distill` block is a training loop, so every module-level analysis that
+  walks training blocks sees it: `nsl check --training-report` reports its
+  FASE plan under `Kind: distill` with the student as `Model:`, and a packed
+  `data:` corpus selects the segment-masked attention kernels exactly as it
+  does under `train`.
 - `fused_kl_ce(x_s, W_s, b_s, x_t, W_t, b_t, targets, alpha, T)` computes
   `alpha*CE(student, targets) + (1-alpha)*T^2*KL(softmax(t/T) || softmax(s/T))`
   in ONE kernel without materializing either `[rows, vocab]` logit tensor in

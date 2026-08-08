@@ -1,0 +1,46 @@
+# Distill twin of training_report_fase_pca_composition.nsl — the SAME model,
+# dataset and accumulation window, driven by `distill(...)` instead of
+# `train(...)`.
+#
+# Why it exists: a distill block lowers through a SYNTHETIC TrainBlock built
+# inside codegen, so every module-level AST scan that matched
+# `StmtKind::TrainBlock` saw nothing at all for it. `nsl check
+# --training-report` — the audit whose entire job is explaining the FASE
+# accumulation decision — answered "Training blocks found: 0" for this
+# program, and `pca_activation::detect_packing_for_stmts` answered `false`
+# for its packed corpus while `stmts_contain_train_block` (twelve lines
+# earlier in the same function) admitted the block into PCA Tier-A kernel
+# synthesis.
+#
+# One token separates this file from its train twin, so anything that differs
+# between the two reports is caused by the block spelling and nothing else.
+from nsl.nn.losses import mse_loss
+
+dataset PretrainCorpus("/data/pile"):
+    source = "/data/pile.bin"
+    packing = true
+    max_sequence_length = 2048
+    mean_doc_length = 400
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let teacher = Linear()
+let student = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+distill(teacher = teacher, student = student, epochs = 1, grad_accumulation = 4):
+    data:
+        source = PretrainCorpus
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    loss:
+        alpha = 0.5
+        temperature = 2.0
+    step(batch):
+        let t_out = teacher.forward(x)
+        let s_out = student.forward(x)
+        let loss = mse_loss(s_out, y) + mse_loss(s_out, t_out)

@@ -2020,6 +2020,25 @@ impl<'a> Compiler<'a> {
         self.wgrad_hook_blocks + self.wgrad_declines.len() + 1
     }
 
+    /// How to NAME the block currently being lowered, in a diagnostic emitted
+    /// from the shared `compile_train_block_inner` path.
+    ///
+    /// A `distill(...)` block lowers through a synthetic `TrainBlock`, so
+    /// every diagnostic on that path spoke about a "train block" — including
+    /// the accumulation-window ones, whose remedies literally instruct the
+    /// user to "set grad_accumulation ... in a train block". A distill program
+    /// has no train block to edit, and `distill`'s own `grad_accumulation`
+    /// key (which is what they need) went unmentioned. `active_distill_context`
+    /// is `Some` for exactly the span of the delegation, which is exactly the
+    /// span over which the answer is "distill".
+    pub(crate) fn training_block_noun(&self) -> &'static str {
+        if self.active_distill_context.is_some() {
+            "distill block"
+        } else {
+            "train block"
+        }
+    }
+
     pub(crate) fn finish_wgrad_admission(&self) -> Result<(), CodegenError> {
         if !self.compile_options.fuse_wgrad_accum || self.wgrad_hook_blocks > 0 {
             return Ok(());
@@ -2078,8 +2097,8 @@ impl<'a> Compiler<'a> {
             // reported as silently permitted.
             Err(CodegenError::new(format!(
                 "--fuse-wgrad-accum requires grad_accumulation >= 2 and a \
-                 FASE-Deferred plan in at least one train block, and this \
-                 compile has none: {reason}. {remedy}"
+                 FASE-Deferred plan in at least one training block (`train` \
+                 or `distill`), and this compile has none: {reason}. {remedy}"
             )))
         }
     }

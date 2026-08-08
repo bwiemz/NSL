@@ -373,6 +373,215 @@ fn nsl_run_distill_loss_decreases() {
     );
 }
 
+/// `epochs` gets the same by-value contract as `grad_accumulation`, for the
+/// same reason and one step worse: a non-literal used to leave the count at
+/// `1` in `compile_distill_block`, so `let n = 8` + `distill(..., epochs = n)`
+/// COMPILED CLEAN, reported "Epochs: 1", and trained the student on an eighth
+/// of the requested work.
+///
+/// The control is the `train` twin, which has always hard-errored on the
+/// identical input — the asymmetry was the bug, not the strictness. Both arms
+/// are the same program differing only in the block spelling, so the block
+/// kind is the only thing that can explain a difference between them.
+#[test]
+fn a_non_literal_epochs_refuses_on_distill_exactly_as_it_does_on_train() {
+    let base = std::fs::read_to_string(fixture_path("cpkd_distill_basic.nsl")).unwrap();
+    let src = base
+        .replace("distill(", "let n_ep = 8\ndistill(")
+        .replace("epochs = 1)", "epochs = n_ep)");
+    assert_ne!(base, src, "fixture knobs not found — resync test");
+    assert!(src.contains("epochs = n_ep)"), "the epochs rewrite matched nothing");
+    let file = write_temp_fixture("nonlit_epochs", &src);
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("check").arg(&file);
+    cmd.assert().failure().stderr(
+        predicate::str::contains("distill 'epochs' must be an integer literal")
+            .and(predicate::str::contains("unknown distill config key").not()),
+    );
+
+    // Control: an integer literal still checks, so the guard is not simply
+    // rejecting the key.
+    let ok = base.replace("epochs = 1)", "epochs = 8)");
+    let ok_file = write_temp_fixture("lit_epochs", &ok);
+    let mut ok_cmd = Command::cargo_bin("nsl").unwrap();
+    ok_cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    ok_cmd.arg("check").arg(&ok_file);
+    ok_cmd
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("checked successfully"));
+}
+
+/// The Distillation Build Report states the accumulation window and the FASE
+/// mode it selected.
+///
+/// It reported `Epochs: N` and stopped there, which is not the optimizer-step
+/// count once a window exists, and said nothing about the decision the window
+/// actually drives. `Passthrough` is the load-bearing word: it means there is
+/// no Deferred envelope, and therefore that a CPDT optimizer-moment precision
+/// plan will arbitrate to nothing however good the plan is — the exact failure
+/// PR #484 fixed, which this report could not have explained.
+///
+/// Two arms, one token apart, so the window is demonstrably the cause.
+#[test]
+fn the_build_report_states_the_accumulation_window_and_its_fase_mode() {
+    let fixture = fixture_path("cpdt_precision_fp16_distill.nsl");
+    let dir = std::env::temp_dir().join(format!("nsl_cpkd_window_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg("--source-ad")
+        .arg(&fixture)
+        .arg("-o")
+        .arg(dir.join("with_window"));
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Accumulation: grad_accumulation=4 (FASE Deferred)",
+        ))
+        .stderr(predicate::str::contains("no window, so no Deferred envelope").not());
+
+    let src = std::fs::read_to_string(&fixture).unwrap();
+    let no_window = src.replace(", grad_accumulation = 4)", ")");
+    assert_ne!(src, no_window, "the rewrite matched nothing — fixture drifted");
+    let no_window_file = dir.join("no_window.nsl");
+    std::fs::write(&no_window_file, no_window).unwrap();
+
+    let mut off = Command::cargo_bin("nsl").unwrap();
+    off.env("NSL_STDLIB_PATH", stdlib_path());
+    off.arg("build")
+        .arg("--source-ad")
+        .arg(&no_window_file)
+        .arg("-o")
+        .arg(dir.join("without_window"));
+    off.assert().success().stderr(
+        predicate::str::contains("Accumulation: grad_accumulation=1 (FASE Passthrough)")
+            .and(predicate::str::contains(
+                "no window, so no Deferred envelope for a CPDT optimizer-moment \
+                 precision plan to lower into",
+            )),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Diagnostics emitted from the SHARED `compile_train_block_inner` path must
+/// name the block the user actually wrote. `--fuse-wgrad-accum` and
+/// `--layerwise-accum` both refuse on a window of 1, and both told a distill
+/// author to go edit a "train block" — a construct their program does not
+/// contain — while never mentioning `distill`'s own `grad_accumulation` key,
+/// which is the thing they need to set.
+///
+/// The train twin is the control: it must keep saying "train block", so the
+/// selector is demonstrably reading the block kind rather than having been
+/// globally reworded.
+#[test]
+fn window_diagnostics_name_the_distill_block_not_a_train_block() {
+    let dir = std::env::temp_dir().join(format!("nsl_cpkd_noun_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    let distill_src =
+        std::fs::read_to_string(fixture_path("cpdt_precision_fp16_distill.nsl")).unwrap();
+    let no_window = distill_src.replace(", grad_accumulation = 4)", ")");
+    assert_ne!(distill_src, no_window, "the rewrite matched nothing");
+    let distill_file = dir.join("distill_no_window.nsl");
+    std::fs::write(&distill_file, no_window).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg("--source-ad")
+        .arg("--fuse-wgrad-accum")
+        .arg(&distill_file)
+        .arg("-o")
+        .arg(dir.join("distill_bin"));
+    // Failure, not success: with no block fusing, the compile-scoped
+    // admission refuses. What this arm pins is the WORDING on the way there.
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "[wgrad-fusion] declined: distill block #1",
+        ))
+        .stderr(predicate::str::contains(
+            "the distill block omits grad_accumulation",
+        ));
+
+    // Control: the train twin keeps the train wording.
+    let train_src =
+        std::fs::read_to_string(fixture_path("cpdt_precision_fp16.nsl")).unwrap();
+    let train_no_window = train_src.replace(", grad_accumulation = 4)", ")");
+    assert_ne!(train_src, train_no_window, "the train rewrite matched nothing");
+    let train_file = dir.join("train_no_window.nsl");
+    std::fs::write(&train_file, train_no_window).unwrap();
+
+    let mut train_cmd = Command::cargo_bin("nsl").unwrap();
+    train_cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    train_cmd
+        .arg("build")
+        .arg("--source-ad")
+        .arg("--fuse-wgrad-accum")
+        .arg(&train_file)
+        .arg("-o")
+        .arg(dir.join("train_bin"));
+    train_cmd
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "[wgrad-fusion] declined: train block #1",
+        ))
+        .stderr(predicate::str::contains("the train block omits grad_accumulation"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The WGGO pre-pass must count a distill block in its document order.
+///
+/// `walk_stmts` stamps `is_first_train_block` from a running counter, and its
+/// `For`/`While` arms exist precisely because a block that yields no pre-plan
+/// must still ADVANCE that counter — "otherwise a LATER top-level train block
+/// wrongly inherits `is_first_train_block`, corrupting the 'first train block
+/// governs admission' invariant every consumer in kernel.rs relies on". A
+/// distill block yields no pre-plan either, and it was falling through to
+/// `_ => {}`.
+///
+/// Two distill blocks make the ordinal the whole assertion: the notes must
+/// read #1 then #2. If the counter did not advance, both would read #1 — which
+/// is exactly the mutation this arm exists to catch, and no `contains` check
+/// on a single-block program could see it.
+#[test]
+fn the_wggo_prepass_counts_distill_blocks_in_document_order() {
+    let base = std::fs::read_to_string(fixture_path("cpdt_precision_fp16_distill.nsl")).unwrap();
+    let (head, block) = base
+        .split_once("distill(teacher = teacher")
+        .expect("fixture header not found — resync test");
+    let block = format!("distill(teacher = teacher{block}");
+    let second = block.replace("epochs = 8, grad_accumulation = 4", "epochs = 2, grad_accumulation = 2");
+    assert_ne!(block, second, "the second-block rewrite matched nothing");
+    let file = write_temp_fixture("two_distill", &format!("{head}{block}\n{second}"));
+
+    let dir = file.parent().unwrap().to_path_buf();
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg("--source-ad")
+        .arg("--wggo")
+        .arg("full")
+        .arg(&file)
+        .arg("-o")
+        .arg(dir.join("two_distill_bin"));
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "[wggo] pre-pass: no pre-plan for training block #1 (distill block",
+        ))
+        .stderr(predicate::str::contains(
+            "[wggo] pre-pass: no pre-plan for training block #2 (distill block",
+        ));
+}
+
 /// The Distillation Build Report must render on stderr with the fused
 /// KL-CE line and the I-11 freeze evidence when @fused_kl_ce fires.
 #[test]

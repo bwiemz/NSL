@@ -4404,58 +4404,22 @@ impl Compiler<'_> {
             ));
         }
 
-        // ── Extract distill config (semantic layer already validated) ──
-        let mut teacher_sym: Option<nsl_ast::Symbol> = None;
-        let mut student_sym: Option<nsl_ast::Symbol> = None;
-        let mut epochs: i64 = 1;
-        let mut forwarded_config: Vec<nsl_ast::expr::Arg> = Vec::new();
-        for arg in &distill.config {
-            if let Some(name_sym) = arg.name {
-                match self.resolve_sym(name_sym) {
-                    "teacher" => {
-                        if let ExprKind::Ident(sym) = &arg.value.kind {
-                            teacher_sym = Some(*sym);
-                        }
-                    }
-                    "student" => {
-                        if let ExprKind::Ident(sym) = &arg.value.kind {
-                            student_sym = Some(*sym);
-                        }
-                    }
-                    "epochs" => {
-                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                            epochs = *n;
-                        }
-                    }
-                    "grad_accumulation" => {
-                        // Mirrors the 'epochs' contract: the window is a
-                        // compile-time constant. The train path CLAMPS a
-                        // non-literal to 1 silently; on distill that clamp is
-                        // indistinguishable from the pre-fix behaviour (no
-                        // FASE-Deferred envelope, so no CPDT moment precision),
-                        // so refuse instead. The semantic checker produces the
-                        // span-labelled diagnostic; this is the backstop for
-                        // callers that lower an AST without checking it.
-                        match arg.value.kind {
-                            ExprKind::IntLiteral(n) if n >= 1 => {
-                                forwarded_config.push(arg.clone());
-                            }
-                            _ => {
-                                return Err(CodegenError::new(
-                                    "distill 'grad_accumulation' must be a positive \
-                                     integer literal",
-                                ));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let teacher_sym = teacher_sym.ok_or_else(|| {
+        // ── Present the distill header as a train header ────────────────
+        // `cpkd::distill_as_train_block` is the ONE place that says which
+        // header keys travel and how. It is shared with the module-level AST
+        // scans (`training_report`, `pca_activation`), which is the point: a
+        // distill block is a training loop, and before this every such scan
+        // matched `StmtKind::TrainBlock` and saw nothing at all — reporting
+        // "Training blocks found: 0" for a block that trains, and computing
+        // `segment_masked = false` for a packed corpus. Extracting here
+        // rather than there would have re-opened exactly that divergence.
+        let presented = crate::cpkd::distill_as_train_block(distill, self.interner)
+            .map_err(CodegenError::new)?;
+        let epochs = presented.epochs;
+        let teacher_sym = presented.teacher_sym.ok_or_else(|| {
             CodegenError::new("distill block requires 'teacher=<model ident>'")
         })?;
-        let student_sym = student_sym.ok_or_else(|| {
+        let student_sym = presented.student_sym.ok_or_else(|| {
             CodegenError::new("distill block requires 'student=<model ident>'")
         })?;
 
@@ -4515,30 +4479,12 @@ impl Compiler<'_> {
             }
         }
 
-        // ── Synthetic TrainBlock: the DistillContext seeds model/epochs, so
-        //    the config carries ONLY the keys the context cannot express.
-        //
-        //    Today that is exactly `grad_accumulation`: it is consumed solely
-        //    by `compile_train_block_inner` (the accumulation gate and the
-        //    FASE plan's `accumulation` field), has no DistillContext home,
-        //    and its absence pinned every distill block to FASE Passthrough —
-        //    which is why the CPDT optimizer-moment precision plan planned
-        //    weights-only and then lowered nothing on this path.
-        //
-        //    `teacher`/`student`/`epochs` stay OUT deliberately: the context
-        //    is their single source of truth (`model_sym = student_sym`,
-        //    `epochs = distill.epochs`, applied AFTER this config loop runs),
-        //    so a second copy here would be a divergence waiting for one of
-        //    the two to be edited. Blanket-forwarding is refused for a
-        //    sharper reason: the train config loop ignores keys it does not
-        //    know, so any future distill-only key that later becomes a train
-        //    key would silently activate a train feature nobody declared for
-        //    distillation. Each key gets forwarded when it is justified.
-        let synthetic = nsl_ast::block::TrainBlock {
-            config: forwarded_config,
-            sections: distill.sections.clone(),
-            span: distill.span,
-        };
+        // The synthetic TrainBlock built above by the shared presentation.
+        // Which keys travel — and why `teacher`/`student`/`epochs` stay out
+        // of the config while `grad_accumulation` goes in — is documented on
+        // `cpkd::distill_as_train_block`, which is also what the analysis
+        // scans read, so the two can never drift apart.
+        let synthetic = presented.train;
 
         // Per-block @fused_kl_ce dispatch (mirrors CFTP v10 item 3's
         // per-train-block @fused_lm_ce lookup by stmt id).
@@ -6348,20 +6294,30 @@ impl Compiler<'_> {
                     // user to look for a missing `grad_accumulation=` that is
                     // right there in the source is the wrong-reason failure
                     // this admission exists to avoid.
+                    //
+                    // The noun is chosen, not hard-coded: a distill block
+                    // lowers through this same function, and telling its
+                    // author to edit "a train block" names a construct their
+                    // program does not contain while leaving `distill`'s own
+                    // `grad_accumulation` key unmentioned.
+                    let noun = self.training_block_noun();
                     let how = match grad_accumulation_decl {
                         GradAccumulationDecl::Omitted => {
-                            "the train block omits grad_accumulation, so it \
-                             defaults to 1"
+                            format!("the {noun} omits grad_accumulation, so it defaults to 1")
                         }
                         GradAccumulationDecl::Literal => {
-                            "the train block sets grad_accumulation to 1"
+                            format!("the {noun} sets grad_accumulation to 1")
                         }
+                        // Train-only by construction: `cpkd::distill_as_train_block`
+                        // refuses a non-literal window before this point, so
+                        // this arm cannot describe a distill block.
                         GradAccumulationDecl::NonLiteral => {
                             "the train block sets grad_accumulation to a \
                              non-literal expression, which the train path \
                              reads as 1 — only an integer literal is honoured \
                              here (`distill` refuses one instead; see \
                              spec/05-training-loop.nsl.md)"
+                                .to_string()
                         }
                     };
                     (
@@ -6370,8 +6326,13 @@ impl Compiler<'_> {
                              Passthrough and there is no m_partial for the \
                              beta=1 GEMM to accumulate into"
                         ),
-                        "Set grad_accumulation to an integer literal >= 2 in a \
-                         train block, or drop --fuse-wgrad-accum.",
+                        if self.active_distill_context.is_some() {
+                            "Set grad_accumulation to an integer literal >= 2 on \
+                             the distill block, or drop --fuse-wgrad-accum."
+                        } else {
+                            "Set grad_accumulation to an integer literal >= 2 in a \
+                             train block, or drop --fuse-wgrad-accum."
+                        },
                     )
                 } else {
                     (
@@ -6395,7 +6356,8 @@ impl Compiler<'_> {
                 // program this line is the only thing that says which block
                 // is inert.
                 eprintln!(
-                    "[wgrad-fusion] declined: train block #{} — {reason}",
+                    "[wgrad-fusion] declined: {} #{} — {reason}",
+                    self.training_block_noun(),
                     self.wgrad_block_ordinal()
                 );
                 self.wgrad_declines.push((reason, remedy));
@@ -6423,18 +6385,20 @@ impl Compiler<'_> {
                 ));
             }
             if grad_accumulation_steps <= 1 {
-                return Err(CodegenError::new(
-                    "--layerwise-accum requires grad_accumulation >= 2 in the train \
-                     block: with a single-micro-batch window there is no \
-                     accumulation window to buffer",
-                ));
+                return Err(CodegenError::new(format!(
+                    "--layerwise-accum requires grad_accumulation >= 2 in the {}: \
+                     with a single-micro-batch window there is no accumulation \
+                     window to buffer",
+                    self.training_block_noun()
+                )));
             }
             if !fase_deferred {
                 return Err(CodegenError::new(format!(
                     "--layerwise-accum requires a FASE-Deferred plan (AdamW/Adam \
                      + grad_accumulation >= 2, or Muon's separate-accumulator \
-                     window mode); this train block resolved to {:?}. Use \
+                     window mode); this {} resolved to {:?}. Use \
                      AdamW, Adam, or Muon, or drop --layerwise-accum",
+                    self.training_block_noun(),
                     fase_plan.mode
                 )));
             }
@@ -8531,6 +8495,18 @@ impl Compiler<'_> {
                         teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
                         student_name: self.resolve_sym(distill.student_sym).to_string(),
                         epochs: distill.epochs,
+                        // The window and the FASE mode it selected. The report
+                        // stated `Epochs` alone, which is not the optimizer-step
+                        // count once a window exists, and said nothing about the
+                        // decision the window actually drives: `Passthrough` here
+                        // means there is no Deferred envelope, and therefore that
+                        // a CPDT optimizer-moment precision plan will arbitrate
+                        // to nothing no matter how good the plan is. Read from
+                        // the SAME locals the lowering used, three thousand lines
+                        // after they were computed, so the report cannot claim a
+                        // mode the emitted code does not have.
+                        grad_accumulation: grad_accumulation_steps.max(1),
+                        fase_mode: format!("{:?}", fase_plan.mode),
                         loss: distill.loss.clone(),
                         trainable_params: extractor.named_param_var_ids().len(),
                         frozen_teacher_inputs: extractor.frozen_input_var_ids().len(),

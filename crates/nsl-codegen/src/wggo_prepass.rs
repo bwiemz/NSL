@@ -437,6 +437,34 @@ fn walk_stmts(
                     out.push(preplan);
                 }
             }
+            // A distill block is a training loop over the student, so it
+            // OCCUPIES a position in the document order this counter defines
+            // — exactly the reason the `For`/`While` arms below exist. It
+            // gets no pre-plan (`plan_train_block` wants a train header, and
+            // CPDT's weights-only path is designed around a distill block
+            // having none — see `invoke_cpdt_if_enabled`'s doc and the
+            // "[cpdt] planned without a WGGO plan for this block" notice,
+            // which is the honest signal that it planned without one). But
+            // skipping it silently made `distill(...)` followed by
+            // `train(...)` hand `is_first_train_block` to the SECOND block,
+            // and every consumer in kernel.rs relies on "the first training
+            // block governs admission".
+            StmtKind::DistillBlock(_) => {
+                *train_blocks_seen += 1;
+                if wggo_mode_enabled(&compiler.compile_options) {
+                    // Chatter-free unless WGGO is actually enabled, matching
+                    // the sibling notes in `compiler/kernel.rs`. The ordinal
+                    // is the point of the line: it is what proves the block
+                    // occupied its position in the document order rather than
+                    // being skipped.
+                    eprintln!(
+                        "[wggo] pre-pass: no pre-plan for training block #{} \
+                         (distill block — the pre-pass plans from a train \
+                         header; CPDT covers it weights-only)",
+                        *train_blocks_seen
+                    );
+                }
+            }
             StmtKind::Decorated { stmt: inner, .. } => {
                 // Train blocks often sit inside test/bench decorators — same
                 // recursion `stmts_contain_train_block` uses.

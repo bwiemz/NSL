@@ -196,6 +196,24 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 "epochs" => {
+                    // Same contract as `grad_accumulation` below, and for the
+                    // same reason: codegen reads the epoch count as a
+                    // compile-time constant. It used to accept any expression
+                    // here and then LEAVE THE COUNT AT 1 in
+                    // `compile_distill_block` — so `let n = 8` followed by
+                    // `distill(..., epochs = n)` compiled clean, reported
+                    // "Epochs: 1", and trained the student on an eighth of
+                    // the requested work. `train(model = m, epochs = n)`
+                    // hard-errors on the identical input; the asymmetry was
+                    // the bug, not the strictness.
+                    if !matches!(arg.value.kind, ExprKind::IntLiteral(_)) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "distill 'epochs' must be an integer literal",
+                            )
+                            .with_label(arg.span, "expected an integer literal"),
+                        );
+                    }
                     self.check_expr(&arg.value);
                 }
                 "grad_accumulation" => {
@@ -368,8 +386,8 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Shared sections — identical semantics to train, except distribute:
-        // (CPDT composition with distillation) is deferred in v1.
+        // Shared sections — identical semantics to train, including the
+        // `distribute:` refusal, which `train` makes too.
         let mut has_step = false;
         for section in &distill.sections {
             match section {
@@ -456,12 +474,26 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 TrainSection::Distribute(_) => {
+                    // This used to read "(CPDT + distillation composition is
+                    // deferred)". Both halves were false and the wording sent
+                    // readers at the wrong artifact. `distribute:` is not how
+                    // CPDT is configured on ANY block — `compiler.cpdt_mode`
+                    // and `cpdt_cluster` come from `--cpdt` / `--cpdt-num-gpus`
+                    // (and, when the pass reaches it, `@cpdt`) — and codegen
+                    // refuses the section on a plain `train` block in exactly
+                    // the same way. Meanwhile CPDT × distill is NOT deferred:
+                    // `--cpdt full --cpdt-num-gpus N` on a distill block plans
+                    // weights-only and lowers the student's optimizer-moment
+                    // precision today, gated by
+                    // `cpdt_moment_precision_gate::a_distill_block_activates_weights_only_under_the_accumulation_window`.
+                    // Say what train says, so the two agree.
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "distill does not support a distribute: section in v1 \
-                             (CPDT + distillation composition is deferred)",
+                            "distill block `distribute:` sections are not supported; \
+                             configure distribution via the @pipeline decorator / \
+                             CLI options instead",
                         )
-                        .with_label(distill.span, "deferred feature"),
+                        .with_label(distill.span, "unsupported section"),
                     );
                 }
                 TrainSection::Stmt(stmt) => {

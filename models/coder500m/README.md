@@ -77,9 +77,10 @@ Expected report shape:
 ```
 === Training Pipeline Report ===
 File: models/coder500m/pretrain_fase.nsl
-Train blocks found: 1
+Training blocks found: 1
 
 [Block 1]
+  Kind: train
   Model: m
 
   FASE (Fused Accumulation-Step Elimination):
