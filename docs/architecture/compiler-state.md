@@ -85,7 +85,7 @@ including the autodiff `TAPE` itself.)
 | `nsl-codegen/src/hir/ids.rs` | `WIRE_ID_COUNTER`, `REGISTER_ID_COUNTER`, `GENVAR_ID_COUNTER` | TEST | FPGA HIR id generation (macro-declared), reset by `KirToHirPass::lower`. Per-thread BY DESIGN: a process-global atomic would break snapshot tests under parallel sharding. Note: these do shape emitted HIR id values, so they are the one TEST entry with artifact influence — a lowering-context field is the eventual home. |
 | `nsl-codegen/src/pass_trace.rs` | `CURRENT_PHASE` | FFI/RUNTIME-OK | Active driver phase for trace attribution — written during every production compile and read by `NSL_PASS_TRACE` reporting, so not test-only; diagnostic-only either way. |
 | `nsl-codegen/src/pass_trace.rs` | `CURRENT_EPOCH` | MIGRATE (compile) | Per-compile attribution scope, added with the pass manager's ordering decision. Thread-local strictly BEATS the process-global counter it replaced (a compile never spans threads, and a process-global let one thread's compile claim another's pass invocations) — but unlike `CURRENT_PHASE` it is not diagnostic-only: `per_compile_view` is what the manager ENFORCES ordering from, so a wrong epoch is a wrong refusal. The only compile-side MIGRATE row; last in priority, not first, because its explicit home (an epoch owned by `PassManager` and handed to `record`) means threading a parameter through 32 ambient call sites in unrelated passes. |
-| `nsl-runtime/src/pca_rope_runtime.rs` | `PACKING_METADATA` | **MIGRATE** | Device pointers for `segment_ids`/`doc_starts` set per training step — the "explicit step input" migration target (Phase 3). Real runtime behavior via a global; races if a step's data prep and its FA call ever land on different threads. |
+| `nsl-runtime/src/pca_rope_runtime.rs` | `PACKING_METADATA` | **MIGRATE** | Device pointers for `segment_ids`/`doc_starts` set per training step. Phase 3a (done): the fused-AD @flash_attention reads inside a train block are explicit Cranelift dataflow (`Compiler::packing_meta_vars`, per-micro-batch `def_var` at the stash) — no global read on that path. What remains (3b): the model-METHOD readers in `expr/advanced.rs`, a different Cranelift function, which need the hidden-param-vs-handle ABI decision; until then the setter and both getters stay. |
 | `nsl-runtime/src/autodiff/mod.rs` | `TAPE` | MIGRATE (runtime) | THE autodiff tape — the heaviest behavioral thread-local in the codebase (27 access sites). Missing from every previous version of this table. |
 | `nsl-runtime/src/tensor/mod.rs` | `TENSOR_SCOPE`, `TRAINING_MODE` | MIGRATE (runtime) | Scope-stack pointer and the global train/eval flag that gates tape recording. |
 | `nsl-runtime/src/tensor/mod.rs` | `INPLACE_SUPPRESS_DEPTH` | MIGRATE (runtime) | FBIP in-place-suppression depth. Its only production readers were the (permanently disabled) refcount-elision predicates — writers are still emitted; the live reads are one test. A migration should first decide whether it still earns its writes. |
@@ -140,12 +140,18 @@ refilled exactly one row of it (see its note — it is deliberately last, and it
 replaced something worse). The runtime side splits into three independent
 clusters — do NOT build one mega-context:
 
-1. **Per-train-step inputs**: `PACKING_METADATA`. Smallest and cleanest —
-   the first target. The obstacle every cluster shares: these are reached
-   across `extern "C"` boundaries from Cranelift-emitted code, so an
-   explicit context means either a hidden parameter in emitted signatures
-   or an opaque handle — an ABI change, which is why this phase needs its
-   own design rather than a mechanical sweep.
+1. **Per-train-step inputs**: `PACKING_METADATA`. Phase 3a landed: the
+   in-function half (the wengert-lowered forward claim + csha backward,
+   which share the train block's Cranelift function with the stash) reads
+   function-local variables the stash `def_var`s per micro-batch — the
+   CSLA window-backward's re-stash now feeds dataflow rather than
+   compensating for a global surviving loop iterations. The residual 3b
+   half is the model-method readers (`expr/advanced.rs`), a DIFFERENT
+   Cranelift function: reaching them means either a hidden parameter in
+   emitted method signatures or an opaque handle — an ABI change
+   (`declaration.rs` signature build, `c_wrapper.rs`, FPGA lowering's
+   params[0] assertion), which is why 3b needs its own design rather than
+   a mechanical sweep.
 2. **Autodiff/execution session**: `TAPE`, `TRAINING_MODE`, `TENSOR_SCOPE`,
    `INPLACE_SUPPRESS_DEPTH` (decide the last one's fate first — its
    production reader is dead).

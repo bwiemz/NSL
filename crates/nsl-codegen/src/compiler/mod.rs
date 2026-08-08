@@ -901,6 +901,24 @@ pub struct Compiler<'a> {
     /// VarIds — the counter is per-extraction, so the ids WOULD collide.
     pub arena_placements: HashMap<crate::wengert::VarId, crate::transient_arena::Placement>,
 
+    /// Item 17 phase 3a: the packing-metadata `(segment_ids, doc_starts)`
+    /// device pointers as Cranelift variables of the TRAIN-STEP function.
+    /// `Some` only between the train block declaring them and its wrapper
+    /// clearing them — the fused-AD @flash_attention sites (forward claim +
+    /// csha backward in `wengert_lower.rs`) read these instead of the
+    /// `PACKING_METADATA` thread-local, making the value per-micro-batch
+    /// dataflow (the stash `def_var`s it) rather than mutable global state.
+    /// Model-METHOD bodies (`expr/advanced.rs`) are a different Cranelift
+    /// function, so they keep the getter FFI until the phase-3b ABI change;
+    /// a Variable from this function would be meaningless there, which is
+    /// why the field must never survive past the train block that made it.
+    ///
+    /// Lives on the compiler for the same reason as `arena_placements`
+    /// above: the wengert lowering already takes `&mut Compiler`, and a new
+    /// parameter through every `compile_wengert_ops_range` caller would be
+    /// a wider diff for the same reachability.
+    pub packing_meta_vars: Option<(cranelift_frontend::Variable, cranelift_frontend::Variable)>,
+
     // ── CPKD side-channel ─────────────────────────────────────────────
     /// The distill block currently being lowered, if any.  Installed by
     /// `compile_distill_block` around its delegation into
@@ -1211,6 +1229,7 @@ impl<'a> Compiler<'a> {
                     .to_string(),
             ),
             arena_placements: HashMap::new(),
+            packing_meta_vars: None,
             active_distill_context: None,
             pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,

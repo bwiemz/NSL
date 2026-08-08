@@ -5340,6 +5340,13 @@ impl Compiler<'_> {
             self.arena_placements.clear();
             let _ = self.compile_call_by_name(builder, "nsl_arena_destroy", &[]);
         }
+        // Item 17 phase 3a: the packing-metadata variables belong to the
+        // train-step function this block just built — a later function
+        // (another train block, a grad block, a model method) using them
+        // would reference a variable of the WRONG Cranelift function.
+        // Cleared unconditionally, including on the error path, exactly
+        // like the placement map above.
+        self.packing_meta_vars = None;
         result?;
         // Item 2 step 6: the ordering decision, enforced. Every pass on a
         // declared InvocationOrdered edge (CSHA, WRGA — both invoked inside
@@ -7370,6 +7377,20 @@ impl Compiler<'_> {
         state
             .variables
             .insert(step_param_sym, (step_param_var, cl_types::I64));
+
+        // Item 17 phase 3a: packing metadata as explicit dataflow. Declared
+        // here (dominating every stash and every fused-AD read) and defined
+        // per micro-batch by `emit_packing_registry_stash`; (0, 0) is the
+        // same identity sentinel the runtime registry uses. The wrapper
+        // clears the field on every exit path — see `packing_meta_vars`'s
+        // doc for why it must not outlive this function.
+        let seg_meta_var = state.new_variable();
+        builder.declare_var(seg_meta_var, cl_types::I64);
+        builder.def_var(seg_meta_var, init_null);
+        let doc_meta_var = state.new_variable();
+        builder.declare_var(doc_meta_var, cl_types::I64);
+        builder.def_var(doc_meta_var, init_null);
+        self.packing_meta_vars = Some((seg_meta_var, doc_meta_var));
 
         let epoch_loss_var = state.new_variable();
         builder.declare_var(epoch_loss_var, cl_types::I64);
@@ -16326,6 +16347,14 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_data_ptr", &[seg_tensor])?;
         let doc_data_ptr =
             self.compile_call_by_name(builder, "nsl_tensor_data_ptr", &[doc_tensor])?;
+        // Item 17 phase 3a: the fused-AD reads consume these VARIABLES; the
+        // thread-local set below stays for the model-METHOD readers
+        // (`expr/advanced.rs`), which live in a different Cranelift function
+        // until the phase-3b ABI change.
+        if let Some((sv, dv)) = self.packing_meta_vars {
+            builder.def_var(sv, seg_data_ptr);
+            builder.def_var(dv, doc_data_ptr);
+        }
         self.compile_call_by_name(
             builder,
             "nsl_packing_metadata_set",
@@ -16339,6 +16368,10 @@ impl Compiler<'_> {
         builder.switch_to_block(no_seg_block);
         builder.seal_block(no_seg_block);
         let zero = builder.ins().iconst(cl_types::I64, 0);
+        if let Some((sv, dv)) = self.packing_meta_vars {
+            builder.def_var(sv, zero);
+            builder.def_var(dv, zero);
+        }
         self.compile_call_by_name(builder, "nsl_packing_metadata_set", &[zero, zero])?;
         builder.ins().jump(after_block, &[]);
 
