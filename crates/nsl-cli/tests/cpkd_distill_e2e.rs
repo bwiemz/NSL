@@ -400,7 +400,7 @@ fn a_non_literal_epochs_refuses_on_distill_exactly_as_it_does_on_train() {
             .and(predicate::str::contains("unknown distill config key").not()),
     );
 
-    // Control: an integer literal still checks, so the guard is not simply
+    // Control 1: an integer literal still checks, so the guard is not simply
     // rejecting the key.
     let ok = base.replace("epochs = 1)", "epochs = 8)");
     let ok_file = write_temp_fixture("lit_epochs", &ok);
@@ -411,6 +411,38 @@ fn a_non_literal_epochs_refuses_on_distill_exactly_as_it_does_on_train() {
         .assert()
         .success()
         .stdout(predicate::str::contains("checked successfully"));
+
+    // Control 2 — the parity this test is NAMED for, which the two arms above
+    // cannot show because they are both distill programs differing in a value.
+    // The train twin must refuse the same shape, so "distill is now as strict
+    // as train" is demonstrated rather than asserted. Note the different
+    // message and the different LAYER: train's is a codegen error, distill's a
+    // span-labelled semantic one, which is why `nsl check` alone catches only
+    // the distill side and this arm has to build.
+    let train_base =
+        std::fs::read_to_string(fixture_path("cpdt_precision_fp16.nsl")).unwrap();
+    let train_src = train_base
+        .replace("train(", "let n_ep = 2\ntrain(")
+        .replace("epochs = 2,", "epochs = n_ep,");
+    assert_ne!(train_base, train_src, "train fixture knobs not found — resync test");
+    assert!(
+        train_src.contains("epochs = n_ep,"),
+        "the train epochs rewrite matched nothing"
+    );
+    let train_file = write_temp_fixture("nonlit_epochs_train", &train_src);
+    let train_dir = train_file.parent().unwrap().to_path_buf();
+    let mut train_cmd = Command::cargo_bin("nsl").unwrap();
+    train_cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    train_cmd
+        .arg("build")
+        .arg("--source-ad")
+        .arg(&train_file)
+        .arg("-o")
+        .arg(train_dir.join("train_bin"));
+    train_cmd.assert().failure().stderr(predicate::str::contains(
+        "train 'epochs' arg must be an integer literal",
+    ));
+    let _ = std::fs::remove_dir_all(&train_dir);
 }
 
 /// The Distillation Build Report states the accumulation window and the FASE
@@ -465,6 +497,37 @@ fn the_build_report_states_the_accumulation_window_and_its_fase_mode() {
                  precision plan to lower into",
             )),
     );
+    // Third arm: a WINDOW without a Deferred envelope. `Lion` resolves to
+    // FullBuffer at any window (`sign(m + g)` cannot be decomposed
+    // incrementally), so this is the case that separates a RECORDED
+    // `fase_mode` from one re-derived off `grad_accumulation > 1` — the
+    // property `CpkdPlan::fase_mode`'s doc calls load-bearing, and which the
+    // two arms above cannot see because their window and mode move together.
+    let lion = src.replace(
+        "optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)",
+        "optimizer: Lion(lr = 0.0001)",
+    );
+    assert_ne!(src, lion, "the optimizer rewrite matched nothing — fixture drifted");
+    let lion_file = dir.join("lion.nsl");
+    std::fs::write(&lion_file, lion).unwrap();
+
+    let mut lion_cmd = Command::cargo_bin("nsl").unwrap();
+    lion_cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    lion_cmd
+        .arg("build")
+        .arg("--source-ad")
+        .arg(&lion_file)
+        .arg("-o")
+        .arg(dir.join("lion_bin"));
+    lion_cmd.assert().success().stderr(
+        predicate::str::contains(
+            "Accumulation: grad_accumulation=4 (FASE FullBuffer) — a window, but \
+             not a Deferred envelope",
+        )
+        // The window is present, so the no-window clause must NOT fire.
+        .and(predicate::str::contains("no window, so no Deferred envelope").not()),
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -547,10 +610,20 @@ fn window_diagnostics_name_the_distill_block_not_a_train_block() {
 /// distill block yields no pre-plan either, and it was falling through to
 /// `_ => {}`.
 ///
-/// Two distill blocks make the ordinal the whole assertion: the notes must
-/// read #1 then #2. If the counter did not advance, both would read #1 — which
-/// is exactly the mutation this arm exists to catch, and no `contains` check
-/// on a single-block program could see it.
+/// The fixture is `distill; train; distill`, and the assertion is that the two
+/// notes read **#1 and #3**. That ordering is chosen to make the counter's
+/// SHARING observable, not just its advancement:
+///
+/// * `#1` then `#3` requires the distill arm to READ increments made by the
+///   train arm — so an implementation that gave the distill arm its own
+///   private counter (and never touched `train_blocks_seen`) prints `#1, #2`
+///   and fails. A two-distill fixture could not tell those apart, because a
+///   module with no train block leaves the shared counter with exactly one
+///   reachable reader: the `eprintln!` three lines below the write.
+/// * Deleting the increment prints `#1, #2` as well.
+///
+/// So both the mutation and the private-counter rewrite are caught, and the
+/// train block in the middle is what does it.
 #[test]
 fn the_wggo_prepass_counts_distill_blocks_in_document_order() {
     let base = std::fs::read_to_string(fixture_path("cpdt_precision_fp16_distill.nsl")).unwrap();
@@ -560,7 +633,18 @@ fn the_wggo_prepass_counts_distill_blocks_in_document_order() {
     let block = format!("distill(teacher = teacher{block}");
     let second = block.replace("epochs = 8, grad_accumulation = 4", "epochs = 2, grad_accumulation = 2");
     assert_ne!(block, second, "the second-block rewrite matched nothing");
-    let file = write_temp_fixture("two_distill", &format!("{head}{block}\n{second}"));
+    // A train block on the student, between them. `head` already binds
+    // `student`, `x` and `y`.
+    let middle = "train(model = student, epochs = 1):\n    \
+                  optimizer: AdamW(lr = 0.001)\n    \
+                  step(batch):\n        \
+                  let out = student.forward(x)\n        \
+                  let diff = out - y\n        \
+                  let loss = (diff * diff).sum()\n";
+    let file = write_temp_fixture(
+        "distill_train_distill",
+        &format!("{head}{block}\n{middle}\n{second}"),
+    );
 
     let dir = file.parent().unwrap().to_path_buf();
     let mut cmd = Command::cargo_bin("nsl").unwrap();
@@ -579,8 +663,14 @@ fn the_wggo_prepass_counts_distill_blocks_in_document_order() {
             "[wggo] pre-pass: no pre-plan for training block #1 (distill block",
         ))
         .stderr(predicate::str::contains(
-            "[wggo] pre-pass: no pre-plan for training block #2 (distill block",
-        ));
+            "[wggo] pre-pass: no pre-plan for training block #3 (distill block",
+        ))
+        // The negative is what rules out a private counter: with the train
+        // block between them, a distill-local counter would print #2 here.
+        .stderr(predicate::str::contains(
+            "[wggo] pre-pass: no pre-plan for training block #2",
+        )
+        .not());
     // `-o` put a ~270 MB unstripped ELF under `std::env::temp_dir()`, which on
     // this box is a 31 GB tmpfs shared with the linker. Leaving one behind per
     // run is how a suite starts failing with `ld: No space left on device` in

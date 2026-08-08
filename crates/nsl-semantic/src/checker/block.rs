@@ -204,8 +204,17 @@ impl<'a> TypeChecker<'a> {
                     // `distill(..., epochs = n)` compiled clean, reported
                     // "Epochs: 1", and trained the student on an eighth of
                     // the requested work. `train(model = m, epochs = n)`
-                    // hard-errors on the identical input; the asymmetry was
-                    // the bug, not the strictness.
+                    // refuses the identical input; the asymmetry was the bug,
+                    // not the strictness.
+                    //
+                    // Deliberately stricter than train AT THIS LAYER: train's
+                    // refusal lives in codegen (`stmt.rs`), so `nsl check` on
+                    // a train block with a non-literal `epochs` is green and
+                    // only `nsl build` refuses. Putting distill's here means
+                    // `nsl check` catches it and the diagnostic carries a
+                    // span. Lifting train's into this checker would make the
+                    // two layers agree, but that changes train-block
+                    // behaviour and belongs in its own change.
                     if !matches!(arg.value.kind, ExprKind::IntLiteral(_)) {
                         self.diagnostics.push(
                             Diagnostic::error(

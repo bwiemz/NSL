@@ -444,11 +444,27 @@ fn walk_stmts(
             // CPDT's weights-only path is designed around a distill block
             // having none — see `invoke_cpdt_if_enabled`'s doc and the
             // "[cpdt] planned without a WGGO plan for this block" notice,
-            // which is the honest signal that it planned without one). But
-            // skipping it silently made `distill(...)` followed by
-            // `train(...)` hand `is_first_train_block` to the SECOND block,
-            // and every consumer in kernel.rs relies on "the first training
-            // block governs admission".
+            // which is the honest signal that it planned without one).
+            //
+            // BE PRECISE ABOUT WHAT THIS BUYS, because it is a trade and not
+            // a strict win. Before, `distill(...)` followed by `train(...)`
+            // handed `is_first_train_block` to the SECOND block, so a plan
+            // solved for the train block governed module-scoped kernel
+            // admission for both. Now nothing carries the flag at all — a
+            // distill block can NEVER yield a pre-plan, unlike the loop-bound
+            // train block the `For` arm covers — so all three consumers fall
+            // through to their unplanned defaults: the
+            // `[wggo] plan-reachability:` verdict does not print, the
+            // `[csha] wggo-override-{rejected,consumed}` notes do not print,
+            // and `plan_prefers_segment_id` collapses to false, which flips
+            // `per_doc_plan` from "deferred to plan preference" to running
+            // `pca_per_doc::admit`. Both PCA families still mask, so this is
+            // kernel SELECTION, not a correctness change. It is the honest
+            // reading of kernel.rs's own rule — the first training block
+            // governs, and this one has no plan — where the old behaviour
+            // silently let a different block's plan speak for it. No in-tree
+            // program mixes the two spellings; a gate pinning which branch of
+            // that fork runs is a follow-up.
             StmtKind::DistillBlock(_) => {
                 *train_blocks_seen += 1;
                 if wggo_mode_enabled(&compiler.compile_options) {

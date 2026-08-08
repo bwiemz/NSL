@@ -184,6 +184,25 @@ fn a_distill_block_is_reported_with_its_accumulation_window() {
             "missing {needle:?} in the distill report; stdout:\n{stdout}"
         );
     }
+
+    // The TEXT report's discriminator has to be pinned in BOTH directions, and
+    // the JSON arm below cannot do it: `kind` there comes from
+    // `#[derive(Serialize)]`, a different code path from `BlockKind::as_str`.
+    // Without this, `fn as_str(self) -> &'static str { "distill" }` passes
+    // every test in the repo.
+    let (train_code, train_stdout, train_stderr) = run_check_with_report(
+        "training_report_fase_pca_composition.nsl",
+        None,
+    );
+    assert_eq!(train_code, 0, "train twin failed; stderr:\n{train_stderr}");
+    assert!(
+        train_stdout.contains("Kind: train"),
+        "the train twin must render Kind: train; stdout:\n{train_stdout}"
+    );
+    assert!(
+        !train_stdout.contains("Kind: distill"),
+        "the train twin must not render Kind: distill; stdout:\n{train_stdout}"
+    );
 }
 
 /// The JSON surface carries the block kind too, so a consumer diffing two

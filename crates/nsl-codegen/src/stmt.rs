@@ -4482,8 +4482,11 @@ impl Compiler<'_> {
         // The synthetic TrainBlock built above by the shared presentation.
         // Which keys travel — and why `teacher`/`student`/`epochs` stay out
         // of the config while `grad_accumulation` goes in — is documented on
-        // `cpkd::distill_as_train_block`, which is also what the analysis
-        // scans read, so the two can never drift apart.
+        // `cpkd::distill_as_train_block`. Every consumer that needs a distill
+        // block's HEADER builds it there, this site included, so they cannot
+        // drift apart. `pca_activation` is not one of them: it reads only the
+        // verbatim `sections`, so it matches `StmtKind::DistillBlock` directly
+        // rather than cloning a step body to answer a boolean.
         let synthetic = presented.train;
 
         // Per-block @fused_kl_ce dispatch (mirrors CFTP v10 item 3's

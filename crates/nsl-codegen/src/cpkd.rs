@@ -90,9 +90,16 @@ pub struct CpkdPlan {
     pub teacher_name: String,
     pub student_name: String,
     pub epochs: i64,
-    /// The accumulation window this block lowered with (1 = none). It decides
-    /// whether a FASE-Deferred envelope exists at all, and therefore whether
-    /// the CPDT optimizer-moment precision plan has anything to lower into.
+    /// The accumulation window this block lowered with (1 = none).
+    ///
+    /// NECESSARY BUT NOT SUFFICIENT for a FASE-Deferred envelope, which is
+    /// what the CPDT optimizer-moment precision plan lowers into: `fase::plan`
+    /// returns `Passthrough` unconditionally at a window of 1, and at a window
+    /// >= 2 it still needs an optimizer it can decompose incrementally. `Lion`
+    /// (sign(m + g)) and every unrecognised optimizer name resolve to
+    /// `FullBuffer` at ANY window. Read `fase_mode` for the answer; this field
+    /// is the input, not the conclusion. Reasoning "window > 1, therefore
+    /// Deferred" is exactly what put a wrong caveat in `render_report`.
     pub grad_accumulation: i64,
     /// The FASE mode the lowering actually selected, as its `Debug` spelling
     /// (`Deferred` / `Passthrough` / `FullBuffer`). Recorded rather than
@@ -279,11 +286,15 @@ pub struct DistillContext {
 /// `compile_distill_block` matched `IntLiteral` and left `epochs = 1` for
 /// every other expression, so `distill(..., epochs = n)` compiled clean,
 /// printed "Epochs: 1" and trained one epoch, where the identical
-/// `train(model = m, epochs = n)` refuses with "train 'epochs' arg must be an
-/// integer literal". The semantic checker refuses the same spellings with a
-/// span-labelled diagnostic, so on any AST that passed `nsl check` this is a
-/// backstop for callers that lower an unchecked AST — never the user's first
-/// diagnostic.
+/// `train(model = m, epochs = n)` refuses.
+///
+/// Note WHICH LAYER refuses on each side. Train's is a codegen error
+/// (`stmt.rs`: "train 'epochs' arg must be an integer literal"), so
+/// `nsl check` on a train block with a non-literal `epochs` is GREEN.
+/// Distill's is a span-labelled semantic diagnostic, so `nsl check` catches
+/// it, and this function is only the backstop for a caller that lowers an
+/// unchecked AST. Both refuse before anything is emitted; "distill is now
+/// exactly as strict as train" is true of the compile, not of `nsl check`.
 pub fn distill_as_train_block(
     distill: &nsl_ast::block::DistillBlock,
     interner: &nsl_lexer::Interner,
