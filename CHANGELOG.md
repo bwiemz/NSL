@@ -6,7 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Added — `--fuse-lm-head`: the fused LM head joins the production profile
+### Changed — item 17 phase 3a: packing metadata becomes dataflow on the fused-AD path
+
+- **The `@flash_attention` reads inside a train block no longer consult the
+  `PACKING_METADATA` thread-local.** The stash `def_var`s the
+  `(segment_ids, doc_starts)` device pointers into function-local Cranelift
+  variables per micro-batch, and the wengert-lowered forward claim and csha
+  backward read those — so the CSLA window-backward's re-stash now feeds
+  per-iteration dataflow instead of compensating for a global that survives
+  loop iterations, and a read can no longer see a stale batch's (freed)
+  pointers on that path. The variables are cleared on every train-block
+  exit path (they belong to that function; a later block or grad block gets
+  the getter fallback). The thread-local, its setter, and both getters stay
+  for the model-METHOD readers (`expr/advanced.rs`) — a different Cranelift
+  function that needs phase 3b's ABI decision (hidden param vs opaque
+  handle) documented in `docs/architecture/compiler-state.md`.
 
 - **An ~8.5% measured step-time win no longer depends on hand-editing model
   source.** The CFTP fused linear-CE kernel required a `@fused_lm_ce`

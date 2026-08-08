@@ -1200,23 +1200,32 @@ fn emit_fused_forward_under_claim(
     // through this call — not the advanced.rs one — so the diagnostic
     // must exist here too.
     //
-    // CFTP §4.3 / Tier A activation (spec 2026-05-17): read the per-step
-    // thread-local packing registry. Train block sets segment_ids /
-    // doc_starts at step body start; this @train fused launch reads them
-    // back. Both getters return 0 when uninitialized (test fixtures that
-    // skip the train block) → identity path.
-    let seg_ids_ptr_v = call(
-        compiler,
-        builder,
-        "nsl_packing_metadata_get_segment_ids",
-        &[],
-    )?;
-    let doc_starts_v = call(
-        compiler,
-        builder,
-        "nsl_packing_metadata_get_doc_starts",
-        &[],
-    )?;
+    // CFTP §4.3 / Tier A activation (spec 2026-05-17): the per-step packing
+    // metadata. Item 17 phase 3a: inside a train block this is explicit
+    // dataflow — the stash `def_var`s the pointers per micro-batch into
+    // function-local variables, so this @train fused launch reads the value
+    // the CURRENT iteration's batch produced (not whatever a global last
+    // held). Outside a train block (no stash ran) the thread-local getters
+    // remain; they return 0 when uninitialized (test fixtures that skip the
+    // train block) → identity path.
+    let (seg_ids_ptr_v, doc_starts_v) = if let Some((sv, dv)) = compiler.packing_meta_vars {
+        (builder.use_var(sv), builder.use_var(dv))
+    } else {
+        (
+            call(
+                compiler,
+                builder,
+                "nsl_packing_metadata_get_segment_ids",
+                &[],
+            )?,
+            call(
+                compiler,
+                builder,
+                "nsl_packing_metadata_get_doc_starts",
+                &[],
+            )?,
+        )
+    };
     // Sprint 1 (cycle-2): hoist null RoPE cos/sin into named locals so the
     // save record can stash them. Forward and backward must agree on cos/sin;
     // the save record is the structural channel.
@@ -3119,23 +3128,34 @@ fn lower_single_op(
             // pass 0 (kernel interprets as "all heads live").
             let active_heads_val = builder.ins().iconst(cl_types::I64, 0);
 
-            // CFTP §4.3 / Tier A activation (spec 2026-05-17): read the
-            // per-step thread-local packing registry. The forward at
-            // line ~565 above reads the same registry on the same step,
-            // so the de-rotation math here uses identical segment_ids /
-            // doc_starts pointers — bit-identical effective_pos.
-            let seg_ids_ptr_v = call(
-                compiler,
-                builder,
-                "nsl_packing_metadata_get_segment_ids",
-                &[],
-            )?;
-            let doc_starts_v = call(
-                compiler,
-                builder,
-                "nsl_packing_metadata_get_doc_starts",
-                &[],
-            )?;
+            // CFTP §4.3 / Tier A activation (spec 2026-05-17): the same
+            // packing metadata the forward consumed. Item 17 phase 3a:
+            // inside a train block both forward and backward read the SAME
+            // function-local variables, re-defined per micro-batch by the
+            // stash (the CSLA window backward re-runs the stash for batch b
+            // before replaying its adjoint) — so the de-rotation math here
+            // uses identical segment_ids / doc_starts pointers to that
+            // micro-batch's forward: bit-identical effective_pos. Outside a
+            // train block the thread-local getters remain.
+            let (seg_ids_ptr_v, doc_starts_v) =
+                if let Some((sv, dv)) = compiler.packing_meta_vars {
+                    (builder.use_var(sv), builder.use_var(dv))
+                } else {
+                    (
+                        call(
+                            compiler,
+                            builder,
+                            "nsl_packing_metadata_get_segment_ids",
+                            &[],
+                        )?,
+                        call(
+                            compiler,
+                            builder,
+                            "nsl_packing_metadata_get_doc_starts",
+                            &[],
+                        )?,
+                    )
+                };
 
             // CSHA Tier B.2 (Phase 3 T6 / Sprint 1 T1.3): tier_b2_active flag.
             //
