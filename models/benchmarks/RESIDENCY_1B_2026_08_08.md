@@ -55,6 +55,27 @@ different denominator and is **not** comparable to the tf32 ones. Compare
 consulted, so the policy neither helps nor hinders it — its mirrors were
 already device-resident.
 
+## Direct confirmation at 1B (not inferred from timing)
+
+Re-running the built `layerwise` arm — `--weight-stream` still passed — with
+`NSL_WS_COUNTER=1`:
+
+```
+[weight-stream] uploads: 0 evicts: 0 writeback: 0 registered: 144 ptr_moves: 0 ...
+[weight-stream] residency: pinned=144 of 144 param(s) pinned_mib=3712 streamed_mib=0
+```
+
+**3,712 MiB is the ~3.7 GiB/step the 2026-08-06 matrix measured**: the
+streamed set was the whole parameter surface, re-uploaded every step. All 144
+parameters now pin, and uploads / evicts / writebacks / pointer-moves are all
+zero. The run's `[gpu-mem]` peak reads `alloc=13239MB` — the *resident* arm's
+footprint, not the streaming arm's 12,304 MB, which is the same fact from the
+memory side.
+
+(That capture predates the fix for the blank audit tail, which is why the
+`free_at_decision`/`reserve`/`must_free` fields are missing from the line
+above — see the CHANGELOG. Current builds print them.)
+
 ## What it establishes
 
 - **Not streaming is worth 15.7% of step time — +18.6% tokens/s** (2,246 →
