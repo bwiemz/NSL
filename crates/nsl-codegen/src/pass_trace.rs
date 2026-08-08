@@ -408,8 +408,8 @@ pub fn dispositions() -> Vec<(&'static str, PassDisposition)> {
     let mut out: Vec<(&'static str, PassDisposition)> = Vec::new();
     for (p, d, _) in t.iter() {
         match out.iter_mut().find(|(q, _)| q == p) {
-            Some(slot) => slot.1 = d.clone(),
-            None => out.push((*p, d.clone())),
+            Some(slot) => slot.1 = *d,
+            None => out.push((*p, *d)),
         }
     }
     out
@@ -424,7 +424,7 @@ pub(crate) fn dispositions_in(epoch: u64) -> Vec<(&'static str, PassDisposition)
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|(_, _, e)| *e == epoch)
-        .map(|(p, d, _)| (*p, d.clone()))
+        .map(|(p, d, _)| (*p, *d))
         .collect()
 }
 
