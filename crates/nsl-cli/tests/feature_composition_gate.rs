@@ -1101,14 +1101,18 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
         "internal backstop for a state the CLI makes unreachable",
     ),
     // ADVISORY, not a refusal: `--pretrain-optimized` sets --fuse-wgrad-accum
-    // on programs that never asked for it, so a train block with no
-    // `grad_accumulation` gets this note and the compile SUCCEEDS. The TYPED
-    // form of the same precondition IS a refusal and IS registered
+    // on programs that never asked for it, so a program whose train blocks all
+    // lack `grad_accumulation` gets this note and the compile SUCCEEDS. The
+    // TYPED form of the same precondition IS a refusal and IS registered
     // (`--fuse-wgrad-accum requires grad_accumulation >= 2 ...` in
     // feature_rules.rs); registering the advisory too would claim the bundle
     // refuses, which would be exactly backwards.
+    //
+    // "in this compile", not "on this train block": the note moved with the
+    // refusal when both were rescoped from per-block to per-compile, so that a
+    // program in which SOME block fuses is neither refused nor warned about.
     (
-        "--fuse-wgrad-accum fuses nothing on this train block",
+        "--fuse-wgrad-accum fused nothing in this compile",
         "advisory bundle-partially-disabled note, compile succeeds",
     ),
 ];

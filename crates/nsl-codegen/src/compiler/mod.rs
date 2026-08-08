@@ -2070,9 +2070,16 @@ impl<'a> Compiler<'a> {
             // nothing ANYWHERE in the program is the deferral-must-refuse
             // case — and, unlike the per-block form this replaced, that
             // statement is now true whenever it is made.
+            // Wording is REGISTERED. `feature_rules.rs` pins
+            // "--fuse-wgrad-accum requires grad_accumulation >= 2 and a
+            // FASE-Deferred plan" as this rule's refusal fragment, and
+            // `feature_composition_gate`'s deleted-refusal arm reads it out of
+            // THIS file — reword the leading clause and the composition is
+            // reported as silently permitted.
             Err(CodegenError::new(format!(
-                "--fuse-wgrad-accum fused nothing in this compile: {reason}. \
-                 {remedy}"
+                "--fuse-wgrad-accum requires grad_accumulation >= 2 and a \
+                 FASE-Deferred plan in at least one train block, and this \
+                 compile has none: {reason}. {remedy}"
             )))
         }
     }

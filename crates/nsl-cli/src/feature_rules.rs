@@ -108,6 +108,9 @@ const fn src_rule(
 }
 
 const STMT: &str = "crates/nsl-codegen/src/stmt.rs";
+/// Refusals raised once per COMPILE rather than per train block — see
+/// `Compiler::finish_wgrad_admission`.
+const CODEGEN_COMPILER: &str = "crates/nsl-codegen/src/compiler/mod.rs";
 const STMT_FASE: &str = "crates/nsl-codegen/src/stmt_fase.rs";
 const CLI_RUN: &str = "crates/nsl-cli/src/commands/run.rs";
 const CALIB: &str = "crates/nsl-codegen/src/calibration/binary_codegen.rs";
@@ -713,11 +716,19 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
     // inert on exactly that configuration; a typed flag now refuses. The
     // `--pretrain-optimized` path only warns and is NOT this rule — a bundle
     // that errors would break both shipped pretrain scripts.
+    //
+    // Enforced in `compiler/mod.rs`, not `stmt.rs`, because the flag is per
+    // COMPILE while the precondition is per TRAIN BLOCK: refusing inside
+    // `compile_train_block_inner` aborted programs in which an EARLIER block
+    // had already fused. `stmt.rs` still emits the per-block
+    // `[wgrad-fusion] declined:` note (registered in `exec_markers.rs`);
+    // `Compiler::finish_wgrad_admission` raises this refusal once, and only
+    // when no block anywhere reached the hook.
     src_rule(
         "--fuse-wgrad-accum",
         RuleKind::Requires,
         "grad_accumulation >= 2 (train block)",
-        STMT,
+        CODEGEN_COMPILER,
         "--fuse-wgrad-accum requires grad_accumulation >= 2 and a FASE-Deferred plan",
     ),
     // ── Item 9 phase 2: `@fp8_compute` × source AD — added 2026-07-28 ──────
