@@ -43,13 +43,20 @@
 //! What the scheduler enforces, all of it read from the declarations rather
 //! than hard-coded per pass:
 //!
-//! | when | check | declared by |
-//! |---|---|---|
-//! | before | the pass is registered | `pass_registry::PASSES` |
-//! | before | this driver phase is one the pass declares | `PassDescriptor::phases` |
-//! | before | every `InvocationOrdered` predecessor already ran THIS compile | `ChannelDescriptor::consumed_by_passes` |
-//! | after | `Applied` ⇒ its `Enforced` channels are published | `applied_implies_published` |
-//! | later | the tape a plan's positional refs were captured against is unchanged when the plan is consumed | `TapeAccess` / `TapeRef::PositionalIndex` |
+//! | when | check | refuses? | declared by |
+//! |---|---|---|---|
+//! | before | the pass is registered | yes | `pass_registry::PASSES` |
+//! | before | this driver phase is one the pass declares | yes, when a phase is installed | `PassDescriptor::phases` |
+//! | before | which `InvocationOrdered` predecessors have run | **no — traced** | `ChannelDescriptor::consumed_by_passes` |
+//! | after | `Applied` ⇒ its `Enforced` channels are published | yes | `applied_implies_published` |
+//! | later | the tape a plan's positional refs were captured against is unchanged when the plan is consumed | yes | `TapeAccess` / `TapeRef::PositionalIndex` |
+//!
+//! The predecessor row is an OBSERVATION, not a refusal, and the reason is
+//! written out at its site: "has my producer run yet" is not soundly
+//! decidable before the compile finishes, and every proxy for it that was
+//! tried refuses correct compiles. Inversion enforcement stays in
+//! [`PassManager::enforce_dependency_order`], which is sound because it runs
+//! once both passes are in the ledger.
 //!
 //! The last one is the tape half, and it is the one no existing gate covered:
 //! WRGA scans the primal, and its plan is consumed ~400 lines later where
@@ -327,36 +334,40 @@ impl PassScheduler {
             None => {}
         }
 
-        // PRE 2: every InvocationOrdered predecessor must already have run in
-        // THIS compile. Process-scoped evidence could not support this — see
-        // the module header — which is why it lives on the manager.
-        let seen: Vec<&'static str> = self
-            .trace()
+        // PRE 2: the declared InvocationOrdered predecessors, OBSERVED — not
+        // refused on.
+        //
+        // The refusal is not soundly decidable here, and the first version of
+        // this function shipped one that was not. "Consumer ran before its
+        // producer" needs to know the producer WILL run, which at schedule
+        // time is undecidable: a predecessor that never runs is not an
+        // inversion at all, just a feature that is off, and the consumer
+        // legitimately reads the channel empty (each channel's `empty_means`
+        // says what that means).
+        //
+        // The obvious proxy — "the channel is already published, so its
+        // producer must have run" — is wrong twice over. It was first written
+        // against `pass_bus::traffic`, which is PROCESS-scoped: in a
+        // multi-module build one module's publish leaves `publishes > 0` for
+        // every later module, so a later compile whose own epoch has no WGGO
+        // would be refused. That is the #466 finding exactly. And even scoped
+        // to this compile's bus it stays wrong, because publisher and
+        // recorded pass legitimately differ — `adapter_prescan_plan`'s own
+        // descriptor says it is "published by the driver prescan, which never
+        // records WRGA as having run, so the antecedent cannot be
+        // established for it".
+        //
+        // Enforcement therefore stays where it is sound:
+        // [`PassManager::enforce_dependency_order`], which fires only when
+        // BOTH passes are in this compile's ledger and the order is actually
+        // inverted. The scheduler contributes the observation to the trace so
+        // a missing predecessor is visible at the point of invocation.
+        let seen: Vec<&'static str> = self.trace().into_iter().map(|(p, _)| p).collect();
+        let missing: Vec<&'static str> = crate::pass_bus::required_predecessors(pass)
             .into_iter()
-            .map(|(p, _)| p)
+            .filter(|(producer, _)| !seen.contains(producer))
+            .map(|(producer, _)| producer)
             .collect();
-        for (producer, channel) in crate::pass_bus::required_predecessors(pass) {
-            // A predecessor that did not run AT ALL is not an ordering
-            // violation: the feature is simply off, and the consumer reads the
-            // channel empty (which `empty_means` documents per channel). Only
-            // an INVERSION is a defect, and at this point "producer ran" is
-            // decidable while "producer will run later" is not — so the check
-            // is: if the producer is going to run in this compile it must have
-            // run by now. That is exactly what the post-hoc
-            // `dependency_order_violations` catches after the fact; scheduling
-            // upgrades it to a pre-check for the passes routed through here.
-            if crate::pass_bus::traffic(channel).publishes > 0 && !seen.contains(&producer) {
-                return Err(format!(
-                    "pass '{pass}' was scheduled before '{producer}', its \
-                     declared InvocationOrdered producer on the '{}' channel, \
-                     yet that channel has already been published — the \
-                     consumer is reading a value whose producing pass this \
-                     compile has not run. Compiler scheduling defect, please \
-                     report. NSL_PASS_TRACE=1 prints the full trace.",
-                    channel.descriptor().name
-                ));
-            }
-        }
 
         if let Some(list) = tape {
             let digest = TapeDigest::of(list);
@@ -375,7 +386,7 @@ impl PassScheduler {
         }
 
         Self::trace_line(format_args!(
-            "-> {pass} phase={} epoch={} tape={}",
+            "-> {pass} phase={} epoch={} tape={} predecessors={}",
             match phase {
                 Some(p) => format!("{p:?}"),
                 None => "unscoped(phase check skipped)".to_string(),
@@ -383,6 +394,11 @@ impl PassScheduler {
             self.epoch,
             tape.map(|t| t.ops.len().to_string())
                 .unwrap_or_else(|| "none".into()),
+            if missing.is_empty() {
+                "all-ran".to_string()
+            } else {
+                format!("not-yet-run{missing:?}")
+            },
         ));
 
         let value = body();
