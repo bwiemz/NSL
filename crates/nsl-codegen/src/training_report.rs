@@ -123,21 +123,30 @@ pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &st
                 ));
             }
             StmtKind::DistillBlock(distill) => {
-                // A header this refuses cannot compile either (the semantic
-                // checker refuses the same spellings with a span), so there
-                // is no successful build whose report this skip could
-                // misdescribe.
-                if let Ok(presented) = crate::cpkd::distill_as_train_block(distill, interner) {
-                    let student = presented
-                        .student_sym
-                        .map(|s| resolve(interner, s).to_string());
-                    blocks.push(build_block_report(
-                        BlockKind::Distill,
-                        &presented.train,
-                        student,
-                        interner,
-                        &dataset_configs,
-                    ));
+                // A header the presentation refuses cannot compile either (the
+                // semantic checker refuses the same spellings with a span), so
+                // no successful build reaches here with one. But `build_report`
+                // is `pub` and runs no semantic analysis, so a caller that
+                // hands it an unchecked AST would otherwise get "Training
+                // blocks found: 0" — character for character the defect this
+                // arm exists to fix. Say why instead of dropping it silently.
+                match crate::cpkd::distill_as_train_block(distill, interner) {
+                    Ok(presented) => {
+                        let student = presented
+                            .student_sym
+                            .map(|s| resolve(interner, s).to_string());
+                        blocks.push(build_block_report(
+                            BlockKind::Distill,
+                            &presented.train,
+                            student,
+                            interner,
+                            &dataset_configs,
+                        ));
+                    }
+                    Err(why) => eprintln!(
+                        "note: --training-report skipped a distill block whose \
+                         header cannot be planned: {why}"
+                    ),
                 }
             }
             _ => {}

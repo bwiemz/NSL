@@ -137,13 +137,25 @@ impl CpkdPlan {
             self.loss.alpha, self.loss.temperature, self.loss.feature_weight
         );
         let _ = writeln!(s, "Epochs: {}", self.epochs);
+        // The caveat keys on the MODE, not on the window. Keying it on
+        // `grad_accumulation > 1` was wrong in the one case that matters:
+        // `Lion` (or any optimizer `FaseOptimizer::parse` does not recognise)
+        // resolves to FullBuffer at ANY window, so a block with
+        // `grad_accumulation = 4` printed a clean line while having no
+        // Deferred envelope at all — which is exactly the state the caveat
+        // exists to announce.
         let _ = writeln!(
             s,
             "Accumulation: grad_accumulation={} (FASE {}){}",
             self.grad_accumulation,
             self.fase_mode,
-            if self.grad_accumulation > 1 {
+            if self.fase_mode == "Deferred" {
                 String::new()
+            } else if self.grad_accumulation > 1 {
+                " — a window, but not a Deferred envelope (the optimizer \
+                 decides), so a CPDT optimizer-moment precision plan has \
+                 nothing to lower into"
+                    .to_string()
             } else {
                 " — no window, so no Deferred envelope for a CPDT \
                  optimizer-moment precision plan to lower into"
@@ -237,11 +249,14 @@ pub struct DistillContext {
 /// a train key would silently activate a train feature nobody declared for
 /// distillation.
 ///
-/// * `grad_accumulation` — travels as config, because it is read *only* by
-///   that loop (the FASE plan's `accumulation` field and the accumulation
-///   gate). Carrying it is what lets a distill block reach FASE-Deferred at
-///   all (PR #484); without it every distill block was pinned to Passthrough
-///   and the CPDT optimizer-moment precision plan arbitrated to nothing.
+/// * `grad_accumulation` — travels as config, because config is where the
+///   readers look for it: `compile_train_block_inner`'s loop (the FASE plan's
+///   `accumulation` field and the accumulation gate) and, since this change,
+///   `training_report::extract_fase_config`, which runs the same planner over
+///   the same presented block. Carrying it is what lets a distill block reach
+///   FASE-Deferred at all (PR #484); without it every distill block was pinned
+///   to Passthrough and the CPDT optimizer-moment precision plan arbitrated to
+///   nothing.
 /// * `teacher` / `student` / `epochs` — do NOT travel as config. `train` has
 ///   no teacher/student keys, and on the lowering path [`DistillContext`] is
 ///   the single source of truth for the student and the epoch count (it seeds

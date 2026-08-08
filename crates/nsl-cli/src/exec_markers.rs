@@ -61,6 +61,11 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
             "crates/nsl-codegen/src/stmt.rs",
             "crates/nsl-codegen/src/wggo.rs",
             "crates/nsl-codegen/src/compiler/kernel.rs",
+            // The pre-pass's "no pre-plan for training block #N (distill
+            // block)" note. Registered because the list is the point: the
+            // gate only requires SOME listed file to still contain the
+            // token, so an unlisted emit site can be renamed silently.
+            "crates/nsl-codegen/src/wggo_prepass.rs",
         ],
         "the WGGO planner ran; `consumed pre-solved plan` / `wggo[...]` mean it APPLIED one",
     ),

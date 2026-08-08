@@ -474,24 +474,37 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 TrainSection::Distribute(_) => {
+                    // UNREACHABLE TODAY, and kept deliberately:
+                    // `parse_distill_block_stmt` has no `distribute:` arm (the
+                    // train parser does), so the section becomes a
+                    // `TrainSection::Stmt` and the user gets an undefined-
+                    // variable error instead. Closing that parser gap is a
+                    // separate change; this arm is what will say the right
+                    // thing when it lands, and deleting it now would lose the
+                    // correction below.
+                    //
                     // This used to read "(CPDT + distillation composition is
                     // deferred)". Both halves were false and the wording sent
                     // readers at the wrong artifact. `distribute:` is not how
                     // CPDT is configured on ANY block — `compiler.cpdt_mode`
                     // and `cpdt_cluster` come from `--cpdt` / `--cpdt-num-gpus`
-                    // (and, when the pass reaches it, `@cpdt`) — and codegen
-                    // refuses the section on a plain `train` block in exactly
-                    // the same way. Meanwhile CPDT × distill is NOT deferred:
-                    // `--cpdt full --cpdt-num-gpus N` on a distill block plans
-                    // weights-only and lowers the student's optimizer-moment
-                    // precision today, gated by
+                    // — and codegen refuses the section on a plain `train`
+                    // block in exactly the same way. Meanwhile CPDT × distill
+                    // is NOT deferred: `--cpdt full --cpdt-num-gpus N` on a
+                    // distill block plans weights-only and lowers the student's
+                    // optimizer-moment precision today, gated by
                     // `cpdt_moment_precision_gate::a_distill_block_activates_weights_only_under_the_accumulation_window`.
-                    // Say what train says, so the two agree.
+                    //
+                    // The remedy deliberately does NOT name `@pipeline` the way
+                    // train's does: `compile_distill_block` refuses pipeline
+                    // configuration outright in CPKD v1, so pointing a distill
+                    // author at it would trade one refusal for another.
                     self.diagnostics.push(
                         Diagnostic::error(
                             "distill block `distribute:` sections are not supported; \
-                             configure distribution via the @pipeline decorator / \
-                             CLI options instead",
+                             configure distribution via CLI options (`@pipeline` is \
+                             not an option here — distill refuses pipeline-parallel \
+                             training in CPKD v1)",
                         )
                         .with_label(distill.span, "unsupported section"),
                     );

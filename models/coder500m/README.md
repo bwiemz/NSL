@@ -88,7 +88,7 @@ Training blocks found: 1
     optimizer:         AdamW
     mode:              Deferred
     rationale:         AdamW supports deferred first-moment accumulation with batch-variance v approximation
-    backward_phases:   AccumulateOnly × 7, FinalTwoPhase × 1
+    backward_phases:   AccumulateOnly x 7, FinalTwoPhase
     two_phase_clip:    true
     ...
 ```

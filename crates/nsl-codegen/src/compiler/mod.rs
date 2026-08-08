@@ -2024,13 +2024,23 @@ impl<'a> Compiler<'a> {
     /// from the shared `compile_train_block_inner` path.
     ///
     /// A `distill(...)` block lowers through a synthetic `TrainBlock`, so
-    /// every diagnostic on that path spoke about a "train block" — including
-    /// the accumulation-window ones, whose remedies literally instruct the
-    /// user to "set grad_accumulation ... in a train block". A distill program
-    /// has no train block to edit, and `distill`'s own `grad_accumulation`
-    /// key (which is what they need) went unmentioned. `active_distill_context`
-    /// is `Some` for exactly the span of the delegation, which is exactly the
-    /// span over which the answer is "distill".
+    /// EVERY diagnostic on that path speaks about a "train block", and a
+    /// distill program has no train block to edit.
+    /// `active_distill_context` is `Some` for exactly the span of the
+    /// delegation, which is exactly the span over which the answer is
+    /// "distill".
+    ///
+    /// **Scope, stated so the next reader does not mistake partial wiring for
+    /// full coverage:** only the ACCUMULATION-WINDOW diagnostics call this —
+    /// the `[wgrad-fusion] declined:` note, its two provenance strings and its
+    /// remedy, and the two `--layerwise-accum` refusals. Those are the ones
+    /// whose remedy tells the user to go set `grad_accumulation` somewhere, so
+    /// naming the wrong block makes the remedy unfollowable. Other shared-path
+    /// diagnostics (the Muon optimizer-name refusals, "train block requires a
+    /// step section", the ZeRO optimizer refusal, the model-resolution errors)
+    /// still say "train block" and are reachable from a distill program; they
+    /// are describing a property rather than prescribing an edit, so they are
+    /// less wrong, but they are not right.
     pub(crate) fn training_block_noun(&self) -> &'static str {
         if self.active_distill_context.is_some() {
             "distill block"

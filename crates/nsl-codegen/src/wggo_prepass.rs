@@ -452,11 +452,14 @@ fn walk_stmts(
             StmtKind::DistillBlock(_) => {
                 *train_blocks_seen += 1;
                 if wggo_mode_enabled(&compiler.compile_options) {
-                    // Chatter-free unless WGGO is actually enabled, matching
-                    // the sibling notes in `compiler/kernel.rs`. The ordinal
-                    // is the point of the line: it is what proves the block
-                    // occupied its position in the document order rather than
-                    // being skipped.
+                    // Redundant TODAY — `run` above already returns early
+                    // unless WGGO is enabled, so this is always true when
+                    // reached. Kept as a local guard rather than relying on a
+                    // caller's early return, because `walk_stmts` recurses and
+                    // this is the only line in it that writes to stderr. The
+                    // ordinal is the point of the line: it is what proves the
+                    // block occupied its position in the document order rather
+                    // than being skipped.
                     eprintln!(
                         "[wggo] pre-pass: no pre-plan for training block #{} \
                          (distill block — the pre-pass plans from a train \
