@@ -23,14 +23,59 @@
 //! and the driver refuses the compile instead of printing a line nobody
 //! reads.
 //!
-//! # What this is not
+//! # Scheduling: one pass so far
 //!
-//! Not a scheduler. The driver (`stmt.rs`, `kernel.rs`) still decides when
-//! each pass runs; this module owns the JUDGMENT of that order against the
-//! declared edges. Inverting control — the manager invoking passes from the
-//! declarations — is the step after this one, and it should be built on the
-//! per-compile substrate this module establishes, because a scheduler that
-//! cannot soundly see its own compile's history cannot enforce anything.
+//! The step after judgment is INVERTING CONTROL — the manager invoking passes
+//! from the declarations rather than grading the driver afterwards. That is
+//! [`PassScheduler`], and it is deliberately wired to exactly ONE pass today
+//! (WRGA). Converting the rest is mechanical once the substrate is proven;
+//! converting them all at once would mean landing a scheduler whose refusals
+//! nobody had watched fire.
+//!
+//! WRGA is the first because it is the pass whose declarations are richest and
+//! whose invocation is narrowest: ONE call site
+//! (`stmt::invoke_wrga_if_enabled`), an INCOMING `InvocationOrdered` edge (it
+//! consumes `wggo_overrides`, so WGGO must precede it), an OUTGOING channel
+//! with `applied_implies_published: Enforced` (`wrga_plan`), and a tape
+//! declaration — `MutatesFork`, holding `TapeRef::PositionalIndex` — whose
+//! staleness rule is real and was checked nowhere.
+//!
+//! What the scheduler enforces, all of it read from the declarations rather
+//! than hard-coded per pass:
+//!
+//! | when | check | refuses? | declared by |
+//! |---|---|---|---|
+//! | before | the pass is registered | yes | `pass_registry::PASSES` |
+//! | before | this driver phase is one the pass declares | yes, when a phase is installed | `PassDescriptor::phases` |
+//! | before | which `InvocationOrdered` predecessors have run | **no — traced** | `ChannelDescriptor::consumed_by_passes` |
+//! | after | `Applied` ⇒ its `Enforced` channels are published | yes | `applied_implies_published` |
+//! | later | the tape a plan's positional refs were captured against is unchanged when the plan is consumed | yes | `TapeAccess` / `TapeRef::PositionalIndex` |
+//!
+//! The predecessor row is an OBSERVATION, not a refusal, and the reason is
+//! written out at its site: "has my producer run yet" is not soundly
+//! decidable before the compile finishes, and every proxy for it that was
+//! tried refuses correct compiles. Inversion enforcement stays in
+//! [`PassManager::enforce_dependency_order`], which is sound because it runs
+//! once both passes are in the ledger.
+//!
+//! The phase row is live where a phase scope exists — a top-level
+//! `train(...)` on a real `nsl build` reaches the scheduler as
+//! `Some(TrainBlock)` — and SKIPPED where none does, notably a `train` block
+//! nested inside `fn main():`. See the `None` arm of `schedule`.
+//!
+//! The last one is the tape half, and it is the one no existing gate covered:
+//! WRGA scans the primal, and its plan is consumed ~400 lines later where
+//! `effective_primal` forks onto `plan.prune.pruned`. Positional references
+//! are valid only against the list state that produced them, so anything
+//! mutating that list in between silently invalidates the plan. See
+//! [`PassScheduler::assert_tape_unchanged_since`].
+//!
+//! # Why a Copy handle and not `&self`
+//!
+//! A pass body needs `&mut Compiler`, and the manager LIVES on the Compiler.
+//! `compiler.passes.schedule(|| … compiler …)` cannot borrow-check. The
+//! handle carries the epoch by value, so the borrow of `compiler.passes` ends
+//! before the body runs.
 //!
 //! # Recording stays at the callee
 //!
@@ -39,8 +84,9 @@
 //! The epoch is ambient (thread-local, RAII-scoped), so the callee-side
 //! recording gains per-compile attribution without any call site changing.
 
-use crate::pass_bus::Channel;
+use crate::pass_bus::{Channel, PassBus};
 use crate::pass_registry::CompilePhase;
+use crate::wengert::WengertList;
 
 /// Test-only knob, same convention as `NSL_WGGO_FORCE_STALE_TABLE` /
 /// `NSL_CPDT_FORCE_STALE_PLAN`: force the refusal arm so the enforcement is
@@ -147,6 +193,353 @@ impl PassManager {
     }
 }
 
+/// A `Copy` handle to this compile's manager, so a pass body may borrow the
+/// `Compiler` mutably while a schedule call is in flight. Carries the epoch by
+/// value — see the module header.
+#[derive(Clone, Copy, Debug)]
+pub struct PassScheduler {
+    epoch: u64,
+}
+
+impl PassManager {
+    /// A handle for scheduling passes in this compile.
+    pub fn scheduler(&self) -> PassScheduler {
+        PassScheduler { epoch: self.epoch }
+    }
+}
+
+/// A pass that ran under the scheduler, awaiting its postconditions.
+///
+/// `#[must_use]` because dropping this instead of calling [`Self::finish`]
+/// silently skips the postcondition checks — the value would still be there
+/// and the compile would proceed, which is exactly the "detector nobody calls"
+/// shape the bus module warns about.
+#[must_use = "call finish(&bus) — dropping a Scheduled skips the pass's postconditions"]
+pub struct Scheduled<R> {
+    value: R,
+    pass: &'static str,
+    epoch: u64,
+}
+
+/// A structural digest of a tape, for the positional-reference staleness rule.
+///
+/// Records what a positional reference's validity depends on: the op
+/// sequence and each op's identity. Deliberately NOT the name/type side
+/// tables — renaming a var moves nothing. A 64-bit digest can in principle collide;
+/// this is a tripwire for a compiler-scheduling defect, not a security
+/// boundary, and the alternative (retaining a full clone of every scanned
+/// tape for the rest of the compile) costs memory proportional to the model on
+/// every build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TapeDigest {
+    len: usize,
+    hash: u64,
+}
+
+impl TapeDigest {
+    fn of(list: &WengertList) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        list.ops.len().hash(&mut h);
+        for op in &list.ops {
+            op.id.hash(&mut h);
+            op.result.hash(&mut h);
+            op.inputs.hash(&mut h);
+            op.saved_for_backward.hash(&mut h);
+            op.checkpointed.hash(&mut h);
+            // `PrimalOp` is not `Hash` (it carries an f64 in `Constant`), so
+            // its `Debug` stands in. That distinguishes every variant and
+            // every payload that can affect POSITIONS — in particular a
+            // rewritten `Passthrough` name, which is a real in-place rewrite
+            // (`fuse_swiglu_gate_backward` does exactly it) that a
+            // discriminant-only digest would miss.
+            //
+            // It is not a total injection and is not claimed to be:
+            // `Constant(NaN)` and `Constant(-NaN)` format identically. A
+            // constant's sign cannot move an op's position, which is the only
+            // property the positional-reference rule depends on.
+            format!("{:?}", op.op).hash(&mut h);
+        }
+        list.output.hash(&mut h);
+        Self {
+            len: list.ops.len(),
+            hash: h.finish(),
+        }
+    }
+}
+
+thread_local! {
+    /// `(epoch, pass) -> digest of the tape that pass scanned`.
+    ///
+    /// Thread-local for the reason [`crate::pass_trace`]'s phase is: a compile
+    /// never spans threads, and 15 integration-test binaries drive full
+    /// compiles in parallel, so a process-global map would let one compile's
+    /// digest answer another's question.
+    static SCANNED_TAPES: std::cell::RefCell<Vec<((u64, &'static str), TapeDigest)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl PassScheduler {
+    /// Invoke `body` AS the registered pass `pass`, enforcing what the
+    /// registry and bus declare about it.
+    ///
+    /// `tape`, when supplied, is the list the pass scans; its digest is
+    /// retained so [`Self::assert_tape_unchanged_since`] can check the
+    /// positional-reference rule where the pass's product is consumed.
+    ///
+    /// `Err` means a COMPILER defect — the driver invoked a pass somewhere its
+    /// declarations do not admit — so the body does not run and the message is
+    /// written to be reported, not worked around.
+    pub fn schedule<R>(
+        self,
+        pass: &'static str,
+        tape: Option<&WengertList>,
+        body: impl FnOnce() -> R,
+    ) -> Result<Scheduled<R>, String> {
+        let desc = crate::pass_registry::pass(pass).ok_or_else(|| {
+            format!(
+                "pass '{pass}' was scheduled but is not in pass_registry::PASSES \
+                 — the scheduler cannot check declarations it does not have"
+            )
+        })?;
+
+        // PRE 1: the driver phase must be one the registry declares. An empty
+        // declaration means "expected unattributed" (an OutOfBand subcommand),
+        // which is not a schedulable pass.
+        let phase = crate::pass_trace::current_phase();
+        if desc.phases.is_empty() {
+            return Err(format!(
+                "pass '{pass}' declares no compile phase (it is an out-of-band \
+                 driver) and so cannot be scheduled"
+            ));
+        }
+        match phase {
+            Some(p) if desc.phases.contains(&p) => {}
+            Some(p) => {
+                return Err(format!(
+                    "pass '{pass}' was scheduled from phase {p:?}, which is not \
+                     among its declared phases {:?}. Either the driver grew a \
+                     new invocation site or the registry is stale — both are \
+                     compiler defects, please report.",
+                    desc.phases
+                ));
+            }
+            // UNSCOPED, and deliberately not a refusal.
+            //
+            // Only five call sites install a phase scope (`main_entry`,
+            // `entry_points`, `kernel`, `standalone`, `training_report`), and
+            // plenty of legitimate compiles reach a pass without one — every
+            // unit test that drives the compiler directly, and any entry point
+            // not yet wrapped. `pass_trace` already models this: an
+            // unattributed pass is REPORTED, because "a driver nobody wrapped
+            // in enter_phase" is how a new driver announces itself, not a
+            // defect in the pass.
+            //
+            // Refusing here would fire on correct compiles, which is the
+            // failure `pass_bus`'s `Invariant` doc names outright: a rule that
+            // fires on correct behaviour trains its reader to stop reading it.
+            //
+            // Measured coverage, so the claim is not overstated: a top-level
+            // `train(...)` reaches this with `Some(TrainBlock)` on a real
+            // `nsl build` (`compiler/main_entry.rs` installs it around
+            // `compile_main`), and the check is live there. A `train` block
+            // nested inside `fn main():` arrives via `compile_user_functions`,
+            // which installs NO phase — so on that program shape the check is
+            // skipped. Note `pass_trace::phase_mismatches` classifies the same
+            // `None` as a MISMATCH for reporting; the report may say so, the
+            // scheduler may not refuse on it.
+            //
+            // The trace line below prints which case applied, so "unscoped" is
+            // visible rather than indistinguishable from a pass.
+            None => {}
+        }
+
+        // PRE 2: the declared InvocationOrdered predecessors, OBSERVED — not
+        // refused on.
+        //
+        // The refusal is not soundly decidable here, and the first version of
+        // this function shipped one that was not. "Consumer ran before its
+        // producer" needs to know the producer WILL run, which at schedule
+        // time is undecidable: a predecessor that never runs is not an
+        // inversion at all, just a feature that is off, and the consumer
+        // legitimately reads the channel empty (each channel's `empty_means`
+        // says what that means).
+        //
+        // The obvious proxy — "the channel is already published, so its
+        // producer must have run" — is wrong twice over. It was first written
+        // against `pass_bus::traffic`, which is PROCESS-scoped: in a
+        // multi-module build one module's publish leaves `publishes > 0` for
+        // every later module, so a later compile whose own epoch has no WGGO
+        // would be refused. That is the #466 finding exactly. And even scoped
+        // to this compile's bus it stays wrong, because publisher and
+        // recorded pass legitimately differ — `adapter_prescan_plan`'s own
+        // descriptor says it is "published by the driver prescan, which never
+        // records WRGA as having run, so the antecedent cannot be
+        // established for it".
+        //
+        // Enforcement therefore stays where it is sound:
+        // [`PassManager::enforce_dependency_order`], which fires only when
+        // BOTH passes are in this compile's ledger and the order is actually
+        // inverted. The scheduler contributes the observation to the trace so
+        // a missing predecessor is visible at the point of invocation.
+        let seen: Vec<&'static str> = self.trace().into_iter().map(|(p, _)| p).collect();
+        let missing: Vec<&'static str> = crate::pass_bus::required_predecessors(pass)
+            .into_iter()
+            .filter(|(producer, _)| !seen.contains(producer))
+            .map(|(producer, _)| producer)
+            .collect();
+
+        // A pass legitimately re-invoked in one compile (WGGO's in-place
+        // replan is the in-tree example) rescans a possibly-different tape;
+        // the LATEST scan is the one its live plan refers to. A re-invocation
+        // WITHOUT a tape must CLEAR the slot rather than leave the previous
+        // digest live — otherwise the staleness check would answer a question
+        // about a scan that this invocation superseded, and refuse a build
+        // whose plan no longer holds those references at all.
+        SCANNED_TAPES.with(|m| {
+            let mut m = m.borrow_mut();
+            let key = (self.epoch, pass);
+            match (tape, m.iter().position(|(k, _)| *k == key)) {
+                (Some(list), Some(i)) => m[i].1 = TapeDigest::of(list),
+                (Some(list), None) => m.push((key, TapeDigest::of(list))),
+                (None, Some(i)) => {
+                    m.swap_remove(i);
+                }
+                (None, None) => {}
+            }
+        });
+
+        Self::trace_line(format_args!(
+            "-> {pass} phase={} epoch={} tape={} predecessors={}",
+            match phase {
+                Some(p) => format!("{p:?}"),
+                None => "unscoped(phase check skipped)".to_string(),
+            },
+            self.epoch,
+            tape.map(|t| t.ops.len().to_string())
+                .unwrap_or_else(|| "none".into()),
+            if missing.is_empty() {
+                "all-ran".to_string()
+            } else {
+                format!("not-yet-run{missing:?}")
+            },
+        ));
+
+        let value = body();
+
+        // `dispositions_in`, NOT `dispositions()`: the process view dedupes by
+        // name across every epoch, so on a multi-compile process it would
+        // print ANOTHER compile's disposition for the pass that just ran —
+        // cross-compile attribution in the very line a person reads while
+        // diagnosing cross-compile attribution. (The old `.rev()` was also a
+        // no-op once that view held at most one row per name.)
+        //
+        // Computed lazily: `format_args!` evaluates its arguments eagerly, so
+        // building this unconditionally would scan the disposition table once
+        // per scheduled pass even with tracing off.
+        if crate::pass_trace::enabled() {
+            let disposition = crate::pass_trace::dispositions_in(self.epoch)
+                .into_iter()
+                .find(|(p, _)| *p == pass)
+                .map(|(_, d)| d);
+            Self::trace_line(format_args!("<- {pass} disposition={disposition:?}"));
+        }
+
+        Ok(Scheduled {
+            value,
+            pass,
+            epoch: self.epoch,
+        })
+    }
+
+    /// Refuse if the tape `pass` scanned is no longer the state its plan's
+    /// positional references were captured against.
+    ///
+    /// `WengertList`'s header states the rule: a positional index is valid
+    /// only against the list state it was captured from, and "a position that
+    /// must OUTLIVE the scan must be converted to the op's id at the
+    /// boundary". WRGA's plan holds `TapeRef::PositionalIndex` and IS consumed
+    /// after the scan — several hundred lines after, at the
+    /// `effective_primal` fork. Nothing checked that the list had not moved in
+    /// between; this does.
+    ///
+    /// A pass that recorded no scan (it did not run, or ran without a tape)
+    /// vacuously passes: there is no captured state to invalidate.
+    pub fn assert_tape_unchanged_since(
+        self,
+        pass: &'static str,
+        tape: &WengertList,
+    ) -> Result<(), String> {
+        let recorded = SCANNED_TAPES.with(|m| {
+            m.borrow()
+                .iter()
+                .find(|(k, _)| *k == (self.epoch, pass))
+                .map(|(_, d)| *d)
+        });
+        let Some(before) = recorded else {
+            return Ok(());
+        };
+        let now = TapeDigest::of(tape);
+        if now == before {
+            return Ok(());
+        }
+        Err(format!(
+            "the Wengert tape '{pass}' scanned has changed before its plan was \
+             consumed ({} ops then, {} now) — that plan holds POSITIONAL \
+             references, which are valid only against the list state they were \
+             captured from, so consuming it now would index the wrong ops. \
+             Compiler scheduling defect, please report.",
+            before.len, now.len
+        ))
+    }
+
+    /// This compile's invocation ledger. Same view as
+    /// [`PassManager::per_compile_trace`], reachable from the handle.
+    fn trace(self) -> Vec<(&'static str, Option<CompilePhase>)> {
+        crate::pass_trace::per_compile_view(self.epoch)
+    }
+
+    fn trace_line(args: std::fmt::Arguments<'_>) {
+        if crate::pass_trace::enabled() {
+            eprintln!("[pass-manager] {args}");
+        }
+    }
+}
+
+impl<R> Scheduled<R> {
+    /// Check the pass's declared postconditions and unwrap its value.
+    ///
+    /// Today that is one rule, and it is the bus's own: a channel declaring
+    /// `applied_implies_published: Enforced` must be occupied once its
+    /// producer has recorded `Applied`. The bus REPORT already finds this at
+    /// end of compile, where it is a line in a report nobody blocks on; at the
+    /// pass boundary it is a refusal that still names the pass that just ran.
+    pub fn finish(self, bus: &PassBus) -> Result<R, String> {
+        let applied = crate::pass_trace::dispositions_in(self.epoch)
+            .into_iter()
+            .any(|(p, d)| {
+                p == self.pass && matches!(d, crate::pass_trace::PassDisposition::Applied { .. })
+            });
+        if applied {
+            for d in crate::pass_bus::enforced_publish_channels(self.pass) {
+                if !bus.is_published(d.channel) {
+                    return Err(format!(
+                        "pass '{}' recorded Applied but its '{}' channel is \
+                         empty, and that channel declares \
+                         applied_implies_published as Enforced — the pass \
+                         rewrote something and its product did not reach the \
+                         consumers ({}). Compiler defect, please report.",
+                        self.pass,
+                        d.name,
+                        d.consumers.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(self.value)
+    }
+}
+
 impl Drop for PassManager {
     fn drop(&mut self) {
         // The restore assumes LIFO: this manager's epoch is the thread's
@@ -164,6 +557,12 @@ impl Drop for PassManager {
                 self.epoch
             );
         }
+        // Retire this compile's tape digests. Without it the map grows one
+        // entry per (scheduled pass x compile) for the process lifetime — the
+        // growth `pass_trace::TRACE` documents and tolerates for a `&'static
+        // str` pair, but these carry a digest per entry and every integration
+        // test binary drives many compiles.
+        SCANNED_TAPES.with(|m| m.borrow_mut().retain(|((e, _), _)| *e != self.epoch));
         crate::pass_trace::restore_epoch(self.prev_epoch);
     }
 }

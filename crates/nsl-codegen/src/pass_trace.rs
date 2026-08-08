@@ -188,6 +188,16 @@ pub fn enter_phase(phase: CompilePhase) -> PhaseGuard {
     PhaseGuard(CURRENT_PHASE.with(|c| c.replace(Some(phase))))
 }
 
+/// The driver phase executing on this thread right now, if any.
+///
+/// [`observed_phases`] answers "which phase did a pass run in" AFTER the fact,
+/// from the trace. The scheduler needs the same fact BEFORE it invokes a pass,
+/// so it can refuse an invocation from a phase the registry does not declare
+/// instead of reporting the mismatch once the pass has already run.
+pub fn current_phase() -> Option<CompilePhase> {
+    CURRENT_PHASE.with(|c| c.get())
+}
+
 /// The phase each observed pass ran in — first occurrence per name, which is
 /// exactly what the pre-epoch process-wide idempotence produced.
 pub fn observed_phases() -> Vec<(&'static str, Option<CompilePhase>)> {
@@ -283,7 +293,24 @@ pub enum DeclineReason {
 ///
 /// A `Vec` rather than a map so the render order is deterministic without
 /// pulling in an ordered map for eleven entries.
-static DISPOSITION: Mutex<Vec<(&'static str, PassDisposition)>> = Mutex::new(Vec::new());
+///
+/// Stamped with the compile epoch for the same reason [`TRACE`] is: the
+/// process-global view is fine for REPORTING, but the scheduler turns
+/// "this pass reported Applied" into a refusal, and over-inclusion in a
+/// refusal is a false refusal. In a multi-module build, module A's `Applied`
+/// against module B's empty channel would refuse a correct compile — the #466
+/// finding, one channel over. [`dispositions`] keeps the flat process view;
+/// [`dispositions_in`] is the enforceable one.
+///
+/// Growth is now O(passes x compiles) where it was O(passes) — the same trade
+/// [`TRACE`] documents, and deliberately NOT retired per epoch: the
+/// process-facing readers ([`dispositions`], [`report`]) are defined over the
+/// whole history, and the report runs after that compile's `PassManager` has
+/// already dropped, so retiring would erase the rows it exists to print.
+/// Irrelevant at CLI scales (one row per pass per module compile); a
+/// long-lived recompiling process would want the epoch-retiring compaction
+/// already noted on `TRACE`.
+static DISPOSITION: Mutex<Vec<(&'static str, PassDisposition, u64)>> = Mutex::new(Vec::new());
 
 /// Record that `pass` was reached. Idempotent per compile: a pass invoked
 /// once per layer would otherwise swamp the sequence, and the question this
@@ -362,10 +389,15 @@ pub fn record_disposition(pass: &'static str, d: PassDisposition) {
          either a missing record at the pass's entry point or a disposition \
          attributed to the wrong pass"
     );
+    let epoch = current_epoch();
     let mut t = DISPOSITION.lock().unwrap_or_else(|e| e.into_inner());
-    match t.iter_mut().find(|(p, _)| *p == pass) {
+    // Keyed by (pass, epoch), not by pass: the pre-epoch code collapsed a
+    // second compile's disposition onto the first's slot, which is harmless
+    // for the report (last writer wins, and it renders one line per pass) but
+    // would make the per-compile view answer with another compile's outcome.
+    match t.iter_mut().find(|(p, _, e)| *p == pass && *e == epoch) {
         Some(slot) => slot.1 = d,
-        None => t.push((pass, d)),
+        None => t.push((pass, d, epoch)),
     }
 }
 
@@ -376,8 +408,33 @@ pub fn observed() -> Vec<&'static str> {
 }
 
 /// What each pass that reported a disposition did, in first-disposition order.
+///
+/// Process-scoped, deduped by pass name so the report keeps its one-line-per-
+/// pass shape across a multi-module build. For enforcement use
+/// [`dispositions_in`].
 pub fn dispositions() -> Vec<(&'static str, PassDisposition)> {
-    DISPOSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    let t = DISPOSITION.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(&'static str, PassDisposition)> = Vec::new();
+    for (p, d, _) in t.iter() {
+        match out.iter_mut().find(|(q, _)| q == p) {
+            Some(slot) => slot.1 = *d,
+            None => out.push((*p, *d)),
+        }
+    }
+    out
+}
+
+/// The dispositions recorded under `epoch` — the sound counterpart of
+/// [`dispositions`], for the same reason [`per_compile_view`] is the sound
+/// counterpart of [`observed`].
+pub(crate) fn dispositions_in(epoch: u64) -> Vec<(&'static str, PassDisposition)> {
+    DISPOSITION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, _, e)| *e == epoch)
+        .map(|(p, d, _)| (*p, *d))
+        .collect()
 }
 
 /// Clear the trace.

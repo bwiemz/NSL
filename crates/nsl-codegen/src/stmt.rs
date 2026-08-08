@@ -9273,7 +9273,22 @@ impl Compiler<'_> {
                 // fusion) before primal lowering.  When WRGA is disabled or
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
-                let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                //
+                // Item 2 step 7: this invocation is SCHEDULED, not called. The
+                // manager checks WRGA's registry-declared phase and its
+                // bus-declared InvocationOrdered predecessor before the body
+                // runs, and its applied-implies-published channel after —
+                // then retains a digest of the tape WRGA scanned, so the
+                // `effective_primal` fork below can prove the plan's
+                // positional references still refer to this list. WRGA is the
+                // first pass routed this way; the rest still call directly.
+                let sched = self.passes.scheduler();
+                let scheduled = sched
+                    .schedule("WRGA", Some(extractor.wengert_list()), || {
+                        crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list())
+                    })
+                    .map_err(CodegenError::new)?;
+                let wrga_plan = scheduled.finish(&self.bus).map_err(CodegenError::new)?;
                 // CPDT planning site. On the pre-plan path the wrapper
                 // already planned before the moment consult (a plan
                 // published only HERE arrives ~2.2k lines after that consult
@@ -9692,6 +9707,23 @@ impl Compiler<'_> {
                             primal_vars.insert(*vid, tensor_ptr);
                         }
                     }
+                }
+                // Item 2 step 7: WRGA's plan is consumed HERE, several hundred
+                // lines after the scan that produced it, and it holds
+                // `TapeRef::PositionalIndex` (declared in `pass_registry`).
+                // Positional references are valid only against the list state
+                // they were captured from, so if anything moved the extractor's
+                // list in between, forking onto this plan indexes the wrong
+                // ops. Nothing checked that until the pass was scheduled.
+                // Only when a plan actually exists. The `None` arm below clones
+                // the extractor list directly — no positional references are
+                // being consumed, so there is nothing to invalidate, and
+                // asserting there would refuse builds with WRGA entirely off
+                // (the common case) for a mutation that harmed nobody.
+                if wrga_plan.is_some() {
+                    sched
+                        .assert_tape_unchanged_since("WRGA", extractor.wengert_list())
+                        .map_err(CodegenError::new)?;
                 }
                 let effective_primal: crate::wengert::WengertList = match &wrga_plan {
                     Some(plan) => plan.prune.pruned.clone(),

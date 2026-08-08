@@ -436,9 +436,17 @@ fn is_csha_claimed_still_has_no_production_callers() {
 /// that channel's traffic wrong in the direction that hides findings. This is
 /// the static enforcement the privacy argument was resting on and did not have.
 ///
-/// The four exemptions are lifecycle operations on a value already published
-/// once: counting a restore as a publish would make a channel nobody consumes
-/// look busier than it is. Adding a fifth is a deliberate edit here.
+/// The lifecycle exemptions are operations on a value already published once:
+/// counting a restore as a publish would make a channel nobody consumes look
+/// busier than it is. Adding another is a deliberate edit here.
+///
+/// `is_published` is exempt on the opposite ground: it is the pass scheduler's
+/// OCCUPANCY PROBE, and counting it would be self-defeating. The scheduler
+/// consults it once per scheduled pass to check `applied_implies_published`;
+/// if that consult counted as a `reads_full`, every channel the scheduler
+/// watches would show a read it never had, and the `dead_output` finding —
+/// "published, never read" — would be disarmed for exactly those channels. A
+/// checker that breaks the checker underneath it is worse than no checker.
 #[test]
 fn every_accessor_counts_or_declares_why_not() {
     const UNCOUNTED: &[&str] = &[
@@ -447,6 +455,7 @@ fn every_accessor_counts_or_declares_why_not() {
         "clear_wggo_overrides",
         "clear_cpdt_plan",
         "clear_cfie_serve_gen",
+        "is_published",
     ];
 
     let src = pass_bus_source();
