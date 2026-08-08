@@ -301,6 +301,15 @@ pub enum DeclineReason {
 /// against module B's empty channel would refuse a correct compile — the #466
 /// finding, one channel over. [`dispositions`] keeps the flat process view;
 /// [`dispositions_in`] is the enforceable one.
+///
+/// Growth is now O(passes x compiles) where it was O(passes) — the same trade
+/// [`TRACE`] documents, and deliberately NOT retired per epoch: the
+/// process-facing readers ([`dispositions`], [`report`]) are defined over the
+/// whole history, and the report runs after that compile's `PassManager` has
+/// already dropped, so retiring would erase the rows it exists to print.
+/// Irrelevant at CLI scales (one row per pass per module compile); a
+/// long-lived recompiling process would want the epoch-retiring compaction
+/// already noted on `TRACE`.
 static DISPOSITION: Mutex<Vec<(&'static str, PassDisposition, u64)>> = Mutex::new(Vec::new());
 
 /// Record that `pass` was reached. Idempotent per compile: a pass invoked

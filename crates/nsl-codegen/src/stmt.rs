@@ -9715,9 +9715,16 @@ impl Compiler<'_> {
                 // they were captured from, so if anything moved the extractor's
                 // list in between, forking onto this plan indexes the wrong
                 // ops. Nothing checked that until the pass was scheduled.
-                sched
-                    .assert_tape_unchanged_since("WRGA", extractor.wengert_list())
-                    .map_err(CodegenError::new)?;
+                // Only when a plan actually exists. The `None` arm below clones
+                // the extractor list directly — no positional references are
+                // being consumed, so there is nothing to invalidate, and
+                // asserting there would refuse builds with WRGA entirely off
+                // (the common case) for a mutation that harmed nobody.
+                if wrga_plan.is_some() {
+                    sched
+                        .assert_tape_unchanged_since("WRGA", extractor.wengert_list())
+                        .map_err(CodegenError::new)?;
+                }
                 let effective_primal: crate::wengert::WengertList = match &wrga_plan {
                     Some(plan) => plan.prune.pruned.clone(),
                     None => extractor.wengert_list().clone(),

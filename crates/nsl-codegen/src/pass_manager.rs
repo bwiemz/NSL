@@ -58,6 +58,11 @@
 //! [`PassManager::enforce_dependency_order`], which is sound because it runs
 //! once both passes are in the ledger.
 //!
+//! The phase row is live where a phase scope exists — a top-level
+//! `train(...)` on a real `nsl build` reaches the scheduler as
+//! `Some(TrainBlock)` — and SKIPPED where none does, notably a `train` block
+//! nested inside `fn main():`. See the `None` arm of `schedule`.
+//!
 //! The last one is the tape half, and it is the one no existing gate covered:
 //! WRGA scans the primal, and its plan is consumed ~400 lines later where
 //! `effective_primal` forks onto `plan.prune.pruned`. Positional references
@@ -218,8 +223,9 @@ pub struct Scheduled<R> {
 
 /// A structural digest of a tape, for the positional-reference staleness rule.
 ///
-/// Records everything a positional reference's validity depends on: the op
-/// sequence and each op's identity. A 64-bit digest can in principle collide;
+/// Records what a positional reference's validity depends on: the op
+/// sequence and each op's identity. Deliberately NOT the name/type side
+/// tables — renaming a var moves nothing. A 64-bit digest can in principle collide;
 /// this is a tripwire for a compiler-scheduling defect, not a security
 /// boundary, and the alternative (retaining a full clone of every scanned
 /// tape for the rest of the compile) costs memory proportional to the model on
@@ -241,12 +247,17 @@ impl TapeDigest {
             op.inputs.hash(&mut h);
             op.saved_for_backward.hash(&mut h);
             op.checkpointed.hash(&mut h);
-            // `PrimalOp` is not `Hash` (it carries an f64 in `Constant`).
-            // Its `Debug` is total and distinguishes every variant AND
-            // payload, which is what the staleness question needs — a
-            // discriminant-only digest would miss a rewritten `Passthrough`
-            // name, and that is a real rewrite (`fuse_swiglu_gate_backward`
-            // does exactly it).
+            // `PrimalOp` is not `Hash` (it carries an f64 in `Constant`), so
+            // its `Debug` stands in. That distinguishes every variant and
+            // every payload that can affect POSITIONS — in particular a
+            // rewritten `Passthrough` name, which is a real in-place rewrite
+            // (`fuse_swiglu_gate_backward` does exactly it) that a
+            // discriminant-only digest would miss.
+            //
+            // It is not a total injection and is not claimed to be:
+            // `Constant(NaN)` and `Constant(-NaN)` format identically. A
+            // constant's sign cannot move an op's position, which is the only
+            // property the positional-reference rule depends on.
             format!("{:?}", op.op).hash(&mut h);
         }
         list.output.hash(&mut h);
@@ -327,10 +338,19 @@ impl PassScheduler {
             // Refusing here would fire on correct compiles, which is the
             // failure `pass_bus`'s `Invariant` doc names outright: a rule that
             // fires on correct behaviour trains its reader to stop reading it.
-            // So the phase check is LIVE exactly where a phase is established
-            // — which includes the production `nsl build` train-block path —
-            // and silent elsewhere. The trace line below says which it was, so
-            // "unscoped" is visible rather than indistinguishable from a pass.
+            //
+            // Measured coverage, so the claim is not overstated: a top-level
+            // `train(...)` reaches this with `Some(TrainBlock)` on a real
+            // `nsl build` (`compiler/main_entry.rs` installs it around
+            // `compile_main`), and the check is live there. A `train` block
+            // nested inside `fn main():` arrives via `compile_user_functions`,
+            // which installs NO phase — so on that program shape the check is
+            // skipped. Note `pass_trace::phase_mismatches` classifies the same
+            // `None` as a MISMATCH for reporting; the report may say so, the
+            // scheduler may not refuse on it.
+            //
+            // The trace line below prints which case applied, so "unscoped" is
+            // visible rather than indistinguishable from a pass.
             None => {}
         }
 
@@ -369,21 +389,25 @@ impl PassScheduler {
             .map(|(producer, _)| producer)
             .collect();
 
-        if let Some(list) = tape {
-            let digest = TapeDigest::of(list);
-            SCANNED_TAPES.with(|m| {
-                let mut m = m.borrow_mut();
-                let key = (self.epoch, pass);
-                match m.iter_mut().find(|(k, _)| *k == key) {
-                    // A pass legitimately re-invoked in one compile (WGGO's
-                    // in-place replan is the in-tree example) rescans a
-                    // possibly-different tape; the LATEST scan is the one its
-                    // live plan refers to.
-                    Some(slot) => slot.1 = digest,
-                    None => m.push((key, digest)),
+        // A pass legitimately re-invoked in one compile (WGGO's in-place
+        // replan is the in-tree example) rescans a possibly-different tape;
+        // the LATEST scan is the one its live plan refers to. A re-invocation
+        // WITHOUT a tape must CLEAR the slot rather than leave the previous
+        // digest live — otherwise the staleness check would answer a question
+        // about a scan that this invocation superseded, and refuse a build
+        // whose plan no longer holds those references at all.
+        SCANNED_TAPES.with(|m| {
+            let mut m = m.borrow_mut();
+            let key = (self.epoch, pass);
+            match (tape, m.iter().position(|(k, _)| *k == key)) {
+                (Some(list), Some(i)) => m[i].1 = TapeDigest::of(list),
+                (Some(list), None) => m.push((key, TapeDigest::of(list))),
+                (None, Some(i)) => {
+                    m.swap_remove(i);
                 }
-            });
-        }
+                (None, None) => {}
+            }
+        });
 
         Self::trace_line(format_args!(
             "-> {pass} phase={} epoch={} tape={} predecessors={}",
@@ -403,14 +427,23 @@ impl PassScheduler {
 
         let value = body();
 
-        Self::trace_line(format_args!(
-            "<- {pass} disposition={:?}",
-            crate::pass_trace::dispositions()
+        // `dispositions_in`, NOT `dispositions()`: the process view dedupes by
+        // name across every epoch, so on a multi-compile process it would
+        // print ANOTHER compile's disposition for the pass that just ran —
+        // cross-compile attribution in the very line a person reads while
+        // diagnosing cross-compile attribution. (The old `.rev()` was also a
+        // no-op once that view held at most one row per name.)
+        //
+        // Computed lazily: `format_args!` evaluates its arguments eagerly, so
+        // building this unconditionally would scan the disposition table once
+        // per scheduled pass even with tracing off.
+        if crate::pass_trace::enabled() {
+            let disposition = crate::pass_trace::dispositions_in(self.epoch)
                 .into_iter()
-                .rev()
                 .find(|(p, _)| *p == pass)
-                .map(|(_, d)| d)
-        ));
+                .map(|(_, d)| d);
+            Self::trace_line(format_args!("<- {pass} disposition={disposition:?}"));
+        }
 
         Ok(Scheduled {
             value,

@@ -1381,12 +1381,21 @@ pub fn edges_for(pass: &str) -> Vec<&'static ChannelDescriptor> {
 /// pass that must therefore have been invoked first.
 ///
 /// This is [`dependency_order_violations`]'s edge set read the other way
-/// round. That function answers "did anything run out of order?" from a
-/// finished ledger; the scheduler asks "may this pass run NOW?" before
-/// invoking, which is the same declaration used as a precondition instead of
-/// a post-mortem. `ValueOrderedOnly` edges are excluded for the reason
-/// [`OrderClaim`] gives: their producer may legitimately run later, so
-/// blocking on them would refuse correct compiles.
+/// round: that function answers "did anything run out of order?" from a
+/// finished ledger, this one answers "which declared producers of mine have
+/// run so far?".
+///
+/// The scheduler REPORTS the answer on its trace line; it does NOT refuse on
+/// it. An earlier revision did, and it was unsound — "will my producer run
+/// later in this compile" is not decidable at schedule time, and every proxy
+/// tried (process-scoped publish counters, then this compile's bus
+/// occupancy) refuses correct compiles. See the removal rationale in
+/// `pass_manager::PassScheduler::schedule`. Inversion enforcement stays in
+/// [`dependency_order_violations_in`], which is sound because it runs once
+/// both passes are in the ledger.
+///
+/// `ValueOrderedOnly` edges are excluded for the reason [`OrderClaim`] gives:
+/// their producer may legitimately run later.
 pub fn required_predecessors(pass: &str) -> Vec<(&'static str, Channel)> {
     let mut out = Vec::new();
     for d in CHANNELS {

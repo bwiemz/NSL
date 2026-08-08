@@ -175,6 +175,15 @@ fn applied_with_an_empty_enforced_channel_is_refused() {
 /// refused an Applied pass.
 #[test]
 fn applied_with_a_published_channel_is_admitted() {
+    // Build the plan BEFORE the epoch opens. `wrga::run` records its own
+    // disposition (`Declined { NoCandidates }` on a toy tape), and inside the
+    // live epoch that OVERWRITES the `Applied` staged below — leaving
+    // `finish` with `applied == false`, so it would skip the
+    // `enforced_publish_channels` loop entirely and this "positive control"
+    // would control nothing. Review caught exactly that: with the plan built
+    // inside the epoch, `is_published` had no test that it ever returns true.
+    let plan = minimal_wrga_plan(&tiny_tape(3));
+
     let mgr = PassManager::begin();
     let _phase = enter_phase(CompilePhase::TrainBlock);
     let scheduled = mgr
@@ -185,8 +194,27 @@ fn applied_with_a_published_channel_is_admitted() {
         })
         .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
 
+    // The antecedent must actually hold, or the check below is skipped
+    // silently rather than satisfied.
+    assert!(
+        matches!(
+            nsl_codegen::pass_trace::dispositions()
+                .into_iter()
+                .find(|(p, _)| *p == "WRGA")
+                .map(|(_, d)| d),
+            Some(PassDisposition::Applied { .. })
+        ),
+        "the staged Applied disposition must survive into finish(), or this \
+         test passes without ever entering the published-channel check"
+    );
+
     let mut bus = PassBus::default();
-    bus.publish_wrga_plan(minimal_wrga_plan(&tiny_tape(3)));
+    assert!(
+        !bus.is_published(nsl_codegen::pass_bus::Channel::WrgaPlan),
+        "the channel must start empty so publishing is what changes the outcome"
+    );
+    bus.publish_wrga_plan(plan);
+    assert!(bus.is_published(nsl_codegen::pass_bus::Channel::WrgaPlan));
     scheduled
         .finish(&bus)
         .expect("a published channel satisfies applied_implies_published");
@@ -283,3 +311,80 @@ fn a_compiles_tape_digest_does_not_outlive_it() {
 
 /// `VarId` is unused in the fixture beyond typing; keep the import honest.
 const _: Option<VarId> = None;
+
+/// A pass re-invoked in one compile WITHOUT a tape must clear its recorded
+/// scan, not inherit the previous one.
+///
+/// Not reachable for WRGA (always scheduled with a tape), but the re-schedule
+/// path exists precisely to support WGGO's in-place replan, which is a
+/// re-invocation that may carry no tape. Leaving the stale digest live would
+/// answer a staleness question about a scan this invocation superseded — and
+/// refuse a correct build.
+#[test]
+fn a_reschedule_without_a_tape_clears_the_recorded_scan() {
+    let mgr = PassManager::begin();
+    let sched = mgr.scheduler();
+    let tape = tiny_tape(6);
+
+    let _first = sched
+        .schedule("WRGA", Some(&tape), || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    // Sanity: the digest IS live at this point.
+    let mut moved = tape.clone();
+    moved.ops.remove(2);
+    sched
+        .assert_tape_unchanged_since("WRGA", &moved)
+        .expect_err("the first scan must still be enforced");
+
+    // Re-invoke with no tape: the pass no longer holds positional refs.
+    let _second = sched
+        .schedule("WRGA", None, || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    sched
+        .assert_tape_unchanged_since("WRGA", &moved)
+        .expect("a tape-less re-invocation supersedes the earlier scan");
+}
+
+/// A re-invocation WITH a tape rebinds to the latest scan.
+#[test]
+fn a_reschedule_with_a_tape_rebinds_to_the_latest_scan() {
+    let mgr = PassManager::begin();
+    let sched = mgr.scheduler();
+    let first = tiny_tape(6);
+    let second = tiny_tape(4);
+
+    let _a = sched
+        .schedule("WRGA", Some(&first), || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    let _b = sched
+        .schedule("WRGA", Some(&second), || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+
+    sched
+        .assert_tape_unchanged_since("WRGA", &second)
+        .expect("the latest scan is the live one");
+    sched
+        .assert_tape_unchanged_since("WRGA", &first)
+        .expect_err("the superseded scan must no longer be enforced");
+}
+
+/// The declaration the predecessor OBSERVATION reads. Pinned because the
+/// observation itself is only rendered into a trace line, so nothing else in
+/// the tree would notice this edge disappearing from the bus.
+#[test]
+fn wrga_declares_wggo_as_an_invocation_ordered_predecessor() {
+    let preds = nsl_codegen::pass_bus::required_predecessors("WRGA");
+    assert!(
+        preds.iter().any(|(p, c)| *p == "WGGO"
+            && c.descriptor().name == "wggo_overrides"),
+        "WRGA should declare WGGO on wggo_overrides, got {preds:?}"
+    );
+    // And the query is edge-directed, not a producer listing: WGGO does not
+    // consume anything WRGA produces.
+    assert!(
+        !nsl_codegen::pass_bus::required_predecessors("WGGO")
+            .iter()
+            .any(|(p, _)| *p == "WRGA"),
+        "the predecessor relation must not be symmetric"
+    );
+}
