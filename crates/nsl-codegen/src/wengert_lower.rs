@@ -4232,6 +4232,30 @@ fn lower_fused_linear_ce_forward(
     // existing fixture) and all 16-bit storage configs. Kill-switch
     // NSL_FUSED_LCE_GEMM=0 (compile-time) restores v1 for large vocab.
     let gemm_off = std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() == Some("0");
+    // DERIVE `is_large`, do not trust the tape field — the backward already
+    // derives it (`vocab_size > LARGE_VOCAB_THRESHOLD`) while this site took
+    // whatever the op carried, so the pair agreed only by convention. That
+    // convention is already broken in-tree: `build_forward_plus_backward_
+    // wengert` hardcodes `is_large: false` at a 16384-wide vocabulary, which
+    // makes this site synthesize the SMALL-vocab single-kernel PTX for a
+    // vocabulary it cannot serve while the backward takes gemm.
+    //
+    // The route note this change added prints both phases, so their agreement
+    // is now an observable, asserted property — which is exactly why it should
+    // hold by construction rather than by convention. The parameter is kept
+    // and cross-checked so a caller that disagrees fails loudly instead of
+    // being silently overridden.
+    let derived_large = vocab_size > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+    if is_large != derived_large {
+        return Err(CodegenError::new(format!(
+            "fused_linear_ce: the op says is_large={is_large} for vocab_size \
+             {vocab_size}, but the threshold ({}) says {derived_large}. The forward \
+             and backward lowerings would pick different kernel families for one \
+             substitution — fix the producer of this op rather than this check",
+            crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD
+        )));
+    }
+    let is_large = derived_large;
     let use_gemm = dtype_tag == 0 && (is_large || !has_bias) && !gemm_off;
     if !use_gemm && !has_bias {
         return Err(CodegenError::new(
