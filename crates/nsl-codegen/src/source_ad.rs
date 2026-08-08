@@ -142,7 +142,10 @@ impl AdjointGenerator {
             adjoint_ops: Vec::new(),
             adjoint_vars: HashMap::new(),
             var_counter: start_var,
-            op_counter: 0,
+            // Adjoint ids number from the adjoint half, not from 0: a
+            // primal-keyed table (the CSHA claim map) is consulted against
+            // every op the lowerer walks, including this list's.
+            op_counter: crate::wengert::ADJOINT_ID_BASE,
             csha_claims: None,
             csha_diagnostics: Vec::new(),
             csha_fused_events: Vec::new(),
@@ -198,6 +201,13 @@ impl AdjointGenerator {
     fn next_op(&mut self) -> OpId {
         let o = self.op_counter;
         self.op_counter += 1;
+        // A real assert, not `debug_assert!` — CI ships release builds, and
+        // this is one compare against a minting path that already allocates.
+        assert_eq!(
+            crate::wengert::id_space(o),
+            crate::wengert::IdSpace::Adjoint,
+            "adjoint op counter left the adjoint id half"
+        );
         o
     }
 
@@ -1632,9 +1642,7 @@ pub fn fuse_rmsnorm_dx_residual(
         idx += 1;
         keep
     });
-    for (i, op) in ops.iter_mut().enumerate() {
-        op.id = i as u32;
-    }
+    crate::wengert::renumber_adjoint_ops(ops);
     fused
 }
 
@@ -1703,9 +1711,7 @@ pub fn fuse_swiglu_gate_backward(
         idx += 1;
         keep
     });
-    for (i, op) in ops.iter_mut().enumerate() {
-        op.id = i as u32;
-    }
+    crate::wengert::renumber_adjoint_ops(ops);
     fused
 }
 

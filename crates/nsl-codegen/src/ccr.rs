@@ -409,7 +409,10 @@ pub fn insert_adjoint_last_use_frees(
         adjoint.ops.insert(
             at + 1,
             WengertOp {
-                id: 0,
+                // Placeholder — the renumber below assigns the real
+                // adjoint-space id. Seeded in the adjoint half so an early
+                // return could not leave a primal-space id behind.
+                id: crate::wengert::ADJOINT_ID_BASE,
                 result,
                 op: PrimalOp::FreeTensor,
                 inputs: vec![victim],
@@ -418,9 +421,11 @@ pub fn insert_adjoint_last_use_frees(
             },
         );
     }
-    for (i, op) in adjoint.ops.iter_mut().enumerate() {
-        op.id = i as u32;
-    }
+    crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
+    adjoint.assert_ids_in_space(
+        crate::wengert::IdSpace::Adjoint,
+        "ccr::insert_adjoint_last_use_frees",
+    );
     inserted
 }
 
@@ -1425,9 +1430,11 @@ pub fn splice_decompress(
             }
         }
     }
-    for (i, op) in adjoint.ops.iter_mut().enumerate() {
-        op.id = i as u32;
-    }
+    crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
+    adjoint.assert_ids_in_space(
+        crate::wengert::IdSpace::Adjoint,
+        "ccr::splice_decompress",
+    );
     // Validation: no non-free op may still reference a compressed original.
     for (idx, op) in adjoint.ops.iter().enumerate() {
         if matches!(op.op, PrimalOp::FreeTensor) {
@@ -1506,7 +1513,7 @@ pub fn apply_to_adjoint(
         let result = *fresh;
         *fresh += 1;
         WengertOp {
-            id: 0, // renumbered below
+            id: crate::wengert::ADJOINT_ID_BASE, // renumbered below
             result,
             op: PrimalOp::Passthrough(
                 if on {
@@ -1538,7 +1545,12 @@ pub fn apply_to_adjoint(
                 .map(|v| remap.get(v).copied().unwrap_or(*v))
                 .collect();
             clones.push(WengertOp {
-                id: 0, // renumbered below
+                // NOT `op.id`: this is a CLONE of a primal op spliced into
+                // the adjoint, and copying the primal id is exactly how a
+                // recompute clone of an unclaimed SDPA used to be able to
+                // match a CSHA claim key. Renumbered into the adjoint half
+                // below; seeded there so it is never primal-space.
+                id: crate::wengert::ADJOINT_ID_BASE,
                 result: remap[&op.result],
                 op: op.op.clone(),
                 inputs,
@@ -1613,7 +1625,10 @@ pub fn apply_to_adjoint(
             let result = *fresh;
             *fresh += 1;
             markers.push(WengertOp {
-                id: 0,
+                // Placeholder; the renumber below assigns the real id. Kept
+                // in the adjoint half so no primal-space id ever exists on
+                // this list, even transiently.
+                id: crate::wengert::ADJOINT_ID_BASE,
                 result,
                 op: PrimalOp::FreeTensor,
                 inputs: vec![v],
@@ -1624,12 +1639,15 @@ pub fn apply_to_adjoint(
         adjoint.ops.splice(last_idx + 1..last_idx + 1, markers);
     }
 
-    // Renumber adjoint op ids sequentially (ids are positional metadata in
-    // the adjoint list; nothing keys off them the way CSHA claims key off
-    // primal ids).
-    for (i, op) in adjoint.ops.iter_mut().enumerate() {
-        op.id = i as u32;
-    }
+    // Renumber adjoint op ids sequentially. Ids stay positional metadata
+    // WITHIN the adjoint (nothing keys off them the way CSHA claims key off
+    // primal ids) — but they carry the adjoint base, which is what keeps a
+    // recompute clone spliced above from ever matching a primal claim key.
+    crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
+    adjoint.assert_ids_in_space(
+        crate::wengert::IdSpace::Adjoint,
+        "ccr::apply_to_adjoint",
+    );
 
     validate(primal, adjoint, plan)
 }

@@ -988,7 +988,23 @@ impl PassBus {
     // ── CSHA backward claims ─────────────────────────────────────────
 
     /// Publish the reverse-walk dispatch map.
+    ///
+    /// Every key must be a PRIMAL op id. The map is consulted while the
+    /// lowerer walks BOTH tapes, so an adjoint-space key would be a claim
+    /// that could match an adjoint op — the thing the id split exists to
+    /// prevent. Checked here, at the one choke point, rather than at each
+    /// of the two consulting arms.
     pub fn publish_csha_backward_claims(&mut self, v: crate::source_ad::CshaBackwardClaims) {
+        for &id in v.op_to_chain.keys() {
+            assert_eq!(
+                crate::wengert::id_space(id),
+                crate::wengert::IdSpace::Primal,
+                "CSHA backward claim key {id} is an ADJOINT-space op id — \
+                 claims are keyed by primal ids and are consulted against \
+                 adjoint ops too, so this key could route an adjoint op \
+                 through another layer's fused backward"
+            );
+        }
         note_publish(Channel::CshaBackwardClaims);
         self.csha_backward_claims = Some(v);
     }
