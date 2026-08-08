@@ -105,6 +105,14 @@ fn run_program_env(
         // EmbedCpu-style runs).
         .env("NSL_CSLA_COUNTER", "1")
         .env("NSL_WS_COUNTER", "1")
+        // The capacity-aware residency policy would PIN these small fixtures
+        // resident on any roomy card, taking the transfer counts this file
+        // asserts to zero. The weight-stream arms here test the STREAMING
+        // MACHINERY, so the policy is pinned off — otherwise the gate's
+        // expected counts would depend on the host card's VRAM. Set BEFORE
+        // the caller's `envs` loop so an individual arm can still override it
+        // (the residency gate does exactly that).
+        .env("NSL_WS_RESIDENT", "0")
         .env("NSL_EMBEDDING_BWD_CPU", "1");
     for (k, v) in envs {
         cmd.env(k, v);
@@ -1594,5 +1602,262 @@ fn csla_grad_integrity_detects_partial_and_double_contributions() {
     assert!(
         c_under.is_empty() && c_over.is_empty(),
         "control run must be clean: under={c_under:?} over={c_over:?}"
+    );
+}
+
+/// Parse the `[weight-stream] residency:` posture line.
+/// Returns `(pinned, registered, pinned_bytes, streamed_bytes)` — EXACT
+/// bytes, because these fixtures' whole parameter set is a few hundred KiB
+/// and the MiB rendering rounds it away.
+fn residency_counts(stderr: &str) -> (i64, i64, u64, u64) {
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("[weight-stream] residency:"))
+        .unwrap_or_else(|| panic!("no residency line:\n{stderr}"));
+    let field = |label: &str| -> String {
+        line.split(&format!("{label}="))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no {label} in:\n{line}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let pinned: i64 = field("pinned").parse().unwrap();
+    // "pinned=N of M param(s)" — M is the token after "of".
+    let registered: i64 = line
+        .split(" of ")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("no registered count in:\n{line}"));
+    (
+        pinned,
+        registered,
+        field("pinned_bytes").parse().unwrap(),
+        field("streamed_bytes").parse().unwrap(),
+    )
+}
+
+/// The capacity-aware residency policy: on a card with headroom,
+/// `--weight-stream` keeps parameters DEVICE-RESIDENT and moves zero
+/// parameter bytes over PCIe — while producing a BIT-IDENTICAL loss stream
+/// and checkpoint to the streaming path.
+///
+/// Why this matters beyond the gate: the measured 1B@2048 configuration was
+/// paying ~3.7 GiB of H2D per step to stream a parameter set that fits in
+/// VRAM with ~18 GiB to spare, because streaming was an unconditional
+/// consequence of the flag rather than a decision. Dropping that traffic is
+/// worth ~16% of step time at 1B (914.6 -> 770.8 ms/step measured).
+///
+/// Both arms run the SAME binary with the SAME flags — only
+/// `NSL_WS_RESIDENT` differs — so any loss divergence is attributable to the
+/// residency decision alone and nothing else.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn weight_stream_residency_is_bit_exact_and_moves_no_bytes_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_ws_resident_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_stream = tmp.join("stream.nslm");
+    let save_resident = tmp.join("resident.nslm");
+    let flags = ["--checkpoint-blocks", "--layerwise-accum", "--weight-stream"];
+
+    // Arm A: policy OFF — the pre-existing unconditional streaming stack.
+    let streamed = run_program_env(
+        &program("csla_layerwise_ffn.nsl", true, &save_stream, &[]),
+        "res_stream",
+        true,
+        true,
+        &flags,
+        &[("NSL_WS_RESIDENT", "0")],
+    );
+    assert!(streamed.success, "streaming arm failed:\n{}", streamed.stderr);
+
+    // Arm B: policy ON (the default) — same flags, same binary.
+    let resident = run_program_env(
+        &program("csla_layerwise_ffn.nsl", true, &save_resident, &[]),
+        "res_pinned",
+        true,
+        true,
+        &flags,
+        &[("NSL_WS_RESIDENT", "1")],
+    );
+    assert!(resident.success, "resident arm failed:\n{}", resident.stderr);
+
+    // 1. Bit-exactness. A host round trip is an exact copy, so residency can
+    //    only change WHERE the bytes live, never their value.
+    assert_eq!(
+        streamed.loss_stream, resident.loss_stream,
+        "residency changed the loss stream — it must be a pure placement \
+         decision\nstreamed stderr:\n{}\nresident stderr:\n{}",
+        streamed.stderr, resident.stderr
+    );
+    let a = std::fs::read(&save_stream).expect("streaming .nslm");
+    let b = std::fs::read(&save_resident).expect("resident .nslm");
+    assert_eq!(a, b, "residency changed the saved model bytes");
+
+    // 2. The policy actually engaged, and engaged COMPLETELY: this fixture is
+    //    a few MiB against a multi-GiB card, so every registered param must
+    //    pin and nothing may stream.
+    let (pinned, registered, pinned_bytes, streamed_bytes) =
+        residency_counts(&resident.stderr);
+    assert!(registered > 0, "no params registered — gate is vacuous");
+    assert_eq!(
+        pinned, registered,
+        "expected every param resident on a card with this much headroom:\n{}",
+        resident.stderr
+    );
+    assert!(
+        pinned_bytes > 0,
+        "pinned zero bytes:\n{}",
+        resident.stderr
+    );
+    assert_eq!(
+        streamed_bytes, 0,
+        "streamed bytes on a fully-resident run:\n{}",
+        resident.stderr
+    );
+    // The streaming control must account for the same parameter set on the
+    // other side of the decision — otherwise "pinned_bytes > 0" could be a
+    // single tiny param while the rest went missing.
+    let (_, _, ctl_pinned_bytes, ctl_streamed_bytes) = residency_counts(&streamed.stderr);
+    assert_eq!(ctl_pinned_bytes, 0, "control arm pinned despite NSL_WS_RESIDENT=0");
+    assert_eq!(
+        ctl_streamed_bytes, pinned_bytes,
+        "the two arms disagree about the total parameter bytes under \
+         management — one of them is losing params"
+    );
+
+    // 3. Zero parameter traffic — the whole point. The streaming arm is the
+    //    non-vacuity witness: it must move a nonzero, much larger amount, or
+    //    "0 uploads" would prove nothing about the policy.
+    let (up_res, ev_res, wb_res) = ws_counts(&resident.stderr);
+    assert_eq!(
+        (up_res, ev_res, wb_res),
+        (0, 0, 0),
+        "a fully-resident run must not upload, evict or write back:\n{}",
+        resident.stderr
+    );
+    let (up_str, ..) = ws_counts(&streamed.stderr);
+    assert!(
+        up_str > 0,
+        "control arm did not stream, so the 0-upload assertion above is \
+         vacuous:\n{}",
+        streamed.stderr
+    );
+
+    // 4. Pointer stability is a free consequence worth pinning: a pinned
+    //    param never has its storage freed and reallocated, so the moves
+    //    counter — which the #397 view-of-theta hazard is about — stays 0.
+    assert!(
+        resident
+            .stderr
+            .lines()
+            .any(|l| l.contains("[weight-stream] uploads:") && l.contains("ptr_moves: 0")),
+        "resident params must never move:\n{}",
+        resident.stderr
+    );
+
+    // 5. The posture line's audit tail must be POPULATED. It is printed at
+    //    atexit, which runs after teardown clears the plan, so without a
+    //    snapshot every one of these fields is silently blank — and they are
+    //    the only way to see WHY the policy decided what it did.
+    for field in ["free_at_decision=", "total=", "reserve=", "must_free="] {
+        assert!(
+            resident.stderr.contains(field),
+            "residency posture is missing {field} — the atexit report read a \
+             plan that teardown had already cleared:\n{}",
+            resident.stderr
+        );
+    }
+}
+
+/// Residency × the ARENA PACK paths (`--stream-arena --stream-prefetch
+/// --stream-async-writeback`).
+///
+/// This arm exists because the pack paths make assumptions a pinned
+/// parameter violates by construction — `arena_slot == -1` while
+/// `data != null`, which three separate sites treat as a fatal
+/// pack-grouping mismatch — and because a pack that is entirely pinned
+/// acquires no slot at all, while codegen still emits the `await`. Without
+/// this arm the residency policy has ZERO coverage of the pack paths, and
+/// the gates that do cover them pin the policy off.
+///
+/// It also guards a refcount invariant that no assertion can see directly:
+/// `upload_pack` must charge the slot only for members it actually staged,
+/// or a partially-pinned pack strands one device + pinned-host buffer per
+/// upload. That leak shows up here as a run that OOMs or balloons rather
+/// than a failed assert, which is why the arm runs long enough to repeat.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn weight_stream_residency_composes_with_arena_pack_paths_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_ws_res_pack_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_stream = tmp.join("pack_stream.nslm");
+    let save_resident = tmp.join("pack_resident.nslm");
+    let flags = [
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+        "--stream-arena",
+        "--stream-prefetch",
+        "--stream-async-writeback",
+    ];
+
+    let streamed = run_program_env(
+        &program("csla_layerwise_ffn.nsl", true, &save_stream, &[]),
+        "pack_stream",
+        true,
+        true,
+        &flags,
+        &[("NSL_WS_RESIDENT", "0")],
+    );
+    assert!(
+        streamed.success,
+        "arena/prefetch/async streaming arm failed:\n{}",
+        streamed.stderr
+    );
+
+    let resident = run_program_env(
+        &program("csla_layerwise_ffn.nsl", true, &save_resident, &[]),
+        "pack_resident",
+        true,
+        true,
+        &flags,
+        &[("NSL_WS_RESIDENT", "1")],
+    );
+    assert!(
+        resident.success,
+        "arena/prefetch/async resident arm failed — a pinned param reached a \
+         pack path that aborts on it:\n{}",
+        resident.stderr
+    );
+
+    assert_eq!(
+        streamed.loss_stream, resident.loss_stream,
+        "residency changed the loss stream under the pack paths\nstreamed:\n{}\nresident:\n{}",
+        streamed.stderr, resident.stderr
+    );
+    let a = std::fs::read(&save_stream).expect("streaming .nslm");
+    let b = std::fs::read(&save_resident).expect("resident .nslm");
+    assert_eq!(a, b, "residency changed saved bytes under the pack paths");
+
+    let (pinned, registered, ..) = residency_counts(&resident.stderr);
+    assert!(registered > 0, "no params registered — gate is vacuous");
+    assert_eq!(
+        pinned, registered,
+        "expected every param resident on a card with this headroom:\n{}",
+        resident.stderr
+    );
+    // The streaming control must genuinely have exercised the PACK path, or
+    // "resident survives the pack paths" is proven against nothing.
+    assert!(
+        streamed
+            .stderr
+            .lines()
+            .any(|l| l.contains("[weight-stream] uploads:") && !l.contains("pack_uploads: 0")),
+        "control arm never used the arena pack path, so this gate proves \
+         nothing about residency x packs:\n{}",
+        streamed.stderr
     );
 }

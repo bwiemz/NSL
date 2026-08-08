@@ -6,6 +6,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed — weight streaming is now a capacity-aware DECISION (1B@2048: +18.6% tokens/s)
+
+- **`--weight-stream` streamed unconditionally, and at 1B that cost ~16% of
+  step time for under 1 GiB of memory.** Measured on this 32 GB card, same
+  harness and cell as the 2026-08-06 matrix, at **identical flags** with the
+  policy off vs on: 912.0 → **765.2 ms/step**, 2,246 → **2,676 tokens/s**,
+  for **+935 MB** of peak device memory. Dropping `--weight-stream` entirely
+  lands in the same place (768.9 ms, 20.8% MFU — the highest in the matrix),
+  confirming the pinned path costs nothing over not streaming at all. The streaming stack was
+  designed for a 16 GiB card where weights (3.9 GiB) + moments (7.7 GiB)
+  left nothing for activations; on 32 GB it re-uploaded the whole parameter
+  set every step — ~3.7 GiB/step of H2D — while ~18 GB of VRAM sat unused.
+  Nothing noticed, because streaming was a consequence of the flag rather
+  than a decision: there was no capacity model, no device query, and nowhere
+  that "does it fit?" was asked. Full write-up and per-round data in
+  `models/benchmarks/RESIDENCY_1B_2026_08_08.md`; the corresponding claim in
+  MATRIX_2026_08_06 ("weight streaming's cost, and the reason it fits") is
+  annotated in place as corrected.
+- **The policy.** At registration every parameter is *already* device-
+  resident, so streaming does not acquire memory — it frees θ and buys it
+  back over PCIe every step. The decision is therefore
+  `must_free = reserve − free_at_first_registration`: parameters stream, in
+  registration order, only until that debt is paid, and every remaining one
+  is **pinned resident** with no host mirror at all (so the run also stops
+  paying pinned host memory for it) and with its upload/evict sites reduced
+  to no-ops. `reserve` defaults to 50% of total VRAM — deliberately generous,
+  since the activation peak is not modelled here and being wrong costs an
+  OOM — and reproduces both known data points: everything pins on this 32 GB
+  card, and on a 16 GiB card the debt exceeds all of θ so everything streams
+  exactly as before. `NSL_WS_RESIDENT_RESERVE_MIB` overrides the reserve;
+  `NSL_WS_RESIDENT=0` restores unconditional streaming.
+- **Bit-exact by construction** — a host round trip is an exact copy, so this
+  changes only *where* bytes live. Pinned parameters are also strictly better
+  for pointer stability: their device address never moves, so `ptr_moves`
+  stays 0 and the #397 view-of-θ hazard cannot arise for them. Gated by
+  `weight_stream_residency_is_bit_exact_and_moves_no_bytes_gpu`, which runs
+  the same binary and flags with only `NSL_WS_RESIDENT` differing and
+  requires identical loss streams and `.nslm` bytes, zero uploads/evicts/
+  writebacks, and a streaming control arm as the non-vacuity witness.
+- **The arena pack paths needed the same treatment, and adversarial review
+  found three defects there that no gate could see** (the residency gate did
+  not pass `--stream-arena`, and the gates that do were pinned policy-off):
+  `evict_pack_async` carried a second copy of the "resident but not
+  arena-backed" abort with no pinned skip — a hard crash on the first async
+  writeback under `--stream-async-writeback`; `await_pack` aborted when a
+  pack was entirely pinned, since it acquires no slot while codegen still
+  emits the await from compile-time info; and `upload_pack` charged the
+  arena slot for ALL members while `evict_pack` released only the streamed
+  ones, stranding one device + pinned-host buffer per upload of a
+  partially-pinned pack — unbounded growth in exactly the new middle regime
+  the policy introduces. All three are fixed and now covered by
+  `weight_stream_residency_composes_with_arena_pack_paths_gpu`.
+- Three hazards the pinned path introduced are refused rather than risked:
+  `upload` of a pinned-but-evicted param aborts (it has no mirror, so the old
+  code would have memcpy'd from null and filled θ with garbage); `evict_pack`
+  skips pinned members *before* the check that treats "resident but not
+  arena-backed" as a fatal grouping mismatch, which pinned params trip by
+  construction; and the residency plan resets per train block so a second
+  block re-decides against the VRAM free then. The four gates that test the
+  streaming *machinery* pin `NSL_WS_RESIDENT=0`, so their transfer counts no
+  longer depend on the host card's size.
+- **Also measured, and it revises an earlier reading:** `--param-dtype
+  bf16-sr` is ~1% *slower* than f32 at 1B once residency is equalised (2,639
+  vs 2,663 tokens/s) — the first controlled comparison, same schedule, same
+  accumulation, both resident. The 500M ladder's srbf16 win (405 → 239 ms)
+  was the CSLA schedule, not the dtype, exactly as that document's own note
+  said; its fp32/bf16 arms run `--source-ad` alone.
+
 ### Added — arena × CUDA graphs: the composition measured, gated, and one hole closed
 
 - **`--transient-arena` composes with `--cuda-graphs` by construction, now

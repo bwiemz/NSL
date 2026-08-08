@@ -61,6 +61,14 @@ struct Mirror {
     /// allocation base).
     arena_slot: i64,
     arena_off: usize,
+    /// Capacity-aware residency: this parameter was admitted to stay
+    /// DEVICE-RESIDENT for the whole run, so it has no host mirror
+    /// (`host` is null) and its upload/evict sites are no-ops. See
+    /// [`residency_admit`] for the decision. Numerically identical to
+    /// streaming — a host round trip is an exact copy — and strictly
+    /// better for pointer stability (a pinned param's device address
+    /// never moves, so `WS_PTR_MOVES` stays 0 for it).
+    pinned: bool,
 }
 // Raw pointers in the table are only touched under the lock on the
 // (single-threaded) training path.
@@ -76,6 +84,18 @@ static MIRRORS: Mutex<Option<HashMap<i64, Mirror>>> = Mutex::new(None);
 /// read-only one absorbed by the idempotent step-top register belt (review
 /// D2b-2-5) — dropping the writeback leg would leave totals unchanged but
 /// silently train on stale mirrors after the first window.
+/// Capacity-aware residency (the 1B residency work): parameters admitted to
+/// stay device-resident, and their total bytes. `WS_PINNED == WS_REGISTERED`
+/// means NOTHING streamed and the run pays zero weight PCIe; 0 means the
+/// device had no headroom and behavior is exactly the pre-existing streaming
+/// stack. Both are reported on the teardown line so a run's residency
+/// posture is visible without a profiler.
+pub static WS_PINNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WS_PINNED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes of streamed (host-mirrored) parameter storage — the per-step H2D
+/// bill this policy exists to remove.
+pub static WS_STREAMED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub static WS_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WS_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WS_EVICTS_WB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -116,9 +136,122 @@ pub extern "C" fn nsl_weight_stream_ptr_moves() -> i64 {
     WS_PTR_MOVES.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
+/// Capacity-aware residency decision, computed ONCE at the first
+/// registration and then consulted per parameter.
+///
+/// The modeling point that makes this simple: at registration time every
+/// parameter is ALREADY device-resident (the train setup allocated θ and the
+/// optimizer moments before the streaming belt runs). Streaming does not
+/// *acquire* memory — it *frees* θ's device storage and buys it back over
+/// PCIe every step. So the question is not "can I afford to keep this
+/// resident" but "how many bytes must I give up so the activation working
+/// set still fits".
+///
+/// `must_free = reserve.saturating_sub(free_at_first_registration)`. Params
+/// stream (in registration order) until that debt is paid; every remaining
+/// param is pinned resident. On a device with headroom the debt is zero and
+/// nothing streams; on a device without it, the behavior is byte-for-byte
+/// the pre-existing streaming stack.
+///
+/// `reserve` defaults to 50% of TOTAL VRAM — deliberately generous, because
+/// the activation peak is not modeled here and being wrong costs an OOM.
+/// It reproduces both known data points: on this 32 GiB card 1B@2048 pins
+/// everything (measured free ≈ 19 GiB > 16 GiB reserve), and on the 16 GiB
+/// card the fixture headers describe (free ≈ 3 GiB < 8 GiB reserve) the debt
+/// exceeds all of θ, so everything streams exactly as before.
+#[cfg(feature = "cuda")]
+struct ResidencyPlan {
+    /// Bytes of θ that must be surrendered to the host before pinning starts.
+    must_free: usize,
+    /// Bytes surrendered so far.
+    freed: usize,
+    reserve: usize,
+    free_at_decision: usize,
+    total_vram: usize,
+}
+
+#[cfg(feature = "cuda")]
+static RESIDENCY: std::sync::Mutex<Option<ResidencyPlan>> = std::sync::Mutex::new(None);
+
+/// `NSL_WS_RESIDENT=0` restores unconditional streaming (the pre-policy
+/// behavior) for A/B measurement and as an escape hatch.
+#[cfg(feature = "cuda")]
+fn residency_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_WS_RESIDENT").ok().as_deref() != Some("0"))
+}
+
+/// Decide whether this parameter stays resident. Returns true to PIN.
+#[cfg(feature = "cuda")]
+fn residency_admit(bytes: usize) -> bool {
+    if !residency_enabled() {
+        return false;
+    }
+    let mut guard = RESIDENCY.lock().unwrap();
+    let plan = guard.get_or_insert_with(|| {
+        let (free, total) = crate::cuda::inner::query_vram();
+        let reserve = std::env::var("NSL_WS_RESIDENT_RESERVE_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mib| mib * 1024 * 1024)
+            .unwrap_or(total / 2);
+        ResidencyPlan {
+            must_free: reserve.saturating_sub(free),
+            freed: 0,
+            reserve,
+            free_at_decision: free,
+            total_vram: total,
+        }
+    });
+    if plan.freed < plan.must_free {
+        plan.freed += bytes;
+        return false; // stream this one: the debt is not yet paid
+    }
+    true
+}
+
+/// The last decided plan's posture, SNAPSHOTTED as text before the plan is
+/// cleared. The posture line is printed at `atexit`, which always runs after
+/// train-block teardown clears `RESIDENCY` — reading the live plan there
+/// would report an empty tail on every normal run, hiding exactly the four
+/// fields that let anyone audit why the policy decided what it did.
+#[cfg(feature = "cuda")]
+static RESIDENCY_LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Render the CURRENT plan's posture (used to take the snapshot).
+#[cfg(feature = "cuda")]
+fn residency_posture() -> Option<String> {
+    let guard = RESIDENCY.lock().unwrap();
+    let p = guard.as_ref()?;
+    let mib = |b: usize| b as f64 / 1048576.0;
+    Some(format!(
+        "free_at_decision={:.0} MiB total={:.0} MiB reserve={:.0} MiB \
+         must_free={:.0} MiB",
+        mib(p.free_at_decision),
+        mib(p.total_vram),
+        mib(p.reserve),
+        mib(p.must_free),
+    ))
+}
+
+/// One-line residency posture for the teardown report. `None` when the
+/// policy never ran (no registrations, or disabled). Survives the per-train-
+/// block plan reset via the snapshot above.
+#[cfg(feature = "cuda")]
+pub fn residency_summary() -> Option<String> {
+    if let Some(live) = residency_posture() {
+        return Some(live);
+    }
+    RESIDENCY_LAST.lock().unwrap().clone()
+}
+
 /// Register a GPU-resident f32 parameter for streaming: allocate a pinned
 /// host mirror, copy the current device bytes into it, free the device
 /// buffer, and null `t.data` (evicted state).
+///
+/// Capacity-aware residency (see [`residency_admit`]): a parameter the
+/// device has room for is instead PINNED — it keeps its device storage, gets
+/// no host mirror, and its upload/evict sites become no-ops.
 ///
 /// IDEMPOTENT: on an already-registered RESIDENT tensor this degenerates
 /// to a writeback-free evict — the mirror is current by construction
@@ -184,8 +317,33 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
             std::process::abort();
         }
         let bytes = t.data_byte_size();
-        let host = crate::tensor::alloc_host_state_buffer(bytes);
         crate::cuda::inner::ensure_context();
+        // Capacity-aware residency: keep this parameter on the device when
+        // the card has room. No host mirror is allocated (so the run also
+        // stops paying pinned HOST memory for it), the device storage is NOT
+        // freed, and upload/evict below no-op on the `pinned` flag. It still
+        // enters MIRRORS so `mirror_is_registered` — which the parameter-plan
+        // verifier uses to confirm the declared backend actually took this
+        // param — keeps answering true.
+        if residency_admit(bytes) {
+            let mut guard = MIRRORS.lock().unwrap();
+            guard.get_or_insert_with(HashMap::new).insert(
+                tensor_ptr,
+                Mirror {
+                    host: std::ptr::null_mut(),
+                    bytes,
+                    last_dev: t.data as i64,
+                    arena_slot: -1,
+                    arena_off: 0,
+                    pinned: true,
+                },
+            );
+            WS_REGISTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WS_PINNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WS_PINNED_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let host = crate::tensor::alloc_host_state_buffer(bytes);
         crate::cuda::inner::memcpy_dtoh(host as *mut c_void, t.data, bytes);
         crate::cuda::inner::free_managed(t.data);
         t.data = std::ptr::null_mut();
@@ -198,8 +356,10 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
                 last_dev: 0,
                 arena_slot: -1,
                 arena_off: 0,
+                pinned: false,
             },
         );
+        WS_STREAMED_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
         // First registration = this param's original device storage was freed
         // (its pointer is now invalid). A view-rooted param excluded by #397
         // never reaches here.
@@ -247,6 +407,20 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
             );
             std::process::abort();
         };
+        // Reaching here with a PINNED param means its device storage was
+        // freed by something other than this module — the param never left
+        // the device by design and has NO host mirror, so the copy below
+        // would read a null pointer and silently fill θ with garbage.
+        // Refuse instead of dereferencing (deferral-must-refuse).
+        if m.pinned {
+            eprintln!(
+                "[weight-stream] FATAL: pinned-resident tensor {tensor_ptr} was \
+                 found evicted — its device storage was freed by something \
+                 outside the residency backend, and it has no host mirror to \
+                 restore from"
+            );
+            std::process::abort();
+        }
         crate::cuda::inner::ensure_context();
         let dev = crate::cuda::inner::alloc_managed(m.bytes);
         crate::cuda::inner::memcpy_htod(dev, m.host as *const c_void, m.bytes);
@@ -313,6 +487,12 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
             );
             std::process::abort();
         };
+        // Pinned resident: nothing to write back (there is no mirror) and
+        // nothing to free — this param never left the device. Returning
+        // here is what makes the emitted per-slice evict sites free.
+        if m.pinned {
+            return;
+        }
         crate::cuda::inner::ensure_context();
         if writeback != 0 {
             // Reading the arena INTERIOR pointer for a DtoH is valid; only
@@ -646,9 +826,21 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
             eprintln!("[weight-stream] FATAL: upload_pack of unregistered tensor {ptr}");
             std::process::abort();
         };
+        // Pinned-resident members carry no mirror and need no transfer, so
+        // they take no space in the pack's staging buffer. The pack is a
+        // batched-transfer optimization over the params that actually move;
+        // including a pinned one would gather from a null host pointer.
+        if m.pinned {
+            continue;
+        }
         let off = align_up(total, ARENA_ALIGN);
         layout.push((ptr, off, m.bytes));
         total = off + m.bytes;
+    }
+    if layout.is_empty() {
+        // Every member of this pack is resident — nothing to stage, and
+        // acquiring a zero-byte arena slot would be meaningless.
+        return;
     }
 
     // Item 11 (writeback half): the gather below reads each param's MIRROR —
@@ -660,7 +852,13 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
         drain_writebacks_for_params(&ptrs);
     }
 
-    let (slot_idx, dev, host_stage) = arena_acquire(total, n);
+    // `layout.len()`, NOT `n`: pinned-resident members were filtered out
+    // above and are skipped by evict_pack, which releases `regions.len()`.
+    // Passing the full member count would leave the slot permanently at
+    // `live == pinned_count > 0`, so `arena_acquire`'s `live == 0` reuse
+    // predicate would never match it again — one leaked device buffer AND
+    // pinned host staging buffer per upload of a partially-pinned pack.
+    let (slot_idx, dev, host_stage) = arena_acquire(total, layout.len());
 
     // Gather each mirror into the contiguous pinned host buffer, then ONE HtoD
     // for the whole pack — synchronous for `upload_pack`, async (overlapping
@@ -720,7 +918,24 @@ pub extern "C" fn nsl_weight_stream_await_pack(pw_list_ptr: i64) {
         if list.len == 0 {
             return;
         }
-        let first = unsafe { *list.data };
+        // Skip pinned-resident members when picking the representative: they
+        // never acquire a slot, so a pack whose FIRST member is pinned would
+        // otherwise look like a prefetch/await desync. A pack that is
+        // ENTIRELY pinned uploaded nothing and has no event to await.
+        // (Codegen decides `was_prefetched` from compile-time info alone, so
+        // it calls await for packs the runtime chose to keep resident.)
+        let Some(first) = (0..list.len as usize)
+            .map(|i| unsafe { *list.data.add(i) })
+            .find(|p| {
+                let guard = MIRRORS.lock().unwrap();
+                !guard
+                    .as_ref()
+                    .and_then(|g| g.get(p))
+                    .is_some_and(|m| m.pinned)
+            })
+        else {
+            return;
+        };
         let slot = {
             let guard = MIRRORS.lock().unwrap();
             match guard.as_ref().and_then(|g| g.get(&first)) {
@@ -810,6 +1025,14 @@ pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64)
                 eprintln!("[weight-stream] FATAL: evict_pack of unregistered tensor {ptr}");
                 std::process::abort();
             };
+            // Pinned-resident: by construction arena_slot is -1 AND data is
+            // non-null, which is exactly the shape the abort below treats as
+            // a pack-grouping slip. Skip before that check — for this param
+            // "resident via a non-arena buffer" is the intended state, not a
+            // codegen mismatch, and it has no writeback to lose.
+            if m.pinned {
+                continue;
+            }
             if m.arena_slot < 0 {
                 // Legitimately evicted (idempotent belt) → skip. But a member
                 // that is RESIDENT via a non-arena owned buffer (data != null
@@ -1024,6 +1247,14 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
                 eprintln!("[weight-stream] FATAL: evict_pack_async of unregistered tensor {ptr}");
                 std::process::abort();
             };
+            // Pinned-resident: same reasoning as the synchronous evict_pack —
+            // arena_slot is -1 AND data is non-null by construction, which is
+            // exactly the shape the abort below treats as a grouping slip.
+            // (This is the SECOND copy of that check; the two must stay in
+            // step, which is why both carry this skip.)
+            if m.pinned {
+                continue;
+            }
             if m.arena_slot < 0 {
                 if !NslTensor::from_ptr(ptr).data.is_null() {
                     eprintln!(
@@ -1248,6 +1479,12 @@ fn teardown_mirrors() {
                 crate::cuda::inner::memcpy_dtod(owned, interior, m.bytes);
                 t.data = owned;
                 t.owns_data = 1;
+            } else if m.pinned {
+                // Never left the device and has no mirror to free: the
+                // tensor is already the plain owned f32 buffer post-training
+                // code expects. (Its `host` is null — skipping the free
+                // below is why this arm returns early.)
+                continue;
             } else if t.data.is_null() {
                 // NOTE: deliberately NOT counted in WS_UPLOADS — under
                 // part-2 whole-loop streaming EVERY streamed param arrives
@@ -1276,5 +1513,16 @@ fn teardown_mirrors() {
         }
         // Free the arena slots now that every param owns its buffer again.
         arena_teardown();
+        // Re-decide residency for the next train block against the VRAM that
+        // is actually free THEN. Carrying this block's plan forward would
+        // reuse a `free_at_decision` measured before this block's surfaces
+        // existed — and a second block with a larger model (or a first block
+        // that has not released everything) would inherit a debt computed
+        // for a different footprint. Snapshot the posture FIRST so the
+        // atexit report (which always runs after this) can still print it.
+        if let Some(s) = residency_posture() {
+            *RESIDENCY_LAST.lock().unwrap() = Some(s);
+        }
+        *RESIDENCY.lock().unwrap() = None;
     }
 }

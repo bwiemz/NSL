@@ -165,6 +165,7 @@ ARMS = {
         Arm("layerwise",
             ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
              "--weight-stream"),
+            (("NSL_WS_RESIDENT", "0"),),
             what="the CSLA window-buffered schedule with weight streaming — "
                  "the shipped memory stack that makes 1B fit. NOT built on "
                  "--pretrain-optimized: the bundle's WGGO per-parameter FASE "
@@ -174,6 +175,43 @@ ARMS = {
                  "campaign certifies. Trains with grad_accumulation=2 and NO "
                  "grad_clip (both required by --layerwise-accum), so its "
                  "loss stream is not comparable to the other arms'",
+            accum=2, grad_clip=False),
+        Arm("layerwise_policy",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream"),
+            (("NSL_WS_RESIDENT", "1"),),
+            what="THE SHIPPED PATH: identical flags to `layerwise`, with the "
+                 "capacity-aware residency policy ON (the default). This is "
+                 "the arm that exercises the pinned code — Mirror{pinned}, "
+                 "no-op upload/evict, the per-micro-batch register belt over "
+                 "a pinned table. `layerwise` vs this is policy-off vs "
+                 "policy-on at identical flags, which is the comparison the "
+                 "policy should be judged on; `layerwise_resident` below "
+                 "drops the flag entirely and is the reference for what "
+                 "residency is worth intrinsically",
+            accum=2, grad_clip=False),
+        Arm("layerwise_resident",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum"),
+            what="the SAME CSLA window schedule as `layerwise`, with weight "
+                 "streaming OFF. --weight-stream requires --layerwise-accum "
+                 "but NOT the reverse, so this composition is legal and has "
+                 "simply never been measured at 1B. The streaming stack was "
+                 "designed for a 16 GiB card (weights 3.9 + m/v 7.7 GiB left "
+                 "no room for activations); this box has 32 GiB, so the "
+                 "question this arm answers is whether the ~3.7 GiB/step of "
+                 "H2D the `layerwise` arm pays is still buying anything. "
+                 "Numerically identical to `layerwise` — same schedule, same "
+                 "f32 weights, only residency differs",
+            accum=2, grad_clip=False),
+        Arm("layerwise_resident_srbf16",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--param-dtype", "bf16-sr"),
+            (), "bf16",
+            what="bf16-authoritative weights: the mirrors are DEVICE-resident, "
+                 "so --weight-stream here names the residency backend and "
+                 "moves no host bytes (0 uploads measured at 500M). Halves "
+                 "the weight surface (2 vs 4 GiB at 1B) on top of that. Its "
+                 "loss stream is not bit-comparable to the f32 arms",
             accum=2, grad_clip=False),
         Arm("fp32", ("--source-ad",), (("NSL_MATMUL_TF32", "0"),), "fp32",
             what="full-f32 matmul (TF32 tensor cores off)"),
@@ -199,7 +237,9 @@ MATRIX = [
     ("50m", 1024, [1, 4, 8, 16], ["reference", "optimized"]),
     ("500m", 1024, None, ["fp32", "bf16", "srbf16"]),
     ("1b", 512, None, ["reference", "optimized", "layerwise"]),
-    ("1b", 2048, None, ["reference", "optimized", "layerwise"]),
+    ("1b", 2048, None, ["reference", "optimized", "layerwise",
+                        "layerwise_policy", "layerwise_resident",
+                        "layerwise_resident_srbf16"]),
 ]
 
 
