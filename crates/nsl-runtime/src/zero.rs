@@ -111,6 +111,14 @@ pub static ZERO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 =
 /// shrink to ~1/N — a numeric parity gate alone can't see this (owned-only
 /// allocation is invisible to the loss because non-owners never read their
 /// non-owned m/v). Bumped once per owned moment tensor at allocation.
+///
+/// Item C extends the same instrument to stage 3: tensor-granular sharded
+/// params bump it from `emit_owner_gated_moment` exactly as stages 1/2 do,
+/// and elementwise params bump it by their SLICE size from
+/// `nsl_zero3_alloc_elem_moment`. REPLICATED params (tied/epilogue/
+/// view-rooted) are deliberately NOT counted on any rank — counting them
+/// would break the `r0 + r1 == full` partition identity the gates assert,
+/// since every rank holds a full copy of those by construction.
 pub static ZERO_OPTIM_ELEMS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2188,6 +2196,12 @@ static ZERO3_ELEM_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// stochastic rounding and read green on every other counter).
 static ZERO3_SR_ELEM_PARAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ZERO3_SR_ELEM_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Owner-only moments anti-vacuity: SLICE-sized optimizer moments handed out
+/// by `nsl_zero3_alloc_elem_moment`. Reported on the teardown line — a fill
+/// loop that silently fell back to full `zeros_like` reads 0 here while
+/// loss parity stays green, which is the exact failure this counter exists
+/// to catch.
+static ZERO3_ELEM_MOMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Codegen calls this once per train block when `--zero-stage 3` is baked.
 #[no_mangle]
@@ -2198,7 +2212,9 @@ pub extern "C" fn nsl_zero3_enable() -> i64 {
     eprintln!(
         "[zero3] tensor-granular parameter sharding enabled: owners keep \
          their params device-resident, non-owners hold nothing at rest and \
-         gather per layer window (optimizer state stays replicated in v1)"
+         gather per layer window (optimizer moments are OWNER-ONLY too — \
+         allocation is deferred to the first window and every rank holds \
+         m/v for its own share of the sharded set)"
     );
     0
 }
@@ -2295,9 +2311,9 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
             eprintln!(
                 "[zero3] elementwise sharding armed: eligible params live as \
                  1/{ws} slices per rank, gathers ride all_gather, gradients \
-                 reduce_scatter, every rank steps its own slice (v1: optimizer \
-                 state stays replicated; m/v regions outside this rank's slice \
-                 are never touched)"
+                 reduce_scatter, every rank steps its own slice — and m/v are \
+                 SLICE-sized too (1/{ws} of the moment surface per rank, \
+                 allocated at the first window register belt)"
             );
         });
         e.elem_pending = true;
@@ -2324,6 +2340,114 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
     }
     e.elem_sr = sr;
     0
+}
+
+/// Item C: allocate THIS RANK's slice-sized optimizer moment for an
+/// elementwise-sharded parameter, and record its elements against the
+/// `optim_elems` shrink counter.
+///
+/// Shape/dtype/device come from the `ElemShard` the CARVE populated
+/// (`zero3_register`), never from the θ tensor's own `len` — at rest an
+/// elementwise param's `data` is null and its `len` is still the FULL
+/// element count, so sizing a moment off θ would hand back exactly the
+/// replicated buffer this whole change exists to delete. That ordering
+/// (mark → register/carve → moment fill) is load-bearing: a call before the
+/// carve aborts loudly rather than silently allocating full.
+///
+/// Returns a fresh 1-D `[shard]` tensor owned by the caller (codegen stores
+/// it in the moment list; the end-of-train free loop releases it through
+/// `nsl_tensor_free` like every other moment).
+#[no_mangle]
+pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
+    if theta_ptr == 0 {
+        eprintln!(
+            "[zero3] FATAL: elementwise moment allocation for a null \
+             parameter slot (param {idx})"
+        );
+        std::process::abort();
+    }
+    let th = unsafe { &*(theta_ptr as *const crate::tensor::NslTensor) };
+    let (shard, elem_bytes) = {
+        let tbl = ZERO3_TABLE.lock().unwrap();
+        let Some(e) = tbl.as_ref().and_then(|map| map.get(&theta_ptr)) else {
+            eprintln!(
+                "[zero3] FATAL: elementwise moment allocation for untracked \
+                 tensor {theta_ptr} (param {idx})"
+            );
+            std::process::abort();
+        };
+        if e.idx != idx as usize {
+            eprintln!(
+                "[zero3] FATAL: elementwise moment param-index mismatch \
+                 (tensor says {}, codegen says {idx})",
+                e.idx
+            );
+            std::process::abort();
+        }
+        let Some(s) = e.elem.as_ref() else {
+            eprintln!(
+                "[zero3] FATAL: elementwise moment allocation for param {idx}, \
+                 which was never carved — the deferred moment fill must be \
+                 emitted AFTER the weight-stream register belt"
+            );
+            std::process::abort();
+        };
+        (s.shard, s.elem_bytes)
+    };
+    // The carve derived elem_bytes from θ's dtype; if the two disagree the
+    // moment would be sized for one storage and stepped as another.
+    let expect_bytes = if th.dtype == 0 { 8 } else { 4 };
+    if shard == 0 || (th.dtype != 0 && th.dtype != 1) || elem_bytes != expect_bytes {
+        eprintln!(
+            "[zero3] FATAL: elementwise moment for param {idx} has an \
+             inconsistent slice descriptor (shard={shard} elem_bytes={} \
+             theta dtype={})",
+            elem_bytes, th.dtype
+        );
+        std::process::abort();
+    }
+    let bytes = shard * elem_bytes;
+    let shape =
+        crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *shape = shard as i64 };
+    let strides = crate::tensor::NslTensor::compute_strides(shape, 1);
+    let data: *mut std::ffi::c_void = if th.device != 0 {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::inner::ensure_context();
+            let p = crate::cuda::inner::alloc_managed(bytes);
+            crate::cuda::inner::memset_d8(p, bytes);
+            p
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!(
+                "[zero3] FATAL: device elementwise moment in a non-cuda build"
+            );
+            std::process::abort();
+        }
+    } else {
+        crate::memory::checked_alloc_zeroed(bytes) as *mut std::ffi::c_void
+    };
+    let t = Box::new(crate::tensor::NslTensor::new(
+        data,
+        shape,
+        strides,
+        1,
+        shard as i64,
+        th.device,
+        th.dtype,
+        1,
+        0,
+    ));
+    let ptr = crate::tensor::NslTensor::publish(t);
+    ZERO3_ELEM_MOMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The note lives HERE, not at the call site: `optim_elems` is the only
+    // instrument that distinguishes owner-only moments from replicated ones
+    // (loss parity is invariant to the difference), so it must not be
+    // possible to add an allocation arm and forget the counter.
+    nsl_zero_note_optim_alloc(ptr);
+    ptr
 }
 
 /// Item 12 introspection (tests/diagnostics): residency of this rank's
@@ -3084,9 +3208,11 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
 /// this region. The updated theta region is then persisted into the slice
 /// (release frees the full transient right after the group update).
 ///
-/// v1: `m`/`v` are the codegen-allocated FULL moment tensors (replicated);
-/// only this rank's region is ever touched, so each region equals the
-/// baseline's bit-for-bit. Owner-only slice moments are the follow-up.
+/// Item C: `m`/`v` are THIS RANK's SLICE — exactly `shard` elements, from
+/// `nsl_zero3_alloc_elem_moment` — so they are indexed at `i` while θ (the
+/// gathered full transient) is indexed at `off + i`. The region result is
+/// bit-identical to the old replicated form, which touched `m[off+i]` of a
+/// full buffer whose other elements were dead weight on every rank.
 ///
 /// The scalar argument order mirrors `nsl_fase_fused_adamw_step` exactly.
 #[no_mangle]
@@ -3169,10 +3295,16 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         );
         std::process::abort();
     }
-    let n = th.len.max(0) as usize;
+    // Item C: m/v are SLICE-sized. A full-sized buffer here means the
+    // deferred fill fell back to `zeros_like` (or a caller kept the old
+    // replicated allocation) — refuse rather than silently index the first
+    // `shard` elements of a replicated buffer, which is arithmetically fine
+    // on rank 0 and WRONG on every other rank.
     assert!(
-        m.len.max(0) as usize == n && v.len.max(0) as usize == n,
-        "zero3 elem step: m/v length mismatch (theta={}, m={}, v={})",
+        m.len.max(0) as usize == shard && v.len.max(0) as usize == shard,
+        "zero3 elem step: m/v must be this rank's slice, not a full replica \
+         (shard={}, theta={}, m={}, v={})",
+        shard,
         th.len,
         m.len,
         v.len
@@ -3185,6 +3317,15 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         let guard = ZERO_CTX.lock().unwrap();
         guard.as_ref().map(|c| c.rank).unwrap_or(0)
     };
+    // Bound proof for the θ region this rank writes: the gathered transient
+    // must actually cover [rank*shard, (rank+1)*shard).
+    assert!(
+        rank.saturating_add(1).saturating_mul(shard) <= th.len.max(0) as usize,
+        "zero3 elem step: region [{}, {}) escapes theta (len={})",
+        rank * shard,
+        (rank + 1) * shard,
+        th.len
+    );
     let off_bytes = rank * shard * elem_bytes;
     let has_wd = wd != 0.0;
 
@@ -3199,8 +3340,9 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
             // GPU arm — this is what makes the region bit-equal.
             crate::cuda::gpu_fase_fused_adamw_step_raw(
                 (th.data as u64) + off_bytes as u64,
-                (m.data as u64) + off_bytes as u64,
-                (v.data as u64) + off_bytes as u64,
+                // Item C: slice-sized moments start at their own base.
+                m.data as u64,
+                v.data as u64,
                 grad_ptr as u64,
                 shard,
                 beta1 as f32,
@@ -3247,15 +3389,17 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         for i in 0..shard {
             unsafe {
                 let g_i = *gd.add(i);
-                let t1 = *md.add(off + i) * beta1;
+                // Item C: m/v are slice-local (`i`); θ is the gathered full
+                // transient (`off + i`).
+                let t1 = *md.add(i) * beta1;
                 let t2 = g_i * one_minus_beta1;
                 let m_new = t1 + t2;
-                *md.add(off + i) = m_new;
+                *md.add(i) = m_new;
                 let sq = g_i * g_i;
                 let ssq = sq * one_minus_beta2;
-                let vdec = *vd.add(off + i) * beta2;
+                let vdec = *vd.add(i) * beta2;
                 let v_new = vdec + ssq;
-                *vd.add(off + i) = v_new;
+                *vd.add(i) = v_new;
                 let mh = m_new * bc1_inv;
                 let vh = v_new * bc2_inv;
                 let tden = vh.sqrt() + eps;
@@ -3290,15 +3434,16 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         for i in 0..shard {
             unsafe {
                 let g_i = *gd.add(i);
-                let t1 = *md.add(off + i) * b1;
+                // Item C: m/v slice-local; θ at `off + i` (see the f64 arm).
+                let t1 = *md.add(i) * b1;
                 let t2 = g_i * omb1;
                 let m_new = t1 + t2;
-                *md.add(off + i) = m_new;
+                *md.add(i) = m_new;
                 let sq = g_i * g_i;
                 let ssq = sq * omb2;
-                let vdec = *vd.add(off + i) * b2;
+                let vdec = *vd.add(i) * b2;
                 let v_new = vdec + ssq;
-                *vd.add(off + i) = v_new;
+                *vd.add(i) = v_new;
                 let mh = m_new * bc1;
                 let vh = v_new * bc2;
                 let tden = vh.sqrt() + epsf;
@@ -3660,13 +3805,15 @@ pub extern "C" fn nsl_zero3_teardown() -> i64 {
         // gate parsed a field from it).
         let line = format!(
             "[zero3] teardown: full residency restored (gathers={} releases={} \
-             elem_params={} elem_steps={} sr_elem_params={} sr_elem_steps={})\n",
+             elem_params={} elem_steps={} sr_elem_params={} sr_elem_steps={} \
+             elem_moments={})\n",
             ZERO3_GATHERS.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_RELEASES.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_ELEM_PARAMS.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_ELEM_STEPS.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_SR_ELEM_PARAMS.load(std::sync::atomic::Ordering::Relaxed),
             ZERO3_SR_ELEM_STEPS.load(std::sync::atomic::Ordering::Relaxed),
+            ZERO3_ELEM_MOMENTS.load(std::sync::atomic::Ordering::Relaxed),
         );
         use std::io::Write;
         let _ = std::io::stderr().lock().write_all(line.as_bytes());
@@ -3680,6 +3827,7 @@ pub extern "C" fn nsl_zero3_teardown() -> i64 {
     ZERO3_ELEM_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
     ZERO3_SR_ELEM_PARAMS.store(0, std::sync::atomic::Ordering::Relaxed);
     ZERO3_SR_ELEM_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
+    ZERO3_ELEM_MOMENTS.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut guard = ZERO3_TABLE.lock().unwrap();
     // Item 11: device shard buffers are freed explicitly — entries live in a
     // static, so ShardBuf cannot carry a cfg(cuda) Drop.
@@ -4305,23 +4453,62 @@ mod tests {
         crate::list::nsl_list_push(list, &g as *const NslTensor as i64);
         assert_eq!(nsl_zero3_reduce_grad_slot(list, 0), 0);
 
+        // Item C: m/v come from the SLICE allocator, not a hand-rolled full
+        // buffer — this is the production shape (codegen's deferred fill
+        // calls exactly this), and it pins the three properties the counter
+        // gates rest on: slice-sized, θ's dtype/device, and `optim_elems`
+        // credited by the shard's element count.
+        let elems_before = ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed);
+        let m_ptr = nsl_zero3_alloc_elem_moment(tp, 0);
+        let v_ptr = nsl_zero3_alloc_elem_moment(tp, 0);
+        assert!(m_ptr != 0 && v_ptr != 0, "slice moment allocation returned null");
+        for (name, p) in [("m", m_ptr), ("v", v_ptr)] {
+            let mt = crate::tensor::NslTensor::from_ptr(p);
+            assert_eq!(mt.len, 4, "{name}: slice moment must be shard-sized");
+            assert_eq!(mt.ndim, 1, "{name}: slice moment is 1-D");
+            assert_eq!(mt.dtype, 0, "{name}: slice moment must carry theta's dtype");
+            assert_eq!(mt.device, 0, "{name}: slice moment must carry theta's device");
+            assert!(
+                unsafe { std::slice::from_raw_parts(mt.data as *const f64, 4) }
+                    .iter()
+                    .all(|x| *x == 0.0),
+                "{name}: slice moment must start zeroed"
+            );
+        }
+        assert_eq!(
+            ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed) - elems_before,
+            8,
+            "each slice moment must credit `optim_elems` with its shard \
+             elements (2 moments x 4) — that counter is the ONLY instrument \
+             that separates owner-only moments from replicated ones"
+        );
+
         // The elementwise step vs the fused step on an identical twin.
-        let mut m = vec![0.0f64; 4];
-        let mut v = vec![0.0f64; 4];
-        let ms = owned_cpu_tensor(m.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
-        let vs = owned_cpu_tensor(v.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), strides.as_mut_ptr(), 4);
         let (lr, b1, b2, eps, wd) = (0.002f64, 0.9f64, 0.95f64, 1e-8f64, 0.01f64);
         let (bc1, bc2) = (1.0 / (1.0 - b1), 1.0 / (1.0 - b2)); // t=1
         assert_eq!(
             nsl_zero3_elem_adamw_step(
-                tp,
-                &ms as *const NslTensor as i64,
-                &vs as *const NslTensor as i64,
-                0,
+                tp, m_ptr, v_ptr, 0,
                 lr, b1, 1.0 - b1, b2, 1.0 - b2, eps, wd, bc1, bc2,
             ),
             0
         );
+        let m: Vec<f64> = unsafe {
+            std::slice::from_raw_parts(
+                crate::tensor::NslTensor::from_ptr(m_ptr).data as *const f64,
+                4,
+            )
+        }
+        .to_vec();
+        let v: Vec<f64> = unsafe {
+            std::slice::from_raw_parts(
+                crate::tensor::NslTensor::from_ptr(v_ptr).data as *const f64,
+                4,
+            )
+        }
+        .to_vec();
+        crate::tensor::nsl_tensor_free(m_ptr);
+        crate::tensor::nsl_tensor_free(v_ptr);
 
         // Twin: plain fused step over the same starting values.
         let mut theta2 = vec![0.5f64, -1.25, 2.0, 3.75];

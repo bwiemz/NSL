@@ -17,6 +17,24 @@ use crate::error::CodegenError;
 use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
 use cranelift_codegen::ir::Value;
 
+/// Item C: how ONE parameter's optimizer moments are allocated under
+/// `--zero-stage 3`, decided from its `ParameterPlan` entry and consumed by
+/// `Compiler::emit_deferred_moment_fill`. Section 4 allocates nothing under
+/// stage 3 (the plan and the runtime carve both post-date it), so this is
+/// the single place the three shapes are spelled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MomentFill {
+    /// `--zero-elementwise` eligible: a persistent 1/world_size SLICE on
+    /// every rank, sized by the runtime from the carved shard.
+    Elementwise,
+    /// Tensor-granular sharded: the owner allocates the full moment, the
+    /// rest keep the null placeholder (the stages-1/2 machinery, reused).
+    OwnerGated,
+    /// Replicated (tied / view-rooted / epilogue): full m/v on every rank,
+    /// because every rank updates it from all-reduced gradients.
+    Full,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceAdParamDiagnosticKind {
     Trainable,
@@ -4620,6 +4638,182 @@ impl Compiler<'_> {
         Ok(builder.block_params(merge_b)[0])
     }
 
+    /// Item C: one slot's moment allocation under the ZeRO-3 deferred fill.
+    /// Shared by m and v so the two can never drift into different sharding
+    /// decisions for the same parameter.
+    fn emit_filled_moment(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        mode: MomentFill,
+        param_i: Value,
+        idx: Value,
+        precision_list: Option<Value>,
+        offload: bool,
+    ) -> Result<Value, CodegenError> {
+        Ok(match mode {
+            // Elementwise: every rank holds a persistent 1/ws SLICE and
+            // steps it, so there is no owner gate — the runtime sizes the
+            // buffer from the carved shard and notes its own elements.
+            MomentFill::Elementwise => self.compile_call_by_name(
+                builder,
+                "nsl_zero3_alloc_elem_moment",
+                &[param_i, idx],
+            )?,
+            // Tensor-granular sharded: the SAME owner gate stages 1/2 ship,
+            // reused verbatim — one rank allocates the full moment, the
+            // rest carry the established null placeholder.
+            MomentFill::OwnerGated => {
+                self.emit_owner_gated_moment(builder, state, param_i, idx, precision_list, offload)?
+            }
+            // Replicated (tied / view-rooted / epilogue params): every rank
+            // updates these from all-reduced gradients, so every rank needs
+            // full m/v. Deliberately NOT noted against `optim_elems` — see
+            // that counter's doc for why counting them would break the
+            // `r0 + r1 == full` partition identity.
+            MomentFill::Full => {
+                self.emit_moment_zeros_like(builder, param_i, idx, precision_list, offload)?
+            }
+        })
+    }
+
+    /// Item C: fill the ZeRO-3 moment lists that section 4 left null.
+    ///
+    /// Emitted ONCE, inline at the WINDOW register belt — not the
+    /// pre-forward belt, which is guarded by `if let Some(ws_fwd_plan)` and
+    /// would make this loop silently vacuous when that plan is None (the
+    /// PR #482 failure mode). It is a compile-time loop over EVERY parameter
+    /// index, not over `wsplan.register_idxs`: replicated and
+    /// tensor-granular params are not in the streamed register set but
+    /// still need their moments.
+    ///
+    /// Each slot is latched on its own `state_list_1[idx] == 0` test, so the
+    /// belt can run every window and allocate exactly once. A non-owner's
+    /// tensor-granular slot stays null forever and re-runs the (allocation
+    /// free) owner gate each window — correct, and the alternative
+    /// (a single global latch) would double-allocate every OTHER slot the
+    /// first time a non-owner slot kept slot 0 null.
+    ///
+    /// The alloc-surface bracket is re-opened here because setup's bracket
+    /// only wraps section 4; without it the moment bytes land on whatever
+    /// surface the step body left current (Activations) and
+    /// `mem_accounting_gpu_gate`'s attribution is silently wrong. The pool
+    /// bracket matters just as much: the step body runs on the TRANSIENT
+    /// pool, whose segments are drained at end of step — moments must be
+    /// Persistent or they would be handed back under the optimizer.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_deferred_moment_fill(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        modes: &[MomentFill],
+        param_list: Value,
+        state_list_1: Value,
+        state_list_2: Value,
+        num_state_buffers: usize,
+        m_codes: Option<Value>,
+        v_codes: Option<Value>,
+        muon_v_gate: Option<Value>,
+        offload: bool,
+    ) -> Result<(), CodegenError> {
+        // P0.1 surface tags — must match the setup bracket's constants.
+        const SURFACE_OPTIM_M: i64 = 2;
+        const SURFACE_OPTIM_V: i64 = 3;
+
+        if m_codes.is_some() && modes.contains(&MomentFill::Elementwise) {
+            // deferral-must-refuse: the elementwise slice allocator sizes
+            // from the carve and hands back θ's own dtype — it has no
+            // reduced-precision arm. Today this is unreachable (CPDT and
+            // muon-state-bf16 are both refused alongside --zero-elementwise),
+            // so refuse loudly instead of silently ignoring the plan.
+            return Err(CodegenError::new(
+                "--zero-elementwise does not compose with a per-parameter \
+                 moment-precision plan: the elementwise slice moment is \
+                 allocated at the parameter's own dtype. Drop one",
+            ));
+        }
+
+        // The step body runs on the TRANSIENT pool (set at its top, flipped
+        // back to Persistent at its bottom) and the allocator DRAINS
+        // transient segments at end of step. Optimizer moments must outlive
+        // every step, so flip to Persistent for the fill and back after —
+        // there is no get/set for the pool, and this site is only ever
+        // reached from inside that transient region.
+        self.compile_call_by_name(builder, "nsl_gpu_set_persistent_pool", &[])?;
+        let surface_prev = self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+        for (i, &mode) in modes.iter().enumerate() {
+            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+            let cur = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, idx])?;
+            let empty = builder.ins().icmp_imm(IntCC::Equal, cur, 0);
+            let do_b = builder.create_block();
+            let join_b = builder.create_block();
+            builder.ins().brif(empty, do_b, &[], join_b, &[]);
+
+            builder.switch_to_block(do_b);
+            builder.seal_block(do_b);
+            state.current_block = Some(do_b);
+
+            let param_i = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
+
+            let s_m = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_M);
+            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[s_m])?;
+            let m_buf =
+                self.emit_filled_moment(builder, state, mode, param_i, idx, m_codes, offload)?;
+            self.compile_call_by_name(builder, "nsl_list_set", &[state_list_1, idx, m_buf])?;
+
+            if num_state_buffers >= 2 {
+                let s_v = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_V);
+                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[s_v])?;
+                let v_buf = if let Some(route_list) = muon_v_gate {
+                    // P1 Muon item 9, carried onto the deferred path: v (the
+                    // AdamW second moment) is UNREAD on the Muon route, so
+                    // route-gate it here exactly as section 4 does for the
+                    // non-zero3 case. The route gate wraps the sharding gate
+                    // — a Muon-routed param allocates no v on ANY rank, and
+                    // an AdamW-routed one still allocates only its share.
+                    let routed =
+                        self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
+                    let needs_v = builder.ins().icmp_imm(IntCC::Equal, routed, 0);
+                    let alloc_b = builder.create_block();
+                    let skip_b = builder.create_block();
+                    let merge_b = builder.create_block();
+                    builder.append_block_param(merge_b, cl_types::I64);
+                    builder.ins().brif(needs_v, alloc_b, &[], skip_b, &[]);
+
+                    builder.switch_to_block(alloc_b);
+                    builder.seal_block(alloc_b);
+                    state.current_block = Some(alloc_b);
+                    let real = self.emit_filled_moment(
+                        builder, state, mode, param_i, idx, v_codes, offload,
+                    )?;
+                    builder.ins().jump(merge_b, &[real]);
+
+                    builder.switch_to_block(skip_b);
+                    builder.seal_block(skip_b);
+                    state.current_block = Some(skip_b);
+                    let null_v = builder.ins().iconst(cl_types::I64, 0);
+                    builder.ins().jump(merge_b, &[null_v]);
+
+                    builder.switch_to_block(merge_b);
+                    builder.seal_block(merge_b);
+                    state.current_block = Some(merge_b);
+                    builder.block_params(merge_b)[0]
+                } else {
+                    self.emit_filled_moment(builder, state, mode, param_i, idx, v_codes, offload)?
+                };
+                self.compile_call_by_name(builder, "nsl_list_set", &[state_list_2, idx, v_buf])?;
+            }
+
+            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
+            builder.ins().jump(join_b, &[]);
+            builder.switch_to_block(join_b);
+            builder.seal_block(join_b);
+            state.current_block = Some(join_b);
+        }
+        self.compile_call_by_name(builder, "nsl_gpu_set_transient_pool", &[])?;
+        Ok(())
+    }
+
     /// THE Muon-route predicate: `route_flag == 0 && runtime_rank == 2` —
     /// the one definition of "this parameter is stepped by Muon's matrix
     /// path". Item 8 (dispatcher unification): this rule was previously
@@ -7065,11 +7259,20 @@ impl Compiler<'_> {
             // perturb the identical-collective-sequence spin-barrier invariant.
             // `zero_enabled` is recomputed locally: the outer binding is
             // introduced far below (near the optimizer loop), out of scope here.
-            // P3 ZeRO-3: stage 3 keeps optimizer state REPLICATED in v1
-            // (resident/tied params update on every rank from all-reduced
-            // gradients and need m/v everywhere; owner-only m/v for the
-            // sharded set is a follow-up) — owner-gated moment allocation is
-            // stages 1/2 only, and a loud note records the choice.
+            // P3 ZeRO-3 (item C): stage 3 allocates NOTHING here. Its
+            // per-parameter decision needs the ParameterPlan (who is
+            // elementwise, who is tensor-granular sharded, who is a
+            // replicated epilogue/tied param) and the runtime carve that
+            // sizes an elementwise slice — neither exists this early, so
+            // section 4 pushes nulls and `emit_deferred_moment_fill` at the
+            // window register belt fills every slot ONCE, after
+            // registration. A "allocate full here, replace at the belt"
+            // shape would save nothing: the transient peak IS the cost.
+            //
+            // `zero_enabled` (stages 1/2) keeps its own arm below and is
+            // recomputed locally: the outer binding is introduced far below
+            // (near the optimizer loop), out of scope here.
+            let zero3_defer = self.features.zero_stage == Some(3);
             let zero_enabled = self
                 .features
                 .zero_stage
@@ -7094,7 +7297,9 @@ impl Compiler<'_> {
             let muon_resident_m = optimizer_name == "muon"
                 && offload
                 && self.compile_options.muon_resident_momentum;
-            let buf1 = if muon_resident_m {
+            let buf1 = if zero3_defer {
+                builder.ins().iconst(cl_types::I64, 0)
+            } else if muon_resident_m {
                 let route_list = muon_route_list
                     .expect("muon route list is built before state buffers (4a)");
                 let resident =
@@ -7148,7 +7353,9 @@ impl Compiler<'_> {
                 let muon_cond_v = optimizer_name == "muon"
                     && !offload
                     && cpdt_precision_dtypes.is_none();
-                let buf2 = if muon_cond_v {
+                let buf2 = if zero3_defer {
+                    builder.ins().iconst(cl_types::I64, 0)
+                } else if muon_cond_v {
                     let route_list = muon_route_list
                         .expect("muon route list is built before state buffers (4a)");
                     // needs_v == NOT(muon-routed): inverted from the shared
@@ -13672,6 +13879,57 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_assert", &[mok, mmp])?;
                     }
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
+                }
+
+                // Item C: ZeRO-3's deferred moment fill. It MUST sit here —
+                // inside `ws_active` (stage 3 refuses without
+                // --weight-stream, so this is unconditional under stage 3)
+                // and AFTER the mark/register loop, because an elementwise
+                // moment is sized from the slice the REGISTER carved. The
+                // window belt, not the pre-forward belt: that one is behind
+                // `if let Some(ws_fwd_plan)` and would go vacuous whenever
+                // the forward schedule is absent.
+                if self.features.zero_stage == Some(3) {
+                    let plan_entries = pending.schedule.plan.entries();
+                    let modes: Vec<MomentFill> = (0..param_paths.len())
+                        .map(|u| match plan_entries.get(u) {
+                            Some(e) if e.is_elementwise() => MomentFill::Elementwise,
+                            Some(e) if e.sharding.is_sharded() => MomentFill::OwnerGated,
+                            // A param the plan does not cover cannot be
+                            // sharded (derive covers every index), so the
+                            // replicated arm is the safe reading.
+                            _ => MomentFill::Full,
+                        })
+                        .collect();
+                    // Same precision-list projection as section 4, so a slot
+                    // filled here is byte-identical to what setup would have
+                    // built for it.
+                    let m_codes = cpdt_precision_dtypes.map(|(m, _)| m).or(muon_state_m_codes);
+                    let v_codes = cpdt_precision_dtypes.map(|(_, v)| v);
+                    // Muon's v-skip condition, verbatim from section 4.
+                    // `muon_resident_m` needs --optim-state-offload, which
+                    // stage 3 refuses outright, so the m side has no Muon arm.
+                    let muon_v_gate = if optimizer_name == "muon"
+                        && !self.compile_options.optim_state_offload
+                        && cpdt_precision_dtypes.is_none()
+                    {
+                        muon_route_list
+                    } else {
+                        None
+                    };
+                    self.emit_deferred_moment_fill(
+                        builder,
+                        state,
+                        &modes,
+                        param_list,
+                        state_list_1,
+                        state_list_2,
+                        num_state_buffers,
+                        m_codes,
+                        v_codes,
+                        muon_v_gate,
+                        self.compile_options.optim_state_offload,
+                    )?;
                 }
             }
 
