@@ -17,6 +17,24 @@ use crate::error::CodegenError;
 use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
 use cranelift_codegen::ir::Value;
 
+/// Item C: how ONE parameter's optimizer moments are allocated under
+/// `--zero-stage 3`, decided from its `ParameterPlan` entry and consumed by
+/// `Compiler::emit_deferred_moment_fill`. Section 4 allocates nothing under
+/// stage 3 (the plan and the runtime carve both post-date it), so this is
+/// the single place the three shapes are spelled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MomentFill {
+    /// `--zero-elementwise` eligible: a persistent 1/world_size SLICE on
+    /// every rank, sized by the runtime from the carved shard.
+    Elementwise,
+    /// Tensor-granular sharded: the owner allocates the full moment, the
+    /// rest keep the null placeholder (the stages-1/2 machinery, reused).
+    OwnerGated,
+    /// Replicated (tied / view-rooted / epilogue): full m/v on every rank,
+    /// because every rank updates it from all-reduced gradients.
+    Full,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceAdParamDiagnosticKind {
     Trainable,
@@ -4640,6 +4658,186 @@ impl Compiler<'_> {
         Ok(builder.block_params(merge_b)[0])
     }
 
+    /// Item C: one slot's moment allocation under the ZeRO-3 deferred fill.
+    /// Shared by m and v so the two can never drift into different sharding
+    /// decisions for the same parameter.
+    fn emit_filled_moment(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        mode: MomentFill,
+        param_i: Value,
+        idx: Value,
+        precision_list: Option<Value>,
+        offload: bool,
+    ) -> Result<Value, CodegenError> {
+        Ok(match mode {
+            // Elementwise: every rank holds a persistent 1/ws SLICE and
+            // steps it, so there is no owner gate — the runtime sizes the
+            // buffer from the carved shard and notes its own elements.
+            MomentFill::Elementwise => self.compile_call_by_name(
+                builder,
+                "nsl_zero3_alloc_elem_moment",
+                &[param_i, idx],
+            )?,
+            // Tensor-granular sharded: the SAME owner gate stages 1/2 ship,
+            // reused verbatim — one rank allocates the full moment, the
+            // rest carry the established null placeholder.
+            MomentFill::OwnerGated => {
+                self.emit_owner_gated_moment(builder, state, param_i, idx, precision_list, offload)?
+            }
+            // Replicated (tied / view-rooted / epilogue params): every rank
+            // updates these from all-reduced gradients, so every rank needs
+            // full m/v. Deliberately NOT noted against `optim_elems` — see
+            // that counter's doc for why counting them would break the
+            // `r0 + r1 == full` partition identity.
+            MomentFill::Full => {
+                self.emit_moment_zeros_like(builder, param_i, idx, precision_list, offload)?
+            }
+        })
+    }
+
+    /// Item C: fill the ZeRO-3 moment lists that section 4 left null.
+    ///
+    /// Emitted ONCE, inline at the WINDOW register belt — not the
+    /// pre-forward belt, which is guarded by `if let Some(ws_fwd_plan)` and
+    /// would make this loop silently vacuous when that plan is None (the
+    /// PR #482 failure mode). It is a compile-time loop over EVERY parameter
+    /// index, not over `wsplan.register_idxs`: replicated and
+    /// tensor-granular params are not in the streamed register set but
+    /// still need their moments.
+    ///
+    /// The whole fill is behind ONE runtime latch (`latch[0] == 0`), not a
+    /// per-slot `state_list_1[idx] == 0` test: a non-owner's tensor-granular
+    /// slot is legitimately null forever, so a per-slot guard would never
+    /// latch and would re-run the owner gate for ~(ws-1)/ws of the sharded
+    /// set on every optimizer step, inside the hot window region. One pass
+    /// covers every slot, so one flag is equally correct and free after the
+    /// first window.
+    ///
+    /// The alloc-surface bracket is re-opened here because setup's bracket
+    /// only wraps section 4; without it the moment bytes land on whatever
+    /// surface the step body left current (Activations) and
+    /// `mem_accounting_gpu_gate`'s attribution is silently wrong. The pool
+    /// bracket matters just as much: the step body runs on the TRANSIENT
+    /// pool, whose segments are drained at end of step — moments must be
+    /// Persistent or they would be handed back under the optimizer.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_deferred_moment_fill(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        modes: &[MomentFill],
+        param_list: Value,
+        state_list_1: Value,
+        state_list_2: Value,
+        num_state_buffers: usize,
+        m_codes: Option<Value>,
+        v_codes: Option<Value>,
+        muon_v_gate: Option<Value>,
+        offload: bool,
+        latch: Value,
+    ) -> Result<(), CodegenError> {
+        // P0.1 surface tags — must match the setup bracket's constants.
+        const SURFACE_OPTIM_M: i64 = 2;
+        const SURFACE_OPTIM_V: i64 = 3;
+
+        if m_codes.is_some() && modes.contains(&MomentFill::Elementwise) {
+            // deferral-must-refuse: the elementwise slice allocator sizes
+            // from the carve and hands back θ's own dtype — it has no
+            // reduced-precision arm. Today this is unreachable (CPDT and
+            // muon-state-bf16 are both refused alongside --zero-elementwise),
+            // so refuse loudly instead of silently ignoring the plan.
+            return Err(CodegenError::new(
+                "--zero-elementwise does not compose with a per-parameter \
+                 moment-precision plan: the elementwise slice moment is \
+                 allocated at the parameter's own dtype. Drop one",
+            ));
+        }
+
+        let slot0 = builder.ins().iconst(cl_types::I64, 0);
+        let done = self.compile_call_by_name(builder, "nsl_list_get", &[latch, slot0])?;
+        let first_window = builder.ins().icmp_imm(IntCC::Equal, done, 0);
+        let fill_b = builder.create_block();
+        let after_b = builder.create_block();
+        builder.ins().brif(first_window, fill_b, &[], after_b, &[]);
+        builder.switch_to_block(fill_b);
+        builder.seal_block(fill_b);
+        state.current_block = Some(fill_b);
+
+        // The step body runs on the TRANSIENT pool (set at its top, flipped
+        // back to Persistent at its bottom) and the allocator DRAINS
+        // transient segments at end of step. Optimizer moments must outlive
+        // every step, so flip to Persistent for the fill and back after —
+        // there is no get/set for the pool, and this site is only ever
+        // reached from inside that transient region.
+        self.compile_call_by_name(builder, "nsl_gpu_set_persistent_pool", &[])?;
+        let surface_prev = self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+        for (i, &mode) in modes.iter().enumerate() {
+            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+            let param_i = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
+
+            let s_m = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_M);
+            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[s_m])?;
+            let m_buf =
+                self.emit_filled_moment(builder, state, mode, param_i, idx, m_codes, offload)?;
+            self.compile_call_by_name(builder, "nsl_list_set", &[state_list_1, idx, m_buf])?;
+
+            if num_state_buffers >= 2 {
+                let s_v = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_V);
+                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[s_v])?;
+                let v_buf = if let Some(route_list) = muon_v_gate {
+                    // P1 Muon item 9, carried onto the deferred path: v (the
+                    // AdamW second moment) is UNREAD on the Muon route, so
+                    // route-gate it here exactly as section 4 does for the
+                    // non-zero3 case. The route gate wraps the sharding gate
+                    // — a Muon-routed param allocates no v on ANY rank, and
+                    // an AdamW-routed one still allocates only its share.
+                    let routed =
+                        self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
+                    let needs_v = builder.ins().icmp_imm(IntCC::Equal, routed, 0);
+                    let alloc_b = builder.create_block();
+                    let skip_b = builder.create_block();
+                    let merge_b = builder.create_block();
+                    builder.append_block_param(merge_b, cl_types::I64);
+                    builder.ins().brif(needs_v, alloc_b, &[], skip_b, &[]);
+
+                    builder.switch_to_block(alloc_b);
+                    builder.seal_block(alloc_b);
+                    state.current_block = Some(alloc_b);
+                    let real = self.emit_filled_moment(
+                        builder, state, mode, param_i, idx, v_codes, offload,
+                    )?;
+                    builder.ins().jump(merge_b, &[real]);
+
+                    builder.switch_to_block(skip_b);
+                    builder.seal_block(skip_b);
+                    state.current_block = Some(skip_b);
+                    let null_v = builder.ins().iconst(cl_types::I64, 0);
+                    builder.ins().jump(merge_b, &[null_v]);
+
+                    builder.switch_to_block(merge_b);
+                    builder.seal_block(merge_b);
+                    state.current_block = Some(merge_b);
+                    builder.block_params(merge_b)[0]
+                } else {
+                    self.emit_filled_moment(builder, state, mode, param_i, idx, v_codes, offload)?
+                };
+                self.compile_call_by_name(builder, "nsl_list_set", &[state_list_2, idx, v_buf])?;
+            }
+        }
+        self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
+        self.compile_call_by_name(builder, "nsl_gpu_set_transient_pool", &[])?;
+        let one = builder.ins().iconst(cl_types::I64, 1);
+        self.compile_call_by_name(builder, "nsl_list_set", &[latch, slot0, one])?;
+        builder.ins().jump(after_b, &[]);
+
+        builder.switch_to_block(after_b);
+        builder.seal_block(after_b);
+        state.current_block = Some(after_b);
+        Ok(())
+    }
+
     /// THE Muon-route predicate: `route_flag == 0 && runtime_rank == 2` —
     /// the one definition of "this parameter is stepped by Muon's matrix
     /// path". Item 8 (dispatcher unification): this rule was previously
@@ -4694,18 +4892,34 @@ impl Compiler<'_> {
     ///
     /// **`owner_gated_moments` is the STAGES-1/2 predicate, not "ZeRO is
     /// on".** That is the whole invariant: the subset is valid exactly when
-    /// the moments were owner-gated, and stage 3 deliberately does the
-    /// opposite — it keeps optimizer state REPLICATED (see the note at the
-    /// allocation site), so a stage-3 program reaching this arm would step
-    /// only its byte-balanced share and zero every other parameter's
-    /// accumulator, freezing most of the model per rank with the post-step
-    /// broadcast hiding it. Stage 3 cannot reach here today, but only via
-    /// two unrelated guards (it is refused unless `--layerwise-accum`, and
-    /// the layerwise arm short-circuits above this one) — nothing pins that
-    /// coupling, so the predicate names the invariant instead of relying on
-    /// it. The old `&& !zero_enabled` exclusion was safe under `>= 1` only
-    /// because it disabled batching for EVERY stage; narrowing the exclusion
-    /// without narrowing the predicate is what opened the gap.
+    /// every parameter's moments were owner-gated, which is true for stages
+    /// 1/2 and for no other configuration. The old `&& !zero_enabled`
+    /// exclusion was safe under `>= 1` only because it disabled batching for
+    /// EVERY stage; narrowing the exclusion without narrowing the predicate
+    /// is what opened the gap.
+    ///
+    /// **Stage 3 is not a third value of this boolean — it has no correct
+    /// value.** Item C made stage-3 moments per-parameter: the deferred fill
+    /// (`emit_deferred_moment_fill`, see the note at the allocation site)
+    /// picks `MomentFill::Elementwise` (a 1/ws SLICE), `OwnerGated` (NULL on
+    /// non-owners) or `Full` (replicated — tied / view-rooted / epilogue
+    /// params every rank must step) per entry. `nsl_zero_owned_step_indices`
+    /// describes none of those three, so `true` would skip the replicated
+    /// params on non-owner ranks — the very freeze this paragraph used to
+    /// warn about — while `false` hands the launcher the null placeholders
+    /// its own assert exists to reject. The invariant for stage 3 is
+    /// therefore "must not reach this launcher at all", not "must be
+    /// correctly parameterised".
+    ///
+    /// That is structural, not incidental: stage 3 is refused unless
+    /// `csla_active` (and `--weight-stream`, itself requiring
+    /// `--layerwise-accum`), and both call sites sit in the `!csla_active`
+    /// sub-arm — the SAME local, so `stage 3 => csla_active => short-circuit`
+    /// is one implication, not a coincidence of two guards. The CSLA
+    /// in-window batched arm is independently gated on
+    /// `zero3.is_none() && zero3_elem.is_none()`. Verified by construction:
+    /// a hard refusal planted at the top of this function never fires under
+    /// any shipped stage-3 configuration.
     #[allow(clippy::too_many_arguments)]
     fn emit_fused_multi_launch(
         &mut self,
@@ -7200,6 +7414,25 @@ impl Compiler<'_> {
             builder.ins().iconst(cl_types::I64, 0)
         };
 
+        // Item C: under stage 3 the loop below pushes NULLS and
+        // `emit_deferred_moment_fill` allocates at the first window register
+        // belt. This 1-slot list is that fill's one-shot latch. A per-slot
+        // `state_list_N[idx] == 0` test was the obvious alternative and is
+        // WRONG on cost: a non-owner's tensor-granular slot is legitimately
+        // null forever, so its guard never latches and the owner gate would
+        // re-run — ~(ws-1)/ws of the sharded set, every optimizer step,
+        // inside the hot window region. The fill covers every slot in one
+        // pass, so one flag is also exactly as correct.
+        let zero3_defer_moments = self.features.zero_stage == Some(3);
+        let moment_fill_latch: Option<Value> = if zero3_defer_moments {
+            let l = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let z = builder.ins().iconst(cl_types::I64, 0);
+            self.compile_call_by_name(builder, "nsl_list_push", &[l, z])?;
+            Some(l)
+        } else {
+            None
+        };
+
         // Loop: for i in 0..num_params, create zeros_like(param_list[i])
         {
             let init_counter_var = state.new_variable();
@@ -7241,11 +7474,20 @@ impl Compiler<'_> {
             // perturb the identical-collective-sequence spin-barrier invariant.
             // `zero_enabled` is recomputed locally: the outer binding is
             // introduced far below (near the optimizer loop), out of scope here.
-            // P3 ZeRO-3: stage 3 keeps optimizer state REPLICATED in v1
-            // (resident/tied params update on every rank from all-reduced
-            // gradients and need m/v everywhere; owner-only m/v for the
-            // sharded set is a follow-up) — owner-gated moment allocation is
-            // stages 1/2 only, and a loud note records the choice.
+            // P3 ZeRO-3 (item C): stage 3 allocates NOTHING here. Its
+            // per-parameter decision needs the ParameterPlan (who is
+            // elementwise, who is tensor-granular sharded, who is a
+            // replicated epilogue/tied param) and the runtime carve that
+            // sizes an elementwise slice — neither exists this early, so
+            // section 4 pushes nulls and `emit_deferred_moment_fill` at the
+            // window register belt fills every slot ONCE, after
+            // registration. A "allocate full here, replace at the belt"
+            // shape would save nothing: the transient peak IS the cost.
+            //
+            // `zero_enabled` (stages 1/2) keeps its own arm below and is
+            // recomputed locally: the outer binding is introduced far below
+            // (near the optimizer loop), out of scope here.
+            let zero3_defer = zero3_defer_moments;
             let zero_enabled = self
                 .features
                 .zero_stage
@@ -7270,7 +7512,9 @@ impl Compiler<'_> {
             let muon_resident_m = optimizer_name == "muon"
                 && offload
                 && self.compile_options.muon_resident_momentum;
-            let buf1 = if muon_resident_m {
+            let buf1 = if zero3_defer {
+                builder.ins().iconst(cl_types::I64, 0)
+            } else if muon_resident_m {
                 let route_list = muon_route_list
                     .expect("muon route list is built before state buffers (4a)");
                 let resident =
@@ -7324,7 +7568,9 @@ impl Compiler<'_> {
                 let muon_cond_v = optimizer_name == "muon"
                     && !offload
                     && cpdt_precision_dtypes.is_none();
-                let buf2 = if muon_cond_v {
+                let buf2 = if zero3_defer {
+                    builder.ins().iconst(cl_types::I64, 0)
+                } else if muon_cond_v {
                     let route_list = muon_route_list
                         .expect("muon route list is built before state buffers (4a)");
                     // needs_v == NOT(muon-routed): inverted from the shared
@@ -13849,6 +14095,73 @@ impl Compiler<'_> {
                     }
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
                 }
+
+                // Item C: ZeRO-3's deferred moment fill. It MUST sit here —
+                // inside `ws_active` (stage 3 refuses without
+                // --weight-stream, so this is unconditional under stage 3)
+                // and AFTER the mark/register loop, because an elementwise
+                // moment is sized from the slice the REGISTER carved. The
+                // window belt, not the pre-forward belt: that one is behind
+                // `if let Some(ws_fwd_plan)` and would go vacuous whenever
+                // the forward schedule is absent.
+                if self.features.zero_stage == Some(3) {
+                    let plan_entries = pending.schedule.plan.entries();
+                    // A plan-coverage miss must REFUSE, not fall back to the
+                    // replicated arm: `Full` is the one shape that is not
+                    // counted against `optim_elems`, so a param sliding into
+                    // it would drop out of both sides of the `r0+r1 == full`
+                    // identity and every gate here would stay green while the
+                    // rank quietly held a full moment replica. Same rule as
+                    // the register belt's positional lookup above.
+                    let modes: Vec<MomentFill> = (0..param_paths.len())
+                        .map(|u| {
+                            let e = plan_entries.get(u).ok_or_else(|| {
+                                CodegenError::new(format!(
+                                    "parameter plan: the ZeRO-3 deferred moment \
+                                     fill needs an entry for parameter {u}, \
+                                     which the plan does not cover"
+                                ))
+                            })?;
+                            Ok(if e.is_elementwise() {
+                                MomentFill::Elementwise
+                            } else if e.sharding.is_sharded() {
+                                MomentFill::OwnerGated
+                            } else {
+                                MomentFill::Full
+                            })
+                        })
+                        .collect::<Result<Vec<_>, CodegenError>>()?;
+                    // Same precision-list projection as section 4, so a slot
+                    // filled here is byte-identical to what setup would have
+                    // built for it.
+                    let m_codes = cpdt_precision_dtypes.map(|(m, _)| m).or(muon_state_m_codes);
+                    let v_codes = cpdt_precision_dtypes.map(|(_, v)| v);
+                    // Muon's v-skip condition, verbatim from section 4.
+                    // `muon_resident_m` needs --optim-state-offload, which
+                    // stage 3 refuses outright, so the m side has no Muon arm.
+                    let muon_v_gate = if optimizer_name == "muon"
+                        && !self.compile_options.optim_state_offload
+                        && cpdt_precision_dtypes.is_none()
+                    {
+                        muon_route_list
+                    } else {
+                        None
+                    };
+                    self.emit_deferred_moment_fill(
+                        builder,
+                        state,
+                        &modes,
+                        param_list,
+                        state_list_1,
+                        state_list_2,
+                        num_state_buffers,
+                        m_codes,
+                        v_codes,
+                        muon_v_gate,
+                        self.compile_options.optim_state_offload,
+                        moment_fill_latch.expect("latch allocated under stage 3"),
+                    )?;
+                }
             }
 
             // Bias correction — the same expression the (now-bypassed)
@@ -16277,6 +16590,10 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_list_free", &[state_list_1])?;
         if num_state_buffers >= 2 {
             self.compile_call_by_name(builder, "nsl_list_free", &[state_list_2])?;
+        }
+        // Item C: the deferred-fill latch (1 slot, no tensors).
+        if let Some(latch) = moment_fill_latch {
+            self.compile_call_by_name(builder, "nsl_list_free", &[latch])?;
         }
 
         // Free gradient accumulation buffers (if allocated) — runtime loop.

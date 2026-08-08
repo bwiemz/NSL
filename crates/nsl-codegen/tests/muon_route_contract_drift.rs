@@ -26,18 +26,25 @@ fn read(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
 }
 
-/// (a) The three codegen emission sites route through the ONE helper, and
+/// (a) The four codegen emission sites route through the ONE helper, and
 /// the raw predicate spelling exists only inside it.
+///
+/// The fourth site is item C's ZeRO-3 deferred moment fill
+/// (`emit_deferred_moment_fill`): under `--zero-stage 3` the moment lists
+/// are filled at the window register belt instead of at train setup, so the
+/// v-allocation route gate has to be re-emitted there. It is a SECOND
+/// v-allocation site, not a new kind of decision — which is exactly why it
+/// must call the helper rather than re-derive the De Morgan inverse.
 #[test]
 fn codegen_sites_share_the_one_predicate() {
     let stmt = read("src/stmt.rs");
     let calls = stmt.matches("self.emit_muon_route_predicate(").count();
     assert_eq!(
-        calls, 3,
-        "expected exactly 3 emission sites calling emit_muon_route_predicate \
-         (batch-skip, resident-momentum, v-allocation); found {calls}. A new \
-         site must call the helper — and update this count consciously — not \
-         hand-spell the predicate"
+        calls, 4,
+        "expected exactly 4 emission sites calling emit_muon_route_predicate \
+         (batch-skip, resident-momentum, v-allocation, zero3 deferred \
+         v-allocation); found {calls}. A new site must call the helper — and \
+         update this count consciously — not hand-spell the predicate"
     );
     // The raw spelling appears exactly once: inside the helper itself.
     let raw = stmt.matches("band(is_muon, is_r2)").count();

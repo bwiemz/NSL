@@ -136,6 +136,8 @@ crates/nsl-cli/tests/ws_prefetch_gate.rs	prefetch_bit_exact_ffn_gpu	gpu	requires
 crates/nsl-cli/tests/ws_prefetch_gate.rs	prefetch_bit_exact_packed_gqa_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/zero3_gate.rs	zero3_bit_exact_vs_single_rank_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
 crates/nsl-cli/tests/zero3_gate.rs	zero3_elementwise_bit_exact_vs_single_rank_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
+crates/nsl-cli/tests/zero3_gate.rs	zero3_tensor_granular_moments_are_owner_only_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
+crates/nsl-cli/tests/zero3_gate.rs	zero3_muon_moments_are_owner_only_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
 crates/nsl-cli/tests/zero3_gate.rs	zero3_muon_overlap_and_callback_touch_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
 crates/nsl-cli/tests/zero3_gate.rs	srbf16_elementwise_bit_exact_vs_plain_sr_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
 crates/nsl-cli/tests/zero_gpu_collectives_gate.rs	sim_gpu_two_rank_parity_bit_exact	gpu	requires CUDA GPU

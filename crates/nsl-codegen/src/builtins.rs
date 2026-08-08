@@ -2736,6 +2736,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // nsl_fase_fused_adamw_step.
     // (tensor, idx, sr) — `sr` is the plan entry's storage decision (item 16x11)
     ("nsl_zero3_mark_elementwise", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // Owner-only moments: THIS RANK's slice-sized m/v for an elementwise
+    // param. Sized from the carved ElemShard, so it MUST be emitted after
+    // the weight-stream register belt (it aborts otherwise). Notes its own
+    // element count against `optim_elems`.
+    ("nsl_zero3_alloc_elem_moment", &[types::I64, types::I64], Some(types::I64)), // (theta, idx)
     (
         "nsl_zero3_elem_adamw_step",
         &[

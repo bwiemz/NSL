@@ -345,6 +345,52 @@ fn counter_field(line: &str, label: &str) -> Option<u64> {
         .ok()
 }
 
+/// `optim_elems=N` off the `[zero] ws=W rank=R ...` atexit line — the
+/// per-rank total of optimizer-moment ELEMENTS actually allocated. Item C's
+/// only real instrument: loss parity is INVARIANT to whether moments are
+/// owner-only or replicated (a non-owner never reads its non-owned m/v), so
+/// a broken implementation stays bit-exact and only this number moves.
+///
+/// `contains`, not `starts_with`: a neighbouring fragment without a
+/// trailing newline can land immediately before the (single-write) counter
+/// line — same reason the all_gather parser below uses `contains`.
+fn optim_elems(stderr: &str, ws: u64, rank: u64) -> u64 {
+    let needle = format!("[zero] ws={ws} rank={rank}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("no '{needle}' line in stderr:\n{stderr}"));
+    counter_field(line, "optim_elems")
+        .unwrap_or_else(|| panic!("no optim_elems= field in line: {line}"))
+}
+
+/// Item C's shared assertion: the sharded moment surface is a COMPLETE,
+/// STRICT partition across the two ranks. `full` first, as
+/// zero_spmd_gate.rs does — a zero baseline would make every other test
+/// here pass vacuously.
+fn assert_moment_partition(full: u64, r0: u64, r1: u64, ctx: &str) {
+    assert!(
+        full > 0,
+        "{ctx}: the ws=1 run allocated NO sharded moments — the counter is \
+         dead and the partition assertions below would be vacuous"
+    );
+    assert_eq!(
+        r0 + r1,
+        full,
+        "{ctx}: sharded moment elements must sum to the ws=1 surface \
+         (r0={r0} r1={r1} full={full}) — a rank is holding a full replica, \
+         or a slot was dropped entirely"
+    );
+    assert!(
+        r0 > 0 && r0 < full,
+        "{ctx}: rank 0 optimizer state is not a strict shard: r0={r0} full={full}"
+    );
+    assert!(
+        r1 > 0 && r1 < full,
+        "{ctx}: rank 1 optimizer state is not a strict shard: r1={r1} full={full}"
+    );
+}
+
 /// Item 11 core parity gate: elementwise-sharded 2-rank training (sim-gpu)
 /// is BIT-IDENTICAL to the single-rank baseline of the same layerwise
 /// config — loss stream and saved bytes — and the elementwise machinery
@@ -465,6 +511,264 @@ fn zero3_elementwise_bit_exact_vs_single_rank_gpu() {
         "no tensor-granular gathers — the mixed-mode arm went vacuous \
          (all_gather={}, gathers={gathers})",
         ag_per_rank[0]
+    );
+
+    // ── Item C: the moment surface is OWNER-ONLY, not replicated ────────
+    //
+    // Every assertion above is invariant to this: a rank never reads the
+    // m/v it does not own, so replicated moments produce the identical
+    // loss stream and the identical saved bytes. `optim_elems` is the only
+    // number that moves — flip the fill loop's elementwise arm back to a
+    // full `zeros_like` and the partition below goes red while parity
+    // stays green (that is the anti-vacuity probe for this gate).
+    //
+    // `elem_moments` (teardown line) additionally proves the SLICE
+    // allocator was the one that ran: 4 elementwise params x 2 moments.
+    let elem_moments = counter_field(teardown, "elem_moments").expect("elem_moments field");
+    assert_eq!(
+        elem_moments,
+        elem_params * 2,
+        "expected one m and one v SLICE per elementwise param — a fill that \
+         fell back to a full zeros_like reads 0 here:\n{teardown}"
+    );
+
+    // `full` = the same config at ws=1, where every eligible param is a
+    // 1/1 slice and rank 0 therefore allocates the WHOLE sharded surface.
+    let save_ws1 = tmp.join("e_ws1.nslm");
+    let mut ws1_args: Vec<&str> = flags_common.to_vec();
+    ws1_args.extend_from_slice(&[
+        "--zero-stage",
+        "3",
+        "--devices",
+        "1",
+        "--collectives",
+        "sim-gpu",
+        "--zero-elementwise",
+    ]);
+    let ws1 = run_nsl_with_env(
+        &oddify(program(&save_ws1, true)),
+        "e_ws1",
+        &ws1_args,
+        &[("NSL_ZERO_COUNTER", "1")],
+        600,
+    );
+    assert!(ws1.success, "ws=1 elementwise run failed:\n{}", ws1.stderr);
+    let full = optim_elems(&ws1.stderr, 1, 0);
+    assert_moment_partition(
+        full,
+        optim_elems(&z3.stderr, 2, 0),
+        optim_elems(&z3.stderr, 2, 1),
+        "zero3 elementwise moments",
+    );
+}
+
+/// Item C on the TENSOR-GRANULAR arm (`--zero-stage 3` without
+/// `--zero-elementwise`): the same owner gate stages 1/2 ship now runs at
+/// the deferred fill, so each rank allocates m/v only for the sharded
+/// params it owns. Parity is asserted alongside the partition for the same
+/// reason as the elementwise gate — parity alone cannot see the change, and
+/// the partition alone would not catch an owner gate that skipped the
+/// UPDATE too.
+#[test]
+#[ignore = "requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)"]
+fn zero3_tensor_granular_moments_are_owner_only_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_z3g_om_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let flags_common = [
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+    ];
+
+    let save_base = tmp.join("g_base.nslm");
+    let base = run_nsl_with_env(
+        &oddify(program(&save_base, true)),
+        "g_base",
+        &flags_common,
+        &[],
+        600,
+    );
+    assert!(base.success, "single-rank baseline failed:\n{}", base.stderr);
+    let base_losses = losses(&base.stdout);
+    assert!(!base_losses.is_empty(), "empty baseline stream");
+
+    let zero3_only = |dev: &'static str| -> Vec<&'static str> {
+        let mut a: Vec<&'static str> = flags_common.to_vec();
+        a.extend_from_slice(&["--zero-stage", "3", "--devices", dev, "--collectives", "sim-gpu"]);
+        a
+    };
+
+    let save_ws1 = tmp.join("g_ws1.nslm");
+    let ws1 = run_nsl_with_env(
+        &oddify(program(&save_ws1, true)),
+        "g_ws1",
+        &zero3_only("1"),
+        &[("NSL_ZERO_COUNTER", "1")],
+        600,
+    );
+    assert!(ws1.success, "ws=1 stage-3 run failed:\n{}", ws1.stderr);
+
+    let save_ws2 = tmp.join("g_ws2.nslm");
+    let ws2 = run_nsl_with_env(
+        &oddify(program(&save_ws2, true)),
+        "g_ws2",
+        &zero3_only("2"),
+        &[("NSL_ZERO_COUNTER", "1")],
+        900,
+    );
+    assert!(ws2.success, "2-rank stage-3 run failed:\n{}", ws2.stderr);
+
+    // Parity first — an owner gate that also skipped the update would shrink
+    // `optim_elems` and silently stop training.
+    assert_eq!(
+        base_losses,
+        losses(&ws2.stdout),
+        "tensor-granular loss stream diverged from the single-rank baseline\nstderr:\n{}",
+        ws2.stderr
+    );
+    assert_eq!(
+        std::fs::read(&save_base).expect("baseline .nslm"),
+        std::fs::read(&save_ws2).expect("zero3 .nslm"),
+        "model bytes diverged under tensor-granular zero3 owner-only moments"
+    );
+
+    // No elementwise machinery on this arm — the fill must have taken the
+    // owner-gated arm, not the slice allocator.
+    let teardown = ws2
+        .stderr
+        .lines()
+        .find(|l| l.contains("[zero3] teardown"))
+        .unwrap_or_else(|| panic!("no teardown line:\n{}", ws2.stderr));
+    assert_eq!(
+        counter_field(teardown, "elem_moments"),
+        Some(0),
+        "tensor-granular stage 3 must not allocate slice moments:\n{teardown}"
+    );
+
+    assert_moment_partition(
+        optim_elems(&ws1.stderr, 1, 0),
+        optim_elems(&ws2.stderr, 2, 0),
+        optim_elems(&ws2.stderr, 2, 1),
+        "zero3 tensor-granular moments",
+    );
+}
+
+/// Item C x Muon: the deferred fill stacks the OWNER gate on top of the
+/// ROUTE gate. A Muon-routed rank-2 param's `v` is unread, so it must stay
+/// null on EVERY rank; an AdamW-routed one must still be owner-only. Both
+/// halves are visible in one number — `optim_elems` here is strictly less
+/// than the AdamW configuration's, because the routed matrices contribute
+/// m only.
+///
+/// Deliberately does NOT carry the θ-probing callback that
+/// `zero3_muon_overlap_and_callback_touch_gpu` uses — because that gate
+/// ALREADY certifies it. It runs the same owner-only deferred fill with a
+/// per-micro-batch `on_step` that reads gathered θ, and its whole-stream
+/// parity assertion compares those probe values, so a fill that dropped a
+/// non-owner's `m` or mis-timed against the callback's read breaks it.
+/// What this gate adds on top is the RAGGED (63-dim) shape and the
+/// `optim_elems` partition number, neither of which that gate asserts.
+///
+/// (An earlier revision of this comment claimed the sibling gate was
+/// broken on main with a glibc "double free or corruption". It is not:
+/// it passes, and the composition it covers passes with it. The abort
+/// that prompted the claim was a stale `libnsl_runtime.a` in a shared
+/// CARGO_TARGET_DIR — see the mtime fallback at
+/// `crates/nsl-codegen/src/linker.rs` — which surfaces as
+/// "CUDA support not compiled", not as a double free.)
+#[test]
+#[ignore = "requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)"]
+fn zero3_muon_moments_are_owner_only_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_z3mu_om_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let muonize = |src: String| -> String {
+        src.replace(
+            "AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)",
+            "Muon(lr=0.002, momentum=0.95, nesterov=true, ns_steps=5, \
+             weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)",
+        )
+    };
+    let flags_common = [
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+    ];
+
+    let save_base = tmp.join("mu_base.nslm");
+    let base = run_nsl_with_env(
+        &muonize(oddify(program(&save_base, true))),
+        "mu_base",
+        &flags_common,
+        &[],
+        600,
+    );
+    assert!(base.success, "muon single-rank baseline failed:\n{}", base.stderr);
+    let base_losses = losses(&base.stdout);
+    assert!(!base_losses.is_empty(), "empty baseline stream");
+
+    let zero3_only = |dev: &'static str| -> Vec<&'static str> {
+        let mut a: Vec<&'static str> = flags_common.to_vec();
+        a.extend_from_slice(&["--zero-stage", "3", "--devices", dev, "--collectives", "sim-gpu"]);
+        a
+    };
+
+    let save_ws1 = tmp.join("mu_ws1.nslm");
+    let ws1 = run_nsl_with_env(
+        &muonize(oddify(program(&save_ws1, true))),
+        "mu_ws1",
+        &zero3_only("1"),
+        &[("NSL_ZERO_COUNTER", "1")],
+        600,
+    );
+    assert!(ws1.success, "muon ws=1 stage-3 run failed:\n{}", ws1.stderr);
+
+    let save_ws2 = tmp.join("mu_ws2.nslm");
+    let ws2 = run_nsl_with_env(
+        &muonize(oddify(program(&save_ws2, true))),
+        "mu_ws2",
+        &zero3_only("2"),
+        &[("NSL_ZERO_COUNTER", "1")],
+        900,
+    );
+    assert!(ws2.success, "muon 2-rank stage-3 run failed:\n{}", ws2.stderr);
+
+    assert_eq!(
+        base_losses,
+        losses(&ws2.stdout),
+        "muon x zero3 owner-only moments diverged from the single-rank \
+         baseline\nstderr:\n{}",
+        ws2.stderr
+    );
+    assert_eq!(
+        std::fs::read(&save_base).expect("baseline .nslm"),
+        std::fs::read(&save_ws2).expect("zero3 .nslm"),
+        "model bytes diverged under muon x zero3 owner-only moments"
+    );
+
+    let full = optim_elems(&ws1.stderr, 1, 0);
+    assert_moment_partition(
+        full,
+        optim_elems(&ws2.stderr, 2, 0),
+        optim_elems(&ws2.stderr, 2, 1),
+        "zero3 muon moments",
+    );
+    // The route gate must ALSO still bite: the 4 rank-2 matrices carry m
+    // only, so the Muon surface is strictly smaller than the AdamW one
+    // (which allocates m AND v for every sharded param). Without this the
+    // test would pass with the route gate deleted.
+    let adamw_ws1 = run_nsl_with_env(
+        &oddify(program(&tmp.join("mu_adamw_ws1.nslm"), true)),
+        "mu_adamw_ws1",
+        &zero3_only("1"),
+        &[("NSL_ZERO_COUNTER", "1")],
+        600,
+    );
+    assert!(adamw_ws1.success, "adamw ws=1 reference run failed:\n{}", adamw_ws1.stderr);
+    let adamw_full = optim_elems(&adamw_ws1.stderr, 1, 0);
+    assert!(
+        full < adamw_full,
+        "muon-routed params must skip v even under the deferred fill \
+         (muon full={full}, adamw full={adamw_full})"
     );
 }
 
@@ -620,6 +924,15 @@ fn srbf16_zero3_refuses_without_elementwise_and_on_ragged_params() {
 /// global element. Un-oddified fixture: every streamed param divides by 2,
 /// so the whole streamed set is elementwise (mixed mode is REFUSED under
 /// SR — that is the ragged refusal above, not this gate).
+///
+/// Item C also carries the moment-partition instrument here. Two distinct
+/// regressions hide from parity alone on this arm: (a) a fill that kept
+/// full replicated moments for SR params — parity green, `optim_elems`
+/// never shrinks, and the PR's headline claim is false for the composed
+/// config; (b) an SR step that reads slice-sized moments at `+ off_bytes`
+/// — every rank aborts, which parity DOES catch, but only because the
+/// length assert exists. The `full` baseline is the same composed config
+/// at `--devices 1`, where each slice is the whole parameter.
 #[test]
 #[ignore = "requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)"]
 fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
@@ -736,5 +1049,48 @@ fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
         "the SR backend reports 0 steps on a run that executed {sr_steps} \
          composed SR steps — tooling keyed on this counter would conclude \
          stochastic rounding never ran:\n{sr_line}"
+    );
+
+
+    // Item C: the SLICE allocator ran for the SR-carved params too — one m
+    // and one v each. A fill that special-cased bf16-sr back onto a full
+    // `zeros_like` (to keep the un-converted SR step happy) reads 0 here
+    // while every assertion above stays green.
+    let elem_moments = counter_field(teardown, "elem_moments").expect("elem_moments field");
+    assert_eq!(
+        elem_moments,
+        elem_params * 2,
+        "expected one m and one v SLICE per bf16-sr elementwise param — a \
+         fill that kept replicated moments for SR reads 0 here:\n{teardown}"
+    );
+
+    // `full` = the same composed config at ws=1, where every streamed param
+    // is a 1/1 slice and rank 0 therefore allocates the WHOLE sharded
+    // optimizer surface. This is the only number that moves when the SR
+    // moments stop being sharded — parity is invariant to it.
+    let save_ws1 = tmp.join("sr_ws1.nslm");
+    let mut ws1_args: Vec<&str> = flags_common.to_vec();
+    ws1_args.extend_from_slice(&[
+        "--zero-stage",
+        "3",
+        "--devices",
+        "1",
+        "--collectives",
+        "sim-gpu",
+        "--zero-elementwise",
+    ]);
+    let ws1 = run_nsl_with_env(
+        &program(&save_ws1, true),
+        "sr_ws1",
+        &ws1_args,
+        &[("NSL_ZERO_COUNTER", "1")],
+        600,
+    );
+    assert!(ws1.success, "ws=1 composed SR run failed:\n{}", ws1.stderr);
+    assert_moment_partition(
+        optim_elems(&ws1.stderr, 1, 0),
+        optim_elems(&sr.stderr, 2, 0),
+        optim_elems(&sr.stderr, 2, 1),
+        "bf16-sr x zero3 elementwise moments",
     );
 }
