@@ -194,10 +194,15 @@ extern "C" fn nsl_fase_fused_step_count_atexit() {
     // mid-string and the parsing gate flakes on a missing field. This report
     // became multi-rank the moment the batched optimizer step started firing
     // under `--zero-stage`.
+    // The multi-params line carries `rank=`: with `--devices N` every rank
+    // writes one, and a gate pairing them by ARRIVAL ORDER against per-rank
+    // facts (which parameters that rank owns) would silently cross them
+    // whenever the ranks happen to exit in the other order.
+    let (rank, _ws, _ar, _bc, _oe, _bm) = crate::zero::zero_counter_snapshot();
     let report = format!(
         "[fase-fused] optimizer fused-step launches: {}\n\
          [fase-fused] block-table builds: {}\n\
-         [fase-fused] multi params: batched={} fallback={}\n",
+         [fase-fused] multi params: rank={rank} batched={} fallback={}\n",
         crate::fase_step::nsl_fase_fused_step_count(),
         crate::fase_step::nsl_fase_blk_table_builds(),
         crate::fase_step::nsl_fase_multi_batched_params(),

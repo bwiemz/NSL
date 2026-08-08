@@ -15075,10 +15075,10 @@ impl Compiler<'_> {
                     // m_partial zero). Admission (`multi_scalars`) is hoisted
                     // above the clip fork and shared with the clip arm.
                     if let Some(sc) = multi_scalars {
-                        let lr_v = builder.ins().f64const(sc.lr);
-                        let b1_v = builder.ins().f64const(sc.beta1);
-                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
-                        let b2_v = builder.ins().f64const(sc.beta2);
+                        // The recipe constants are materialized inside
+                        // `emit_fused_multi_launch` now — emitting them here
+                        // too would leave four dead Cranelift values and a
+                        // `-D warnings` clippy failure.
                         let exempt_list_v = decay_exempt_list
                             .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
                         let exempt_nr2_v = builder.ins().iconst(

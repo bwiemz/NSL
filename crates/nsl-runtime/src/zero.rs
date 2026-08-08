@@ -643,15 +643,43 @@ pub extern "C" fn nsl_zero_owned_step_indices(accum_list: i64, num_params: i64) 
     };
 
     let list = crate::list::nsl_list_new();
+    let mut idxs: Vec<usize> = Vec::new();
     for (i, is_owner) in owned.iter().enumerate() {
         if *is_owner {
             crate::list::nsl_list_push(list, i as i64);
+            idxs.push(i);
         } else if accum_list != 0 {
             let mp = crate::list::nsl_list_get(accum_list, i as i64);
             if mp != 0 {
                 crate::tensor::nsl_tensor_zero_inplace(mp);
             }
         }
+    }
+
+    // Publish the actual index SET once, under NSL_ZERO_COUNTER=1.
+    //
+    // A gate can otherwise only compare COUNTS, and counts cannot tell a
+    // partition from an overlap plus a matching gap: ranks owning {0,1,2} and
+    // {2,3,4} of five parameters sum to the same 6 as {0,1,2} and {3,4} — one
+    // parameter stepped twice, one never stepped, both totals right. The sets
+    // themselves are the only thing that settles it (review finding).
+    //
+    // Once per process, so a many-step run does not flood stderr; formatted
+    // and written in one syscall because every rank shares this pipe.
+    static PUBLISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !PUBLISHED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && std::env::var("NSL_ZERO_COUNTER").ok().as_deref() == Some("1")
+    {
+        let rank = ZERO_CTX.lock().unwrap().as_ref().map(|c| c.rank).unwrap_or(0);
+        let line = format!(
+            "[zero] owned-step rank={rank} n={n} idx={}\n",
+            idxs.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
     }
     list
 }
