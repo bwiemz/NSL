@@ -4673,7 +4673,10 @@ mod tests {
         let tp = &t as *const NslTensor as i64;
 
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
-        assert_eq!(nsl_zero3_mark_elementwise(tp, 0), 0);
+        // `sr = 0`: plain f32 elementwise storage. #493 widened this call to
+        // carry the plan entry's storage decision; this test covers the
+        // non-SR arm, which is where slice-local moment indexing lives.
+        assert_eq!(nsl_zero3_mark_elementwise(tp, 0, 0), 0);
         zero3_register(tp); // REAL carve — rank 1 takes theta[4..8]
         assert!(t.data.is_null(), "carve must drop the full replica");
 
@@ -4816,6 +4819,19 @@ mod tests {
 
         unsafe { crate::memory::checked_free(transient as *mut u8, full_bytes) };
         crate::tensor::NslTensor::from_ptr(tp).data = std::ptr::null_mut();
+        // `nsl_zero3_teardown()` before destroy, per every sibling here, and
+        // it is NOT optional bookkeeping: `nsl_zero_destroy` leaves
+        // ZERO3_TABLE populated, so an entry keyed on this stack tensor
+        // outlives the frame and the NEXT test's teardown walks it and
+        // dereferences freed stack memory ("bad magic ... possible
+        // use-after-free", a non-unwinding abort that kills the whole
+        // binary and reports against the innocent test). Teardown restores
+        // a full replica, so free what it hands back.
+        nsl_zero3_teardown();
+        if !t.data.is_null() {
+            unsafe { crate::memory::checked_free(t.data as *mut u8, full_bytes) };
+            crate::tensor::NslTensor::from_ptr(tp).data = std::ptr::null_mut();
+        }
         nsl_zero_destroy();
     }
 

@@ -1017,7 +1017,6 @@ fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
         "some elementwise steps took the plain f32 arm:\n{teardown}"
     );
 
-<<<<<<< HEAD
     // The SR backend's OWN teardown must run on a composed run. It did not
     // before review: nsl_weight_stream_teardown returned after the zero3
     // arm, so SRBF16_ACTIVE leaked past the train block (inverting the
