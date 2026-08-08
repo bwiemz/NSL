@@ -3318,12 +3318,16 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         guard.as_ref().map(|c| c.rank).unwrap_or(0)
     };
     // Bound proof for the θ region this rank writes: the gathered transient
-    // must actually cover [rank*shard, (rank+1)*shard).
+    // must actually cover [rank*shard, (rank+1)*shard). Saturating on BOTH
+    // the test and the message — a debug build would otherwise panic with
+    // "attempt to multiply with overflow" while formatting, replacing the
+    // drift diagnostic with a arithmetic one.
+    let region_lo = rank.saturating_mul(shard);
+    let region_hi = region_lo.saturating_add(shard);
     assert!(
-        rank.saturating_add(1).saturating_mul(shard) <= th.len.max(0) as usize,
-        "zero3 elem step: region [{}, {}) escapes theta (len={})",
-        rank * shard,
-        (rank + 1) * shard,
+        region_hi <= th.len.max(0) as usize,
+        "zero3 elem step: region [{region_lo}, {region_hi}) escapes theta \
+         (len={})",
         th.len
     );
     let off_bytes = rank * shard * elem_bytes;
