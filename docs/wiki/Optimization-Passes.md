@@ -319,10 +319,22 @@ provenance at compile time and pin diagnostics at runtime.
 
 Validated on coder50m (40 steps, `--deterministic --seed 4242`): planned and
 unplanned runs produce **byte-identical** loss streams and `.nslm`
-checkpoints; 7240 of 7240 binds placed; per-step guard checks clean. What it
-deliberately does **not** do yet: feed the stable offsets into CUDA-graph
-capture — that is the payoff this staging exists to unlock, and it lands
-separately now that the byte-identity gate is green.
+checkpoints; 7240 of 7240 binds placed; per-step guard checks clean.
+
+**Composition with `--cuda-graphs` (measured 2026-08-07):** the arena's
+pinned addresses feed graph capture *by construction* — the allocator pin
+returns the same pointer every step, which is exactly what the recorder's
+digest-stability streak wants — so no separate "offset feeding" mechanism
+exists or is needed. On coder50m the composed run is byte-identical to
+eager, reconciles all binds (0 misplaced — the precondition for a captured
+graph never baking a scratch address), and stabilizes capture one window
+earlier than graphs-alone (36 vs 35 replays). On the canonical
+`cuda_graph_gate.nsl` fixture the arena admits **zero** transients (they
+are exactly the refused classes: forward-region, unsized, tape-escaping),
+so there is no delta there — capture-coverage growth on real models is
+bounded by readback taints and admission breadth, not address stability.
+`scripts/arena-parity.sh` gates the composition (byte-identity, capture
+non-vacuity, replays ≥ graphs-alone, `0 misplaced`).
 
 Gates: `crates/nsl-codegen/src/transient_arena.rs` unit tests (per-rule
 admission cases, shape-rule semantics, packing non-overlap),
