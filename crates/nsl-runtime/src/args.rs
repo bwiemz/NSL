@@ -183,17 +183,28 @@ extern "C" fn nsl_csla_window_count_atexit() {
 }
 
 extern "C" fn nsl_fase_fused_step_count_atexit() {
-    eprintln!(
-        "[fase-fused] optimizer fused-step launches: {}",
-        crate::fase_step::nsl_fase_fused_step_count()
+    // Each counter gets its OWN line: the launches line is consumed by
+    // strip_prefix-then-parse gates, so appending a field there would break
+    // them (the append-breaks-terminal-anchors class).
+    //
+    // Formatted once and written once, for the reason the `[zero]` reporter
+    // documents: under `--devices N` every rank prints to the SAME inherited
+    // stderr pipe, often exiting together, and `eprintln!` issues one write(2)
+    // per format fragment — so concurrent ranks TEAR each other's lines
+    // mid-string and the parsing gate flakes on a missing field. This report
+    // became multi-rank the moment the batched optimizer step started firing
+    // under `--zero-stage`.
+    let report = format!(
+        "[fase-fused] optimizer fused-step launches: {}\n\
+         [fase-fused] block-table builds: {}\n\
+         [fase-fused] multi params: batched={} fallback={}\n",
+        crate::fase_step::nsl_fase_fused_step_count(),
+        crate::fase_step::nsl_fase_blk_table_builds(),
+        crate::fase_step::nsl_fase_multi_batched_params(),
+        crate::fase_step::nsl_fase_multi_fallback_params(),
     );
-    // Item 8 follow-up: its OWN line — the launches line above is consumed
-    // by strip_prefix-then-parse gates, so appending a field there would
-    // break them (the append-breaks-terminal-anchors class).
-    eprintln!(
-        "[fase-fused] block-table builds: {}",
-        crate::fase_step::nsl_fase_blk_table_builds()
-    );
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(report.as_bytes());
 }
 
 extern "C" fn nsl_wgrad_count_atexit() {

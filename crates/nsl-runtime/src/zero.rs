@@ -588,6 +588,74 @@ pub extern "C" fn nsl_zero_owns_param(param_idx: i64) -> i64 {
     }
 }
 
+/// Item 8 × D3: split a FullBuffer optimizer step into the subset this rank
+/// owns, so the batched launcher can be used under `--zero-stage 1/2`.
+///
+/// Codegen's per-param ZeRO loop does exactly two things per parameter: the
+/// owner runs the update (whose kernel also zeroes `m_partial`), and a
+/// NON-owner zeroes its `m_partial` and nothing else — the accumulator must
+/// not survive into the next window, and a true zero-fill rather than a
+/// multiply-by-0.0, because `x * 0.0` keeps a NaN/Inf alive forever.
+///
+/// This performs that same partition once: non-owners' accumulators are
+/// zeroed here, and the returned list of owned indices feeds
+/// `nsl_fase_fused_adamw_step_multi_idx`, the subset launcher that already
+/// exists for CSLA layer groups. The caller owns the returned list and must
+/// `nsl_list_free` it.
+///
+/// Why an owner SUBSET and not an owner-aware batched launcher: under stages
+/// 1/2 a non-owned parameter's moment buffers are NULL placeholders
+/// (`emit_owner_gated_moment` allocates nothing for them), so the batched
+/// path must never see one. Handing it only owners keeps
+/// `fase_multi_impl`'s null assert as a live belt instead of something to
+/// weaken.
+///
+/// **Deliberate divergence from the loop it replaces.** `nsl_zero_owns_param`
+/// returns -1 when no ZeRO context is installed, which the old loop's
+/// `owns == 1` test read as "not owned" — so a program built with
+/// `--zero-stage` whose `nsl_zero_init` had failed would zero every
+/// accumulator, update nothing, and train silently forever. There is no
+/// configuration in which that is correct, so this aborts instead.
+#[no_mangle]
+pub extern "C" fn nsl_zero_owned_step_indices(accum_list: i64, num_params: i64) -> i64 {
+    let n = num_params.max(0);
+    // Snapshot ownership under the lock, then release it: the zero-fill below
+    // reaches into tensor code and must not run with ZERO_CTX held.
+    let owned: Vec<bool> = {
+        let guard = ZERO_CTX.lock().unwrap();
+        let Some(ctx) = guard.as_ref() else {
+            if n > 0 {
+                eprintln!(
+                    "nsl_zero_owned_step_indices: no ZeRO context is installed, \
+                     but this program was compiled with --zero-stage and is \
+                     asking which of {n} parameter(s) this rank owns. \
+                     nsl_zero_init must have failed (see its message above); \
+                     continuing would zero every gradient accumulator and \
+                     update no parameter at all — aborting instead."
+                );
+                std::process::abort();
+            }
+            return crate::list::nsl_list_new();
+        };
+        (0..n as usize)
+            .map(|i| ctx.owned_params.contains(&i))
+            .collect()
+    };
+
+    let list = crate::list::nsl_list_new();
+    for (i, is_owner) in owned.iter().enumerate() {
+        if *is_owner {
+            crate::list::nsl_list_push(list, i as i64);
+        } else if accum_list != 0 {
+            let mp = crate::list::nsl_list_get(accum_list, i as i64);
+            if mp != 0 {
+                crate::tensor::nsl_tensor_zero_inplace(mp);
+            }
+        }
+    }
+    list
+}
+
 // ---------------------------------------------------------------------------
 // P4 item 15: bucketed collectives.
 // ---------------------------------------------------------------------------

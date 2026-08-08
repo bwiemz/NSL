@@ -55,6 +55,33 @@ pub extern "C" fn nsl_fase_blk_table_builds() -> i64 {
     FASE_BLK_TABLE_BUILDS.load(Ordering::Relaxed) as i64
 }
 
+/// How many parameters actually went into a batched launch, and how many took
+/// the per-param fallback arm inside `fase_multi_impl`.
+///
+/// The existing evidence that batching happened is a ONE-SHOT marker
+/// (`[fase-multi] batched k params`, printed for the first bucket of the
+/// first call) plus `FASE_FUSED_STEP_COUNT`, which the batched arm bumps by
+/// `k` — so a run where 1 of 25 layer groups batched and the other 24 fell
+/// back is indistinguishable from one where every group batched. Both of
+/// these count PARAMETERS, so a gate can assert the whole set was batched
+/// rather than "at least one was".
+///
+/// The fallback arm is not a bug — an aliased theta (tied weights) or a
+/// non-uniform bucket legitimately routes there — which is exactly why it
+/// needs to be countable rather than silent.
+pub static FASE_MULTI_BATCHED_PARAMS: AtomicU64 = AtomicU64::new(0);
+pub static FASE_MULTI_FALLBACK_PARAMS: AtomicU64 = AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn nsl_fase_multi_batched_params() -> i64 {
+    FASE_MULTI_BATCHED_PARAMS.load(Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_fase_multi_fallback_params() -> i64 {
+    FASE_MULTI_FALLBACK_PARAMS.load(Ordering::Relaxed) as i64
+}
+
 /// Global sum-of-squares over every tensor in an `NslList` — the FASE
 /// two-phase-clip Phase A norm, batched.
 ///
@@ -525,6 +552,7 @@ fn fase_multi_impl(
             param_wd(i, tp), bc1_inv, bc2_inv,
         );
         crate::tensor::nsl_tensor_zero_inplace(ap);
+        FASE_MULTI_FALLBACK_PARAMS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(feature = "cuda")]
@@ -571,14 +599,21 @@ fn fase_multi_impl(
             );
             // Keep the fused-step counter's per-param semantics (gates read it).
             FASE_FUSED_STEP_COUNT.fetch_add(k as u64, Ordering::Relaxed);
+            FASE_MULTI_BATCHED_PARAMS.fetch_add(k as u64, Ordering::Relaxed);
             // One-time anti-vacuity marker for the e2e gates.
             static MARKED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !MARKED.swap(true, Ordering::Relaxed) {
-                eprintln!(
+                // Write-once: under `--devices N` every rank shares one stderr
+                // pipe and `eprintln!` emits a write(2) per fragment, so two
+                // ranks tear this marker mid-string. It only became
+                // multi-rank-visible when ZeRO stopped disabling batching.
+                let line = format!(
                     "[fase-multi] batched {k} params into one fused AdamW launch \
-                     ({n_buckets} bucket(s))"
+                     ({n_buckets} bucket(s))\n"
                 );
+                use std::io::Write;
+                let _ = std::io::stderr().lock().write_all(line.as_bytes());
             }
         }
     }
