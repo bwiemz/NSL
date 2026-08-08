@@ -2737,6 +2737,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // Item 16×11: the composed bf16-sr elementwise step — same scalar order
+    // plus the trailing optimizer step the SR counter stream is keyed on.
+    (
+        "nsl_zero3_elem_sr_adamw_step",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // theta, m, v, idx
+            types::F64, types::F64, types::F64, types::F64, types::F64, // lr, b1, omb1, b2, omb2
+            types::F64, types::F64, types::F64, types::F64, // eps, wd, bc1_inv, bc2_inv
+            types::I64, // step
+        ],
+        Some(types::I64),
+    ),
     // P5 item 19: opportunistic per-region CUDA graph capture/replay
     ("nsl_cuda_graphs_enable", &[types::I64], None), // (accum_window)
     ("nsl_cuda_graph_region_begin", &[types::I64], None), // (region_id)

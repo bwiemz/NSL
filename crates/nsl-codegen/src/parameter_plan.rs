@@ -230,11 +230,12 @@ impl ParameterPlan {
                     .into(),
             ));
         }
-        if f.param_dtype_bf16sr && sharding_on {
+        if f.param_dtype_bf16sr && sharding_on && !f.zero_elementwise {
             return Err(PlanError(
-                "--param-dtype bf16-sr does not compose with --zero-stage 3: \
-                 both claim the residency backend, and nsl_weight_stream_register \
-                 can only dispatch to one"
+                "--param-dtype bf16-sr composes with --zero-stage 3 only under \
+                 --zero-elementwise: tensor-granular sharding and the mirror \
+                 backend both claim the residency backend, and \
+                 nsl_weight_stream_register can only dispatch to one"
                     .into(),
             ));
         }
@@ -316,7 +317,31 @@ impl ParameterPlan {
             })
             .collect();
 
-        Ok(Self { entries })
+        let plan = Self { entries };
+        // Item 16×11 fail-closed: under composed bf16-sr × elementwise, a
+        // streamed param whose numel is not an exact 1/ws split would fall
+        // back to TENSOR-GRANULAR sharding — whose owner-gated update leaves
+        // non-owner bf16 state stale (the exact hazard the stage-3 refusal
+        // names). Refuse loudly with the param and the arithmetic rather
+        // than train it without stochastic rounding.
+        if f.param_dtype_bf16sr && f.zero_elementwise {
+            for e in plan.entries().iter() {
+                if e.storage == ParamStorage::Bf16Sr && e.sharding == ParamSharding::Sharded {
+                    return Err(PlanError(format!(
+                        "--param-dtype bf16-sr composes with --zero-stage 3 only \
+                         under --zero-elementwise, and parameter '{}' cannot \
+                         shard elementwise ({} elements is not divisible by \
+                         world size {ws}) — it would fall back to the \
+                         tensor-granular owner-gated path. Pad the parameter \
+                         or drop a flag",
+                        e.name,
+                        elems.get(e.idx as usize).copied().unwrap_or(0),
+                    )));
+                }
+            }
+        }
+
+        Ok(plan)
     }
 
     pub fn entries(&self) -> &[ParamPlanEntry] {
@@ -582,7 +607,33 @@ mod tests {
             ..Default::default()
         };
         let e = ParameterPlan::derive(&names(2), &[0], &[], &both).unwrap_err();
-        assert!(e.0.contains("does not compose"), "{e}");
+        assert!(e.0.contains("only under --zero-elementwise"), "{e}");
+
+        // Item 16×11: WITH --zero-elementwise the composition derives — the
+        // streamed entry carries both the bf16-sr storage and the
+        // elementwise sharding refinement.
+        let composed = PlanFeatures {
+            weight_stream: true,
+            param_dtype_bf16sr: true,
+            zero_stage: Some(3),
+            zero_elementwise: true,
+            world_size: 2,
+            ..Default::default()
+        };
+        let p = ParameterPlan::derive(&names(2), &[0], &[8, 8], &composed).unwrap();
+        assert_eq!(p.entries()[0].storage, ParamStorage::Bf16Sr);
+        assert_eq!(p.entries()[0].sharding, ParamSharding::ShardedElementwise);
+        assert_eq!(p.entries()[1].sharding, ParamSharding::Replicated);
+
+        // ...but a streamed param that CANNOT split 1/ws fails closed — the
+        // tensor-granular fallback would owner-gate its update and leave
+        // non-owner bf16 state stale, i.e. train it without SR.
+        let e = ParameterPlan::derive(&names(2), &[0], &[7, 8], &composed).unwrap_err();
+        assert!(e.0.contains("cannot shard elementwise"), "{e}");
+        assert!(
+            e.0.contains("blocks.0.w") && e.0.contains("7 elements"),
+            "the refusal must name the parameter and the arithmetic: {e}"
+        );
 
         let ws_off = PlanFeatures::default();
         let e = ParameterPlan::derive(&names(2), &[0], &[], &ws_off).unwrap_err();

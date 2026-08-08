@@ -552,3 +552,155 @@ fn zero3_muon_overlap_and_callback_touch_gpu() {
     let b = std::fs::read(&save_z3).expect("zero3 .nslm");
     assert_eq!(a, b, "model bytes diverged under muon x zero3");
 }
+
+/// Item 16×11 refusals, both fail-closed arms:
+/// - bf16-sr × tensor-granular stage 3 (no `--zero-elementwise`) refuses at
+///   the envelope — the owner-gated update would leave non-owner slices
+///   un-stepped;
+/// - bf16-sr × elementwise with a RAGGED streamed param refuses at plan
+///   derivation — the tensor-granular fallback would train that param
+///   without stochastic rounding.
+#[test]
+fn srbf16_zero3_refuses_without_elementwise_and_on_ragged_params() {
+    let tmp = std::env::temp_dir().join(format!("nsl_z3sr_ref_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("sr_ref.nslm");
+    let flags_common = [
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+        "--param-dtype",
+        "bf16-sr",
+    ];
+
+    let mut granular: Vec<&str> = flags_common.to_vec();
+    granular.extend_from_slice(&["--zero-stage", "3", "--devices", "2"]);
+    let out = run_nsl_with_env(&program(&save, false), "sr_granular", &granular, &[], 300);
+    assert!(
+        !out.success,
+        "bf16-sr x tensor-granular stage 3 ran:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr
+            .contains("only under --zero-elementwise"),
+        "wrong refusal:\n{}",
+        out.stderr
+    );
+
+    let mut ragged: Vec<&str> = flags_common.to_vec();
+    ragged.extend_from_slice(&[
+        "--zero-stage",
+        "3",
+        "--devices",
+        "2",
+        "--zero-elementwise",
+    ]);
+    let out = run_nsl_with_env(&oddify(program(&save, false)), "sr_ragged", &ragged, &[], 300);
+    assert!(
+        !out.success,
+        "bf16-sr x elementwise with 63-elem ragged norms ran:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("cannot shard elementwise"),
+        "wrong refusal (expected the plan-level ragged fail-closed):\n{}",
+        out.stderr
+    );
+}
+
+/// Item 16×11 parity: composed `--param-dtype bf16-sr --zero-stage 3
+/// --zero-elementwise` 2-rank training (sim-gpu collectives, one physical
+/// GPU) is BIT-IDENTICAL to single-rank PLAIN bf16-sr — loss stream and
+/// saved model bytes. The chain: rank-blind loaders make both ranks'
+/// window grads identical, reduce_scatter+1/ws is `(g+g)/2 == g` bit-exact
+/// at ws=2, each rank's slice was carved by the same f32→bf16 cast as the
+/// mirror, and the composed SR kernel draws each element's dither at
+/// `param_base + rank*shard + i` — the single-rank counter for the same
+/// global element. Un-oddified fixture: every streamed param divides by 2,
+/// so the whole streamed set is elementwise (mixed mode is REFUSED under
+/// SR — that is the ragged refusal above, not this gate).
+#[test]
+#[ignore = "requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)"]
+fn srbf16_elementwise_bit_exact_vs_plain_sr_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_z3sr_bx_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let flags_common = [
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+        "--param-dtype",
+        "bf16-sr",
+    ];
+
+    let save_base = tmp.join("sr_base.nslm");
+    let base = run_nsl_with_env(
+        &program(&save_base, true),
+        "sr_base",
+        &flags_common,
+        &[],
+        600,
+    );
+    assert!(base.success, "plain-SR baseline failed:\n{}", base.stderr);
+    let base_losses = losses(&base.stdout);
+    assert!(!base_losses.is_empty(), "empty baseline stream");
+    assert!(
+        base.stderr.contains("[sr-bf16] teardown:"),
+        "baseline never armed the SR backend:\n{}",
+        base.stderr
+    );
+
+    let save_sr = tmp.join("sr_z3.nslm");
+    let mut sr_args: Vec<&str> = flags_common.to_vec();
+    sr_args.extend_from_slice(&[
+        "--zero-stage",
+        "3",
+        "--devices",
+        "2",
+        "--collectives",
+        "sim-gpu",
+        "--zero-elementwise",
+    ]);
+    let sr = run_nsl_with_env(
+        &program(&save_sr, true),
+        "sr_z3",
+        &sr_args,
+        &[("NSL_ZERO_COUNTER", "1")],
+        900,
+    );
+    assert!(sr.success, "composed 2-rank run failed:\n{}", sr.stderr);
+
+    assert_eq!(
+        base_losses,
+        losses(&sr.stdout),
+        "composed loss stream diverged from single-rank plain SR\nstderr:\n{}",
+        sr.stderr
+    );
+    let a = std::fs::read(&save_base).expect("baseline .nslm");
+    let b = std::fs::read(&save_sr).expect("composed .nslm");
+    assert_eq!(a, b, "model bytes diverged under composed bf16-sr x zero3");
+
+    // Anti-vacuity: the SR-elementwise machinery demonstrably ran, and NO
+    // streamed param silently took a non-SR arm (sr_elem == elem on both
+    // counters — a composed run that trains any slice without stochastic
+    // rounding must not read green here).
+    let teardown = sr
+        .stderr
+        .lines()
+        .find(|l| l.contains("[zero3] teardown"))
+        .unwrap_or_else(|| panic!("no teardown line:\n{}", sr.stderr));
+    let elem_params = counter_field(teardown, "elem_params").expect("elem_params field");
+    let elem_steps = counter_field(teardown, "elem_steps").expect("elem_steps field");
+    let sr_params = counter_field(teardown, "sr_elem_params").expect("sr_elem_params field");
+    let sr_steps = counter_field(teardown, "sr_elem_steps").expect("sr_elem_steps field");
+    assert!(sr_params > 0, "no bf16-sr slices carved:\n{teardown}");
+    assert_eq!(
+        sr_params, elem_params,
+        "some elementwise params carved WITHOUT bf16-sr storage:\n{teardown}"
+    );
+    assert!(sr_steps > 0, "no composed SR steps ran:\n{teardown}");
+    assert_eq!(
+        sr_steps, elem_steps,
+        "some elementwise steps took the plain f32 arm:\n{teardown}"
+    );
+}

@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — SR-BF16 composes with elementwise ZeRO-3 (`--param-dtype bf16-sr --zero-stage 3 --zero-elementwise`)
+
+- **The two memory features stack**: bf16 authoritative weights (2 bytes/elem)
+  AND 1/ws elementwise sharding, so each rank persistently holds
+  `numel/ws × 2` bytes per streamed param. The elementwise slice IS the bf16
+  authoritative storage — carved by the same f32→bf16 cast as the mirror
+  backend's register, widened to f32 at gather (collectives stay f32), and
+  stepped in place by the same fused SR kernel with the counter base offset
+  by `rank * shard`, which makes every element's dither identical to the
+  single-rank baseline's at the same global index. **Validated bit-exact**:
+  2-rank sim-gpu composed training equals single-rank plain SR — loss stream
+  and saved `.nslm` bytes (`srbf16_elementwise_bit_exact_vs_plain_sr_gpu`),
+  and the composed ws=1 lifecycle equals the mirror path bitwise at the unit
+  level (`srbf16_elementwise_ws1_matches_the_mirror_path_bitwise`).
+- **Everything else stays refused, loudly**: stages 1/2 (defense-in-depth —
+  the layerwise chain refuses them first), tensor-granular stage 3 (the
+  owner-gated update would leave non-owner slices un-stepped), and — new
+  fail-closed arm — a streamed param whose numel does not divide the world
+  size, which would silently fall back to the tensor-granular path and train
+  without stochastic rounding. The plan refusal names the param and the
+  arithmetic.
+- The `[zero3] teardown:` line gains `sr_elem_params`/`sr_elem_steps`
+  (label-anchored; appended fields), the composed step samples `NSL_SR_HIST`
+  histograms like both mirror paths, θ-mutating callback writes follow plain
+  SR's contract (dropped — the SR step is the only sanctioned θ writer), and
+  the `[sr-bf16]` teardown line converts to single-write formatting (it can
+  now print from multiple ranks).
+
 ### Added — `--fuse-lm-head`: the fused LM head joins the production profile
 
 - **An ~8.5% measured step-time win no longer depends on hand-editing model

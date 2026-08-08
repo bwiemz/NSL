@@ -6487,12 +6487,34 @@ impl Compiler<'_> {
                          residency schedule (transient f32 working views)",
                     ));
                 }
-                if self.features.zero_stage.is_some() {
-                    return Err(CodegenError::new(
-                        "--param-dtype bf16-sr does not compose with \
-                         --zero-stage yet (the ZeRO gather/reduce paths pin \
-                         f32 device storage). Drop one of the flags",
-                    ));
+                // Item 16×11: the ONE supported ZeRO composition is
+                // elementwise stage 3 — every rank steps its own bf16
+                // slice with the SR kernel, so the sanctioned-θ-writer
+                // invariant holds on every rank. Tensor-granular stage 3
+                // owner-gates the update (non-owner slices would go stale),
+                // and stages 1/2 route θ through the owner partition; both
+                // stay refused. The stage-1/2 arm is defense-in-depth:
+                // bf16-sr requires --weight-stream, which clap-requires
+                // --layerwise-accum, which already refuses stages 1/2.
+                match self.features.zero_stage {
+                    Some(3) if self.features.zero_elementwise => {}
+                    Some(3) => {
+                        return Err(CodegenError::new(
+                            "--param-dtype bf16-sr composes with --zero-stage 3 \
+                             only under --zero-elementwise (the tensor-granular \
+                             owner-gated update would leave non-owner slices \
+                             un-stepped). Add --zero-elementwise or drop a flag",
+                        ));
+                    }
+                    Some(_) => {
+                        return Err(CodegenError::new(
+                            "--param-dtype bf16-sr does not compose with \
+                             --zero-stage 1/2 (the owner-partitioned optimizer \
+                             would route θ updates around the SR step). Drop \
+                             one of the flags",
+                        ));
+                    }
+                    None => {}
                 }
                 if self.compile_options.optim_state_offload {
                     return Err(CodegenError::new(
@@ -13224,14 +13246,37 @@ impl Compiler<'_> {
                         // and the multi arm (CSLA has no AdamW group
                         // plumbing; grad_clip is refused by the schedule).
                         let wd_v = builder.ins().f64const(sc.wd);
-                        let rc = c.compile_call_by_name(
-                            builder,
-                            "nsl_zero3_elem_adamw_step",
-                            &[
-                                theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v,
-                                omb2_v, eps_v, wd_v, bc.0, bc.1,
-                            ],
-                        )?;
+                        // Item 16×11: under composed bf16-sr the slice is
+                        // bf16-authoritative and the step is the SR kernel —
+                        // a distinct entry (it needs the optimizer step for
+                        // the SR counter key, and the runtime belts abort on
+                        // a carve/dispatch mismatch in either direction).
+                        let rc = if c.features.param_dtype_bf16sr {
+                            let step_v = sr_step.ok_or_else(|| {
+                                CodegenError::new(
+                                    "bf16-sr elementwise group update reached \
+                                     without an opt_step value — dispatcher \
+                                     must thread sr_step",
+                                )
+                            })?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_zero3_elem_sr_adamw_step",
+                                &[
+                                    theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v,
+                                    omb2_v, eps_v, wd_v, bc.0, bc.1, step_v,
+                                ],
+                            )?
+                        } else {
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_zero3_elem_adamw_step",
+                                &[
+                                    theta, m, v, iv, lr_v, b1_v, omb1_v, b2_v,
+                                    omb2_v, eps_v, wd_v, bc.0, bc.1,
+                                ],
+                            )?
+                        };
                         let z = builder.ins().iconst(cl_types::I64, 0);
                         let ok = builder.ins().icmp(IntCC::Equal, rc, z);
                         let msg =
