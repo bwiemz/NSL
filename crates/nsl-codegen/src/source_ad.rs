@@ -6206,7 +6206,14 @@ mod tests {
             PrimalOp::Passthrough(n) if n == "swiglu_gate_backward"
         ));
         assert_eq!(ops[0].inputs, vec![10, 11, 12]);
-        assert_eq!(ops[0].id, 0, "ids renumbered positionally");
+        // Positional WITHIN the adjoint half: this is a backward-tape
+        // rewriter, so index 0 is `ADJOINT_ID_BASE`, not 0. Pinning the raw
+        // 0 here would pin the primal/adjoint id collision back into place.
+        assert_eq!(
+            ops[0].id,
+            crate::wengert::adjoint_op_id(0),
+            "ids renumbered positionally within the adjoint id space"
+        );
     }
 
     #[test]

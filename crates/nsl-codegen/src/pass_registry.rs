@@ -318,7 +318,8 @@ pub const PASSES: &[PassDescriptor] = &[
                    ids above the max — a len-minted id collides after any \
                    deletion); its OnAdjoint half splices recompute clones \
                    and decompress ops into the adjoint and renumbers that \
-                   list back to id == index",
+                   list to ADJOINT_ID_BASE + index, keeping adjoint ids \
+                   positional within the adjoint half of the id space",
         },
     },
     PassDescriptor {
