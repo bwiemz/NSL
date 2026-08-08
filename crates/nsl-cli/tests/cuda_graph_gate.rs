@@ -174,6 +174,42 @@ fn cuda_graphs_refuses_cuda_sync() {
     );
 }
 
+/// `NSL_ASYNC_ALLOC=1` puts allocations on the NULL stream via
+/// `cuMemAllocAsync` with no taint hook — an alloc inside a capture region
+/// would be recorded into the graph (or fail the capture) with nothing
+/// self-healing it. `enable()` must refuse up front, loudly, and the run
+/// must still train (eager). Env-driven, so this is a runtime disable
+/// rather than a CLI conflict; `enable()` is host-side, so no GPU is
+/// needed to observe it — but the refusal only exists in cuda builds.
+#[test]
+fn cuda_graphs_refuse_async_alloc_env() {
+    if !cfg!(feature = "cuda") {
+        return; // the capture machinery (and its enable gate) is cfg(cuda)
+    }
+    let out = run_fixture_env(
+        "cuda_graph_gate.nsl",
+        "asyncalloc",
+        &[],
+        &["--cuda-graphs"],
+        &[("NSL_ASYNC_ALLOC", "1")],
+    );
+    assert!(
+        out.success,
+        "the refusal must disable graphs, not kill training:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("[cuda-graph] disabled: NSL_ASYNC_ALLOC=1"),
+        "missing async-alloc disable line:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("[cuda-graph] regions="),
+        "banner printed — capture ran despite the refusal:\n{}",
+        out.stderr
+    );
+}
+
 /// Core e2e: on a readback-free fixture, regions capture and replay, and
 /// the loss stream is bit-identical to the eager run and across reruns.
 /// Covers both the monolithic (plain) and the CSLA per-layer-range shapes.

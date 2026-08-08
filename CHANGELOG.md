@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — arena × CUDA graphs: the composition measured, gated, and one hole closed
+
+- **`--transient-arena` composes with `--cuda-graphs` by construction, now
+  proven and pinned.** The arena's allocator pin returns the same device
+  pointer every step — exactly what the graph recorder's digest-stability
+  streak needs — so no separate "offset feeding" mechanism was ever
+  required. Measured on coder50m: the composed run is byte-identical to
+  eager (loss stream + `.nslm`), reconciles 7240/7240 binds with **0
+  misplaced** (the precondition for a captured graph never baking an
+  op-local scratch address), and stabilizes capture one window earlier
+  than graphs-alone (36 vs 35 replays). The canonical graph fixture shows
+  no delta — its transients are exactly the classes arena admission
+  refuses (forward-region, unsized, tape-escaping) — so the composition
+  gate lives in `scripts/arena-parity.sh` (two new arms: capture
+  non-vacuity, `mismatches=0`, replays ≥ graphs-alone, `0 misplaced`).
+- **`NSL_ASYNC_ALLOC=1` now disables `--cuda-graphs` up front.**
+  `cuMemAllocAsync` issues on the NULL stream with no taint hook, so an
+  allocation inside a capture region would be recorded into the graph (or
+  fail the capture) with nothing self-healing it — every other
+  stream-touching primitive taints. Refused loudly at `enable()` (the
+  `NSL_LEGACY_NULL_STREAM` shape); training continues eager
+  (`cuda_graphs_refuse_async_alloc_env`).
+
 ### Added — `--fuse-lm-head`: the fused LM head joins the production profile
 
 - **An ~8.5% measured step-time win no longer depends on hand-editing model
@@ -65,7 +88,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   vs unplanned loss streams and 199 MB `.nslm` checkpoints byte-identical;
   7240/7240 binds placed; 0 guard failures; canary run clean. CUDA-graph
   offset feeding is deliberately NOT wired — that lands separately now that
-  the byte-identity gate is green.
+  the byte-identity gate is green. *(Landed since: see "arena × CUDA graphs"
+  below — the pin feeds capture by construction; no separate mechanism.)*
 
 ### Added — SR-BF16 certification instrumentation (item 7)
 
