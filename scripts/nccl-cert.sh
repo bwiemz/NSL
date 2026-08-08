@@ -32,7 +32,10 @@
 #   TIER 1 (any GPU + libnccl): comm init/destroy, real ncclAllReduce /
 #     ncclAllGather / ncclReduceScatter on device buffers verified against a
 #     poisoned receive buffer, our dtype-mapping refusals, and the documented
-#     ws==1 short-circuit. Proves NCCL device code runs on this GPU.
+#     ws==1 short-circuit. Proves our calls into NCCL are well-formed and that
+#     NCCL honoured them — NOT that an NCCL ring KERNEL ran: at nRanks==1 all
+#     three collectives are the identity, so no observable can distinguish a
+#     collective kernel from a copy.
 #   TIER 2 (1 GPU): the same-device refusal is loud, symmetric across ranks,
 #     fast, and carries the real ncclInvalidUsage code.
 #   TIER 3 (>= 2 GPUs): full ZeRO parity under the real transport. NOT
@@ -53,7 +56,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${HOME}/.cache/nsl-target-nccl}"
+# DEDICATED, and deliberately NOT `${CARGO_TARGET_DIR:-...}`. This build sets
+# RUSTFLAGS, so sharing a target dir thrashes fingerprints — and worse, any
+# concurrent `cargo test --workspace` (which builds WITHOUT --features cuda)
+# replaces release/libnsl_runtime.a with a CUDA-less archive. `nsl` embeds that
+# archive into every program it compiles, and linker.rs only probes for ONE
+# cuda marker symbol, so the emitted binary silently links a runtime with no
+# CUDA and aborts in nsl_tensor_to_device. Observed during this script's own
+# development. Override with NSL_NCCL_TARGET_DIR if you really mean to.
+CARGO_TARGET_DIR="${NSL_NCCL_TARGET_DIR:-${HOME}/.cache/nsl-target-nccl}"
 export CARGO_TARGET_DIR
 
 # ---------------------------------------------------------------------------
@@ -67,7 +78,15 @@ find_nccl_dir() {
     local d
     for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu \
              "${CUDA_PATH:-/opt/cuda}/lib64" "${HOME}/Projects/nccl-local/usr/lib"; do
+        # Both names matter: cudarc dlopens libnccl.so.2 at runtime, but
+        # linker.rs passes -lnccl when linking the COMPILED PROGRAM (tier 2),
+        # and `-lnccl` resolves only against the unversioned libnccl.so.
         if [[ -e "${d}/libnccl.so.2" ]]; then
+            if [[ ! -e "${d}/libnccl.so" ]]; then
+                echo "nccl-cert: ${d} has libnccl.so.2 but no unversioned" >&2
+                echo "  libnccl.so — tier 2's \`-lnccl\` link will fail." >&2
+                echo "  Fix: ln -s libnccl.so.2 ${d}/libnccl.so" >&2
+            fi
             printf '%s' "${d}"
             return
         fi
@@ -91,7 +110,13 @@ fi
 echo "nccl-cert: libnccl at ${NCCL_DIR}"
 
 export NSL_NCCL_LIB_DIR="${NCCL_DIR}"
-export LD_LIBRARY_PATH="${NCCL_DIR}:${LD_LIBRARY_PATH:-}"
+# No trailing colon: an EMPTY element in LD_LIBRARY_PATH means "the current
+# directory" to the loader, and this script has already cd'd to the repo root.
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    export LD_LIBRARY_PATH="${NCCL_DIR}:${LD_LIBRARY_PATH}"
+else
+    export LD_LIBRARY_PATH="${NCCL_DIR}"
+fi
 export RUSTFLAGS="-L ${NCCL_DIR} ${RUSTFLAGS:-}"
 export CUDA_PATH="${CUDA_PATH:-/opt/cuda}"
 # Fail fast instead of sitting on the 300s defaults when a rank dies.
@@ -101,10 +126,14 @@ export NSL_TP_BARRIER_TIMEOUT_SECS="${NSL_TP_BARRIER_TIMEOUT_SECS:-60}"
 # ---------------------------------------------------------------------------
 # Device count decides which tiers are reachable
 # ---------------------------------------------------------------------------
+# `|| true` is load-bearing: under `set -euo pipefail` a failing nvidia-smi
+# propagates through the pipeline and kills the script HERE, making the
+# "no GPU" verdict below unreachable — the one case it exists to report.
 GPUS=0
 if command -v nvidia-smi > /dev/null 2>&1; then
-    GPUS="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')"
+    GPUS="$( { nvidia-smi --query-gpu=index --format=csv,noheader || true; } | grep -c . || true)"
 fi
+[[ "${GPUS}" =~ ^[0-9]+$ ]] || GPUS=0
 echo "nccl-cert: ${GPUS} GPU(s) visible"
 if [[ "${GPUS}" -lt 1 ]]; then
     echo "nccl-cert: no GPU — NCCL NOT CERTIFIED (nothing ran)" >&2
@@ -112,16 +141,39 @@ if [[ "${GPUS}" -lt 1 ]]; then
 fi
 
 FAILED=0
+
+# Exit status alone is NOT enough: `cargo test <filter>` exits 0 when the
+# filter matches NOTHING ("0 passed; 0 failed; N filtered out"). A tier that
+# ran zero tests would then be indistinguishable from a tier that passed —
+# the exact vacuity this whole script exists to eliminate. So require a
+# positive pass count as well.
 run_tier() {
     local name="$1"
     shift
     echo ""
     echo "=== ${name} ==="
-    if "$@"; then
-        echo "--- ${name}: PASS"
-    else
-        echo "--- ${name}: FAIL" >&2
+    local log rc passed
+    log="$(mktemp)"
+    rc=0
+    "$@" > "${log}" 2>&1 || rc=$?
+    cat "${log}"
+    # awk, not bc: bc is not installed on this box, and `|| echo 0` would have
+    # made EVERY tier report "selected ZERO tests" — a script that always fails
+    # is no better than one that always passes.
+    passed="$(grep -oE 'test result: ok\. [0-9]+ passed' "${log}" \
+        | grep -oE '[0-9]+' | awk '{n += $1} END {print n + 0}')"
+    passed="${passed:-0}"
+    rm -f "${log}"
+    if [[ "${rc}" -ne 0 ]]; then
+        echo "--- ${name}: FAIL (exit ${rc})" >&2
         FAILED=1
+    elif [[ "${passed}" -eq 0 ]]; then
+        echo "--- ${name}: FAIL — the filter selected ZERO tests, so this" >&2
+        echo "    tier certified nothing. A green exit code here means the" >&2
+        echo "    test names moved, not that NCCL works." >&2
+        FAILED=1
+    else
+        echo "--- ${name}: PASS (${passed} test(s))"
     fi
 }
 
@@ -153,15 +205,21 @@ fi
 
 echo "CERTIFIED on this host (${GPUS} GPU(s)):"
 echo "  * libnccl links and ncclCommInitRank/ncclCommDestroy succeed"
-echo "  * ncclAllReduce / ncclAllGather / ncclReduceScatter execute on this"
-echo "    GPU and write the expected values over a poisoned receive buffer"
+echo "  * ncclAllReduce / ncclAllGather / ncclReduceScatter are ACCEPTED by"
+echo "    NCCL on our stream and write the expected values over a poisoned"
+echo "    receive buffer. At nRanks==1 all three are the identity, so this"
+echo "    proves the calls are well-formed, NOT that a ring kernel ran."
 echo "  * unmapped dtypes are refused before reaching NCCL"
-echo "  * the ws==1 short-circuit really does bypass NCCL"
+echo "  * the ws==1 short-circuit really does bypass NCCL (proved with a"
+echo "    deliberately NULL communicator, not a real one)"
 
 if [[ "${GPUS}" -ge 2 ]]; then
     echo ""
-    echo "TIER 3 (multi-GPU) ran: ZeRO parity under the real transport is"
-    echo "covered by the ws=2 arm of nccl_two_rank_parity_or_documented_refusal."
+    echo "This host has >= 2 GPUs, so tier 2 MAY have taken the parity arm of"
+    echo "nccl_two_rank_parity_or_documented_refusal rather than the refusal"
+    echo "arm. This script does not inspect which arm ran — nvidia-smi ignores"
+    echo "CUDA_VISIBLE_DEVICES while the spawned ranks honour it — so read the"
+    echo "tier 2 output above before claiming multi-GPU parity."
 else
     cat <<'EOF'
 

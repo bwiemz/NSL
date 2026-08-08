@@ -34,9 +34,25 @@
 # Format (tab-separated, matching the report's first two columns):
 #   <cargo target args><TAB><test name>
 
-# ── Structurally unreachable under the lane (2) ──────────────────────────
-# Both are #[cfg(not(feature = "cuda"))] — they exist ONLY in non-CUDA builds,
-# so a CUDA sweep can never list them. Not breakage; recorded so the NOTFOUND
-# is accounted for rather than silently ignored.
+# ── Structurally unreachable under the lane (6) ──────────────────────────
+# The first two are #[cfg(not(feature = "cuda"))] — they exist ONLY in
+# non-CUDA builds, so a CUDA sweep can never list them. Not breakage; recorded
+# so the NOTFOUND is accounted for rather than silently ignored.
+#
+# The four nccl_cert gates are the mirror image: #[cfg(feature = "nccl")], and
+# CERT_FEATURES (gpu-cert.sh:110) is cuda,test-hooks,test-helpers,nsl-test/cuda
+# with no `nccl`, so this lane compiles them out. Adding `nccl` to the lane is
+# NOT the fix — cudarc dlopens libnccl.so.2 at runtime and no libnccl is
+# system-installed on the cert host, so the lane would go from NOTFOUND to a
+# load failure.
+#
+# These are certified by `scripts/nccl-cert.sh` instead, which builds with
+# --features nccl against an explicit NSL_NCCL_LIB_DIR and prints a verdict
+# naming what it could and could not prove. If this lane ever gains a real
+# libnccl, DELETE these four lines — that is how the coverage gets locked in.
 -p nsl-runtime --test fp8_dispatcher 	cuda_feature_required
 -p nsl-cli --test wrga_gatedlora_backward_trigger 	wrga_b32_trigger_measurement_requires_cuda
+-p nsl-runtime --lib 	a_real_one_rank_communicator_initializes_and_destroys
+-p nsl-runtime --lib 	nccl_device_collectives_actually_execute_on_this_gpu
+-p nsl-runtime --lib 	unmapped_dtypes_are_refused_before_reaching_nccl
+-p nsl-runtime --lib 	the_trait_methods_short_circuit_at_ws1_without_entering_nccl

@@ -393,12 +393,21 @@ fn zero_line_field(stderr: &str, ws: u64, rank: u64, label: &str) -> u64 {
 /// holds a full copy — so its identity is `r0 == r1 == full`, not
 /// `r0 + r1 == full`.
 ///
-/// Asserting `> 0` is the anti-vacuity half and it is doing real work: it
-/// pins that the shipped fixture genuinely HAS replicated params (embedding +
-/// final norm, 8320 elements measured on this box). Without it, a future
-/// change that made every param elementwise would drive this to 0 and the
-/// equality assertions would hold vacuously.
-fn assert_replica_surface_is_flat(full: u64, r0: u64, r1: u64, ctx: &str) {
+/// The MAGNITUDE is pinned, not just the shape. Equality across ranks is
+/// near-structural (`MomentFill` is chosen from a compile-time plan that does
+/// not depend on rank, so `r0 == r1` would survive almost any regression),
+/// and `full > 0` only catches the surface vanishing. Neither can see the
+/// failure this instrument exists for: the replicated remainder GROWING.
+/// Without an exact count, a change that pushed params out of the streamed
+/// set and into `MomentFill::Full` — which is precisely how a param silently
+/// stops being sharded — would leave every assertion here green while each
+/// rank's optimizer state grew.
+///
+/// `expected` is fixture-specific by design. On `csla_layerwise_ffn.nsl` it is
+/// `2 moments × (embed 4096 + norm_out 64) = 8320`. If the fixture's parameter
+/// set changes, this SHOULD fail: the new number needs re-pricing against the
+/// sharded half, not silent acceptance.
+fn assert_replica_surface_is_flat(expected: u64, full: u64, r0: u64, r1: u64, ctx: &str) {
     assert!(
         full > 0,
         "{ctx}: the ws=1 run reported NO replicated moments — either the \
@@ -406,13 +415,19 @@ fn assert_replica_surface_is_flat(full: u64, r0: u64, r1: u64, ctx: &str) {
          nsl_zero_note_replicated_optim_alloc is not being emitted"
     );
     assert_eq!(
+        full, expected,
+        "{ctx}: the replicated moment surface changed size (got {full}, \
+         expected {expected}). GROWING means params moved out of the sharded \
+         set into MomentFill::Full and each rank now carries more unsharded \
+         optimizer state; SHRINKING means the replicated set started sharding. \
+         Both are real changes that must be re-priced against `optim_elems`, \
+         not absorbed."
+    );
+    assert_eq!(
         (r0, r1),
         (full, full),
         "{ctx}: replicated moments must be a FULL copy on every rank \
-         (r0={r0} r1={r1} full={full}). If this shrank, the replicated set \
-         started sharding — a real improvement, but it changes the \
-         `optim_elems` denominator too and both identities must be revisited \
-         together."
+         (r0={r0} r1={r1} full={full})"
     );
 }
 
@@ -618,15 +633,17 @@ fn zero3_elementwise_bit_exact_vs_single_rank_gpu() {
     // assertion above), but every param with no `blocks.N` key — embedding,
     // final norm, LM head — keeps FULL m and v on EVERY rank, and `Full` is
     // excluded from `optim_elems` on both sides of the identity precisely so
-    // that identity keeps holding. Measured on this fixture: the sharded half
-    // halves 65792 -> 32896+32896 while this one sits at 8320 per rank
-    // regardless of world size. That is 11% of the moment surface at ws=1 and
-    // 20% of each rank's at ws=2, and the fraction GROWS with ws because only
-    // the counted half shrinks.
+    // that identity keeps holding.
     //
-    // Pinning it here means the remainder can never again grow unobserved,
-    // and it is the before-measurement for sharding it.
+    // 8190 = 2 moments x (embed 64x63 = 4032 + norm_out 63) under `oddify`.
+    // On the un-oddified fixture the same surface is 8320; the ragged shapes
+    // are what force mixed mode, so this gate sees the odd numbers.
+    //
+    // The sharded half halves with world size while this one does not move,
+    // so the unsharded fraction of each rank's optimizer state GROWS with ws.
+    // Pinning the magnitude is what stops that growing unobserved.
     assert_replica_surface_is_flat(
+        8190,
         repl_optim_elems(&ws1.stderr, 1, 0),
         repl_optim_elems(&z3.stderr, 2, 0),
         repl_optim_elems(&z3.stderr, 2, 1),

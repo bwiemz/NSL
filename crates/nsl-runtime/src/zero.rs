@@ -358,11 +358,11 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         .map(|v| v == "1")
         .unwrap_or(true);
     if !simulated && ws > 1 {
-        eprintln!(
-            "nsl_zero_init: NSL_SIMULATED_TP=0 requests a real collective \
-             backend, but no NCCL/inter-device transport is built into this \
-             runtime — refusing rather than silently simulating."
-        );
+        emit_rank_line(format!(
+            "nsl_zero_init: rank {rank}: NSL_SIMULATED_TP=0 requests a real \
+             collective backend, but no NCCL/inter-device transport is built \
+             into this runtime — refusing rather than silently simulating."
+        ));
         return -2;
     }
 
@@ -382,10 +382,10 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         "sim-gpu" => WantBackend::SimGpu,
         "nccl" => WantBackend::Nccl,
         other => {
-            eprintln!(
-                "nsl_zero_init: unknown NSL_COLLECTIVES backend '{other}' \
-                 (expected 'sim', 'sim-gpu', or 'nccl')"
-            );
+            emit_rank_line(format!(
+                "nsl_zero_init: rank {rank}: unknown NSL_COLLECTIVES backend \
+                 '{other}' (expected 'sim', 'sim-gpu', or 'nccl')"
+            ));
             return -2;
         }
     };

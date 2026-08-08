@@ -149,13 +149,23 @@ extern "C" fn nsl_zero_count_atexit() {
     // write_all under PIPE_BUF is atomic on POSIX pipes.
     let rs = crate::zero::ZERO_REDUCE_SCATTER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let ag = crate::zero::ZERO_ALL_GATHER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-    // `repl_optim_elems` is APPENDED, never inserted: every live parser in the
-    // gates is label-anchored with a trailing space (` optim_elems=` etc.)
-    // precisely so this line stays extensible, and the one historical
+    // `repl_optim_elems` is APPENDED, never inserted, and that ordering is
+    // load-bearing: `optim_elems=` is a SUBSTRING of `repl_optim_elems=`, so a
+    // parser that matches by bare substring reads the right field only while
+    // `optim_elems` appears FIRST on the line.
+    //
+    // The three live parsers survive it two different ways, neither of which
+    // is "a trailing space":
+    //   * zero_spmd_gate.rs and zero_gpu_collectives_gate.rs split on
+    //     whitespace and `strip_prefix("optim_elems=")` — token-exact, so
+    //     `repl_optim_elems=8320` simply is not a match. Order-independent.
+    //   * zero3_gate.rs anchors with a LEADING space (` optim_elems=`), which
+    //     `repl_optim_elems=` cannot contain (the preceding char is `_`).
+    // A bare-substring parser would be order-dependent; don't add one.
+    //
+    // Keep new fields at the end regardless — the historical
     // `ends_with("reduce_scatter=6")` parser broke the day item 11 appended
-    // `all_gather=`. Keep new fields at the end and keep the trailing space
-    // before `\n` implicit — a label anchored as ` label=` needs the SPACE
-    // that precedes it, which only holds for non-first fields.
+    // `all_gather=`, and terminal anchoring is never safe on this line.
     let line = format!(
         "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems} bucket_members={bucket_members} reduce_scatter={rs} all_gather={ag} repl_optim_elems={repl_optim_elems}\n"
     );

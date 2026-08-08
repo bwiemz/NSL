@@ -1196,20 +1196,30 @@ impl CollectiveBackend for NcclBackend {
 /// `ncclAllReduce` / `ncclAllGather` / `ncclReduceScatter` calls against it.
 ///
 /// What this certifies: that we link a real libnccl, that `ncclCommInitRank`
-/// succeeds and `ncclCommDestroy` tears down cleanly, that our dtype
-/// mapping / element counts / stream handle are well-formed enough for NCCL
-/// to accept and execute, and that NCCL's device code runs on sm_120.
-/// That is precisely the part most likely to be wrong in code that has never
-/// run.
+/// succeeds and `ncclCommDestroy` tears down cleanly, that our dtype mapping
+/// / element counts / stream handle are well-formed enough for NCCL to
+/// ACCEPT the calls, execute them on our stream, and return the correct
+/// bytes. That is precisely the part most likely to be wrong in code that
+/// has never run.
+///
+/// It does NOT prove an NCCL device KERNEL ran. At nRanks==1 AllReduce-SUM,
+/// AllGather and ReduceScatter are all the identity, and NCCL is free to
+/// service them with a copy (or nothing) rather than a collective kernel —
+/// no assertion here can tell those apart, because the only observable is
+/// the receive buffer and every implementation of the identity agrees on it.
+/// The claim is "our calls into NCCL are well-formed and NCCL honoured
+/// them", not "NCCL's ring kernels are exercised".
 ///
 /// What it does NOT certify, and no test on this box can: inter-rank
 /// transport, ring reduction ORDER (the one property `reduce_scatter_sum`
 /// documents as per-backend and NOT shared with `SimulatedBackend`), or any
 /// ZeRO parity number under NCCL. Those need ≥2 physical GPUs.
 ///
-/// The public trait methods are deliberately NOT the vehicle here: all four
-/// short-circuit at `world_size == 1` to a `memcpy_dtod` before reaching
-/// NCCL, so testing through them would certify our memcpy, not NCCL. Each
+/// The public trait methods are deliberately NOT the vehicle here: they all
+/// short-circuit at `world_size == 1` before reaching NCCL — three to a
+/// `memcpy_dtod`, and `broadcast` to a bare `return 0` with no copy at all
+/// (correct: NCCL broadcast is in-place on one buffer). Testing through them
+/// would certify our memcpy, not NCCL. Each
 /// test therefore calls the raw `nccl::*` entry point with the backend's own
 /// `comm` and `compute_stream()`, and separately asserts the wrapper's
 /// short-circuit really is a short-circuit.
@@ -1290,7 +1300,7 @@ mod nccl_cert {
                     s,
                     r,
                     n,
-                    nccl::ncclDataType_t::ncclFloat32,
+                    NcclBackend::nccl_dtype(DTYPE_F32).expect("f32 must map"),
                     nccl::ncclRedOp_t::ncclSum,
                     b.comm,
                     b.compute_stream(),
@@ -1307,7 +1317,7 @@ mod nccl_cert {
                     s,
                     r,
                     n,
-                    nccl::ncclDataType_t::ncclFloat32,
+                    NcclBackend::nccl_dtype(DTYPE_F32).expect("f32 must map"),
                     b.comm,
                     b.compute_stream(),
                 )
@@ -1323,7 +1333,7 @@ mod nccl_cert {
                     s,
                     r,
                     n,
-                    nccl::ncclDataType_t::ncclFloat32,
+                    NcclBackend::nccl_dtype(DTYPE_F32).expect("f32 must map"),
                     nccl::ncclRedOp_t::ncclSum,
                     b.comm,
                     b.compute_stream(),
@@ -1370,20 +1380,53 @@ mod nccl_cert {
     }
 
     /// Pins the documented ws==1 bypass, so the claim in this module's header
-    /// ("the trait methods do not reach NCCL at ws=1") is checked rather than
-    /// asserted. A null `comm` would segfault if the call did reach NCCL.
+    /// ("the trait methods do not reach NCCL at ws=1") is CHECKED rather than
+    /// asserted.
+    ///
+    /// The discriminator is a deliberately NULL communicator. Driving a real
+    /// one proves nothing: over a 1-rank comm `ncclAllReduce` is the identity,
+    /// so the NCCL path and the memcpy path produce byte-identical output and
+    /// deleting the short-circuit would leave the test green. With a null
+    /// `comm`, the short-circuit is the ONLY way this can succeed — reaching
+    /// NCCL passes a null handle and dies.
+    ///
+    /// `aborted: true` keeps `Drop` from calling `ncclCommDestroy` on the null
+    /// handle. Constructing the struct directly is why this module is a unit
+    /// test rather than an integration test.
     #[test]
     #[ignore = "requires CUDA GPU + a real libnccl (--features nccl)"]
     fn the_trait_methods_short_circuit_at_ws1_without_entering_nccl() {
         let src: Vec<f32> = (0..64).map(|i| i as f32).collect();
-        let b = one_rank_comm();
-        let got = with_device_bufs(&src, f32::NAN, |s, r, n| {
-            assert_eq!(
-                b.all_reduce_sum(s, r, n, DTYPE_F32, std::ptr::null_mut()),
-                0
-            );
-        });
-        assert_eq!(got, src, "the ws=1 memcpy path must still move the data");
+        let b = NcclBackend {
+            host: SimulatedBackend::new(0, 1, std::ptr::null_mut(), 0),
+            comm: std::ptr::null_mut(),
+            aborted: std::sync::atomic::AtomicBool::new(true),
+        };
+
+        for (label, call) in [
+            ("all_reduce_sum", 0usize),
+            ("all_gather", 1),
+            ("reduce_scatter_sum", 2),
+        ] {
+            let got = with_device_bufs(&src, f32::NAN, |s, r, n| {
+                let rc = match call {
+                    0 => b.all_reduce_sum(s, r, n, DTYPE_F32, std::ptr::null_mut()),
+                    1 => b.all_gather(s, r, n, DTYPE_F32, std::ptr::null_mut()),
+                    _ => b.reduce_scatter_sum(s, r, n, DTYPE_F32, std::ptr::null_mut()),
+                };
+                assert_eq!(rc, 0, "{label} must succeed on the ws=1 bypass");
+            });
+            assert_eq!(got, src, "{label}: the ws=1 path must still move the data");
+        }
+
+        // broadcast is the odd one out: its ws==1 arm returns 0 with NO copy,
+        // because NCCL broadcast is in-place on a single buffer and the root's
+        // buffer already holds the data. Asserting a copy here would be wrong.
+        assert_eq!(
+            b.broadcast(std::ptr::null_mut(), 4, DTYPE_F32, 0, std::ptr::null_mut()),
+            0,
+            "broadcast's ws=1 arm must be a no-op, not a copy"
+        );
     }
 }
 
