@@ -3926,6 +3926,33 @@ fn emit_fused_lce_route_note(
         "[fused-lce] {phase} route={route} vocab={vocab_size} bias={} dtype_tag={dtype_tag}",
         if has_bias { "yes" } else { "no" }
     );
+
+    // 16-bit storage above the threshold: the one route choice worth three
+    // orders of magnitude that a user cannot see coming. `use_gemm` requires
+    // `dtype_tag == 0`, so a `dtype=` hint sends a production-sized vocabulary
+    // to the v1 per-row-CTA kernels.
+    //
+    // A WARNING, not a refusal. The first version of this refused, and that
+    // was wrong: `fused_linear_ce_precision_cast_lowering.rs` pins
+    // "Large-vocab forward path -> same three-cast insertion" as a CONTRACT,
+    // Sprint v6 built the cast insertion precisely so this combination works,
+    // and it is numerically certified at this shape. Every sibling refusal at
+    // these two sites is a CORRECTNESS refusal (the v1 PTX dereferences bias
+    // unconditionally; CSLA's shadow casts are step-scoped) — this one would
+    // have been a performance opinion breaking a working, certified, and
+    // deliberately-supported configuration. Making the cost impossible to
+    // miss is the whole ask; refusing to compile it is not mine to decide.
+    if !use_gemm && is_large && dtype_tag != 0 {
+        eprintln!(
+            "[fused-lce] warning: {phase} takes the v1 per-row-CTA kernels because \
+             @fused_lm_ce carries a 16-bit `dtype=` hint and vocab_size {vocab_size} \
+             is above {} — there is no GEMM-chunked path for 16-bit storage. \
+             Measured at production shape (rows=1024, V=49152, H=512) the v1 kernels \
+             are 335x slower in forward and 504x in backward. Drop the `dtype=` hint \
+             to route f32 storage through the GEMM path, or keep it deliberately.",
+            crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD
+        );
+    }
 }
 
 /// CFTP v6 — Inline precision-cast for fused_linear_ce inputs.
@@ -4210,25 +4237,6 @@ fn lower_fused_linear_ce_forward(
         return Err(CodegenError::new(
             "fused_linear_ce: a biasless head requires the GEMM path (dtype              f32 and NSL_FUSED_LCE_GEMM enabled) — the v1 PTX kernels read              bias unconditionally",
         ));
-    }
-    // The one silent bad combination. A 16-bit storage hint at production
-    // vocab takes the v1 per-row-CTA kernels, which are 335x/504x slower at
-    // that shape (486/2222 ms vs 1.45/4.41 ms, rows=1024 V=49152 H=512 —
-    // fused_linear_ce_perf_probe.rs). The biasless case already refuses and
-    // the CSLA case already refuses; this closed the last hole where the
-    // compiler quietly picks a path three orders of magnitude off and says
-    // nothing. Not raised when the kill switch is set: there the v1 route was
-    // asked for explicitly.
-    if !use_gemm && is_large && dtype_tag != 0 && !gemm_off {
-        return Err(CodegenError::new(format!(
-            "fused_linear_ce: 16-bit storage at vocab_size {vocab_size} (> {}) has no \
-             GEMM-chunked path, so it would silently take the v1 per-row-CTA kernels — \
-             measured 335x (forward) and 504x (backward) slower at production shape. \
-             Either drop the `dtype=` hint from @fused_lm_ce (f32 storage routes to the \
-             GEMM path), or set NSL_FUSED_LCE_GEMM=0 to accept the v1 kernels \
-             deliberately",
-            crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD
-        )));
     }
     emit_fused_lce_route_note("forward", use_gemm, is_large, has_bias, dtype_tag, vocab_size);
     let cfg = build_fused_ce_cfg(
@@ -4611,18 +4619,6 @@ fn lower_fused_linear_ce_backward_extract(
             return Err(CodegenError::new(
                 "fused_linear_ce backward: a biasless head requires the GEMM                  path — the v1 PTX kernels write dbias unconditionally",
             ));
-        }
-        // Mirror of the forward's refusal — see its comment. The backward is
-        // the more expensive of the two (504x), so the pair must agree.
-        if !use_gemm && is_large && dtype_tag != 0 && !gemm_off {
-            return Err(CodegenError::new(format!(
-                "fused_linear_ce backward: 16-bit storage at vocab_size {vocab_size} \
-                 (> {}) has no GEMM-chunked path, so it would silently take the v1 \
-                 per-row-CTA kernels — measured 504x slower at production shape. Either \
-                 drop the `dtype=` hint from @fused_lm_ce, or set NSL_FUSED_LCE_GEMM=0 \
-                 to accept the v1 kernels deliberately",
-                crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD
-            )));
         }
         emit_fused_lce_route_note("backward", use_gemm, is_large, has_bias, dtype_tag, vocab_size);
 

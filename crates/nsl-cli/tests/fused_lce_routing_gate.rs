@@ -22,12 +22,12 @@
 //!
 //! # The silent combination
 //!
-//! Three of the four bad routings already refused: a biasless head (the v1
-//! kernels read bias unconditionally), the same in backward, and CSLA. The
-//! fourth — a 16-bit `dtype=` hint at large vocab — compiled clean and took
-//! the slow kernels without a word. That is now a refusal, and the arm below
-//! is what proves it fires; the control arm at vocab 4096 proves it is not a
-//! blanket refusal of 16-bit storage.
+//! A 16-bit `dtype=` hint at large vocab compiles clean and takes the slow
+//! kernels. That combination is SUPPORTED — `fused_linear_ce_precision_cast_
+//! lowering.rs` pins the large-vocab 16-bit cast insertion as a contract — so
+//! the fix is to make the cost impossible to miss, not to refuse it. The arms
+//! below pin the warning and the route, and the control at vocab 128 shows the
+//! warning is scoped to the threshold rather than to 16-bit storage.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -181,10 +181,20 @@ fn disabling_the_gemm_path_refuses_the_biasless_head() {
     );
 }
 
-/// 16-bit storage at large vocab: the combination that used to compile clean
-/// and silently take the 335x/504x-slower kernels.
+/// 16-bit storage at large vocab: the route choice worth three orders of
+/// magnitude that a user could not see coming.
+///
+/// It must COMPILE — `fused_linear_ce_precision_cast_lowering.rs` pins
+/// "Large-vocab forward path -> same three-cast insertion" as a contract and
+/// Sprint v6 built that support on purpose — and it must say, loudly, what it
+/// just chose. (An earlier draft of this gate asserted a refusal here. That
+/// was a performance opinion breaking a working, numerically-certified
+/// configuration; every sibling refusal at these sites is a correctness one.)
+///
+/// This is also the only arm that produces `route=v1-large`, so it is what
+/// keeps the third route observable at all.
 #[test]
-fn sixteen_bit_storage_at_large_vocab_refuses() {
+fn sixteen_bit_storage_at_large_vocab_warns_and_takes_v1_large() {
     let out = build_fixture(
         "crates/nsl-cli/tests/fixtures",
         "fused_lmce_bf16_large_vocab.nsl",
@@ -192,28 +202,42 @@ fn sixteen_bit_storage_at_large_vocab_refuses() {
         "bf16large",
     );
     assert!(
-        !out.success,
-        "16-bit storage above the large-vocab threshold must refuse — it has no \
-         GEMM-chunked path:\n{}",
+        out.success,
+        "16-bit storage above the threshold must still COMPILE — it is a pinned \
+         contract, not a defect:\n{}",
         out.stderr
     );
-    // Anchor on tokens that survive rewrapping, not on the wrapped sentence:
+
+    let r = routes(&out.stderr);
+    assert!(
+        !r.is_empty(),
+        "no [fused-lce] route line — this fixture did not fuse, so it says nothing \
+         about routing:\n{}",
+        out.stderr
+    );
+    for (phase, route) in &r {
+        assert_eq!(
+            route, "v1-large",
+            "16-bit storage at vocab 16384 should take the large-vocab v1 kernels in \
+             {phase}, got route={route}"
+        );
+    }
+
+    // Anchored on tokens that survive rewrapping, not on the wrapped sentence:
     // the message is a multi-line Rust literal, so matching its line breaks
-    // would make a reflow look like a missing refusal.
-    for needle in ["16-bit storage at vocab_size", "GEMM-chunked path"] {
+    // would make a reflow look like a missing warning.
+    for needle in [
+        "[fused-lce] warning:",
+        "16-bit `dtype=` hint",
+        "335x",
+        "504x",
+    ] {
         assert!(
             out.stderr.contains(needle),
-            "wrong refusal — expected the 16-bit large-vocab message containing \
-             {needle:?}:\n{}",
+            "the warning must carry {needle:?} so a reader can weigh the cost:\n{}",
             out.stderr
         );
     }
-    assert!(
-        out.stderr.contains("335x") || out.stderr.contains("504x"),
-        "the refusal must carry the measured cost, so a reader can weigh the \
-         kill switch against it:\n{}",
-        out.stderr
-    );
 }
 
 /// Control: the SAME 16-bit hint below the threshold still compiles. Without
@@ -256,6 +280,44 @@ fn sixteen_bit_storage_below_the_threshold_still_compiles() {
             route, "v1",
             "small-vocab 16-bit storage should take the v1 kernels in {phase}, got \
              route={route}"
+        );
+    }
+}
+
+/// The `is_large` half of `use_gemm` — the case the 335x/504x numbers are
+/// actually about, and the one no other arm reached.
+///
+/// The three arms above all turn on `!has_bias` or on the dtype tag; a
+/// BIASED f32 head above the threshold is the production large-vocab shape,
+/// and it must route to gemm on vocabulary alone. Same fixture as the refusing
+/// arm with the dtype hint flipped back to f32, so vocabulary is held constant
+/// and the dtype is the only difference between "refuses" and "routes to
+/// gemm" — which is also what shows the refusal is dtype-scoped rather than a
+/// ban on large vocabularies.
+#[test]
+fn a_large_vocab_f32_head_routes_to_gemm_on_size_alone() {
+    let out = build_fixture(
+        "crates/nsl-cli/tests/fixtures",
+        "fused_lmce_bf16_large_vocab.nsl",
+        &[(r#"dtype="bf16""#, r#"dtype="f32""#)],
+        "gemmlarge",
+    );
+    assert!(
+        out.success,
+        "a biased f32 head above the large-vocab threshold must compile:\n{}",
+        out.stderr
+    );
+    let r = routes(&out.stderr);
+    assert!(
+        !r.is_empty(),
+        "no [fused-lce] route line — this fixture did not fuse:\n{}",
+        out.stderr
+    );
+    for (phase, route) in &r {
+        assert_eq!(
+            route, "gemm",
+            "a large-vocab f32 head took route={route} in {phase} — this is the \
+             shape the 335x/504x measurement was taken on"
         );
     }
 }
