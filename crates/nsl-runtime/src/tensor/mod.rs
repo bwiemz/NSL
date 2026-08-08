@@ -4880,7 +4880,11 @@ mod tests {
             DTYPE_I32,
         ] {
             assert_eq!(nsl_dtype_to_capi(tag), tag as i32, "C-API tag must equal canonical tag {tag}");
-            assert_eq!(capi_dtype_to_nsl(tag as i32), tag, "canonical tag must round-trip {tag}");
+            assert_eq!(
+                capi_dtype_to_nsl(tag as i32),
+                Some(tag),
+                "canonical tag must round-trip {tag}"
+            );
         }
     }
 

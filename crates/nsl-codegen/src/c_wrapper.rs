@@ -188,6 +188,20 @@ pub fn emit_c_abi_wrapper(
                     param_cursor += 1;
                     let tensor =
                         call_desc_to_tensor(&mut builder, &mut compiler.module, arg_val)?;
+                    let msg = format!(
+                        "parameter '{}' of '{}' has an unrecognized NslTensorDesc dtype tag \
+                         (valid: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, 5=fp8e4m3, 6=fp8e5m2, \
+                         7=u16-token, 8=u16-segment, 9=int32)",
+                        param.name, wrapper.raw_name
+                    );
+                    emit_null_tensor_guard(
+                        &mut builder,
+                        &mut compiler.module,
+                        tensor,
+                        &msg,
+                        &tensor_inputs_to_free,
+                        &lists_to_free,
+                    )?;
                     internal_args.push(tensor);
                     tensor_inputs_to_free.push(tensor);
                 }
@@ -249,6 +263,25 @@ pub fn emit_c_abi_wrapper(
                         };
                         let tensor =
                             call_desc_to_tensor(&mut builder, &mut compiler.module, desc_ptr)?;
+                        let msg = format!(
+                            "tuple parameter '{}' element {} of '{}' has an unrecognized \
+                             NslTensorDesc dtype tag (valid: 0=f64, 1=f32, 2=f16, 3=bf16, \
+                             4=int8, 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, \
+                             9=int32)",
+                            param.name, k, wrapper.raw_name
+                        );
+                        // `list` is live but not yet in `lists_to_free`; pass it
+                        // explicitly so the refusal path releases it too.
+                        let mut lists_live = lists_to_free.clone();
+                        lists_live.push(list);
+                        emit_null_tensor_guard(
+                            &mut builder,
+                            &mut compiler.module,
+                            tensor,
+                            &msg,
+                            &tensor_inputs_to_free,
+                            &lists_live,
+                        )?;
                         call_nsl_list_push(&mut builder, &mut compiler.module, list, tensor)?;
                         tensor_inputs_to_free.push(tensor);
                     }
@@ -803,6 +836,48 @@ fn emit_set_error<M: Module + ?Sized>(
     let fid = declare_runtime_fn(module, "nsl_set_error_cstr", &[cw_types::I64], &[])?;
     let fref = module.declare_func_in_func(fid, builder.func);
     builder.ins().call(fref, &[str_ptr]);
+    Ok(())
+}
+
+/// Emit `if tensor == 0 { free what we already imported; set_error(msg); return -1 }`.
+///
+/// Required by `nsl_desc_to_tensor`'s contract change: it now returns 0 on an
+/// unrecognized `NslTensorDesc::dtype` tag instead of `abort()`ing the process,
+/// so every emitted call site is a null site. Without this guard the wrapper
+/// would hand the 0 to the impl function, which dereferences it — trading a
+/// loud abort for a segfault, which is strictly worse.
+///
+/// Leaves the builder positioned in a fresh, sealed continuation block.
+fn emit_null_tensor_guard<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    tensor: cranelift_codegen::ir::Value,
+    msg: &str,
+    tensors_to_free: &[cranelift_codegen::ir::Value],
+    lists_to_free: &[cranelift_codegen::ir::Value],
+) -> Result<(), CodegenError> {
+    let null_block = builder.create_block();
+    let cont_block = builder.create_block();
+    let zero = builder.ins().iconst(cw_types::I64, 0);
+    let is_null = builder.ins().icmp(IntCC::Equal, tensor, zero);
+    builder.ins().brif(is_null, null_block, &[], cont_block, &[]);
+
+    builder.switch_to_block(null_block);
+    builder.seal_block(null_block);
+    // Release everything imported before the bad desc so a refusal is not
+    // also a leak. The failing conversion itself allocated nothing.
+    for t in tensors_to_free {
+        call_nsl_tensor_free(builder, module, *t)?;
+    }
+    for l in lists_to_free {
+        call_nsl_list_free(builder, module, *l)?;
+    }
+    emit_set_error(builder, module, msg)?;
+    let neg_one = builder.ins().iconst(cw_types::I32, -1);
+    builder.ins().return_(&[neg_one]);
+
+    builder.switch_to_block(cont_block);
+    builder.seal_block(cont_block);
     Ok(())
 }
 
