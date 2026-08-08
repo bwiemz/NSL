@@ -572,7 +572,8 @@ fn the_wggo_prepass_counts_distill_blocks_in_document_order() {
         .arg(&file)
         .arg("-o")
         .arg(dir.join("two_distill_bin"));
-    cmd.assert()
+    let assertion = cmd.assert();
+    let assertion = assertion
         .success()
         .stderr(predicate::str::contains(
             "[wggo] pre-pass: no pre-plan for training block #1 (distill block",
@@ -580,6 +581,12 @@ fn the_wggo_prepass_counts_distill_blocks_in_document_order() {
         .stderr(predicate::str::contains(
             "[wggo] pre-pass: no pre-plan for training block #2 (distill block",
         ));
+    // `-o` put a ~270 MB unstripped ELF under `std::env::temp_dir()`, which on
+    // this box is a 31 GB tmpfs shared with the linker. Leaving one behind per
+    // run is how a suite starts failing with `ld: No space left on device` in
+    // tests that have nothing to do with this one.
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(assertion);
 }
 
 /// The Distillation Build Report must render on stderr with the fused
