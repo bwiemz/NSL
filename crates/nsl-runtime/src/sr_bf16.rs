@@ -313,7 +313,16 @@ pub(crate) fn srbf16_register(tensor_ptr: i64) {
          counter block (2^{SR_PARAM_SHIFT})"
     );
     crate::cuda::inner::ensure_context();
-    let dev_bf16 = crate::cuda::inner::alloc_managed(len * 2) as u64;
+    // The mirror IS the parameter — account it as `weights`. `alloc_managed`
+    // inherits whatever surface is ambient; the register belt runs inside the
+    // step body, where codegen has set `activations`, so the mirrors landed
+    // in the activation bucket. Measured at 1B@2048 before this fix: the
+    // report read `weights 400 MB / activations 12.23 GB`, i.e. bf16-sr
+    // appeared to make activations 1.81 GB WORSE while "saving" 3.62 GB of
+    // weights. Corrected, activations read 10.41 GB against the f32 arm's
+    // 10.42 GB. (`srbf16_upload`'s widened views were landing in `other`
+    // rather than `activations` — a different wrong bucket, same cause.)
+    let dev_bf16 = with_weights_surface(|| crate::cuda::inner::alloc_managed(len * 2)) as u64;
     crate::cuda::gpu_cast_raw_f32_to_bf16(t.data as u64, dev_bf16, len);
     crate::cuda::inner::free_managed(t.data);
     t.data = std::ptr::null_mut();
@@ -321,6 +330,30 @@ pub(crate) fn srbf16_register(tensor_ptr: i64) {
     guard
         .get_or_insert_with(HashMap::new)
         .insert(tensor_ptr, Bf16Mirror { dev_bf16, len, param_idx });
+}
+
+/// Run `f` with the allocator surface set to `weights`, restoring whatever
+/// was ambient afterwards.
+///
+/// RESTORES rather than resetting to a constant: these entry points are
+/// called from the register/upload belts, which codegen emits at several
+/// points with different surfaces in force (the step body sets
+/// `activations`, the train-block setup does not). Assuming the caller's
+/// surface would silently re-tag every allocation that follows in whichever
+/// context guessed wrong.
+///
+/// `SurfaceGuard` rather than a trailing `set_alloc_surface` purely to keep
+/// the restore adjacent to the acquire — this is house style for the
+/// surface/pool brackets, not a defence against unwinding. `alloc_managed`'s
+/// OOM `panic!` reaches an `extern "C"` frame and ABORTS, so no destructor
+/// would run anyway, and the surface tag only labels FUTURE allocations —
+/// it cannot corrupt counters already recorded.
+#[cfg(feature = "cuda")]
+fn with_weights_surface<T>(f: impl FnOnce() -> T) -> T {
+    use crate::cuda::caching_allocator::{SurfaceGuard, SurfaceTag};
+
+    let _guard = SurfaceGuard::new(SurfaceTag::Weights);
+    f()
 }
 
 /// Upload: widen the mirror into a fresh transient f32 working view.
@@ -336,7 +369,9 @@ pub(crate) fn srbf16_upload(tensor_ptr: i64) {
         std::process::abort();
     };
     crate::cuda::inner::ensure_context();
-    let dev = crate::cuda::inner::alloc_managed(m.len * 4);
+    // Same surface as the mirror it widens: this buffer holds theta, not an
+    // activation, and it is what the forward reads as the parameter.
+    let dev = with_weights_surface(|| crate::cuda::inner::alloc_managed(m.len * 4));
     crate::cuda::gpu_cast_raw_bf16_to_f32(m.dev_bf16, dev as u64, m.len);
     drop(guard);
     t.data = dev;
