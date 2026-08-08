@@ -987,6 +987,37 @@ impl PassBus {
 
     // ── CSHA backward claims ─────────────────────────────────────────
 
+    /// Is `channel` occupied on THIS bus, without counting a read?
+    ///
+    /// The scheduler needs occupancy as EVIDENCE, not as consumption. Going
+    /// through the normal accessors would call `note_read`, which would
+    /// manufacture a `reads_full` on every scheduled pass and quietly disarm
+    /// the `dead_output` finding for exactly the channels the scheduler
+    /// watches — a checker that breaks the checker beneath it.
+    ///
+    /// Per-BUS (per-compile), not the process-scoped counters: "did this
+    /// compile's producer publish" is the only form of the question that can
+    /// be turned into a refusal, for the same reason `PassManager` exists.
+    ///
+    /// The match is exhaustive on purpose — a new channel must decide what
+    /// occupancy means for it rather than inheriting a default.
+    pub fn is_published(&self, channel: Channel) -> bool {
+        match channel {
+            Channel::CshaBridge => self.csha_bridge.is_some(),
+            Channel::CshaClaimedOps => !self.csha_claimed_ops.is_empty(),
+            Channel::CshaBackwardClaims => self.csha_backward_claims.is_some(),
+            Channel::WrgaPlan => self.wrga_plan.is_some(),
+            Channel::AdapterPrescanPlan => self.adapter_prescan_plan.is_some(),
+            Channel::CpkdPlan => self.cpkd_plan.is_some(),
+            Channel::CpdtPlan => self.cpdt_plan.is_some(),
+            Channel::CfiePlan => self.cfie_plan.is_some(),
+            Channel::WggoOverrides => self.wggo_overrides.is_some(),
+            Channel::WggoPreplans => !self.wggo_preplans.is_empty(),
+            Channel::AdapterSites => !self.adapter_sites.is_empty(),
+            Channel::CfieServeGen => self.cfie_serve_gen.is_some(),
+        }
+    }
+
     /// Publish the reverse-walk dispatch map.
     pub fn publish_csha_backward_claims(&mut self, v: crate::source_ad::CshaBackwardClaims) {
         note_publish(Channel::CshaBackwardClaims);
@@ -1343,6 +1374,44 @@ pub(crate) fn dependency_order_violations_in(
 /// what the tree supports.
 pub fn edges_for(pass: &str) -> Vec<&'static ChannelDescriptor> {
     CHANNELS.iter().filter(|d| d.producer == pass).collect()
+}
+
+/// The INCOMING scheduling edges of `pass`: every channel it consumes whose
+/// [`PassConsumer`] claims [`OrderClaim::InvocationOrdered`], paired with the
+/// pass that must therefore have been invoked first.
+///
+/// This is [`dependency_order_violations`]'s edge set read the other way
+/// round. That function answers "did anything run out of order?" from a
+/// finished ledger; the scheduler asks "may this pass run NOW?" before
+/// invoking, which is the same declaration used as a precondition instead of
+/// a post-mortem. `ValueOrderedOnly` edges are excluded for the reason
+/// [`OrderClaim`] gives: their producer may legitimately run later, so
+/// blocking on them would refuse correct compiles.
+pub fn required_predecessors(pass: &str) -> Vec<(&'static str, Channel)> {
+    let mut out = Vec::new();
+    for d in CHANNELS {
+        for c in d.consumed_by_passes {
+            if c.pass == pass && c.order == OrderClaim::InvocationOrdered {
+                out.push((d.producer, d.channel));
+            }
+        }
+    }
+    out.sort_by_key(|(p, _)| *p);
+    out.dedup_by_key(|(p, _)| *p);
+    out
+}
+
+/// The channels `pass` produces for which `producer applied ⇒ channel
+/// published` is [`Invariant::Enforced`].
+///
+/// The bus REPORT checks this at end of compile, where a violation is a line
+/// in a report. The scheduler checks it at the pass boundary, where it is a
+/// refusal — and where it still names the pass that just ran.
+pub fn enforced_publish_channels(pass: &str) -> Vec<&'static ChannelDescriptor> {
+    CHANNELS
+        .iter()
+        .filter(|d| d.producer == pass && d.applied_implies_published == Invariant::Enforced)
+        .collect()
 }
 
 /// One line per channel that saw traffic, then one per finding.
