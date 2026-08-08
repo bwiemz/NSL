@@ -136,6 +136,12 @@ fn run_gpu(fixture: &str, tag: &str, arena: bool) -> GpuRun {
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .env("NSL_WS_COUNTER", "1")
+        // The capacity-aware residency policy would PIN these small
+        // fixtures resident on any roomy card, taking this gate's
+        // transfer counts to zero. This gate tests the STREAMING
+        // MACHINERY, so it pins the policy off — otherwise its
+        // behavior would silently depend on the host card's VRAM.
+        .env("NSL_WS_RESIDENT", "0")
         .env("NSL_EMBEDDING_BWD_CPU", "1")
         .output()
         .expect("spawn nsl run");

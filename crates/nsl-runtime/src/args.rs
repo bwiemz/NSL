@@ -173,6 +173,31 @@ extern "C" fn nsl_weight_stream_count_atexit() {
         crate::weight_stream::WS_PREFETCHES.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_ASYNC_WB.load(std::sync::atomic::Ordering::Relaxed),
     );
+    // Capacity-aware residency posture. Its OWN line, never appended fields:
+    // the counters line above is consumed by strip_prefix-then-parse gates.
+    // `pinned == registered` means no parameter bytes crossed PCIe at all.
+    #[cfg(feature = "cuda")]
+    {
+        let pinned = crate::weight_stream::WS_PINNED.load(std::sync::atomic::Ordering::Relaxed);
+        let registered =
+            crate::weight_stream::WS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed);
+        if registered > 0 {
+            let mib = |b: u64| b as f64 / 1048576.0;
+            let line = format!(
+                "[weight-stream] residency: pinned={} of {} param(s) \
+                 pinned_mib={:.0} streamed_mib={:.0} {}\n",
+                pinned,
+                registered,
+                mib(crate::weight_stream::WS_PINNED_BYTES
+                    .load(std::sync::atomic::Ordering::Relaxed)),
+                mib(crate::weight_stream::WS_STREAMED_BYTES
+                    .load(std::sync::atomic::Ordering::Relaxed)),
+                crate::weight_stream::residency_summary().unwrap_or_default(),
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        }
+    }
 }
 
 extern "C" fn nsl_csla_window_count_atexit() {

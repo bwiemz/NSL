@@ -175,6 +175,29 @@ ARMS = {
                  "grad_clip (both required by --layerwise-accum), so its "
                  "loss stream is not comparable to the other arms'",
             accum=2, grad_clip=False),
+        Arm("layerwise_resident",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum"),
+            what="the SAME CSLA window schedule as `layerwise`, with weight "
+                 "streaming OFF. --weight-stream requires --layerwise-accum "
+                 "but NOT the reverse, so this composition is legal and has "
+                 "simply never been measured at 1B. The streaming stack was "
+                 "designed for a 16 GiB card (weights 3.9 + m/v 7.7 GiB left "
+                 "no room for activations); this box has 32 GiB, so the "
+                 "question this arm answers is whether the ~3.7 GiB/step of "
+                 "H2D the `layerwise` arm pays is still buying anything. "
+                 "Numerically identical to `layerwise` — same schedule, same "
+                 "f32 weights, only residency differs",
+            accum=2, grad_clip=False),
+        Arm("layerwise_resident_srbf16",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--param-dtype", "bf16-sr"),
+            (), "bf16",
+            what="bf16-authoritative weights: the mirrors are DEVICE-resident, "
+                 "so --weight-stream here names the residency backend and "
+                 "moves no host bytes (0 uploads measured at 500M). Halves "
+                 "the weight surface (2 vs 4 GiB at 1B) on top of that. Its "
+                 "loss stream is not bit-comparable to the f32 arms",
+            accum=2, grad_clip=False),
         Arm("fp32", ("--source-ad",), (("NSL_MATMUL_TF32", "0"),), "fp32",
             what="full-f32 matmul (TF32 tensor cores off)"),
         Arm("tf32", ("--source-ad",), (), "tf32",
@@ -199,7 +222,8 @@ MATRIX = [
     ("50m", 1024, [1, 4, 8, 16], ["reference", "optimized"]),
     ("500m", 1024, None, ["fp32", "bf16", "srbf16"]),
     ("1b", 512, None, ["reference", "optimized", "layerwise"]),
-    ("1b", 2048, None, ["reference", "optimized", "layerwise"]),
+    ("1b", 2048, None, ["reference", "optimized", "layerwise",
+                        "layerwise_resident", "layerwise_resident_srbf16"]),
 ]
 
 
