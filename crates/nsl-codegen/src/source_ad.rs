@@ -1576,6 +1576,17 @@ pub fn fuse_rmsnorm_dx_residual(
     ops: &mut Vec<crate::wengert::WengertOp>,
     needed: &std::collections::HashSet<crate::wengert::VarId>,
 ) -> usize {
+    // These take a BARE `&mut Vec<WengertOp>`, and both `adjoint.ops` and
+    // `primal.ops` have that type — so passing the primal here compiles, and
+    // the positional renumber at the end would rewrite every primal id into
+    // the adjoint half, invalidating every CSHA claim key and CCR's exemption
+    // set with nothing to say so. This is the one place that slip is
+    // detectable, because after the renumber the evidence is gone.
+    crate::wengert::assert_ids_in_space(
+        ops,
+        crate::wengert::IdSpace::Adjoint,
+        "source_ad::fuse_rmsnorm_dx_residual (argument)",
+    );
     use crate::wengert::PrimalOp;
     use std::collections::HashMap;
 
@@ -1650,6 +1661,17 @@ pub fn fuse_swiglu_gate_backward(
     ops: &mut Vec<crate::wengert::WengertOp>,
     needed: &std::collections::HashSet<crate::wengert::VarId>,
 ) -> usize {
+    // These take a BARE `&mut Vec<WengertOp>`, and both `adjoint.ops` and
+    // `primal.ops` have that type — so passing the primal here compiles, and
+    // the positional renumber at the end would rewrite every primal id into
+    // the adjoint half, invalidating every CSHA claim key and CCR's exemption
+    // set with nothing to say so. This is the one place that slip is
+    // detectable, because after the renumber the evidence is gone.
+    crate::wengert::assert_ids_in_space(
+        ops,
+        crate::wengert::IdSpace::Adjoint,
+        "source_ad::fuse_swiglu_gate_backward (argument)",
+    );
     use crate::wengert::PrimalOp;
     use std::collections::HashMap;
 
@@ -6133,9 +6155,12 @@ impl<'a> WengertExtractor<'a> {
 mod tests {
     #[test]
     fn rmsnorm_residual_fold_fuses_both_operand_orders() {
-        use crate::wengert::{PrimalOp, WengertOp};
+        use crate::wengert::{adjoint_op_id, PrimalOp, WengertOp};
+        // These fixtures are ADJOINT tapes — that is the whole point of the
+        // rewriters under test — so they must carry adjoint-space ids. `id`
+        // is the position within the adjoint; `adjoint_op_id` rebases it.
         let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
-            id,
+            id: adjoint_op_id(id as usize),
             result,
             op,
             inputs,
@@ -6163,9 +6188,12 @@ mod tests {
 
     #[test]
     fn rmsnorm_residual_fold_keeps_multi_reader_dx() {
-        use crate::wengert::{PrimalOp, WengertOp};
+        use crate::wengert::{adjoint_op_id, PrimalOp, WengertOp};
+        // These fixtures are ADJOINT tapes — that is the whole point of the
+        // rewriters under test — so they must carry adjoint-space ids. `id`
+        // is the position within the adjoint; `adjoint_op_id` rebases it.
         let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
-            id,
+            id: adjoint_op_id(id as usize),
             result,
             op,
             inputs,
@@ -6184,9 +6212,12 @@ mod tests {
 
     #[test]
     fn swiglu_peephole_fuses_single_reader_pair() {
-        use crate::wengert::{PrimalOp, WengertOp};
+        use crate::wengert::{adjoint_op_id, PrimalOp, WengertOp};
+        // These fixtures are ADJOINT tapes — that is the whole point of the
+        // rewriters under test — so they must carry adjoint-space ids. `id`
+        // is the position within the adjoint; `adjoint_op_id` rebases it.
         let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
-            id,
+            id: adjoint_op_id(id as usize),
             result,
             op,
             inputs,
@@ -6218,9 +6249,12 @@ mod tests {
 
     #[test]
     fn swiglu_peephole_keeps_multi_reader_product() {
-        use crate::wengert::{PrimalOp, WengertOp};
+        use crate::wengert::{adjoint_op_id, PrimalOp, WengertOp};
+        // These fixtures are ADJOINT tapes — that is the whole point of the
+        // rewriters under test — so they must carry adjoint-space ids. `id`
+        // is the position within the adjoint; `adjoint_op_id` rebases it.
         let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
-            id,
+            id: adjoint_op_id(id as usize),
             result,
             op,
             inputs,

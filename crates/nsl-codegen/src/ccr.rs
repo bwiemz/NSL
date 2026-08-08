@@ -336,6 +336,13 @@ pub fn insert_adjoint_last_use_frees(
     fresh: &mut VarId,
     wgrad_chains: Option<&crate::wgrad_fusion::WgradFusionPlan>,
 ) -> usize {
+    // On the way IN: this renumbers whatever it is handed into the adjoint
+    // half, so being handed the primal would rewrite every primal id and
+    // invalidate every CSHA claim key silently.
+    adjoint.assert_ids_in_space(
+        crate::wengert::IdSpace::Adjoint,
+        "ccr::insert_adjoint_last_use_frees (argument)",
+    );
     // Vars produced in the adjoint region (only these are candidates —
     // primal values are owned by the primal cleanup path).
     let produced: HashMap<VarId, usize> = adjoint
@@ -422,10 +429,6 @@ pub fn insert_adjoint_last_use_frees(
         );
     }
     crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
-    adjoint.assert_ids_in_space(
-        crate::wengert::IdSpace::Adjoint,
-        "ccr::insert_adjoint_last_use_frees",
-    );
     inserted
 }
 
@@ -1276,7 +1279,17 @@ pub fn build_early_free_list(plan: &CcrPlan) -> WengertList {
     for (i, victim) in victims.into_iter().enumerate() {
         let result = u32::MAX - 1 - i as u32;
         ops.push(WengertOp {
-            id: i as u32,
+            // NOT `i as u32`. This is a THIRD list — neither the primal nor
+            // the adjoint — that gets its own `compile_wengert_ops`, and
+            // primal-space ids here duplicate the real primal tape's `0..n`
+            // exactly. Harmless today only because every op is a
+            // `FreeTensor`, so the claim-consulting SDPA arm is unreachable;
+            // adding one non-`FreeTensor` op (a bulk-free marker, a compress
+            // cast) would reopen the alias INSIDE the primal half, where the
+            // id split offers no protection at all. Minting in the adjoint
+            // half costs nothing — nothing reads these ids — and removes the
+            // duplication rather than relying on the op mix staying put.
+            id: crate::wengert::adjoint_op_id(i),
             result,
             op: PrimalOp::FreeTensor,
             inputs: vec![victim],
@@ -1373,6 +1386,11 @@ pub fn splice_decompress(
     compress_map: &HashMap<VarId, VarId>,
     fresh: &mut VarId,
 ) -> Result<(), CodegenError> {
+    // Entry, not exit — see `apply_to_adjoint`.
+    adjoint.assert_ids_in_space(
+        crate::wengert::IdSpace::Adjoint,
+        "ccr::splice_decompress (argument)",
+    );
     // Descending first-use order so insertions don't shift pending sites.
     let mut sites: Vec<(usize, VarId, VarId)> = Vec::new(); // (idx, v, half)
     for (&v, &half) in compress_map {
@@ -1401,7 +1419,11 @@ pub fn splice_decompress(
             at..at,
             [
                 WengertOp {
-                    id: 0,
+                    // Adjoint half even though the renumber below overwrites
+                    // it: `splice_decompress` returns Result, so a validation
+                    // `?` added inside this loop would leave primal-space ids
+                    // on the adjoint AND skip the renumber.
+                    id: crate::wengert::ADJOINT_ID_BASE,
                     result: restored,
                     op: PrimalOp::Passthrough("ccr_cast_f32".to_string()),
                     inputs: vec![half],
@@ -1409,7 +1431,7 @@ pub fn splice_decompress(
                     checkpointed: false,
                 },
                 WengertOp {
-                    id: 0,
+                    id: crate::wengert::ADJOINT_ID_BASE,
                     result: free_result,
                     op: PrimalOp::FreeTensor,
                     inputs: vec![half],
@@ -1431,10 +1453,6 @@ pub fn splice_decompress(
         }
     }
     crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
-    adjoint.assert_ids_in_space(
-        crate::wengert::IdSpace::Adjoint,
-        "ccr::splice_decompress",
-    );
     // Validation: no non-free op may still reference a compressed original.
     for (idx, op) in adjoint.ops.iter().enumerate() {
         if matches!(op.op, PrimalOp::FreeTensor) {
@@ -1464,6 +1482,19 @@ pub fn apply_to_adjoint(
     plan: &CcrPlan,
     fresh: &mut VarId,
 ) -> Result<(), CodegenError> {
+    // Checked on the way IN, where it can fail. An assertion placed after
+    // `renumber_adjoint_ops` would only re-read what that call unconditionally
+    // wrote — it can never fire, and a check that cannot fail is worse than no
+    // check because it reads like coverage. Here it catches the real slip: the
+    // two lists swapped, or a primal list handed in as the adjoint.
+    primal.assert_ids_in_space(
+        crate::wengert::IdSpace::Primal,
+        "ccr::apply_to_adjoint (primal argument)",
+    );
+    adjoint.assert_ids_in_space(
+        crate::wengert::IdSpace::Adjoint,
+        "ccr::apply_to_adjoint (adjoint argument)",
+    );
     // The adjoint lowering is seeded with the primal's VALUES (full_vars)
     // but its type map is the adjoint list's own — recompute clones that
     // reference primal SCALAR vars (e.g. the SDPA scale chain) would be
@@ -1644,10 +1675,6 @@ pub fn apply_to_adjoint(
     // primal ids) — but they carry the adjoint base, which is what keeps a
     // recompute clone spliced above from ever matching a primal claim key.
     crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
-    adjoint.assert_ids_in_space(
-        crate::wengert::IdSpace::Adjoint,
-        "ccr::apply_to_adjoint",
-    );
 
     validate(primal, adjoint, plan)
 }
@@ -1820,6 +1847,22 @@ mod tests {
     fn op(id: u32, result: VarId, p: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
         WengertOp {
             id,
+            result,
+            op: p,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        }
+    }
+
+    /// Same, for a fixture standing in for an ADJOINT tape. `pos` is the
+    /// position within the adjoint; the id is rebased into the adjoint half,
+    /// which is what the real rewriters produce and what their entry
+    /// assertions require. Passing `op()` here would be a primal list handed
+    /// to an adjoint rewriter — the exact slip those assertions catch.
+    fn adj_op(pos: u32, result: VarId, p: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
+        WengertOp {
+            id: crate::wengert::adjoint_op_id(pos as usize),
             result,
             op: p,
             inputs,
@@ -2042,11 +2085,11 @@ mod tests {
         let mut adjoint = WengertList {
             ops: vec![
                 // d_v5-ish: consumes v5 and v4
-                op(0, 100, PrimalOp::Mul, vec![5, 4]),
+                adj_op(0, 100, PrimalOp::Mul, vec![5, 4]),
                 // d_w1: consumes v4 only
-                op(1, 101, PrimalOp::Mul, vec![4, 100]),
+                adj_op(1, 101, PrimalOp::Mul, vec![4, 100]),
                 // d_v3-ish: consumes v3 and v0
-                op(2, 102, PrimalOp::Mul, vec![3, 0]),
+                adj_op(2, 102, PrimalOp::Mul, vec![3, 0]),
             ],
             output: 0,
             var_names: HashMap::new(),
@@ -2152,7 +2195,7 @@ mod tests {
 
         // Adjoint consuming the original v3 gets a restore.
         let mut adjoint = WengertList {
-            ops: vec![op(0, 100, PrimalOp::Mul, vec![3, 0])],
+            ops: vec![adj_op(0, 100, PrimalOp::Mul, vec![3, 0])],
             output: 0,
             var_names: HashMap::new(),
             var_types: HashMap::new(),

@@ -938,6 +938,25 @@ pub struct PassBus {
     cfie_serve_gen: Option<crate::serve::CfieServeGen>,
 }
 
+/// Every CSHA backward-claim key must be a PRIMAL op id.
+///
+/// The map is consulted while `wengert_lower` walks BOTH tapes, so an
+/// adjoint-space key is a claim that can match an adjoint op — exactly what
+/// the primal/adjoint id split exists to make unrepresentable. `site` names
+/// which writer installed it.
+fn assert_claim_keys_are_primal(v: &crate::source_ad::CshaBackwardClaims, site: &str) {
+    for &id in v.op_to_chain.keys() {
+        assert_eq!(
+            crate::wengert::id_space(id),
+            crate::wengert::IdSpace::Primal,
+            "CSHA backward claim key {id} is an ADJOINT-space op id at the \
+             {site} site — claims are keyed by primal ids and are consulted \
+             against adjoint ops too, so this key could route an adjoint op \
+             through another layer's fused backward"
+        );
+    }
+}
+
 impl PassBus {
     // ── CSHA bridge ──────────────────────────────────────────────────
 
@@ -992,19 +1011,12 @@ impl PassBus {
     /// Every key must be a PRIMAL op id. The map is consulted while the
     /// lowerer walks BOTH tapes, so an adjoint-space key would be a claim
     /// that could match an adjoint op — the thing the id split exists to
-    /// prevent. Checked here, at the one choke point, rather than at each
-    /// of the two consulting arms.
+    /// prevent. Checked on every path that can INSTALL a value in this
+    /// channel, not just this one: `restore_` writes the field directly, so
+    /// "the one choke point" would have been a false claim about a channel
+    /// with two writers.
     pub fn publish_csha_backward_claims(&mut self, v: crate::source_ad::CshaBackwardClaims) {
-        for &id in v.op_to_chain.keys() {
-            assert_eq!(
-                crate::wengert::id_space(id),
-                crate::wengert::IdSpace::Primal,
-                "CSHA backward claim key {id} is an ADJOINT-space op id — \
-                 claims are keyed by primal ids and are consulted against \
-                 adjoint ops too, so this key could route an adjoint op \
-                 through another layer's fused backward"
-            );
-        }
+        assert_claim_keys_are_primal(&v, "publish");
         note_publish(Channel::CshaBackwardClaims);
         self.csha_backward_claims = Some(v);
     }
@@ -1033,6 +1045,12 @@ impl PassBus {
         &mut self,
         v: Option<crate::source_ad::CshaBackwardClaims>,
     ) {
+        // Sound today because the value round-trips read-only through the
+        // adjoint generator — but "today" is a property of that generator, not
+        // of this setter, and this setter is `pub`.
+        if let Some(v) = v.as_ref() {
+            assert_claim_keys_are_primal(v, "restore");
+        }
         self.csha_backward_claims = v;
     }
 

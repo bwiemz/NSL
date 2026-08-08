@@ -80,8 +80,19 @@ fn two_block_primal() -> (WengertList, Vec<BlockSegment>) {
         );
         let out = push(&mut ops, PrimalOp::Relu, vec![attn]);
         let end = ops.len();
+        // `Input`/`Param`/`Constant` are skipped BEFORE `interior` is built in
+        // the real planner (`ccr::plan`), so a real plan never recomputes a
+        // Param. Match that: an interior containing Params drives
+        // `apply_to_adjoint` into cloning `Param(..)` ops onto the adjoint, a
+        // configuration production never emits.
         let interior: Vec<VarId> = ops[start..end]
             .iter()
+            .filter(|o| {
+                !matches!(
+                    o.op,
+                    PrimalOp::Input(_) | PrimalOp::Param(_) | PrimalOp::Constant(_)
+                )
+            })
             .map(|o| o.result)
             .filter(|r| *r != out)
             .collect();
@@ -144,13 +155,12 @@ fn adjoint_with_recompute_clones(
                 + 1,
         );
 
-    // Recompute the whole interior of the LAST block, SDPA included: the
-    // clone of that SDPA is the op the claim table could alias.
+    // Recompute the LAST block's interior, SDPA included: the clone of that
+    // SDPA is the op the claim table could alias. Victims come from the
+    // segment's own `interior` (which already excludes leaves), so the plan
+    // has the shape `ccr::plan` produces rather than one this test invented.
     let seg = segments.last().expect("two blocks");
-    let victims: Vec<VarId> = primal.ops[seg.start..seg.end]
-        .iter()
-        .map(|o| o.result)
-        .collect();
+    let victims: Vec<VarId> = seg.interior.clone();
     let recompute: HashSet<VarId> = victims.iter().copied().collect();
     let plan = CcrPlan {
         segments,
@@ -165,13 +175,30 @@ fn adjoint_with_recompute_clones(
     (adjoint, added)
 }
 
-/// The claim set a CSHA build publishes: the primal ids of block 0's
-/// chain. Block 1's SDPA is deliberately NOT claimed — the hazard is an
-/// unclaimed op's recompute clone matching a claimed op's key.
+/// The claim set a CSHA build publishes for block 0.
+///
+/// Shaped like the real thing: `collect_chain_dispatch_map_with_wengert`
+/// claims the boundary chain — RMSNorm, the Q/K/V projection matmuls, the
+/// optional RoPE — plus the SDPA primary. It does NOT claim `Param`,
+/// `Constant` or the block's output op, and keying on every id in the span
+/// (as an earlier version of this file did) makes the claim set a strict
+/// superset of any real one, which weakens what a disjointness result means.
+///
+/// Block 1's SDPA is deliberately NOT claimed — the hazard is an UNCLAIMED
+/// op's recompute clone landing on a CLAIMED op's key.
 fn block0_claim_keys(primal: &WengertList, segments: &[BlockSegment]) -> HashSet<OpId> {
     let seg = &segments[0];
     primal.ops[seg.start..seg.end]
         .iter()
+        .filter(|o| {
+            matches!(
+                o.op,
+                PrimalOp::RMSNorm { .. }
+                    | PrimalOp::Matmul
+                    | PrimalOp::RoPE { .. }
+                    | PrimalOp::ScaledDotProductAttention { .. }
+            )
+        })
         .map(|o| o.id)
         .collect()
 }
@@ -252,25 +279,60 @@ fn a_recompute_clone_of_an_unclaimed_sdpa_cannot_match_a_claim_key() {
 fn numbering_alone_admitted_the_collision_before_the_split() {
     let (primal, segments) = two_block_primal();
     let claims = block0_claim_keys(&primal, &segments);
-    let (adjoint, _) = adjoint_with_recompute_clones(&primal, segments);
+    let (adjoint, sdpa_clones) = adjoint_with_recompute_clones(&primal, segments);
+    assert!(sdpa_clones > 0, "no SDPA clone was spliced onto the adjoint");
 
-    let legacy_ids: HashSet<OpId> = (0..adjoint.ops.len() as OpId).collect();
-    let would_have_aliased: Vec<OpId> =
-        legacy_ids.intersection(&claims).copied().collect();
+    // The SPECIFIC op that matters: the recompute clone of block 1's
+    // (unclaimed) SDPA, now riding the adjoint. Under the pre-split scheme
+    // its id was its POSITION in the adjoint — that is what every adjoint
+    // rewriter wrote — so that is the id `wengert_lower`'s SDPA arm would
+    // have looked up in the primal-keyed claim table.
+    //
+    // An earlier version of this test intersected `0..adjoint.ops.len()`
+    // with the claim set, which reduces to `adjoint.ops.len() >= 2` and says
+    // nothing about the clone at all. Locate the clone and check ITS id.
+    let clone_pos = adjoint
+        .ops
+        .iter()
+        .position(|o| matches!(o.op, PrimalOp::ScaledDotProductAttention { .. }))
+        .expect("the CCR splice put an SDPA clone on the adjoint");
+    let legacy_id = clone_pos as OpId;
+
     assert!(
-        !would_have_aliased.is_empty(),
-        "expected the pre-split numbering to collide with claim keys on \
-         this fixture; if it no longer does, this test has stopped \
-         describing the debt it was written for"
+        claims.contains(&legacy_id),
+        "the SDPA recompute clone sits at adjoint position {clone_pos}, whose \
+         pre-split id ({legacy_id}) is NOT one of block 0's claim keys \
+         {claims:?} — the fixture no longer reproduces the collision this \
+         test exists to pin, so it has stopped describing the debt"
     );
 
-    // And the collision matters because a real forward op is replayed on
-    // the adjoint under one of those ids, not just a marker.
+    // And the op that key belongs to is a CLAIMED SDPA in the primal, so the
+    // lookup would have resolved to a real chain and taken the fused-forward
+    // path under block 0's layer — not merely matched a number.
+    let claimed_op = primal
+        .ops
+        .iter()
+        .find(|o| o.id == legacy_id)
+        .expect("claim keys are primal op ids");
     assert!(
-        sdpa_count(&adjoint) > 0,
-        "the collision matters because an SDPA clone rides the adjoint; \
-         this fixture has none"
+        matches!(
+            claimed_op.op,
+            PrimalOp::RMSNorm { .. }
+                | PrimalOp::Matmul
+                | PrimalOp::RoPE { .. }
+                | PrimalOp::ScaledDotProductAttention { .. }
+        ),
+        "the aliased key must belong to a real boundary-chain op, got {:?}",
+        claimed_op.op
     );
+
+    // Post-split, that same clone carries an adjoint-space id instead.
+    assert_eq!(
+        id_space(adjoint.ops[clone_pos].id),
+        IdSpace::Adjoint,
+        "the clone should now be numbered in the adjoint half"
+    );
+    assert!(!claims.contains(&adjoint.ops[clone_pos].id));
 }
 
 #[test]
@@ -297,6 +359,44 @@ fn publishing_a_claim_keyed_by_an_adjoint_id_is_refused() {
     assert!(
         msg.contains("ADJOINT-space op id"),
         "panic should name the id space, got: {msg}"
+    );
+}
+
+/// The adjoint rewriters take a bare `&mut Vec<WengertOp>`, and `primal.ops`
+/// has that exact type — so handing them the primal COMPILES. Their trailing
+/// positional renumber would then rewrite every primal id into the adjoint
+/// half, invalidating every CSHA claim key and CCR's exemption set at once,
+/// and after the renumber there is no evidence left that it happened.
+///
+/// This is why the id-space assertions live at each rewriter's ENTRY. An
+/// assertion placed after `renumber_adjoint_ops` only re-reads what that call
+/// unconditionally wrote: it cannot fail for any input, which reads like
+/// coverage while providing none.
+#[test]
+fn handing_a_primal_list_to_an_adjoint_rewriter_is_refused() {
+    let (primal, _) = two_block_primal();
+    let mut primal_ops = primal.ops.clone();
+    let needed: HashSet<VarId> = HashSet::new();
+
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        nsl_codegen::source_ad::fuse_swiglu_gate_backward(&mut primal_ops, &needed);
+    }))
+    .expect_err("a primal list reaching an adjoint rewriter must panic");
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(
+        msg.contains("Primal id space") || msg.contains("expected Adjoint"),
+        "the panic should name the id-space mismatch, got: {msg}"
+    );
+
+    // And the guard has NOT silently renumbered anything on the way out.
+    assert_eq!(
+        primal_ops.iter().map(|o| o.id).collect::<Vec<_>>(),
+        primal.ops.iter().map(|o| o.id).collect::<Vec<_>>(),
+        "the refusal must precede any mutation"
     );
 }
 
