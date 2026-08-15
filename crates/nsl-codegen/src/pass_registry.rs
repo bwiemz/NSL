@@ -30,12 +30,14 @@
 //! # What this is NOT
 //!
 //! Not a pass *manager* — it does not schedule, order, or invoke anything.
-//! `compile_train_block` still calls the passes directly. This is a
-//! description of that call sequence, and the gates prove the description
-//! stays true; wiring the registry into the driver so it becomes the single
-//! source of execution order is the natural follow-on, and is deliberately not
-//! attempted here (it would change codegen behaviour, which a documentation
-//! gate has no business doing).
+//! It is the DECLARATION the manager reads: since Milestone C,
+//! `compile_train_block`'s pass invocations go through
+//! [`crate::pass_manager::PassScheduler::schedule`], which checks each one
+//! against [`PassDescriptor::phases`] and the bus's channel declarations
+//! before the body runs. The driver still owns the call order (the value
+//! order that matters is declared on the bus and enforced per compile);
+//! this file owns what the checks are checked AGAINST, and the drift gates
+//! prove it stays true of the tree.
 //!
 //! # Adding a pass
 //!
@@ -494,11 +496,13 @@ pub const PASSES: &[PassDescriptor] = &[
         ],
         cli_flags: &[],
         // NOT OnWengert. No `pca_*.rs` module references `WengertList`;
-        // activation happens in `compiler/kernel.rs` (lines 548/802/851) via
-        // `pca_activation::detect_packing_for_stmts(stmts, ..)`, a scan over
-        // the module AST that runs before `compile_main`. An earlier version of
-        // this entry said OnWengert, which would have told a reader PCA can
-        // consume WGGO's AppliedPlan. It cannot.
+        // activation happens in `compiler/kernel.rs` (the scheduled
+        // segment-masked decision and per-doc admission inside
+        // `maybe_synthesize_csha_training_ptx`, plus direct predicate calls)
+        // via `pca_activation::detect_packing_for_stmts(stmts, ..)`, a scan
+        // over the module AST that runs before `compile_main`. An earlier
+        // version of this entry said OnWengert, which would have told a
+        // reader PCA can consume WGGO's AppliedPlan. It cannot.
         stage: PipelineStage::ModuleScan,
         // Neither member is gate-verified: PCA needs a packing-shaped model no
         // CPU fixture provides. KernelPrepass is where `compiler/kernel.rs`

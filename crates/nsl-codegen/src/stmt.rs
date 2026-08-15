@@ -592,6 +592,226 @@ pub(crate) fn invoke_wrga_if_enabled(
     Some(plan)
 }
 
+/// CSHA driver bridge — mirrors `invoke_wrga_if_enabled` (Milestone C).
+///
+/// Hoisted out of `compile_train_block_inner` so the scheduler has a body to
+/// schedule: resolves the per-model `@csha(...)` config, runs the planner
+/// against `list`, and performs the pass's three bus publishes
+/// (`csha_bridge`, `csha_claimed_ops`, conditionally
+/// `csha_backward_claims`). Everything a `finish(&bus)` postcondition judges
+/// happens INSIDE this function — `csha_bridge` declares
+/// `applied_implies_published: Enforced`, and `Applied` is recorded inside
+/// `csha::run`, so calling finish before the publish would refuse every
+/// applying compile.
+///
+/// No-op when `--csha` was not passed, when the flag or the per-model
+/// decorator disables it, or when the planner returns no plan.
+pub(crate) fn invoke_csha_if_enabled(
+    compiler: &mut crate::compiler::Compiler,
+    list: &crate::wengert::WengertList,
+    model_type_name: &str,
+) {
+    let Some(ref mode_str) = compiler.compile_options.csha.mode else {
+        return;
+    };
+    // Sprint 2 (paper §6.2 binding fix): consult the per-model `@csha(...)`
+    // config captured by the semantic checker, keyed by the model type the
+    // current train block is compiling against.  We resolve effective
+    // mode_str / target / disable HERE so the rest of the hook stays uniform.
+    let per_model_cfg = compiler
+        .compile_options
+        .csha_configs
+        .get(model_type_name)
+        .cloned();
+    let model_disabled = per_model_cfg
+        .as_ref()
+        .map(|c| c.disabled)
+        .unwrap_or(false);
+    // `level=` on the decorator clamps the planner's mode.
+    // We prefer the decorator over `--csha` because the
+    // decorator is the per-model authorial intent, not the
+    // global build switch.  Mapping mirrors `CshaMode::parse`.
+    let effective_mode_string: String = per_model_cfg
+        .as_ref()
+        .and_then(|c| {
+            c.level.map(|l| match l {
+                nsl_semantic::csha::CshaLevel::Boundary => {
+                    "boundary".to_string()
+                }
+                nsl_semantic::csha::CshaLevel::Pipeline => {
+                    "pipeline".to_string()
+                }
+                nsl_semantic::csha::CshaLevel::Block => {
+                    "block".to_string()
+                }
+            })
+        })
+        .unwrap_or_else(|| mode_str.clone());
+    let effective_mode_str = effective_mode_string.as_str();
+    // `target=` on the decorator overrides the global GPU
+    // target for CSHA planning only (does NOT affect the
+    // rest of codegen — that runs on the global target).
+    let effective_target: &str = per_model_cfg
+        .as_ref()
+        .and_then(|c| c.target.as_deref())
+        .unwrap_or(compiler.compile_options.target.as_str());
+
+    let disabled_by_decorator = model_disabled;
+    let disabled_by_flag = mode_str == "off"
+        || mode_str == "disable"
+        || mode_str == "disabled";
+    if !disabled_by_decorator && !disabled_by_flag {
+        // H.1: when `@flash_attention(head_dim=N)` is on a
+        // method, `compile_flash_attention_kernels` has
+        // already populated `flash_attention_context.config.head_dim`
+        // with the user-specified N. Without threading that
+        // value into CSHA's `LayerShape`, the planner's
+        // `roofline_tile_config` sees `head_dim=64` (from
+        // `run_on_wengert`'s default shape), every downstream
+        // `FlashAttentionConfig` carries `head_dim=64`, and
+        // the Tier C backward SMEM validator rejects the
+        // fused backward ("713472 bytes > 101376 byte cap").
+        // The dispatcher then silently falls back to per-op
+        // adjoints and the toy pretrain smoke never emits
+        // `nsl_flash_attention_csha_backward`.
+        let csha_shape_override = compiler
+            .kernels
+            .flash_attention_context
+            .as_ref()
+            .map(|ctx| crate::wggo_cost::LayerShape {
+                batch: 1,
+                seq: 1024,
+                d_model: 512,
+                head_dim: ctx.config.head_dim as u64,
+                n_kv_heads: 4,
+                dtype_bytes: 2,
+            });
+        if let Some(plan) = crate::csha::run_on_wengert(
+            list,
+            effective_target,
+            effective_mode_str,
+            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
+            csha_shape_override, // H.1: forward decorator head_dim to the planner
+            8,    // default head count; weight-informed path refines this
+            compiler.bus.wggo_overrides(),
+        ) {
+            if compiler.compile_options.csha.report {
+                eprintln!("{}", plan.render_report());
+            } else {
+                eprintln!("[csha] {}", plan.summary());
+            }
+            // Emit override-rejection diagnostics after the summary line
+            // so CLI readers see summary first, per-layer details after.
+            for diag in &plan.override_diagnostics {
+                let reason_str = match &diag.reason {
+                    crate::wggo_overrides::OverrideRejectReason::SmemBudgetExceeded {
+                        actual_kb,
+                        limit_kb,
+                    } => {
+                        format!("smem_{}kb_exceeds_{}kb", actual_kb, limit_kb)
+                    }
+                    other => format!("{:?}", other),
+                };
+                eprintln!(
+                    "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                    diag.layer_index,
+                    diag.requested,
+                    diag.applied,
+                    reason_str
+                );
+            }
+            // A.1: persist the bridge result so the FA call
+            // site can route CSHA-active layers through the
+            // CSHA-aware FFI. `csha::run` already called
+            // `csha_apply::bridge`; we reconstruct it here
+            // to keep the kernels / marks / configs map
+            // available to downstream code.
+            let mut diags = Vec::<String>::new();
+            let mut bridge_out = crate::csha_apply::bridge(
+                &plan,
+                plan.per_layer
+                    .first()
+                    .map(|lp| lp.tiles.head_dim as i64)
+                    .unwrap_or(64),
+                &mut diags,
+            );
+            // Gap A: we're inside `compile_train_block`, so
+            // `@train` is active — flip the save flag on
+            // every per-layer CshaExtras. The forward FA
+            // call site (`compile_flash_attention_call`)
+            // reads this to decide between the no-saves
+            // and with-saves FFI variants.
+            for extras in bridge_out.extras.values_mut() {
+                extras.save_activations_for_backward = true;
+            }
+            compiler.bus.publish_csha_bridge(bridge_out);
+            for d in diags { eprintln!("warning: {d}"); }
+            // A.2.1d: record the Wengert OpIds CSHA has
+            // claimed across all boundary chains so
+            // downstream passes (A.2.2 RMSNorm prologue,
+            // A.2.3 matmul projection, A.2.4 RoPE
+            // epilogue) can ask `is_csha_claimed(op)`
+            // before emitting a redundant launch. The list
+            // argument is the id-space conversion boundary:
+            // chain fields are positions in the scanned
+            // list, and positions stop equaling ids the
+            // moment any earlier prune deleted an op.
+            compiler.bus.publish_csha_claimed_ops(
+                crate::csha_apply::collect_claimed_ops(
+                    &plan,
+                    list,
+                ),
+            );
+            // T7.1 / Gap D.1: build the chain-level dispatch
+            // map for the AD reverse walk. Gap D.1 passes the
+            // Wengert list so the dispatcher can resolve
+            // per-chain VarIds (Q/K/V outputs, weights,
+            // RMSNorm-out) and detect the shared SDPA op —
+            // which is the correct primary claim site for
+            // `EmitFused`.
+            // Computed into a local FIRST so the read borrow of
+            // `compiler.bus` ends before the publish below takes it
+            // mutably. Both values used to be separate public
+            // fields, which let the read and the write overlap;
+            // they are one struct now, so the sequence has to be
+            // written out. Same values, same order.
+            let backward_claims = if let Some(bridge) =
+                compiler.bus.csha_bridge()
+            {
+                // Gap I.1: pass the TRAINING config (clamped, no
+                // fusion flags) so the dispatcher's backward SMEM
+                // validator sees the same geometry the real
+                // launch will fire. Falls back to plan-level
+                // config when `csha_training_config` is absent
+                // (inference-only builds).
+                let training_config = compiler
+                    .kernels
+                    .flash_attention_context
+                    .as_ref()
+                    .and_then(|c| c.csha_training_config.as_ref());
+                let (op_to_chain, chain_marks) =
+                    crate::csha_apply::collect_chain_dispatch_map_with_wengert(
+                        &plan,
+                        bridge,
+                        Some(list),
+                        training_config,
+                    );
+                (!chain_marks.is_empty()).then_some(
+                    crate::source_ad::CshaBackwardClaims {
+                        op_to_chain,
+                        chain_marks,
+                    },
+                )
+            } else {
+                None
+            };
+            if let Some(claims) = backward_claims {
+                compiler.bus.publish_csha_backward_claims(claims);
+            }
+        }
+    }
+}
+
 /// Dev Tools Phase 4 Task 4: extract a layer index from a parameter path.
 /// Finds the last numeric segment (e.g. "blocks.3.attn.wq" -> 3).  Returns
 /// `u32::MAX` when no numeric segment is present.
@@ -5368,6 +5588,17 @@ impl Compiler<'_> {
         // extraction and fused-LCE dtype resolution.
         train_block_stmt_id: nsl_ast::NodeId,
     ) -> Result<(), CodegenError> {
+        // Milestone C: the phase scope lives at the CALLEE — this fn, not
+        // the drivers. compile_main/-standalone_main already install
+        // TrainBlock (same-value RAII nest, harmless), but a train block
+        // also arrives through paths that install nothing — user fns
+        // (nested train, @test fns), lambdas, model/agent methods, module
+        // compiles. Scoping here covers all of them by construction, which
+        // is what closes the "production scheduled pass sees phase=None"
+        // gap the scheduler's None arm used to document as live.
+        let _phase = crate::pass_trace::enter_phase(
+            crate::pass_registry::CompilePhase::TrainBlock,
+        );
         // M43b: Pipeline parallel detection
         if self.features.pipeline_config.is_some() {
             if self.compile_options.layerwise_accum {
@@ -5538,7 +5769,24 @@ impl Compiler<'_> {
                 // Speculative in exactly the way the overrides install is;
                 // the planning site refuses if the fingerprint rejects this
                 // pre-plan and the consumed moment dtypes no longer match.
-                crate::stmt::invoke_cpdt_if_enabled(self, Some(&applied), Some(train));
+                //
+                // Milestone C: SCHEDULED. tape=None — CPDT is
+                // TapeAccess::None (the registry is the authority; its
+                // OnWengert stage records pipeline position, not access).
+                // finish() is live: cpdt_plan declares
+                // applied_implies_published Enforced, Applied is only
+                // recordable inside cpdt::run, and invoke publishes
+                // unconditionally after it returns — so this is a tripwire
+                // for any future early-return between the run and the
+                // publish.
+                let sched = self.passes.scheduler();
+                sched
+                    .schedule("CPDT", None, || {
+                        crate::stmt::invoke_cpdt_if_enabled(self, Some(&applied), Some(train));
+                    })
+                    .map_err(CodegenError::new)?
+                    .finish(&self.bus)
+                    .map_err(CodegenError::new)?;
             }
             // Explicitly cleared, never a previous block's leftovers — the
             // pre-restructure stale-leak this site exists to prevent. The
@@ -5556,7 +5804,17 @@ impl Compiler<'_> {
             None => {
                 self.bus.clear_wggo_overrides();
                 self.bus.clear_cpdt_plan();
-                crate::stmt::invoke_cpdt_if_enabled(self, None, Some(train));
+                // The clear stays BEFORE the scheduled call: finish() must
+                // never observe a cleared channel after this invocation's own
+                // Applied record.
+                let sched = self.passes.scheduler();
+                sched
+                    .schedule("CPDT", None, || {
+                        crate::stmt::invoke_cpdt_if_enabled(self, None, Some(train));
+                    })
+                    .map_err(CodegenError::new)?
+                    .finish(&self.bus)
+                    .map_err(CodegenError::new)?;
             }
         }
         let result =
@@ -6126,6 +6384,20 @@ impl Compiler<'_> {
             momentum: momentum_value,
             allow_v_approx: true,
         };
+        // Milestone C: SCHEDULED, with the body widened through the driver's
+        // muon x --layerwise-accum rewrite and the disposition re-record —
+        // the scheduler prints `<- FASE disposition=` right after the body
+        // returns, and a body that ended at `fase::plan` would print the
+        // pass's self-report which the driver overwrites just below
+        // (Declined flipped to Applied on the muon arm), leaving the trace
+        // line disagreeing with the report. tape=None: TapeAccess::None, and
+        // no WengertList exists yet (the extractor is built ~1,900 lines
+        // down). finish() is vacuous (FASE publishes no channel) but keeps
+        // the template uniform. FASE's real staleness guard is value-level —
+        // the fase_fused divergence refusal at the WGGO replan site — and
+        // stays where it is.
+        let sched = self.passes.scheduler();
+        let fase_plan = sched.schedule("FASE", None, || {
         let fase_plan = match self.bus.wggo_overrides() {
             Some(o) => {
                 let mut fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
@@ -6252,6 +6524,11 @@ impl Compiler<'_> {
                 rewrites: fase_plan.backward_phases.len(),
             });
         }
+        fase_plan
+        })
+        .map_err(CodegenError::new)?
+        .finish(&self.bus)
+        .map_err(CodegenError::new)?;
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── Item 7 (`--fuse-wgrad-accum`) admission ─────────────────────
@@ -8496,20 +8773,21 @@ impl Compiler<'_> {
                     let logit_bytes_eliminated = fused_op
                         .map(|(v, _, _, rows)| 2 * (v as u64) * (rows as u64) * 4)
                         .unwrap_or(0);
-                    // Item 2: CPKD is the one registered pass with no module
-                    // entry point to instrument — the driver builds its plan
-                    // inline here rather than calling into `cpkd.rs`, which is
-                    // itself an instance of the pass-bus tangle this roadmap
-                    // item exists to unpick. Recorded at the point the plan is
-                    // produced, which is what "CPKD ran" means today.
-                    crate::pass_trace::record("CPKD");
-                    // AdvisoryOnly, and not a hedge: the plan built here is
-                    // consumed by exactly one thing, `render_report` (see
-                    // `compile_distill_block`). The fusion it reports on was
-                    // performed by the `@fused_kl_ce` decorator during
-                    // extraction, not by this code — CPKD rewrites nothing.
-                    crate::pass_trace::record_disposition("CPKD", crate::pass_trace::PassDisposition::AdvisoryOnly);
-                    self.bus.publish_cpkd_plan(crate::cpkd::CpkdPlan {
+                    // Milestone C: CPKD gained a real module entry
+                    // (`cpkd::build_plan`) — record/disposition moved to the
+                    // callee with it — and the invocation is SCHEDULED. The
+                    // FusedKlCe tape scan above stays HERE: the registry
+                    // declares TapeAccess::None for CPKD and the drift gate
+                    // enforces zero WengertList mentions in the cpkd* family,
+                    // so the driver reads the tape and hands the RESULT in.
+                    // tape=None for the same reason; the plan holds no
+                    // positional refs and its sole consumer (`render_report`
+                    // via take_cpkd_plan) runs after the tape is gone.
+                    let sched = self.passes.scheduler();
+                    sched
+                        .schedule("CPKD", None, || {
+                            let plan =
+                                crate::cpkd::build_plan(crate::cpkd::DistillLoweringFacts {
                         teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
                         student_name: self.resolve_sym(distill.student_sym).to_string(),
                         epochs: distill.epochs,
@@ -8528,10 +8806,14 @@ impl Compiler<'_> {
                         loss: distill.loss.clone(),
                         trainable_params: extractor.named_param_var_ids().len(),
                         frozen_teacher_inputs: extractor.frozen_input_var_ids().len(),
-                        fused_kl_ce_fired: fused_op.is_some(),
                         fused_shape: fused_op,
                         logit_bytes_eliminated,
-                    });
+                                });
+                            self.bus.publish_cpkd_plan(plan);
+                        })
+                        .map_err(CodegenError::new)?
+                        .finish(&self.bus)
+                        .map_err(CodegenError::new)?;
                 }
 
                 // 4. Find the loss symbol's VarId and set it as the Wengert
@@ -8663,8 +8945,30 @@ impl Compiler<'_> {
                 // stale.
                 let mut wggo_preplan_offered = false;
                 let mut wggo_preplan_was_rejected = false;
-                if let Some(ref mode_str) = self.compile_options.wggo.mode {
+                // Owned, not `ref`: the scheduled closure below captures
+                // `self` mutably (bus publish), so a `ref` pattern holding a
+                // shared borrow of `self.compile_options` across it would not
+                // borrow-check.
+                let wggo_mode = self.compile_options.wggo.mode.clone();
+                if let Some(mode_str) = wggo_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        // Milestone C: SCHEDULED, both arms of the pre-plan
+                        // match — on the fingerprint-match arm the pass body
+                        // never runs (recorded at KernelPrepass), but the
+                        // scheduler still retains the digest of the tape the
+                        // reused plan's positional indices will PRUNE, which
+                        // is exactly what the consumption-fork assert below
+                        // needs (TapeDigest and fingerprint_wengert are
+                        // different hashes, not interchangeable). The body is
+                        // widened through the publish: wggo_overrides
+                        // declares applied_implies_published Enforced and
+                        // Applied is recorded inside wggo::run, so a finish
+                        // directly after the planner call would refuse every
+                        // correct compile. The stale-mode-table refusal
+                        // returns THROUGH the closure (R is a Result).
+                        let sched = self.passes.scheduler();
+                        let scheduled = sched
+                            .schedule("WGGO", Some(extractor.wengert_list()), || {
                         // Build AnalysisConfig from CLI overrides; clamp is
                         // also applied in analyze(), but applying it here
                         // keeps the --wggo-report line honest.
@@ -8730,7 +9034,7 @@ impl Compiler<'_> {
                             None => crate::wggo::run_on_wengert_with_weights(
                                 extractor.wengert_list(),
                                 &self.compile_options.target,
-                                mode_str,
+                                &mode_str,
                                 self.compile_options.world_size,
                                 weights_path,
                                 analysis_config,
@@ -8951,8 +9255,15 @@ impl Compiler<'_> {
                             self.bus.publish_wggo_overrides(
                                 crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
                             );
-                            wggo_applied = Some(plan.applied);
+                            Ok(Some(plan.applied))
+                        } else {
+                            Ok(None)
                         }
+                            })
+                            .map_err(CodegenError::new)?;
+                        wggo_applied = scheduled
+                            .finish(&self.bus)
+                            .map_err(CodegenError::new)??;
                     }
                 }
 
@@ -8969,206 +9280,33 @@ impl Compiler<'_> {
                 // (via bus.wggo_overrides) so that per-layer fusion-level
                 // decisions from WGGO are honoured (or rejected with a
                 // diagnostic) by CSHA.
-                if let Some(ref mode_str) = self.compile_options.csha.mode {
-                    // Sprint 2 (paper §6.2 binding fix): consult the
-                    // per-model `@csha(...)` config captured by the semantic
-                    // checker, keyed by the model type the current train
-                    // block is compiling against.  We resolve effective
-                    // mode_str / target / disable HERE so the rest of the
-                    // hook stays uniform.
-                    let per_model_cfg = self
-                        .compile_options
-                        .csha_configs
-                        .get(&model_type_name)
-                        .cloned();
-                    let model_disabled = per_model_cfg
-                        .as_ref()
-                        .map(|c| c.disabled)
-                        .unwrap_or(false);
-                    // `level=` on the decorator clamps the planner's mode.
-                    // We prefer the decorator over `--csha` because the
-                    // decorator is the per-model authorial intent, not the
-                    // global build switch.  Mapping mirrors `CshaMode::parse`.
-                    let effective_mode_string: String = per_model_cfg
-                        .as_ref()
-                        .and_then(|c| {
-                            c.level.map(|l| match l {
-                                nsl_semantic::csha::CshaLevel::Boundary => {
-                                    "boundary".to_string()
-                                }
-                                nsl_semantic::csha::CshaLevel::Pipeline => {
-                                    "pipeline".to_string()
-                                }
-                                nsl_semantic::csha::CshaLevel::Block => {
-                                    "block".to_string()
-                                }
-                            })
-                        })
-                        .unwrap_or_else(|| mode_str.clone());
-                    let effective_mode_str = effective_mode_string.as_str();
-                    // `target=` on the decorator overrides the global GPU
-                    // target for CSHA planning only (does NOT affect the
-                    // rest of codegen — that runs on the global target).
-                    let effective_target: &str = per_model_cfg
-                        .as_ref()
-                        .and_then(|c| c.target.as_deref())
-                        .unwrap_or(self.compile_options.target.as_str());
-
-                    let disabled_by_decorator = model_disabled;
-                    let disabled_by_flag = mode_str == "off"
-                        || mode_str == "disable"
-                        || mode_str == "disabled";
-                    if !disabled_by_decorator && !disabled_by_flag {
-                        // H.1: when `@flash_attention(head_dim=N)` is on a
-                        // method, `compile_flash_attention_kernels` has
-                        // already populated `flash_attention_context.config.head_dim`
-                        // with the user-specified N. Without threading that
-                        // value into CSHA's `LayerShape`, the planner's
-                        // `roofline_tile_config` sees `head_dim=64` (from
-                        // `run_on_wengert`'s default shape), every downstream
-                        // `FlashAttentionConfig` carries `head_dim=64`, and
-                        // the Tier C backward SMEM validator rejects the
-                        // fused backward ("713472 bytes > 101376 byte cap").
-                        // The dispatcher then silently falls back to per-op
-                        // adjoints and the toy pretrain smoke never emits
-                        // `nsl_flash_attention_csha_backward`.
-                        let csha_shape_override = self
-                            .kernels
-                            .flash_attention_context
-                            .as_ref()
-                            .map(|ctx| crate::wggo_cost::LayerShape {
-                                batch: 1,
-                                seq: 1024,
-                                d_model: 512,
-                                head_dim: ctx.config.head_dim as u64,
-                                n_kv_heads: 4,
-                                dtype_bytes: 2,
-                            });
-                        if let Some(plan) = crate::csha::run_on_wengert(
+                //
+                // Milestone C: SCHEDULED — the body (hoisted to
+                // `invoke_csha_if_enabled`, mirroring WRGA's bridge) contains
+                // the planner run AND all three bus publishes, so finish()'s
+                // applied⇒published check on `csha_bridge` (Enforced) judges
+                // a settled state. tape=Some: CSHA scans this list, and the
+                // digest records what it scanned — but NO
+                // assert_tape_unchanged_since is placed for CSHA anywhere:
+                // its positional chain fields are converted to OpIds AT the
+                // scan boundary inside this window (`collect_claimed_ops` /
+                // the dispatch-map build), OpIds are stable across the
+                // deletions `wggo_prune` makes right after this, and an
+                // assert against the post-prune list would refuse every
+                // prune+CSHA composition for a mutation that invalidates
+                // nothing the pass retained.
+                let sched = self.passes.scheduler();
+                sched
+                    .schedule("CSHA", Some(extractor.wengert_list()), || {
+                        crate::stmt::invoke_csha_if_enabled(
+                            self,
                             extractor.wengert_list(),
-                            effective_target,
-                            effective_mode_str,
-                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
-                            csha_shape_override, // H.1: forward decorator head_dim to the planner
-                            8,    // default head count; weight-informed path refines this
-                            self.bus.wggo_overrides(),
-                        ) {
-                            if self.compile_options.csha.report {
-                                eprintln!("{}", plan.render_report());
-                            } else {
-                                eprintln!("[csha] {}", plan.summary());
-                            }
-                            // Emit override-rejection diagnostics after the summary line
-                            // so CLI readers see summary first, per-layer details after.
-                            for diag in &plan.override_diagnostics {
-                                let reason_str = match &diag.reason {
-                                    crate::wggo_overrides::OverrideRejectReason::SmemBudgetExceeded {
-                                        actual_kb,
-                                        limit_kb,
-                                    } => {
-                                        format!("smem_{}kb_exceeds_{}kb", actual_kb, limit_kb)
-                                    }
-                                    other => format!("{:?}", other),
-                                };
-                                eprintln!(
-                                    "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
-                                    diag.layer_index,
-                                    diag.requested,
-                                    diag.applied,
-                                    reason_str
-                                );
-                            }
-                            // A.1: persist the bridge result so the FA call
-                            // site can route CSHA-active layers through the
-                            // CSHA-aware FFI. `csha::run` already called
-                            // `csha_apply::bridge`; we reconstruct it here
-                            // to keep the kernels / marks / configs map
-                            // available to downstream code.
-                            let mut diags = Vec::<String>::new();
-                            let mut bridge_out = crate::csha_apply::bridge(
-                                &plan,
-                                plan.per_layer
-                                    .first()
-                                    .map(|lp| lp.tiles.head_dim as i64)
-                                    .unwrap_or(64),
-                                &mut diags,
-                            );
-                            // Gap A: we're inside `compile_train_block`, so
-                            // `@train` is active — flip the save flag on
-                            // every per-layer CshaExtras. The forward FA
-                            // call site (`compile_flash_attention_call`)
-                            // reads this to decide between the no-saves
-                            // and with-saves FFI variants.
-                            for extras in bridge_out.extras.values_mut() {
-                                extras.save_activations_for_backward = true;
-                            }
-                            self.bus.publish_csha_bridge(bridge_out);
-                            for d in diags { eprintln!("warning: {d}"); }
-                            // A.2.1d: record the Wengert OpIds CSHA has
-                            // claimed across all boundary chains so
-                            // downstream passes (A.2.2 RMSNorm prologue,
-                            // A.2.3 matmul projection, A.2.4 RoPE
-                            // epilogue) can ask `is_csha_claimed(op)`
-                            // before emitting a redundant launch. The list
-                            // argument is the id-space conversion boundary:
-                            // chain fields are positions in the scanned
-                            // list, and positions stop equaling ids the
-                            // moment any earlier prune deleted an op.
-                            self.bus.publish_csha_claimed_ops(
-                                crate::csha_apply::collect_claimed_ops(
-                                    &plan,
-                                    extractor.wengert_list(),
-                                ),
-                            );
-                            // T7.1 / Gap D.1: build the chain-level dispatch
-                            // map for the AD reverse walk. Gap D.1 passes the
-                            // Wengert list so the dispatcher can resolve
-                            // per-chain VarIds (Q/K/V outputs, weights,
-                            // RMSNorm-out) and detect the shared SDPA op —
-                            // which is the correct primary claim site for
-                            // `EmitFused`.
-                            // Computed into a local FIRST so the read borrow of
-                            // `self.bus` ends before the publish below takes it
-                            // mutably. Both values used to be separate public
-                            // fields, which let the read and the write overlap;
-                            // they are one struct now, so the sequence has to be
-                            // written out. Same values, same order.
-                            let backward_claims = if let Some(bridge) =
-                                self.bus.csha_bridge()
-                            {
-                                // Gap I.1: pass the TRAINING config (clamped, no
-                                // fusion flags) so the dispatcher's backward SMEM
-                                // validator sees the same geometry the real
-                                // launch will fire. Falls back to plan-level
-                                // config when `csha_training_config` is absent
-                                // (inference-only builds).
-                                let training_config = self
-                                    .kernels
-                                    .flash_attention_context
-                                    .as_ref()
-                                    .and_then(|c| c.csha_training_config.as_ref());
-                                let (op_to_chain, chain_marks) =
-                                    crate::csha_apply::collect_chain_dispatch_map_with_wengert(
-                                        &plan,
-                                        bridge,
-                                        Some(extractor.wengert_list()),
-                                        training_config,
-                                    );
-                                (!chain_marks.is_empty()).then_some(
-                                    crate::source_ad::CshaBackwardClaims {
-                                        op_to_chain,
-                                        chain_marks,
-                                    },
-                                )
-                            } else {
-                                None
-                            };
-                            if let Some(claims) = backward_claims {
-                                self.bus.publish_csha_backward_claims(claims);
-                            }
-                        }
-                    }
-                }
+                            &model_type_name,
+                        );
+                    })
+                    .map_err(CodegenError::new)?
+                    .finish(&self.bus)
+                    .map_err(CodegenError::new)?;
 
                 // 5. Lower PRIMAL Wengert list to Cranelift IR.
                 //    This IS the forward pass — each WengertOp is compiled to
@@ -9206,6 +9344,23 @@ impl Compiler<'_> {
                 // compilation fails with a CodegenError. On success each rewritten layer
                 // gets a stderr marker that Task 15 will upgrade to format_refusal output.
                 if let Some(ref applied_plan) = wggo_applied {
+                    // Milestone C: THE positional consumption fork — the
+                    // plan's indices are applied to the tape here, and they
+                    // are valid only against the list state the plan was
+                    // produced from (planned in place, or fingerprint-matched
+                    // to the pre-plan's extraction). Prove nothing moved the
+                    // list since the scheduled WGGO retained its digest
+                    // (CSHA in between is Reads-only). Assert at ENTRY of the
+                    // consumption; after the prune the digest is stale BY
+                    // DESIGN (the prune is WGGO's declared mutation) and
+                    // nothing may re-assert it — WRGA's own schedule
+                    // re-digests the post-prune list.
+                    {
+                        let sched = self.passes.scheduler();
+                        sched
+                            .assert_tape_unchanged_since("WGGO", extractor.wengert_list())
+                            .map_err(CodegenError::new)?;
+                    }
                     let empty_weight_map = crate::weight_aware::WeightMap::default();
                     let weight_map_ref = self.features.weight_map.as_ref().unwrap_or(&empty_weight_map);
                     let wggo_prune_result = crate::wggo_prune::run(
@@ -9298,7 +9453,20 @@ impl Compiler<'_> {
                 // silently training with FP32 moments.
                 if let Some(ref applied) = wggo_applied {
                     if !wggo_preplan_offered || wggo_preplan_was_rejected {
-                        crate::stmt::invoke_cpdt_if_enabled(self, Some(applied), Some(train));
+                        // Milestone C: SCHEDULED, inside the existing guard —
+                        // wrapping the guard itself would trace a scheduled
+                        // no-invocation on every pre-plan-path compile.
+                        sched
+                            .schedule("CPDT", None, || {
+                                crate::stmt::invoke_cpdt_if_enabled(
+                                    self,
+                                    Some(applied),
+                                    Some(train),
+                                );
+                            })
+                            .map_err(CodegenError::new)?
+                            .finish(&self.bus)
+                            .map_err(CodegenError::new)?;
                     }
                     // Re-arbitrate what the moments WOULD be typed as under
                     // the CURRENT plan and overrides — the same pipeline the
@@ -9791,6 +9959,20 @@ impl Compiler<'_> {
                 let ccr_plan = if self.compile_options.checkpoint_blocks
                     || ccr_selective_decorated
                 {
+                    // Milestone C: SCHEDULED as ONE region — the whole
+                    // search (DP partition, stride candidates, final plan)
+                    // is one CCR invocation; recording stays at the callee
+                    // (plan_impl) and last-wins dispositions already model
+                    // the candidate sweep. tape=None at schedule time
+                    // because the body itself mutates the scanned list
+                    // (append_compressed_saves appends the compressed-save
+                    // tail), so the entry digest would be stale by the
+                    // pass's own declared mutation — rescan_tape below
+                    // captures the state the pass LEFT, which is what the
+                    // consumption forks must see intact.
+                    let sched = self.passes.scheduler();
+                    let scheduled = sched
+                        .schedule("CCR", None, || {
                     let claimed_ids: Option<std::collections::HashSet<u32>> =
                         self.bus.csha_backward_claims().map(|claims| {
                             claims.op_to_chain.keys().copied().collect()
@@ -10064,6 +10246,17 @@ impl Compiler<'_> {
                         }
                     }
                     plan
+                        })
+                        .map_err(CodegenError::new)?;
+                    // The body appended the compressed-save tail to
+                    // `effective_primal` (append-only: existing positions
+                    // stay valid, but an exact-equality digest from entry
+                    // would now refuse every --checkpoint-compress build).
+                    // Re-digest the state the pass left; the
+                    // apply_to_adjoint / CSLA seg_bounds forks below assert
+                    // against THIS.
+                    scheduled.rescan_tape(&effective_primal);
+                    scheduled.finish(&self.bus).map_err(CodegenError::new)?
                 } else {
                     None
                 };
@@ -10103,6 +10296,22 @@ impl Compiler<'_> {
                         eprintln!(
                             "[ccr] nothing recomputable after the owned-tensor \
                              restriction; running without checkpointing"
+                        );
+                        // Milestone C: correct the ledger at the drop site.
+                        // plan_impl recorded Applied{segments} at plan
+                        // CONSTRUCTION; dropping the plan here used to leave
+                        // that Applied standing for a build that runs
+                        // uncheckpointed — a disposition finish() cannot see
+                        // (CCR publishes no channel). Last-wins makes this
+                        // the build-truthful statement, the FASE re-record
+                        // precedent.
+                        crate::pass_trace::record_disposition(
+                            "CCR",
+                            crate::pass_trace::PassDisposition::Declined {
+                                reason: crate::pass_trace::DeclineReason::PreconditionViolated(
+                                    "the owned-tensor restriction emptied the recompute set",
+                                ),
+                            },
                         );
                         ccr_plan = None;
                     } else if let Some(budget_mib) = self.compile_options.checkpoint_budget_mib {
@@ -10284,6 +10493,19 @@ impl Compiler<'_> {
                 // and last-use frees are computed against exactly the op
                 // list that will be lowered.
                 if let Some(plan) = &ccr_plan {
+                    // Milestone C: THE positional fork — apply_to_adjoint
+                    // iterates `seg.start..seg.end` indexing
+                    // effective_primal.ops. The plan's segment bounds are
+                    // valid only against the list state CCR left (post
+                    // compressed-save append — rescan_tape re-digested it);
+                    // prove nothing moved it in the ~300 lines between.
+                    // Assert at ENTRY of the consumption.
+                    {
+                        let sched = self.passes.scheduler();
+                        sched
+                            .assert_tape_unchanged_since("CCR", &effective_primal)
+                            .map_err(CodegenError::new)?;
+                    }
                     ccr_fresh = ccr_fresh.max(
                         effective_primal
                             .ops
@@ -10684,13 +10906,33 @@ impl Compiler<'_> {
                         propagated.len(),
                         effective_primal.ops.len() + adjoint.ops.len(),
                     );
-                    let arena = crate::transient_arena::analyze(
-                        &effective_primal,
-                        &adjoint,
-                        &|v| propagated.get(&v).copied(),
-                        &tape_escaping,
-                        4, // GPU f32 training dtype width
-                    );
+                    // Milestone C: SCHEDULED. The pass scans BOTH lists
+                    // (birth/death liveness over the concatenated
+                    // [forward; adjoint] positions) but the scheduler retains
+                    // ONE digest per (epoch, pass) — the adjoint is the one
+                    // digested, because every admitted placement lives there
+                    // (`admit` refuses NotBackward) and it is the list the
+                    // arena-consuming lowering walks. A forward-tape splice
+                    // between here and that lowering would evade this digest;
+                    // none exists today (fuse_swiglu_gate_backward runs
+                    // BEFORE this analyze, CCR's splices before that), and
+                    // the honest fix for a second scanned list is a
+                    // scheduler API that digests both — deliberately not
+                    // built for a window with no known mutator.
+                    let sched = self.passes.scheduler();
+                    let arena = sched
+                        .schedule("MemoryPlanner", Some(&adjoint), || {
+                            crate::transient_arena::analyze(
+                                &effective_primal,
+                                &adjoint,
+                                &|v| propagated.get(&v).copied(),
+                                &tape_escaping,
+                                4, // GPU f32 training dtype width
+                            )
+                        })
+                        .map_err(CodegenError::new)?
+                        .finish(&self.bus)
+                        .map_err(CodegenError::new)?;
                     eprintln!("[arena]\n{}", arena.render_report("  "));
 
                     // ── Stage-2B: placement ──────────────────────────
@@ -11239,6 +11481,17 @@ impl Compiler<'_> {
                             let plan_ref = ccr_plan
                                 .as_ref()
                                 .expect("csla refusal above guarantees a plan");
+                            // Milestone C: the SECOND positional fork — the
+                            // segment bounds are sliced against
+                            // effective_primal ~1,200 lines after planning.
+                            // Same digest, same rule as the
+                            // apply_to_adjoint fork above.
+                            {
+                                let sched = self.passes.scheduler();
+                                sched
+                                    .assert_tape_unchanged_since("CCR", &effective_primal)
+                                    .map_err(CodegenError::new)?;
+                            }
                             let seg_bounds: Vec<(usize, usize)> = plan_ref
                                 .segments
                                 .iter()
@@ -11556,6 +11809,22 @@ impl Compiler<'_> {
                     // the first belt, so the check covers the earliest moment
                     // the tables are populated.
                     self.emit_param_plan_check(builder, plan, param_list)?;
+                }
+                // Milestone C: the arena's positional liveness (birth/death
+                // over the concatenated [forward; adjoint] timeline) was
+                // captured at `transient_arena::analyze`; the placements it
+                // burned into `arena_placements` are consumed from here on,
+                // during lowering (`wengert_lower.rs` looks slots up per op).
+                // Slot-sharing is sound only if the list being lowered is the
+                // list that was analyzed — prove the adjoint has not moved
+                // since the scan, at the entry to the consumption window
+                // (assert at ENTRY, not after a write). Guarded: no
+                // placements means nothing downstream consumes the scan.
+                if !self.arena_placements.is_empty() {
+                    let sched = self.passes.scheduler();
+                    sched
+                        .assert_tape_unchanged_since("MemoryPlanner", &adjoint)
+                        .map_err(CodegenError::new)?;
                 }
                 self.emit_inplace_suppress(builder, true)?;
                 let full_lowered = if let Some(wsplan) = &ws_fwd_plan {

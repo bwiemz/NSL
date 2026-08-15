@@ -123,6 +123,61 @@ pub struct CpkdPlan {
     pub logit_bytes_eliminated: u64,
 }
 
+/// The lowering facts the driver collects for [`build_plan`] — everything
+/// the Distillation Build Report states about one distill block. A struct
+/// rather than ten positional arguments so the call site stays readable and
+/// clippy's argument ceiling stays un-suppressed.
+pub struct DistillLoweringFacts {
+    pub teacher_name: String,
+    pub student_name: String,
+    pub epochs: i64,
+    pub grad_accumulation: i64,
+    pub fase_mode: String,
+    pub loss: DistillLossConfig,
+    pub trainable_params: usize,
+    pub frozen_teacher_inputs: usize,
+    /// `Some` iff the fused KL-CE op fired; the shape it fired with.
+    pub fused_shape: Option<(u32, u32, u32, u32)>,
+    pub logit_bytes_eliminated: u64,
+}
+
+/// The CPKD pass entry (Milestone C).
+///
+/// CPKD was the one registered pass with no module entry point — the driver
+/// built the plan inline in `stmt.rs` and recorded the trace there, which the
+/// old inline comment named as "an instance of the pass-bus tangle this
+/// roadmap item exists to unpick". Building the plan HERE gives
+/// `pass_trace::record` its callee-side choke point (the step-2 lesson: a
+/// record at call sites misses drivers nobody wrapped) and gives the
+/// scheduler a body to schedule.
+///
+/// Deliberately takes NO `WengertList`: the registry declares
+/// `TapeAccess::None` for CPKD and `tape_access_drift.rs` enforces zero
+/// code-level `WengertList` mentions across the cpkd* module family — so the
+/// driver performs the one tape read this plan consumes (the FusedKlCe shape
+/// scan) in `stmt.rs` and passes the RESULT in as `fused_shape`.
+pub fn build_plan(facts: DistillLoweringFacts) -> CpkdPlan {
+    crate::pass_trace::record("CPKD");
+    // AdvisoryOnly, and not a hedge: the plan built here is consumed by
+    // exactly one thing, `render_report` (see `compile_distill_block`). The
+    // fusion it reports on was performed by the `@fused_kl_ce` decorator
+    // during extraction, not by this code — CPKD rewrites nothing.
+    crate::pass_trace::record_disposition("CPKD", crate::pass_trace::PassDisposition::AdvisoryOnly);
+    CpkdPlan {
+        teacher_name: facts.teacher_name,
+        student_name: facts.student_name,
+        epochs: facts.epochs,
+        grad_accumulation: facts.grad_accumulation,
+        fase_mode: facts.fase_mode,
+        loss: facts.loss,
+        trainable_params: facts.trainable_params,
+        frozen_teacher_inputs: facts.frozen_teacher_inputs,
+        fused_kl_ce_fired: facts.fused_shape.is_some(),
+        fused_shape: facts.fused_shape,
+        logit_bytes_eliminated: facts.logit_bytes_eliminated,
+    }
+}
+
 impl CpkdPlan {
     pub fn render_report(&self) -> String {
         use std::fmt::Write as _;

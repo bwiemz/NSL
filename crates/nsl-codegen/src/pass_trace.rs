@@ -3,11 +3,16 @@
 //! # Why this exists
 //!
 //! [`crate::pass_registry`] describes eleven passes as data — implementation
-//! files, driving CLI flags, pipeline stage — and its own header is explicit
-//! about the limit of that:
+//! files, driving CLI flags, pipeline stage — and its header at the time this
+//! module was built was explicit about the limit of that:
 //!
 //! > Not a pass *manager* — it does not schedule, order, or invoke anything.
 //! > `compile_train_block` still calls the passes directly.
+//!
+//! (Since Milestone C the direct calls are gone — the driver routes every
+//! in-pipeline pass through `pass_manager::PassScheduler::schedule` — but the
+//! observation gap this module closes predates that and remains its
+//! foundation: scheduling decisions are made FROM this trace's epochs.)
 //!
 //! So the registry can prove a pass *exists* and that its flags are wired, but
 //! nothing proves a pass *ran*. That is the gap this module closes, and it is
