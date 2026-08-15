@@ -137,6 +137,8 @@ pub(crate) fn run_build_standalone(
 
     // 9. Link all objects
     crate::commands::build::emit_pass_trace();
+    // Milestone A: reconcile requested surfaces before the artifact links.
+    crate::activation_enforce::enforce_from_argv(nsl_codegen::pass_registry::Subcommand::Build);
     match nsl_codegen::linker::link_multi(&obj_paths, &output_path) {
         Ok(()) => {
             // 10. Clean up temp object files

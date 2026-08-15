@@ -365,6 +365,22 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         ],
         "the kernel counter reported",
     ),
+    m(
+        "[fase]",
+        &[
+            "crates/nsl-codegen/src/stmt.rs",
+        ],
+        "the FASE planner's driver reported a decorator/override decision \
+         (the @fase activation witness is `[fase] @fase decorator applied:`)",
+    ),
+    m(
+        "[activation]",
+        &[
+            "crates/nsl-codegen/src/activation.rs",
+        ],
+        "the Milestone A reconciler reported a requested surface's outcome \
+         (applied / declined / witnessed / UNSATISFIED)",
+    ),
 ];
 
 /// Look a marker up by token. Panics if it is not registered — call sites are
@@ -410,6 +426,8 @@ pub mod tokens {
     pub const WGRAD_ACCUM: &str = "[wgrad-accum]";
     pub const WGRAD_FUSION: &str = "[wgrad-fusion]";
     pub const CCR: &str = "[ccr]";
+    pub const FASE: &str = "[fase]";
+    pub const ACTIVATION: &str = "[activation]";
 }
 
 /// A string a NEGATIVE assertion depends on.

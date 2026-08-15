@@ -41,8 +41,20 @@ pub(crate) fn build_to_temp(
     };
     let exe_path = temp_dir.join(&exe_name);
 
-    // Build to temp dir (reuse existing build logic, quiet mode)
-    run_build_inner(file, Some(exe_path.clone()), false, false, true, options, None);
+    // Build to temp dir (reuse existing build logic, quiet mode). Milestone
+    // A: the Run entry point scopes activation enforcement, which fires
+    // inside the build right after codegen — before the program can execute
+    // with a silently-inert request.
+    run_build_inner(
+        file,
+        Some(exe_path.clone()),
+        false,
+        false,
+        true,
+        options,
+        None,
+        nsl_codegen::pass_registry::Subcommand::Run,
+    );
 
     // CPDT: post-compile rendering, mirroring the `nsl build` path. Stderr
     // diagnostics always fire when CPDT ran; the stdout plan only with

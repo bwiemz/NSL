@@ -113,7 +113,19 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             cep_out,
             cep_emit_weights,
             cep_emit_source,
+            // Milestone A: consumed by activation_enforce, which reads argv
+            // directly (see its module doc), so the typed values are unused.
+            activation_report: _activation_report,
+            allow_inert_requests: _allow_inert_requests,
+            allow_unknown_decorators,
     } = args;
+
+    // Milestone A: the unknown-decorator escape hatch travels to
+    // nsl-semantic (and to every module the loader analyzes) as an env var,
+    // the same plumbing --grad-integrity and --collectives use.
+    if allow_unknown_decorators {
+        std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
+    }
 
     // Item 10: load the frozen tuning DB before ANY compile work — the
     // overlay must be in place before the first autotune cache lookup, and

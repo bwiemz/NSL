@@ -166,7 +166,19 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             csha,
             csha_report,
             wrga_ablate,
+            // Milestone A: consumed by activation_enforce, which reads argv
+            // directly (see its module doc), so the typed values are unused.
+            activation_report: _activation_report,
+            allow_inert_requests: _allow_inert_requests,
+            allow_unknown_decorators,
     } = args;
+
+    // Milestone A: the unknown-decorator escape hatch travels to
+    // nsl-semantic (and to every module the loader analyzes) as an env var,
+    // the same plumbing --grad-integrity and --collectives use.
+    if allow_unknown_decorators {
+        std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
+    }
 
             if cep_search && cep_profile {
                 eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
@@ -585,4 +597,12 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
     // never links, so without this the trace is silent on a path where passes
     // demonstrably ran.
     crate::commands::build::emit_pass_trace();
+
+    // Milestone A: report-only on check — compile-scoped contracts reconcile
+    // to OutOfScope here (check runs no full codegen), and the few
+    // check-scoped ones stay warnings; `nsl check` answers "is this program
+    // well-formed", never "did an optimizer fire".
+    crate::activation_enforce::enforce_from_argv(
+        nsl_codegen::pass_registry::Subcommand::Check,
+    );
 }

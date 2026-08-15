@@ -11,6 +11,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     let crate::args::RunArgs {
             file,
             args,
+            // Milestone A: consumed by activation_enforce, which reads argv
+            // directly (see its module doc), so the typed values are unused.
+            activation_report: _activation_report,
+            allow_inert_requests: _allow_inert_requests,
+            allow_unknown_decorators,
             profile_memory,
             profile_kernels,
             profile,
@@ -81,6 +86,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             stream_async_writeback,
             weights,
     } = args;
+
+    // Milestone A: the unknown-decorator escape hatch travels to
+    // nsl-semantic (and to every module the loader analyzes) as an env var,
+    // the same plumbing --grad-integrity and --collectives use.
+    if allow_unknown_decorators {
+        std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
+    }
 
     // P4 item 14: validate the collective backend up front (fail before
     // spawning ranks) and export it for the runtime — nsl_zero_init reads
@@ -621,8 +633,19 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 };
                 let binary_path = temp_dir.join(&exe_name);
 
-                // Build the binary
-                crate::commands::build::run_build_inner(&file, Some(binary_path.clone()), false, false, true, &compile_opts, None);
+                // Build the binary. Milestone A: the Run entry scopes
+                // activation enforcement, which fires inside the build —
+                // before any worker spawns onto an unexamined build.
+                crate::commands::build::run_build_inner(
+                    &file,
+                    Some(binary_path.clone()),
+                    false,
+                    false,
+                    true,
+                    &compile_opts,
+                    None,
+                    nsl_codegen::pass_registry::Subcommand::Run,
+                );
 
                 let mut children: Vec<(&str, std::process::Child)> = Vec::new();
                 let total_workers = 1 + prefill_workers + decode_workers;

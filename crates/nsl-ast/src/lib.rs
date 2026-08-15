@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod block;
 pub mod decl;
+/// Milestone A: the one walk that finds every decorator with its host.
+pub mod decorator_walk;
 pub mod expr;
 pub mod operator;
 pub mod pattern;

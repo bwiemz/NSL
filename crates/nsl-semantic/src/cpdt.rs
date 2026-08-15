@@ -159,8 +159,26 @@ pub fn validate_cpdt_decorator(
                             .with_label(arg.span, "invalid precision"),
                         ),
                     }
+                    // Milestone A (deferral-must-refuse): the value parses
+                    // but NOTHING consumes it — the precision plan is derived
+                    // by the CPDT planner and the CLI override is reserved
+                    // (`--cpdt-precision, future` in the plan report). Until
+                    // a consumer exists, accepting the argument would let a
+                    // configured value silently produce derived-plan output.
+                    // Lifting this refusal is the consumer's one-line job.
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "@cpdt: the `precision` argument has no consumer in \
+                             this toolchain version — the precision plan is \
+                             derived by the planner (paper §4.x; CLI override \
+                             reserved). Remove the argument"
+                                .to_string(),
+                        )
+                        .with_label(arg.span, "accepted by grammar, consumed by nothing"),
+                    );
                 }
-                "target_memory" => match &arg.value.kind {
+                "target_memory" => {
+                    match &arg.value.kind {
                     ExprKind::FloatLiteral(f) => {
                         if *f <= 0.0 || *f > 1.0 {
                             diagnostics.push(
@@ -196,7 +214,21 @@ pub fn validate_cpdt_decorator(
                         )
                         .with_label(arg.span, "expected number"),
                     ),
-                },
+                    }
+                    // Milestone A (deferral-must-refuse): same as `precision`
+                    // — the fraction parses into CpdtConfig but no planner
+                    // input reads it. Refuse until a consumer exists.
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "@cpdt: the `target_memory` argument has no consumer \
+                             in this toolchain version — the memory budget comes \
+                             from the cluster spec (paper §6.1 example \
+                             notwithstanding). Remove the argument"
+                                .to_string(),
+                        )
+                        .with_label(arg.span, "accepted by grammar, consumed by nothing"),
+                    );
+                }
                 "cluster" => {
                     // Cluster accepts a nested struct literal.  We try to
                     // decode whatever the user provided into the

@@ -161,6 +161,8 @@ fn run_build_shared_single(
     export_refs.extend_from_slice(&runtime_exports);
 
     crate::commands::build::emit_pass_trace();
+    // Milestone A: reconcile requested surfaces before the artifact links.
+    crate::activation_enforce::enforce_from_argv(nsl_codegen::pass_registry::Subcommand::Build);
     match nsl_codegen::linker::link_shared_with_exports(
         std::slice::from_ref(&obj_path),
         &lib_path,
@@ -532,6 +534,8 @@ fn run_build_shared_multi(
     export_refs.extend_from_slice(&runtime_exports);
 
     crate::commands::build::emit_pass_trace();
+    // Milestone A: reconcile requested surfaces before the artifact links.
+    crate::activation_enforce::enforce_from_argv(nsl_codegen::pass_registry::Subcommand::Build);
     match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {
         Ok(()) => {
             // Whole scratch directory — see normal.rs.

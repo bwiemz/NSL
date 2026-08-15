@@ -698,6 +698,10 @@ fn compile_returning_plan_impl(
     compiler.profile_capture_slot = capture_slot;
     install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
 
+    // Milestone A: log the entry module's decorators so the CLI can reconcile
+    // every requested surface against the disposition log after the compile.
+    crate::activation::note_entry_module_decorators(ast, interner);
+
     // M52: load weights if --weights was provided.
     load_and_register_weights_if_needed(&mut compiler, options)?;
 
@@ -1497,6 +1501,11 @@ pub fn compile_entry_returning_plan(
     install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
     compiler.dump_ir = dump_ir;
 
+    // Milestone A: log the entry module's decorators for post-compile
+    // reconciliation — entry module only; imported modules' decorators are
+    // the library author's requests (see activation.rs).
+    crate::activation::note_entry_module_decorators(ast, interner);
+
     // M52 / CPDT Phase 1: load weights if --weights was provided.  Load-bearing
     // for the multi-file build path: without this call, `compile_main` sees
     // `compiler.features.weight_map == None` and CPDT Phase 1 silently
@@ -1598,6 +1607,23 @@ pub fn compile_entry_returning_plan(
             entry.entry(field).or_insert(value);
         }
     }
+    // Milestone A (@cpdt fix): the single-file path has applied the `@cpdt`
+    // train-block decorator since §6.1 shipped, but THIS path — the one every
+    // program with an import takes, i.e. every real program — never did. The
+    // decorator validated cleanly and then configured nothing: `nsl build`
+    // and `nsl run` of `@cpdt(mode = off)` produced byte-identical binaries
+    // to the no-decorator control (PR #502 measured it; the activation
+    // reconciler now errors on it). Mirror the impl-path sequence exactly:
+    // decorator first (source config is authoritative), then the two
+    // CPDT MoE passes that read `compiler.cpdt_mode` — also absent here,
+    // which made `--cpdt` + `@moe` silently prune-free on multi-file builds.
+    let cpdt_decor_outcome = crate::cpdt_decorator::apply_cpdt_decorator_from_ast(
+        ast, interner, &mut compiler,
+    );
+    crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
+    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
+    crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen — see `compile_returning_plan` for the full rationale.
