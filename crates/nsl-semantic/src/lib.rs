@@ -34,6 +34,7 @@ pub mod sparse;
 pub mod sparse_layout;
 pub mod speculative;
 pub mod target;
+pub mod train_config;
 pub mod types;
 pub mod vmap;
 pub mod wggo;

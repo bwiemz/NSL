@@ -45,21 +45,18 @@ enum SourceAdParamDiagnosticKind {
 /// HOW a train block arrived at its `grad_accumulation` window — kept apart
 /// from the window VALUE because a diagnostic that says "1" needs to say why.
 ///
-/// `NonLiteral` is the interesting one: `train(..., grad_accumulation=GA)`
-/// with a `const GA = 4` parses, type-checks, and then lowers a window of
-/// **1**, because the config reader honours an `IntLiteral` only. That clamp
-/// is specified (`spec/05-training-loop.nsl.md` documents `distill` refusing a
-/// non-literal as the difference from `train`), so it stays — but a message
-/// that blames "the default when the train block omits it" for such a block
-/// sends the reader hunting for a line that is right there in the source.
+/// A `NonLiteral` variant used to live here: `train(..., grad_accumulation=GA)`
+/// with a `const GA = 4` parsed, type-checked, and then lowered a window of
+/// **1** with no diagnostic. The Training Configuration Contract
+/// (`nsl_semantic::train_config`) now REFUSES a non-literal window — the
+/// same contract `distill` always had — so a Literal here means the window
+/// is exactly what the source says.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GradAccumulationDecl {
     /// No `grad_accumulation=` in the train block's config at all.
     Omitted,
     /// Present as an integer literal — the window is what it says.
     Literal,
-    /// Present, but not an integer literal, so it was clamped to 1.
-    NonLiteral,
 }
 
 /// Item 12: result of analyzing whether a train-loop callback body touches
@@ -5962,97 +5959,49 @@ impl Compiler<'_> {
         let saved_borrowed_batch_symbols = state.borrowed_batch_symbols.clone();
 
         // ── 1. Extract config from train(...) args ──────────────────────
-        let mut model_sym: Option<nsl_ast::Symbol> = None;
-        let mut epochs: i64 = 1;
-        let mut grad_accumulation_steps: i64 = 1;
-        let mut grad_accumulation_decl = GradAccumulationDecl::Omitted;
-        let mut grad_clip: f64 = f64::MAX; // default: no clipping
-        // Milestone B: full-train-state checkpointing (θ + m/v + step).
-        // `checkpoint_save` + `checkpoint_every` write periodic checkpoints
-        // at optimizer-step boundaries; `checkpoint_load` resumes one at
-        // train start. String/int literals only — same contract as `epochs`.
-        let mut checkpoint_save_path: Option<String> = None;
-        let mut checkpoint_every: i64 = 0;
-        let mut checkpoint_load_path: Option<String> = None;
+        // The Training Configuration Contract: ONE resolver (in
+        // nsl-semantic, also called by `check_train_block` with spans)
+        // owns the closed key set, duplicate/positional refusals, and
+        // literal/range validation. The old inline match here ended in
+        // `_ => {} // ignore unknown config for forward compat` — a typo'd
+        // key silently trained with defaults, a non-literal
+        // grad_accumulation silently clamped to 1, a non-literal grad_clip
+        // vanished without a trace, and epochs=0 trained zero epochs.
+        // This call is the backstop for paths that bypass `nsl check`
+        // (notably the distill lowering's synthesized TrainBlock, which
+        // legitimately has no model= — the context carries it).
+        let purpose = if self.active_distill_context.is_some() {
+            nsl_semantic::train_config::TrainConfigPurpose::DistillLowering
+        } else {
+            nsl_semantic::train_config::TrainConfigPurpose::UserTrainBlock
+        };
+        let cfg = nsl_semantic::train_config::resolve_train_config(
+            train,
+            &|sym| self.resolve_sym(sym).to_string(),
+            purpose,
+        )
+        .map_err(|diags| {
+            let msgs: Vec<String> = diags.into_iter().map(|d| d.message).collect();
+            CodegenError::new(format!(
+                "train config refused: {}",
+                msgs.join("; ")
+            ))
+        })?;
 
-        for arg in &train.config {
-            if let Some(name_sym) = arg.name {
-                let name = self.resolve_sym(name_sym).to_string();
-                match name.as_str() {
-                    "model" => {
-                        if let ExprKind::Ident(sym) = &arg.value.kind {
-                            model_sym = Some(*sym);
-                        } else {
-                            return Err(CodegenError::new(
-                                "train 'model' arg must be an identifier",
-                            ));
-                        }
-                    }
-                    "epochs" => {
-                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                            epochs = *n;
-                        } else {
-                            return Err(CodegenError::new(
-                                "train 'epochs' arg must be an integer literal",
-                            ));
-                        }
-                    }
-                    "grad_accumulation" => {
-                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                            grad_accumulation_steps = (*n).max(1);
-                            grad_accumulation_decl = GradAccumulationDecl::Literal;
-                        } else {
-                            // Deliberately still a silent clamp — the spec
-                            // pins it (`spec/05-training-loop.nsl.md`, where
-                            // `distill`'s refusal is documented as the
-                            // DIFFERENCE from `train`), so tightening it is a
-                            // separate decision. Recorded, so a diagnostic
-                            // downstream can at least stop calling this
-                            // "omitted".
-                            grad_accumulation_decl = GradAccumulationDecl::NonLiteral;
-                        }
-                    }
-                    "grad_clip" => {
-                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                            grad_clip = *f;
-                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                            grad_clip = *n as f64;
-                        }
-                    }
-                    "checkpoint_save" => {
-                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
-                            checkpoint_save_path = Some(s.clone());
-                        } else {
-                            return Err(CodegenError::new(
-                                "train 'checkpoint_save' arg must be a string \
-                                 literal (file path)",
-                            ));
-                        }
-                    }
-                    "checkpoint_every" => {
-                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                            checkpoint_every = *n;
-                        } else {
-                            return Err(CodegenError::new(
-                                "train 'checkpoint_every' arg must be an integer \
-                                 literal (optimizer steps between checkpoints)",
-                            ));
-                        }
-                    }
-                    "checkpoint_load" => {
-                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
-                            checkpoint_load_path = Some(s.clone());
-                        } else {
-                            return Err(CodegenError::new(
-                                "train 'checkpoint_load' arg must be a string \
-                                 literal (file path)",
-                            ));
-                        }
-                    }
-                    _ => {} // ignore unknown config for forward compat
-                }
-            }
-        }
+        let mut model_sym: Option<nsl_ast::Symbol> = cfg.model;
+        let mut epochs: i64 = cfg.epochs;
+        let grad_accumulation_steps: i64 = cfg.grad_accumulation;
+        let grad_accumulation_decl = if cfg.grad_accumulation_explicit {
+            GradAccumulationDecl::Literal
+        } else {
+            GradAccumulationDecl::Omitted
+        };
+        let grad_clip: f64 = cfg.grad_clip.unwrap_or(f64::MAX); // MAX = no clipping
+        // Milestone B: full-train-state checkpointing (θ + m/v + step).
+        // Pairing (save↔every) already validated by the resolver.
+        let checkpoint_save_path: Option<String> = cfg.checkpoint_save;
+        let checkpoint_every: i64 = cfg.checkpoint_every;
+        let checkpoint_load_path: Option<String> = cfg.checkpoint_load;
 
         // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
         // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
@@ -6810,19 +6759,11 @@ impl Compiler<'_> {
                         GradAccumulationDecl::Omitted => {
                             format!("the {noun} omits grad_accumulation, so it defaults to 1")
                         }
+                        // A non-literal window is refused by the Training
+                        // Configuration Contract before this point (train and
+                        // distill alike), so Literal is exact.
                         GradAccumulationDecl::Literal => {
                             format!("the {noun} sets grad_accumulation to 1")
-                        }
-                        // Train-only by construction: `cpkd::distill_as_train_block`
-                        // refuses a non-literal window before this point, so
-                        // this arm cannot describe a distill block.
-                        GradAccumulationDecl::NonLiteral => {
-                            "the train block sets grad_accumulation to a \
-                             non-literal expression, which the train path \
-                             reads as 1 — only an integer literal is honoured \
-                             here (`distill` refuses one instead; see \
-                             spec/05-training-loop.nsl.md)"
-                                .to_string()
                         }
                     };
                     (
@@ -17855,7 +17796,25 @@ impl Compiler<'_> {
         )?;
 
         // ── 2. Extract config from train(...) args ──────────────────────
-        let mut model_sym: Option<nsl_ast::Symbol> = None;
+        // Same Training Configuration Contract as the standard path: the
+        // old scan here read ONLY `model=` and accepted everything else
+        // unvalidated — under @pipeline a typo'd key (or a duplicate)
+        // was doubly invisible. NOTE: epochs/grad_accumulation/grad_clip
+        // are still accepted-but-inert on this lowering path (no epoch
+        // loop exists; micro-batches are hardcoded below) — a known
+        // contract gap tracked for the pipelined path's own change; the
+        // resolver at least guarantees the keys are well-formed and the
+        // namespace closed.
+        let pipe_cfg = nsl_semantic::train_config::resolve_train_config(
+            train,
+            &|sym| self.resolve_sym(sym).to_string(),
+            nsl_semantic::train_config::TrainConfigPurpose::UserTrainBlock,
+        )
+        .map_err(|diags| {
+            let msgs: Vec<String> = diags.into_iter().map(|d| d.message).collect();
+            CodegenError::new(format!("train config refused: {}", msgs.join("; ")))
+        })?;
+        let model_sym: Option<nsl_ast::Symbol> = pipe_cfg.model;
         let mut optimizer_name = String::new();
         let mut lr_value: f64 = 0.01;
         let mut momentum_value: f64 = 0.0;
@@ -17869,17 +17828,6 @@ impl Compiler<'_> {
         let mut beta2_value: f64 = 0.999;
         let mut eps_value: f64 = 1e-8;
         let mut step_body: Option<(&nsl_ast::stmt::Block, nsl_ast::Symbol)> = None;
-
-        for arg in &train.config {
-            if let Some(name_sym) = arg.name {
-                let name = self.resolve_sym(name_sym).to_string();
-                if name == "model" {
-                    if let ExprKind::Ident(sym) = &arg.value.kind {
-                        model_sym = Some(*sym);
-                    }
-                }
-            }
-        }
 
         for section in &train.sections {
             match section {

@@ -2404,3 +2404,180 @@ train(model = m, epochs = 1):
         "absent @pca must leave the collection empty"
     );
 }
+
+// -----------------------------------------------------------------------
+// Training Configuration Contract (train_config.rs): the train(...) key
+// namespace is CLOSED at check time. Each test wraps one violation in an
+// otherwise-valid program; the valid-control test pins that the closed
+// set is not over-broad (the cpkd guard-test pattern).
+// -----------------------------------------------------------------------
+
+/// A minimal valid program with `{header}` spliced as the train header.
+fn train_fixture(header: &str) -> String {
+    format!(
+        r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+{header}
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#
+    )
+}
+
+fn train_config_errors(header: &str) -> Vec<String> {
+    check_source(&train_fixture(header))
+        .into_iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn train_unknown_key_is_refused_at_check_time() {
+    // The motivating typo: epochz=8 used to type-check clean and lower
+    // with epochs' DEFAULT — a silently different training run.
+    let errs = train_config_errors("train(model = m, epochz = 8):");
+    assert!(
+        errs.iter().any(|m| m.contains("unknown train config key 'epochz'")),
+        "expected unknown-key refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_duplicate_key_is_refused() {
+    let errs = train_config_errors("train(model = m, epochs = 2, epochs = 3):");
+    assert!(
+        errs.iter().any(|m| m.contains("duplicate train config key 'epochs'")),
+        "expected duplicate-key refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_positional_config_arg_is_refused() {
+    // `train(m, 5):` used to parse and silently ignore BOTH args (every
+    // consumer guarded `if let Some(name) = arg.name`).
+    let errs = train_config_errors("train(m, 5):");
+    assert!(
+        errs.iter().any(|m| m.contains("named arguments only")),
+        "expected positional-arg refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_epochs_zero_and_negative_are_refused() {
+    let errs = train_config_errors("train(model = m, epochs = 0):");
+    assert!(
+        errs.iter().any(|m| m.contains("'epochs' must be >= 1")),
+        "epochs=0 used to silently train zero epochs; got {errs:?}"
+    );
+    let errs = train_config_errors("train(model = m, epochs = -3):");
+    assert!(
+        errs.iter().any(|m| m.contains("'epochs' must be >= 1")),
+        "negative epochs must refuse, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_non_literal_epochs_is_refused_at_check_time() {
+    // Previously refused only at CODEGEN ("nsl check" was green) — the
+    // layer asymmetry cpkd_distill_e2e documents. Both layers agree now.
+    let errs = train_config_errors("train(model = m, epochs = n_ep):");
+    assert!(
+        errs.iter().any(|m| m.contains("'epochs' must be an integer literal")),
+        "expected non-literal epochs refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_non_literal_grad_accumulation_is_refused_not_clamped() {
+    // The old behavior silently clamped to 1 (accumulation OFF while the
+    // source asked for it) — recorded as GradAccumulationDecl::NonLiteral
+    // but never surfaced.
+    let errs = train_config_errors("train(model = m, grad_accumulation = ga):");
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("'grad_accumulation' must be a positive integer literal")),
+        "expected non-literal grad_accumulation refusal, got {errs:?}"
+    );
+    let errs = train_config_errors("train(model = m, grad_accumulation = 0):");
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("'grad_accumulation' must be a positive integer literal")),
+        "grad_accumulation=0 used to silently clamp to 1, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_grad_clip_zero_negative_and_non_literal_are_refused() {
+    // grad_clip=0 zeroes every gradient each step (training silently
+    // frozen); negative flips gradient signs; a non-literal used to be the
+    // one key with a FULLY silent bad-value path (no else arm at all).
+    let errs = train_config_errors("train(model = m, grad_clip = 0.0):");
+    assert!(
+        errs.iter().any(|m| m.contains("'grad_clip' must be > 0")),
+        "grad_clip=0 must refuse, got {errs:?}"
+    );
+    let errs = train_config_errors("train(model = m, grad_clip = -1.0):");
+    assert!(
+        errs.iter().any(|m| m.contains("'grad_clip' must be > 0")),
+        "negative grad_clip must refuse, got {errs:?}"
+    );
+    let errs = train_config_errors("train(model = m, grad_clip = gc):");
+    assert!(
+        errs.iter().any(|m| m.contains("'grad_clip' must be a numeric literal")),
+        "non-literal grad_clip must refuse, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_checkpoint_pairing_is_enforced_both_directions() {
+    let errs =
+        train_config_errors(r#"train(model = m, checkpoint_save = "ck.nslm"):"#);
+    assert!(
+        errs.iter().any(|m| m.contains("requires checkpoint_every")),
+        "save without cadence must refuse, got {errs:?}"
+    );
+    let errs = train_config_errors("train(model = m, checkpoint_every = 5):");
+    assert!(
+        errs.iter().any(|m| m.contains("without checkpoint_save= is inert")),
+        "cadence without save used to be silently inert, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_missing_model_is_refused_at_check_time() {
+    // Previously only caught at codegen; `nsl check` was green.
+    let errs = train_config_errors("train(epochs = 2):");
+    assert!(
+        errs.iter().any(|m| m.contains("requires a 'model' config arg")),
+        "expected missing-model refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_valid_full_header_produces_no_config_errors() {
+    // Anti-overbreadth control: every accepted key, all valid — the
+    // contract must not fire (the cpkd guard-test pattern: pin the error's
+    // ABSENCE on valid programs).
+    let errs = train_config_errors(
+        r#"train(model = m, epochs = 2, grad_accumulation = 4, grad_clip = 1.0, checkpoint_save = "ck.nslm", checkpoint_every = 5, checkpoint_load = "ck.nslm"):"#,
+    );
+    let config_errs: Vec<_> = errs
+        .iter()
+        .filter(|m| m.contains("train config") || m.contains("train '"))
+        .collect();
+    assert!(
+        config_errs.is_empty(),
+        "valid header must produce no contract errors, got {config_errs:?}"
+    );
+}

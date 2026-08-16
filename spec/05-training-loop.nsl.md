@@ -425,13 +425,20 @@ Semantics and constraints (v1):
   optimizer-moment precision.)
 - `grad_accumulation = N` is accepted on the header and means exactly what it
   means on `train`: the step body runs per micro-batch and the optimizer fires
-  every `N`. Unlike `train` it is refused rather than clamped when it is not a
-  positive integer literal — a silently-clamped window is indistinguishable
-  from having no window, which strands the FASE-Deferred envelope (and with
-  it CPDT's optimizer-moment precision plan) with no diagnostic.
-- `epochs = N` must likewise be an integer literal, and is refused rather than
-  defaulted. `train` already hard-errors on a non-literal; `distill` used to
-  accept the expression and then train ONE epoch, reporting `Epochs: 1`.
+  every `N`. It is refused when it is not a positive integer literal — a
+  silently-clamped window is indistinguishable from having no window, which
+  strands the FASE-Deferred envelope (and with it CPDT's optimizer-moment
+  precision plan) with no diagnostic. (`train` historically CLAMPED a
+  non-literal to 1 while `distill` refused; the Training Configuration
+  Contract closed that asymmetry — both refuse, and `train`'s whole config
+  namespace is closed: unknown keys, duplicate keys, positional args,
+  `epochs < 1`, non-positive `grad_clip`, and an unpaired
+  `checkpoint_save`/`checkpoint_every` are all compile errors at
+  `nsl check` time. See `nsl_semantic::train_config`.)
+- `epochs = N` must likewise be an integer literal `>= 1`, and is refused
+  rather than defaulted — on both blocks. (`distill` used to accept the
+  expression and then train ONE epoch, reporting `Epochs: 1`; `train` used
+  to accept `epochs = 0` and silently train nothing.)
 - A `distill` block is a training loop, and the module-level analyses that
   decide how it trains now see it as one: `nsl check --training-report`
   reports its FASE plan under `Kind: distill` with the student as `Model:`,

@@ -16,6 +16,21 @@ impl<'a> TypeChecker<'a> {
             self.check_expr(&arg.value);
         }
 
+        // The Training Configuration Contract: keys validated against the
+        // closed set, duplicates/positional args refused, values
+        // literal- and range-checked — at CHECK time, with spans. Codegen
+        // calls the same resolver again as its backstop, so the two layers
+        // cannot disagree (the pre-contract asymmetry — `nsl check` green
+        // on headers `nsl build` refused, and vice versa — was the bug;
+        // see crate::train_config's module doc).
+        if let Err(diags) = crate::train_config::resolve_train_config(
+            train,
+            &|sym| self.resolve_name(sym),
+            crate::train_config::TrainConfigPurpose::UserTrainBlock,
+        ) {
+            self.diagnostics.extend(diags);
+        }
+
         let mut has_step = false;
 
         for section in &train.sections {
