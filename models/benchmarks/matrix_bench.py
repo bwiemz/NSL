@@ -257,6 +257,91 @@ ARMS = {
                  "csla_layerwise_gate asserts `fused-ce tape-carry: 1 slots` "
                  "on layerwise arms",
             accum=2, grad_clip=False),
+        Arm("layerwise_srbf16_fusedce_rn",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--param-dtype", "bf16-sr",
+             "--fuse-lm-head", "require", "--fuse-rmsnorm-backward"),
+            (), "tf32",
+            what="`layerwise_srbf16_fusedce` plus the fused RMSNorm backward. "
+                 "The decomposed dx/dgamma backward holds full [rows, cols] "
+                 "temporaries (~1 GB of the mb2 activation peak as rmsnorm_f32 "
+                 "+ part of the add/mul context bytes); the fusion removes "
+                 "them and -37% backward launches (#403). Changes arithmetic "
+                 "within f32 tolerance — loss parity at the repo's 3-4 dp "
+                 "standard, not bit-exact vs the unfused arm",
+            accum=2, grad_clip=False),
+        Arm("layerwise_srbf16_fusedce_rn_s2",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--param-dtype", "bf16-sr",
+             "--fuse-lm-head", "require", "--fuse-rmsnorm-backward",
+             "--checkpoint-stride", "2"),
+            (), "tf32",
+            what="`..._rn` plus --checkpoint-stride 2: halves the saved block-"
+                 "boundary surface the CSLA window buffers per micro-batch, "
+                 "recomputing 2-block spans instead. Bit-exact vs stride 1 by "
+                 "the stride contract; the trade is recompute time for the "
+                 "Milestone B safety margin",
+            accum=2, grad_clip=False),
+        Arm("layerwise_srbf16_fusedce_oso",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--param-dtype", "bf16-sr",
+             "--fuse-lm-head", "require", "--optim-state-offload"),
+            (), "tf32",
+            what="`layerwise_srbf16_fusedce` plus host-resident optimizer "
+                 "moments. The fused arm fits microbatch 2 with only ~1.4 GB "
+                 "of driver headroom; the f32 moments are 8.00 GB of the "
+                 "peak. This arm measures what offloading them buys in "
+                 "margin and costs in step time — the Milestone B safety-"
+                 "margin lever. Composition already certified by "
+                 "csla_fused_lmce_streams_gpu",
+            accum=2, grad_clip=False),
+        Arm("layerwise_f32_fusedce",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--fuse-lm-head", "require"),
+            (("NSL_WS_RESIDENT", "1"),),
+            what="`layerwise_policy` (f32, residency ON) plus the fused LM "
+                 "head: the reference-dtype arm at the fused-CE composition. "
+                 "Exists so the Milestone B F32 reference trajectory runs "
+                 "the same schedule as the SR-BF16 arm; also answers whether "
+                 "f32 weights (4.02 vs 2.20 GB) still fit at microbatch 2 "
+                 "once the logits surface is fused away",
+            accum=2, grad_clip=False),
+        Arm("layerwise_f32_fusedce_rn",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--fuse-lm-head", "require",
+             "--fuse-rmsnorm-backward"),
+            (("NSL_WS_RESIDENT", "1"),),
+            what="the Milestone B F32 reference arm: `layerwise_f32_fusedce` "
+                 "plus the fused RMSNorm backward, mirroring the SR-BF16 "
+                 "endurance arm flag-for-flag except the storage dtype. "
+                 "endurance_1b.py banks this arm's trajectory next to the "
+                 "SR-BF16 one",
+            accum=2, grad_clip=False),
+        Arm("layerwise_f32_fusedce_rn_oso",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--fuse-lm-head", "require",
+             "--fuse-rmsnorm-backward", "--optim-state-offload"),
+            (("NSL_WS_RESIDENT", "1"),),
+            what="the Milestone B F32 reference arm, moments host-resident. "
+                 "f32 weights cost +1.8 GB over bf16-sr and put the resident "
+                 "arm's driver peak within ambient-desktop reach; offloading "
+                 "the 8 GB of f32 m/v buys the reference trajectory a wide "
+                 "margin at a step-time cost the reference arm can afford. "
+                 "Offload staging is byte-preserving (D2a: bit-exact vs the "
+                 "resident baseline), so the trajectory is the same one the "
+                 "resident arm would produce. Composition certified by "
+                 "csla_fused_lmce_streams_gpu",
+            accum=2, grad_clip=False),
+        Arm("layerwise_f32_fusedce_rn_s2",
+            ("--source-ad", "--checkpoint-blocks", "--layerwise-accum",
+             "--weight-stream", "--fuse-lm-head", "require",
+             "--fuse-rmsnorm-backward", "--checkpoint-stride", "2"),
+            (("NSL_WS_RESIDENT", "1"),),
+            what="the F32 reference at the full Milestone B lever stack "
+                 "(+stride 2). The fallback F32 trajectory arm if plain "
+                 "`_rn` does not clear microbatch 2 with margin — f32 "
+                 "weights cost +1.8 GB over bf16-sr",
+            accum=2, grad_clip=False),
         Arm("fp32", ("--source-ad",), (("NSL_MATMUL_TF32", "0"),), "fp32",
             what="full-f32 matmul (TF32 tensor cores off)"),
         Arm("tf32", ("--source-ad",), (), "tf32",
@@ -291,7 +376,12 @@ MATRIX = [
     ("1b", 2048, None, ["reference", "optimized", "layerwise",
                         "layerwise_policy", "layerwise_resident",
                         "layerwise_resident_srbf16",
-                        "layerwise_srbf16_fusedce"]),
+                        "layerwise_srbf16_fusedce",
+                        # Milestone B canonical + F32 reference arms — also
+                        # the endurance_1b.py defaults; listed here so the
+                        # standardized matrix exercises them too.
+                        "layerwise_srbf16_fusedce_rn",
+                        "layerwise_f32_fusedce_rn_s2"]),
 ]
 
 

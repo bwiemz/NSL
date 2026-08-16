@@ -1,0 +1,109 @@
+# models/coder1b/pretrain_1b2048.nsl
+#
+# Milestone B: THE canonical 1B@2048 single-GPU workload. One file that IS
+# the configuration the milestone certifies — microbatch 2, seq 2048,
+# grad_accumulation 2 (8,192 tokens per optimizer step), AdamW, periodic
+# full-train-state checkpoints — with its witnesses printed in-program so
+# any run of it is self-documenting.
+#
+# CANONICAL INVOCATION (the harness passes exactly these; `require` NOT
+# `auto`, so a run where the fused LM head cannot engage is a COMPILE error
+# rather than a silent 768 MB/microbatch logits regression):
+#
+#   nsl run --source-ad --checkpoint-blocks --layerwise-accum \
+#           --weight-stream --param-dtype bf16-sr \
+#           --fuse-lm-head require --fuse-rmsnorm-backward \
+#           models/coder1b/pretrain_1b2048.nsl
+#
+# The F32 reference arm drops `--param-dtype bf16-sr` and keeps everything
+# else. Exercised end to end (build, run, witness assertions, VRAM-flatness
+# check, checkpoint/restart) by models/benchmarks/endurance_1b.py.
+#
+# Harness markers (exact string rewrites, same convention as
+# pretrain_srbf16_cert.nsl — a missing rewrite is a hard error in the
+# harness):
+#   B2048_TOKENS_PATH  -> u16 token stream (load_mmap kind 3)
+#   B2048_CKPT_ARGS    -> either
+#       `, checkpoint_save = "b2048.ckpt.nslm", checkpoint_every = 50`
+#     or, for the resume phase,
+#       `, checkpoint_load = "b2048.ckpt.nslm"`
+#
+# Witness contract (asserted by the harness, greppable by hand):
+#   compile stderr : [lm-head-fusion] inferred: vocab=49152 hidden=2048 ...
+#                    [csla] fused-ce tape-carry: 1 slots
+#   run stdout     : WITNESS_* blocks below — fused-CE launch counters
+#                    (runtime proof the fused kernels FIRED, not just
+#                    compiled), the residency posture + weight-traffic bill
+#                    from weight_stream_stat, and the allocator peak with
+#                    its per-surface at-peak decomposition.
+#   run stderr     : [checkpoint] saved: ... / [checkpoint] resumed: ...
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+let tokens = load_mmap("B2048_TOKENS_PATH", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+print("B2048_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2 B2048_CKPT_ARGS):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+            print(gpu_peak_bytes())
+
+# ── Witness block: the run proves its own posture ────────────────────────
+# Fused-CE launch counters (0 fwd, 1 fwd_large, 2 bwd, 3 fwd_gemm,
+# 4 bwd_gemm). "Proven active" = fwd + bwd counters > 0 at runtime, on top
+# of `require`'s compile-time guarantee.
+print("WITNESS_FUSED_LCE_BEGIN")
+print(fused_lce_launch_count(0))
+print(fused_lce_launch_count(1))
+print(fused_lce_launch_count(2))
+print(fused_lce_launch_count(3))
+print(fused_lce_launch_count(4))
+print("WITNESS_FUSED_LCE_END")
+
+# Weight-stream stat surface (kinds documented on nsl_weight_stream_stat):
+# 0 h2d traffic B, 1 d2h traffic B, 2 pinned, 3 pinned B, 4 streamed B,
+# 5 reserve B, 6 must_free B, 7 free-at-decision B, 8 LIVE total VRAM B,
+# 9 registered. Kinds 5-7 read -1 on the SR-BF16 arm — bf16-sr owns its
+# residency (registration bypasses the policy), so the modeled-decision
+# record belongs to the F32 reference arm; kind 8 is live and valid on both.
+print("WITNESS_WEIGHT_STREAM_BEGIN")
+print(weight_stream_stat(0))
+print(weight_stream_stat(1))
+print(weight_stream_stat(2))
+print(weight_stream_stat(3))
+print(weight_stream_stat(4))
+print(weight_stream_stat(5))
+print(weight_stream_stat(6))
+print(weight_stream_stat(7))
+print(weight_stream_stat(8))
+print(weight_stream_stat(9))
+print("WITNESS_WEIGHT_STREAM_END")
+
+# Allocator truth: global high-water + its per-surface decomposition AT the
+# peak (sums to the peak — the step-boundary [gpu-mem] samples do not).
+# Surfaces: 1 weights, 2 optim_m, 3 optim_v, 4 m_partial, 6 activations.
+print("WITNESS_PEAK_BEGIN")
+print(gpu_peak_bytes())
+print(gpu_surface_at_peak_bytes(1))
+print(gpu_surface_at_peak_bytes(2))
+print(gpu_surface_at_peak_bytes(3))
+print(gpu_surface_at_peak_bytes(4))
+print(gpu_surface_at_peak_bytes(6))
+print("WITNESS_PEAK_END")
+
+print("B2048_COMPLETE")

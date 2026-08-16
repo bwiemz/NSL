@@ -161,6 +161,19 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // Milestone B: weight-stream stat surface (kind 0 = H2D traffic bytes,
+    // 1 = D2H traffic bytes, 2 = pinned count, 3 = pinned bytes,
+    // 4 = streamed storage bytes, 5 = plan reserve, 6 = plan must_free,
+    // 7 = plan free-at-decision, 8 = LIVE total device VRAM,
+    // 9 = registered). Kinds 5-7 return -1 until the residency decision ran.
+    def(
+        "weight_stream_stat",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
     def(
         "gpu_surface_at_peak_bytes",
         Type::Function {

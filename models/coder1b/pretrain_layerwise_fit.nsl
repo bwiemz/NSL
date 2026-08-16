@@ -35,9 +35,14 @@ print("Model on GPU")
 #   - batch=1, accum=8: OOM mid-window — the D1a window buffers hold every
 #     adjoint-read value per micro-batch, and the materialized CE logits
 #     (512 x vocab f32 per micro-batch) dominate: ~8 x ~150 MiB on top of a
-#     ~15 GiB-committed card. @fused_lm_ce would remove the logits surface
-#     but is refused under --layerwise-accum until its cast cache is
-#     tape-carried.
+#     ~15 GiB-committed card. @fused_lm_ce would remove the logits surface.
+#     [STALE CLAIM REMOVED 2026-08-15: this header said the fused LM head
+#     "is refused under --layerwise-accum until its cast cache is
+#     tape-carried". False since the fce tape-carry landed —
+#     csla_layerwise_gate asserts `[csla] fused-ce tape-carry: 1 slots` on
+#     layerwise arms, and `--fuse-lm-head require` composes with
+#     --layerwise-accum + --param-dtype bf16-sr (SRBF16_1B_2026_08_08.md);
+#     at 1B@2048 it is what moves the microbatch ceiling from 1 to 2.]
 #   - batch=1, accum=2, seq=512: STILL OOM in the first forward — the
 #     seq-512 working set (attention chain + the 512 x 49152 CE logits
 #     chain) does not fit the ~2.5 GiB left beside 12.3 GiB of resident

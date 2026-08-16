@@ -766,6 +766,28 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64],
         None,
     ),
+    // Milestone B: full training-state checkpoint (θ .nslm + .optim sidecar
+    // with m/v moments + micro-batch step counter). Save: (path_ptr,
+    // path_len, names_list, param_list, state_list_1, state_list_2,
+    // step_count). Load returns the saved step counter.
+    (
+        "nsl_train_checkpoint_save",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        None,
+    ),
+    (
+        "nsl_train_checkpoint_load",
+        &[types::I64, types::I64, types::I64, types::I64, types::I64],
+        Some(types::I64),
+    ),
     // Scalar math (M14)
     ("nsl_floor", &[types::F64], Some(types::F64)),
     // Activation functions (M15)
@@ -3068,6 +3090,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // forward, 1 = forward_large, 2 = backward) — NSL-callable as
     // fused_lce_launch_count(k).
     ("nsl_fused_lce_launch_count", &[types::I64], Some(types::I64)),
+    // Milestone B: weight-stream stat surface — NSL-callable as
+    // weight_stream_stat(kind); kinds documented on the runtime fn.
+    ("nsl_weight_stream_stat", &[types::I64], Some(types::I64)),
     // Fused-CE targets dtype bridge: the kernels read targets as s64 but
     // NSL GPU labels are f32 — materialize/free a device i64 copy around
     // each fused forward/backward FFI.

@@ -370,7 +370,11 @@ pub(crate) fn srbf16_upload(tensor_ptr: i64) {
     };
     crate::cuda::inner::ensure_context();
     // Same surface as the mirror it widens: this buffer holds theta, not an
-    // activation, and it is what the forward reads as the parameter.
+    // activation, and it is what the forward reads as the parameter. Name
+    // the OOM context too — the thread-local otherwise still holds whatever
+    // kernel launched last, and 3.6 GB of working views once appeared in the
+    // context table as `nsl_div_f32` (a stale tag, not div outputs).
+    crate::cuda::inner::set_oom_context("srbf16_widen_view");
     let dev = with_weights_surface(|| crate::cuda::inner::alloc_managed(m.len * 4));
     crate::cuda::gpu_cast_raw_bf16_to_f32(m.dev_bf16, dev as u64, m.len);
     drop(guard);

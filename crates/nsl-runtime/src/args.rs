@@ -113,6 +113,22 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
+    // Milestone B: machine-readable residency-decision record. When
+    // NSL_WS_DECISION_JSON=<path>, an atexit writes the policy's inputs and
+    // outcome as JSON — the decision existed only as a human stderr line
+    // before, so no artifact could bank WHY the policy pinned what it pinned.
+    if let Ok(path) = std::env::var("NSL_WS_DECISION_JSON") {
+        if !path.is_empty() {
+            *WS_DECISION_JSON_PATH.lock().unwrap() = Some(path);
+            extern "C" {
+                fn atexit(cb: extern "C" fn()) -> i32;
+            }
+            unsafe {
+                atexit(nsl_ws_decision_json_atexit);
+            }
+        }
+    }
+
     // D3 (ZeRO-1): collective counts, enabled when NSL_ZERO_COUNTER=1. The
     // parity gate asserts EXACT all_reduce/broadcast totals — with
     // replicated data a no-op reduce is otherwise invisible (identical
@@ -173,13 +189,62 @@ extern "C" fn nsl_zero_count_atexit() {
     let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
+/// Target path for the residency-decision JSON, set once at reporter setup.
+/// A static because `atexit` callbacks take no arguments.
+static WS_DECISION_JSON_PATH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+extern "C" fn nsl_ws_decision_json_atexit() {
+    let Some(path) = WS_DECISION_JSON_PATH.lock().unwrap().clone() else {
+        return;
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let ld = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed);
+    let total = ld(&crate::weight_stream::WS_PLAN_TOTAL);
+    let decided = total != u64::MAX;
+    // Plan fields are meaningful only after a decision ran; emit them as
+    // JSON null otherwise so a consumer cannot mistake "never decided" for
+    // "reserve was 0". Hand-built JSON — the repo convention (checkpoint.rs).
+    let plan_fields = if decided {
+        format!(
+            "\"reserve_bytes\":{},\"must_free_bytes\":{},\"free_at_decision_bytes\":{},\
+             \"total_vram_bytes\":{}",
+            ld(&crate::weight_stream::WS_PLAN_RESERVE),
+            ld(&crate::weight_stream::WS_PLAN_MUST_FREE),
+            ld(&crate::weight_stream::WS_PLAN_FREE_AT_DECISION),
+            total,
+        )
+    } else {
+        "\"reserve_bytes\":null,\"must_free_bytes\":null,\"free_at_decision_bytes\":null,\
+         \"total_vram_bytes\":null"
+            .to_string()
+    };
+    let json = format!(
+        "{{\"decided\":{},\"registered\":{},\"pinned\":{},\"pinned_bytes\":{},\
+         \"streamed_bytes\":{},\"h2d_traffic_bytes\":{},\"d2h_traffic_bytes\":{},{}}}\n",
+        decided,
+        ld(&crate::weight_stream::WS_REGISTERED),
+        ld(&crate::weight_stream::WS_PINNED),
+        ld(&crate::weight_stream::WS_PINNED_BYTES),
+        ld(&crate::weight_stream::WS_STREAMED_BYTES),
+        ld(&crate::weight_stream::WS_H2D_TRAFFIC_BYTES),
+        ld(&crate::weight_stream::WS_D2H_TRAFFIC_BYTES),
+        plan_fields,
+    );
+    if let Err(e) = std::fs::write(&path, json) {
+        eprintln!("[weight-stream] warning: could not write decision json to {path}: {e}");
+    }
+}
+
 extern "C" fn nsl_weight_stream_count_atexit() {
     // Item 10: pack_uploads/pack_evicts count contiguous-layer-pack transfers
     // (arena mode). In per-param mode both are 0; in arena mode they are far
     // below uploads/evicts — the batching evidence the arena gate asserts.
+    // h2d_bytes/d2h_bytes are APPENDED (Milestone B traffic counters, exact
+    // bytes) — the zero-line lore above applies here too: existing gates
+    // strip_prefix-then-parse leading fields, so new fields go at the END.
     eprintln!(
         "[weight-stream] uploads: {} evicts: {} writeback: {} registered: {} ptr_moves: {} \
-         pack_uploads: {} pack_evicts: {} prefetches: {} async_wb: {}",
+         pack_uploads: {} pack_evicts: {} prefetches: {} async_wb: {} h2d_bytes: {} d2h_bytes: {}",
         crate::weight_stream::WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_EVICTS_WB.load(std::sync::atomic::Ordering::Relaxed),
@@ -189,6 +254,8 @@ extern "C" fn nsl_weight_stream_count_atexit() {
         crate::weight_stream::WS_PACK_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_PREFETCHES.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_ASYNC_WB.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_H2D_TRAFFIC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_D2H_TRAFFIC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
     );
     // Capacity-aware residency posture. Its OWN line, never appended fields:
     // the counters line above is consumed by strip_prefix-then-parse gates.
