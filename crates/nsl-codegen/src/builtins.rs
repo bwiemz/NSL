@@ -864,6 +864,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
+    // Source-AD dropout forward: returns an NslList [out, mask] so the
+    // compiled backward can consume the exact RNG mask (two-op split,
+    // wengert.rs DropoutMask).
+    (
+        "nsl_tensor_dropout_fwd_mask",
+        &[types::I64, types::F64],
+        Some(types::I64),
+    ),
     (
         "nsl_tensor_conv2d",
         &[

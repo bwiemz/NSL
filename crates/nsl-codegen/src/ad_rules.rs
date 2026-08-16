@@ -522,19 +522,30 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }
 
         // --- Dropout ---
-        PrimalOp::Dropout { p } => vec![InputAdjoint {
-            input_var: op.inputs[0],
-            // inputs[1] is the dropout mask (saved from forward)
-            expr: AdjointExpr::DropoutBackward(
-                output_bar,
-                if op.inputs.len() > 1 {
-                    op.inputs[1]
-                } else {
-                    op.inputs[0]
-                },
-                1.0 / (1.0 - p),
-            ),
-        }],
+        // Two-op split (see wengert.rs): `DropoutMask` draws the RNG
+        // keep-mask (result = mask, inputs = [x]); `Dropout` applies it
+        // (result = out, inputs = [x, mask]). inputs[1] is genuinely the
+        // exact forward mask here — the pre-split layout put the raw call
+        // args at inputs, so this rule multiplied the gradient by the p
+        // ARGUMENT var (dx = dy·p/(1-p), decorrelated from the forward);
+        // pinned wrong until 2026-08-16, now gated by
+        // `dropout_backward_parity_gate`.
+        PrimalOp::Dropout { p } => {
+            let mask = *op.inputs.get(1).unwrap_or_else(|| {
+                panic!(
+                    "PrimalOp::Dropout requires inputs [x, mask] — got {} \
+                     input(s). The extraction two-op split must emit \
+                     DropoutMask first (wengert.rs)",
+                    op.inputs.len()
+                )
+            });
+            vec![InputAdjoint {
+                input_var: op.inputs[0],
+                expr: AdjointExpr::DropoutBackward(output_bar, mask, 1.0 / (1.0 - p)),
+            }]
+        }
+        // The mask is an RNG draw — no gradient flows through it to x.
+        PrimalOp::DropoutMask { .. } => vec![],
 
         // --- Indexing ---
         PrimalOp::Embedding => vec![InputAdjoint {
@@ -969,6 +980,12 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::LogSoftmax { .. }
         | PrimalOp::MaxPool2d { .. } => SavedRequirement::Output,
 
+        // The mask op's OUTPUT is what the paired Dropout's backward
+        // multiplies by (DropoutBackward reads the mask var, which is this
+        // op's result). The RNG draw is not replayable, so the mask must
+        // survive to the backward.
+        PrimalOp::DropoutMask { .. } => SavedRequirement::Output,
+
         // Non-differentiable — nothing needed
         PrimalOp::Condition(_) => SavedRequirement::Nothing,
         _ => SavedRequirement::Nothing,
@@ -1307,13 +1324,18 @@ mod tests {
 
     #[test]
     fn test_dropout_backward() {
+        // Two-op split layout: inputs = [x, mask] where mask is the paired
+        // DropoutMask op's result — the EXACT forward RNG mask, an SSA var.
+        // (Before 2026-08-16 extraction put the raw call args here, so
+        // "inputs[1]" was the p ARGUMENT var and this test pinned a wrong
+        // wiring as correct.)
         let op = make_op(2, PrimalOp::Dropout { p: 0.1 }, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         match &adj[0].expr {
             AdjointExpr::DropoutBackward(y_bar, mask, scale) => {
                 assert_eq!(*y_bar, 100);
-                assert_eq!(*mask, 1); // inputs[1] = mask
+                assert_eq!(*mask, 1); // inputs[1] = the DropoutMask result
                 assert!((scale - 1.0 / 0.9).abs() < 1e-6); // 1/(1-0.1)
             }
             other => panic!("Expected DropoutBackward, got {:?}", other),
@@ -1322,6 +1344,27 @@ mod tests {
             saved_for_backward(&PrimalOp::Dropout { p: 0.1 }),
             SavedRequirement::Inputs
         );
+    }
+
+    #[test]
+    fn test_dropout_mask_has_no_adjoint_and_saves_output() {
+        // The mask is an RNG draw: no gradient flows through it to x, and
+        // its OUTPUT (the mask tensor) must survive to the backward.
+        let op = make_op(1, PrimalOp::DropoutMask { p: 0.5 }, vec![0]);
+        assert!(apply_ad_rule(&op, 100).is_empty());
+        assert_eq!(
+            saved_for_backward(&PrimalOp::DropoutMask { p: 0.5 }),
+            SavedRequirement::Output
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "requires inputs [x, mask]")]
+    fn test_dropout_without_mask_input_panics() {
+        // A 1-input Dropout op is malformed post-split: the old rule fell
+        // back to multiplying the gradient by x ITSELF — silently wrong.
+        let op = make_op(1, PrimalOp::Dropout { p: 0.1 }, vec![0]);
+        let _ = apply_ad_rule(&op, 100);
     }
 
     #[test]

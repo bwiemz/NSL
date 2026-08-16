@@ -407,6 +407,17 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the Milestone A reconciler reported a requested surface's outcome \
          (applied / declined / witnessed / UNSATISFIED)",
     ),
+    m(
+        "[source-ad]",
+        &[
+            "crates/nsl-codegen/src/source_ad.rs",
+            "crates/nsl-codegen/src/wengert_lower.rs",
+        ],
+        "a source-AD extraction/lowering diagnostic (extraction failures, \
+         unresolved VarIds, CSHA claims). The dropout parity gate asserts the \
+         NEGATIVE form: the pre-2026-08-16 wrong-backward warning must never \
+         return (see its NEGATIVE_NEEDLES tombstone entry)",
+    ),
 ];
 
 /// Look a marker up by token. Panics if it is not registered — call sites are
@@ -483,6 +494,24 @@ pub struct NegativeNeedle {
 /// loudly when its marker rots and needs no entry here; a negative one cannot
 /// fail at all, so each is pinned.
 pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/dropout_backward_parity_gate.rs",
+        asserts: "the pre-2026-08-16 wrong-backward dropout warning \
+                  (\"[source-ad] WARNING: dropout\") never returns. TOMBSTONE: \
+                  the banned literal deliberately has NO emit site — the \
+                  backward now consumes the exact forward mask, so parts is \
+                  empty by design. This needle cannot rot into always-true; \
+                  always-true IS its steady state, and it fails exactly when \
+                  someone reintroduces the warning verbatim",
+        parts: &[],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/dropout_elision_gate.rs",
+        asserts: "same tombstone as dropout_backward_parity_gate.rs (that gate \
+                  reads the banned literal through a const, which the sweep \
+                  cannot see — registered here for the record anyway)",
+        parts: &[],
+    },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/cpdt_decorator_activation_gate.rs",
         asserts: "a control build without @cpdt carries no decorator-applied marker",

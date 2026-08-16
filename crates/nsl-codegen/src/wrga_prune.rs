@@ -59,6 +59,15 @@ pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
             needs_inputs: false,
             needs_output: true,
         },
+        // Two-op dropout split (wengert.rs): the mask op's OUTPUT is what
+        // the paired Dropout's backward multiplies by, and the RNG draw is
+        // not replayable — the mask must survive to the backward. (The
+        // Dropout apply op itself stays in the conservative catch-all: its
+        // backward reads only the mask, which this entry already covers.)
+        DropoutMask { .. } => SaveRequirements {
+            needs_inputs: false,
+            needs_output: true,
+        },
         LayerNorm { .. } | RMSNorm { .. } | BatchNorm { .. } => SaveRequirements {
             needs_inputs: true,
             needs_output: false,

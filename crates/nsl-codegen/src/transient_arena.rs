@@ -887,6 +887,7 @@ impl<'a> SizeProp<'a> {
             | PrimalOp::RMSNorm { .. }
             | PrimalOp::BatchNorm { .. }
             | PrimalOp::Dropout { .. }
+            | PrimalOp::DropoutMask { .. }
             | PrimalOp::RoPE { .. }
             | PrimalOp::RoPEInverse { .. }
             | PrimalOp::Reshape { .. }

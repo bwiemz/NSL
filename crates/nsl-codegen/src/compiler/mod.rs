@@ -857,6 +857,15 @@ pub struct Compiler<'a> {
     /// fixed-arity slot record for the v1 three-output backward.
     pub fused_ce_bwd_cache: HashMap<Value, [Value; 3]>,
 
+    // ── Dropout two-op split side-channel ─────────────────────────────
+    /// The dropout OUTPUT Value keyed by the MASK Value. Populated by the
+    /// `PrimalOp::DropoutMask` launch arm (one `nsl_tensor_dropout_fwd_mask`
+    /// call returns NslList [out, mask]); popped by the paired
+    /// `PrimalOp::Dropout` apply arm, which errors on a miss (a pass that
+    /// separates or reorders the pair breaks the invariant). Value-keyed →
+    /// cleared per function like the CSHA/fused-CE caches.
+    pub dropout_fwd_out: HashMap<Value, Value>,
+
     // ── CPKD fused KL-CE side-channels ────────────────────────────────
     /// Forward-saved per-row LSE buffers `[lse_s1, lse_sT, lse_tT]` keyed
     /// by the scalar-loss Cranelift Value. Populated by
@@ -1258,6 +1267,7 @@ impl<'a> Compiler<'a> {
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),
             fused_ce_bwd_cache: HashMap::new(),
+            dropout_fwd_out: HashMap::new(),
             fused_kl_ce_fwd_saves: HashMap::new(),
             fused_kl_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
@@ -1448,6 +1458,10 @@ impl<'a> Compiler<'a> {
         self.flash_attn_bwd_cache.clear();
         self.flash_attn_aux.clear();
         self.sdpa_extra_owned.clear();
+        // Dropout two-op split: Value-keyed like the caches above. The
+        // apply arm pops on consumption, so this only matters if a future
+        // pass dead-eliminates an apply op after its launch lowered.
+        self.dropout_fwd_out.clear();
     }
 
     /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the

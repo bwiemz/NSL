@@ -3299,7 +3299,25 @@ pub extern "C" fn nsl_rmsnorm_dx_backward(
 #[no_mangle]
 pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i64 {
     if training == 0 || p == 0.0 {
-        return nsl_tensor_clone(tensor_ptr);
+        let out = nsl_tensor_clone(tensor_ptr);
+        // Identity dropout must still be DIFFERENTIABLE on the tape: the
+        // clone carries a fresh tape_id, so without a recorded node the
+        // graph silently disconnects here and everything upstream of the
+        // dropout gets NO gradient (found by the p=0 arm of
+        // dropout_backward_parity_gate). A same-shape Reshape is the
+        // established metadata-only relabel — backward passes the gradient
+        // through unchanged.
+        if autodiff::is_recording() {
+            let t = NslTensor::from_ptr(tensor_ptr);
+            let input_shape: Vec<i64> =
+                (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect();
+            autodiff::maybe_record(autodiff::TapeOp::Reshape {
+                a: tensor_ptr,
+                out,
+                input_shape,
+            });
+        }
+        return out;
     }
 
     // GPU dispatch: native dropout kernel with per-element PRNG
@@ -3407,6 +3425,132 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
     }
 
     result_ptr
+}
+
+/// Source-AD dropout forward: returns an `NslList [out, mask]`, handing BOTH
+/// tensors to the caller. `nsl_tensor_dropout`'s mask is tape-only (freed
+/// when no tape is recording — exactly the source-AD execution mode); the
+/// compiled source-AD backward needs the exact forward mask as an SSA value
+/// (dx = dy * mask * 1/(1-p)), so this channel exists (precedent:
+/// `nsl_sdpa_fused_forward`). Records NO tape op.
+///
+/// The CPU mask is produced in the INPUT's dtype (f32 mask for f32 input) so
+/// the generic `Mul` backward stays same-dtype; the tape path keeps its
+/// historical always-f64 CPU mask. The GPU mask is f32, as `gpu_dropout_f32`
+/// has always produced.
+///
+/// Contract: 0 < p < 1. Statically-known p=0 is elided at extraction and
+/// out-of-range p is refused at compile time, so a violation here is a
+/// compiler bug — abort loudly rather than train on a wrong scale.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
+    if !(p > 0.0 && p < 1.0) {
+        eprintln!(
+            "nsl: nsl_tensor_dropout_fwd_mask called with p={p} outside (0, 1) — \
+             the compiler must elide p==0 and refuse out-of-range p"
+        );
+        std::process::abort();
+    }
+
+    // GPU dispatch: same kernel as the tape path (out, mask both f32).
+    {
+        let t = NslTensor::from_ptr(tensor_ptr);
+        if t.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+                let (result_ptr, mask_ptr) = crate::cuda::gpu_dropout_f32(c_ptr, p);
+                nsl_tensor_free(c_ptr);
+                let list = crate::list::nsl_list_new();
+                crate::list::nsl_list_push(list, result_ptr);
+                crate::list::nsl_list_push(list, mask_ptr);
+                return list;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                panic!("CUDA support not compiled");
+            }
+        }
+    }
+
+    // Read from a contiguous view: the loops below index linearly while
+    // stamping row-major strides on out/mask, which is silently wrong for a
+    // strided CPU view (and reads out of bounds for an expand view). The
+    // already-contiguous fast path is a refcount bump, so the common case
+    // stays zero-copy. Mirrors the GPU arm above.
+    let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+    let a = NslTensor::from_ptr(c_ptr);
+    let len = a.len as usize;
+    let ndim = a.ndim;
+    let in_dtype = a.dtype;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let out_data_raw = checked_alloc(len * elem_size);
+
+    let mask_shape = NslTensor::copy_shape(a.shape, ndim);
+    let mask_strides = NslTensor::compute_strides(mask_shape, ndim);
+    let mask_data_raw = checked_alloc(len * elem_size);
+
+    let scale = 1.0 / (1.0 - p);
+
+    if in_dtype == 1 {
+        let out_data = out_data_raw as *mut f32;
+        let mask_data = mask_data_raw as *mut f32;
+        for i in 0..len {
+            let rand_val = crate::sampling::rng_f64();
+            let keep = if rand_val >= p { 1.0_f64 } else { 0.0_f64 };
+            unsafe {
+                *mask_data.add(i) = keep as f32;
+                // Same rounding as the tape-path kernel: one f64 product,
+                // one cast — keeps source-vs-tape forward bit-identical.
+                *out_data.add(i) = (*a.data_f32().add(i) as f64 * keep * scale) as f32;
+            }
+        }
+    } else {
+        let out_data = out_data_raw as *mut f64;
+        let mask_data = mask_data_raw as *mut f64;
+        for i in 0..len {
+            let rand_val = crate::sampling::rng_f64();
+            let keep = if rand_val >= p { 1.0 } else { 0.0 };
+            unsafe {
+                *mask_data.add(i) = keep;
+                *out_data.add(i) = *a.data_f64().add(i) * keep * scale;
+            }
+        }
+    }
+    nsl_tensor_free(c_ptr);
+
+    let result = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    ));
+    let result_ptr = NslTensor::publish(result);
+
+    let mask_tensor = Box::new(NslTensor::new(
+        mask_data_raw as *mut c_void,
+        mask_shape,
+        mask_strides,
+        ndim,
+        len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    ));
+    let mask_ptr = NslTensor::publish(mask_tensor);
+
+    let list = crate::list::nsl_list_new();
+    crate::list::nsl_list_push(list, result_ptr);
+    crate::list::nsl_list_push(list, mask_ptr);
+    list
 }
 
 // === Conv2d ===
@@ -4672,6 +4816,61 @@ mod tests {
              training-mode dropout call); rc=0 means the tape's reference \
              was released early and backward would read a freed mask."
         );
+    }
+
+    /// The source-AD dropout forward hands BOTH tensors to the caller as an
+    /// NslList [out, mask]: caller-owned (rc=1 each), mask in the INPUT's
+    /// dtype with strictly {0,1} entries, and out = x·mask·(1/(1-p))
+    /// elementwise — the invariant the compiled backward (dy·mask·scale)
+    /// relies on. No exact-value RNG assertions: the thread-local RNG
+    /// state depends on which tests already ran on this thread.
+    #[test]
+    fn dropout_fwd_mask_returns_caller_owned_out_and_mask() {
+        use crate::list::{nsl_list_free, nsl_list_get, nsl_list_len};
+
+        let x = crate::cpu::create_tensor_with_shape_rs_dtype(&[64], 1);
+        {
+            let xt = NslTensor::from_ptr(x);
+            for i in 0..64 {
+                unsafe { *(xt.data as *mut f32).add(i) = (i as f32) * 0.25 + 1.0 };
+            }
+        }
+        let p = 0.5;
+        let scale = 1.0 / (1.0 - p);
+        let list = nsl_tensor_dropout_fwd_mask(x, p);
+        assert_eq!(nsl_list_len(list), 2, "expected NslList [out, mask]");
+        let out = nsl_list_get(list, 0);
+        let mask = nsl_list_get(list, 1);
+        nsl_list_free(list);
+
+        let ot = NslTensor::from_ptr(out);
+        let mt = NslTensor::from_ptr(mask);
+        assert_eq!(ot.dtype, 1, "out keeps the input dtype");
+        assert_eq!(mt.dtype, 1, "mask is produced in the INPUT dtype (f32)");
+        assert_eq!(ot.len, 64);
+        assert_eq!(mt.len, 64);
+        assert_eq!(ot.refcount.load(Ordering::SeqCst), 1, "out is caller-owned");
+        assert_eq!(mt.refcount.load(Ordering::SeqCst), 1, "mask is caller-owned");
+
+        let xt = NslTensor::from_ptr(x);
+        let mut kept = 0usize;
+        for i in 0..64 {
+            let m = unsafe { *(mt.data as *const f32).add(i) };
+            assert!(m == 0.0 || m == 1.0, "mask[{i}] = {m} not in {{0, 1}}");
+            kept += (m == 1.0) as usize;
+            let xi = unsafe { *(xt.data as *const f32).add(i) };
+            let oi = unsafe { *(ot.data as *const f32).add(i) };
+            let expect = (xi as f64 * m as f64 * scale) as f32;
+            assert_eq!(oi, expect, "out[{i}] must equal x·mask·scale exactly");
+        }
+        // Loose sanity only (deterministic per-thread stream, but the state
+        // depends on test order): all-kept or all-dropped would mean the
+        // threshold comparison broke.
+        assert!(kept > 0 && kept < 64, "degenerate mask: {kept}/64 kept");
+
+        nsl_tensor_free(out);
+        nsl_tensor_free(mask);
+        nsl_tensor_free(x);
     }
 
     /// A gradient listed twice — which `@tie_weights` produces — must end up

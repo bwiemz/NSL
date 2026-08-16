@@ -2211,6 +2211,15 @@ pub struct WengertExtractor<'a> {
     ///
     /// `BTreeSet` for a deterministic message order.
     inlined_fp8_methods: std::collections::BTreeSet<String>,
+    /// A refusal the extractor recorded before returning `None`: the body
+    /// must NOT fall back to tape AD — the compile must abort with this
+    /// message. Set by the dropout arm for an unresolvable or out-of-range
+    /// probability (the old behavior silently defaulted an unresolved p to
+    /// 0.1 — the bug class Milestone B measured at ~1.5 GiB of phantom
+    /// dropout state). Checked at every `!extraction_ok` fallback site in
+    /// `stmt.rs` (train block + grad blocks); a fallback site that ignores
+    /// this field reintroduces a silent-default path.
+    pending_refusal: Option<String>,
     /// Item 6: how many calls this extractor DID substitute — both
     /// auto-substituted `cross_entropy` and explicit `fused_linear_ce(...)`.
     ///
@@ -2560,6 +2569,7 @@ impl<'a> WengertExtractor<'a> {
             fused_lce_declines: Vec::new(),
             fp8_compute_methods: HashSet::new(),
             inlined_fp8_methods: std::collections::BTreeSet::new(),
+            pending_refusal: None,
             fused_lce_substitutions: 0,
             fused_kl_ce_config: None,
             distill_loss_alpha_temp: (None, None),
@@ -2584,6 +2594,14 @@ impl<'a> WengertExtractor<'a> {
     ) -> Self {
         self.checkpoint_policies = policies;
         self
+    }
+
+    /// A refusal recorded during a failed extraction (see the field doc):
+    /// the caller must abort the compile with this message instead of
+    /// falling back to tape AD. Only meaningful when extraction failed —
+    /// a successful extraction never leaves one set on the emitting paths.
+    pub fn pending_refusal(&self) -> Option<&str> {
+        self.pending_refusal.as_deref()
     }
 
     /// Cycle-10 §5.3 Task 5: allocate a fresh `SubgraphId` for a recompute
@@ -4897,8 +4915,63 @@ impl<'a> WengertExtractor<'a> {
                             // call and force-saves both.
                             return Some(input_vars[0]);
                         }
-                        let p = p_resolved.unwrap_or(0.1);
-                        PrimalOp::Dropout { p }
+                        // An unresolved p must REFUSE, not silently default:
+                        // the old `.unwrap_or(0.1)` here is the exact bug
+                        // class Milestone B measured (~1.5 GiB of phantom
+                        // dropout state on p=0 configs). `pending_refusal`
+                        // turns the extraction failure into a hard compile
+                        // error instead of a silent tape fallback.
+                        let Some(p) = p_resolved else {
+                            self.pending_refusal = Some(
+                                "dropout probability could not be resolved to a \
+                                 compile-time constant under source AD. The \
+                                 backward needs the compile-time scale 1/(1-p), \
+                                 and a silent default (the old behavior assumed \
+                                 0.1) trains a different model than the config \
+                                 describes. Make p a literal or a ctor-folded \
+                                 1-element config tensor read via `.item()` \
+                                 (e.g. `_dropout_p: Tensor = full([1], 0.1)`), \
+                                 set it to 0.0 to elide dropout, or drop \
+                                 --source-ad/--pretrain-optimized (tape AD, the \
+                                 default path, handles a runtime p correctly)."
+                                    .to_string(),
+                            );
+                            return None;
+                        };
+                        if !(0.0..1.0).contains(&p) {
+                            self.pending_refusal = Some(format!(
+                                "dropout p={p} is outside [0, 1) — the \
+                                 inverted-dropout scale 1/(1-p) is undefined at \
+                                 p=1 and negative p is meaningless. Fix the \
+                                 config value."
+                            ));
+                            return None;
+                        }
+                        // Two-op split (see wengert.rs): the mask becomes a
+                        // first-class SSA value so the adjoint multiplies the
+                        // gradient by the EXACT forward mask — not the p
+                        // argument var, which is what the old single-op
+                        // layout put at inputs[1].
+                        let x = input_vars[0];
+                        let mask_var = result;
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: mask_var,
+                            op: PrimalOp::DropoutMask { p },
+                            inputs: vec![x],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        let out_var = self.alloc_var();
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: out_var,
+                            op: PrimalOp::Dropout { p },
+                            inputs: vec![x, mask_var],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(out_var);
                     }
                     // Indexing
                     "embedding" | "embedding_lookup" => PrimalOp::Embedding,
