@@ -1,26 +1,31 @@
-//! Milestone B gates for the source-AD dropout p=0 elision and the scalar
-//! resolver behind it.
+//! Gates for the source-AD dropout p=0 elision, the scalar resolver behind
+//! it, and the unresolved-p refusal.
 //!
-//! The defect this closes: `dropout(x, self._dropout_p.item(), training)` —
-//! the house pattern — reached extraction as a non-literal p, and the old
+//! History: `dropout(x, self._dropout_p.item(), training)` — the house
+//! pattern — reached extraction as a non-literal p, and the old
 //! `.unwrap_or(0.1)` default silently ran REAL p=0.1 dropout on models whose
 //! config said 0.0 (coder1b among them): ~1.5 GB of force-saved
 //! outputs+masks at the 1B@2048 microbatch-2 peak, and semantics the source
-//! never asked for. The resolver now follows the ctor-folded config scalar
-//! through the `.item()` passthrough and elides the call at p=0.
+//! never asked for. Milestone B fixed the resolver (it follows the
+//! ctor-folded config scalar through the `.item()` passthrough and elides
+//! the call at p=0); the dropout-mask campaign then REMOVED the 0.1 default
+//! entirely — a genuinely unresolvable p now refuses the compile instead of
+//! silently training a different model than the config describes.
 //!
 //! The resolver WHITELISTS value-preserving passthroughs. The adversarial
 //! case that forced it: `full([1], 0.3).item()` — a constructor's inputs[0]
-//! is its SHAPE LIST, so a naive walk resolves p to 1.0 (the shape dim) and
-//! "elides" nothing while compiling dropout at a p the program never wrote.
-//! With the whitelist the constructor is not walked, p stays unresolved, and
-//! the pre-existing 0.1 default (with its warning) applies.
+//! is its SHAPE LIST, so a naive walk resolves p to 1.0 (the shape dim). With
+//! the whitelist the constructor is not walked, p stays unresolved, and the
+//! refusal fires. The two failure modes have DISTINCT messages ("could not
+//! be resolved" vs the out-of-range "outside [0, 1)"), so a whitelist
+//! regression that resolves p=1.0 is still caught here.
 //!
-//! Dropout that SURVIVES to source-AD lowering warns loudly: its backward is
-//! structurally wrong (gradient scaled by the p argument, not the runtime
-//! RNG mask — a pre-existing defect this campaign surfaced; refusal is
-//! deferred because coder50m/coder500m ship with DROPOUT=0.1 and every
-//! pipeline over them would red-line).
+//! Elision witness: a p=0 dropout that SURVIVED extraction would hit the
+//! DropoutMask lowering guard (p outside (0,1) is a hard CodegenError), so a
+//! successful run IS the elision proof.
+//!
+//! Backward correctness (source-vs-tape mask parity) lives in
+//! `dropout_backward_parity_gate.rs`.
 
 use std::process::Command;
 
@@ -85,14 +90,20 @@ fn run_fixture(tag: &str, src: &str) -> (bool, String, String) {
     res
 }
 
-const WRONG_BACKWARD_WARNING: &str =
-    "[source-ad] WARNING: dropout with p=";
+/// The pre-fix once-per-process warning. It must never come back: the
+/// backward now consumes the exact forward mask, and anything the compiler
+/// cannot make correct refuses instead of warning.
+const OLD_WRONG_BACKWARD_WARNING: &str = "[source-ad] WARNING: dropout with p=";
+/// The unresolved-p refusal (extraction; see source_ad.rs dropout arm).
+const UNRESOLVED_REFUSAL: &str = "could not be resolved to a compile-time constant";
+/// The out-of-range refusal — distinct from UNRESOLVED so a resolver
+/// regression that walks a ctor to its shape list (p=1.0) is still caught.
+const OUT_OF_RANGE_REFUSAL: &str = "outside [0, 1)";
 
 #[test]
 fn config_scalar_p_zero_is_elided_through_item() {
     // The house pattern at p=0: ctor-folded field, .item() hop. Elided —
-    // the run completes AND no wrong-backward warning fires (no Dropout op
-    // survives to lowering).
+    // the run completes (a surviving p=0 op would refuse at lowering).
     let (ok, stdout, stderr) = run_fixture(
         "cfgzero",
         &fixture(
@@ -103,56 +114,74 @@ fn config_scalar_p_zero_is_elided_through_item() {
     assert!(ok, "p=0 config-scalar run failed:\n{stderr}");
     assert!(stdout.contains("DROPOUT_GATE_DONE"), "fixture did not finish");
     assert!(
-        !stderr.contains(WRONG_BACKWARD_WARNING),
-        "p=0 dropout must be ELIDED, not lowered-with-warning:\n{stderr}"
+        !stderr.contains(OLD_WRONG_BACKWARD_WARNING),
+        "the pre-fix wrong-backward warning is back:\n{stderr}"
     );
 }
 
 #[test]
 fn literal_p_zero_is_elided() {
-    let (ok, _stdout, stderr) =
-        run_fixture("litzero", &fixture("", "0.0"));
+    let (ok, _stdout, stderr) = run_fixture("litzero", &fixture("", "0.0"));
     assert!(ok, "p=0 literal run failed:\n{stderr}");
+}
+
+#[test]
+fn nonzero_p_compiles_and_trains_without_the_old_warning() {
+    // p=0.1 survives to lowering and now trains with the mask-correct
+    // backward — no warning, no refusal. (Numerical parity with tape AD is
+    // gated in dropout_backward_parity_gate.rs.)
+    let (ok, stdout, stderr) = run_fixture("litnonzero", &fixture("", "0.1"));
+    assert!(ok, "p=0.1 must compile and run:\n{stderr}");
+    assert!(stdout.contains("DROPOUT_GATE_DONE"), "fixture did not finish");
     assert!(
-        !stderr.contains(WRONG_BACKWARD_WARNING),
-        "literal p=0 must be elided:\n{stderr}"
+        !stderr.contains(OLD_WRONG_BACKWARD_WARNING),
+        "the wrong-backward warning must be gone — the backward consumes \
+         the exact forward mask now:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("falling back to tape-based AD"),
+        "dropout must lower on the source-AD path, not silently fall back:\n{stderr}"
     );
 }
 
 #[test]
-fn nonzero_p_survives_and_warns_about_the_broken_backward() {
-    let (ok, _stdout, stderr) =
-        run_fixture("litnonzero", &fixture("", "0.1"));
-    assert!(ok, "p=0.1 must still compile (refusal deferred):\n{stderr}");
-    assert!(
-        stderr.contains(WRONG_BACKWARD_WARNING) && stderr.contains("p=0.1"),
-        "surviving dropout must warn about the mask-free backward:\n{stderr}"
-    );
-}
-
-#[test]
-fn inline_constructor_p_is_not_resolved_to_its_shape() {
+fn inline_constructor_p_refuses_instead_of_defaulting() {
     // full([1], 0.3).item(): a naive resolver walks the constructor to its
-    // SHAPE LIST and reads p=1.0. The whitelist leaves it unresolved, so
-    // the 0.1 default applies — the warning must say p=0.1, and must NOT
-    // say p=1 (shape dim) or p=0.3 (falsely claiming resolution).
-    //
-    // Exit status is deliberately NOT asserted: an inline-ctor `.item()`
-    // argument trips a PRE-EXISTING forward-lowering type bug (i64 where
-    // f64 expected, Cranelift verifier error) unrelated to the resolver.
-    // The extraction — where the resolver runs and warns — happens first,
-    // so the stderr assertions below hold either way.
-    let (_ok, _stdout, stderr) = run_fixture(
+    // SHAPE LIST and reads p=1.0; the whitelist leaves it unresolved. The
+    // old behavior silently defaulted to 0.1 — now it must REFUSE, with the
+    // unresolved message (NOT the out-of-range one, which would mean the
+    // resolver "resolved" the shape dim 1.0 and the whitelist regressed).
+    let (ok, _stdout, stderr) = run_fixture(
         "inlinector",
         &fixture("", "full([1], 0.3).item()"),
     );
     assert!(
-        stderr.contains("p=0.1"),
-        "unresolvable p must fall back to the 0.1 default (warned):\n{stderr}"
+        !ok,
+        "unresolvable p must refuse the compile, not default:\n{stderr}"
     );
     assert!(
-        !stderr.contains("p=1 ") && !stderr.contains("p=1\n"),
-        "resolver walked a constructor to its shape list — the whitelist \
-         regressed:\n{stderr}"
+        stderr.contains(UNRESOLVED_REFUSAL),
+        "expected the unresolved-p refusal:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(OUT_OF_RANGE_REFUSAL),
+        "resolver walked a constructor to its shape list (p=1.0) — the \
+         whitelist regressed:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("falling back to tape-based AD"),
+        "a refusal must abort the compile, not fall back to tape AD:\n{stderr}"
+    );
+}
+
+#[test]
+fn p_one_refuses_out_of_range() {
+    // 1/(1-p) is undefined at p=1; the refusal must fire at extraction
+    // with the out-of-range message.
+    let (ok, _stdout, stderr) = run_fixture("pone", &fixture("", "1.0"));
+    assert!(!ok, "p=1.0 must refuse:\n{stderr}");
+    assert!(
+        stderr.contains(OUT_OF_RANGE_REFUSAL),
+        "expected the out-of-range refusal:\n{stderr}"
     );
 }

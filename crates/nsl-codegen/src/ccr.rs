@@ -778,17 +778,20 @@ fn plan_impl(
                 continue;
             }
             // Force-save: non-tensor/list results (scalar SSA values are
-            // neither freeable nor worth cloning), Dropout (RNG must not
-            // be replayed), structural markers. Lists ARE recompute
-            // candidates: an NslList holds raw element pointers, so a
-            // consumer of a list over freed elements needs a fresh list
-            // built from the clones.
+            // neither freeable nor worth cloning), Dropout/DropoutMask (the
+            // RNG draw must not be replayed, and the apply op's cached-
+            // output pop cannot re-run — wengert.rs two-op split),
+            // structural markers. Lists ARE recompute candidates: an
+            // NslList holds raw element pointers, so a consumer of a list
+            // over freed elements needs a fresh list built from the clones.
             let ty = effective_type(primal, op);
             if !matches!(ty, WengertType::Tensor | WengertType::List) {
                 continue;
             }
             match &op.op {
-                PrimalOp::Dropout { .. } | PrimalOp::PrologueRecompute { .. } => continue,
+                PrimalOp::Dropout { .. }
+                | PrimalOp::DropoutMask { .. }
+                | PrimalOp::PrologueRecompute { .. } => continue,
                 PrimalOp::FreeTensor => continue,
                 _ => {}
             }
@@ -2141,10 +2144,25 @@ mod tests {
     #[test]
     fn dropout_is_force_saved() {
         let mut primal = toy_primal();
-        // Replace block-0's interior Matmul with a Dropout.
-        primal.ops[3] = op(3, 3, PrimalOp::Dropout { p: 0.1 }, vec![0]);
+        // Replace block-0's interior Matmul with a Dropout (two-op split:
+        // inputs = [x, mask]).
+        primal.ops[3] = op(3, 3, PrimalOp::Dropout { p: 0.1 }, vec![0, 1]);
         let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
         assert!(!plan.recompute.contains(&3), "dropout must not be replayed");
+    }
+
+    #[test]
+    fn dropout_mask_is_force_saved() {
+        let mut primal = toy_primal();
+        // The mask launch (result = the RNG mask) must never enter the
+        // recompute set: replaying it draws a DIFFERENT mask, decorrelating
+        // the backward from the forward it is differentiating.
+        primal.ops[3] = op(3, 3, PrimalOp::DropoutMask { p: 0.1 }, vec![0]);
+        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        assert!(
+            !plan.recompute.contains(&3),
+            "the dropout RNG mask must not be replayed"
+        );
     }
 
     #[test]

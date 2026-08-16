@@ -8897,6 +8897,18 @@ impl Compiler<'_> {
             }
 
             if !extraction_ok {
+                // A recorded refusal is not a fallback candidate: the
+                // extractor found something that must abort the compile
+                // (e.g. an unresolvable dropout probability — the old path
+                // silently assumed 0.1). Falling back to tape here would
+                // reintroduce exactly the silent-default behavior the
+                // refusal exists to prevent.
+                if let Some(msg) = extractor.pending_refusal() {
+                    return Err(CodegenError::new(format!(
+                        "source-AD extraction refused: {msg}"
+                    )));
+                }
+
                 // CPKD: the tape records EVERY op on the thread-local tape —
                 // including the teacher forward — and its backward allocates
                 // gradient buffers for each recorded op.  That is the
@@ -18712,6 +18724,15 @@ impl Compiler<'_> {
         }
 
         if !extractor.extract_stmts(&grad.body.stmts) {
+            // Same contract as the train-block site: a recorded refusal
+            // (e.g. unresolvable dropout probability) aborts the compile —
+            // the tape fallback would silently reintroduce the default the
+            // refusal exists to prevent.
+            if let Some(msg) = extractor.pending_refusal() {
+                return Err(CodegenError::new(format!(
+                    "source-AD extraction refused: {msg}"
+                )));
+            }
             eprintln!(
                 "[nsl] source AD extraction failed in grad block, falling back to tape-based AD"
             );

@@ -113,6 +113,11 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_causal_mask", OwnedNewResult);
     m.insert("nsl_tensor_rmsnorm", OwnedNewResult);
     m.insert("nsl_tensor_dropout", OwnedNewResult);
+    // Source-AD dropout forward: returns an NslList handle wrapping
+    // [out, mask] — a list, not a tensor (same class as topk's dict). The
+    // two element tensors become the DropoutMask/Dropout op results and are
+    // freed by the wengert owned-values cleanup.
+    m.insert("nsl_tensor_dropout_fwd_mask", NotATensor);
     m.insert("nsl_tensor_layernorm", OwnedNewResult);
     m.insert("nsl_tensor_bias_add", OwnedNewResult);
     m.insert("nsl_tensor_embedding_lookup", OwnedNewResult);

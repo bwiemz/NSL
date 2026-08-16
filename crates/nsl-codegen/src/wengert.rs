@@ -664,8 +664,26 @@ pub enum PrimalOp {
         alpha_bits: u64,
         temperature_bits: u64,
     },
-    // Regularization
+    // Regularization — two-op split so the RNG mask is a first-class SSA
+    // value the adjoint can consume (DropoutBackward(dy, mask, 1/(1-p))):
+    //
+    //   DropoutMask { p }  result = MASK,  inputs = [x]
+    //       lowers `nsl_tensor_dropout_fwd_mask` (NslList [out, mask]) —
+    //       ONE runtime call computes both; the output is cached in
+    //       `Compiler::dropout_fwd_out` keyed by the mask's Cranelift Value.
+    //   Dropout { p }      result = OUT,   inputs = [x, mask_var]
+    //       pops the cached output; no runtime work of its own.
+    //
+    // The split keeps SSA order (the apply op references the mask var
+    // defined one op earlier) and makes the mask forward-live (the apply
+    // reads it) AND adjoint-live (the backward multiplies by it), so CSLA
+    // window buffering and lifetime handling treat it like any saved
+    // activation. Both ops are force-saved by CCR: the RNG draw must never
+    // be replayed, and the apply's cached-output pop cannot re-run.
     Dropout {
+        p: f64,
+    },
+    DropoutMask {
         p: f64,
     },
     // Control flow

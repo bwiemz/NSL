@@ -3363,45 +3363,51 @@ fn lower_single_op(
         }
 
         // === Regularization ===
-        PrimalOp::Dropout { p } => {
-            // KNOWN DEFECT (Milestone B review find, 2026-08-16,
-            // pre-existing): the source-AD adjoint for Dropout multiplies
-            // the upstream gradient by op.inputs[1] — the p ARGUMENT var —
-            // because the RNG mask `nsl_tensor_dropout` draws at runtime is
-            // never an SSA value on this path (ad_rules.rs
-            // DropoutBackward). Every Dropout that survives to lowering
-            // therefore trains with gradients decorrelated from the forward
-            // mask. Statically-known p=0 calls are elided as identity at
-            // extraction and never reach here. A hard refusal is the honest
-            // endpoint, but coder50m/coder500m ship with DROPOUT=0.1 and
-            // every gate/campaign over them would red-line — converting a
-            // long-standing silent defect into a repo-wide refusal belongs
-            // to its own change with its own re-baselines. Until then: warn
-            // ONCE, loudly, with the defect named.
-            {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                let pv = *p;
-                WARNED.call_once(|| {
-                    eprintln!(
-                        "[source-ad] WARNING: dropout with p={pv} trains with a \
-                         structurally wrong backward on the source-AD path — \
-                         the gradient is scaled by the p argument, NOT the \
-                         runtime RNG mask (the mask is never tape-carried). \
-                         Set the dropout probability to a statically-\
-                         resolvable 0.0 (elided as identity), pass \
-                         training=false, or use --tape-ad. Tracked as a known \
-                         defect (found 2026-08-16)."
-                    );
-                });
+        // Two-op split (see wengert.rs): DropoutMask is the launch — one
+        // runtime call computes BOTH the dropout output and the RNG
+        // keep-mask (`nsl_tensor_dropout_fwd_mask`, NslList [out, mask];
+        // `nsl_sdpa_fused_forward` precedent). This op's result is the MASK
+        // (the SSA value the adjoint multiplies by); the output is cached
+        // for the paired apply op, keyed by the mask's Cranelift Value.
+        PrimalOp::DropoutMask { p } => {
+            if !(*p > 0.0 && *p < 1.0) {
+                return Err(CodegenError::new(format!(
+                    "DropoutMask lowered with p={p} outside (0, 1) — \
+                     statically-known p=0 must be elided at extraction and \
+                     out-of-range p refused (source_ad.rs dropout arm)"
+                )));
             }
             let pv = builder.ins().f64const(*p);
-            let training = builder.ins().iconst(cl_types::I8, 1);
-            call(
+            let list = call(
                 compiler,
                 builder,
-                "nsl_tensor_dropout",
-                &[inputs[0], pv, training],
-            )
+                "nsl_tensor_dropout_fwd_mask",
+                &[inputs[0], pv],
+            )?;
+            let idx0 = builder.ins().iconst(cl_types::I64, 0);
+            let out = call(compiler, builder, "nsl_list_get", &[list, idx0])?;
+            let idx1 = builder.ins().iconst(cl_types::I64, 1);
+            let mask = call(compiler, builder, "nsl_list_get", &[list, idx1])?;
+            // Element-preserving: frees the shell, not [out, mask].
+            let _ = call(compiler, builder, "nsl_list_free", &[list])?;
+            compiler.dropout_fwd_out.insert(mask, out);
+            Ok(mask)
+        }
+        // Apply: pop the forward output the paired DropoutMask launch
+        // cached. inputs = [x, mask]; the runtime work already happened at
+        // the launch, so this arm emits no call. The pop (vs. read) keeps
+        // the Value-keyed cache empty across functions — same hygiene as
+        // fused_ce_fwd_lse.
+        PrimalOp::Dropout { p: _ } => {
+            let mask_val = inputs[1];
+            compiler.dropout_fwd_out.remove(&mask_val).ok_or_else(|| {
+                CodegenError::new(
+                    "PrimalOp::Dropout: no cached forward output for this \
+                     mask — the paired DropoutMask launch must lower before \
+                     the apply op in the same function (a pass that separates \
+                     or reorders the pair breaks this invariant)",
+                )
+            })
         }
 
         // === Control flow (2 ops) ===
@@ -5576,6 +5582,7 @@ mod tests {
             PrimalOp::RoPE { dim: 64 },
             PrimalOp::RoPEInverse { dim: 64 },
             PrimalOp::Dropout { p: 0.1 },
+            PrimalOp::DropoutMask { p: 0.1 },
             PrimalOp::Select,
             PrimalOp::Condition(CompareKind::Gt),
             PrimalOp::FusedLinearCe {
@@ -5604,10 +5611,10 @@ mod tests {
             PrimalOp::Param("w".into()),
             PrimalOp::Constant(1.0),
         ];
-        // 57 variants total (including markers) — bumped by PCA Stage C's
-        // ScaledDotProductAttentionPacked + FlashAttentionBackwardExtractPacked
-        // on top of CFTP §4.4 G3's FusedLinearCe pair.
-        assert_eq!(ops.len(), 57);
+        // 58 variants total (including markers) — bumped by the dropout
+        // two-op split's DropoutMask on top of PCA Stage C's
+        // ScaledDotProductAttentionPacked + FlashAttentionBackwardExtractPacked.
+        assert_eq!(ops.len(), 58);
     }
 
     #[test]
