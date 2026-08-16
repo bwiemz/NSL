@@ -156,9 +156,15 @@ fn assert_source_ad_actually_ran(r: &Run) {
 
 /// Weight-block parity: elementwise |a-b| within tol; anti-vacuity: the
 /// weights must have MOVED off their deterministic init (a no-op train
-/// would "match" trivially).
+/// would "match" trivially). The init closures carry the FULL init
+/// expression — comparing W2 against a bare i*0.03 would count its +0.1
+/// offset as "movement" and never fail (review finding on 6e3993ab).
 fn assert_weight_parity(sa: &Run, tape: &Run, tol: f64) {
-    for (block, init_stride) in [("W1", 0.05), ("W2", 0.03)] {
+    let inits: [(&str, fn(usize) -> f64); 2] = [
+        ("W1", |i| (i as f64) * 0.05),
+        ("W2", |i| (i as f64) * 0.03 + 0.1),
+    ];
+    for (block, init) in inits {
         let begin = format!("{block}_BEGIN");
         let end = format!("{block}_END");
         let a = parse_floats(between(&sa.stdout, &begin, &end));
@@ -168,7 +174,7 @@ fn assert_weight_parity(sa: &Run, tape: &Run, tol: f64) {
         let moved = b
             .iter()
             .enumerate()
-            .any(|(i, v)| (v - (i as f64) * init_stride).abs() > 1e-3);
+            .any(|(i, v)| (v - init(i)).abs() > 1e-3);
         assert!(
             moved,
             "{block} never moved off its init — the fixture trained nothing"
@@ -284,11 +290,194 @@ fn config_scalar_p_through_item_matches_tape() {
     assert_weight_parity(&sa, &tape, 2e-3);
 }
 
+/// A 2-block residual MLP with dropout inside each block. `--checkpoint-blocks`
+/// segments on `blocks.N`-style param names ONLY (ccr.rs plan_impl via
+/// wggo_graph::layer_prefix) — the flat w1/w2 fixture above makes CCR decline
+/// and the composition test vacuous (review finding on 6e3993ab). Two dropout
+/// sites per step also exercise multi-call RNG stream consumption.
+fn fixture_blocks(p_expr: &str) -> String {
+    format!(
+        r#"from nsl.nn.losses import mse_loss
+
+model Blk:
+    w_up: Tensor = (arange(32).reshape([4, 8])) * 0.02
+    w_down: Tensor = (arange(32).reshape([8, 4])) * 0.01
+
+    fn forward(self, h: Tensor, training: bool) -> Tensor:
+        let pre = h @ self.w_up
+        let act = relu(pre)
+        let d = dropout(act, {p_expr}, training)
+        let out = d @ self.w_down
+        return h + out
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h, training)
+        return h
+
+let m = Net()
+let x = (arange(16).reshape([4, 4])) * 0.1
+let y = zeros([4, 4])
+
+print("LOSS_STREAM_BEGIN")
+train(model=m, epochs=6, grad_accumulation=1):
+    optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(x, true)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+print("LOSS_STREAM_END")
+
+model_save(m, "ccr_dropout_parity.nslm")
+print("DROPOUT_PARITY_DONE")
+"#
+    )
+}
+
+/// Like `run`, but keeps the temp dir alive long enough to read back the
+/// saved model bytes (empty vec if the fixture never saved).
+fn run_with_model_bytes(
+    tag: &str,
+    src: &str,
+    source_ad: bool,
+    extra_args: &[&str],
+) -> (Run, Vec<u8>) {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!(
+        "nsl_dropparity_{}_{tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+    let mut args: Vec<&str> = vec!["run", "--seed", "1234"];
+    if source_ad {
+        args.push("--source-ad");
+    }
+    args.extend_from_slice(extra_args);
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args(&args)
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .output()
+        .expect("spawn nsl run");
+    let run = Run {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    };
+    let bytes = std::fs::read(tmp.join("ccr_dropout_parity.nslm")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&tmp);
+    (run, bytes)
+}
+
+fn loss_stream(r: &Run) -> Vec<f64> {
+    parse_floats(between(&r.stdout, "LOSS_STREAM_BEGIN", "LOSS_STREAM_END"))
+}
+
 #[test]
 fn ccr_checkpoint_blocks_preserve_dropout_parity() {
     // CCR must force-save the mask (and the dropout output) rather than
     // replay the RNG: a replayed mask decorrelates the backward exactly
-    // like the pre-fix defect. Parity vs the un-checkpointed tape oracle
-    // is the witness. (--checkpoint-blocks is a bare bool flag.)
-    parity_case("ccr", "0.5", &["--checkpoint-blocks"], 2e-3);
+    // like the pre-fix defect. Two witnesses on a fixture CCR actually
+    // segments:
+    //   1. source+CCR is BIT-IDENTICAL to plain source (recompute replays
+    //      are exact; RNG never redrawn) — the ccr_checkpoint_parity
+    //      invariant, applied to a dropout-bearing model.
+    //   2. plain source matches the tape oracle (mask-correct backward).
+    let src = fixture_blocks("0.5");
+
+    // Determinism probe (run the control).
+    let (plain_a, bytes_a) = run_with_model_bytes("ccrb_plain_a", &src, true, &[]);
+    let (plain_b, bytes_b) = run_with_model_bytes("ccrb_plain_b", &src, true, &[]);
+    assert!(plain_a.ok, "plain source run failed:\n{}", plain_a.stderr);
+    assert!(plain_b.ok, "plain source probe failed:\n{}", plain_b.stderr);
+    assert_source_ad_actually_ran(&plain_a);
+    assert_eq!(
+        plain_a.stdout, plain_b.stdout,
+        "plain source-AD baseline is not run-to-run deterministic on CPU"
+    );
+    assert_eq!(bytes_a, bytes_b, "baseline model bytes not deterministic");
+    assert!(!bytes_a.is_empty(), "fixture never saved the model");
+
+    // The CCR arm — must actually ENGAGE (anti-vacuity: every plan-decline
+    // path prints "running without checkpointing").
+    let (ccr, bytes_ccr) =
+        run_with_model_bytes("ccrb_ccr", &src, true, &["--checkpoint-blocks"]);
+    assert!(ccr.ok, "CCR run failed:\n{}", ccr.stderr);
+    assert_source_ad_actually_ran(&ccr);
+    assert!(
+        !ccr.stderr.contains("running without checkpointing"),
+        "CCR declined on the blocks fixture — the composition test is \
+         vacuous:\n{}",
+        ccr.stderr
+    );
+    assert_eq!(
+        loss_stream(&ccr),
+        loss_stream(&plain_a),
+        "loss stream diverged under --checkpoint-blocks — a saved mask was \
+         replayed or freed"
+    );
+    assert_eq!(
+        bytes_ccr, bytes_a,
+        "model bytes diverged under --checkpoint-blocks — the checkpointed \
+         backward did not reproduce the baseline gradients"
+    );
+
+    // Mask-correctness on this fixture: plain source vs the tape oracle.
+    let (tape, _) = run_with_model_bytes("ccrb_tape", &src, false, &[]);
+    assert!(tape.ok, "tape run failed:\n{}", tape.stderr);
+    assert_first_loss_bit_equal(&plain_a, &tape);
+    let sl = loss_stream(&plain_a);
+    let tl = loss_stream(&tape);
+    assert_eq!(sl.len(), tl.len(), "loss stream lengths differ");
+    assert!(sl.len() >= 6, "expected >=6 loss lines, got {}", sl.len());
+    assert!(
+        (sl.first().unwrap() - sl.last().unwrap()).abs() > 1e-6,
+        "loss never changed — the fixture trained nothing"
+    );
+    for (i, (a, b)) in sl.iter().zip(tl.iter()).enumerate() {
+        assert!(
+            (a - b).abs() <= 2e-3,
+            "loss[{i}]: source {a} vs tape {b} (|diff| > 2e-3)"
+        );
+    }
+}
+
+/// GPU arm: the same parity claim on CUDA. GPU dropout masks come from a
+/// process-global counter seeded 42 (`DROPOUT_SEED`, ignores --seed), so two
+/// separate processes with the SAME dropout call order draw the SAME masks —
+/// source vs tape alignment holds per-process. Looser tolerance (TF32/atomics
+/// noise) and no first-loss bit-equality on GPU.
+///
+/// BLOCKED (2026-08-16): this fixture aborts on GPU under --source-ad in a
+/// PRE-EXISTING defect UNRELATED to dropout — relu's backward reaches
+/// `nsl_tensor_compare` (ad_ops.rs), which calls `data_f64()` on an f32
+/// tensor. The control reproduces it with `dropout(h, 0.0, ...)`, i.e. with
+/// the dropout op fully elided. Un-ignore once that compare dtype bug is
+/// fixed in its own change.
+#[test]
+#[ignore = "requires CUDA GPU; blocked on a pre-existing source-AD GPU relu-backward dtype abort (nsl_tensor_compare data_f64 on f32) — reproduces with dropout elided"]
+fn gpu_source_backward_matches_tape_mask_backward() {
+    let src = fixture("0.5")
+        .replace("let m = M()", "let m = M()\nm.to(cuda)")
+        .replace(
+            "let x = (arange(8).reshape([2, 4])) * 0.1 + full([2, 4], 0.1)",
+            "let x = ((arange(8).reshape([2, 4])) * 0.1 + full([2, 4], 0.1)).to(cuda)",
+        )
+        .replace("let y = zeros([2, 4])", "let y = zeros([2, 4]).to(cuda)");
+    let sa = run("gpu_sa", &src, true, &[]);
+    assert!(sa.ok, "source-AD GPU run failed:\n{}", sa.stderr);
+    assert_source_ad_actually_ran(&sa);
+    let tape = run("gpu_tape", &src, false, &[]);
+    assert!(tape.ok, "tape GPU run failed:\n{}", tape.stderr);
+    assert_weight_parity(&sa, &tape, 2e-2);
 }

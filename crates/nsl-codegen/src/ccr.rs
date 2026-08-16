@@ -2144,11 +2144,18 @@ mod tests {
     #[test]
     fn dropout_is_force_saved() {
         let mut primal = toy_primal();
-        // Replace block-0's interior Matmul with a Dropout (two-op split:
-        // inputs = [x, mask]).
-        primal.ops[3] = op(3, 3, PrimalOp::Dropout { p: 0.1 }, vec![0, 1]);
+        // Same interior placement discipline as dropout_mask_is_force_saved:
+        // v3 = Matmul(x, w0); v9 = Dropout(v3, mask); v4 = Add(v9, x).
+        // (inputs[1] is the mask slot per the two-op split; for a plan-only
+        // test any earlier var works — plan() never applies AD rules.)
+        primal.ops.insert(4, op(9, 9, PrimalOp::Dropout { p: 0.1 }, vec![3, 0]));
+        primal.ops[5] = op(4, 4, PrimalOp::Add, vec![9, 0]);
         let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
-        assert!(!plan.recompute.contains(&3), "dropout must not be replayed");
+        assert!(
+            plan.recompute.contains(&3),
+            "control: the matmul interior must be recomputable"
+        );
+        assert!(!plan.recompute.contains(&9), "dropout must not be replayed");
     }
 
     #[test]
@@ -2157,10 +2164,26 @@ mod tests {
         // The mask launch (result = the RNG mask) must never enter the
         // recompute set: replaying it draws a DIFFERENT mask, decorrelating
         // the backward from the forward it is differentiating.
-        primal.ops[3] = op(3, 3, PrimalOp::DropoutMask { p: 0.1 }, vec![0]);
+        //
+        // Placement matters (review finding on 6e3993ab): REPLACING block-0's
+        // Matmul would drop the blocks.0.w consumption, push the op outside
+        // every segment, and make the assert vacuously true. Instead the mask
+        // goes BETWEEN the interior Matmul and the boundary Add — a genuine
+        // segment interior with a downstream consumer:
+        //   v3 = Matmul(x, w0); v9 = DropoutMask(v3); v4 = Add(v9, x)
+        primal.ops.insert(4, op(9, 9, PrimalOp::DropoutMask { p: 0.1 }, vec![3]));
+        primal.ops[5] = op(4, 4, PrimalOp::Add, vec![9, 0]);
         let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        // Negative control: the ordinary Matmul interior at the SAME segment
+        // IS recomputable — proof the segment actually covers these ops, so
+        // the mask assert below cannot pass by falling outside coverage.
         assert!(
-            !plan.recompute.contains(&3),
+            plan.recompute.contains(&3),
+            "control: the matmul interior must be recomputable — the segment \
+             does not cover the ops this test is about"
+        );
+        assert!(
+            !plan.recompute.contains(&9),
             "the dropout RNG mask must not be replayed"
         );
     }

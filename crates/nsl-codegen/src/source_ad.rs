@@ -4931,8 +4931,9 @@ impl<'a> WengertExtractor<'a> {
                                  describes. Make p a literal or a ctor-folded \
                                  1-element config tensor read via `.item()` \
                                  (e.g. `_dropout_p: Tensor = full([1], 0.1)`), \
-                                 set it to 0.0 to elide dropout, or run with \
-                                 --tape-ad."
+                                 set it to 0.0 to elide dropout, or drop \
+                                 --source-ad/--pretrain-optimized (tape AD, the \
+                                 default path, handles a runtime p correctly)."
                                     .to_string(),
                             );
                             return None;

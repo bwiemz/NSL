@@ -1370,6 +1370,16 @@ fn emit_model_backward_bridge(
     }
 
     if !extraction_ok || extractor.wengert_list().ops.is_empty() {
+        // Same contract as the stmt.rs train/grad-block sites: a recorded
+        // refusal (e.g. unresolvable dropout probability) must not degrade
+        // into a silent no-op backward stub with the diagnostic swallowed.
+        if let Some(msg) = extractor.pending_refusal() {
+            return Err(HarnessError::Infrastructure {
+                reason: format!(
+                    "model_backward extraction refused for '{model_name}': {msg}"
+                ),
+            });
+        }
         // Extraction failed — emit trivial stub, log warning.
         eprintln!(
             "[nsl] model_backward: WengertExtractor failed for '{model_name}' — emitting stub"

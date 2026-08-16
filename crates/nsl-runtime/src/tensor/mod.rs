@@ -3473,7 +3473,13 @@ pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
         }
     }
 
-    let a = NslTensor::from_ptr(tensor_ptr);
+    // Read from a contiguous view: the loops below index linearly while
+    // stamping row-major strides on out/mask, which is silently wrong for a
+    // strided CPU view (and reads out of bounds for an expand view). The
+    // already-contiguous fast path is a refcount bump, so the common case
+    // stays zero-copy. Mirrors the GPU arm above.
+    let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+    let a = NslTensor::from_ptr(c_ptr);
     let len = a.len as usize;
     let ndim = a.ndim;
     let in_dtype = a.dtype;
@@ -3513,6 +3519,7 @@ pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
             }
         }
     }
+    nsl_tensor_free(c_ptr);
 
     let result = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
