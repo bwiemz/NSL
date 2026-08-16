@@ -743,7 +743,18 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Parse a human-readable size string (e.g., "8GB", "512MB") to bytes.
 pub fn parse_vram_budget(s: &str) -> Option<u64> {
     let s = s.trim().to_uppercase();
-    let (num_str, multiplier) = if s.ends_with("GB") {
+    // The GB/MB/KB multipliers are BINARY (1024-based), so the IEC
+    // spellings are aliases, not a different unit. Before they were
+    // accepted, "8GiB" fell into the bare-`B` arm, left "8GI" for the
+    // number parse, and the whole budget silently became None — a guard
+    // rail the user set and the compiler dropped (Milestone A).
+    let (num_str, multiplier) = if s.ends_with("GIB") {
+        (&s[..s.len() - 3], 1024 * 1024 * 1024_u64)
+    } else if s.ends_with("MIB") {
+        (&s[..s.len() - 3], 1024 * 1024_u64)
+    } else if s.ends_with("KIB") {
+        (&s[..s.len() - 3], 1024_u64)
+    } else if s.ends_with("GB") {
         (&s[..s.len() - 2], 1024 * 1024 * 1024_u64)
     } else if s.ends_with("MB") {
         (&s[..s.len() - 2], 1024 * 1024_u64)

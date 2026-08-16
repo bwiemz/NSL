@@ -829,6 +829,17 @@ fn compile_returning_plan_impl(
         compiler.run_wcet_analysis()?;
     }
 
+    // Milestone A (path-divergence fix): the fusion report was printed ONLY
+    // by `compile_entry_returning_plan` — a single-file
+    // `nsl build --fusion-report` set `report_enabled` and then produced no
+    // report at all. Mirror the entry path's block.
+    if compiler.fusion.report_enabled {
+        crate::fusion_report::print_fusion_report(
+            &compiler.fusion.events,
+            &compiler.fusion.barriers,
+        );
+    }
+
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     let plan = compiler.bus.wrga_plan().cloned();
@@ -1505,6 +1516,22 @@ pub fn compile_entry_returning_plan(
     // reconciliation — entry module only; imported modules' decorators are
     // the library author's requests (see activation.rs).
     crate::activation::note_entry_module_decorators(ast, interner);
+
+    // Milestone A (deferral-must-refuse): the whole-program memory plan —
+    // and with it `check_vram_budget` — runs only on the single-file path
+    // (`compile_returning_plan_impl`). A multi-file `--vram-budget` was
+    // accepted and silently unenforced: a budget the user relied on as a
+    // guard-rail did nothing on exactly the builds real models use. Refuse
+    // until the planner integration reaches this path; lifting this is the
+    // integration's one-line job.
+    if let Some(budget) = options.vram_budget {
+        return Err(CodegenError::new(format!(
+            "--vram-budget ({budget} bytes) is enforced only on single-file \
+             builds today — the whole-program memory planner does not run on \
+             the multi-file path, so the budget would be silently ignored. \
+             Remove the flag for this build",
+        )));
+    }
 
     // M52 / CPDT Phase 1: load weights if --weights was provided.  Load-bearing
     // for the multi-file build path: without this call, `compile_main` sees

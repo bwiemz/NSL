@@ -144,8 +144,14 @@ pub struct Contract {
     pub witness: Witness,
 }
 
-use Subcommand::{Build, Run};
+use Subcommand::{Build, Check, Run};
 const BR: &[Subcommand] = &[Build, Run];
+const CBR: &[Subcommand] = &[Check, Build, Run];
+const CB: &[Subcommand] = &[Check, Build];
+const CR: &[Subcommand] = &[Check, Run];
+const B_ONLY: &[Subcommand] = &[Build];
+const C_ONLY: &[Subcommand] = &[Check];
+const R_ONLY: &[Subcommand] = &[Run];
 
 const fn deco(
     surface: &'static str,
@@ -154,6 +160,15 @@ const fn deco(
     witness: Witness,
 ) -> Contract {
     Contract { surface: Surface::Decorator(surface), on, owner, witness }
+}
+
+const fn flag(
+    surface: &'static str,
+    on: &'static [Subcommand],
+    owner: &'static str,
+    witness: Witness,
+) -> Contract {
+    Contract { surface: Surface::Flag(surface), on, owner, witness }
 }
 
 /// Contracts for surfaces that are NOT derivable from [`pass_registry`]:
@@ -165,19 +180,134 @@ const fn deco(
 pub static MANUAL_CONTRACTS: &[Contract] = &[
     // ------------------------------------------------------------------
     // Decorators owned by non-pass components (frontend / kernel driver).
-    // Witness sites name the consumer the gate pins.
     // ------------------------------------------------------------------
     deco("fase", BR, "FASE", Witness::Disposition("FASE")),
     deco("autotune", BR, "autotune", Witness::Marker("[autotune]")),
     deco("flash_attention", BR, "kernel-driver", Witness::Marker("[flash-attention]")),
+    // ------------------------------------------------------------------
+    // CLI flags with no pass-registry owner, from the 2026-08-15 consumer
+    // audit. `on` mirrors the arg structs that declare the flag and is
+    // gated against args.rs; witness strings/sites are gated for existence.
+    //
+    // The autotune / calibration families (driver-owned, not passes).
+    // ------------------------------------------------------------------
+    flag("autotune-clean", B_ONLY, "autotune", Witness::Config("crates/nsl-cli/src/commands/build/options.rs")),
+    flag("autotune-db", B_ONLY, "autotune", Witness::Marker("[autotune]")),
+    flag("autotune-db-sha256", B_ONLY, "autotune", Witness::Config("crates/nsl-codegen/src/autotune.rs")),
+    flag("autotune-fresh", B_ONLY, "autotune", Witness::Marker("[autotune]")),
+    flag("no-autotune", B_ONLY, "autotune", Witness::Config("crates/nsl-codegen/src/compiler/kernel.rs")),
+    flag("calibrate", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
+    flag("calibration-batch-size", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
+    flag("calibration-data", B_ONLY, "calibration", Witness::Marker("[calibration]")),
+    flag("calibration-samples", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
+    flag("calibration-timeout", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
+    // Gated optimizations with stderr markers (the strongest witnesses).
+    flag("cuda-graphs", BR, "cuda-graphs", Witness::Marker("[cuda-graph]")),
+    flag("fuse-lm-head", BR, "lm-head-fusion", Witness::Marker("[lm-head-fusion]")),
+    flag("fuse-rmsnorm-backward", BR, "source-ad-fusion", Witness::Marker("[fuse]")),
+    flag("fuse-wgrad-accum", BR, "wgrad-fusion", Witness::Marker("[wgrad-fusion]")),
+    flag("layerwise-accum", BR, "csla", Witness::Marker("[csla]")),
+    flag("optim-state-offload", BR, "offload", Witness::Marker("[offload]")),
+    flag("param-dtype", BR, "sr-bf16", Witness::Marker("[sr-bf16]")),
+    flag("muon-state-dtype", BR, "muon", Witness::Marker("[muon-state]")),
+    flag("stream-arena", BR, "weight-stream", Witness::Marker("[weight-stream]")),
+    flag("stream-async-writeback", BR, "weight-stream", Witness::Marker("[weight-stream]")),
+    flag("stream-prefetch", BR, "weight-stream", Witness::Marker("[weight-stream]")),
+    flag("weight-stream", BR, "weight-stream", Witness::Marker("[weight-stream]")),
+    flag("transient-arena", BR, "arena", Witness::Marker("[arena]")),
+    flag("zero-elementwise", BR, "zero3", Witness::Marker("[zero3]")),
+    flag("zero-stage", BR, "zero", Witness::Marker("[zero]")),
+    flag("grad-integrity", BR, "grad-integrity", Witness::Marker("[grad-integrity]")),
+    flag("gpu-mem-report", R_ONLY, "runtime", Witness::Marker("[gpu-mem]")),
+    flag("inspect", R_ONLY, "inspect", Witness::Marker("[inspect]")),
+    // Unconditional configuration (consumed at the named site on every
+    // compile that accepts the flag; inertness impossible by construction).
+    flag("muon-batch-ns", BR, "muon", Witness::Config("crates/nsl-codegen/src/stmt.rs")),
+    flag("muon-resident-momentum", BR, "muon", Witness::Config("crates/nsl-codegen/src/stmt_fase.rs")),
+    flag("collectives", R_ONLY, "zero", Witness::Config("crates/nsl-cli/src/commands/run.rs")),
+    flag("cuda-sync", R_ONLY, "runtime", Witness::Config("crates/nsl-cli/src/commands/build/run.rs")),
+    flag("decode-workers", R_ONLY, "serve", Witness::Config("crates/nsl-cli/src/commands/run.rs")),
+    flag("prefill-workers", R_ONLY, "serve", Witness::Config("crates/nsl-cli/src/commands/run.rs")),
+    flag("health-interval", R_ONLY, "monitor", Witness::Config("crates/nsl-cli/src/commands/run.rs")),
+    flag("monitor", R_ONLY, "monitor", Witness::Config("crates/nsl-cli/src/commands/run.rs")),
+    flag("debug-training", BR, "driver", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("disable-fusion", BR, "driver", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("source-ad", BR, "driver", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    // `--tape-ad`'s whole effect is clap's source_ad_mode group (tape AD is
+    // the default path); the CompileOptions field it once filled was never
+    // read and has been removed.
+    flag("tape-ad", BR, "clap-group", Witness::Config("crates/nsl-cli/src/args.rs")),
+    flag("deterministic", CBR, "driver", Witness::Config("crates/nsl-codegen/src/compiler/main_entry.rs")),
+    flag("seed", BR, "driver", Witness::Config("crates/nsl-codegen/src/compiler/main_entry.rs")),
+    flag("target", BR, "backend", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("devices", BR, "driver", Witness::Config("crates/nsl-cli/src/commands/build/options.rs")),
+    flag("linear-types", CBR, "ownership", Witness::Config("crates/nsl-cli/src/pipeline.rs")),
+    flag("pretrain-optimized", BR, "meta-flags", Witness::Config("crates/nsl-cli/src/meta_flags.rs")),
+    flag("training-reference", BR, "meta-flags", Witness::Config("crates/nsl-cli/src/meta_flags.rs")),
+    flag("trace-ops", R_ONLY, "driver", Witness::Config("crates/nsl-codegen/src/compiler/main_entry.rs")),
+    // Weight-aware family.
+    flag("weights", CBR, "weight-aware", Witness::Config("crates/nsl-codegen/src/weight_aware.rs")),
+    flag("dead-weight-threshold", CB, "weight-aware", Witness::Config("crates/nsl-codegen/src/weight_aware.rs")),
+    flag("sparse-threshold", CB, "weight-aware", Witness::Config("crates/nsl-codegen/src/weight_aware.rs")),
+    flag("no-constant-fold", B_ONLY, "weight-aware", Witness::Config("crates/nsl-codegen/src/expr/advanced.rs")),
+    flag("no-dead-weight", B_ONLY, "weight-aware", Witness::Config("crates/nsl-codegen/src/weight_aware.rs")),
+    flag("no-sparse-codegen", B_ONLY, "weight-aware", Witness::Config("crates/nsl-codegen/src/expr/advanced.rs")),
+    flag("embed-threshold", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
+    flag("embed-weights", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
+    flag("vram-budget", B_ONLY, "memory-planner", Witness::Config("crates/nsl-codegen/src/memory_planner.rs")),
+    // WCET family (declared on all three; check REFUSES them — see
+    // commands/check.rs — so the check column is a declared refusal, not a
+    // silent drop).
+    flag("wcet", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("wcet-cert", CBR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("wcet-target", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("cpu", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("do178c-report", CBR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("fpga-device", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    // Report-only surfaces: the artifact/report is the witness.
+    flag("fusion-report", B_ONLY, "fusion", Witness::Report("crates/nsl-codegen/src/fusion_report.rs")),
+    flag("nan-analysis", CB, "nan-analysis", Witness::Report("crates/nsl-cli/src/commands/build/normal.rs")),
+    flag("perf", C_ONLY, "profile", Witness::Report("crates/nsl-cli/src/profile.rs")),
+    flag("gpu", CR, "profile", Witness::Config("crates/nsl-cli/src/profile.rs")),
+    flag("shapes", C_ONLY, "shape-debug", Witness::Report("crates/nsl-cli/src/shape_debug.rs")),
+    flag("training-report", C_ONLY, "training-report", Witness::Report("crates/nsl-codegen/src/training_report.rs")),
+    flag("weight-analysis", C_ONLY, "weight-aware", Witness::Report("crates/nsl-codegen/src/weight_aware.rs")),
+    flag("profile", R_ONLY, "profiling", Witness::Report("crates/nsl-cli/src/commands/profile_merge.rs")),
+    flag("profile-kernels", R_ONLY, "profiling", Witness::Report("crates/nsl-runtime/src/args.rs")),
+    flag("profile-memory", R_ONLY, "profiling", Witness::Report("crates/nsl-runtime/src/args.rs")),
 ];
 
-/// Optimization-surface flags DELIBERATELY without an activation contract,
-/// with the reason written down. The completeness gate fails on any
-/// optimization flag missing from both this list and the contract set, so
-/// exclusion is a diff-visible decision.
+/// Flags DELIBERATELY without an activation contract, with the reason
+/// written down. The completeness gate fails on any arg-struct field missing
+/// from both the contract set and this list, so exclusion is a diff-visible
+/// decision (item-20 lesson: a registry must gate its own incompleteness).
 pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
-    // (flag, reason) — populated family-by-family alongside MANUAL_CONTRACTS.
+    ("file", "positional input path, not a feature request"),
+    ("args", "positional program arguments forwarded to the compiled binary"),
+    ("output", "artifact path plumbing"),
+    ("emit-obj", "artifact form plumbing (stop after the object file)"),
+    ("dump-ir", "debug dump plumbing"),
+    ("dump-tokens", "debug dump plumbing"),
+    ("dump-ast", "debug dump plumbing"),
+    ("dump-types", "debug dump plumbing"),
+    ("shared-lib", "build-flavor selector (dispatches to run_build_shared)"),
+    ("standalone", "build-flavor selector (dispatches to run_build_standalone)"),
+    ("unikernel", "build-flavor selector (M54)"),
+    ("listen", "serve-mode selector"),
+    ("trace", "refused on nsl check (see commands/check.rs); nsl debug owns traces"),
+    (
+        "distribute",
+        "REFUSED at dispatch: M43's 3D-parallelism config has no consumer \
+         anywhere in the tree — an inert value is an error, not a contract",
+    ),
+    ("zk-circuit", "build-flavor selector (dispatches to run_build_zk)"),
+    ("zk-backend", "zk emission parameter, consumed by the zk build flavor"),
+    ("zk-field", "zk emission parameter, consumed by the zk build flavor"),
+    ("zk-solidity", "zk emission parameter, consumed by the zk build flavor"),
+    ("zk-weights", "zk emission parameter, consumed by the zk build flavor"),
+    ("activation-report", "the activation mechanism's own reporting switch"),
+    ("allow-inert-requests", "the activation mechanism's own escape hatch"),
+    ("allow-unknown-decorators", "the namespace close's own escape hatch"),
 ];
 
 /// The full contract set: every pass-registry surface (flags AND decorator

@@ -127,6 +127,21 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
         std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
     }
 
+    // Milestone A (deferral-must-refuse): --distribute parses "dp=2, tp=4,
+    // pp=4" into a value NOTHING reads — the flag has zero consumers in
+    // nsl-cli or nsl-codegen (M43's 3D-parallelism config was never wired).
+    // Refuse rather than compile a single-process binary that LOOKS
+    // distributed. Multi-process training is driven by --zero-stage /
+    // --devices / --collectives today.
+    if _distribute.is_some() {
+        eprintln!(
+            "error: --distribute is not implemented (the M43 3D-parallelism \
+             config has no consumer); use --zero-stage/--devices/--collectives \
+             for multi-process training, or drop the flag"
+        );
+        process::exit(1);
+    }
+
     // Item 10: load the frozen tuning DB before ANY compile work — the
     // overlay must be in place before the first autotune cache lookup, and
     // a pin mismatch must refuse the build outright rather than silently
@@ -443,12 +458,25 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 autotune_fresh,
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
                 fusion_report,
-                vram_budget: vram_budget.as_deref()
-                    .and_then(nsl_codegen::memory_planner::parse_vram_budget),
+                // Milestone A: an unparseable budget must refuse, not
+                // silently become "no budget" — the flag is a guard rail.
+                vram_budget: match vram_budget.as_deref() {
+                    None => None,
+                    Some(s) => match nsl_codegen::memory_planner::parse_vram_budget(s) {
+                        Some(b) => Some(b),
+                        None => {
+                            eprintln!(
+                                "error: --vram-budget '{s}' is not a size; \
+                                 accepted forms: <n>GB/<n>GiB/<n>MB/<n>MiB/\
+                                 <n>KB/<n>KiB/<n>B (1024-based)"
+                            );
+                            process::exit(1);
+                        }
+                    },
+                },
                 memory_report,
                 target,
                 disable_fusion,
-                tape_ad: _tape_ad,
                 source_ad: _source_ad,
                 trace_ops: false,
                 nan_analysis,

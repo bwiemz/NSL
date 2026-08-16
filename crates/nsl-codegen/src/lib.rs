@@ -1119,8 +1119,6 @@ pub struct CompileOptions {
     pub target: String,
     /// Disable all fusion optimizations (for differential testing baseline).
     pub disable_fusion: bool,
-    /// M40b: Force tape-based AD (disable source-to-source AD).
-    pub tape_ad: bool,
     /// M40: Use compile-time source-to-source AD for training (default: false = tape AD).
     pub source_ad: bool,
     /// M45: Enable tensor operation tracing.
@@ -1549,7 +1547,6 @@ impl Default for CompileOptions {
             memory_report: false,
             target: "cuda".to_string(),
             disable_fusion: false,
-            tape_ad: false,
             source_ad: false,
             trace_ops: false,
             nan_analysis: false,

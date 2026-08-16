@@ -200,6 +200,36 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 eprintln!("error: --cpkd-target requires --cpkd-design-student");
                 std::process::exit(1);
             }
+            // Milestone A: the whole WCET flag family on `nsl check` was
+            // destructured-and-dropped — six flags accepted and silently
+            // inert while check.rs elsewhere is scrupulous about refusing
+            // dormant flags (`--trace` below is the doctrine). Same cure:
+            // refuse until check-side WCET analysis exists. `--wcet-target`
+            // has a clap default, so explicit presence comes from argv.
+            {
+                let argv = crate::activation_enforce::requested_long_flags();
+                let explicitly = |f: &str| argv.iter().any(|a| a == f);
+                let dropped: &[(&str, bool)] = &[
+                    ("wcet", _wcet),
+                    ("wcet-cert", _wcet_cert.is_some()),
+                    ("cpu", _cpu.is_some()),
+                    ("do178c-report", _do178c_report.is_some()),
+                    ("wcet-target", explicitly("wcet-target")),
+                    ("fpga-device", _fpga_device.is_some()),
+                ];
+                for (flag, present) in dropped {
+                    if *present {
+                        eprintln!(
+                            "error: --{flag} is not implemented on `nsl check` \
+                             (it was accepted and silently ignored); run WCET \
+                             analysis with `nsl build --wcet ...` or \
+                             `nsl run --wcet ...`"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             // M37: `--trace` on `nsl check` was parsed-but-dormant for a long
             // time (users got silence and no trace file). Deferral must
             // refuse: fail loudly until compile-time trace synthesis exists.

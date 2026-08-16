@@ -1,0 +1,225 @@
+//! Milestone A: total-coverage drift gates for the activation-contract table.
+//!
+//! The strong claims, each gated in the direction that catches tomorrow's
+//! drift (item-20/21 lessons):
+//!
+//! 1. TOTAL COVERAGE (tree -> table): every field of CheckArgs / BuildArgs /
+//!    RunArgs is covered by exactly one of {a pass's `cli_flags`,
+//!    `MANUAL_CONTRACTS`, `UNCONTRACTED_FLAGS`}. A flag added tomorrow
+//!    without a contract or a written-down exclusion fails here.
+//! 2. NO GHOSTS (table -> tree): every manual/uncontracted row names a flag
+//!    that actually exists in args.rs.
+//! 3. ENTRY SETS: each manual contract's `on` EXACTLY matches the arg
+//!    structs that declare the flag — the "Build/Run/Check differences are
+//!    explicitly declared" exit criterion, gated bidirectionally.
+//! 4. WITNESSES ARE REAL: every `Marker` string appears literally in some
+//!    src file; every `Config`/`Report` site file exists. A witness that
+//!    cannot be observed is decorative metadata — inadmissible.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use nsl_codegen::activation::{self, Surface, Witness};
+use nsl_codegen::pass_registry::{self, Subcommand};
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+/// Parse args.rs: struct name -> kebab-case flag names. args.rs derives every
+/// long flag from the field name (no `long = "..."` renames exist — asserted
+/// below so a rename cannot silently invalidate this parser).
+fn parse_arg_structs() -> BTreeMap<&'static str, Vec<String>> {
+    let src = std::fs::read_to_string(
+        workspace_root().join("crates/nsl-cli/src/args.rs"),
+    )
+    .expect("read args.rs");
+    assert!(
+        !src.contains("long = \""),
+        "args.rs now uses an explicit `long = \"...\"` rename; this parser \
+         derives flags from field names and must learn the rename first"
+    );
+    let mut out: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    let mut cur: Option<&'static str> = None;
+    for line in src.lines() {
+        for name in ["CheckArgs", "BuildArgs", "RunArgs"] {
+            if line.contains(&format!("struct {name} {{")) {
+                cur = Some(name);
+            }
+        }
+        if let Some(struct_name) = cur {
+            let t = line.trim();
+            if t == "}" {
+                cur = None;
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("pub(crate) ") {
+                if let Some((field, _)) = rest.split_once(':') {
+                    out.entry(struct_name)
+                        .or_default()
+                        .push(field.trim().replace('_', "-"));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn declared_on(structs: &BTreeMap<&'static str, Vec<String>>, flag: &str) -> Vec<Subcommand> {
+    let mut on = Vec::new();
+    for (name, sub) in [
+        ("CheckArgs", Subcommand::Check),
+        ("BuildArgs", Subcommand::Build),
+        ("RunArgs", Subcommand::Run),
+    ] {
+        if structs.get(name).map(|v| v.iter().any(|f| f == flag)).unwrap_or(false) {
+            on.push(sub);
+        }
+    }
+    on
+}
+
+#[test]
+fn every_cli_flag_is_covered_exactly_once() {
+    let structs = parse_arg_structs();
+    // Anti-vacuity above the collapsed value: a broken parser finds 0; the
+    // union today is ~135 fields.
+    let total: usize = structs.values().map(|v| v.len()).sum();
+    assert!(total >= 120, "args.rs parse collapsed: {total} fields");
+
+    let registry: Vec<&str> = pass_registry::PASSES
+        .iter()
+        .flat_map(|p| p.cli_flags.iter().map(|f| f.flag))
+        .collect();
+    let manual: Vec<&str> = activation::MANUAL_CONTRACTS
+        .iter()
+        .filter_map(|c| match c.surface {
+            Surface::Flag(f) => Some(f),
+            Surface::Decorator(_) => None,
+        })
+        .collect();
+    let uncontracted: Vec<&str> =
+        activation::UNCONTRACTED_FLAGS.iter().map(|(f, _)| *f).collect();
+
+    let mut all_flags: Vec<String> = structs.values().flatten().cloned().collect();
+    all_flags.sort();
+    all_flags.dedup();
+
+    for f in &all_flags {
+        let sets = [
+            registry.contains(&f.as_str()),
+            manual.contains(&f.as_str()),
+            uncontracted.contains(&f.as_str()),
+        ];
+        let n = sets.iter().filter(|b| **b).count();
+        assert!(
+            n != 0,
+            "--{f} has no activation contract and no written-down exclusion — \
+             add a MANUAL_CONTRACTS row (owner + witness), or an \
+             UNCONTRACTED_FLAGS entry with the reason"
+        );
+        assert!(
+            n == 1,
+            "--{f} is claimed by {n} coverage sets (registry={}, manual={}, \
+             uncontracted={}) — exactly one must own it",
+            sets[0],
+            sets[1],
+            sets[2],
+        );
+    }
+
+    // Direction 2: no ghost rows.
+    for f in manual.iter().chain(uncontracted.iter()) {
+        assert!(
+            all_flags.iter().any(|a| a == f),
+            "table names --{f} but no arg struct declares it — the flag died \
+             or was renamed; remove or update the row"
+        );
+    }
+
+    // Reasons must be non-empty (a written-down decision, not a shrug).
+    for (f, reason) in activation::UNCONTRACTED_FLAGS {
+        assert!(
+            reason.len() >= 10,
+            "--{f}: uncontracted reason is too short to be a decision: {reason:?}"
+        );
+    }
+}
+
+/// Exit criterion "Build/Run/Check differences are explicitly declared":
+/// every manual contract's `on` must EXACTLY match the structs that declare
+/// the flag, both directions.
+#[test]
+fn entry_sets_match_the_arg_structs_exactly() {
+    let structs = parse_arg_structs();
+    for c in activation::MANUAL_CONTRACTS {
+        let Surface::Flag(f) = c.surface else { continue };
+        let actual = declared_on(&structs, f);
+        assert_eq!(
+            c.on, &actual[..],
+            "--{f}: contract declares {:?} but args.rs declares it on {:?}",
+            c.on, actual
+        );
+    }
+}
+
+/// Every witness must be observable: markers appear literally somewhere in
+/// src; Config/Report sites are real files.
+#[test]
+fn every_witness_is_observable() {
+    let root = workspace_root();
+    // Collect all src file contents once.
+    let mut src_blobs: Vec<(PathBuf, String)> = Vec::new();
+    for crate_dir in std::fs::read_dir(root.join("crates")).unwrap() {
+        let src = crate_dir.unwrap().path().join("src");
+        if src.is_dir() {
+            collect_rs(&src, &mut src_blobs);
+        }
+    }
+    assert!(src_blobs.len() >= 100, "src walk collapsed: {} files", src_blobs.len());
+
+    for c in activation::MANUAL_CONTRACTS {
+        match c.witness {
+            Witness::Marker(m) => {
+                assert!(
+                    src_blobs.iter().any(|(_, s)| s.contains(m)),
+                    "{}: marker {m} appears nowhere under crates/*/src — the \
+                     witness is unobservable",
+                    c.surface.render(),
+                );
+            }
+            Witness::Config(site) | Witness::Report(site) => {
+                let path = site.split("::").next().unwrap_or(site);
+                assert!(
+                    root.join(path).is_file(),
+                    "{}: witness site {path} is not a file",
+                    c.surface.render(),
+                );
+            }
+            Witness::Disposition(pass) => {
+                assert!(
+                    pass_registry::pass(pass).is_some(),
+                    "{}: disposition owner {pass} is not a registered pass",
+                    c.surface.render(),
+                );
+            }
+        }
+    }
+}
+
+fn collect_rs(dir: &std::path::Path, out: &mut Vec<(PathBuf, String)>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            collect_rs(&p, out);
+        } else if p.extension().map(|x| x == "rs").unwrap_or(false) {
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                out.push((p, s));
+            }
+        }
+    }
+}

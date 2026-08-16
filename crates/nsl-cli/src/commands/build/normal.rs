@@ -267,6 +267,29 @@ fn run_build_multi(
         process::exit(1);
     }
 
+    // Milestone A (path-divergence fix): `--nan-analysis` ran only on
+    // `run_build_single` — a multi-file build accepted the flag and emitted
+    // neither warnings nor the "no risks" note. Run the analyzer over every
+    // module in dependency order, mirroring the single-file block's output
+    // shape so tests can assert one needle on both paths.
+    if options.nan_analysis {
+        let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
+        for path in &graph.dep_order {
+            analyzer.analyze_module(&graph.modules[path].ast, &interner);
+        }
+        if analyzer.diagnostics.is_empty() {
+            eprintln!("note: --nan-analysis: no NaN/Inf risks detected");
+        } else {
+            eprintln!(
+                "note: --nan-analysis: {} warning(s) detected",
+                analyzer.diagnostics.len()
+            );
+            for diag in &analyzer.diagnostics {
+                source_map.emit_diagnostic(diag);
+            }
+        }
+    }
+
     let mut obj_files: Vec<PathBuf> = Vec::new();
 
     // Compile each module in dependency order

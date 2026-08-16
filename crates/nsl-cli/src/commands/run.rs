@@ -25,7 +25,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             decode_workers,
             target,
             disable_fusion,
-            tape_ad,
+            // Milestone A: `tape_ad` is destructured-and-dropped on purpose —
+            // the flag's whole effect is clap's source_ad_mode group (tape AD is
+            // the default path; the CompileOptions field it used to fill was
+            // never read and has been removed).
+            tape_ad: _tape_ad,
             source_ad,
             pretrain_optimized,
             debug_training,
@@ -92,6 +96,21 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     // the same plumbing --grad-integrity and --collectives use.
     if allow_unknown_decorators {
         std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
+    }
+
+    // Milestone A (deferral-must-refuse): --distribute parses "dp=2, tp=4,
+    // pp=4" into a value NOTHING reads — the flag has zero consumers in
+    // nsl-cli or nsl-codegen (M43's 3D-parallelism config was never wired).
+    // Refuse rather than compile a single-process binary that LOOKS
+    // distributed. Multi-process training is driven by --zero-stage /
+    // --devices / --collectives today.
+    if _distribute.is_some() {
+        eprintln!(
+            "error: --distribute is not implemented (the M43 3D-parallelism \
+             config has no consumer); use --zero-stage/--devices/--collectives \
+             for multi-process training, or drop the flag"
+        );
+        process::exit(1);
     }
 
     // P4 item 14: validate the collective backend up front (fail before
@@ -436,7 +455,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 memory_report: false,
                 target,
                 disable_fusion,
-                tape_ad,
                 source_ad,
                 trace_ops,
                 nan_analysis: false,
