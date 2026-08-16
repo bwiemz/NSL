@@ -3586,6 +3586,42 @@ impl<'a> WengertExtractor<'a> {
         &self.known_scalar_values
     }
 
+    /// Resolve a var to a compile-time scalar VALUE where one is statically
+    /// known: a tracked 1-element config tensor (`known_scalar_values`), a
+    /// `Constant`, or a value-preserving `Passthrough` chain (`.item()`,
+    /// `reshape`, …) over either — the house style passes config scalars as
+    /// `self._field.item()`, which is exactly one Passthrough hop over a
+    /// tracked field read. The walk is bounded as belt-and-suspenders; SSA
+    /// makes chains acyclic and short.
+    fn resolve_scalar_var(&self, mut var: VarId) -> Option<f64> {
+        for _ in 0..16 {
+            if let Some(&v) = self.known_scalar_values.get(&var) {
+                return Some(v);
+            }
+            let op = self.list.ops.iter().find(|op| op.result == var)?;
+            match &op.op {
+                PrimalOp::Constant(c) => return Some(*c),
+                // WHITELIST, not `Passthrough(_)`: several passthroughs are
+                // not value-preserving — constructors put the SHAPE LIST in
+                // inputs[0] (`full([1], 0.3)` would resolve to 1.0, the
+                // shape dim), `subscript` discards its index, `list` walks
+                // to an arbitrary element, and cos/sin/int transform the
+                // value. Walking any of those returns a confidently WRONG
+                // scalar; an unlisted name returns None (unresolved), which
+                // downstream treats conservatively.
+                PrimalOp::Passthrough(name) => match name.as_str() {
+                    "item" | "reshape" | "contiguous" | "squeeze" | "unsqueeze"
+                    | "expand" | "transpose" | "float" => {
+                        var = *op.inputs.first()?;
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Extract statements into the Wengert list.
     /// Returns false if dynamic control flow is detected.
     pub fn extract_stmts(&mut self, stmts: &[nsl_ast::stmt::Stmt]) -> bool {
@@ -4833,13 +4869,35 @@ impl<'a> WengertExtractor<'a> {
                             // passthrough.
                             return Some(input_vars[0]);
                         }
-                        let p = args
+                        // Resolve p beyond the literal case: the house style
+                        // passes `self._dropout_p.item()` — a ctor-folded
+                        // 1-element config tensor, one Passthrough hop over a
+                        // field read Item 5 already tracks. The bare
+                        // `.unwrap_or(0.1)` default here silently ran REAL
+                        // dropout at p=0.1 on models whose config said 0.0 —
+                        // measured at 1B@2048 as ~1.5 GB of force-saved
+                        // dropout outputs+masks at the peak (CCR force-saves
+                        // Dropout: RNG is not replayable), multiplied per
+                        // micro-batch by the CSLA window buffer.
+                        let p_resolved = args
                             .get(1)
                             .and_then(|a| match &a.value.kind {
                                 ExprKind::FloatLiteral(v) => Some(*v),
+                                ExprKind::IntLiteral(v) => Some(*v as f64),
                                 _ => None,
                             })
-                            .unwrap_or(0.1);
+                            .or_else(|| {
+                                input_vars
+                                    .get(1)
+                                    .and_then(|&pv| self.resolve_scalar_var(pv))
+                            });
+                        if p_resolved == Some(0.0) {
+                            // p=0 dropout is the identity; emitting it anyway
+                            // allocates an output AND a same-size mask per
+                            // call and force-saves both.
+                            return Some(input_vars[0]);
+                        }
+                        let p = p_resolved.unwrap_or(0.1);
                         PrimalOp::Dropout { p }
                     }
                     // Indexing

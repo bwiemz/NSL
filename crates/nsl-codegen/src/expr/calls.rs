@@ -477,6 +477,13 @@ impl Compiler<'_> {
             let kind = self.compile_nested_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_fused_lce_launch_count", &[kind]);
         }
+        // Milestone B: weight-stream stat surface — kinds documented on the
+        // runtime `nsl_weight_stream_stat`. Lets a training program assert
+        // its own residency posture and weight-traffic bill in-process.
+        if func_name == "weight_stream_stat" && args.len() == 1 {
+            let kind = self.compile_nested_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_weight_stream_stat", &[kind]);
+        }
         if matches!(func_name.as_str(), "gpu_surface_peak_bytes" | "gpu_surface_at_peak_bytes")
             && args.len() == 1
         {

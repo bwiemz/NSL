@@ -3364,6 +3364,36 @@ fn lower_single_op(
 
         // === Regularization ===
         PrimalOp::Dropout { p } => {
+            // KNOWN DEFECT (Milestone B review find, 2026-08-16,
+            // pre-existing): the source-AD adjoint for Dropout multiplies
+            // the upstream gradient by op.inputs[1] — the p ARGUMENT var —
+            // because the RNG mask `nsl_tensor_dropout` draws at runtime is
+            // never an SSA value on this path (ad_rules.rs
+            // DropoutBackward). Every Dropout that survives to lowering
+            // therefore trains with gradients decorrelated from the forward
+            // mask. Statically-known p=0 calls are elided as identity at
+            // extraction and never reach here. A hard refusal is the honest
+            // endpoint, but coder50m/coder500m ship with DROPOUT=0.1 and
+            // every gate/campaign over them would red-line — converting a
+            // long-standing silent defect into a repo-wide refusal belongs
+            // to its own change with its own re-baselines. Until then: warn
+            // ONCE, loudly, with the defect named.
+            {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                let pv = *p;
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[source-ad] WARNING: dropout with p={pv} trains with a \
+                         structurally wrong backward on the source-AD path — \
+                         the gradient is scaled by the p argument, NOT the \
+                         runtime RNG mask (the mask is never tape-carried). \
+                         Set the dropout probability to a statically-\
+                         resolvable 0.0 (elided as identity), pass \
+                         training=false, or use --tape-ad. Tracked as a known \
+                         defect (found 2026-08-16)."
+                    );
+                });
+            }
             let pv = builder.ins().f64const(*p);
             let training = builder.ins().iconst(cl_types::I8, 1);
             call(

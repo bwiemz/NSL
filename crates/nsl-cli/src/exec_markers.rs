@@ -359,6 +359,18 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          fused_lm_ce_decline_gate's success cases",
     ),
     m(
+        "[checkpoint]",
+        &[
+            "crates/nsl-runtime/src/checkpoint.rs",
+        ],
+        "Milestone B full-train-state checkpointing: `saved: <path> (+.optim) \
+         at micro-batch step N` after each boundary save (θ .nslm + AdamW \
+         m/v + step counter, tmp-and-rename atomic), `resumed: ...` after \
+         checkpoint_load restored all three and seeded the step counter. \
+         train_checkpoint_gate.rs asserts both; endurance_1b.py asserts the \
+         resume witness at 1B",
+    ),
+    m(
         "[nsl-kernel-count]",
         &[
             "crates/nsl-runtime/src/fused_adapter.rs",
