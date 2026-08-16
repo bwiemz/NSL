@@ -843,19 +843,50 @@ fn plan_train_block(
         if let Some(f) = compiler.compile_options.wggo.prune_fraction {
             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
         }
-        let plan = crate::wggo::run_on_wengert_with_weights(
-            extractor.wengert_list(),
-            &compiler.compile_options.target,
-            compiler.compile_options.wggo.mode.as_deref().unwrap_or("off"),
-            compiler.compile_options.world_size,
-            compiler.compile_options.wggo.weights.as_deref(),
-            analysis_config,
-            Some(&compiler.compile_options),
-            compiler.features.packing_supported_in_module,
-            // Campaign item 6: doc-length stats resolved in kernel synthesis
-            // (before this pre-pass) so packing is priced from the real
-            // distribution; `None` on non-packed modules → legacy constants.
-            compiler.features.dataset_packing_stats.clone(),
+        // Milestone C: SCHEDULED (KernelPrepass is a declared WGGO phase).
+        // tape=None deliberately: the list scanned here is this prepass's own
+        // function-local extraction, dead when this function returns; its
+        // structural identity with the codegen-time tape is bridged by
+        // `fingerprint_wengert` below (the pre-plan's real staleness
+        // mechanism), and the TrainBlock site re-digests the codegen tape
+        // through its own schedule before any positional consumption — so a
+        // digest captured here would be guaranteed-overwritten before any
+        // assert could read it, a full-tape hash per block buying nothing.
+        let sched = compiler.passes.scheduler();
+        let scheduled = match sched.schedule("WGGO", None, || {
+            crate::wggo::run_on_wengert_with_weights(
+                extractor.wengert_list(),
+                &compiler.compile_options.target,
+                compiler.compile_options.wggo.mode.as_deref().unwrap_or("off"),
+                compiler.compile_options.world_size,
+                compiler.compile_options.wggo.weights.as_deref(),
+                analysis_config,
+                Some(&compiler.compile_options),
+                compiler.features.packing_supported_in_module,
+                // Campaign item 6: doc-length stats resolved in kernel synthesis
+                // (before this pre-pass) so packing is priced from the real
+                // distribution; `None` on non-packed modules → legacy constants.
+                compiler.features.dataset_packing_stats.clone(),
+            )
+        }) {
+            Ok(s) => s,
+            // A schedule refusal here is a compiler defect (this is a
+            // declared WGGO phase); degrading to "no pre-plan" would hide
+            // it behind a slower-but-green compile. Panic, the same choice
+            // `pass_trace::record` makes for an unregistered name.
+            Err(e) => panic!("{e}"),
+        };
+        // NOT finish(): `wggo_overrides` declares applied_implies_published
+        // Enforced, but it is published per train block by the TrainBlock
+        // driver — during the prepass the channel is structurally not yet
+        // publishable, and downgrading it to Exempt would disarm the check
+        // at the TrainBlock boundary, the one place it is sound. The
+        // TrainBlock schedule's finish() and the end-of-compile bus finding
+        // judge it where it can hold.
+        let plan = scheduled.defer_postconditions(
+            "wggo_overrides is published per train block by the TrainBlock \
+             driver; the prepass invocation cannot satisfy applied=>published \
+             at any point inside KernelPrepass",
         )?;
         let overrides = crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied);
         let contains_attention = extractor.wengert_list().ops.iter().any(|op| {

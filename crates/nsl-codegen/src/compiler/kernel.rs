@@ -937,7 +937,29 @@ impl Compiler<'_> {
         // training kernels when the train block's dataset is packed. RoPE-reset rides
         // on the existing `segment_masked && rope_q` gate (forward/prelude.rs:113); no
         // separate flag. Inference (`base_config`) stays unmasked → byte-identical.
-        let segment_masked = crate::pca_activation::detect_packing_for_stmts(stmts, self.interner);
+        //
+        // Milestone C: SCHEDULED — this is the load-bearing PCA decision
+        // (masked vs unmasked training kernels). The pure PREDICATE calls to
+        // detect_packing_for_stmts elsewhere (the features-OR in
+        // compile_flash_attention_kernels, the plan-reachability diagnostic)
+        // stay direct and UNscheduled. Honest scope of that distinction:
+        // pca_detect's record placement (after the !cfg.enabled guard) only
+        // keeps packing-DISABLED predicate calls out of the trace — an
+        // enabled predicate call does record "PCA ran", today as before.
+        // What staying unscheduled buys is not suppressing that record but
+        // not printing a scheduler "-> PCA" line for a query, and not
+        // needing an error path in `&self -> ()` helpers. A non-recording
+        // `would_pack` predicate entry is the real fix for the attribution
+        // blur; pre-existing, out of this milestone's scope. tape=None: PCA
+        // is a ModuleScan (TapeAccess::None); no WengertList exists here.
+        let sched = self.passes.scheduler();
+        let segment_masked = sched
+            .schedule("PCA", None, || {
+                crate::pca_activation::detect_packing_for_stmts(stmts, self.interner)
+            })
+            .map_err(CodegenError::new)?
+            .finish(&self.bus)
+            .map_err(CodegenError::new)?;
 
         // Resolve `d_model` from the layer's RMSNorm gamma / Q/K/V
         // projection shapes.  Without this the AD emitter allocates
@@ -1156,6 +1178,15 @@ impl Compiler<'_> {
         // whole module, and when the first block's extraction failed there
         // is no plan entitled to govern it — a later block's preference must
         // not flip admission on the wrong evidence (review finding).
+        // Milestone C: the per-doc admission is PCA's second scheduled
+        // decision in this fn — a legitimate same-epoch re-schedule (the
+        // WGGO replan precedent). The whole decision region rides inside
+        // the body: the wggo_preplans read, the config resolution, the
+        // detect + user-strategy override, and pca_per_doc::admit. The PTX
+        // emission below stays OUTSIDE (it needs &mut self and is emission,
+        // not the pass — the WRGA decide-inside/emit-outside shape).
+        let per_doc_plan = sched
+            .schedule("PCA", None, || {
         let plan_prefers_segment_id = self
             .bus
             .wggo_preplans()
@@ -1171,7 +1202,7 @@ impl Compiler<'_> {
                 .csha
                 .as_ref()
                 .is_some_and(|c| c.fused_projections);
-        let per_doc_plan = if per_doc_authorized && plan_prefers_segment_id {
+        if per_doc_authorized && plan_prefers_segment_id {
             eprintln!(
                 "[pca-per-doc] deferred to plan preference: wggo packing_mode=segment_id \
                  prefers the segment-masked Tier-B kernels — skipping per-doc CTA admission"
@@ -1228,7 +1259,11 @@ impl Compiler<'_> {
             }
         } else {
             None
-        };
+        }
+            })
+            .map_err(CodegenError::new)?
+            .finish(&self.bus)
+            .map_err(CodegenError::new)?;
 
         // ── Forward with saves ─────────────────────────────
         // PCA Tier B Planner (planner spec §5): use the emission helper so the

@@ -371,6 +371,20 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          resume witness at 1B",
     ),
     m(
+        "[pass-manager]",
+        &[
+            "crates/nsl-codegen/src/pass_manager.rs",
+        ],
+        "Milestone C scheduler trace: `-> PASS phase=... epoch=N tape=... \
+         predecessors=...` at each scheduled invocation, `<- PASS \
+         disposition=...` (or `postconditions deferred: <reason>`) at its \
+         boundary, and the non-LIFO epoch-drop BUG line. OPT-IN \
+         (NSL_PASS_TRACE=1, the same switch as the pass trace), \
+         which is the point of the entry — pass_scheduler_gate.rs asserts it \
+         ABSENT on a default build, and a renamed tag would make that \
+         negative assertion pass forever",
+    ),
+    m(
         "[nsl-kernel-count]",
         &[
             "crates/nsl-runtime/src/fused_adapter.rs",

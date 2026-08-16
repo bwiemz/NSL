@@ -1,0 +1,31 @@
+# Milestone C witness: a train block NESTED inside `fn run_training():`.
+#
+# This shape reaches compile_train_block via compile_user_functions — the
+# path that used to install NO driver phase, so every scheduled pass saw
+# phase=None and the scheduler's phase check was silently skipped
+# (`phase=unscoped(phase check skipped)` in the [pass-manager] trace).
+# compile_train_block now installs its own TrainBlock scope at entry, and
+# pass_scheduler_gate.rs asserts on THIS fixture that the unscoped token is
+# gone and FASE attributes to TrainBlock.
+#
+# Kept deliberately tiny: one model, one nested train block, CPU-only.
+
+from nsl.nn.losses import mse_loss
+
+model TinyNet:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+fn run_training():
+    let m = TinyNet()
+    let x = ones([2, 8])
+    let y = zeros([2, 8])
+    train(model = m, epochs = 1, grad_accumulation = 2):
+        optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+        step(batch):
+            let pred = m.forward(x)
+            let loss = mse_loss(pred, y)
+
+run_training()

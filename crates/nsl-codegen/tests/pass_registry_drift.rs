@@ -718,7 +718,14 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("speculative", "speculative decoding support"),
     ("standalone", "standalone binary emission"),
     ("stdlib_loader", "stdlib module loading"),
-    ("stmt", "statement lowering - this is where the passes are DRIVEN from"),
+    (
+        "stmt",
+        "statement lowering - the passes are still DRIVEN from here, but \
+         since Milestone C every invocation goes through \
+         pass_manager::PassScheduler::schedule, so the AUTHORITY (phase \
+         admission, applied=>published, tape staleness, dependency order) \
+         lives in pass_manager, not here",
+    ),
     ("tensor_parallel", "tensor-parallel sharding"),
     ("test_helpers", "test-only helpers"),
     ("training_report", "training report emission"),
@@ -1074,6 +1081,22 @@ fn every_phase_owning_function_establishes_its_scope() {
          "pub fn compile_standalone_main", "TrainBlock"),
         ("crates/nsl-codegen/src/training_report.rs",
          "pub fn build_report", "Analysis"),
+        // Milestone C: the train-block wrapper scopes ITSELF, so every
+        // caller — compile_user_functions (nested train in any fn),
+        // lambdas, model/agent methods, module compiles — is covered by
+        // construction, not just the two top-level drivers above. This is
+        // what closes the scheduler's phase=None production gap, and it is
+        // the LOAD-BEARING TrainBlock install: the compile_main /
+        // compile_standalone_main blankets above are now redundant for
+        // every scheduled pass (kept because their scope also attributes
+        // non-train work compiled at top level, and removing them is a
+        // trace-attribution change this gate should not force silently).
+        // A future pass scheduled from compile_main OUTSIDE a train block
+        // will ambiently inherit their Some(TrainBlock) — declare its real
+        // phase and narrow the blanket then, rather than adding TrainBlock
+        // to its declaration to make the check pass.
+        ("crates/nsl-codegen/src/stmt.rs",
+         "fn compile_train_block(", "TrainBlock"),
     ];
     for (file, sig, phase) in OWNERS {
         let src = read(file);

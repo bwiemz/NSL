@@ -388,3 +388,185 @@ fn wrga_declares_wggo_as_an_invocation_ordered_predecessor() {
         "the predecessor relation must not be symmetric"
     );
 }
+
+/// Milestone C: a MutatesInPlace pass whose body mutates the very list it
+/// scanned (CCR's compressed-save append) re-digests via `rescan_tape` — the
+/// consumption fork must then see the state the pass LEFT, and the state it
+/// ENTERED with must no longer be the enforced one.
+#[test]
+fn rescan_tape_rebinds_the_digest_to_the_post_mutation_state() {
+    let mgr = PassManager::begin();
+    let _p = enter_phase(CompilePhase::TrainBlock);
+    let sched = mgr.scheduler();
+    let mut tape = tiny_tape(5);
+
+    let scheduled = sched
+        .schedule("CCR", None, || {
+            // The pass's own declared mutation: append to the scanned list
+            // (positions of existing ops stay valid — the CCR shape).
+            tape.ops.push(WengertOp {
+                id: 5,
+                result: 5,
+                op: PrimalOp::Relu,
+                inputs: vec![4],
+                saved_for_backward: false,
+                checkpointed: false,
+            });
+        })
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    scheduled.rescan_tape(&tape);
+
+    sched
+        .assert_tape_unchanged_since("CCR", &tape)
+        .expect("the post-mutation state is the enforced one after rescan");
+    let entry_state = tiny_tape(5);
+    sched
+        .assert_tape_unchanged_since("CCR", &entry_state)
+        .expect_err("the pre-mutation state must no longer satisfy the digest");
+
+    // And a LATER mutation — someone else moving the list after the pass
+    // finished — is still refused, which is the point of the whole check.
+    tape.ops.remove(2);
+    sched
+        .assert_tape_unchanged_since("CCR", &tape)
+        .expect_err("a post-rescan mutation must refuse");
+    // `scheduled` drops without finish() deliberately: this test is about
+    // the digest, and CCR has no Enforced channel for finish to judge.
+}
+
+/// `rescan_tape` on a pass scheduled WITHOUT a tape installs a digest that
+/// was previously absent — the CCR schedule shape (tape=None because the
+/// closure needs the list mutably; digest installed after the body).
+#[test]
+fn rescan_tape_installs_a_digest_where_none_was_captured() {
+    let mgr = PassManager::begin();
+    let _p = enter_phase(CompilePhase::TrainBlock);
+    let sched = mgr.scheduler();
+    let tape = tiny_tape(7);
+
+    let scheduled = sched
+        .schedule("CCR", None, || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    // Before the rescan there is no captured state: vacuous pass.
+    sched
+        .assert_tape_unchanged_since("CCR", &tiny_tape(2))
+        .expect("no recorded scan means nothing to invalidate");
+    scheduled.rescan_tape(&tape);
+    sched
+        .assert_tape_unchanged_since("CCR", &tape)
+        .expect("the rescan is now the enforced state");
+    sched
+        .assert_tape_unchanged_since("CCR", &tiny_tape(2))
+        .expect_err("a different list must now refuse");
+    // `scheduled` drops without finish() deliberately, as above.
+}
+
+/// `defer_postconditions` skips a finish() that WOULD have refused — proven
+/// by staging exactly the state the applied⇒published check fires on
+/// (Applied recorded, Enforced channel empty) and observing the deferral
+/// admit it while finish on the same state refuses. This is the WGGO-prepass
+/// shape: the channel is structurally not yet publishable in that phase.
+#[test]
+fn defer_postconditions_skips_a_finish_that_would_refuse() {
+    let bus = PassBus::default();
+    let mgr = PassManager::begin();
+    let _p = enter_phase(CompilePhase::TrainBlock);
+    let sched = mgr.scheduler();
+
+    // Stage: WRGA records Applied, wrga_plan (Enforced) never published.
+    let scheduled_a = sched
+        .schedule("WRGA", None, || {
+            record("WRGA");
+            record_disposition("WRGA", PassDisposition::Applied { rewrites: 1 });
+            41
+        })
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    // Antecedent: finish on this exact state refuses.
+    let err = match scheduled_a.finish(&bus) {
+        Err(e) => e,
+        Ok(_) => panic!("applied with an empty Enforced channel must refuse"),
+    };
+    assert!(err.contains("wrga_plan"), "refusal names the channel: {err}");
+
+    // The deferral admits the same state — and returns the body's value.
+    let scheduled_b = sched
+        .schedule("WRGA", None, || 42)
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    let v = scheduled_b.defer_postconditions(
+        "test: the channel is structurally not yet publishable here",
+    );
+    assert_eq!(v, 42, "the deferral unwraps the body's value");
+}
+
+/// An empty reason is the escape hatch a gate cannot distinguish from an
+/// oversight — refused at the API boundary, not by convention.
+#[test]
+#[should_panic(expected = "non-empty reason")]
+fn defer_postconditions_requires_a_reason() {
+    let mgr = PassManager::begin();
+    let _p = enter_phase(CompilePhase::TrainBlock);
+    let scheduled = mgr
+        .scheduler()
+        .schedule("WRGA", None, || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    scheduled.defer_postconditions("   ");
+}
+
+/// The rescan obligation is the SCHEDULER's, not the caller's memory: a pass
+/// declaring MutatesInPlace + PositionalIndex (CCR) that records Applied
+/// with no live digest gets refused at finish() — otherwise a forgotten
+/// rescan_tape makes every consumption-fork assert vacuously pass while the
+/// static coverage gate keeps certifying the assert SITE exists.
+#[test]
+fn an_applied_in_place_mutator_without_a_live_digest_is_refused() {
+    let bus = PassBus::default();
+    let mgr = PassManager::begin();
+    let _p = enter_phase(CompilePhase::TrainBlock);
+    let sched = mgr.scheduler();
+
+    let scheduled = sched
+        .schedule("CCR", None, || {
+            record("CCR");
+            record_disposition("CCR", PassDisposition::Applied { rewrites: 2 });
+        })
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    let err = match scheduled.finish(&bus) {
+        Err(e) => e,
+        Ok(_) => panic!("Applied + MutatesInPlace + no digest must refuse"),
+    };
+    assert!(
+        err.contains("no tape digest is live"),
+        "refusal names the missing digest: {err}"
+    );
+
+    // Positive control: the same state with a rescan is admitted (CCR has
+    // no Enforced channel, so the digest rule is the only live check).
+    let tape = tiny_tape(3);
+    let scheduled = sched
+        .schedule("CCR", None, || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    scheduled.rescan_tape(&tape);
+    scheduled
+        .finish(&bus)
+        .expect("a live digest satisfies the obligation");
+
+    // And a pass that DECLINED owes no digest: the obligation follows
+    // Applied, not scheduling.
+    let mgr2 = PassManager::begin();
+    let _p2 = enter_phase(CompilePhase::TrainBlock);
+    let scheduled = mgr2
+        .scheduler()
+        .schedule("CCR", None, || {
+            record("CCR");
+            record_disposition(
+                "CCR",
+                PassDisposition::Declined {
+                    reason: nsl_codegen::pass_trace::DeclineReason::ModeOff,
+                },
+            );
+        })
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    scheduled
+        .finish(&bus)
+        .expect("a declining mutator owes no digest");
+}

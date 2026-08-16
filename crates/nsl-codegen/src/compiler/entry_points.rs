@@ -792,7 +792,19 @@ fn compile_returning_plan_impl(
                     crate::pass_registry::CompilePhase::Lowering,
                 );
                 let graph = InterferenceGraph::build(&plannable);
-                let plan = plan_slab(&plannable, &graph);
+                // Milestone C: SCHEDULED. The scope install above must stay
+                // BEFORE this call — schedule() reads the ambient phase.
+                // tape=None: this driver walks AST liveness; no WengertList
+                // exists on this path and the plan's keys are statement
+                // indices and names. The closure captures only locals, and
+                // the vram-budget refusal below stays OUTSIDE the body so a
+                // budget error is never misattributed as a scheduler refusal.
+                let sched = compiler.passes.scheduler();
+                let plan = sched
+                    .schedule("MemoryPlanner", None, || plan_slab(&plannable, &graph))
+                    .map_err(crate::error::CodegenError::new)?
+                    .finish(&compiler.bus)
+                    .map_err(crate::error::CodegenError::new)?;
 
                 if options.memory_report || plan.total_bytes > 0 {
                     let report = format_memory_report(&allocs, &plan);
