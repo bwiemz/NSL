@@ -942,11 +942,16 @@ impl Compiler<'_> {
         // (masked vs unmasked training kernels). The pure PREDICATE calls to
         // detect_packing_for_stmts elsewhere (the features-OR in
         // compile_flash_attention_kernels, the plan-reachability diagnostic)
-        // stay direct by documented design: pca_detect's record placement
-        // exists so a predicate use does not report "PCA ran", and a
-        // scheduler wrap would resurrect exactly that false positive one
-        // layer up. tape=None: PCA is a ModuleScan (TapeAccess::None); no
-        // WengertList exists here.
+        // stay direct and UNscheduled. Honest scope of that distinction:
+        // pca_detect's record placement (after the !cfg.enabled guard) only
+        // keeps packing-DISABLED predicate calls out of the trace — an
+        // enabled predicate call does record "PCA ran", today as before.
+        // What staying unscheduled buys is not suppressing that record but
+        // not printing a scheduler "-> PCA" line for a query, and not
+        // needing an error path in `&self -> ()` helpers. A non-recording
+        // `would_pack` predicate entry is the real fix for the attribution
+        // blur; pre-existing, out of this milestone's scope. tape=None: PCA
+        // is a ModuleScan (TapeAccess::None); no WengertList exists here.
         let sched = self.passes.scheduler();
         let segment_masked = sched
             .schedule("PCA", None, || {

@@ -6398,7 +6398,7 @@ impl Compiler<'_> {
         // stays where it is.
         let sched = self.passes.scheduler();
         let fase_plan = sched.schedule("FASE", None, || {
-        let fase_plan = match self.bus.wggo_overrides() {
+        let plan = match self.bus.wggo_overrides() {
             Some(o) => {
                 let mut fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
                 // Diagnostic knob: NSL_FASE_FUSED_OVERRIDE="1,0,..." replaces
@@ -6454,7 +6454,7 @@ impl Compiler<'_> {
         // Render FaseModeInfeasible diagnostics to stderr in the same format
         // as CSHA / WRGA / CPDT so the Phase 3 decision explainer parses
         // uniformly.
-        for diag in &fase_plan.override_diagnostics {
+        for diag in &plan.override_diagnostics {
             let reason_str = match &diag.reason {
                 crate::wggo_overrides::OverrideRejectReason::FaseModeInfeasible {
                     optimizer,
@@ -6492,17 +6492,17 @@ impl Compiler<'_> {
         // "classical Muon" accumulation (folding the window sum into the
         // momentum buffer itself) is intentionally NOT this mode; it would
         // ship as a separately named mode when it lands.
-        let mut fase_plan = fase_plan;
+        let mut plan = plan;
         if optimizer_name == "muon" && self.compile_options.layerwise_accum {
-            fase_plan.mode = crate::fase::FaseMode::Deferred;
-            fase_plan.recipe.accum_scale = 1.0;
-            fase_plan.rationale = format!(
+            plan.mode = crate::fase::FaseMode::Deferred;
+            plan.recipe.accum_scale = 1.0;
+            plan.rationale = format!(
                 "{} (muon x layerwise-accum: Deferred-shaped raw-sum window \
                  accumulation, stdlib muon_step at group updates)",
-                fase_plan.rationale
+                plan.rationale
             );
         }
-        let fase_plan = fase_plan;
+        let plan = plan;
         // Item 3: re-record FASE's disposition AFTER the driver's own rewrite
         // above. `fase::plan` is accurate about the pass and can be wrong
         // about the build: the muon x --layerwise-accum arm overwrites `mode`
@@ -6515,16 +6515,16 @@ impl Compiler<'_> {
         // (`&'static str` only, and `rationale` is a runtime `String`), so the
         // phase count is what is reported; the mode itself stays visible in
         // the existing `[fase]` diagnostics.
-        if fase_plan.mode == crate::fase::FaseMode::Passthrough {
+        if plan.mode == crate::fase::FaseMode::Passthrough {
             crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
                 reason: crate::pass_trace::DeclineReason::ModeOff,
             });
         } else {
             crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Applied {
-                rewrites: fase_plan.backward_phases.len(),
+                rewrites: plan.backward_phases.len(),
             });
         }
-        fase_plan
+        plan
         })
         .map_err(CodegenError::new)?
         .finish(&self.bus)
@@ -8787,7 +8787,7 @@ impl Compiler<'_> {
                     sched
                         .schedule("CPKD", None, || {
                             let plan =
-                                crate::cpkd::build_plan(crate::cpkd::DistillLoweringFacts {
+                                crate::cpkd::build_plan(crate::cpkd::CpkdPlan {
                         teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
                         student_name: self.resolve_sym(distill.student_sym).to_string(),
                         epochs: distill.epochs,
@@ -9285,19 +9285,21 @@ impl Compiler<'_> {
                 // `invoke_csha_if_enabled`, mirroring WRGA's bridge) contains
                 // the planner run AND all three bus publishes, so finish()'s
                 // applied⇒published check on `csha_bridge` (Enforced) judges
-                // a settled state. tape=Some: CSHA scans this list, and the
-                // digest records what it scanned — but NO
-                // assert_tape_unchanged_since is placed for CSHA anywhere:
+                // a settled state. tape=None deliberately: NO
+                // assert_tape_unchanged_since exists for CSHA anywhere
+                // (`pass_scheduler_coverage.rs` records the exemption) —
                 // its positional chain fields are converted to OpIds AT the
                 // scan boundary inside this window (`collect_claimed_ops` /
                 // the dispatch-map build), OpIds are stable across the
                 // deletions `wggo_prune` makes right after this, and an
                 // assert against the post-prune list would refuse every
                 // prune+CSHA composition for a mutation that invalidates
-                // nothing the pass retained.
+                // nothing the pass retained. A digest nobody can ever read
+                // is a full-tape hash per train block buying only a trace
+                // token, so none is captured.
                 let sched = self.passes.scheduler();
                 sched
-                    .schedule("CSHA", Some(extractor.wengert_list()), || {
+                    .schedule("CSHA", None, || {
                         crate::stmt::invoke_csha_if_enabled(
                             self,
                             extractor.wengert_list(),

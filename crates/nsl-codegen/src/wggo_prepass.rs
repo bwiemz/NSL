@@ -844,14 +844,16 @@ fn plan_train_block(
             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
         }
         // Milestone C: SCHEDULED (KernelPrepass is a declared WGGO phase).
-        // The tape digested is this prepass's own function-local extraction;
-        // its structural identity with the codegen-time tape is bridged by
-        // `fingerprint_wengert` below, which remains the pre-plan's staleness
-        // mechanism — the digest here records what was scanned, nothing
-        // asserts against it (the TrainBlock consumption fork re-digests the
-        // codegen tape through its own schedule).
+        // tape=None deliberately: the list scanned here is this prepass's own
+        // function-local extraction, dead when this function returns; its
+        // structural identity with the codegen-time tape is bridged by
+        // `fingerprint_wengert` below (the pre-plan's real staleness
+        // mechanism), and the TrainBlock site re-digests the codegen tape
+        // through its own schedule before any positional consumption — so a
+        // digest captured here would be guaranteed-overwritten before any
+        // assert could read it, a full-tape hash per block buying nothing.
         let sched = compiler.passes.scheduler();
-        let scheduled = match sched.schedule("WGGO", Some(extractor.wengert_list()), || {
+        let scheduled = match sched.schedule("WGGO", None, || {
             crate::wggo::run_on_wengert_with_weights(
                 extractor.wengert_list(),
                 &compiler.compile_options.target,

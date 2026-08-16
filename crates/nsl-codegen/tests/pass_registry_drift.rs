@@ -1080,7 +1080,16 @@ fn every_phase_owning_function_establishes_its_scope() {
         // caller — compile_user_functions (nested train in any fn),
         // lambdas, model/agent methods, module compiles — is covered by
         // construction, not just the two top-level drivers above. This is
-        // what closes the scheduler's phase=None production gap.
+        // what closes the scheduler's phase=None production gap, and it is
+        // the LOAD-BEARING TrainBlock install: the compile_main /
+        // compile_standalone_main blankets above are now redundant for
+        // every scheduled pass (kept because their scope also attributes
+        // non-train work compiled at top level, and removing them is a
+        // trace-attribution change this gate should not force silently).
+        // A future pass scheduled from compile_main OUTSIDE a train block
+        // will ambiently inherit their Some(TrainBlock) — declare its real
+        // phase and narrow the blanket then, rather than adding TrainBlock
+        // to its declaration to make the check pass.
         ("crates/nsl-codegen/src/stmt.rs",
          "fn compile_train_block(", "TrainBlock"),
     ];

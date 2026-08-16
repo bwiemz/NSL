@@ -1,8 +1,7 @@
 # Milestone C — PassManager owns training optimization scheduling, and the TrainIR verdict
 
-Date: 2026-08-15. Branch `feat/milestone-c-pass-scheduler`, off `origin/main`
-@ `2a8a5931` (#503). Predecessors: item 2 steps 1–7 (#453, #456, #458, #462,
-#466, #499).
+Date: 2026-08-15. Branch `feat/milestone-c-pass-scheduler`, off `origin/main` @ `2a8a5931` (#503).
+Predecessors: item 2 steps 1–7 (PRs 453, 456, 458, 462, 466, 499).
 
 ## What shipped, per exit criterion
 
@@ -93,6 +92,7 @@ question.
 The suspicion that prompted this reassessment holds. Reasoning:
 
 **What a separate TrainIR would buy, concretely.**
+
 1. *By-construction ordering* — the manager invoking pass bodies from the
    declarations instead of checking the driver's order after the fact.
 2. *An explicit context* — killing the `CURRENT_EPOCH`/`CURRENT_PHASE`
@@ -103,6 +103,7 @@ The suspicion that prompted this reassessment holds. Reasoning:
    ~10k lines of shared locals in `compile_train_block_inner`.
 
 **Why each is worth less than it looks after Milestone C.**
+
 1. Ordering: the enforceable invariant is VALUE order, and it is already
    enforced per compile from declarations, at a single exit, with refusals
    that fire (gate-pinned). By-construction ordering adds soundness only
@@ -124,10 +125,24 @@ The suspicion that prompted this reassessment holds. Reasoning:
    of the compiler's most defect-dense file — and one that simplifies it
    instead is a redesign of the passes themselves, not an IR refactor.
 
+**Known tensions carried forward, deliberately.** The
+`defer_postconditions` reason is free text pinned by a count — if the
+prepass ever starts publishing `wggo_overrides`, nothing flags the stale
+deferral (a `publishable_in` declaration on the channel descriptor would;
+it is the natural next declaration if a second deferral ever appears). The
+`compile_main`/`compile_standalone_main` TrainBlock blankets are now
+redundant for every scheduled pass but kept (removing them changes trace
+attribution for non-train top-level work); the OWNERS gate documents which
+install is load-bearing. And PCA's predicate-vs-decision split is
+conventional, not structural: an enabled predicate call still records
+"PCA ran" — a non-recording `would_pack` entry is the real fix,
+pre-existing and out of scope here.
+
 **What would reopen the question.** (a) A tenth in-pipeline pass whose
 product needs a consumption-window discipline the scheduler cannot express
-— the current API bends (`rescan_tape`, `defer_postconditions`) were
-absorbed cleanly, but a third bend of that kind is a signal. (b) A hard
+— the current API bends (`rescan_tape`, `defer_postconditions`, and
+`finish()` owning the rescan obligation from the declarations) were
+absorbed cleanly, but a fourth bend of that kind is a signal. (b) A hard
 requirement to delete the thread-locals (e.g. a multi-threaded compile,
 which today is structurally excluded — `PassManager` is `!Send` by
 design). (c) Evidence that the post-hoc order enforcement missed a real

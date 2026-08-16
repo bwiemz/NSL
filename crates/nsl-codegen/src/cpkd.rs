@@ -112,32 +112,14 @@ pub struct CpkdPlan {
     /// Frozen teacher-field Input leaves (I-11 evidence: these received
     /// no adjoints and never reach the optimizer).
     pub frozen_teacher_inputs: usize,
-    /// Whether the fused KL-CE op fired (decorator enabled + shape hints
-    /// complete + call recognised).
-    pub fused_kl_ce_fired: bool,
-    /// Shape of the fused kernel when fired: (vocab, student_hidden,
-    /// teacher_hidden, rows).
+    /// Shape of the fused kernel when the fused KL-CE op fired (decorator
+    /// enabled + shape hints complete + call recognised): (vocab,
+    /// student_hidden, teacher_hidden, rows). `Some` IS "it fired" — a
+    /// separate bool was redundant state that could only ever agree or
+    /// silently disagree with this field (review finding).
     pub fused_shape: Option<(u32, u32, u32, u32)>,
     /// HBM bytes saved by never materializing the two [rows, vocab] f32
     /// logit tensors (only meaningful when the fused op fired).
-    pub logit_bytes_eliminated: u64,
-}
-
-/// The lowering facts the driver collects for [`build_plan`] — everything
-/// the Distillation Build Report states about one distill block. A struct
-/// rather than ten positional arguments so the call site stays readable and
-/// clippy's argument ceiling stays un-suppressed.
-pub struct DistillLoweringFacts {
-    pub teacher_name: String,
-    pub student_name: String,
-    pub epochs: i64,
-    pub grad_accumulation: i64,
-    pub fase_mode: String,
-    pub loss: DistillLossConfig,
-    pub trainable_params: usize,
-    pub frozen_teacher_inputs: usize,
-    /// `Some` iff the fused KL-CE op fired; the shape it fired with.
-    pub fused_shape: Option<(u32, u32, u32, u32)>,
     pub logit_bytes_eliminated: u64,
 }
 
@@ -146,36 +128,28 @@ pub struct DistillLoweringFacts {
 /// CPKD was the one registered pass with no module entry point — the driver
 /// built the plan inline in `stmt.rs` and recorded the trace there, which the
 /// old inline comment named as "an instance of the pass-bus tangle this
-/// roadmap item exists to unpick". Building the plan HERE gives
-/// `pass_trace::record` its callee-side choke point (the step-2 lesson: a
-/// record at call sites misses drivers nobody wrapped) and gives the
-/// scheduler a body to schedule.
+/// roadmap item exists to unpick". Recording HERE gives `pass_trace::record`
+/// its callee-side choke point (the step-2 lesson: a record at call sites
+/// misses drivers nobody wrapped) and gives the scheduler a body to
+/// schedule. The plan is the caller's struct literal passed through — an
+/// earlier revision mirrored every field into a `DistillLoweringFacts`
+/// struct and transcribed it here field-by-field, a drift surface where a
+/// mis-paired same-type copy compiles clean and reports wrong (review
+/// finding).
 ///
 /// Deliberately takes NO `WengertList`: the registry declares
 /// `TapeAccess::None` for CPKD and `tape_access_drift.rs` enforces zero
 /// code-level `WengertList` mentions across the cpkd* module family — so the
 /// driver performs the one tape read this plan consumes (the FusedKlCe shape
 /// scan) in `stmt.rs` and passes the RESULT in as `fused_shape`.
-pub fn build_plan(facts: DistillLoweringFacts) -> CpkdPlan {
+pub fn build_plan(plan: CpkdPlan) -> CpkdPlan {
     crate::pass_trace::record("CPKD");
     // AdvisoryOnly, and not a hedge: the plan built here is consumed by
     // exactly one thing, `render_report` (see `compile_distill_block`). The
     // fusion it reports on was performed by the `@fused_kl_ce` decorator
     // during extraction, not by this code — CPKD rewrites nothing.
     crate::pass_trace::record_disposition("CPKD", crate::pass_trace::PassDisposition::AdvisoryOnly);
-    CpkdPlan {
-        teacher_name: facts.teacher_name,
-        student_name: facts.student_name,
-        epochs: facts.epochs,
-        grad_accumulation: facts.grad_accumulation,
-        fase_mode: facts.fase_mode,
-        loss: facts.loss,
-        trainable_params: facts.trainable_params,
-        frozen_teacher_inputs: facts.frozen_teacher_inputs,
-        fused_kl_ce_fired: facts.fused_shape.is_some(),
-        fused_shape: facts.fused_shape,
-        logit_bytes_eliminated: facts.logit_bytes_eliminated,
-    }
+    plan
 }
 
 impl CpkdPlan {
@@ -225,8 +199,7 @@ impl CpkdPlan {
             }
         );
         let _ = writeln!(s, "Optimizations:");
-        if self.fused_kl_ce_fired {
-            let (v, hs, ht, rows) = self.fused_shape.unwrap_or((0, 0, 0, 0));
+        if let Some((v, hs, ht, rows)) = self.fused_shape {
             let _ = writeln!(
                 s,
                 "  [1] Fused KL-CE: teacher+student logits never materialized \

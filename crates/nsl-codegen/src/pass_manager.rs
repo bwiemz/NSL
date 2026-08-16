@@ -248,8 +248,25 @@ pub struct TapeDigest {
     hash: u64,
 }
 
+/// Streams `Debug` output straight into a hasher — no per-op `String`.
+///
+/// With every in-pipeline pass scheduled, a worst-case train compile digests
+/// the tape several times (schedule captures, rescans, consumption-fork
+/// asserts); `format!("{:?}", op.op)` allocated one String per op per
+/// digest, which at 100k-op tapes is ~1M transient allocations buying
+/// nothing — the bytes were only ever fed to a hasher.
+struct HashWriter<'a, H: std::hash::Hasher>(&'a mut H);
+
+impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl TapeDigest {
     fn of(list: &WengertList) -> Self {
+        use std::fmt::Write as _;
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         list.ops.len().hash(&mut h);
@@ -260,7 +277,8 @@ impl TapeDigest {
             op.saved_for_backward.hash(&mut h);
             op.checkpointed.hash(&mut h);
             // `PrimalOp` is not `Hash` (it carries an f64 in `Constant`), so
-            // its `Debug` stands in. That distinguishes every variant and
+            // its `Debug` stands in, streamed through `HashWriter` so no
+            // per-op String is built. That distinguishes every variant and
             // every payload that can affect POSITIONS — in particular a
             // rewritten `Passthrough` name, which is a real in-place rewrite
             // (`fuse_swiglu_gate_backward` does exactly it) that a
@@ -270,7 +288,7 @@ impl TapeDigest {
             // `Constant(NaN)` and `Constant(-NaN)` format identically. A
             // constant's sign cannot move an op's position, which is the only
             // property the positional-reference rule depends on.
-            format!("{:?}", op.op).hash(&mut h);
+            let _ = write!(HashWriter(&mut h), "{:?}", op.op);
         }
         list.output.hash(&mut h);
         Self {
@@ -581,11 +599,22 @@ impl<R> Scheduled<R> {
 
     /// Check the pass's declared postconditions and unwrap its value.
     ///
-    /// Today that is one rule, and it is the bus's own: a channel declaring
+    /// Two rules. The bus's own: a channel declaring
     /// `applied_implies_published: Enforced` must be occupied once its
     /// producer has recorded `Applied`. The bus REPORT already finds this at
     /// end of compile, where it is a line in a report nobody blocks on; at the
     /// pass boundary it is a refusal that still names the pass that just ran.
+    ///
+    /// And the registry's: a pass declaring `TapeAccess::MutatesInPlace`
+    /// with `TapeRef::PositionalIndex` that recorded `Applied` must have a
+    /// LIVE tape digest for this invocation — captured at `schedule(..,
+    /// Some(tape), ..)` or re-captured by [`Self::rescan_tape`]. Without
+    /// this, forgetting the rescan makes every consumption-fork
+    /// `assert_tape_unchanged_since` for that pass vacuously pass (a missing
+    /// digest is "nothing to invalidate"), and the static coverage gate only
+    /// checks the assert SITE exists — protection that certifies while
+    /// checking nothing. The obligation is implied by the declarations, so
+    /// the scheduler owns it, not the caller's memory.
     pub fn finish(self, bus: &PassBus) -> Result<R, String> {
         let applied = crate::pass_trace::dispositions_in(self.epoch)
             .into_iter()
@@ -604,6 +633,29 @@ impl<R> Scheduled<R> {
                         self.pass,
                         d.name,
                         d.consumers.join(", ")
+                    ));
+                }
+            }
+            let declares_positional_in_place = crate::pass_registry::pass(self.pass)
+                .is_some_and(|d| match d.tape {
+                    crate::pass_registry::TapeAccess::MutatesInPlace { refs, .. } => {
+                        refs.contains(&crate::pass_registry::TapeRef::PositionalIndex)
+                    }
+                    _ => false,
+                });
+            if declares_positional_in_place {
+                let digest_live = SCANNED_TAPES.with(|m| {
+                    m.borrow().iter().any(|(k, _)| *k == (self.epoch, self.pass))
+                });
+                if !digest_live {
+                    return Err(format!(
+                        "pass '{}' declares MutatesInPlace with PositionalIndex \
+                         refs and recorded Applied, but no tape digest is live \
+                         for this invocation — its consumption-fork staleness \
+                         asserts would all vacuously pass. Schedule it with \
+                         Some(tape), or call rescan_tape after the mutating \
+                         body. Compiler defect, please report.",
+                        self.pass
                     ));
                 }
             }

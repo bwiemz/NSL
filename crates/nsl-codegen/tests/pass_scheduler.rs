@@ -511,3 +511,62 @@ fn defer_postconditions_requires_a_reason() {
         .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
     scheduled.defer_postconditions("   ");
 }
+
+/// The rescan obligation is the SCHEDULER's, not the caller's memory: a pass
+/// declaring MutatesInPlace + PositionalIndex (CCR) that records Applied
+/// with no live digest gets refused at finish() — otherwise a forgotten
+/// rescan_tape makes every consumption-fork assert vacuously pass while the
+/// static coverage gate keeps certifying the assert SITE exists.
+#[test]
+fn an_applied_in_place_mutator_without_a_live_digest_is_refused() {
+    let bus = PassBus::default();
+    let mgr = PassManager::begin();
+    let _p = enter_phase(CompilePhase::TrainBlock);
+    let sched = mgr.scheduler();
+
+    let scheduled = sched
+        .schedule("CCR", None, || {
+            record("CCR");
+            record_disposition("CCR", PassDisposition::Applied { rewrites: 2 });
+        })
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    let err = match scheduled.finish(&bus) {
+        Err(e) => e,
+        Ok(_) => panic!("Applied + MutatesInPlace + no digest must refuse"),
+    };
+    assert!(
+        err.contains("no tape digest is live"),
+        "refusal names the missing digest: {err}"
+    );
+
+    // Positive control: the same state with a rescan is admitted (CCR has
+    // no Enforced channel, so the digest rule is the only live check).
+    let tape = tiny_tape(3);
+    let scheduled = sched
+        .schedule("CCR", None, || ())
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    scheduled.rescan_tape(&tape);
+    scheduled
+        .finish(&bus)
+        .expect("a live digest satisfies the obligation");
+
+    // And a pass that DECLINED owes no digest: the obligation follows
+    // Applied, not scheduling.
+    let mgr2 = PassManager::begin();
+    let _p2 = enter_phase(CompilePhase::TrainBlock);
+    let scheduled = mgr2
+        .scheduler()
+        .schedule("CCR", None, || {
+            record("CCR");
+            record_disposition(
+                "CCR",
+                PassDisposition::Declined {
+                    reason: nsl_codegen::pass_trace::DeclineReason::ModeOff,
+                },
+            );
+        })
+        .unwrap_or_else(|e| panic!("preconditions hold: {e}"));
+    scheduled
+        .finish(&bus)
+        .expect("a declining mutator owes no digest");
+}

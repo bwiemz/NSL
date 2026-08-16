@@ -16,12 +16,34 @@ fn src(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// Strip `//` comments then all whitespace — the multi-line-call-chain
-/// lesson from `pass_bus_drift.rs`: a line-based scan misses a call split
-/// across lines and certifies what it cannot see. Block comments are not
-/// stripped (known, accepted limit shared with the sibling drift gates).
+/// Strip `/* block comments */`, then `//` line comments, then all
+/// whitespace — the multi-line-call-chain lesson from `pass_bus_drift.rs`
+/// (a line-based scan misses a call split across lines), PLUS the hole the
+/// sibling gates accept and this file must not: every count here is
+/// load-bearing arithmetic (schedule == finish + defer), so a
+/// block-commented-out schedule/finish site counting as LIVE would let the
+/// cheapest possible conversion revert — `/* */` around one wrapper — keep
+/// every gate green while the pass runs unscheduled.
+///
+/// The block-strip is string-naive (a `/*` inside a string literal would
+/// truncate to its closing `*/`) — none of the scanned needles can be
+/// produced that way, and over-stripping only ever LOWERS counts, which
+/// fails closed against the exact-equality pins.
 fn code_only(text: &str) -> String {
-    text.lines()
+    let mut no_blocks = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("/*") {
+        no_blocks.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+            }
+        }
+    }
+    no_blocks.push_str(rest);
+    no_blocks
+        .lines()
         .map(|l| match l.find("//") {
             Some(i) if !l[..i].contains('"') => &l[..i],
             _ => l,
@@ -33,25 +55,30 @@ fn code_only(text: &str) -> String {
 }
 
 /// Every `.rs` file under `src/`, so a schedule site moving to a new module
-/// is found rather than silently uncounted.
-fn all_src_code() -> String {
-    fn walk(dir: &Path, out: &mut String) {
-        for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
-            let p = e.expect("dir entry").path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push_str(&code_only(
-                    &std::fs::read_to_string(&p)
-                        .unwrap_or_else(|e| panic!("{}: {e}", p.display())),
-                ));
-                out.push('\n');
+/// is found rather than silently uncounted. Walked ONCE per test binary —
+/// five tests share the scan (tests run as threads of one process).
+fn all_src_code() -> &'static str {
+    static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CODE.get_or_init(|| {
+        fn walk(dir: &Path, out: &mut String) {
+            for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            {
+                let p = e.expect("dir entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push_str(&code_only(
+                        &std::fs::read_to_string(&p)
+                            .unwrap_or_else(|e| panic!("{}: {e}", p.display())),
+                    ));
+                    out.push('\n');
+                }
             }
         }
-    }
-    let mut out = String::new();
-    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
-    out
+        let mut out = String::new();
+        walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+        out
+    })
 }
 
 fn count(hay: &str, needle: &str) -> usize {
@@ -125,12 +152,19 @@ fn every_scheduled_invocation_settles_its_postconditions() {
     let schedules: usize = SCHEDULED.iter().map(|(_, n, _)| n).sum();
     // Anti-vacuity: the walker actually saw the sites.
     assert_eq!(
-        count(&code, "schedule(\""),
+        count(code, "schedule(\""),
         schedules,
         "total schedule(\"..\") sites moved — update SCHEDULED first"
     );
-    let finishes = count(&code, ".finish(&self.bus)") + count(&code, ".finish(&compiler.bus)");
-    let defers = count(&code, ".defer_postconditions(");
+    // The needle is the CALL SHAPE, not a receiver spelling: counting
+    // `.finish(&self.bus)` literally would fail on a correct refactor that
+    // binds the bus to a local or hoists a helper taking `compiler` (review
+    // finding). `.finish(&` still requires a by-reference bus argument at
+    // the call — the definition site cannot satisfy it (whitespace is
+    // stripped, and pass_manager.rs's `fn finish(self, bus: &PassBus)` does
+    // not contain the token).
+    let finishes = count(code, ".finish(&");
+    let defers = count(code, ".defer_postconditions(");
     assert_eq!(
         finishes + defers,
         schedules,
@@ -146,22 +180,21 @@ fn every_scheduled_invocation_settles_its_postconditions() {
 /// escape hatch cannot quietly become a convention.
 #[test]
 fn defer_postconditions_callers_are_enumerated() {
-    let allowed = ["src/wggo_prepass.rs"];
-    for rel in allowed {
-        assert_eq!(
-            count(&code_only(&src(rel)), ".defer_postconditions("),
-            1,
-            "{rel}: expected exactly one deferral (the prepass invocation)"
-        );
-    }
-    // No caller outside the allowlist.
-    let everywhere = count(&all_src_code(), ".defer_postconditions(");
+    // Two direct pins, no allowlist machinery until a second caller exists
+    // (review finding: generic scaffolding for a one-element set obscured
+    // that the per-file count was hardcoded anyway). Growing the set means
+    // replacing both asserts with the enumeration they pretend to be.
     assert_eq!(
-        everywhere,
-        allowed.len(),
-        "a new defer_postconditions caller appeared outside the allowlist — \
-         every deferral is a reviewed decision; add it here WITH its reason \
-         or call finish()"
+        count(all_src_code(), ".defer_postconditions("),
+        1,
+        "a new defer_postconditions caller appeared — every deferral is a \
+         reviewed decision with its reason; extend this gate with it, or \
+         call finish()"
+    );
+    assert_eq!(
+        count(&code_only(&src("src/wggo_prepass.rs")), ".defer_postconditions("),
+        1,
+        "the one deferral is the WGGO prepass invocation; it moved"
     );
 }
 
