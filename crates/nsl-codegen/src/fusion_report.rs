@@ -88,6 +88,11 @@ pub struct FusionBarrierEvent {
 /// Format and print the fusion report to stderr.
 pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEvent]) {
     if events.is_empty() && barriers.is_empty() {
+        // Milestone A: every caller gates this on `--fusion-report`, so an
+        // empty report must still ANSWER the request — silence here is
+        // indistinguishable from the report never being wired (which was
+        // literally true on the single-file path until the same change).
+        eprintln!("\nFusion Report: no fusion events (nothing fused on this compile)");
         return;
     }
 

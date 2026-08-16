@@ -266,13 +266,24 @@ fn the_report_enumerates_idle_passes_too() {
     let r = run("idle", &[], true);
     assert!(r.ok, "run failed:\n{}", r.stderr);
     let idle = idle(&r.stderr);
-    for expected in ["CCR", "WGGO", "CSHA", "CPDT", "CEP", "CFIE"] {
+    // CPDT is deliberately absent from this list since Milestone A: like
+    // FASE, it is invoked on every train-block compile and records a typed
+    // `declined, mode off` instead of silence — its mode-off early return
+    // used to be invisible, which is how `@cpdt(mode = off)` stayed inert
+    // for months. The decline is asserted below instead.
+    for expected in ["CCR", "WGGO", "CSHA", "CEP", "CFIE"] {
         assert!(
             idle.iter().any(|p| p == expected),
             "{expected} should be listed as not-run on a bare compile:\n{}",
             r.stderr
         );
     }
+    assert!(
+        r.stderr.contains("CPDT: declined, mode off"),
+        "CPDT must record its mode-off decline on a bare train compile \
+         (the FASE-style always-answer discipline):\n{}",
+        r.stderr
+    );
 }
 
 /// **Pins a real finding, so it cannot be lost or silently "fixed".**

@@ -378,30 +378,6 @@ pub(crate) struct CheckArgs {
         #[arg(long, default_value_t = 0.5)]
         pub(crate) sparse_threshold: f64,
 
-        /// M53: Enable WCET analysis for @real_time functions
-        #[arg(long)]
-        pub(crate) wcet: bool,
-
-        /// M53: Write WCET certificate JSON to file
-        #[arg(long)]
-        pub(crate) wcet_cert: Option<PathBuf>,
-
-        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
-        #[arg(long)]
-        pub(crate) cpu: Option<String>,
-
-        /// M53: Write DO-178C compliance report to file (FPGA only)
-        #[arg(long)]
-        pub(crate) do178c_report: Option<PathBuf>,
-
-        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
-        #[arg(long, default_value = "gpu")]
-        pub(crate) wcet_target: String,
-
-        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
-        #[arg(long)]
-        pub(crate) fpga_device: Option<String>,
-
         /// Emit a training-pipeline decision audit for every train block in the file.
         /// Pass without value for text output, or `--training-report=json` for JSON.
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
@@ -483,6 +459,29 @@ pub(crate) struct CheckArgs {
         ///   nsl check --wrga-compare --wrga-ablate=wengert,fusion model.nsl
         #[arg(long)]
         pub(crate) wrga_ablate: Option<String>,
+
+        /// Milestone A: print the activation-contract report — one line per
+        /// requested optimization surface (flag or decorator) with what
+        /// became of it (applied / declined / witnessed / UNSATISFIED). On
+        /// `nsl check` the report is informational only; enforcement happens
+        /// on `build`/`run`, where the compile actually runs.
+        #[arg(long)]
+        pub(crate) activation_report: bool,
+
+        /// Milestone A escape hatch: demote unsatisfied activation contracts
+        /// (a requested feature whose owner recorded no disposition) from a
+        /// hard error to a warning. For migration only — an inert request is
+        /// a correctness bug in the invocation or the compiler.
+        #[arg(long)]
+        pub(crate) allow_inert_requests: bool,
+
+        /// Milestone A escape hatch: demote UNKNOWN-decorator-name errors to
+        /// warnings (one release, for migration). Documented-but-
+        /// unimplemented decorators (e.g. @tie_weights) stay hard errors —
+        /// accepting those would resurrect the silence this flag's namespace
+        /// close exists to end.
+        #[arg(long)]
+        pub(crate) allow_unknown_decorators: bool,
 }
 
 /// Source-AD is in effect if EITHER `--source-ad` is given explicitly or
@@ -1130,6 +1129,27 @@ pub(crate) struct BuildArgs {
         /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
         #[arg(long)]
         pub(crate) cep_emit_source: Option<PathBuf>,
+
+        /// Milestone A: print the activation-contract report — one line per
+        /// requested optimization surface (flag or decorator) with what
+        /// became of it (applied / declined / witnessed / UNSATISFIED).
+        #[arg(long)]
+        pub(crate) activation_report: bool,
+
+        /// Milestone A escape hatch: demote unsatisfied activation contracts
+        /// (a requested feature whose owner recorded no disposition) from a
+        /// hard error to a warning. For migration only — an inert request is
+        /// a correctness bug in the invocation or the compiler.
+        #[arg(long)]
+        pub(crate) allow_inert_requests: bool,
+
+        /// Milestone A escape hatch: demote UNKNOWN-decorator-name errors to
+        /// warnings (one release, for migration). Documented-but-
+        /// unimplemented decorators (e.g. @tie_weights) stay hard errors —
+        /// accepting those would resurrect the silence this flag's namespace
+        /// close exists to end.
+        #[arg(long)]
+        pub(crate) allow_unknown_decorators: bool,
 }
 
 #[derive(clap::Args)]
@@ -1622,6 +1642,27 @@ pub(crate) struct RunArgs {
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
         #[arg(short = 'w', long)]
         pub(crate) weights: Option<PathBuf>,
+
+        /// Milestone A: print the activation-contract report — one line per
+        /// requested optimization surface (flag or decorator) with what
+        /// became of it (applied / declined / witnessed / UNSATISFIED).
+        #[arg(long)]
+        pub(crate) activation_report: bool,
+
+        /// Milestone A escape hatch: demote unsatisfied activation contracts
+        /// (a requested feature whose owner recorded no disposition) from a
+        /// hard error to a warning. For migration only — an inert request is
+        /// a correctness bug in the invocation or the compiler.
+        #[arg(long)]
+        pub(crate) allow_inert_requests: bool,
+
+        /// Milestone A escape hatch: demote UNKNOWN-decorator-name errors to
+        /// warnings (one release, for migration). Documented-but-
+        /// unimplemented decorators (e.g. @tie_weights) stay hard errors —
+        /// accepting those would resurrect the silence this flag's namespace
+        /// close exists to end.
+        #[arg(long)]
+        pub(crate) allow_unknown_decorators: bool,
 
         /// Arguments to pass to the compiled program
         #[arg(last = true)]

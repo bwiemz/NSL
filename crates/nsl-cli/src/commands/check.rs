@@ -147,12 +147,6 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             weights,
             dead_weight_threshold,
             sparse_threshold,
-            wcet: _wcet,
-            wcet_cert: _wcet_cert,
-            cpu: _cpu,
-            do178c_report: _do178c_report,
-            wcet_target: _wcet_target,
-            fpga_device: _fpga_device,
             training_report,
             cep_search,
             cep_profile,
@@ -166,7 +160,14 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             csha,
             csha_report,
             wrga_ablate,
+            // Milestone A: consumed by activation_enforce, which reads argv
+            // directly (see its module doc), so the typed values are unused.
+            activation_report: _activation_report,
+            allow_inert_requests: _allow_inert_requests,
+            allow_unknown_decorators,
     } = args;
+
+    crate::activation_enforce::apply_allow_unknown_decorators(allow_unknown_decorators);
 
             if cep_search && cep_profile {
                 eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
@@ -585,4 +586,12 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
     // never links, so without this the trace is silent on a path where passes
     // demonstrably ran.
     crate::commands::build::emit_pass_trace();
+
+    // Milestone A: report-only on check — compile-scoped contracts reconcile
+    // to OutOfScope here (check runs no full codegen), and the few
+    // check-scoped ones stay warnings; `nsl check` answers "is this program
+    // well-formed", never "did an optimizer fire".
+    crate::activation_enforce::enforce_from_argv(
+        nsl_codegen::pass_registry::Subcommand::Check,
+    );
 }

@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Milestone B — 1B@2048 as a stable first-class single-GPU workload
+
+- **Full training-state checkpoint/restart** (`train(checkpoint_save=…,
+  checkpoint_every=N)` / `checkpoint_load=…`): θ as a normal `.nslm` plus an
+  `NSLO` `.optim` sidecar carrying the AdamW m/v moments and the micro-batch
+  step counter, written atomically (tmp + rename) at optimizer-step
+  boundaries only. Resume restores all three and seeds the step counter, so
+  bias correction, the scheduler, and the checkpoint cadence continue.
+  `train_checkpoint_gate.rs` proves a resumed run is **byte-identical** to an
+  uninterrupted control on CPU, pins the accumulation-boundary cadence, and
+  pins the refusals (AdamW/Adam only, no `--zero-stage`, no CPDT moment
+  precision, literal-only args, missing checkpoint aborts).
+- **Dropout at statically-known p=0 is now elided in source AD** — and the
+  1B model was silently training with REAL p=0.1 dropout: call sites pass
+  `self._dropout_p.item()`, the extractor only understood literals, and its
+  fallback default was 0.1. The resolver now follows the ctor-folded config
+  scalar through the `.item()` passthrough; at 1B@2048 this removes the
+  entire `dropout_f32` context (≈1.5 GB of force-saved outputs+masks at the
+  microbatch-2 peak, window-multiplied) and corrects the semantics drift.
+- **True peak attribution**: the caching allocator snapshots the per-context
+  table at the moment the global peak is set (`Top contexts at peak` in
+  NSL_MEMSTATS), alongside the existing per-surface at-global-peak
+  decomposition. The live `Top contexts` table describes teardown residue,
+  not the peak — the two now print side by side. bf16-sr widen views name
+  themselves (`srbf16_widen_view`) instead of inheriting a stale kernel tag.
+- **Weight-traffic accounting**: the streaming stack counts its own PCIe
+  bytes (`h2d_bytes`/`d2h_bytes` appended to the `[weight-stream]` counters
+  line), separable from dataloader/logits traffic in the global counters.
+  `weight_stream_stat(kind)` (new builtin) exposes traffic, residency
+  posture, and the capacity plan in-process; `NSL_WS_DECISION_JSON=<path>`
+  banks the residency decision machine-readably at exit.
+- **Canonical workload**: `models/coder1b/pretrain_1b2048.nsl` — microbatch
+  2, seq 2048, accum 2, `--fuse-lm-head require`, periodic checkpoints, and
+  in-program witness blocks (fused-CE launch counters, residency posture,
+  at-peak surface decomposition). `models/benchmarks/endurance_1b.py` runs
+  the milestone's exit criteria as assertions: fused-CE proven active
+  (compile witness AND runtime launch counters), flat VRAM high-water over
+  100+ optimizer steps, zero weight-stream traffic bytes, the recorded
+  residency decision validated against the measured peak, a ≥3 GiB margin,
+  and checkpoint/resume continuity — banking F32 and SR-BF16 trajectories.
+- Removed the stale `@fused_lm_ce`-refused-under-`--layerwise-accum` claim
+  from `pretrain_layerwise_fit.nsl` (annotated in place, dated).
+
 ### Measured — SR-BF16 at 1B@2048: streaming is gone; the fused LM head is what moves the ceiling
 
 - **bf16-sr eliminates parameter streaming at 1B@2048 completely** — 0.5 MiB

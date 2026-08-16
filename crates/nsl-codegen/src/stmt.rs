@@ -207,7 +207,29 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // planning into a no-op here. See STATUS.md / docs/architecture/.
     #[cfg(not(feature = "experimental-cpdt"))]
     {
-        let _ = (compiler, applied_plan, train_block);
+        let _ = (applied_plan, train_block);
+        // Milestone A: a build compiled without the feature cannot honour a
+        // CPDT request — say so as a typed decline instead of a silent no-op,
+        // or the activation reconciler reports the request as silently inert
+        // with no way for the user to tell why.
+        // Record unconditionally: `@cpdt(mode = off)` maps to CpdtMode::Off,
+        // so gating the record on mode != Off left exactly that request
+        // unanswered on feature-stripped builds (review finding). ModeOff is
+        // the honest reason when off was requested-or-default; FeatureDisabled
+        // when the request wanted CPDT active.
+        crate::pass_trace::record("CPDT");
+        crate::pass_trace::record_disposition(
+            "CPDT",
+            crate::pass_trace::PassDisposition::Declined {
+                reason: if compiler.cpdt_mode == crate::cpdt::CpdtMode::Off {
+                    crate::pass_trace::DeclineReason::ModeOff
+                } else {
+                    crate::pass_trace::DeclineReason::FeatureDisabled(
+                        "this nsl was built without the experimental-cpdt feature",
+                    )
+                },
+            },
+        );
         return;
     }
     use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
@@ -217,10 +239,34 @@ pub(crate) fn invoke_cpdt_if_enabled(
     use crate::cpdt_zero::ModelSize;
     use crate::wggo_overrides::WggoOverrides;
 
+    // Milestone A: these two early returns were SILENT — `cpdt::run` records
+    // the pass's dispositions, but neither exit ever reaches it, so a compile
+    // that requested CPDT (flag or decorator) and got nothing looked exactly
+    // like one that never asked. Record here, at the decision, mirroring
+    // FASE's mode-off recording. `record` first: disposition presupposes it.
     if compiler.cpdt_mode == CpdtMode::Off {
+        crate::pass_trace::record("CPDT");
+        crate::pass_trace::record_disposition(
+            "CPDT",
+            crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::ModeOff,
+            },
+        );
         return;
     }
     let Some(cluster) = compiler.cpdt_cluster.clone() else {
+        // Reachable from source alone: `@cpdt(mode = full)` with no cluster
+        // argument and no CLI cluster flags leaves `cpdt_cluster` None.
+        crate::pass_trace::record("CPDT");
+        crate::pass_trace::record_disposition(
+            "CPDT",
+            crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::PreconditionViolated(
+                    "no cluster specification — pass --cpdt-num-gpus or give \
+                     @cpdt a cluster argument",
+                ),
+            },
+        );
         return;
     };
 
@@ -2168,6 +2214,31 @@ impl Compiler<'_> {
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                    }
+
+                    // Milestone A: capture `@fase(...)` on a train block so
+                    // the FASE planner consumes it instead of the config
+                    // being validated-then-dropped (the checker's arm at
+                    // nsl-semantic/checker/stmt.rs validated and discarded
+                    // it; same defect class as the @cfie gap above).
+                    if d.name.len() == 1
+                        && self.resolve_sym(d.name[0]) == "fase"
+                        && matches!(stmt.kind, StmtKind::TrainBlock(_))
+                    {
+                        let interner = self.interner;
+                        let resolve = |s: nsl_ast::Symbol| -> String {
+                            interner.resolve(s.0).unwrap_or("").to_string()
+                        };
+                        let mut diags = Vec::new();
+                        if let Some(cfg) = nsl_semantic::cftp::validate_fase_decorator(
+                            d, &resolve, &mut diags,
+                        ) {
+                            // Invalid configs never get here: nsl-semantic
+                            // already failed the compile during analysis.
+                            if diags.is_empty() {
+                                self.fase_decorator = Some(cfg);
                             }
                         }
                     }
@@ -5694,6 +5765,26 @@ impl Compiler<'_> {
                     )));
                 }
             }
+            // Milestone B: the pipelined path never reaches the checkpoint
+            // arg parsing/emission below — a train block carrying the args
+            // would silently train WITHOUT checkpoints. Refuse loudly.
+            for arg in &train.config {
+                if let Some(name_sym) = arg.name {
+                    let n = self.resolve_sym(name_sym).to_string();
+                    if matches!(
+                        n.as_str(),
+                        "checkpoint_save" | "checkpoint_load" | "checkpoint_every"
+                    ) {
+                        return Err(CodegenError::new(format!(
+                            "train '{n}' is not supported on the pipelined \
+                             train path (@pipeline): full-state checkpointing \
+                             serializes the monolithic AdamW state lists, \
+                             which the pipeline does not build. Drop the \
+                             checkpoint args or the @pipeline decorator."
+                        )));
+                    }
+                }
+            }
             // The pipelined path returns before the pre-plan/weights-only
             // offer below, so clear the channels it will never install —
             // the enforcement argument on cpdt_plan ("every consult read
@@ -5876,6 +5967,13 @@ impl Compiler<'_> {
         let mut grad_accumulation_steps: i64 = 1;
         let mut grad_accumulation_decl = GradAccumulationDecl::Omitted;
         let mut grad_clip: f64 = f64::MAX; // default: no clipping
+        // Milestone B: full-train-state checkpointing (θ + m/v + step).
+        // `checkpoint_save` + `checkpoint_every` write periodic checkpoints
+        // at optimizer-step boundaries; `checkpoint_load` resumes one at
+        // train start. String/int literals only — same contract as `epochs`.
+        let mut checkpoint_save_path: Option<String> = None;
+        let mut checkpoint_every: i64 = 0;
+        let mut checkpoint_load_path: Option<String> = None;
 
         for arg in &train.config {
             if let Some(name_sym) = arg.name {
@@ -5919,6 +6017,36 @@ impl Compiler<'_> {
                             grad_clip = *f;
                         } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             grad_clip = *n as f64;
+                        }
+                    }
+                    "checkpoint_save" => {
+                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                            checkpoint_save_path = Some(s.clone());
+                        } else {
+                            return Err(CodegenError::new(
+                                "train 'checkpoint_save' arg must be a string \
+                                 literal (file path)",
+                            ));
+                        }
+                    }
+                    "checkpoint_every" => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            checkpoint_every = *n;
+                        } else {
+                            return Err(CodegenError::new(
+                                "train 'checkpoint_every' arg must be an integer \
+                                 literal (optimizer steps between checkpoints)",
+                            ));
+                        }
+                    }
+                    "checkpoint_load" => {
+                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                            checkpoint_load_path = Some(s.clone());
+                        } else {
+                            return Err(CodegenError::new(
+                                "train 'checkpoint_load' arg must be a string \
+                                 literal (file path)",
+                            ));
                         }
                     }
                     _ => {} // ignore unknown config for forward compat
@@ -6372,6 +6500,20 @@ impl Compiler<'_> {
         // FASE: plan the backward rewrite.  Passthrough (N=1) and FullBuffer
         // (Lion, Unknown) fall through to the existing accum-buffer path
         // below.  Deferred routes through stmt_fase.
+        //
+        // Milestone A: the `@fase(...)` decorator captured by the Decorated
+        // arm configures the plan here — previously its validated config was
+        // discarded at the checker and the two knobs below were hard-coded.
+        // `take()` so a later train block never inherits this one's config.
+        let fase_decorator = self.fase_decorator.take();
+        let fase_forced_mode = fase_decorator.as_ref().and_then(|d| match d.mode {
+            nsl_semantic::cftp::FaseMode::Auto => None,
+            nsl_semantic::cftp::FaseMode::Off => Some(crate::fase::FaseForce::Off),
+            nsl_semantic::cftp::FaseMode::FullBuffer => {
+                Some(crate::fase::FaseForce::FullBuffer)
+            }
+            nsl_semantic::cftp::FaseMode::Deferred => Some(crate::fase::FaseForce::Deferred),
+        });
         let fase_cfg = crate::fase::FaseConfig {
             accumulation: grad_accumulation_steps.max(1) as u32,
             optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
@@ -6382,7 +6524,8 @@ impl Compiler<'_> {
             eps: eps_value,
             weight_decay: weight_decay_value,
             momentum: momentum_value,
-            allow_v_approx: true,
+            allow_v_approx: fase_decorator.as_ref().map(|d| d.allow_v_approx).unwrap_or(true),
+            forced_mode: fase_forced_mode,
         };
         // Milestone C: SCHEDULED, with the body widened through the driver's
         // muon x --layerwise-accum rewrite and the disposition re-record —
@@ -6396,6 +6539,13 @@ impl Compiler<'_> {
         // the template uniform. FASE's real staleness guard is value-level —
         // the fase_fused divergence refusal at the WGGO replan site — and
         // stays where it is.
+        //
+        // The body is fallible (the Milestone A `@fase(...)` decorator
+        // refusals below), so it returns a Result that the site unwraps
+        // AFTER finish() — the same `??` shape as the WGGO site. The
+        // postconditions still run on the refusal path; keeping the checks
+        // inside the window is what makes the decorator's verdict part of
+        // the scheduled pass rather than a driver-side afterthought.
         let sched = self.passes.scheduler();
         let fase_plan = sched.schedule("FASE", None, || {
         let plan = match self.bus.wggo_overrides() {
@@ -6503,6 +6653,58 @@ impl Compiler<'_> {
             );
         }
         let plan = plan;
+
+        // Milestone A: the decorator checks sit AFTER the muon x
+        // --layerwise-accum rewrite above — review caught the first version
+        // running them before it, which refused `@fase(mode = deferred)` on
+        // exactly the build that delivers Deferred, and let the rewrite
+        // silently override `@fase(mode = off)` while the witness printed
+        // the stale mode.
+        //
+        // A forced-off/full_buffer decorator that the muon rewrite would
+        // override is a CONFLICT, not a precedence question: the rewrite
+        // exists because layerwise muon requires the Deferred window, so
+        // honouring the decorator would break the schedule and ignoring it
+        // would break the decorator's contract. Refuse with both facts.
+        if matches!(
+            fase_forced_mode,
+            Some(crate::fase::FaseForce::Off | crate::fase::FaseForce::FullBuffer)
+        ) && plan.mode == crate::fase::FaseMode::Deferred
+        {
+            return Err(CodegenError::new(
+                "@fase(mode = off/full_buffer) conflicts with the muon x \
+                 --layerwise-accum schedule, which requires the Deferred \
+                 accumulation window. Remove the decorator, or drop \
+                 --layerwise-accum / switch the optimizer"
+                    .to_string(),
+            ));
+        }
+
+        // `@fase(mode = deferred)` is a REQUIREMENT, not a preference —
+        // checked against the FINAL mode (post-rewrite). If the build could
+        // not produce Deferred, refuse with requested-vs-derived rather than
+        // silently downgrading (transformation-precondition-refusal).
+        if matches!(fase_forced_mode, Some(crate::fase::FaseForce::Deferred))
+            && plan.mode != crate::fase::FaseMode::Deferred
+        {
+            return Err(CodegenError::new(format!(
+                "@fase(mode = deferred) cannot be honoured: requested the \
+                 Deferred envelope, but the build derived {:?} — {}. \
+                 Use @fase(mode = auto) to accept the derived mode, or \
+                 change the optimizer/accumulation so Deferred is feasible",
+                plan.mode, plan.rationale,
+            )));
+        }
+
+        // The @fase activation witness — the FINAL mode, after every
+        // rewrite. Emitted only when the decorator is present, so vanilla
+        // builds' stderr is unchanged.
+        if fase_decorator.is_some() {
+            eprintln!(
+                "[fase] @fase decorator applied: mode={:?} v_approx={} — {}",
+                plan.mode, fase_cfg.allow_v_approx, plan.rationale,
+            );
+        }
         // Item 3: re-record FASE's disposition AFTER the driver's own rewrite
         // above. `fase::plan` is accurate about the pass and can be wrong
         // about the build: the muon x --layerwise-accum arm overwrites `mode`
@@ -6515,7 +6717,15 @@ impl Compiler<'_> {
         // (`&'static str` only, and `rationale` is a runtime `String`), so the
         // phase count is what is reported; the mode itself stays visible in
         // the existing `[fase]` diagnostics.
-        if plan.mode == crate::fase::FaseMode::Passthrough {
+        if matches!(fase_forced_mode, Some(crate::fase::FaseForce::Off)) {
+            // Milestone A: `@fase(mode = off)` with accumulation > 1 plans
+            // the FullBuffer fallback, but reporting that as "applied" would
+            // tell a user who turned FASE OFF that it ran — record the
+            // decline the request actually was.
+            crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::FeatureDisabled("@fase(mode = off)"),
+            });
+        } else if plan.mode == crate::fase::FaseMode::Passthrough {
             crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
                 reason: crate::pass_trace::DeclineReason::ModeOff,
             });
@@ -6524,11 +6734,11 @@ impl Compiler<'_> {
                 rewrites: plan.backward_phases.len(),
             });
         }
-        plan
+        Ok(plan)
         })
         .map_err(CodegenError::new)?
         .finish(&self.bus)
-        .map_err(CodegenError::new)?;
+        .map_err(CodegenError::new)??;
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── Item 7 (`--fuse-wgrad-accum`) admission ─────────────────────
@@ -6912,6 +7122,23 @@ impl Compiler<'_> {
         }
         // End of the Weights bracket — restore the caller's surface.
         self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
+
+        // Milestone B: the .nslm header names for periodic checkpoints,
+        // built ONCE at setup (host allocations — no surface bracket needed).
+        // Same paths param_list was built from, so save order == list order.
+        let checkpoint_names_list: Option<Value> = if checkpoint_save_path.is_some() {
+            let l = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            for path in &param_paths {
+                let display = path.strip_prefix("$model.").unwrap_or(path);
+                let name_data_id = self.intern_string(display)?;
+                let gv = self.module.declare_data_in_func(name_data_id, builder.func);
+                let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                self.compile_call_by_name(builder, "nsl_list_push", &[l, name_ptr])?;
+            }
+            Some(l)
+        } else {
+            None
+        };
 
         // D3 (ZeRO-1): initialize the real sharding context ONCE at train
         // setup — the missing M43b emitter. The runtime builds the CPU-shm
@@ -7666,6 +7893,56 @@ impl Compiler<'_> {
             None
         };
 
+        // Milestone B: full-state checkpointing composes only where the m/v
+        // lists are complete plain-f32 tensors the runtime can serialize
+        // positionally. Every excluded composition is a loud compile error,
+        // not a runtime surprise (the runtime aborts too, as the belt).
+        if checkpoint_save_path.is_some() || checkpoint_load_path.is_some() {
+            let opt = optimizer_name.to_lowercase();
+            if opt != "adamw" && opt != "adam" {
+                return Err(CodegenError::new(format!(
+                    "checkpoint_save/checkpoint_load support AdamW/Adam only \
+                     (optimizer here is '{optimizer_name}'): the .optim sidecar \
+                     serializes exactly the two f32 moment lists"
+                )));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "checkpoint_save/checkpoint_load do not compose with \
+                     --zero-stage: sharded/owner-gated moment lists hold null \
+                     placeholder slots that a positional serializer cannot \
+                     represent",
+                ));
+            }
+            if cpdt_precision_dtypes.is_some() {
+                return Err(CodegenError::new(
+                    "checkpoint_save/checkpoint_load do not compose with CPDT \
+                     moment precision: the .optim sidecar stores plain f32 \
+                     moments only",
+                ));
+            }
+            if checkpoint_save_path.is_some() && checkpoint_every <= 0 {
+                return Err(CodegenError::new(
+                    "checkpoint_save requires checkpoint_every=<N optimizer \
+                     steps> (a positive integer literal)",
+                ));
+            }
+            if self.features.world_size > 1 {
+                return Err(CodegenError::new(format!(
+                    "checkpoint_save/checkpoint_load do not compose with \
+                     --devices {} : every rank would rename onto the same \
+                     path and the survivor is whichever rank finished last",
+                    self.features.world_size
+                )));
+            }
+        }
+        if checkpoint_every > 0 && checkpoint_save_path.is_none() {
+            return Err(CodegenError::new(
+                "checkpoint_every without checkpoint_save is inert — add \
+                 checkpoint_save=\"<path>\" or remove checkpoint_every",
+            ));
+        }
+
         let state_list_1 = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         let state_list_2 = if num_state_buffers >= 2 {
             self.compile_call_by_name(builder, "nsl_list_new", &[])?
@@ -7899,6 +8176,26 @@ impl Compiler<'_> {
         builder.declare_var(step_count_var, cl_types::I64);
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
+
+        // Milestone B: full-state resume. Emitted AFTER moment allocation and
+        // BEFORE the first register belt: θ and m/v are all still plain f32
+        // device tensors here, so the loader's H2D path covers every arm —
+        // including bf16-sr and --weight-stream, whose registration happens
+        // at step-body top and will quantize/evict the LOADED values. The
+        // restored micro-batch counter seeds step_count_var so bias
+        // correction, the scheduler, and checkpoint cadence all continue
+        // instead of re-warming.
+        if let Some(load_path) = checkpoint_load_path.clone() {
+            self.intern_string(&load_path)?;
+            let path_val = self.compile_string_literal(builder, &load_path)?;
+            let path_len = builder.ins().iconst(cl_types::I64, load_path.len() as i64);
+            let restored = self.compile_call_by_name(
+                builder,
+                "nsl_train_checkpoint_load",
+                &[path_val, path_len, param_list, state_list_1, state_list_2],
+            )?;
+            builder.def_var(step_count_var, restored);
+        }
 
         // Dev Tools Phase 5 Task 7: publish step-counter variable so
         // `@inspect` emission inside the step body can gate on `step % N`.
@@ -16577,9 +16874,54 @@ impl Compiler<'_> {
 
         // 7h. Increment step count (after scheduler so step 0 uses the initial LR)
         let sc = builder.use_var(step_count_var);
-        let one_i64 = builder.ins().iconst(cl_types::I64, 1);
-        let sc_next = builder.ins().iadd(sc, one_i64);
-        builder.def_var(step_count_var, sc_next);
+        let one_i64 = builder.ins().iadd_imm(sc, 1);
+        builder.def_var(step_count_var, one_i64);
+
+        // Milestone B: periodic full-train-state checkpoint. Post-increment
+        // step_count is a multiple of grad_accumulation exactly at optimizer-
+        // step boundaries — where 7g just zeroed the accum buffers and the
+        // offload drain has completed — so the state on disk is always a
+        // clean boundary state. Fires every `checkpoint_every` optimizer
+        // steps; the runtime writes tmp files and renames, so a crash mid-
+        // save leaves the previous checkpoint intact.
+        if let Some(save_path) = checkpoint_save_path.clone() {
+            let names_list = checkpoint_names_list
+                .expect("names list is built at setup whenever checkpoint_save is set");
+            let interval = builder.ins().iconst(
+                cl_types::I64,
+                checkpoint_every.saturating_mul(grad_accumulation_steps.max(1)),
+            );
+            let sc_now = builder.use_var(step_count_var);
+            let rem = builder.ins().srem(sc_now, interval);
+            let z = builder.ins().iconst(cl_types::I64, 0);
+            let fire = builder.ins().icmp(IntCC::Equal, rem, z);
+            let save_block = builder.create_block();
+            let cont_block = builder.create_block();
+            builder.ins().brif(fire, save_block, &[], cont_block, &[]);
+            builder.switch_to_block(save_block);
+            builder.seal_block(save_block);
+            state.current_block = Some(save_block);
+            self.intern_string(&save_path)?;
+            let path_val = self.compile_string_literal(builder, &save_path)?;
+            let path_len = builder.ins().iconst(cl_types::I64, save_path.len() as i64);
+            self.compile_call_by_name(
+                builder,
+                "nsl_train_checkpoint_save",
+                &[
+                    path_val,
+                    path_len,
+                    names_list,
+                    param_list,
+                    state_list_1,
+                    state_list_2,
+                    sc_now,
+                ],
+            )?;
+            builder.ins().jump(cont_block, &[]);
+            builder.switch_to_block(cont_block);
+            builder.seal_block(cont_block);
+            state.current_block = Some(cont_block);
+        }
 
         // 7i. Callbacks: compile on_step body with step_count and loss bound
         for cb in &callbacks {

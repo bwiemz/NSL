@@ -106,9 +106,16 @@ Full reference: [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-a
 | [`@no_grad`](Glossary.md#dec-no-grad) | Disable autodiff tape | [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md) |
 | [`@checkpoint`](Glossary.md#dec-checkpoint) | Gradient checkpointing | [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md) |
 | [`@fuse`](Glossary.md#dec-fuse) | Elementwise fusion hint | [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md) |
-| [`@tie_weights`](Glossary.md#dec-tie-weights) | Share parameters across modules | [`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md) |
 | [`@shard`](Glossary.md#dec-shard) | Tensor parallelism | M30 milestone spec |
 | [`@autotune`](Glossary.md#dec-autotune) | Build-time kernel tuning | M26 milestone spec |
+
+**Not implemented:** `@tie_weights` appears in
+[`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md) but
+has no implementation; the compiler refuses it with a typed error (Milestone
+A). Share weights by assigning the same tensor to both fields. The full
+closed decorator namespace lives in
+`crates/nsl-semantic/src/decorator_registry.rs`; unknown names are compile
+errors with did-you-mean suggestions.
 
 ---
 

@@ -294,6 +294,13 @@ fn build_provider(data: WeightData, metas: Vec<TensorMeta>) -> WeightProvider {
 /// If a weight provider is active, copy tensor data into the tensors in `list`
 /// (by index order, matching `ordered_names`) and return `true`.
 /// Returns `false` if no provider is set.
+/// Whether a standalone weight provider is armed — `nsl_train_checkpoint_load`
+/// refuses to resume in that configuration (θ would come from the embedded
+/// weights while moments come from the sidecar: mixed state).
+pub fn provider_is_set() -> bool {
+    WEIGHT_PROVIDER.get().is_some()
+}
+
 pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
     let provider = match WEIGHT_PROVIDER.get() {
         Some(p) => p,

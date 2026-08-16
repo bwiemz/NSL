@@ -8,6 +8,9 @@ pub mod csha;
 pub mod checker;
 pub mod cpdt;
 pub mod context_parallel;
+/// Milestone A: the decorator namespace, closed (known names + typed
+/// refusals for documented-but-unimplemented ones).
+pub mod decorator_registry;
 pub mod determinism;
 pub mod effects;
 pub mod export;
@@ -159,6 +162,51 @@ pub fn analyze_with_imports(
     let fused_ce_configs = checker.fused_ce_configs;
     let fused_kl_ce_configs = checker.fused_kl_ce_configs;
     let pca_configs = checker.pca_configs;
+
+    // Milestone A: closed decorator namespace. Every decorator anywhere in
+    // the module (any host position — the walk reaches member-level vectors
+    // the generic visitor skips) must be a known name; documented-but-
+    // unimplemented names get their typed refusal; anything else errors with
+    // a did-you-mean. Pure-additive like the @export block below.
+    // `NSL_ALLOW_UNKNOWN_DECORATORS=1` (set by `--allow-unknown-decorators`)
+    // demotes only the UNKNOWN-name error to a warning — the unimplemented
+    // refusals stay errors, because accepting them would resurrect exactly
+    // the @tie_weights silence this namespace exists to end.
+    {
+        let allow_unknown =
+            std::env::var("NSL_ALLOW_UNKNOWN_DECORATORS").ok().as_deref() == Some("1");
+        for u in nsl_ast::decorator_walk::collect_decorators(module) {
+            let name = u
+                .deco
+                .name
+                .iter()
+                .map(|s| interner.resolve(s.0).unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(".");
+            if name.is_empty() || crate::decorator_registry::find(&name).is_some() {
+                continue;
+            }
+            if let Some(msg) = crate::decorator_registry::unimplemented_refusal(&name) {
+                diagnostics.push(
+                    Diagnostic::error(msg.to_string())
+                        .with_label(u.deco.span, "unimplemented decorator"),
+                );
+                continue;
+            }
+            let suggestion = crate::decorator_registry::suggest(&name)
+                .map(|s| format!("; did you mean @{s}?"))
+                .unwrap_or_default();
+            let msg = format!(
+                "unknown decorator @{name} on {}{suggestion}",
+                u.host.describe(),
+            );
+            diagnostics.push(if allow_unknown {
+                Diagnostic::warning(msg).with_label(u.deco.span, "unknown decorator")
+            } else {
+                Diagnostic::error(msg).with_label(u.deco.span, "unknown decorator")
+            });
+        }
+    }
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
     // diagnostics without touching other analysis state.  Also returns the

@@ -466,6 +466,11 @@ pub fn reset() {
     // is no case for clearing one and not the other, so this is not left to a
     // caller to remember.
     crate::pass_bus::reset();
+    // And the activation request log (Milestone A): requested decorators are
+    // compile-scoped exactly like dispositions, and the reconciler joins the
+    // two — clearing one without the other would reconcile this compile's
+    // requests against the previous compile's answers.
+    crate::activation::reset_requests();
 }
 
 /// Is `NSL_PASS_TRACE=1` set? Read per call rather than cached so a test can
@@ -500,6 +505,14 @@ fn render_disposition(d: PassDisposition) -> String {
         },
         PassDisposition::AdvisoryOnly => "advisory only".to_string(),
     }
+}
+
+/// Public form of [`render_disposition`] for the activation reconciler's
+/// report: every outcome category keeps a single spelling in the tree, so
+/// `[activation]` lines reuse this match instead of growing a paraphrase the
+/// distinctness gate cannot see.
+pub fn render_disposition_line(d: PassDisposition) -> String {
+    render_disposition(d)
 }
 
 /// Render the observed sequence with each pass's declared stage and the driver

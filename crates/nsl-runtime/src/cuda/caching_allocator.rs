@@ -397,6 +397,27 @@ pub(crate) struct CachingAllocator<D: DriverAlloc = CudaDriverAlloc> {
     /// KV, attention workspaces). Keyed by device-ptr address so the free
     /// path can decrement the surface/pool/peak counters (A1 unification).
     external_allocs: HashMap<usize, AllocationMetadata>,
+    /// Live POOLED bytes grouped by allocation context (the OOM-context
+    /// string each block carries), maintained incrementally on alloc/free so
+    /// the at-peak snapshot below costs O(distinct contexts), not O(live
+    /// blocks). Keyed by the raw context string ("" = no context; labeled at
+    /// render time). External allocations carry no context string — their
+    /// identity is `op_id`/`tensor_id` — so they are visible in the surface
+    /// table but not here. Value: (bytes, block count).
+    context_live: HashMap<String, (usize, usize)>,
+    /// `context_live` snapshotted at the moment the GLOBAL allocated peak was
+    /// last set — the per-op companion to `SurfaceCounters::
+    /// at_global_peak_bytes`. Without this, every context table (OOM
+    /// diagnostic, memstats "Top contexts") describes CURRENTLY-live blocks,
+    /// and a run that tears down cleanly reports its residual buffers as if
+    /// they were the peak. (context, bytes, blocks), unsorted.
+    contexts_at_peak: Vec<(String, usize, usize)>,
+    /// Bytes at the global peak NOT covered by `contexts_at_peak` — the
+    /// external (async/direct `cuMemAlloc`) allocations, which carry
+    /// op/tensor identity instead of context strings. Recorded so the peak
+    /// table can say what it does NOT decompose instead of silently summing
+    /// short of "Peak allocated".
+    external_at_peak_bytes: usize,
     /// Configurable memory limit (0 = unlimited).
     memory_limit: usize,
     /// The driver backend.
@@ -419,6 +440,9 @@ impl CachingAllocator<CudaDriverAlloc> {
             total_allocated: 0,
             surface_counters: [SurfaceCounters::default(); NUM_SURFACES],
             external_allocs: HashMap::new(),
+            context_live: HashMap::new(),
+            contexts_at_peak: Vec::new(),
+            external_at_peak_bytes: 0,
             memory_limit,
             driver: CudaDriverAlloc,
         }
@@ -439,6 +463,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             total_allocated: 0,
             surface_counters: [SurfaceCounters::default(); NUM_SURFACES],
             external_allocs: HashMap::new(),
+            context_live: HashMap::new(),
+            contexts_at_peak: Vec::new(),
+            external_at_peak_bytes: 0,
             memory_limit: 0,
             driver,
         }
@@ -537,6 +564,10 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.num_cache_hits += 1;
         self.stats.internal_fragmentation_bytes += block.size - size_bytes;
         self.stats.cumulative_allocs += 1;
+        // Context BEFORE surface: the surface call snapshots the context
+        // table on a new global peak, and the block being handed out is part
+        // of that peak.
+        self.note_context_alloc(&block.context, block.size);
         self.note_surface_alloc(block.surface, block.size);
 
         if mem_trace_on() {
@@ -623,6 +654,8 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes += blk.size - size_bytes;
         self.stats.cumulative_allocs += 1;
+        // Context BEFORE surface — see alloc_from_cache.
+        self.note_context_alloc(&blk.context, blk.size);
         self.note_surface_alloc(blk.surface, blk.size);
 
         if mem_trace_on() {
@@ -702,7 +735,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         }
         block.allocated = false;
         block.requested_size = 0;
-        block.context.clear();
+        let old_context = std::mem::take(&mut block.context);
 
         let seg = &mut self.segments[block.segment_idx];
         seg.allocated_count -= 1;
@@ -720,6 +753,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.internal_fragmentation_bytes = self.stats.internal_fragmentation_bytes
             .saturating_sub(old_size - old_requested);
         self.note_surface_free(old_surface, old_size);
+        self.note_context_free(&old_context, old_size);
 
         // Coalesce with next
         let next = block.next;
@@ -898,7 +932,67 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             for sc in &mut self.surface_counters {
                 sc.at_global_peak_bytes = sc.current_bytes;
             }
+            self.snapshot_contexts_at_peak();
         }
+    }
+
+    /// Copy `context_live` into `contexts_at_peak`. Called on every new
+    /// global peak: O(distinct contexts) — a few dozen entries — so the ramp
+    /// phase (where the peak moves often) pays a bounded, small cost and
+    /// steady state pays nothing.
+    fn snapshot_contexts_at_peak(&mut self) {
+        self.contexts_at_peak.clear();
+        let mut pooled = 0usize;
+        self.contexts_at_peak.extend(self.context_live.iter().map(|(k, &(bytes, blocks))| {
+            pooled += bytes;
+            (k.clone(), bytes, blocks)
+        }));
+        self.external_at_peak_bytes = self.total_allocated.saturating_sub(pooled);
+    }
+
+    /// Record one pooled block entering `context_live`. The `get_mut` probe
+    /// first avoids a String clone on the hot path — kernels repeat, so the
+    /// entry almost always exists.
+    fn note_context_alloc(&mut self, ctx: &str, size: usize) {
+        if let Some(e) = self.context_live.get_mut(ctx) {
+            e.0 += size;
+            e.1 += 1;
+        } else {
+            self.context_live.insert(ctx.to_string(), (size, 1));
+        }
+    }
+
+    /// Reverse of [`note_context_alloc`]. Saturating like the surface
+    /// counters: drift must never poison the allocator (report-only data).
+    /// Emptied entries are removed so the at-peak snapshot stays small.
+    fn note_context_free(&mut self, ctx: &str, size: usize) {
+        let mut remove = false;
+        if let Some(e) = self.context_live.get_mut(ctx) {
+            e.0 = e.0.saturating_sub(size);
+            e.1 = e.1.saturating_sub(1);
+            remove = e.0 == 0 && e.1 == 0;
+        }
+        if remove {
+            self.context_live.remove(ctx);
+        }
+    }
+
+    /// The pooled-block context table at the moment the global allocated
+    /// peak was set, sorted by bytes descending: (context, bytes, blocks).
+    /// The per-op companion to [`surface_at_global_peak`]
+    /// (`Self::surface_at_global_peak`) — this is what "which allocations
+    /// were the peak" means, as opposed to the currently-live tables the OOM
+    /// diagnostic and `allocated_block_summary` show.
+    /// Bytes at the global peak the context table does not decompose —
+    /// external (async/direct) allocations, identified by op/tensor id.
+    pub fn external_at_peak(&self) -> usize {
+        self.external_at_peak_bytes
+    }
+
+    pub fn contexts_at_peak_sorted(&self) -> Vec<(String, usize, usize)> {
+        let mut v = self.contexts_at_peak.clone();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
     }
 
     /// Record `size` bytes returning from `surface` on free. Saturating: a
@@ -1004,6 +1098,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.peak_allocated_bytes = self.total_allocated;
         self.stats.cumulative_allocs = 0;
         self.stats.num_external_allocs = 0;
+        self.snapshot_contexts_at_peak();
         for sc in &mut self.surface_counters {
             sc.peak_bytes = sc.current_bytes;
             sc.at_global_peak_bytes = sc.current_bytes;
@@ -1309,10 +1404,32 @@ pub(crate) fn print_memory_summary() {
     // the surface table covers them. The pool breakdown below still reflects
     // caching-pool segments only (async/direct allocations own no segment).
     let surface_lines = alloc.surface_table_string("         ");
+    // Milestone B: the context table AT the global peak — the per-op
+    // decomposition of the number "Peak allocated" reports. The live table
+    // below it describes whatever happens to survive at exit, which for a
+    // clean teardown is residue, not the peak.
+    let mut peak_context_lines = String::new();
+    for (context, bytes, count) in alloc.contexts_at_peak_sorted().into_iter().take(8) {
+        let label = if context.is_empty() { "<unknown>" } else { context.as_str() };
+        peak_context_lines.push_str(&format!(
+            "         {}: {} ({} blocks)\n",
+            label,
+            fmt(bytes),
+            count,
+        ));
+    }
+    if alloc.external_at_peak() > 0 {
+        peak_context_lines.push_str(&format!(
+            "         (external, op/tensor-id identified): {}\n",
+            fmt(alloc.external_at_peak()),
+        ));
+    }
     let (p_bytes, p_segs, t_bytes, t_segs) = alloc.pool_breakdown();
     let async_note = if super::inner::async_alloc_enabled() {
         "\n         NOTE: NSL_ASYNC_ALLOC=1 — surface bytes include async \
-         allocations; the pool (segment) breakdown covers cached blocks only.\n"
+         allocations; the pool (segment) breakdown and BOTH context tables \
+         cover pooled blocks only (async allocations carry op/tensor \
+         identity, not context strings).\n"
     } else {
         ""
     };
@@ -1333,6 +1450,7 @@ pub(crate) fn print_memory_summary() {
          Fragmentation:    {}\n\
          Pools:            persistent {} ({} segs), transient {} ({} segs)\n\
          Surfaces:\n{}{}\
+         Top contexts at peak:\n{}\
          Top contexts:\n{}",
         fmt(s.allocated_bytes), s.num_allocs,
         fmt(s.reserved_bytes), alloc.segments.len(),
@@ -1349,6 +1467,7 @@ pub(crate) fn print_memory_summary() {
         fmt(p_bytes), p_segs, fmt(t_bytes), t_segs,
         surface_lines,
         async_note,
+        peak_context_lines,
         top_context_lines,
     );
 }
@@ -1898,5 +2017,80 @@ mod tests {
         fn drop(&mut self) {
             clear_alloc_identity();
         }
+    }
+
+    /// Clear the OOM-context thread-local on scope exit — same hygiene as
+    /// `IdentityRestore`, for the context-table tests below.
+    struct ContextRestore;
+    impl Drop for ContextRestore {
+        fn drop(&mut self) {
+            crate::cuda::inner::set_oom_context("");
+        }
+    }
+
+    #[test]
+    fn test_context_table_snapshot_at_global_peak() {
+        let _restore = with_default_surface();
+        let _ctx = ContextRestore;
+        let mut a = make_alloc();
+
+        crate::cuda::inner::set_oom_context("matmul_f32");
+        let _p1 = a.alloc_with_grow(1024).unwrap();
+        crate::cuda::inner::set_oom_context("nsl_silu_f32");
+        let p2 = a.alloc_from_cache(4096).unwrap();
+        // Global peak: matmul 1024 + silu 4096.
+
+        a.free_block(p2);
+        crate::cuda::inner::set_oom_context("nsl_add_f32");
+        let _p3 = a.alloc_from_cache(2048).unwrap();
+
+        // Current live is matmul + add — NOT the peak mix. The at-peak table
+        // must still name the contexts that WERE the peak; that is the whole
+        // point (the live tables already exist and cannot say this).
+        let peak = a.contexts_at_peak_sorted();
+        assert_eq!(peak.len(), 2, "exactly the two peak contexts: {peak:?}");
+        assert_eq!(peak[0], ("nsl_silu_f32".to_string(), 4096, 1));
+        assert_eq!(peak[1], ("matmul_f32".to_string(), 1024, 1));
+        assert!(
+            !peak.iter().any(|(c, ..)| c == "nsl_add_f32"),
+            "a post-peak allocation must not appear in the at-peak table"
+        );
+    }
+
+    #[test]
+    fn test_context_live_aggregate_tracks_alloc_free() {
+        let _restore = with_default_surface();
+        let _ctx = ContextRestore;
+        let mut a = make_alloc();
+        crate::cuda::inner::set_oom_context("k1");
+        let p1 = a.alloc_with_grow(1024).unwrap();
+        let p2 = a.alloc_from_cache(1024).unwrap();
+        assert_eq!(a.context_live.get("k1"), Some(&(2048, 2)));
+        a.free_block(p1);
+        assert_eq!(a.context_live.get("k1"), Some(&(1024, 1)));
+        a.free_block(p2);
+        assert!(
+            a.context_live.get("k1").is_none(),
+            "emptied context entries are removed so the snapshot stays small"
+        );
+    }
+
+    #[test]
+    fn test_reset_reseeds_context_table_to_live() {
+        let _restore = with_default_surface();
+        let _ctx = ContextRestore;
+        let mut a = make_alloc();
+        crate::cuda::inner::set_oom_context("ramp");
+        let p1 = a.alloc_with_grow(8192).unwrap();
+        a.free_block(p1);
+        crate::cuda::inner::set_oom_context("steady");
+        let _p2 = a.alloc_from_cache(1024).unwrap();
+        // The run-level peak names the ramp; a region reset (per-step
+        // attribution) must re-seed the table to what is live NOW.
+        assert_eq!(a.contexts_at_peak_sorted()[0].0, "ramp");
+        a.reset_peak_and_counts();
+        let peak = a.contexts_at_peak_sorted();
+        assert_eq!(peak.len(), 1);
+        assert_eq!(peak[0].0, "steady");
     }
 }

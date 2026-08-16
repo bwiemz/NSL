@@ -359,11 +359,39 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          fused_lm_ce_decline_gate's success cases",
     ),
     m(
+        "[checkpoint]",
+        &[
+            "crates/nsl-runtime/src/checkpoint.rs",
+        ],
+        "Milestone B full-train-state checkpointing: `saved: <path> (+.optim) \
+         at micro-batch step N` after each boundary save (θ .nslm + AdamW \
+         m/v + step counter, tmp-and-rename atomic), `resumed: ...` after \
+         checkpoint_load restored all three and seeded the step counter. \
+         train_checkpoint_gate.rs asserts both; endurance_1b.py asserts the \
+         resume witness at 1B",
+    ),
+    m(
         "[nsl-kernel-count]",
         &[
             "crates/nsl-runtime/src/fused_adapter.rs",
         ],
         "the kernel counter reported",
+    ),
+    m(
+        "[fase]",
+        &[
+            "crates/nsl-codegen/src/stmt.rs",
+        ],
+        "the FASE planner's driver reported a decorator/override decision \
+         (the @fase activation witness is `[fase] @fase decorator applied:`)",
+    ),
+    m(
+        "[activation]",
+        &[
+            "crates/nsl-codegen/src/activation.rs",
+        ],
+        "the Milestone A reconciler reported a requested surface's outcome \
+         (applied / declined / witnessed / UNSATISFIED)",
     ),
 ];
 
@@ -410,6 +438,8 @@ pub mod tokens {
     pub const WGRAD_ACCUM: &str = "[wgrad-accum]";
     pub const WGRAD_FUSION: &str = "[wgrad-fusion]";
     pub const CCR: &str = "[ccr]";
+    pub const FASE: &str = "[fase]";
+    pub const ACTIVATION: &str = "[activation]";
 }
 
 /// A string a NEGATIVE assertion depends on.
@@ -439,6 +469,22 @@ pub struct NegativeNeedle {
 /// loudly when its marker rots and needs no entry here; a negative one cannot
 /// fail at all, so each is pinned.
 pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/cpdt_decorator_activation_gate.rs",
+        asserts: "a control build without @cpdt carries no decorator-applied marker",
+        parts: &[
+            // eprintln!("[cpdt] @cpdt decorator applied: mode={} ...")
+            ("[cpdt] @cpdt decorator applied", "crates/nsl-codegen/src/cpdt_decorator.rs"),
+        ],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/fase_decorator_activation_gate.rs",
+        asserts: "a control build without @fase carries no decorator-applied witness",
+        parts: &[
+            // eprintln!("[fase] @fase decorator applied: mode={:?} ...")
+            ("[fase] @fase decorator applied:", "crates/nsl-codegen/src/stmt.rs"),
+        ],
+    },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/csha_checkpoint_decorator_cli_e2e.rs",
         asserts: "@csha(disable=true) suppressed the CSHA plan summary",

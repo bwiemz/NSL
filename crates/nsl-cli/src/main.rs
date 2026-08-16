@@ -1,3 +1,4 @@
+mod activation_enforce;
 mod args;
 mod ast_scan;
 mod commands;

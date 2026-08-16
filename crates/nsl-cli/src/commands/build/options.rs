@@ -113,7 +113,35 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             cep_out,
             cep_emit_weights,
             cep_emit_source,
+            // Milestone A: consumed by activation_enforce, which reads argv
+            // directly (see its module doc), so the typed values are unused.
+            activation_report: _activation_report,
+            allow_inert_requests: _allow_inert_requests,
+            allow_unknown_decorators,
     } = args;
+
+    crate::activation_enforce::apply_allow_unknown_decorators(allow_unknown_decorators);
+
+    // Milestone A (deferral-must-refuse): --vram-budget is enforced by the
+    // whole-program memory planner, which runs only on single-file normal
+    // and shared-lib builds. Refuse the unenforceable flavors HERE, before
+    // any module compiles — the entry-path refusal (entry_points.rs) stays
+    // as the deep backstop, but reaching it costs a full multi-module
+    // codegen (review: seconds of Cranelift work before a decidable error).
+    if vram_budget.is_some()
+        && (standalone || super::normal::needs_multi_file(&file))
+    {
+        eprintln!(
+            "error: --vram-budget is enforced only on single-file builds \
+             today — the whole-program memory planner does not run on the \
+             {} path, so the budget would be silently ignored. Remove the \
+             flag for this build",
+            if standalone { "--standalone" } else { "multi-file" },
+        );
+        process::exit(1);
+    }
+
+    crate::activation_enforce::refuse_unimplemented_distribute(&_distribute);
 
     // Item 10: load the frozen tuning DB before ANY compile work — the
     // overlay must be in place before the first autotune cache lookup, and
@@ -431,12 +459,25 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 autotune_fresh,
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
                 fusion_report,
-                vram_budget: vram_budget.as_deref()
-                    .and_then(nsl_codegen::memory_planner::parse_vram_budget),
+                // Milestone A: an unparseable budget must refuse, not
+                // silently become "no budget" — the flag is a guard rail.
+                vram_budget: match vram_budget.as_deref() {
+                    None => None,
+                    Some(s) => match nsl_codegen::memory_planner::parse_vram_budget(s) {
+                        Some(b) => Some(b),
+                        None => {
+                            eprintln!(
+                                "error: --vram-budget '{s}' is not a size; \
+                                 accepted forms: <n>GB/<n>GiB/<n>MB/<n>MiB/\
+                                 <n>KB/<n>KiB/<n>B (1024-based)"
+                            );
+                            process::exit(1);
+                        }
+                    },
+                },
                 memory_report,
                 target,
                 disable_fusion,
-                tape_ad: _tape_ad,
                 source_ad: _source_ad,
                 trace_ops: false,
                 nan_analysis,

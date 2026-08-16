@@ -120,6 +120,44 @@ pub static WS_PREFETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// on the transfer stream (a subset of `WS_PACK_EVICTS`) — the overlap
 /// evidence the async-writeback gate asserts.
 pub static WS_ASYNC_WB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Milestone B: actual PCIe TRAFFIC bytes moved by the weight-streaming
+/// stack, split by direction. Distinct from `WS_STREAMED_BYTES` (which
+/// counts streamed parameter STORAGE once at registration): these count
+/// every HtoD/DtoH the stack issues — per-param uploads, pack staging
+/// copies, prefetches, writebacks, and the registration evict. The global
+/// `host_profile` H2D/D2H atomics fold ALL sources (dataloader batches,
+/// logits reads) into two numbers; this pair is what lets a gate say "the
+/// residual PCIe is NOT weights" — the "no unexpected weight traffic" exit
+/// criterion, as a counter instead of an inference.
+pub static WS_H2D_TRAFFIC_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static WS_D2H_TRAFFIC_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The residency plan's numeric fields, snapshotted at decision time so the
+/// stat surface below can report them after train-block teardown clears the
+/// live plan (same hazard the `RESIDENCY_LAST` string snapshot exists for,
+/// solved numerically for gates/programs instead of humans). u64::MAX in
+/// `WS_PLAN_TOTAL` means "no decision has run".
+pub static WS_PLAN_FREE_AT_DECISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static WS_PLAN_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+pub static WS_PLAN_RESERVE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static WS_PLAN_MUST_FREE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count PCIe bytes the streaming stack moves. Every copy site in this file
+/// calls one of these next to the transfer — the cfg(test) drift gate in
+/// `host_profile.rs` plays the analogous role for the global counters.
+#[cfg(feature = "cuda")]
+fn note_ws_h2d(bytes: usize) {
+    WS_H2D_TRAFFIC_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(feature = "cuda")]
+fn note_ws_d2h(bytes: usize) {
+    WS_D2H_TRAFFIC_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
 
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
@@ -134,6 +172,55 @@ pub extern "C" fn nsl_weight_stream_registered_count() -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_ptr_moves() -> i64 {
     WS_PTR_MOVES.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+/// One stat surface for gates and NSL programs (`weight_stream_stat(kind)`
+/// builtin — the `fused_lce_launch_count(kind)` pattern). Kinds:
+/// 0 = H2D traffic bytes moved by the streaming stack this run,
+/// 1 = D2H traffic bytes,
+/// 2 = pinned param count, 3 = pinned bytes, 4 = streamed storage bytes,
+/// 5 = residency plan reserve bytes, 6 = plan must_free bytes,
+/// 7 = plan free-at-decision bytes, 8 = total device VRAM bytes (LIVE
+/// `cuMemGetInfo`, not the plan — valid even when the policy never ran,
+/// e.g. under bf16-sr whose registration bypasses it),
+/// 9 = registered param count.
+/// Kinds 5-7 return -1 until the residency decision has run (they read the
+/// decision-time snapshot, so they stay valid after teardown clears the live
+/// plan). Unknown kinds return -1 rather than aborting: a probe must never
+/// kill a training run.
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_stat(kind: i64) -> i64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decided = WS_PLAN_TOTAL.load(Relaxed) != u64::MAX;
+    match kind {
+        0 => WS_H2D_TRAFFIC_BYTES.load(Relaxed) as i64,
+        1 => WS_D2H_TRAFFIC_BYTES.load(Relaxed) as i64,
+        2 => WS_PINNED.load(Relaxed) as i64,
+        3 => WS_PINNED_BYTES.load(Relaxed) as i64,
+        4 => WS_STREAMED_BYTES.load(Relaxed) as i64,
+        5 if decided => WS_PLAN_RESERVE.load(Relaxed) as i64,
+        6 if decided => WS_PLAN_MUST_FREE.load(Relaxed) as i64,
+        7 if decided => WS_PLAN_FREE_AT_DECISION.load(Relaxed) as i64,
+        8 => live_total_vram(),
+        9 => WS_REGISTERED.load(Relaxed) as i64,
+        _ => -1,
+    }
+}
+
+/// Kind 8's source: the device's total VRAM, queried live. The plan
+/// snapshot was the wrong authority here — under `--param-dtype bf16-sr`
+/// the registration redirect means the plan never runs, and the margin
+/// arithmetic every capacity gate wants (total − peak) has nothing to do
+/// with whether the residency policy decided anything.
+#[cfg(feature = "cuda")]
+fn live_total_vram() -> i64 {
+    crate::cuda::inner::ensure_context();
+    let (_free, total) = crate::cuda::inner::query_vram();
+    total as i64
+}
+#[cfg(not(feature = "cuda"))]
+fn live_total_vram() -> i64 {
+    -1
 }
 
 /// Capacity-aware residency decision, computed ONCE at the first
@@ -195,13 +282,21 @@ fn residency_admit(bytes: usize) -> bool {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map(|mib| mib * 1024 * 1024)
             .unwrap_or(total / 2);
-        ResidencyPlan {
+        let plan = ResidencyPlan {
             must_free: reserve.saturating_sub(free),
             freed: 0,
             reserve,
             free_at_decision: free,
             total_vram: total,
-        }
+        };
+        // Numeric snapshot for `nsl_weight_stream_stat` — survives the
+        // per-train-block plan reset the same way RESIDENCY_LAST does.
+        use std::sync::atomic::Ordering::Relaxed;
+        WS_PLAN_RESERVE.store(plan.reserve as u64, Relaxed);
+        WS_PLAN_MUST_FREE.store(plan.must_free as u64, Relaxed);
+        WS_PLAN_FREE_AT_DECISION.store(plan.free_at_decision as u64, Relaxed);
+        WS_PLAN_TOTAL.store(plan.total_vram as u64, Relaxed);
+        plan
     });
     if plan.freed < plan.must_free {
         plan.freed += bytes;
@@ -345,6 +440,7 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
         }
         let host = crate::tensor::alloc_host_state_buffer(bytes);
         crate::cuda::inner::memcpy_dtoh(host as *mut c_void, t.data, bytes);
+        note_ws_d2h(bytes);
         crate::cuda::inner::free_managed(t.data);
         t.data = std::ptr::null_mut();
         let mut guard = MIRRORS.lock().unwrap();
@@ -424,6 +520,7 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
         crate::cuda::inner::ensure_context();
         let dev = crate::cuda::inner::alloc_managed(m.bytes);
         crate::cuda::inner::memcpy_htod(dev, m.host as *const c_void, m.bytes);
+        note_ws_h2d(m.bytes);
         t.data = dev;
         // This is a plain OWNED buffer (not an arena view): restore owns_data
         // so a param that was last arena-resident (owns_data=0) is a
@@ -498,6 +595,7 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
             // Reading the arena INTERIOR pointer for a DtoH is valid; only
             // FREEING an interior pointer would be illegal.
             crate::cuda::inner::memcpy_dtoh(m.host as *mut c_void, t.data, m.bytes);
+            note_ws_d2h(m.bytes);
         }
         if m.arena_slot >= 0 {
             // Item 10: arena-resident — release a reference on the shared slot
@@ -875,6 +973,7 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
     } else {
         crate::cuda::inner::memcpy_htod(dev, host_stage as *const c_void, total);
     }
+    note_ws_h2d(total);
 
     // Point each param at its arena offset (non-owning view).
     for &(ptr, off, _bytes) in &layout {
@@ -1071,6 +1170,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64)
             // (interior gaps between aligned regions are copied but ignored).
             let span = regions.iter().map(|&(_, o, b)| o + b).max().unwrap_or(0);
             crate::cuda::inner::memcpy_dtoh(host_stage as *mut c_void, dev as *const c_void, span);
+            note_ws_d2h(span);
             for &(ptr, off, bytes) in &regions {
                 let host = table.get(&ptr).unwrap().host;
                 unsafe { std::ptr::copy_nonoverlapping(host_stage.add(off), host, bytes) };
@@ -1289,6 +1389,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
             dev as *const c_void,
             span,
         );
+        note_ws_d2h(span);
 
         for &(ptr, _mirror, _off, _bytes) in &regions {
             let t = NslTensor::from_ptr(ptr);
@@ -1498,6 +1599,7 @@ fn teardown_mirrors() {
                 // surface).
                 let dev = crate::cuda::inner::alloc_managed(m.bytes);
                 crate::cuda::inner::memcpy_htod(dev, m.host as *const c_void, m.bytes);
+                note_ws_h2d(m.bytes);
                 t.data = dev;
                 // Arena-mode evicts leave owns_data=0 (set at upload_pack);
                 // restore it so the tensor owns its fresh buffer.
@@ -1524,5 +1626,58 @@ fn teardown_mirrors() {
             *RESIDENCY_LAST.lock().unwrap() = Some(s);
         }
         *RESIDENCY.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+mod ws_traffic_drift_gate {
+    /// Every PCIe copy the streaming stack issues must be counted by a
+    /// `note_ws_h2d`/`note_ws_d2h` within LOOKAROUND lines — the textual
+    /// drift gate `host_profile.rs` runs for the global counters, applied
+    /// to this file's own call sites. A copy site added without its note
+    /// silently under-counts the exact number the "no unexpected weight
+    /// traffic" gates assert on. The `crate::cuda::inner::` prefix keeps
+    /// this test's own string literals out of the scan.
+    #[test]
+    fn every_ws_copy_site_is_counted() {
+        let src = include_str!("weight_stream.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        const LOOKAROUND: usize = 8;
+        let needles: Vec<String> = [
+            "memcpy_htod(",
+            "memcpy_dtoh(",
+            "prefetch_htod_on_transfer(",
+            "writeback_dtoh_on_transfer(",
+        ]
+        .iter()
+        .map(|n| format!("crate::cuda::inner::{n}"))
+        .collect();
+        let mut sites = 0;
+        let mut missing = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !needles.iter().any(|n| line.contains(n.as_str())) {
+                continue;
+            }
+            sites += 1;
+            let lo = i.saturating_sub(LOOKAROUND);
+            let hi = (i + LOOKAROUND + 1).min(lines.len());
+            let counted = lines[lo..hi]
+                .iter()
+                .any(|l| l.contains("note_ws_h2d(") || l.contains("note_ws_d2h("));
+            if !counted {
+                missing.push(i + 1);
+            }
+        }
+        assert!(
+            sites >= 8,
+            "anti-vacuity: expected >= 8 streaming copy sites, found {sites} \
+             — the scan needles have drifted from the code"
+        );
+        assert!(
+            missing.is_empty(),
+            "PCIe copy site(s) at line(s) {missing:?} have no note_ws_* \
+             within {LOOKAROUND} lines — the weight-traffic counters would \
+             silently under-count and the zero-traffic gates go vacuous"
+        );
     }
 }

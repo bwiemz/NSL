@@ -698,6 +698,10 @@ fn compile_returning_plan_impl(
     compiler.profile_capture_slot = capture_slot;
     install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
 
+    // Milestone A: log the entry module's decorators so the CLI can reconcile
+    // every requested surface against the disposition log after the compile.
+    crate::activation::note_entry_module_decorators(ast, interner);
+
     // M52: load weights if --weights was provided.
     load_and_register_weights_if_needed(&mut compiler, options)?;
 
@@ -837,6 +841,17 @@ fn compile_returning_plan_impl(
         compiler.run_wcet_analysis()?;
     }
 
+    // Milestone A (path-divergence fix): the fusion report was printed ONLY
+    // by `compile_entry_returning_plan` — a single-file
+    // `nsl build --fusion-report` set `report_enabled` and then produced no
+    // report at all. Mirror the entry path's block.
+    if compiler.fusion.report_enabled {
+        crate::fusion_report::print_fusion_report(
+            &compiler.fusion.events,
+            &compiler.fusion.barriers,
+        );
+    }
+
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     let plan = compiler.bus.wrga_plan().cloned();
@@ -921,6 +936,12 @@ fn compile_with_zk_info_best_effort_plan(
     }
 
     compiler.dump_ir = dump_ir;
+
+    // Milestone A: this flavor's driver runs activation enforcement, so it
+    // must feed the decorator request log like the normal paths — review
+    // caught standalone/zk enforcing against an EMPTY log, which silently
+    // exempted decorators on exactly these flavors.
+    crate::activation::note_entry_module_decorators(ast, interner);
 
     // Run every pass up to (but not including) finalize so we can observe
     // `bus.wrga_plan` even on an error path before consuming the compiler.
@@ -1107,6 +1128,13 @@ fn compile_standalone_best_effort_plan(
     }
     compiler.dump_ir = dump_ir;
     compiler.standalone_config = Some(config);
+
+    // Milestone A: this flavor's driver runs activation enforcement, so it
+    // must feed the decorator request log like the normal paths — review
+    // caught standalone/zk enforcing against an EMPTY log, which silently
+    // exempted decorators on exactly these flavors.
+    crate::activation::note_entry_module_decorators(ast, interner);
+
     let pre_finalize = (|| -> Result<(), CodegenError> {
         compiler.intern_string("")?;
         compiler.collect_strings(&ast.stmts)?;
@@ -1509,6 +1537,27 @@ pub fn compile_entry_returning_plan(
     install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
     compiler.dump_ir = dump_ir;
 
+    // Milestone A: log the entry module's decorators for post-compile
+    // reconciliation — entry module only; imported modules' decorators are
+    // the library author's requests (see activation.rs).
+    crate::activation::note_entry_module_decorators(ast, interner);
+
+    // Milestone A (deferral-must-refuse): the whole-program memory plan —
+    // and with it `check_vram_budget` — runs only on the single-file path
+    // (`compile_returning_plan_impl`). A multi-file `--vram-budget` was
+    // accepted and silently unenforced: a budget the user relied on as a
+    // guard-rail did nothing on exactly the builds real models use. Refuse
+    // until the planner integration reaches this path; lifting this is the
+    // integration's one-line job.
+    if let Some(budget) = options.vram_budget {
+        return Err(CodegenError::new(format!(
+            "--vram-budget ({budget} bytes) is enforced only on single-file \
+             builds today — the whole-program memory planner does not run on \
+             the multi-file path, so the budget would be silently ignored. \
+             Remove the flag for this build",
+        )));
+    }
+
     // M52 / CPDT Phase 1: load weights if --weights was provided.  Load-bearing
     // for the multi-file build path: without this call, `compile_main` sees
     // `compiler.features.weight_map == None` and CPDT Phase 1 silently
@@ -1610,6 +1659,23 @@ pub fn compile_entry_returning_plan(
             entry.entry(field).or_insert(value);
         }
     }
+    // Milestone A (@cpdt fix): the single-file path has applied the `@cpdt`
+    // train-block decorator since §6.1 shipped, but THIS path — the one every
+    // program with an import takes, i.e. every real program — never did. The
+    // decorator validated cleanly and then configured nothing: `nsl build`
+    // and `nsl run` of `@cpdt(mode = off)` produced byte-identical binaries
+    // to the no-decorator control (PR #502 measured it; the activation
+    // reconciler now errors on it). Mirror the impl-path sequence exactly:
+    // decorator first (source config is authoritative), then the two
+    // CPDT MoE passes that read `compiler.cpdt_mode` — also absent here,
+    // which made `--cpdt` + `@moe` silently prune-free on multi-file builds.
+    let cpdt_decor_outcome = crate::cpdt_decorator::apply_cpdt_decorator_from_ast(
+        ast, interner, &mut compiler,
+    );
+    crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
+    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
+    crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen — see `compile_returning_plan` for the full rationale.
