@@ -882,6 +882,11 @@ pub struct Compiler<'a> {
     /// `@cfie(target=h100)` GPU-name override, same lifecycle as
     /// `cfie_decorator_mode`.
     pub cfie_decorator_target: Option<String>,
+    /// Milestone A: `@fase(...)` decorator config captured in the
+    /// `Decorated` stmt arm before the inner train block compiles.
+    /// Consumed (taken) by `compile_train_block`'s FASE planning, so a
+    /// second train block never inherits the first one's decorator.
+    pub fase_decorator: Option<nsl_semantic::cftp::FaseConfig>,
     /// CFIE Cycle 11: the `generate()` intrinsic's driver parameters,
     /// set by `run_cfie_for_serve` while a CFIE-active serve block
     /// compiles and consulted by the `generate()` rewrite in
@@ -1257,6 +1262,7 @@ impl<'a> Compiler<'a> {
             fused_kl_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             cfie_decorator_mode: None,
+            fase_decorator: None,
             cfie_decorator_target: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
             fused_kl_ce_configs: options.fused_kl_ce_configs.clone(),

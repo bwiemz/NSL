@@ -94,6 +94,27 @@ pub struct FaseConfig {
     /// (see `FaseMode::Deferred`); this flag gates eligibility, it does
     /// not select an approximate formula.
     pub allow_v_approx: bool,
+    /// Milestone A: `@fase(mode = ...)` on the train block. `None`/`Auto`
+    /// keeps the planner's derivation; `Off`/`FullBuffer` force the
+    /// full-gradient-buffer fallback (always feasible); `Deferred` is a
+    /// REQUIREMENT the driver checks after planning — if the derivation
+    /// cannot produce Deferred (Lion, unknown optimizer, v_approx=false on
+    /// Adam/AdamW, accumulation=1) the compile refuses rather than silently
+    /// downgrading (transformation-precondition-refusal doctrine).
+    pub forced_mode: Option<FaseForce>,
+}
+
+/// The source-decorator forcing states. `Off` and `FullBuffer` produce the
+/// same plan shape but keep distinct rationale strings — the report must say
+/// which request produced the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaseForce {
+    /// `@fase(mode = off)` — decline the rewrite; legacy accumulation path.
+    Off,
+    /// `@fase(mode = full_buffer)` — force the full-gradient-buffer path.
+    FullBuffer,
+    /// `@fase(mode = deferred)` — require the Deferred envelope.
+    Deferred,
 }
 
 impl Default for FaseConfig {
@@ -109,6 +130,7 @@ impl Default for FaseConfig {
             weight_decay: 0.0,
             momentum: 0.0,
             allow_v_approx: true,
+            forced_mode: None,
         }
     }
 }
@@ -255,6 +277,26 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
             false,
             "unrecognised optimizer — falling back to full gradient buffer".to_string(),
         ),
+    };
+
+    // Milestone A: apply the source decorator's forcing AFTER the
+    // derivation so the rationale can cite what the planner WOULD have done.
+    // `Deferred` is deliberately not forced here — plan() cannot refuse, so
+    // requiring Deferred is checked by the driver against the planned mode
+    // (stmt.rs), keeping every hard refusal on the path that owns
+    // CodegenError.
+    let (mode, v_approx, rationale) = match cfg.forced_mode {
+        Some(FaseForce::Off) => (
+            FaseMode::FullBuffer,
+            false,
+            format!("@fase(mode = off) — rewrite declined by source decorator (planner would have said: {rationale})"),
+        ),
+        Some(FaseForce::FullBuffer) => (
+            FaseMode::FullBuffer,
+            false,
+            format!("@fase(mode = full_buffer) — forced by source decorator (planner would have said: {rationale})"),
+        ),
+        Some(FaseForce::Deferred) | None => (mode, v_approx, rationale),
     };
 
     // Two-phase clip requires the Deferred accumulation convention: Phase A

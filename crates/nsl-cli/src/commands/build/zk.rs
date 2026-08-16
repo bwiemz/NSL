@@ -138,6 +138,8 @@ pub(crate) fn run_build_zk(
     };
 
     crate::commands::build::emit_pass_trace();
+    // Milestone A: reconcile requested surfaces before the artifact links.
+    crate::activation_enforce::enforce_from_argv(nsl_codegen::pass_registry::Subcommand::Build);
     match nsl_codegen::linker::link(&obj_path, &exe_path) {
         Ok(()) => {
             let _ = std::fs::remove_file(&obj_path);

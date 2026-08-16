@@ -11,6 +11,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     let crate::args::RunArgs {
             file,
             args,
+            // Milestone A: consumed by activation_enforce, which reads argv
+            // directly (see its module doc), so the typed values are unused.
+            activation_report: _activation_report,
+            allow_inert_requests: _allow_inert_requests,
+            allow_unknown_decorators,
             profile_memory,
             profile_kernels,
             profile,
@@ -20,7 +25,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             decode_workers,
             target,
             disable_fusion,
-            tape_ad,
+            // Milestone A: `tape_ad` is destructured-and-dropped on purpose —
+            // the flag's whole effect is clap's source_ad_mode group (tape AD is
+            // the default path; the CompileOptions field it used to fill was
+            // never read and has been removed).
+            tape_ad: _tape_ad,
             source_ad,
             pretrain_optimized,
             debug_training,
@@ -81,6 +90,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             stream_async_writeback,
             weights,
     } = args;
+
+    crate::activation_enforce::apply_allow_unknown_decorators(allow_unknown_decorators);
+
+    crate::activation_enforce::refuse_unimplemented_distribute(&_distribute);
 
     // P4 item 14: validate the collective backend up front (fail before
     // spawning ranks) and export it for the runtime — nsl_zero_init reads
@@ -424,7 +437,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 memory_report: false,
                 target,
                 disable_fusion,
-                tape_ad,
                 source_ad,
                 trace_ops,
                 nan_analysis: false,
@@ -621,8 +633,19 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 };
                 let binary_path = temp_dir.join(&exe_name);
 
-                // Build the binary
-                crate::commands::build::run_build_inner(&file, Some(binary_path.clone()), false, false, true, &compile_opts, None);
+                // Build the binary. Milestone A: the Run entry scopes
+                // activation enforcement, which fires inside the build —
+                // before any worker spawns onto an unexamined build.
+                crate::commands::build::run_build_inner(
+                    &file,
+                    Some(binary_path.clone()),
+                    false,
+                    false,
+                    true,
+                    &compile_opts,
+                    None,
+                    nsl_codegen::pass_registry::Subcommand::Run,
+                );
 
                 let mut children: Vec<(&str, std::process::Child)> = Vec::new();
                 let total_workers = 1 + prefill_workers + decode_workers;

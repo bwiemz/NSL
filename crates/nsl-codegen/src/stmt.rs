@@ -207,7 +207,29 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // planning into a no-op here. See STATUS.md / docs/architecture/.
     #[cfg(not(feature = "experimental-cpdt"))]
     {
-        let _ = (compiler, applied_plan, train_block);
+        let _ = (applied_plan, train_block);
+        // Milestone A: a build compiled without the feature cannot honour a
+        // CPDT request — say so as a typed decline instead of a silent no-op,
+        // or the activation reconciler reports the request as silently inert
+        // with no way for the user to tell why.
+        // Record unconditionally: `@cpdt(mode = off)` maps to CpdtMode::Off,
+        // so gating the record on mode != Off left exactly that request
+        // unanswered on feature-stripped builds (review finding). ModeOff is
+        // the honest reason when off was requested-or-default; FeatureDisabled
+        // when the request wanted CPDT active.
+        crate::pass_trace::record("CPDT");
+        crate::pass_trace::record_disposition(
+            "CPDT",
+            crate::pass_trace::PassDisposition::Declined {
+                reason: if compiler.cpdt_mode == crate::cpdt::CpdtMode::Off {
+                    crate::pass_trace::DeclineReason::ModeOff
+                } else {
+                    crate::pass_trace::DeclineReason::FeatureDisabled(
+                        "this nsl was built without the experimental-cpdt feature",
+                    )
+                },
+            },
+        );
         return;
     }
     use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
@@ -217,10 +239,34 @@ pub(crate) fn invoke_cpdt_if_enabled(
     use crate::cpdt_zero::ModelSize;
     use crate::wggo_overrides::WggoOverrides;
 
+    // Milestone A: these two early returns were SILENT — `cpdt::run` records
+    // the pass's dispositions, but neither exit ever reaches it, so a compile
+    // that requested CPDT (flag or decorator) and got nothing looked exactly
+    // like one that never asked. Record here, at the decision, mirroring
+    // FASE's mode-off recording. `record` first: disposition presupposes it.
     if compiler.cpdt_mode == CpdtMode::Off {
+        crate::pass_trace::record("CPDT");
+        crate::pass_trace::record_disposition(
+            "CPDT",
+            crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::ModeOff,
+            },
+        );
         return;
     }
     let Some(cluster) = compiler.cpdt_cluster.clone() else {
+        // Reachable from source alone: `@cpdt(mode = full)` with no cluster
+        // argument and no CLI cluster flags leaves `cpdt_cluster` None.
+        crate::pass_trace::record("CPDT");
+        crate::pass_trace::record_disposition(
+            "CPDT",
+            crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::PreconditionViolated(
+                    "no cluster specification — pass --cpdt-num-gpus or give \
+                     @cpdt a cluster argument",
+                ),
+            },
+        );
         return;
     };
 
@@ -1948,6 +1994,31 @@ impl Compiler<'_> {
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                    }
+
+                    // Milestone A: capture `@fase(...)` on a train block so
+                    // the FASE planner consumes it instead of the config
+                    // being validated-then-dropped (the checker's arm at
+                    // nsl-semantic/checker/stmt.rs validated and discarded
+                    // it; same defect class as the @cfie gap above).
+                    if d.name.len() == 1
+                        && self.resolve_sym(d.name[0]) == "fase"
+                        && matches!(stmt.kind, StmtKind::TrainBlock(_))
+                    {
+                        let interner = self.interner;
+                        let resolve = |s: nsl_ast::Symbol| -> String {
+                            interner.resolve(s.0).unwrap_or("").to_string()
+                        };
+                        let mut diags = Vec::new();
+                        if let Some(cfg) = nsl_semantic::cftp::validate_fase_decorator(
+                            d, &resolve, &mut diags,
+                        ) {
+                            // Invalid configs never get here: nsl-semantic
+                            // already failed the compile during analysis.
+                            if diags.is_empty() {
+                                self.fase_decorator = Some(cfg);
                             }
                         }
                     }
@@ -6114,6 +6185,20 @@ impl Compiler<'_> {
         // FASE: plan the backward rewrite.  Passthrough (N=1) and FullBuffer
         // (Lion, Unknown) fall through to the existing accum-buffer path
         // below.  Deferred routes through stmt_fase.
+        //
+        // Milestone A: the `@fase(...)` decorator captured by the Decorated
+        // arm configures the plan here — previously its validated config was
+        // discarded at the checker and the two knobs below were hard-coded.
+        // `take()` so a later train block never inherits this one's config.
+        let fase_decorator = self.fase_decorator.take();
+        let fase_forced_mode = fase_decorator.as_ref().and_then(|d| match d.mode {
+            nsl_semantic::cftp::FaseMode::Auto => None,
+            nsl_semantic::cftp::FaseMode::Off => Some(crate::fase::FaseForce::Off),
+            nsl_semantic::cftp::FaseMode::FullBuffer => {
+                Some(crate::fase::FaseForce::FullBuffer)
+            }
+            nsl_semantic::cftp::FaseMode::Deferred => Some(crate::fase::FaseForce::Deferred),
+        });
         let fase_cfg = crate::fase::FaseConfig {
             accumulation: grad_accumulation_steps.max(1) as u32,
             optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
@@ -6124,7 +6209,8 @@ impl Compiler<'_> {
             eps: eps_value,
             weight_decay: weight_decay_value,
             momentum: momentum_value,
-            allow_v_approx: true,
+            allow_v_approx: fase_decorator.as_ref().map(|d| d.allow_v_approx).unwrap_or(true),
+            forced_mode: fase_forced_mode,
         };
         let fase_plan = match self.bus.wggo_overrides() {
             Some(o) => {
@@ -6231,6 +6317,58 @@ impl Compiler<'_> {
             );
         }
         let fase_plan = fase_plan;
+
+        // Milestone A: the decorator checks sit AFTER the muon x
+        // --layerwise-accum rewrite above — review caught the first version
+        // running them before it, which refused `@fase(mode = deferred)` on
+        // exactly the build that delivers Deferred, and let the rewrite
+        // silently override `@fase(mode = off)` while the witness printed
+        // the stale mode.
+        //
+        // A forced-off/full_buffer decorator that the muon rewrite would
+        // override is a CONFLICT, not a precedence question: the rewrite
+        // exists because layerwise muon requires the Deferred window, so
+        // honouring the decorator would break the schedule and ignoring it
+        // would break the decorator's contract. Refuse with both facts.
+        if matches!(
+            fase_forced_mode,
+            Some(crate::fase::FaseForce::Off | crate::fase::FaseForce::FullBuffer)
+        ) && fase_plan.mode == crate::fase::FaseMode::Deferred
+        {
+            return Err(CodegenError::new(
+                "@fase(mode = off/full_buffer) conflicts with the muon x \
+                 --layerwise-accum schedule, which requires the Deferred \
+                 accumulation window. Remove the decorator, or drop \
+                 --layerwise-accum / switch the optimizer"
+                    .to_string(),
+            ));
+        }
+
+        // `@fase(mode = deferred)` is a REQUIREMENT, not a preference —
+        // checked against the FINAL mode (post-rewrite). If the build could
+        // not produce Deferred, refuse with requested-vs-derived rather than
+        // silently downgrading (transformation-precondition-refusal).
+        if matches!(fase_forced_mode, Some(crate::fase::FaseForce::Deferred))
+            && fase_plan.mode != crate::fase::FaseMode::Deferred
+        {
+            return Err(CodegenError::new(format!(
+                "@fase(mode = deferred) cannot be honoured: requested the \
+                 Deferred envelope, but the build derived {:?} — {}. \
+                 Use @fase(mode = auto) to accept the derived mode, or \
+                 change the optimizer/accumulation so Deferred is feasible",
+                fase_plan.mode, fase_plan.rationale,
+            )));
+        }
+
+        // The @fase activation witness — the FINAL mode, after every
+        // rewrite. Emitted only when the decorator is present, so vanilla
+        // builds' stderr is unchanged.
+        if fase_decorator.is_some() {
+            eprintln!(
+                "[fase] @fase decorator applied: mode={:?} v_approx={} — {}",
+                fase_plan.mode, fase_cfg.allow_v_approx, fase_plan.rationale,
+            );
+        }
         // Item 3: re-record FASE's disposition AFTER the driver's own rewrite
         // above. `fase::plan` is accurate about the pass and can be wrong
         // about the build: the muon x --layerwise-accum arm overwrites `mode`
@@ -6243,7 +6381,15 @@ impl Compiler<'_> {
         // (`&'static str` only, and `rationale` is a runtime `String`), so the
         // phase count is what is reported; the mode itself stays visible in
         // the existing `[fase]` diagnostics.
-        if fase_plan.mode == crate::fase::FaseMode::Passthrough {
+        if matches!(fase_forced_mode, Some(crate::fase::FaseForce::Off)) {
+            // Milestone A: `@fase(mode = off)` with accumulation > 1 plans
+            // the FullBuffer fallback, but reporting that as "applied" would
+            // tell a user who turned FASE OFF that it ran — record the
+            // decline the request actually was.
+            crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::FeatureDisabled("@fase(mode = off)"),
+            });
+        } else if fase_plan.mode == crate::fase::FaseMode::Passthrough {
             crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
                 reason: crate::pass_trace::DeclineReason::ModeOff,
             });

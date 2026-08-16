@@ -47,9 +47,24 @@ pub(crate) fn run_build(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    run_build_inner(file, output, emit_obj, dump_ir, false, options, wrga_report);
+    run_build_inner(
+        file,
+        output,
+        emit_obj,
+        dump_ir,
+        false,
+        options,
+        wrga_report,
+        nsl_codegen::pass_registry::Subcommand::Build,
+    );
 }
 
+// Milestone A: `entry` names the subcommand this compile serves (`nsl run`
+// funnels through here via build_to_temp), so activation reconciliation can
+// scope contracts correctly. Enforcement fires inside single/multi right
+// after codegen succeeds and BEFORE any artifact is written — an inert
+// request must not leave a fresh executable behind.
+#[allow(clippy::too_many_arguments)] // CLI dispatcher, not a library API
 pub(crate) fn run_build_inner(
     file: &PathBuf,
     output: Option<PathBuf>,
@@ -58,15 +73,17 @@ pub(crate) fn run_build_inner(
     quiet: bool,
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
+    entry: nsl_codegen::pass_registry::Subcommand,
 ) {
     if needs_multi_file(file) {
-        run_build_multi(file, output, emit_obj, dump_ir, quiet, options, wrga_report);
+        run_build_multi(file, output, emit_obj, dump_ir, quiet, options, wrga_report, entry);
     } else {
-        run_build_single(file, output, emit_obj, dump_ir, quiet, options, wrga_report);
+        run_build_single(file, output, emit_obj, dump_ir, quiet, options, wrga_report, entry);
     }
 }
 
 /// Single-file build (backward compatible, fast path).
+#[allow(clippy::too_many_arguments)] // CLI dispatcher, not a library API
 fn run_build_single(
     file: &PathBuf,
     output: Option<PathBuf>,
@@ -75,6 +92,7 @@ fn run_build_single(
     quiet: bool,
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
+    entry: nsl_codegen::pass_registry::Subcommand,
 ) {
     let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, options.linear_types_enabled);
 
@@ -148,6 +166,11 @@ fn run_build_single(
         }
     };
 
+    // Milestone A: reconcile requested surfaces against the disposition log
+    // BEFORE any artifact is written — an unsatisfied request exits here and
+    // leaves nothing behind that looks freshly built.
+    crate::activation_enforce::enforce_from_argv(entry);
+
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
     // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
     capture_wrga_plan(&wrga_plan, &options.wrga_check);
@@ -214,6 +237,7 @@ fn run_build_single(
 }
 
 /// Multi-file build with module system.
+#[allow(clippy::too_many_arguments)] // CLI dispatcher, not a library API
 fn run_build_multi(
     file: &std::path::Path,
     output: Option<PathBuf>,
@@ -222,6 +246,7 @@ fn run_build_multi(
     quiet: bool,
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
+    entry: nsl_codegen::pass_registry::Subcommand,
 ) {
     let mut entry_wrga_plan: Option<nsl_codegen::wrga::WrgaPlan> = None;
     let mut source_map = SourceMap::new();
@@ -240,6 +265,30 @@ fn run_build_multi(
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
         process::exit(1);
+    }
+
+    // Milestone A (path-divergence fix): `--nan-analysis` ran only on
+    // `run_build_single` — a multi-file build accepted the flag and emitted
+    // neither warnings nor the "no risks" note. Analyze the ENTRY module
+    // only, exactly like the single-file path: review showed that running
+    // one analyzer over the whole graph both surfaces stdlib-internal
+    // warnings the user cannot act on and bleeds module-level value
+    // constraints across modules (NanAnalyzer saves/restores state per fn
+    // body, not per module).
+    if options.nan_analysis {
+        let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
+        analyzer.analyze_module(&graph.modules[&graph.entry].ast, &interner);
+        if analyzer.diagnostics.is_empty() {
+            eprintln!("note: --nan-analysis: no NaN/Inf risks detected");
+        } else {
+            eprintln!(
+                "note: --nan-analysis: {} warning(s) detected",
+                analyzer.diagnostics.len()
+            );
+            for diag in &analyzer.diagnostics {
+                source_map.emit_diagnostic(diag);
+            }
+        }
     }
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
@@ -610,6 +659,12 @@ fn run_build_multi(
     }
 
     crate::commands::build::emit_pass_trace();
+
+    // Milestone A: reconcile requested surfaces against the disposition log
+    // after every module compiled, before the link (or the emit-obj return)
+    // hands an artifact to the user.
+    crate::activation_enforce::enforce_from_argv(entry);
+
     if emit_obj {
         if !quiet {
             for obj in &obj_files {

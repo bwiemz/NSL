@@ -110,6 +110,10 @@ pub(crate) fn run_check_wrga_analyze(
         true,   // quiet
         &opts,
         Some(report_path),
+
+        // Milestone A: this build serves `nsl check --wrga-*`, so activation
+        // reconciliation stays report-only (Check never hard-fails on it).
+        nsl_codegen::pass_registry::Subcommand::Check,
     );
 
     // Cleanup: our owned temp dir, plus any source-adjacent .o that the build
@@ -201,6 +205,10 @@ pub(crate) fn run_check_wrga_compare(
         true,   // quiet
         &opts,
         None,   // wrga_report — suppress the analyze report; we render compare below
+
+        // Milestone A: this build serves `nsl check --wrga-*`, so activation
+        // reconciliation stays report-only (Check never hard-fails on it).
+        nsl_codegen::pass_registry::Subcommand::Check,
     );
 
     // Belt-and-suspenders cleanup of artifacts. Same logic as the analyze path.

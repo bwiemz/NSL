@@ -1,5 +1,7 @@
 /.serena
 /target/
+# Review-agent scratch target dirs (swept into a commit once — 6.2GB)
+/target-review/
 # Unanchored too: tools/tokbench is its own cargo workspace and its target/
 # directory is hundreds of megabytes.
 target/
