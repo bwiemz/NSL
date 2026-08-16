@@ -194,7 +194,7 @@ Disables tape recording inside the decorated function; all operations are forwar
 Marks a tensor as sharded across the GPU world (M30); the compiler inserts NCCL collective ops at the shard boundaries. Full reference: [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
 
 ### <a id="dec-tie-weights"></a>`@tie_weights`
-Declares that two model fields share the same underlying weight tensor (e.g., embedding and output projection); the compiler emits a single weight slot and generates tied-gradient accumulation. Full reference: [`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md).
+**Not implemented.** The spec ([`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md)) describes it declaring that two model fields share one weight tensor, but no compiler support exists; since Milestone A the decorator is a typed compile error rather than a silent no-op. Share weights by assigning the same tensor to both fields.
 
 ### <a id="dec-wrga"></a>`@wrga`
 Attaches WRGA adapter configuration to a model, specifying adapter type (LoRA/IA³/GatedLoRA), rank bounds, and target layers. Used alongside `@freeze` and `@adapter`. See [Glossary#wrga](#wrga).
