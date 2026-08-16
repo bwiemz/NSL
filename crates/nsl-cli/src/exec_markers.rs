@@ -458,6 +458,22 @@ pub struct NegativeNeedle {
 /// fail at all, so each is pinned.
 pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/cpdt_decorator_activation_gate.rs",
+        asserts: "a control build without @cpdt carries no decorator-applied marker",
+        parts: &[
+            // eprintln!("[cpdt] @cpdt decorator applied: mode={} ...")
+            ("[cpdt] @cpdt decorator applied", "crates/nsl-codegen/src/cpdt_decorator.rs"),
+        ],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/fase_decorator_activation_gate.rs",
+        asserts: "a control build without @fase carries no decorator-applied witness",
+        parts: &[
+            // eprintln!("[fase] @fase decorator applied: mode={:?} ...")
+            ("[fase] @fase decorator applied:", "crates/nsl-codegen/src/stmt.rs"),
+        ],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/csha_checkpoint_decorator_cli_e2e.rs",
         asserts: "@csha(disable=true) suppressed the CSHA plan summary",
         parts: &[

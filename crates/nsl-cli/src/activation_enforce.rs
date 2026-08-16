@@ -36,19 +36,53 @@ pub(crate) fn requested_long_flags() -> Vec<String> {
 }
 
 fn requested_long_flags_from(args: impl Iterator<Item = String>) -> Vec<String> {
+    // The CLI's only short aliases; a short flag is the same request as its
+    // long form, and review caught `-w model.nslm` escaping the scan. Kept
+    // in lockstep by the unit test below against args.rs's `short = '..'`
+    // declarations.
+    const SHORT_ALIASES: &[(&str, &str)] = &[("-w", "weights"), ("-o", "output")];
     let mut out = Vec::new();
+    let push = |name: &str, out: &mut Vec<String>| {
+        if !name.is_empty() && !out.iter().any(|e| e == name) {
+            out.push(name.to_string());
+        }
+    };
     for a in args {
         if a == "--" {
             break;
         }
         if let Some(rest) = a.strip_prefix("--") {
-            let name = rest.split('=').next().unwrap_or(rest);
-            if !name.is_empty() && !out.iter().any(|e| e == name) {
-                out.push(name.to_string());
-            }
+            push(rest.split('=').next().unwrap_or(rest), &mut out);
+        } else if let Some((_, long)) = SHORT_ALIASES.iter().find(|(s, _)| *s == a) {
+            push(long, &mut out);
         }
     }
     out
+}
+
+/// `--allow-unknown-decorators` travels to nsl-semantic (and every module
+/// the loader analyzes) as an env var — the plumbing `--grad-integrity` and
+/// `--collectives` already use. One helper so the env-var name has one
+/// spelling in the tree (review found three pasted copies).
+pub(crate) fn apply_allow_unknown_decorators(enabled: bool) {
+    if enabled {
+        std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
+    }
+}
+
+/// `--distribute` refusal (deferral-must-refuse): the M43 3D-parallelism
+/// config has zero consumers anywhere in the tree; refusing beats compiling
+/// a single-process binary that LOOKS distributed. One helper so the two
+/// dispatchers cannot drift (review found the prose pasted verbatim twice).
+pub(crate) fn refuse_unimplemented_distribute(distribute: &Option<String>) {
+    if distribute.is_some() {
+        eprintln!(
+            "error: --distribute is not implemented (the M43 3D-parallelism \
+             config has no consumer); use --zero-stage/--devices/--collectives \
+             for multi-process training, or drop the flag"
+        );
+        std::process::exit(1);
+    }
 }
 
 /// Reconcile every surface requested on this invocation against the compile
@@ -137,7 +171,30 @@ mod tests {
         .into_iter()
         .map(String::from);
         let flags = requested_long_flags_from(args);
-        assert_eq!(flags, vec!["wggo".to_string(), "vram-budget".to_string()]);
+        assert_eq!(
+            flags,
+            vec!["wggo".to_string(), "vram-budget".to_string(), "output".to_string()],
+            "-o is the output short alias and must surface as a request"
+        );
+    }
+
+    #[test]
+    fn short_aliases_map_to_their_long_forms() {
+        let args = ["-w", "m.nslm", "-o", "out"].into_iter().map(String::from);
+        assert_eq!(
+            requested_long_flags_from(args),
+            vec!["weights".to_string(), "output".to_string()]
+        );
+        // The alias list must cover every `short = '..'` args.rs declares —
+        // a new short flag must be added here or its requests escape the
+        // reconciler.
+        let src = include_str!("args.rs");
+        let shorts = src.matches("short = '").count();
+        assert_eq!(
+            shorts, 2,
+            "args.rs declares {shorts} short flags; update SHORT_ALIASES in \
+             requested_long_flags_from and this count"
+        );
     }
 
     #[test]

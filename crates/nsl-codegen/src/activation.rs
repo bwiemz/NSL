@@ -183,7 +183,10 @@ pub static MANUAL_CONTRACTS: &[Contract] = &[
     // ------------------------------------------------------------------
     deco("fase", BR, "FASE", Witness::Disposition("FASE")),
     deco("autotune", BR, "autotune", Witness::Marker("[autotune]")),
-    deco("flash_attention", BR, "kernel-driver", Witness::Marker("[flash-attention]")),
+    // Config, not Marker: the only "[flash-attention]" string in the tree
+    // turned out to be registry data (review caught the gate matching its
+    // own table); the real consumer is the kernel driver's name match.
+    deco("flash_attention", BR, "kernel-driver", Witness::Config("crates/nsl-codegen/src/compiler/kernel.rs")),
     // ------------------------------------------------------------------
     // CLI flags with no pass-registry owner, from the 2026-08-15 consumer
     // audit. `on` mirrors the arg structs that declare the flag and is
@@ -255,15 +258,16 @@ pub static MANUAL_CONTRACTS: &[Contract] = &[
     flag("embed-threshold", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("embed-weights", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("vram-budget", B_ONLY, "memory-planner", Witness::Config("crates/nsl-codegen/src/memory_planner.rs")),
-    // WCET family (declared on all three; check REFUSES them — see
-    // commands/check.rs — so the check column is a declared refusal, not a
-    // silent drop).
-    flag("wcet", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("wcet-cert", CBR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("wcet-target", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("cpu", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("do178c-report", CBR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("fpga-device", CBR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    // WCET family: build/run only. The six were declared-and-dropped on
+    // CheckArgs for a long time; review chose deletion over a bespoke
+    // refusal block — clap's own unknown-argument error IS the refusal, and
+    // the entry-set gate now enforces the BR scope automatically.
+    flag("wcet", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("wcet-cert", BR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("wcet-target", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("cpu", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("do178c-report", BR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
+    flag("fpga-device", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
     // Report-only surfaces: the artifact/report is the witness.
     flag("fusion-report", B_ONLY, "fusion", Witness::Report("crates/nsl-codegen/src/fusion_report.rs")),
     flag("nan-analysis", CB, "nan-analysis", Witness::Report("crates/nsl-cli/src/commands/build/normal.rs")),
@@ -310,53 +314,91 @@ pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
     ("allow-unknown-decorators", "the namespace close's own escape hatch"),
 ];
 
-/// The full contract set: every pass-registry surface (flags AND decorator
-/// triggers become [`Witness::Disposition`] contracts owned by that pass),
-/// then the manual table.
+/// Owners MEASURED to record a [`PassDisposition`] on every compile where
+/// their surface is armed — the precondition for runtime enforcement. FASE
+/// and CPDT record on EVERY train-block compile (including their mode-off
+/// declines); CCR records whenever `--checkpoint-blocks` is set and a train
+/// block compiles. Every other pass has additional preconditions (WRGA needs
+/// decorators, MemoryPlanner needs plannable single-file allocations, WGGO
+/// arms from its own flag family's mode value, ...), so reconciling their
+/// silence as "inert" would hard-fail legitimately-quiet paths — review
+/// found exactly that for `--wrga-report`'s designed soft path and for
+/// `--memory-report` on any multi-file build. Their contracts are
+/// consumer-site witnesses instead, enforced by the static gate.
+const RUNTIME_ENFORCED_PASSES: &[&str] = &["FASE", "CPDT", "CCR"];
+const RUNTIME_ENFORCED_DECORATORS: &[&str] = &["fase", "cpdt"];
+
+/// The full contract set:
+/// - pass-registry flags: [`Witness::Disposition`] where the owner is in
+///   [`RUNTIME_ENFORCED_PASSES`], else a Config witness on the pass's first
+///   source file (activation still declared, verified by gates rather than
+///   reconciled at runtime);
+/// - the two runtime-enforced decorator triggers;
+/// - the manual table;
+/// - every remaining KNOWN decorator name from
+///   `nsl_semantic::decorator_registry`, as a Config witness on the
+///   consumer file that registry row already names — one source of truth,
+///   so a decorator can never again reconcile as "plumbing".
 ///
-/// Derived at call time rather than stored, so the pass-registry half can
-/// never drift from `PASSES` — the same reason `pass_registry` derives its
-/// wiki checks from `PASSES` instead of a second list.
-pub fn contracts() -> Vec<Contract> {
-    let mut out = Vec::new();
-    for p in pass_registry::PASSES {
-        for f in p.cli_flags {
-            out.push(Contract {
-                surface: Surface::Flag(f.flag),
-                on: f.on,
-                owner: p.name,
-                witness: Witness::Disposition(p.name),
-            });
+/// Derived once and memoized (the inputs are all `'static`).
+pub fn contracts() -> &'static [Contract] {
+    use std::sync::OnceLock;
+    static CONTRACTS: OnceLock<Vec<Contract>> = OnceLock::new();
+    CONTRACTS.get_or_init(|| {
+        let mut out = Vec::new();
+        for p in pass_registry::PASSES {
+            let runtime = RUNTIME_ENFORCED_PASSES.contains(&p.name);
+            for f in p.cli_flags {
+                out.push(Contract {
+                    surface: Surface::Flag(f.flag),
+                    on: f.on,
+                    owner: p.name,
+                    witness: if runtime {
+                        Witness::Disposition(p.name)
+                    } else {
+                        Witness::Config(p.source_files[0])
+                    },
+                });
+            }
+            for d in p.decorator_triggers {
+                if RUNTIME_ENFORCED_DECORATORS.contains(d) {
+                    out.push(Contract {
+                        surface: Surface::Decorator(d),
+                        on: BR,
+                        owner: p.name,
+                        witness: Witness::Disposition(p.name),
+                    });
+                }
+                // Non-runtime triggers fall through to the KNOWN_DECORATORS
+                // derivation below, which names the actual consumer.
+            }
         }
-        for d in p.decorator_triggers {
-            out.push(Contract {
-                surface: Surface::Decorator(d),
-                // A decorator can only be honoured where the pass can run;
-                // passes run on the compile pipeline (build/run), and some
-                // analysis modes on check. BR is the conservative floor —
-                // check-side honouring is still reported, never enforced
-                // (see reconcile()).
-                on: BR,
-                owner: p.name,
-                witness: Witness::Disposition(p.name),
-            });
+        for c in MANUAL_CONTRACTS {
+            if !out.iter().any(|e| e.surface == c.surface) {
+                out.push(*c);
+            }
         }
-    }
-    // Manual entries may refine a generated one (e.g. @fase is generated from
-    // FASE's decorator_triggers already); dedupe keeps the FIRST occurrence,
-    // so generated (registry-derived) entries win and a manual duplicate is
-    // rejected by the gate instead of silently shadowing.
-    for c in MANUAL_CONTRACTS {
-        if !out.iter().any(|e| e.surface == c.surface) {
-            out.push(*c);
+        // Every remaining known decorator: the namespace registry's
+        // `read_by` consumer is the witness site. This is what makes "a
+        // decorator is never plumbing" structural: closing the namespace
+        // over a name automatically gives it an activation contract.
+        for d in nsl_semantic::decorator_registry::KNOWN_DECORATORS {
+            if !out.iter().any(|e| e.surface == Surface::Decorator(d.name)) {
+                out.push(Contract {
+                    surface: Surface::Decorator(d.name),
+                    on: BR,
+                    owner: "frontend",
+                    witness: Witness::Config(d.read_by),
+                });
+            }
         }
-    }
-    out
+        out
+    })
 }
 
 /// Look up the contract for a requested surface, if any.
 pub fn contract_for(surface: &RequestedSurface) -> Option<Contract> {
-    contracts().into_iter().find(|c| match (&c.surface, surface) {
+    contracts().iter().copied().find(|c| match (&c.surface, surface) {
         (Surface::Flag(f), RequestedSurface::Flag(name)) => f == name,
         (Surface::Decorator(d), RequestedSurface::Decorator(name)) => d == name,
         _ => false,
@@ -491,7 +533,10 @@ pub fn render_report(outcomes: &[Outcome]) -> String {
                     Witness::Marker(m) => format!("marker {m}"),
                     Witness::Config(site) => format!("consumed at {site}"),
                     Witness::Report(site) => format!("report from {site}"),
-                    Witness::Disposition(_) => unreachable!("Disposition is never ByConstruction"),
+                    // reconcile_with never routes Disposition here; if a
+                    // future refactor does, render it rather than panic in
+                    // the user's build.
+                    Witness::Disposition(p) => format!("disposition owner {p}"),
                 },
             ),
             OutcomeState::Unsatisfied { owner } => format!(
@@ -517,19 +562,32 @@ pub fn render_report(outcomes: &[Outcome]) -> String {
 mod tests {
     use super::*;
 
-    /// Every pass-registry flag and decorator trigger must surface as a
-    /// Disposition contract owned by its pass.
+    /// Every pass-registry flag surfaces as a contract owned by its pass —
+    /// Disposition (runtime-reconciled) ONLY for owners measured to record
+    /// on every armed compile, Config otherwise. Review found the all-
+    /// Disposition version hard-failing designed soft paths
+    /// (`--wrga-report` with no WRGA decorators; `--memory-report` on any
+    /// multi-file build).
     #[test]
-    fn registry_surfaces_become_disposition_contracts() {
+    fn registry_surfaces_become_contracts_with_the_measured_cut() {
         let cs = contracts();
         for p in pass_registry::PASSES {
+            let runtime = RUNTIME_ENFORCED_PASSES.contains(&p.name);
             for f in p.cli_flags {
                 let c = cs
                     .iter()
                     .find(|c| c.surface == Surface::Flag(f.flag))
                     .unwrap_or_else(|| panic!("--{} has no contract", f.flag));
                 assert_eq!(c.owner, p.name, "--{} owner", f.flag);
-                assert_eq!(c.witness, Witness::Disposition(p.name), "--{} witness", f.flag);
+                if runtime {
+                    assert_eq!(c.witness, Witness::Disposition(p.name), "--{} witness", f.flag);
+                } else {
+                    assert!(
+                        matches!(c.witness, Witness::Config(_)),
+                        "--{}: non-runtime pass flags carry Config witnesses",
+                        f.flag
+                    );
+                }
             }
             for d in p.decorator_triggers {
                 assert!(
@@ -537,6 +595,15 @@ mod tests {
                     "@{d} has no contract"
                 );
             }
+        }
+        // Every KNOWN decorator name has a contract — "a decorator is never
+        // plumbing" is structural, not aspirational.
+        for d in nsl_semantic::decorator_registry::KNOWN_DECORATORS {
+            assert!(
+                cs.iter().any(|c| c.surface == Surface::Decorator(d.name)),
+                "@{} is a known decorator with no activation contract",
+                d.name
+            );
         }
     }
 
@@ -561,21 +628,35 @@ mod tests {
     /// it concurrently, so tests never read it.
     #[test]
     fn reconcile_splits_disposed_unsatisfied_uncontracted() {
-        let dispositions = [("WGGO", PassDisposition::Applied { rewrites: 3 })];
+        let dispositions = [("CCR", PassDisposition::Applied { rewrites: 3 })];
         let requested = vec![
-            RequestedSurface::Flag("wggo".into()),               // disposed
-            RequestedSurface::Flag("checkpoint-blocks".into()),  // CCR silent -> unsatisfied
+            RequestedSurface::Flag("checkpoint-blocks".into()),  // disposed (CCR spoke)
+            RequestedSurface::Flag("checkpoint-stride".into()),  // also CCR: same log entry
+            RequestedSurface::Flag("wggo".into()),               // Config witness -> by construction
             RequestedSurface::Flag("output".into()),             // plumbing -> uncontracted
         ];
         let outcomes = reconcile_with(&requested, Subcommand::Build, &dispositions);
         assert!(matches!(outcomes[0].state, OutcomeState::Disposed(_)), "{:?}", outcomes[0]);
+        assert!(matches!(outcomes[1].state, OutcomeState::Disposed(_)), "{:?}", outcomes[1]);
         assert!(
-            matches!(outcomes[1].state, OutcomeState::Unsatisfied { owner: "CCR" }),
+            matches!(outcomes[2].state, OutcomeState::ByConstruction(Witness::Config(_))),
             "{:?}",
-            outcomes[1]
+            outcomes[2]
         );
-        assert!(matches!(outcomes[2].state, OutcomeState::Uncontracted), "{:?}", outcomes[2]);
-        assert_eq!(unsatisfied(&outcomes).len(), 1);
+        assert!(matches!(outcomes[3].state, OutcomeState::Uncontracted), "{:?}", outcomes[3]);
+        assert!(unsatisfied(&outcomes).is_empty());
+
+        // The silent-owner arm, isolated: CCR contracted, nothing recorded.
+        let outcomes = reconcile_with(
+            &[RequestedSurface::Flag("checkpoint-blocks".into())],
+            Subcommand::Build,
+            &[],
+        );
+        assert!(
+            matches!(outcomes[0].state, OutcomeState::Unsatisfied { owner: "CCR" }),
+            "{:?}",
+            outcomes[0]
+        );
     }
 
     /// Check-side reconciliation of a build/run-scoped surface reports

@@ -269,14 +269,15 @@ fn run_build_multi(
 
     // Milestone A (path-divergence fix): `--nan-analysis` ran only on
     // `run_build_single` — a multi-file build accepted the flag and emitted
-    // neither warnings nor the "no risks" note. Run the analyzer over every
-    // module in dependency order, mirroring the single-file block's output
-    // shape so tests can assert one needle on both paths.
+    // neither warnings nor the "no risks" note. Analyze the ENTRY module
+    // only, exactly like the single-file path: review showed that running
+    // one analyzer over the whole graph both surfaces stdlib-internal
+    // warnings the user cannot act on and bleeds module-level value
+    // constraints across modules (NanAnalyzer saves/restores state per fn
+    // body, not per module).
     if options.nan_analysis {
         let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
-        for path in &graph.dep_order {
-            analyzer.analyze_module(&graph.modules[path].ast, &interner);
-        }
+        analyzer.analyze_module(&graph.modules[&graph.entry].ast, &interner);
         if analyzer.diagnostics.is_empty() {
             eprintln!("note: --nan-analysis: no NaN/Inf risks detected");
         } else {

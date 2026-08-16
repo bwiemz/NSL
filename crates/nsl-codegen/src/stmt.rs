@@ -212,17 +212,24 @@ pub(crate) fn invoke_cpdt_if_enabled(
         // CPDT request — say so as a typed decline instead of a silent no-op,
         // or the activation reconciler reports the request as silently inert
         // with no way for the user to tell why.
-        if compiler.cpdt_mode != crate::cpdt::CpdtMode::Off {
-            crate::pass_trace::record("CPDT");
-            crate::pass_trace::record_disposition(
-                "CPDT",
-                crate::pass_trace::PassDisposition::Declined {
-                    reason: crate::pass_trace::DeclineReason::FeatureDisabled(
+        // Record unconditionally: `@cpdt(mode = off)` maps to CpdtMode::Off,
+        // so gating the record on mode != Off left exactly that request
+        // unanswered on feature-stripped builds (review finding). ModeOff is
+        // the honest reason when off was requested-or-default; FeatureDisabled
+        // when the request wanted CPDT active.
+        crate::pass_trace::record("CPDT");
+        crate::pass_trace::record_disposition(
+            "CPDT",
+            crate::pass_trace::PassDisposition::Declined {
+                reason: if compiler.cpdt_mode == crate::cpdt::CpdtMode::Off {
+                    crate::pass_trace::DeclineReason::ModeOff
+                } else {
+                    crate::pass_trace::DeclineReason::FeatureDisabled(
                         "this nsl was built without the experimental-cpdt feature",
-                    ),
+                    )
                 },
-            );
-        }
+            },
+        );
         return;
     }
     use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
@@ -6258,33 +6265,6 @@ impl Compiler<'_> {
             None => crate::fase::plan(&fase_cfg),
         };
 
-        // Milestone A: `@fase(mode = deferred)` is a REQUIREMENT, not a
-        // preference. If the derivation could not produce Deferred, refuse
-        // with requested-vs-derived rather than silently downgrading — a
-        // diagnostic-gated fallback trains users to ignore the diagnostic
-        // (transformation-precondition-refusal doctrine).
-        if matches!(fase_forced_mode, Some(crate::fase::FaseForce::Deferred))
-            && fase_plan.mode != crate::fase::FaseMode::Deferred
-        {
-            return Err(CodegenError::new(format!(
-                "@fase(mode = deferred) cannot be honoured: requested the \
-                 Deferred envelope, but the planner derived {:?} — {}. \
-                 Use @fase(mode = auto) to accept the derived mode, or \
-                 change the optimizer/accumulation so Deferred is feasible",
-                fase_plan.mode, fase_plan.rationale,
-            )));
-        }
-
-        // Milestone A: when the decorator configured this plan, say what it
-        // produced — the activation witness for @fase. Emitted only when the
-        // decorator is present, so vanilla builds' stderr is unchanged.
-        if fase_decorator.is_some() {
-            eprintln!(
-                "[fase] @fase decorator applied: mode={:?} v_approx={} — {}",
-                fase_plan.mode, fase_cfg.allow_v_approx, fase_plan.rationale,
-            );
-        }
-
         // Render FaseModeInfeasible diagnostics to stderr in the same format
         // as CSHA / WRGA / CPDT so the Phase 3 decision explainer parses
         // uniformly.
@@ -6337,6 +6317,58 @@ impl Compiler<'_> {
             );
         }
         let fase_plan = fase_plan;
+
+        // Milestone A: the decorator checks sit AFTER the muon x
+        // --layerwise-accum rewrite above — review caught the first version
+        // running them before it, which refused `@fase(mode = deferred)` on
+        // exactly the build that delivers Deferred, and let the rewrite
+        // silently override `@fase(mode = off)` while the witness printed
+        // the stale mode.
+        //
+        // A forced-off/full_buffer decorator that the muon rewrite would
+        // override is a CONFLICT, not a precedence question: the rewrite
+        // exists because layerwise muon requires the Deferred window, so
+        // honouring the decorator would break the schedule and ignoring it
+        // would break the decorator's contract. Refuse with both facts.
+        if matches!(
+            fase_forced_mode,
+            Some(crate::fase::FaseForce::Off | crate::fase::FaseForce::FullBuffer)
+        ) && fase_plan.mode == crate::fase::FaseMode::Deferred
+        {
+            return Err(CodegenError::new(
+                "@fase(mode = off/full_buffer) conflicts with the muon x \
+                 --layerwise-accum schedule, which requires the Deferred \
+                 accumulation window. Remove the decorator, or drop \
+                 --layerwise-accum / switch the optimizer"
+                    .to_string(),
+            ));
+        }
+
+        // `@fase(mode = deferred)` is a REQUIREMENT, not a preference —
+        // checked against the FINAL mode (post-rewrite). If the build could
+        // not produce Deferred, refuse with requested-vs-derived rather than
+        // silently downgrading (transformation-precondition-refusal).
+        if matches!(fase_forced_mode, Some(crate::fase::FaseForce::Deferred))
+            && fase_plan.mode != crate::fase::FaseMode::Deferred
+        {
+            return Err(CodegenError::new(format!(
+                "@fase(mode = deferred) cannot be honoured: requested the \
+                 Deferred envelope, but the build derived {:?} — {}. \
+                 Use @fase(mode = auto) to accept the derived mode, or \
+                 change the optimizer/accumulation so Deferred is feasible",
+                fase_plan.mode, fase_plan.rationale,
+            )));
+        }
+
+        // The @fase activation witness — the FINAL mode, after every
+        // rewrite. Emitted only when the decorator is present, so vanilla
+        // builds' stderr is unchanged.
+        if fase_decorator.is_some() {
+            eprintln!(
+                "[fase] @fase decorator applied: mode={:?} v_approx={} — {}",
+                fase_plan.mode, fase_cfg.allow_v_approx, fase_plan.rationale,
+            );
+        }
         // Item 3: re-record FASE's disposition AFTER the driver's own rewrite
         // above. `fase::plan` is accurate about the pass and can be wrong
         // about the build: the muon x --layerwise-accum arm overwrites `mode`
@@ -6349,7 +6381,15 @@ impl Compiler<'_> {
         // (`&'static str` only, and `rationale` is a runtime `String`), so the
         // phase count is what is reported; the mode itself stays visible in
         // the existing `[fase]` diagnostics.
-        if fase_plan.mode == crate::fase::FaseMode::Passthrough {
+        if matches!(fase_forced_mode, Some(crate::fase::FaseForce::Off)) {
+            // Milestone A: `@fase(mode = off)` with accumulation > 1 plans
+            // the FullBuffer fallback, but reporting that as "applied" would
+            // tell a user who turned FASE OFF that it ran — record the
+            // decline the request actually was.
+            crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
+                reason: crate::pass_trace::DeclineReason::FeatureDisabled("@fase(mode = off)"),
+            });
+        } else if fase_plan.mode == crate::fase::FaseMode::Passthrough {
             crate::pass_trace::record_disposition("FASE", crate::pass_trace::PassDisposition::Declined {
                 reason: crate::pass_trace::DeclineReason::ModeOff,
             });

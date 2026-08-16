@@ -172,7 +172,16 @@ fn entry_sets_match_the_arg_structs_exactly() {
 #[test]
 fn every_witness_is_observable() {
     let root = workspace_root();
-    // Collect all src file contents once.
+    // Collect all src file contents once — EXCLUDING the registry files
+    // that carry the marker strings as data. Review caught the first
+    // version matching the contract table's own source, which made this
+    // gate structurally unable to fail (the item-20 "verify the gate fails
+    // for the right input" defect, shipped verbatim): "[flash-attention]"
+    // was an unobservable witness and the gate was green.
+    const SELF_REFERENTIAL: &[&str] = &[
+        "crates/nsl-codegen/src/activation.rs",
+        "crates/nsl-cli/src/exec_markers.rs",
+    ];
     let mut src_blobs: Vec<(PathBuf, String)> = Vec::new();
     for crate_dir in std::fs::read_dir(root.join("crates")).unwrap() {
         let src = crate_dir.unwrap().path().join("src");
@@ -180,6 +189,10 @@ fn every_witness_is_observable() {
             collect_rs(&src, &mut src_blobs);
         }
     }
+    src_blobs.retain(|(p, _)| {
+        let rel = p.strip_prefix(&root).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        !SELF_REFERENTIAL.iter().any(|s| rel.ends_with(s) || rel == *s)
+    });
     assert!(src_blobs.len() >= 100, "src walk collapsed: {} files", src_blobs.len());
 
     for c in activation::MANUAL_CONTRACTS {
@@ -220,6 +233,33 @@ fn collect_rs(dir: &std::path::Path, out: &mut Vec<(PathBuf, String)>) {
             if let Ok(s) = std::fs::read_to_string(&p) {
                 out.push((p, s));
             }
+        }
+    }
+}
+
+/// Cross-registry pins: the three tables describing decorators must agree.
+/// - Every pass_registry decorator_trigger must be a KNOWN decorator, or the
+///   semantic namespace close rejects a name the pass registry says it owns.
+/// - Every activation decorator contract must name a KNOWN decorator (no
+///   contracts for names no program can write).
+#[test]
+fn the_decorator_registries_agree() {
+    for p in pass_registry::PASSES {
+        for d in p.decorator_triggers {
+            assert!(
+                nsl_semantic::decorator_registry::find(d).is_some(),
+                "{}: decorator_trigger @{d} is not in KNOWN_DECORATORS — the \
+                 namespace close would reject the name this pass owns",
+                p.name
+            );
+        }
+    }
+    for c in activation::contracts() {
+        if let Surface::Decorator(d) = c.surface {
+            assert!(
+                nsl_semantic::decorator_registry::find(d).is_some(),
+                "@{d} has an activation contract but is not a KNOWN decorator"
+            );
         }
     }
 }

@@ -925,6 +925,12 @@ fn compile_with_zk_info_best_effort_plan(
 
     compiler.dump_ir = dump_ir;
 
+    // Milestone A: this flavor's driver runs activation enforcement, so it
+    // must feed the decorator request log like the normal paths — review
+    // caught standalone/zk enforcing against an EMPTY log, which silently
+    // exempted decorators on exactly these flavors.
+    crate::activation::note_entry_module_decorators(ast, interner);
+
     // Run every pass up to (but not including) finalize so we can observe
     // `bus.wrga_plan` even on an error path before consuming the compiler.
     let pre_finalize = (|| -> Result<(), CodegenError> {
@@ -1110,6 +1116,13 @@ fn compile_standalone_best_effort_plan(
     }
     compiler.dump_ir = dump_ir;
     compiler.standalone_config = Some(config);
+
+    // Milestone A: this flavor's driver runs activation enforcement, so it
+    // must feed the decorator request log like the normal paths — review
+    // caught standalone/zk enforcing against an EMPTY log, which silently
+    // exempted decorators on exactly these flavors.
+    crate::activation::note_entry_module_decorators(ast, interner);
+
     let pre_finalize = (|| -> Result<(), CodegenError> {
         compiler.intern_string("")?;
         compiler.collect_strings(&ast.stmts)?;

@@ -140,8 +140,8 @@ fn the_escape_hatch_demotes_to_a_warning() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
-/// A declined request is a SATISFIED contract: FASE records `declined, mode
-/// off` on every train compile, so `@fase(mode = off)` passes enforcement
+/// A declined request is a SATISFIED contract: a forced-off @fase re-records
+/// `declined, feature disabled - @fase(mode = off)`, so it passes enforcement
 /// and the report says why. This pins the decline path end-to-end — if it
 /// ever regresses to Unsatisfied, every legitimately-declined request would
 /// fail the build it correctly declined on.
@@ -161,8 +161,10 @@ fn a_typed_decline_satisfies_the_contract() {
         r.stderr
     );
     assert!(
-        r.stderr.contains("[activation] @fase: declined, mode off"),
-        "report must show the decline with its reason:\n{}",
+        r.stderr.contains("[activation] @fase: declined, feature disabled - @fase(mode = off)"),
+        "report must show the decline citing the decorator that caused it \
+         (the driver re-records FeatureDisabled for a forced-off @fase, so \
+         the report names the request rather than a generic mode-off):\n{}",
         r.stderr
     );
     std::fs::remove_dir_all(&tmp).ok();

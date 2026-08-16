@@ -626,6 +626,11 @@ fn shell_pass_table_agrees_with_the_registry() {
 /// completeness check would be unrunnable noise; with it, adding a genuinely
 /// new pass module fails until someone classifies it.
 const NOT_A_PASS: &[(&str, &str)] = &[
+    (
+        "activation",
+        "Milestone A contract table + reconciler: DESCRIBES pass activation \
+         (joining requests to dispositions), transforms nothing itself",
+    ),
     ("ad_rules", "adjoint rules table consumed by source-AD, not a pass"),
     ("agent", "M56 agent-memory feature"),
     ("autotune", "kernel autotuner, invoked BY passes rather than being one"),

@@ -156,6 +156,14 @@ impl<'a> Collector<'a> {
                 self.collect_block(&k.body);
             }
             StmtKind::FnDef(f) => self.collect_block(&f.body),
+            // Trait default-method bodies are reachable by the generic
+            // visitor, so they must be reachable here (review caught this
+            // arm missing — a decorator inside one escaped the namespace).
+            StmtKind::TraitDef(tr) => {
+                for m in &tr.methods {
+                    self.collect_block(&m.body);
+                }
+            }
             StmtKind::TrainBlock(t) => self.collect_sections(&t.sections),
             StmtKind::DistillBlock(d) => self.collect_sections(&d.sections),
             StmtKind::GradBlock(g) => self.collect_block(&g.body),

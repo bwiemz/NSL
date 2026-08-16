@@ -186,10 +186,17 @@ pub fn unimplemented_refusal(name: &str) -> Option<&'static str> {
 /// suggestion is deterministic.
 pub fn suggest(name: &str) -> Option<&'static str> {
     let mut best: Option<(usize, &'static str)> = None;
-    for d in KNOWN_DECORATORS {
-        let dist = edit_distance(name, d.name);
-        if dist <= 2 && best.map_or(true, |(b, _)| dist < b) {
-            best = Some((dist, d.name));
+    // Unimplemented names participate too: a typo of @tie_weights should
+    // point at @tie_weights, whose typed refusal is the actionable message
+    // — the bare unknown-name error is a dead end for a name the spec uses.
+    let candidates = KNOWN_DECORATORS
+        .iter()
+        .map(|d| d.name)
+        .chain(UNIMPLEMENTED_DECORATORS.iter().map(|(n, _)| *n));
+    for cand in candidates {
+        let dist = edit_distance(name, cand);
+        if dist <= 2 && best.is_none_or(|(b, _)| dist < b) {
+            best = Some((dist, cand));
         }
     }
     best.map(|(_, n)| n)

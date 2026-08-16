@@ -91,27 +91,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             weights,
     } = args;
 
-    // Milestone A: the unknown-decorator escape hatch travels to
-    // nsl-semantic (and to every module the loader analyzes) as an env var,
-    // the same plumbing --grad-integrity and --collectives use.
-    if allow_unknown_decorators {
-        std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
-    }
+    crate::activation_enforce::apply_allow_unknown_decorators(allow_unknown_decorators);
 
-    // Milestone A (deferral-must-refuse): --distribute parses "dp=2, tp=4,
-    // pp=4" into a value NOTHING reads — the flag has zero consumers in
-    // nsl-cli or nsl-codegen (M43's 3D-parallelism config was never wired).
-    // Refuse rather than compile a single-process binary that LOOKS
-    // distributed. Multi-process training is driven by --zero-stage /
-    // --devices / --collectives today.
-    if _distribute.is_some() {
-        eprintln!(
-            "error: --distribute is not implemented (the M43 3D-parallelism \
-             config has no consumer); use --zero-stage/--devices/--collectives \
-             for multi-process training, or drop the flag"
-        );
-        process::exit(1);
-    }
+    crate::activation_enforce::refuse_unimplemented_distribute(&_distribute);
 
     // P4 item 14: validate the collective backend up front (fail before
     // spawning ranks) and export it for the runtime — nsl_zero_init reads

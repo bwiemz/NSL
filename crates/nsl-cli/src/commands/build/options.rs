@@ -120,27 +120,28 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             allow_unknown_decorators,
     } = args;
 
-    // Milestone A: the unknown-decorator escape hatch travels to
-    // nsl-semantic (and to every module the loader analyzes) as an env var,
-    // the same plumbing --grad-integrity and --collectives use.
-    if allow_unknown_decorators {
-        std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
-    }
+    crate::activation_enforce::apply_allow_unknown_decorators(allow_unknown_decorators);
 
-    // Milestone A (deferral-must-refuse): --distribute parses "dp=2, tp=4,
-    // pp=4" into a value NOTHING reads — the flag has zero consumers in
-    // nsl-cli or nsl-codegen (M43's 3D-parallelism config was never wired).
-    // Refuse rather than compile a single-process binary that LOOKS
-    // distributed. Multi-process training is driven by --zero-stage /
-    // --devices / --collectives today.
-    if _distribute.is_some() {
+    // Milestone A (deferral-must-refuse): --vram-budget is enforced by the
+    // whole-program memory planner, which runs only on single-file normal
+    // and shared-lib builds. Refuse the unenforceable flavors HERE, before
+    // any module compiles — the entry-path refusal (entry_points.rs) stays
+    // as the deep backstop, but reaching it costs a full multi-module
+    // codegen (review: seconds of Cranelift work before a decidable error).
+    if vram_budget.is_some()
+        && (standalone || super::normal::needs_multi_file(&file))
+    {
         eprintln!(
-            "error: --distribute is not implemented (the M43 3D-parallelism \
-             config has no consumer); use --zero-stage/--devices/--collectives \
-             for multi-process training, or drop the flag"
+            "error: --vram-budget is enforced only on single-file builds \
+             today — the whole-program memory planner does not run on the \
+             {} path, so the budget would be silently ignored. Remove the \
+             flag for this build",
+            if standalone { "--standalone" } else { "multi-file" },
         );
         process::exit(1);
     }
+
+    crate::activation_enforce::refuse_unimplemented_distribute(&_distribute);
 
     // Item 10: load the frozen tuning DB before ANY compile work — the
     // overlay must be in place before the first autotune cache lookup, and

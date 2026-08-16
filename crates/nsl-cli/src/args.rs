@@ -378,30 +378,6 @@ pub(crate) struct CheckArgs {
         #[arg(long, default_value_t = 0.5)]
         pub(crate) sparse_threshold: f64,
 
-        /// M53: Enable WCET analysis for @real_time functions
-        #[arg(long)]
-        pub(crate) wcet: bool,
-
-        /// M53: Write WCET certificate JSON to file
-        #[arg(long)]
-        pub(crate) wcet_cert: Option<PathBuf>,
-
-        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
-        #[arg(long)]
-        pub(crate) cpu: Option<String>,
-
-        /// M53: Write DO-178C compliance report to file (FPGA only)
-        #[arg(long)]
-        pub(crate) do178c_report: Option<PathBuf>,
-
-        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
-        #[arg(long, default_value = "gpu")]
-        pub(crate) wcet_target: String,
-
-        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
-        #[arg(long)]
-        pub(crate) fpga_device: Option<String>,
-
         /// Emit a training-pipeline decision audit for every train block in the file.
         /// Pass without value for text output, or `--training-report=json` for JSON.
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
