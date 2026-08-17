@@ -1,0 +1,89 @@
+# models/coder50m/pretrain_prod.nsl
+# ============================================================================
+# NSL-Coder-50M — production pretraining (roadmap item 4)
+# ============================================================================
+#
+# The real recipe: no machine-specific paths, no synthetic data, and every
+# number below agrees with models/coder50m/config.nsl — enforced by
+# crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which parses BOTH
+# files and refuses drift (the old pretrain.nsl hardcoded a Windows path
+# and a scheduler sized for a corpus this repo has never contained).
+#
+# Corpus: ../../data/tokens/train_new.bin — the tokenization of
+# data/tokcorpus/combined_train.txt (48.23 MB: this repo's train split,
+# manifest.json, PLUS other_train.txt — 15 unrelated local projects,
+# ~43% of the training bytes), by the SHIPPED two-stage transition=40960
+# tokenizer at vocab 49152 — see
+# models/benchmarks/TOKENIZER_AND_MFU_2026_07_29.md, whose banked row
+# (8,925,916 tokens, 5.403 B/tok) this file matches exactly. 8,925,916
+# u16 tokens, max id 49151. The corpus is local data, not committed; the
+# agreement gate verifies CORPUS_TOKENS against the file when present.
+#
+# Derivation (config.nsl carries the same numbers):
+#   micro-steps/epoch = floor(8,925,916 / 1024)          = 8716
+#   total micro-steps = 3 epochs x 8716                  = 26148
+#   warmup            = 1300 micro-steps                 (~5.0%)
+#   optimizer steps   = floor(26148 / accum(8))          = 3268
+#     (26148 % 8 = 4: the trailing partial window's gradients are
+#      computed and discarded — the counter is global, so accumulation
+#      windows also straddle epoch boundaries; both are codegen-
+#      documented behavior, not choices this file makes)
+#
+# UNITS: the scheduler counts MICRO-batches (lr is recomputed every
+# micro-batch; with grad_accumulation=8 the effective warmup is
+# 1300/8 ≈ 163 optimizer steps). checkpoint_every counts OPTIMIZER
+# steps — codegen converts internally. Dropout is real here: DROPOUT=0.1
+# trains an actual RNG mask and its backward consumes the same mask
+# (source-AD dropout fix, PR #507).
+#
+# RUN (from models/coder50m):
+#   nsl run --source-ad pretrain_prod.nsl
+# Source AD is the production path. KNOWN LIMIT (pinned by
+# pretrain_prod_agreement_gate): tape AD does not yet support
+# DataLoader-driven train blocks — bare `nsl run` / `--tape-ad` refuse
+# with "train step body must assign to a variable named 'loss'" (the
+# tape lowering never finds the binding when a loader drives the step;
+# every committed coder50m program shares this). The roadmap's AD
+# differential campaign (item 5) needs that fixed first.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+print("================================================================")
+print("  NSL-Coder-50M production pretrain")
+print("  49152 vocab | batch=1 seq=1024 accum=8 | 3 epochs = 26148 steps")
+print("================================================================")
+
+let tokens = load_mmap("../../data/tokens/train_new.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+# The fused linear-CE kernel computes the loss straight from the hidden
+# state and the LM-head weight, so the [batch*seq, vocab] logits surface
+# and its gradient are never materialized. The four hints must be INT
+# LITERALS matching model.nsl / the DataLoader; a wrong one is refused at
+# runtime by `nsl_fused_lce_pin_hint_extents`. The reshape below must use
+# the same compile-time dims (a runtime `logits.shape` read keeps the
+# composite chain live and the compiler refuses the fusion).
+@fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=512, batch_size=1, seq_len=1024)
+train(model=m, epochs=3, grad_accumulation=8, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=500):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=1300, total_steps=26148, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let flat_logits = logits.reshape([1024, 49152])
+        let flat_labels = batch.labels.reshape([1024])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 20 == 0:
+                print(step)
+                print(loss)
+
+print("LOSS_STREAM_END")
+
+model_save(m, "checkpoints/pretrain_prod_final.nslm")
+print("PRETRAIN_PROD_COMPLETE")
