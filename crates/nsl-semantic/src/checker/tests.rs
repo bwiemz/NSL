@@ -3082,3 +3082,76 @@ fn distill_sections_get_the_same_contract_at_check_time() {
         "distill optimizer typo must refuse at check time, got {errs:?}"
     );
 }
+
+#[test]
+fn typo_callback_param_is_refused_not_bound_to_zero() {
+    // Codegen binds callback params BY NAME with a silent zero fallback:
+    // on_step(step, lss) type-checked clean and logged a constant 0
+    // forever (review finding). The param namespace is closed per
+    // callback: on_step provides step/loss, on_epoch* provide epoch/loss.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step, lss):\n",
+        "            let s = step\n",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("unknown on_step callback parameter 'lss'")),
+        "expected the param refusal, got {errs:?}"
+    );
+    // Cross-context names refuse too: on_epoch provides epoch, not step.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_epoch(step, loss):\n",
+        "            let s = step\n",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("unknown on_epoch callback parameter 'step'")),
+        "expected the cross-context param refusal, got {errs:?}"
+    );
+    // Subsets stay legal: on_step(step) is a committed corpus shape.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step):\n",
+        "            let s = step\n",
+    ));
+    assert!(
+        !errs.iter().any(|m| m.contains("callback parameter")),
+        "on_step(step) must stay legal, got {errs:?}"
+    );
+}
+
+#[test]
+fn duplicate_callback_definition_is_refused() {
+    // Codegen compiles EVERY matching definition — a user redefining
+    // on_step (expecting override) silently got both bodies run per step
+    // (review finding). Same contract as duplicate optimizer:/scheduler:.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step, loss):\n",
+        "            let a = step\n",
+        "        on_step(step, loss):\n",
+        "            let b = step\n",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("duplicate callback 'on_step'")),
+        "expected the duplicate-callback refusal, got {errs:?}"
+    );
+    // Distinct callbacks across two callbacks: sections stay legal.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step, loss):\n",
+        "            let a = step\n",
+        "    callbacks:\n",
+        "        on_epoch(epoch, loss):\n",
+        "            let b = epoch\n",
+    ));
+    assert!(
+        !errs.iter().any(|m| m.contains("duplicate callback")),
+        "distinct callbacks across sections must stay legal, got {errs:?}"
+    );
+}

@@ -273,17 +273,30 @@ mod tests {
     // real models); resolve_param_owner's array hop is covered there via
     // the `[TransformerBlock; N]` paths of the mixed-routing fixtures.
 
-    /// The classifier can only assign roles from `VALID_ROLES` — the drift
-    /// guard the accepted set relied on when it was defined in this file.
-    /// (`ParamRoleEntry.role` documents the producible set; the classifier
-    /// arms emit exactly these four strings.)
+    /// The classifier's producible roles and `VALID_ROLES` are the SAME
+    /// set, both directions — the drift guard the accepted set relied on
+    /// when it was defined in this file. (`ParamRoleEntry.role` documents
+    /// the producible set; the classifier arms emit exactly these four
+    /// strings. The reverse direction matters too: a stray VALID_ROLES
+    /// entry would let `no_decay=["gibberish-role"]` validate while
+    /// exempting nothing — the silently-accepted-role class returning
+    /// through the front door; review finding.)
     #[test]
     fn classifier_roles_are_valid_roles() {
-        for role in ["embedding", "head", "hidden", "vector"] {
+        let producible = ["embedding", "head", "hidden", "vector"];
+        for role in producible {
             assert!(
                 nsl_semantic::optim_config::VALID_ROLES.contains(&role),
                 "classifier-producible role '{role}' is missing from \
                  nsl_semantic::optim_config::VALID_ROLES"
+            );
+        }
+        for role in nsl_semantic::optim_config::VALID_ROLES {
+            assert!(
+                producible.contains(role),
+                "VALID_ROLES entry '{role}' is not producible by the \
+                 classifier — no parameter could ever carry it, so \
+                 no_decay=[\"{role}\"] would validate and exempt nothing"
             );
         }
     }

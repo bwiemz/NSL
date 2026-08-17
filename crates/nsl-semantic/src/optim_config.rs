@@ -233,6 +233,19 @@ pub const CALLBACK_NAMES: &[&str] = &["on_step", "on_epoch", "on_epoch_end"];
 
 const CALLBACK_NAMES_LABEL: &str = "expected on_step, on_epoch, or on_epoch_end";
 
+/// The parameter names codegen binds for each callback — anything else hit
+/// a silent `_ => iconst(0)` fallback: `on_step(step, lss)` type-checked
+/// clean (the checker typed unknown params as Unknown) and logged a
+/// constant 0 forever. Any subset in any order is legal (`on_step(step)`
+/// is a committed corpus shape).
+fn callback_param_names(callback: &str) -> &'static [&'static str] {
+    match callback {
+        "on_step" => &["step", "loss"],
+        "on_epoch" | "on_epoch_end" => &["epoch", "loss"],
+        other => unreachable!("no param table for callback '{other}'"),
+    }
+}
+
 /// The optimizer and scheduler sections, fully validated.
 #[derive(Debug, Clone)]
 pub struct ResolvedOptimConfig {
@@ -266,6 +279,8 @@ pub fn resolve_optim_config(
     let mut optimizer_seen = false;
     let mut scheduler_expr: Option<&nsl_ast::expr::Expr> = None;
     let mut scheduler_seen = false;
+    let mut seen_callbacks: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for section in sections {
         match section {
@@ -304,6 +319,39 @@ pub fn resolve_optim_config(
                             Diagnostic::error(format!("unknown callback '{name}'"))
                                 .with_label(cb.span, CALLBACK_NAMES_LABEL),
                         );
+                        continue;
+                    }
+                    // Duplicate DEFINITIONS refuse like duplicate
+                    // optimizer:/scheduler: sections do — codegen compiles
+                    // every matching definition, so a user redefining
+                    // on_step (expecting override) silently got both
+                    // bodies run per step. Multiple callbacks: sections
+                    // defining DISTINCT callbacks stay legal (union).
+                    if !seen_callbacks.insert(name.clone()) {
+                        diags.push(
+                            Diagnostic::error(format!("duplicate callback '{name}'"))
+                                .with_label(cb.span, "already defined above"),
+                        );
+                        continue;
+                    }
+                    // Param namespace: codegen binds params BY NAME with a
+                    // silent zero fallback for anything unrecognized —
+                    // `on_step(step, lss)` logged a constant 0 forever.
+                    let accepted = callback_param_names(&name);
+                    for param in &cb.params {
+                        let pname = resolve_sym(param.name);
+                        if !accepted.contains(&pname.as_str()) {
+                            let joined = accepted.join(", ");
+                            diags.push(
+                                Diagnostic::error(format!(
+                                    "unknown {name} callback parameter '{pname}'"
+                                ))
+                                .with_label(
+                                    param.span,
+                                    format!("{name} provides: {joined}"),
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -926,10 +974,13 @@ mod tests {
     use super::*;
 
     /// Every optimizer's accepted-kwargs table must contain lr — and every
-    /// key in any table must have a resolver arm, which the exhaustive
-    /// match with the `unreachable!` arm enforces at runtime; this test
-    /// drives every table key through resolution once so that arm is
-    /// actually exercised for each key.
+    /// key in any table must have a resolver arm. This test ACTUALLY
+    /// resolves a call carrying each table key with a valid value, so a
+    /// deleted/renamed match arm cannot hide behind the table: the
+    /// `unreachable!` in resolve_optimizer_expr would abort the test.
+    /// (The first version of this test compared the table against a
+    /// hardcoded mirror list of arm names — a guard that guarded nothing;
+    /// review finding.)
     #[test]
     fn every_accepted_kwarg_has_a_resolver_arm() {
         use OptimizerKind::*;
@@ -939,38 +990,49 @@ mod tests {
                 "{} table is missing lr",
                 kind.as_str()
             );
-            let known_arms = [
-                "lr",
-                "momentum",
-                "dampening",
-                "weight_decay",
-                "beta1",
-                "beta2",
-                "eps",
-                "adamw_lr",
-                "nesterov",
-                "ns_steps",
-                "no_decay",
-            ];
             for key in kind.accepted_kwargs() {
+                let mut interner = nsl_lexer::Interner::new();
+                let value = match *key {
+                    "nesterov" => mk_expr(ExprKind::BoolLiteral(true)),
+                    "ns_steps" => mk_expr(ExprKind::IntLiteral(5)),
+                    "no_decay" => mk_expr(ExprKind::ListLiteral(vec![mk_expr(
+                        ExprKind::StringLiteral("embedding".to_string()),
+                    )])),
+                    "beta1" | "beta2" => mk_expr(ExprKind::FloatLiteral(0.9)),
+                    _ => mk_expr(ExprKind::FloatLiteral(0.001)),
+                };
+                let kwarg = mk_kwarg(&mut interner, key, value);
+                let call = mk_call(&mut interner, kind.display(), vec![kwarg]);
+                let result = resolve(&interner, &[TrainSection::Optimizer(call)]);
                 assert!(
-                    known_arms.contains(key),
-                    "accepted {} kwarg '{key}' has no match arm in \
-                     resolve_optimizer_expr — it would hit the unreachable!",
-                    kind.as_str()
+                    result.is_ok(),
+                    "{}({key}=<valid>) must resolve cleanly, got {:?}",
+                    kind.as_str(),
+                    result.err().map(|ds| ds
+                        .into_iter()
+                        .map(|d| d.message)
+                        .collect::<Vec<_>>())
                 );
             }
         }
     }
 
-    /// OPTIMIZER_NAMES_LABEL ↔ OptimizerKind::parse drift guard.
+    /// OPTIMIZER_NAMES_LABEL ↔ OptimizerKind::parse drift guard — pinned
+    /// in BOTH directions by constructing the label from the display names
+    /// (a stale extra name in the label fails assert_eq, not just a
+    /// missing one; review finding on the one-directional version).
     #[test]
-    fn the_optimizer_names_label_lists_every_accepted_name() {
-        for name in ["SGD", "Adam", "AdamW", "Lion", "Muon", "SOAP"] {
-            assert!(
-                OPTIMIZER_NAMES_LABEL.contains(name),
-                "OPTIMIZER_NAMES_LABEL is missing '{name}'"
-            );
+    fn the_optimizer_names_label_lists_exactly_the_accepted_names() {
+        use OptimizerKind::*;
+        let kinds = [Sgd, Adam, AdamW, Lion, Muon, Soap];
+        let names: Vec<&str> = kinds.iter().map(|k| k.display()).collect();
+        let (last, init) = names.split_last().unwrap();
+        let expected = format!("expected {}, or {last}", init.join(", "));
+        assert_eq!(
+            OPTIMIZER_NAMES_LABEL, expected,
+            "OPTIMIZER_NAMES_LABEL drifted from the accepted set"
+        );
+        for name in names {
             assert!(
                 OptimizerKind::parse(name).is_some(),
                 "advertised optimizer '{name}' does not parse"
@@ -978,12 +1040,13 @@ mod tests {
         }
     }
 
-    /// SCHEDULER_NAMES_LABEL ↔ canonical_scheduler_name drift guard, and
-    /// every canonical name must have a kwarg spec (the unreachable! in
+    /// SCHEDULER_NAMES_LABEL ↔ canonical_scheduler_name drift guard —
+    /// both directions via assert_eq on the constructed label — and every
+    /// canonical name must have a kwarg spec (the unreachable! in
     /// scheduler_kwarg_spec fires otherwise).
     #[test]
-    fn the_scheduler_names_label_lists_every_accepted_name() {
-        for name in [
+    fn the_scheduler_names_label_lists_exactly_the_accepted_names() {
+        let names = [
             "constant_lr",
             "step_lr",
             "exponential_lr",
@@ -991,11 +1054,17 @@ mod tests {
             "cosine_anneal",
             "warmup_cosine",
             "one_cycle",
-        ] {
-            assert!(
-                SCHEDULER_NAMES_LABEL.contains(name),
-                "SCHEDULER_NAMES_LABEL is missing '{name}'"
-            );
+        ];
+        let (last, init) = names.split_last().unwrap();
+        let expected = format!("expected {}, or {last}", init.join(", "));
+        // The label wraps across two source lines; compare whitespace-
+        // normalized.
+        let normalized = SCHEDULER_NAMES_LABEL.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            normalized, expected,
+            "SCHEDULER_NAMES_LABEL drifted from the accepted set"
+        );
+        for name in names {
             assert_eq!(canonical_scheduler_name(name), Some(name));
             // CamelCase-collapsed spelling accepted too.
             let collapsed = name.replace('_', "");
@@ -1004,14 +1073,21 @@ mod tests {
         }
     }
 
-    /// CALLBACK_NAMES ↔ CALLBACK_NAMES_LABEL drift guard.
+    /// CALLBACK_NAMES ↔ CALLBACK_NAMES_LABEL drift guard, both directions.
+    /// (A substring check was vacuous for "on_epoch" — it is a prefix of
+    /// "on_epoch_end"; review finding.)
     #[test]
-    fn the_callback_names_label_lists_every_accepted_name() {
+    fn the_callback_names_label_lists_exactly_the_accepted_names() {
+        let (last, init) = CALLBACK_NAMES.split_last().unwrap();
+        let expected = format!("expected {}, or {last}", init.join(", "));
+        assert_eq!(
+            CALLBACK_NAMES_LABEL, expected,
+            "CALLBACK_NAMES_LABEL drifted from the accepted set"
+        );
+        // Every accepted callback has a param table (the unreachable! in
+        // callback_param_names fires otherwise).
         for name in CALLBACK_NAMES {
-            assert!(
-                CALLBACK_NAMES_LABEL.contains(name),
-                "CALLBACK_NAMES_LABEL is missing '{name}'"
-            );
+            assert!(!callback_param_names(name).is_empty());
         }
     }
 
@@ -1210,6 +1286,24 @@ mod tests {
                 total_steps: 12.0,
                 min_lr: 1e-5,
             })
+        );
+    }
+
+    /// Optimizer-side int coercion is the BEHAVIOR CHANGE half of the
+    /// coercion invariant: pre-contract, `SGD(momentum = 1)` (an
+    /// IntLiteral against a FloatLiteral-only arm) was silently dropped
+    /// and trained with momentum 0.0. It now resolves to 1.0.
+    #[test]
+    fn optimizer_int_literals_coerce_instead_of_silently_dropping() {
+        let mut interner = nsl_lexer::Interner::new();
+        let m = mk_kwarg(&mut interner, "momentum", mk_expr(ExprKind::IntLiteral(1)));
+        let call = mk_call(&mut interner, "SGD", vec![m]);
+        let cfg = resolve(&interner, &[TrainSection::Optimizer(call)])
+            .expect("int momentum must coerce");
+        assert!(
+            (cfg.optimizer.momentum - 1.0).abs() < 1e-12,
+            "momentum = {}",
+            cfg.optimizer.momentum
         );
     }
 

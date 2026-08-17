@@ -222,7 +222,64 @@ train(model = m):
     let (ok, _stdout, stderr) = run_cmd("pipe_sched", &src, &["build"]);
     assert!(!ok, "scheduler under @pipeline must refuse:\n{stderr}");
     assert!(
-        stderr.contains("not supported on the @pipeline train path"),
-        "expected the pipelined scheduler refusal:\n{stderr}"
+        stderr.contains("scheduler: sections are not supported")
+            && stderr.contains("@pipeline train"),
+        "expected the pipelined scheduler refusal naming the section:\n{stderr}"
+    );
+}
+
+/// The other two arms the pipelined path previously dropped or
+/// mis-lowered silently — each gets its own build probe so all three
+/// refusals are pinned, not just scheduler: (review finding).
+#[test]
+fn callbacks_and_muon_refuse_under_pipeline_too() {
+    let base = |sections: &str| {
+        format!(
+            r#"from nsl.nn.losses import mse_loss
+
+model Tiny:
+    @pipeline(stages = 2)
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = full([2, 2], 2.0)
+let y = zeros([2, 2])
+train(model = m):
+{sections}
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+"#
+        )
+    };
+
+    // callbacks: previously fell into the same `_ => {{}}` wildcard as
+    // scheduler: — on_step logic silently never ran.
+    let src = base(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step, loss):\n",
+        "            print(\"CB\")\n",
+    ));
+    let (ok, _stdout, stderr) = run_cmd("pipe_cb", &src, &["build"]);
+    assert!(!ok, "callbacks under @pipeline must refuse:\n{stderr}");
+    assert!(
+        stderr.contains("callbacks: sections are not supported on the")
+            || stderr.contains("callbacks: sections are not supported"),
+        "expected the pipelined callbacks refusal:\n{stderr}"
+    );
+
+    // Muon: the per-stage step threads no route/ns_steps/adamw_lr and
+    // allocates one moment buffer where muon_step needs two — previously
+    // an arity-broken lowering, not a refusal.
+    let src = base("    optimizer: Muon(lr = 0.02)");
+    let (ok, _stdout, stderr) = run_cmd("pipe_muon", &src, &["build"]);
+    assert!(!ok, "Muon under @pipeline must refuse:\n{stderr}");
+    assert!(
+        stderr.contains("Muon optimizer is not supported on the @pipeline train"),
+        "expected the pipelined Muon refusal:\n{stderr}"
     );
 }
