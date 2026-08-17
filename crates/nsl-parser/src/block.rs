@@ -11,7 +11,9 @@ pub fn parse_train_block_stmt(p: &mut Parser) -> Stmt {
     let start = p.current_span();
     p.advance(); // consume 'train'
 
-    // Config args: train(model=m, epochs=10, precision=bf16):
+    // Config args: train(model=m, epochs=10, grad_accumulation=4):
+    // The key NAMESPACE is closed downstream (nsl_semantic::train_config;
+    // the parser accepts any kwarg) — keys here must come from that set.
     let config = if p.at(&TokenKind::LeftParen) {
         p.advance();
         let args = parse_args(p);

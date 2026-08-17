@@ -349,13 +349,13 @@ pub fn distill_as_train_block(
                 }
             }
             "epochs" => match arg.value.kind {
-                ExprKind::IntLiteral(n) => epochs = n,
+                ExprKind::IntLiteral(n) if n >= 1 => epochs = n,
                 _ => {
                     return Err(
-                        "distill 'epochs' must be an integer literal: the epoch \
-                         count is a compile-time constant, exactly as on a train \
-                         block (a non-literal used to leave the loop at 1 with no \
-                         diagnostic)"
+                        "distill 'epochs' must be a positive integer literal: the \
+                         epoch count is a compile-time constant, exactly as on a \
+                         train block (a non-literal used to leave the loop at 1, \
+                         and 0 would run it zero times — both with no diagnostic)"
                             .to_string(),
                     )
                 }

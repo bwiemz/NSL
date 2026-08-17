@@ -933,16 +933,18 @@ fn a_typed_flag_that_can_fuse_nowhere_refuses_even_off_the_ordinary_path() {
     );
 }
 
-/// The decline has to describe the program the user actually wrote.
+/// The diagnostic has to describe the program the user actually wrote.
 ///
-/// `train(..., grad_accumulation=GA)` with `const GA = 4` parses, type-checks,
-/// and then lowers a window of **1** — the config reader honours an
-/// `IntLiteral` only and clamps everything else silently. That clamp is
-/// specified (`spec/05-training-loop.nsl.md` documents `distill` refusing a
-/// non-literal as the DIFFERENCE from `train`) and is not changed here. What
-/// is changed is the message: it used to assert "the default when the train
-/// block omits it" unconditionally, which is false for this block and sends
-/// the reader hunting for a `grad_accumulation=` that is right there.
+/// `train(..., grad_accumulation=GA)` with `const GA = 4` used to parse,
+/// type-check, and then lower a window of **1** — silently clamped — and the
+/// wgrad decline then had to explain a window the source never asked for
+/// (this test originally pinned that explanation naming "non-literal" rather
+/// than blaming an omission). The Training Configuration Contract
+/// (`nsl_semantic::train_config`) removed the clamp entirely: a non-literal
+/// window now REFUSES at the config layer, before any fusion admission runs
+/// — the wrong-reason-diagnostic hazard this test exists to prevent is gone
+/// at the root. What remains to pin: the refusal names grad_accumulation,
+/// and no stage ever claims the block OMITS a key it plainly declares.
 #[test]
 fn the_decline_does_not_blame_an_omission_for_a_declared_non_literal_window() {
     let src = ccr_fixture_src()
@@ -956,20 +958,21 @@ fn the_decline_does_not_blame_an_omission_for_a_declared_non_literal_window() {
     let r = build_src(&src, "ga_non_literal", &["--source-ad", "--fuse-wgrad-accum"]);
     assert!(
         !r.ok,
-        "the window really is 1 here (the non-literal is clamped), so the \
-         typed flag must still refuse:\n{}",
+        "a non-literal grad_accumulation must refuse (the old path silently \
+         clamped it to 1):\n{}",
         r.stderr
     );
     assert!(
-        r.stderr.contains("non-literal"),
-        "the decline must name the real cause — the block DOES declare \
-         grad_accumulation, it was clamped:\n{}",
+        r.stderr
+            .contains("train 'grad_accumulation' must be a positive integer literal"),
+        "the refusal must come from the Training Configuration Contract and \
+         name the key:\n{}",
         r.stderr
     );
     assert!(
         !r.stderr.contains("omits grad_accumulation"),
-        "the decline claims the block omits grad_accumulation, but it declares \
-         `grad_accumulation=GA`. That is the wrong-reason diagnostic this arm \
+        "no diagnostic may claim the block omits grad_accumulation when it \
+         declares `grad_accumulation=GA` — the wrong-reason failure this arm \
          exists to prevent:\n{}",
         r.stderr
     );

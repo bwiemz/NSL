@@ -414,11 +414,11 @@ fn a_non_literal_epochs_refuses_on_distill_exactly_as_it_does_on_train() {
 
     // Control 2 — the parity this test is NAMED for, which the two arms above
     // cannot show because they are both distill programs differing in a value.
-    // The train twin must refuse the same shape, so "distill is now as strict
-    // as train" is demonstrated rather than asserted. Note the different
-    // message and the different LAYER: train's is a codegen error, distill's a
-    // span-labelled semantic one, which is why `nsl check` alone catches only
-    // the distill side and this arm has to build.
+    // The train twin must refuse the same shape. Since the Training
+    // Configuration Contract, BOTH refusals live at the semantic layer with
+    // spans — `nsl check` catches the train side too (it used to be a
+    // codegen-only error, so `nsl check` was green on a header `nsl build`
+    // refused; that layer asymmetry was the bug).
     let train_base =
         std::fs::read_to_string(fixture_path("cpdt_precision_fp16.nsl")).unwrap();
     let train_src = train_base
@@ -433,14 +433,9 @@ fn a_non_literal_epochs_refuses_on_distill_exactly_as_it_does_on_train() {
     let train_dir = train_file.parent().unwrap().to_path_buf();
     let mut train_cmd = Command::cargo_bin("nsl").unwrap();
     train_cmd.env("NSL_STDLIB_PATH", stdlib_path());
-    train_cmd
-        .arg("build")
-        .arg("--source-ad")
-        .arg(&train_file)
-        .arg("-o")
-        .arg(train_dir.join("train_bin"));
+    train_cmd.arg("check").arg(&train_file);
     train_cmd.assert().failure().stderr(predicate::str::contains(
-        "train 'epochs' arg must be an integer literal",
+        "train 'epochs' must be an integer literal",
     ));
     let _ = std::fs::remove_dir_all(&train_dir);
 }
