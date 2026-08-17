@@ -206,6 +206,17 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         STMT,
         "Drop --wggo overrides or --layerwise-accum",
     ),
+    // grad_clip= is a train-block key, not a flag — same shape as the
+    // `no_decay=[...]` partner entries below. Two-phase clipping needs the
+    // GLOBAL L2 norm over every completed m_partial, which the layerwise
+    // schedule never materializes.
+    src_rule(
+        "--layerwise-accum",
+        RuleKind::Conflicts,
+        "grad_clip=",
+        STMT,
+        "--layerwise-accum is incompatible with grad_clip",
+    ),
     // CORRECTED after review: the guard here is
     // `wrap_precision && optim_state_offload`, NOT `layerwise_accum &&
     // optim_state_offload`. Plain CSLA + offload is a SUPPORTED path (see the
@@ -234,6 +245,16 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--optim-state-offload",
         STMT,
         "--zero-stage 3 with --optim-state-offload is not lowered",
+    ),
+    // grad_clip= is a train-block key partner (see the no_decay group note).
+    // The all-reduce precedes the two-phase clip, whose norm is rank-local —
+    // clipped multi-rank training would be silently wrong.
+    src_rule(
+        "--zero-stage",
+        RuleKind::Conflicts,
+        "grad_clip=",
+        STMT,
+        "--zero-stage is incompatible with grad_clip",
     ),
     src_rule(
         "--zero-stage",

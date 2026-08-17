@@ -21,7 +21,7 @@ fn parse(src: &str) -> (nsl_ast::Module, Interner) {
 /// indented key-value body (parser-verified in nsl-parser block.rs:1098).
 #[test]
 fn detects_packing_true() {
-    let src = "dataset PretrainCorpus(\"/data/pile\"):\n    packing = true\n    max_sequence_length = 2048\n    mean_doc_length = 400\n\ntrain(model = m, grad_accumulation = 4):\n    data:\n        source = PretrainCorpus\n    optimizer: AdamW\n";
+    let src = "dataset PretrainCorpus(\"/data/pile\"):\n    packing = true\n    max_sequence_length = 2048\n    mean_doc_length = 400\n\ntrain(model = m, grad_accumulation = 4):\n    data:\n        source = PretrainCorpus\n    optimizer: AdamW(lr = 0.001)\n";
     let (module, interner) = parse(src);
     assert!(
         detect_packing_for_stmts(&module.stmts, &interner),
@@ -32,7 +32,7 @@ fn detects_packing_true() {
 /// A dataset without the `packing` key (absent) and a train block → false.
 #[test]
 fn no_packing_when_flag_absent_or_false() {
-    let src = "dataset PretrainCorpus(\"/data/pile\"):\n    max_sequence_length = 2048\n\ntrain(model = m, grad_accumulation = 4):\n    data:\n        source = PretrainCorpus\n    optimizer: AdamW\n";
+    let src = "dataset PretrainCorpus(\"/data/pile\"):\n    max_sequence_length = 2048\n\ntrain(model = m, grad_accumulation = 4):\n    data:\n        source = PretrainCorpus\n    optimizer: AdamW(lr = 0.001)\n";
     let (module, interner) = parse(src);
     assert!(
         !detect_packing_for_stmts(&module.stmts, &interner),
@@ -70,7 +70,7 @@ fn distill_src(packing: &str) -> String {
         "dataset PretrainCorpus(\"/data/pile\"):\n    packing = {packing}\n    \
          max_sequence_length = 2048\n    mean_doc_length = 400\n\n\
          distill(teacher = t, student = s, epochs = 2, grad_accumulation = 4):\n    \
-         data:\n        source = PretrainCorpus\n    optimizer: AdamW\n"
+         data:\n        source = PretrainCorpus\n    optimizer: AdamW(lr = 0.001)\n"
     )
 }
 

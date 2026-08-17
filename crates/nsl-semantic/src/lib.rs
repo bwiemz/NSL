@@ -21,6 +21,7 @@ pub mod kv_compress;
 pub mod moe;
 pub mod multimodal;
 pub mod nan_analysis;
+pub mod optim_config;
 pub mod ownership;
 pub mod pipeline;
 pub mod ownership_autodiff;

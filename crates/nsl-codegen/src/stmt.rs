@@ -6031,235 +6031,66 @@ impl Compiler<'_> {
             CodegenError::new("train block requires 'model=<ident>' config argument")
         })?;
 
-        // ── 2. Extract optimizer info from sections ─────────────────────
-        let mut optimizer_name = String::new();
-        let mut lr_value: f64 = 0.01;
-        let mut momentum_value: f64 = 0.0;
-        let mut dampening_value: f64 = 0.0;
-        let mut weight_decay_value: f64 = 0.0;
+        // ── 2. Resolve the optimizer/scheduler/callbacks contract ───────
+        // Same ONE-resolver pattern as the header above: nsl-semantic owns
+        // the closed per-optimizer kwarg tables, the scheduler name/kwarg
+        // tables WITH their defaults, the Muon spec-default backfill, and
+        // the no_decay role validation. The old inline parse here matched
+        // known kwargs with `_ => {}` (a typo'd `lrr=` silently trained at
+        // the default lr), dropped known kwargs whose literal shape didn't
+        // match (`momentum=1` — an int — kept 0.0), skipped positional
+        // args, resolved duplicates last-wins, and let an unknown
+        // scheduler name fall through to "no change" (constant lr).
+        let optim_cfg = nsl_semantic::optim_config::resolve_optim_config(
+            &train.sections,
+            train.span,
+            &|sym| self.resolve_sym(sym).to_string(),
+            purpose,
+        )
+        .map_err(|diags| {
+            let msgs: Vec<String> = diags.into_iter().map(|d| d.message).collect();
+            CodegenError::new(format!(
+                "optimizer config refused: {}",
+                msgs.join("; ")
+            ))
+        })?;
+
+        let optimizer_name = optim_cfg.optimizer.kind.as_str().to_string();
+        let lr_value: f64 = optim_cfg.optimizer.lr;
+        let momentum_value: f64 = optim_cfg.optimizer.momentum;
+        let dampening_value: f64 = optim_cfg.optimizer.dampening;
+        let weight_decay_value: f64 = optim_cfg.optimizer.weight_decay;
         // AdamW parameter groups (`no_decay=[...]`). Empty = every param
         // decays, bit-identical to before this existed.
-        let mut no_decay_scope = crate::param_roles::NoDecayScope::default();
-        let mut nesterov_value: bool = false;
-        let mut beta1_value: f64 = 0.9;
-        let mut beta2_value: f64 = 0.999;
-        let mut eps_value: f64 = 1e-8;
+        let no_decay_scope = crate::param_roles::NoDecayScope {
+            static_roles: optim_cfg.optimizer.no_decay_static_roles.clone(),
+            exempt_non_rank2: optim_cfg.optimizer.no_decay_exempt_non_rank2,
+        };
+        let nesterov_value: bool = optim_cfg.optimizer.nesterov;
+        let beta1_value: f64 = optim_cfg.optimizer.beta1;
+        let beta2_value: f64 = optim_cfg.optimizer.beta2;
+        let eps_value: f64 = optim_cfg.optimizer.eps;
         // P5 Muon: Newton-Schulz iteration depth (spec default 5).
-        let mut ns_steps_value: f64 = 5.0;
+        let ns_steps_value: f64 = optim_cfg.optimizer.ns_steps;
         // P1 Muon item 5: separate learning rate for the AdamW arm of the
-        // mixed Muon/AdamW step (embeddings/head/vectors). Muon's hidden-
-        // matrix lr (~0.02) is 1-2 orders of magnitude above a sane AdamW
-        // lr — sharing one lr either blows up the embedding or starves the
-        // hidden matrices. None → the AdamW arm follows `lr` exactly
-        // (pre-knob behavior, bit-exact). Threaded as a RATIO of lr so a
+        // mixed Muon/AdamW step (embeddings/head/vectors). None → the
+        // AdamW arm follows `lr` exactly. Threaded as a RATIO of lr so a
         // scheduler modulates both arms coherently.
-        let mut adamw_lr_value: Option<f64> = None;
-        // P5 Muon (review M6): the generic defaults above are wrong for
-        // Muon — spec/10 promises Muon(lr=0.02, momentum=0.95,
-        // nesterov=true), and momentum=0.0 silently degrades the Muon arm
-        // to orthogonalized plain GD. Track which knobs the user actually
-        // set so bare Muon() gets its spec defaults after parsing.
-        let mut lr_set = false;
-        let mut momentum_set = false;
-        let mut nesterov_set = false;
+        let adamw_lr_value: Option<f64> = optim_cfg.optimizer.adamw_lr;
+        // Fully validated, defaults applied (including one_cycle's
+        // max_lr = 10x lr) — the lowering at 7g2 just emits constants.
+        let scheduler: Option<nsl_semantic::optim_config::ResolvedScheduler> =
+            optim_cfg.scheduler;
         let mut step_body: Option<(&nsl_ast::stmt::Block, nsl_ast::Symbol)> = None;
         let mut callbacks: Vec<&nsl_ast::block::CallbackDef> = Vec::new();
-        let mut scheduler_name = String::new();
-        let mut scheduler_args: Vec<(String, f64)> = Vec::new();
 
         for section in &train.sections {
             match section {
-                TrainSection::Optimizer(expr) => {
-                    // Parse call like SGD(lr=0.01, momentum=0.9)
-                    if let ExprKind::Call { callee, args } = &expr.kind {
-                        if let ExprKind::Ident(sym) = &callee.kind {
-                            optimizer_name = self.resolve_sym(*sym).to_string().to_lowercase();
-                        }
-                        for arg in args {
-                            if let Some(name_sym) = arg.name {
-                                let name = self.resolve_sym(name_sym).to_string();
-                                match name.as_str() {
-                                    "lr" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            lr_value = *f;
-                                            lr_set = true;
-                                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                                            lr_value = *n as f64;
-                                            lr_set = true;
-                                        }
-                                    }
-                                    "adamw_lr" => {
-                                        // Review finding: a non-literal or
-                                        // non-positive adamw_lr silently
-                                        // falling back to `lr` would train
-                                        // the embedding/head at Muon's
-                                        // ~2e-2 — the exact divergence
-                                        // class the knob exists to prevent.
-                                        // Same strictness as ns_steps.
-                                        match &arg.value.kind {
-                                            ExprKind::FloatLiteral(f) if *f > 0.0 => {
-                                                adamw_lr_value = Some(*f);
-                                            }
-                                            ExprKind::IntLiteral(n) if *n > 0 => {
-                                                adamw_lr_value = Some(*n as f64);
-                                            }
-                                            ExprKind::FloatLiteral(f) => {
-                                                return Err(CodegenError::new(format!(
-                                                    "adamw_lr must be positive (got {f})"
-                                                )));
-                                            }
-                                            ExprKind::IntLiteral(n) => {
-                                                return Err(CodegenError::new(format!(
-                                                    "adamw_lr must be positive (got {n})"
-                                                )));
-                                            }
-                                            _ => {
-                                                return Err(CodegenError::new(
-                                                    "adamw_lr must be a positive numeric \
-                                                     literal (e.g. adamw_lr = 3e-4); \
-                                                     computed expressions are not \
-                                                     supported here",
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    "momentum" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            momentum_value = *f;
-                                            momentum_set = true;
-                                        }
-                                    }
-                                    "dampening" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            dampening_value = *f;
-                                        }
-                                    }
-                                    "weight_decay" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            weight_decay_value = *f;
-                                        }
-                                    }
-                                    // AdamW parameter groups: role names whose
-                                    // params are EXEMPT from weight decay. An
-                                    // unknown name is a compile error, not a
-                                    // silently-dropped entry — a typo'd
-                                    // "vectors" would otherwise read as
-                                    // "exclusion configured" while decaying
-                                    // every norm in the model.
-                                    "no_decay" => {
-                                        let ExprKind::ListLiteral(items) = &arg.value.kind else {
-                                            return Err(CodegenError::new(
-                                                "no_decay must be a list of role-name strings, \
-                                                 e.g. no_decay=[\"vector\"] (norms/biases) or \
-                                                 no_decay=[\"vector\", \"embedding\"]",
-                                            ));
-                                        };
-                                        for item in items {
-                                            let ExprKind::StringLiteral(s) = &item.kind else {
-                                                return Err(CodegenError::new(
-                                                    "no_decay entries must be string literals \
-                                                     naming a parameter role",
-                                                ));
-                                            };
-                                            if !crate::param_roles::VALID_ROLES.contains(&s.as_str()) {
-                                                return Err(CodegenError::new(format!(
-                                                    "no_decay: unknown parameter role {s:?}. \
-                                                     Valid roles are {:?}. \"vector\" covers \
-                                                     anything not rank-2 at runtime (norms, \
-                                                     biases); \"embedding\"/\"head\" come from \
-                                                     @param_role or embedding_lookup usage",
-                                                    crate::param_roles::VALID_ROLES,
-                                                )));
-                                            }
-                                            if s == "vector" {
-                                                no_decay_scope.exempt_non_rank2 = true;
-                                            } else if !no_decay_scope.exempts_role(s) {
-                                                no_decay_scope.static_roles.push(s.clone());
-                                            }
-                                        }
-                                        // Every param's role is exactly one of
-                                        // embedding/head/hidden/vector, so exempting
-                                        // the three non-vector roles exempts
-                                        // everything (a "vector"-role param needs a
-                                        // statically-derivable rank, which real
-                                        // models do not have). That is
-                                        // weight_decay=0.0 spelled obscurely.
-                                        if ["embedding", "head", "hidden"]
-                                            .iter()
-                                            .all(|r| no_decay_scope.exempts_role(r))
-                                        {
-                                            return Err(CodegenError::new(
-                                                "no_decay exempts every role that a parameter \
-                                                 can have (embedding, head, hidden), which \
-                                                 disables weight decay entirely — set \
-                                                 weight_decay=0.0 instead so the intent is \
-                                                 visible at the call site",
-                                            ));
-                                        }
-                                    }
-                                    "nesterov" => {
-                                        if let ExprKind::BoolLiteral(b) = &arg.value.kind {
-                                            nesterov_value = *b;
-                                            nesterov_set = true;
-                                        }
-                                    }
-                                    "beta1" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            beta1_value = *f;
-                                        }
-                                    }
-                                    "beta2" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            beta2_value = *f;
-                                        }
-                                    }
-                                    "eps" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            eps_value = *f;
-                                        }
-                                    }
-                                    "ns_steps" => {
-                                        // P1 item 7: ns_steps is the Newton-Schulz
-                                        // iteration COUNT — a positive integer by
-                                        // construction (spec/10: `ns_steps: int = 5`).
-                                        // A float would silently truncate in the
-                                        // stdlib `while i < ns_steps` loop and a
-                                        // non-positive value would skip
-                                        // orthogonalization entirely (plain
-                                        // momentum-SGD masquerading as Muon), so
-                                        // both refuse instead of degrading.
-                                        match &arg.value.kind {
-                                            ExprKind::IntLiteral(n) if *n >= 1 => {
-                                                ns_steps_value = *n as f64;
-                                            }
-                                            ExprKind::IntLiteral(n) => {
-                                                return Err(CodegenError::new(format!(
-                                                    "ns_steps must be a positive integer \
-                                                     (got {n}); ns_steps=0 or negative \
-                                                     would skip Newton-Schulz \
-                                                     orthogonalization entirely"
-                                                )));
-                                            }
-                                            ExprKind::FloatLiteral(f) => {
-                                                return Err(CodegenError::new(format!(
-                                                    "ns_steps must be a positive integer \
-                                                     (got float {f}); the Newton-Schulz \
-                                                     iteration count cannot be fractional"
-                                                )));
-                                            }
-                                            _ => {
-                                                return Err(CodegenError::new(
-                                                    "ns_steps must be a positive integer \
-                                                     literal (e.g. ns_steps = 5)",
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
+                TrainSection::Optimizer(_) => {
+                    // Fully consumed by resolve_optim_config above —
+                    // constructor name, per-optimizer kwarg namespace,
+                    // literal/range validation, no_decay roles, and the
+                    // Muon spec-default backfill all live in the resolver.
                 }
                 TrainSection::Step { param, body } => {
                     step_body = Some((body, *param));
@@ -6267,22 +6098,10 @@ impl Compiler<'_> {
                 TrainSection::Callbacks(cbs) => {
                     callbacks.extend(cbs.iter());
                 }
-                TrainSection::Scheduler(expr) => {
-                    if let ExprKind::Call { callee, args } = &expr.kind {
-                        if let ExprKind::Ident(sym) = &callee.kind {
-                            scheduler_name = self.resolve_sym(*sym).to_string();
-                        }
-                        for arg in args {
-                            if let Some(name_sym) = arg.name {
-                                let name = self.resolve_sym(name_sym).to_string();
-                                if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                    scheduler_args.push((name, *f));
-                                } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                                    scheduler_args.push((name, *n as f64));
-                                }
-                            }
-                        }
-                    }
+                TrainSection::Scheduler(_) => {
+                    // Fully consumed by resolve_optim_config above — name
+                    // canonicalization, per-scheduler kwarg namespace, and
+                    // the defaults all live in the resolver.
                 }
                 TrainSection::Data(stmts) => {
                     // Compile data section stmts — typically creates a DataLoader.
@@ -6329,37 +6148,10 @@ impl Compiler<'_> {
             }
         }
 
-        if optimizer_name.is_empty() {
-            return Err(CodegenError::new(
-                "train block requires an optimizer section",
-            ));
-        }
-
-        // P5 Muon (review M6): apply the SPEC defaults for knobs the user
-        // left unset — Muon(lr=0.02, momentum=0.95, nesterov=true). The
-        // generic defaults (lr=0.01, momentum=0.0, nesterov=false) would
-        // silently degrade a bare Muon() to orthogonalized momentum-free GD.
-        if optimizer_name == "muon" {
-            if !lr_set {
-                lr_value = 0.02;
-            }
-            if !momentum_set {
-                momentum_value = 0.95;
-            }
-            if !nesterov_set {
-                nesterov_value = true;
-            }
-            // adamw_lr is threaded as the ratio adamw_lr/lr of the scheduled
-            // lr — lr <= 0 would make that inf/NaN at every AdamW-routed
-            // update (review finding).
-            if adamw_lr_value.is_some() && lr_value <= 0.0 {
-                return Err(CodegenError::new(format!(
-                    "Muon adamw_lr requires a positive lr (got lr={lr_value}): \
-                     the AdamW arm's rate is applied as the fixed ratio \
-                     adamw_lr/lr of the scheduled lr"
-                )));
-            }
-        }
+        // (Missing-optimizer refusal, the Muon spec-default backfill, and
+        // the adamw_lr x lr guard all moved into resolve_optim_config —
+        // they now fire at `nsl check` time too, and identically on the
+        // pipelined path.)
 
         // Muon perf campaign (`--muon-batch-ns`): the batched engine is
         // wired into the FullBuffer optimizer loop only. Every path where
@@ -16659,27 +16451,23 @@ impl Compiler<'_> {
         state.current_block = Some(post_optimizer_block);
         } // end else (non-FASE-Deferred optimizer path)
 
-        // 7g2. Scheduler: update learning rate if scheduler is configured
+        // 7g2. Scheduler: update learning rate if a scheduler is configured.
         // NOTE: step_count is incremented AFTER the scheduler call so that
-        // step 0 produces the step-0 learning rate (e.g. warmup starts correctly).
-        if !scheduler_name.is_empty() {
-            let sched_fn_name = match scheduler_name.to_lowercase().as_str() {
-                "constant_lr" | "constantlr" => "constant_lr",
-                "step_lr" | "steplr" => "step_lr",
-                "exponential_lr" | "exponentiallr" => "exponential_lr",
-                "linear_decay" | "lineardecay" => "linear_decay",
-                "cosine_anneal" | "cosineanneal" => "cosine_anneal",
-                "warmup_cosine" | "warmupcosine" => "warmup_cosine",
-                "one_cycle" | "onecycle" => "one_cycle",
-                _ => &scheduler_name,
-            };
-            let mangled = format!("nsl__optim__schedulers__{}", sched_fn_name);
+        // step 0 produces the step-0 learning rate (e.g. warmup starts
+        // correctly). All names/kwargs/defaults were resolved by
+        // resolve_optim_config — this just emits the constants in the
+        // stdlib signature order after the auto-injected (base_lr, step).
+        if let Some(sched) = &scheduler {
+            use nsl_semantic::optim_config::ResolvedScheduler;
 
-            // Find the actual function name (check functions/runtime_fns with fallback)
+            let mangled = format!("nsl__optim__schedulers__{}", sched.fn_name());
+
+            // Find the actual function name (check functions/runtime_fns
+            // with fallback).
             let sched_fn = if self.registry.functions.contains_key(mangled.as_str()) {
                 mangled.clone()
             } else {
-                let simple = sched_fn_name.to_string();
+                let simple = sched.fn_name().to_string();
                 if self.registry.functions.contains_key(simple.as_str()) {
                     simple
                 } else if self.registry.runtime_fns.contains_key(mangled.as_str()) {
@@ -16695,132 +16483,32 @@ impl Compiler<'_> {
             let step_count_val = builder.use_var(step_count_var);
             let step_float = builder.ins().fcvt_from_sint(cl_types::F64, step_count_val);
 
-            let new_lr = match sched_fn_name {
-                "constant_lr" => {
-                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float])?
-                }
-                "step_lr" => {
-                    let step_size = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "step_size")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(10.0);
-                    let gamma = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "gamma")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.1);
-                    let ss_val = builder.ins().f64const(step_size);
-                    let g_val = builder.ins().f64const(gamma);
-                    self.compile_call_by_name(
-                        builder,
-                        &sched_fn,
-                        &[base_lr_val, step_float, ss_val, g_val],
-                    )?
-                }
-                "exponential_lr" => {
-                    let gamma = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "gamma")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.95);
-                    let g_val = builder.ins().f64const(gamma);
-                    self.compile_call_by_name(
-                        builder,
-                        &sched_fn,
-                        &[base_lr_val, step_float, g_val],
-                    )?
-                }
-                "linear_decay" => {
-                    let total_steps = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "total_steps")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(1000.0);
-                    let end_factor = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "end_factor")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0);
-                    let ts_val = builder.ins().f64const(total_steps);
-                    let ef_val = builder.ins().f64const(end_factor);
-                    self.compile_call_by_name(
-                        builder,
-                        &sched_fn,
-                        &[base_lr_val, step_float, ts_val, ef_val],
-                    )?
-                }
-                "cosine_anneal" => {
-                    let t_max = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "t_max")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(1000.0);
-                    let eta_min = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "eta_min")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0);
-                    let tm_val = builder.ins().f64const(t_max);
-                    let em_val = builder.ins().f64const(eta_min);
-                    self.compile_call_by_name(
-                        builder,
-                        &sched_fn,
-                        &[base_lr_val, step_float, tm_val, em_val],
-                    )?
-                }
-                "warmup_cosine" => {
-                    let ws = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "warmup_steps")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(100.0);
-                    let ts = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "total_steps")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(1000.0);
-                    let ml = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "min_lr")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(1e-5);
-                    let ws_val = builder.ins().f64const(ws);
-                    let ts_val = builder.ins().f64const(ts);
-                    let ml_val = builder.ins().f64const(ml);
-                    self.compile_call_by_name(
-                        builder,
-                        &sched_fn,
-                        &[base_lr_val, step_float, ws_val, ts_val, ml_val],
-                    )?
-                }
-                "one_cycle" => {
-                    let max_lr = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "max_lr")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(lr_value * 10.0);
-                    let total_steps = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "total_steps")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(1000.0);
-                    let pct_start = scheduler_args
-                        .iter()
-                        .find(|(n, _)| n == "pct_start")
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.3);
-                    let ml_val = builder.ins().f64const(max_lr);
-                    let ts_val = builder.ins().f64const(total_steps);
-                    let ps_val = builder.ins().f64const(pct_start);
-                    self.compile_call_by_name(
-                        builder,
-                        &sched_fn,
-                        &[base_lr_val, step_float, ml_val, ts_val, ps_val],
-                    )?
-                }
-                _ => base_lr_val, // fallback: no change
+            let extra: Vec<f64> = match sched {
+                ResolvedScheduler::ConstantLr => vec![],
+                ResolvedScheduler::StepLr { step_size, gamma } => vec![*step_size, *gamma],
+                ResolvedScheduler::ExponentialLr { gamma } => vec![*gamma],
+                ResolvedScheduler::LinearDecay {
+                    total_steps,
+                    end_factor,
+                } => vec![*total_steps, *end_factor],
+                ResolvedScheduler::CosineAnneal { t_max, eta_min } => vec![*t_max, *eta_min],
+                ResolvedScheduler::WarmupCosine {
+                    warmup_steps,
+                    total_steps,
+                    min_lr,
+                } => vec![*warmup_steps, *total_steps, *min_lr],
+                ResolvedScheduler::OneCycle {
+                    max_lr,
+                    total_steps,
+                    pct_start,
+                } => vec![*max_lr, *total_steps, *pct_start],
             };
+
+            let mut call_args = vec![base_lr_val, step_float];
+            for v in extra {
+                call_args.push(builder.ins().f64const(v));
+            }
+            let new_lr = self.compile_call_by_name(builder, &sched_fn, &call_args)?;
 
             builder.def_var(lr_var, new_lr);
         }
@@ -17827,136 +17515,62 @@ impl Compiler<'_> {
             CodegenError::new(format!("train config refused: {}", msgs.join("; ")))
         })?;
         let model_sym: Option<nsl_ast::Symbol> = pipe_cfg.model;
-        let mut optimizer_name = String::new();
-        let mut lr_value: f64 = 0.01;
-        let mut momentum_value: f64 = 0.0;
-        let mut dampening_value: f64 = 0.0;
-        let mut weight_decay_value: f64 = 0.0;
-        // AdamW parameter groups (`no_decay=[...]`). Empty = every param
-        // decays, bit-identical to before this existed.
-        let mut no_decay_scope = crate::param_roles::NoDecayScope::default();
-        let mut nesterov_value: bool = false;
-        let mut beta1_value: f64 = 0.9;
-        let mut beta2_value: f64 = 0.999;
-        let mut eps_value: f64 = 1e-8;
+
+        // Same optimizer/scheduler contract as the standard path — ONE
+        // resolver. This also closes the pipelined path's own historical
+        // gaps: its private kwarg copy lacked adamw_lr/ns_steps arms and
+        // had no Muon spec-default backfill, so the same source trained
+        // differently under @pipeline.
+        let optim_cfg = nsl_semantic::optim_config::resolve_optim_config(
+            &train.sections,
+            train.span,
+            &|sym| self.resolve_sym(sym).to_string(),
+            nsl_semantic::train_config::TrainConfigPurpose::UserTrainBlock,
+        )
+        .map_err(|diags| {
+            let msgs: Vec<String> = diags.into_iter().map(|d| d.message).collect();
+            CodegenError::new(format!(
+                "optimizer config refused: {}",
+                msgs.join("; ")
+            ))
+        })?;
+
+        // Deferral-must-refuse: the pipelined optimizer step passes only
+        // the shared hyperparameters (no adamw_route/ns_steps/adamw_lr
+        // slots, and its state allocation gives Muon one moment buffer
+        // where muon_step needs two) — lowering Muon here would emit a
+        // call that cannot match muon_step's signature.
+        if optim_cfg.optimizer.kind == nsl_semantic::optim_config::OptimizerKind::Muon {
+            return Err(CodegenError::new(
+                "the Muon optimizer is not supported on the @pipeline train \
+                 path yet: the per-stage optimizer step does not thread the \
+                 route/ns_steps/adamw_lr arguments muon_step requires. Use \
+                 AdamW here, or drop @pipeline",
+            ));
+        }
+
+        let optimizer_name = optim_cfg.optimizer.kind.as_str().to_string();
+        let lr_value: f64 = optim_cfg.optimizer.lr;
+        let momentum_value: f64 = optim_cfg.optimizer.momentum;
+        let dampening_value: f64 = optim_cfg.optimizer.dampening;
+        let weight_decay_value: f64 = optim_cfg.optimizer.weight_decay;
+        // AdamW parameter groups (`no_decay=[...]`). Non-empty is refused
+        // below at the optimizer-step emitter, where the comment explains
+        // why the role flags have no list to be parallel to.
+        let no_decay_scope = crate::param_roles::NoDecayScope {
+            static_roles: optim_cfg.optimizer.no_decay_static_roles.clone(),
+            exempt_non_rank2: optim_cfg.optimizer.no_decay_exempt_non_rank2,
+        };
+        let nesterov_value: bool = optim_cfg.optimizer.nesterov;
+        let beta1_value: f64 = optim_cfg.optimizer.beta1;
+        let beta2_value: f64 = optim_cfg.optimizer.beta2;
+        let eps_value: f64 = optim_cfg.optimizer.eps;
         let mut step_body: Option<(&nsl_ast::stmt::Block, nsl_ast::Symbol)> = None;
 
         for section in &train.sections {
             match section {
-                TrainSection::Optimizer(expr) => {
-                    if let ExprKind::Call { callee, args } = &expr.kind {
-                        if let ExprKind::Ident(sym) = &callee.kind {
-                            optimizer_name = self.resolve_sym(*sym).to_string().to_lowercase();
-                        }
-                        for arg in args {
-                            if let Some(name_sym) = arg.name {
-                                let name = self.resolve_sym(name_sym).to_string();
-                                match name.as_str() {
-                                    "lr" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            lr_value = *f;
-                                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                                            lr_value = *n as f64;
-                                        }
-                                    }
-                                    "momentum" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            momentum_value = *f;
-                                        }
-                                    }
-                                    "dampening" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            dampening_value = *f;
-                                        }
-                                    }
-                                    "weight_decay" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            weight_decay_value = *f;
-                                        }
-                                    }
-                                    // AdamW parameter groups: role names whose
-                                    // params are EXEMPT from weight decay. An
-                                    // unknown name is a compile error, not a
-                                    // silently-dropped entry — a typo'd
-                                    // "vectors" would otherwise read as
-                                    // "exclusion configured" while decaying
-                                    // every norm in the model.
-                                    "no_decay" => {
-                                        let ExprKind::ListLiteral(items) = &arg.value.kind else {
-                                            return Err(CodegenError::new(
-                                                "no_decay must be a list of role-name strings, \
-                                                 e.g. no_decay=[\"vector\"] (norms/biases) or \
-                                                 no_decay=[\"vector\", \"embedding\"]",
-                                            ));
-                                        };
-                                        for item in items {
-                                            let ExprKind::StringLiteral(s) = &item.kind else {
-                                                return Err(CodegenError::new(
-                                                    "no_decay entries must be string literals \
-                                                     naming a parameter role",
-                                                ));
-                                            };
-                                            if !crate::param_roles::VALID_ROLES.contains(&s.as_str()) {
-                                                return Err(CodegenError::new(format!(
-                                                    "no_decay: unknown parameter role {s:?}. \
-                                                     Valid roles are {:?}. \"vector\" covers \
-                                                     anything not rank-2 at runtime (norms, \
-                                                     biases); \"embedding\"/\"head\" come from \
-                                                     @param_role or embedding_lookup usage",
-                                                    crate::param_roles::VALID_ROLES,
-                                                )));
-                                            }
-                                            if s == "vector" {
-                                                no_decay_scope.exempt_non_rank2 = true;
-                                            } else if !no_decay_scope.exempts_role(s) {
-                                                no_decay_scope.static_roles.push(s.clone());
-                                            }
-                                        }
-                                        // Every param's role is exactly one of
-                                        // embedding/head/hidden/vector, so exempting
-                                        // the three non-vector roles exempts
-                                        // everything (a "vector"-role param needs a
-                                        // statically-derivable rank, which real
-                                        // models do not have). That is
-                                        // weight_decay=0.0 spelled obscurely.
-                                        if ["embedding", "head", "hidden"]
-                                            .iter()
-                                            .all(|r| no_decay_scope.exempts_role(r))
-                                        {
-                                            return Err(CodegenError::new(
-                                                "no_decay exempts every role that a parameter \
-                                                 can have (embedding, head, hidden), which \
-                                                 disables weight decay entirely — set \
-                                                 weight_decay=0.0 instead so the intent is \
-                                                 visible at the call site",
-                                            ));
-                                        }
-                                    }
-                                    "nesterov" => {
-                                        if let ExprKind::BoolLiteral(b) = &arg.value.kind {
-                                            nesterov_value = *b;
-                                        }
-                                    }
-                                    "beta1" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            beta1_value = *f;
-                                        }
-                                    }
-                                    "beta2" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            beta2_value = *f;
-                                        }
-                                    }
-                                    "eps" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            eps_value = *f;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
+                TrainSection::Optimizer(_) => {
+                    // Fully consumed by resolve_optim_config above.
                 }
                 TrainSection::Step { param, body } => {
                     step_body = Some((body, *param));
@@ -17991,7 +17605,28 @@ impl Compiler<'_> {
                          CLI options instead",
                     ));
                 }
-                _ => {}
+                // Deferral-must-refuse: these previously fell into a
+                // `_ => {}` wildcard and were silently dropped — a
+                // scheduler: section compiled clean under @pipeline and
+                // trained at constant lr; callbacks: never fired.
+                TrainSection::Scheduler(_) => {
+                    return Err(CodegenError::new(
+                        "scheduler: sections are not supported on the \
+                         @pipeline train path yet — its per-stage loop \
+                         never updates the learning rate, so the schedule \
+                         would be silently ignored. Remove the section or \
+                         drop @pipeline",
+                    ));
+                }
+                TrainSection::Callbacks(_) => {
+                    return Err(CodegenError::new(
+                        "callbacks: sections are not supported on the \
+                         @pipeline train path yet — the per-stage loop \
+                         never invokes them, so on_step/on_epoch logic \
+                         would silently not run. Remove the section or \
+                         drop @pipeline",
+                    ));
+                }
             }
         }
 
@@ -17999,11 +17634,7 @@ impl Compiler<'_> {
             CodegenError::new("pipelined train block requires 'model=<ident>' config argument")
         })?;
 
-        if optimizer_name.is_empty() {
-            return Err(CodegenError::new(
-                "pipelined train block requires an optimizer section",
-            ));
-        }
+        // (Missing-optimizer refusal moved into resolve_optim_config.)
 
         let (step_body, step_param_sym) = step_body
             .ok_or_else(|| CodegenError::new("pipelined train block requires a step section"))?;
@@ -19610,20 +19241,20 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Derive [`crate::cpdt_optim::AdamWHyperparams`] from a `@train` block's
-/// optimizer section.
+/// optimizer section — via the SAME resolver the train lowering consumes,
+/// so this can no longer drift from the main parse (pre-contract it was an
+/// independent third parse: first-section-wins where the lowering was
+/// last-wins, int-tolerant where the lowering was float-only, and unknown
+/// kwargs silently ignored).
 ///
 /// Returns library defaults when:
 /// - `train` is `None`
-/// - the optimizer section is missing
-/// - the optimizer is not `AdamW` (case-insensitive, matches the FASE
-///   optimizer-name lookup at the top of `compile_train_block`)
-/// - the optimizer expression is not a direct call
+/// - the sections fail the optimizer contract (the train lowering itself
+///   is the refusal site — CPDT output never outlives a refused compile)
+/// - the optimizer is not `AdamW`
 ///
-/// For β1, β2, ε: any field present as a `FloatLiteral` keyword arg overrides
-/// the default; missing or non-literal values retain the default. `lr` and
-/// `weight_decay` are intentionally NOT read here — CPDT's hyperparams cover
-/// only the running-moment constants. Unknown kwargs are silently ignored for
-/// forward compatibility.
+/// `lr` and `weight_decay` are intentionally NOT read here — CPDT's
+/// hyperparams cover only the running-moment constants.
 ///
 /// Takes the `Interner` directly so this helper stays free-standing (callable
 /// from `invoke_cpdt_if_enabled` via `&compiler.interner`) and is
@@ -19639,49 +19270,21 @@ pub(crate) fn adamw_from_train_block(
         return hp;
     };
 
-    // Find the Optimizer section (there should be at most one meaningful one).
-    let opt_expr = train.sections.iter().find_map(|s| match s {
-        TrainSection::Optimizer(e) => Some(e),
-        _ => None,
-    });
-    let Some(opt_expr) = opt_expr else {
+    let Ok(cfg) = nsl_semantic::optim_config::resolve_optim_config(
+        &train.sections,
+        train.span,
+        &|sym| interner.resolve(sym.0).unwrap_or("<unknown>").to_string(),
+        nsl_semantic::train_config::TrainConfigPurpose::UserTrainBlock,
+    ) else {
         return hp;
     };
-
-    // Pattern-match Call { callee=Ident("AdamW"), args }.
-    let ExprKind::Call { callee, args } = &opt_expr.kind else {
-        return hp;
-    };
-    let ExprKind::Ident(name_sym) = &callee.kind else {
-        return hp;
-    };
-    // Mirror the FASE site: lowercase compare ("AdamW" → "adamw").
-    if interner
-        .resolve(name_sym.0)
-        .unwrap_or("<unknown>")
-        .to_lowercase()
-        != "adamw"
-    {
+    if cfg.optimizer.kind != nsl_semantic::optim_config::OptimizerKind::AdamW {
         return hp;
     }
 
-    for arg in args {
-        let Some(name_sym) = arg.name else { continue };
-        let kw = interner.resolve(name_sym.0).unwrap_or("<unknown>");
-        // Accept FloatLiteral; also tolerate IntLiteral for eps (e.g. eps=0).
-        let val = match &arg.value.kind {
-            ExprKind::FloatLiteral(f) => *f,
-            ExprKind::IntLiteral(n) => *n as f64,
-            _ => continue,
-        };
-        match kw {
-            "beta1" => hp.beta1 = val,
-            "beta2" => hp.beta2 = val,
-            "eps" => hp.eps = val,
-            _ => {} // unknown kwargs silently ignored
-        }
-    }
-
+    hp.beta1 = cfg.optimizer.beta1;
+    hp.beta2 = cfg.optimizer.beta2;
+    hp.eps = cfg.optimizer.eps;
     hp
 }
 
@@ -19789,6 +19392,40 @@ mod tests {
         assert!((hp.beta2 - 0.99).abs() < 1e-12, "beta2 = {}", hp.beta2);
         // eps was not overridden — should stay at library default.
         assert!((hp.eps - d.eps).abs() < 1e-12, "eps = {}", hp.eps);
+    }
+
+    #[test]
+    fn adamw_hyperparams_default_when_block_fails_the_contract() {
+        // AdamW(beta1=0.85, lrr=0.01): the typo'd kwarg fails
+        // resolve_optim_config, so CPDT sees library defaults — never the
+        // half-parsed beta1. (The train lowering itself refuses the block,
+        // so those defaults cannot train anything; pre-contract this
+        // helper would have silently returned beta1=0.85 while the typo
+        // trained at the default lr.)
+        let mut interner: Interner = Interner::new();
+        let adamw_sym = Symbol(interner.get_or_intern("AdamW"));
+        let beta1_sym = Symbol(interner.get_or_intern("beta1"));
+        let lrr_sym = Symbol(interner.get_or_intern("lrr"));
+
+        let callee = Box::new(mk_expr(ExprKind::Ident(adamw_sym)));
+        let args = vec![
+            mk_arg(Some(beta1_sym), mk_expr(ExprKind::FloatLiteral(0.85))),
+            mk_arg(Some(lrr_sym), mk_expr(ExprKind::FloatLiteral(0.01))),
+        ];
+        let opt_call = mk_expr(ExprKind::Call { callee, args });
+
+        let train = TrainBlock {
+            config: vec![],
+            sections: vec![TrainSection::Optimizer(opt_call)],
+            span: Span::dummy(),
+        };
+
+        let hp = adamw_from_train_block(Some(&train), &interner);
+        let d = crate::cpdt_optim::AdamWHyperparams::default();
+        assert!(
+            (hp.beta1 - d.beta1).abs() < 1e-12,
+            "contract-refused block must not leak half-parsed values"
+        );
     }
 
     #[test]

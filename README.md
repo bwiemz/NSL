@@ -84,7 +84,7 @@ let y = randn([32, 512])
 
 train(model=m, epochs=100):
     optimizer: AdamW(lr=0.001, weight_decay=0.01)
-    scheduler: cosine_anneal(min_lr=0.0001)
+    scheduler: cosine_anneal(eta_min=0.0001)
     step(batch):
         let pred = m.forward(x)
         let loss = mse_loss(pred, y)

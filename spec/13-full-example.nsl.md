@@ -208,20 +208,22 @@ train(
         prefetch    = 4
         pin_memory  = true
 
+    # Hyperparameters are literals by contract: the compiler refuses
+    # non-literal config values rather than silently training with
+    # defaults (Training Configuration Contract).
     optimizer: AdamW(
-        lr           = CONFIG.lr,
-        betas        = (0.9, 0.95),
-        weight_decay = CONFIG.weight_decay,
-        groups = [
-            {params: model.params(filter="*.weight"), weight_decay: CONFIG.weight_decay},
-            {params: model.params(filter="*.bias|*ln*"), weight_decay: 0.0}
-        ]
+        lr           = 6e-4,
+        beta1        = 0.9,
+        beta2        = 0.95,
+        weight_decay = 0.1,
+        # No weight decay on non-rank-2 params (biases, norms):
+        no_decay     = ["vector"]
     )
 
     scheduler: WarmupCosine(
-        warmup_steps = CONFIG.warmup_steps,
-        total_steps  = CONFIG.total_steps,
-        min_lr       = CONFIG.lr / 10
+        warmup_steps = 2000,
+        total_steps  = 100000,
+        min_lr       = 6e-5
     )
 
     step(batch):

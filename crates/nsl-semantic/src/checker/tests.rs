@@ -2730,3 +2730,428 @@ fn train_model_written_but_invalid_is_not_reported_as_missing() {
         "a written-but-invalid model must not be reported as missing, got {errs:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Optimizer/scheduler/callbacks section contract (optim_config.rs): the
+// section namespaces are CLOSED at check time — per-optimizer kwarg
+// tables, per-scheduler kwarg tables, callback names. Same shape as the
+// header contract above: one violation per test, plus an anti-overbreadth
+// valid control.
+// -----------------------------------------------------------------------
+
+/// A minimal valid program with `{sections}` spliced as the train
+/// sections (4-space indented; a step section is appended).
+fn train_sections_fixture(sections: &str) -> String {
+    format!(
+        r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+
+train(model = m):
+{sections}
+    step(batch):
+        let pred = m.forward(x)
+"#
+    )
+}
+
+fn section_contract_errors(sections: &str) -> Vec<String> {
+    check_source(&train_sections_fixture(sections))
+        .into_iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn optimizer_typo_kwarg_is_refused_at_check_time() {
+    // The motivating typo: AdamW(lrr=0.01) used to hit codegen's
+    // `_ => {}` and silently train at the default lr=0.01.
+    let errs = section_contract_errors("    optimizer: AdamW(lrr = 0.01)");
+    assert!(
+        errs.iter().any(|m| m.contains("unknown AdamW kwarg 'lrr'")),
+        "expected unknown-kwarg refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn optimizer_inapplicable_kwarg_is_refused() {
+    // beta2 parsed fine on SGD and was simply never read by the emitted
+    // sgd_step call — accepted-but-ignored, the defect class the contract
+    // exists to prevent. The kwarg tables are the stdlib step signatures.
+    let errs = section_contract_errors("    optimizer: SGD(lr = 0.01, beta2 = 0.5)");
+    assert!(
+        errs.iter().any(|m| m.contains("unknown SGD kwarg 'beta2'")),
+        "expected inapplicable-kwarg refusal, got {errs:?}"
+    );
+    // soap_step takes no weight_decay parameter at all.
+    let errs = section_contract_errors("    optimizer: SOAP(lr = 0.01, weight_decay = 0.1)");
+    assert!(
+        errs.iter().any(|m| m.contains("unknown SOAP kwarg 'weight_decay'")),
+        "expected SOAP weight_decay refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn optimizer_duplicate_kwarg_is_refused() {
+    // Previously last-wins (each arm reassigned its local as the loop ran).
+    let errs = section_contract_errors("    optimizer: AdamW(lr = 0.01, lr = 0.02)");
+    assert!(
+        errs.iter().any(|m| m.contains("duplicate optimizer kwarg 'lr'")),
+        "expected duplicate-kwarg refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn optimizer_positional_arg_is_refused() {
+    // Previously skipped before any name matched: SGD(0.05) compiled and
+    // trained at the default lr.
+    let errs = section_contract_errors("    optimizer: SGD(0.05)");
+    assert!(
+        errs.iter().any(|m| m.contains("optimizer takes named arguments only")),
+        "expected positional-arg refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn optimizer_non_literal_value_is_refused_not_defaulted() {
+    // The silent half of the defect: a KNOWN key whose value shape didn't
+    // match fell through its own arm — `lr = base_lr` kept lr=0.01.
+    let errs = section_contract_errors("    optimizer: AdamW(lr = base_lr)");
+    assert!(
+        errs.iter().any(|m| m.contains("optimizer 'lr' must be a numeric literal")),
+        "expected non-literal value refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn optimizer_negative_lr_folds_and_refuses_with_range_message() {
+    // -0.001 parses as UnaryOp(Neg, FloatLiteral) — pre-contract it was
+    // silently dropped (lr stayed 0.01); the resolver folds it and gives
+    // the range message, not a bogus "not a literal".
+    let errs = section_contract_errors("    optimizer: AdamW(lr = -0.001)");
+    assert!(
+        errs.iter().any(|m| m.contains("optimizer 'lr' must be a non-negative")
+            && m.contains("-0.001")),
+        "expected folded range refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn optimizer_beta_out_of_range_is_refused() {
+    // beta = 1.0 divides by zero in bias correction (1 - beta^t) at t=1.
+    let errs = section_contract_errors("    optimizer: AdamW(lr = 0.01, beta1 = 1.0)");
+    assert!(
+        errs.iter().any(|m| m.contains("optimizer 'beta1' must be a numeric literal in [0, 1)")),
+        "expected beta range refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn unknown_optimizer_name_is_refused_at_check_time() {
+    // Previously refused only deep in codegen (step-fn mangling); `nsl
+    // check` was green.
+    let errs = section_contract_errors("    optimizer: RMSProp(lr = 0.01)");
+    assert!(
+        errs.iter().any(|m| m.contains("unknown optimizer 'RMSProp'")),
+        "expected unknown-name refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn bare_ident_optimizer_is_refused_as_not_a_call() {
+    // `optimizer: AdamW` (no parens) passed `nsl check` and then refused
+    // at build with the misleading "requires an optimizer section".
+    let errs = section_contract_errors("    optimizer: AdamW");
+    assert!(
+        errs.iter().any(|m| m.contains("optimizer must be a constructor call")),
+        "expected constructor-call refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn missing_optimizer_section_is_refused_at_check_time() {
+    // Previously codegen-only.
+    let errs = section_contract_errors("    data:\n        source = 1");
+    assert!(
+        errs.iter().any(|m| m.contains("train block requires an optimizer section")),
+        "expected missing-section refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn duplicate_optimizer_sections_are_refused() {
+    // Pre-contract the consumers disagreed: the lowering took the LAST
+    // section, CPDT and the training report took the FIRST.
+    let errs = section_contract_errors(
+        "    optimizer: SGD(lr = 0.01)\n    optimizer: AdamW(lr = 0.001)",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("duplicate optimizer: section")),
+        "expected duplicate-section refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn ns_steps_refusals_fire_at_check_time_with_the_pinned_wording() {
+    // The muon_p1_gate wording contract, now surfaced by `nsl check` too.
+    for (val, expect) in [
+        ("0", "ns_steps must be a positive integer"),
+        ("-3", "ns_steps must be a positive integer"),
+        ("3.5", "cannot be fractional"),
+    ] {
+        let errs = section_contract_errors(&format!(
+            "    optimizer: Muon(lr = 0.01, ns_steps = {val})"
+        ));
+        assert!(
+            errs.iter().any(|m| m.contains(expect)),
+            "ns_steps={val}: expected '{expect}', got {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn no_decay_unknown_role_is_refused_at_check_time() {
+    let errs = section_contract_errors(
+        r#"    optimizer: AdamW(lr = 0.01, no_decay = ["vectors"])"#,
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("unknown parameter role")),
+        "expected unknown-role refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn unknown_scheduler_name_is_refused_at_check_time() {
+    // Previously fell through the lowering's name map to `_ =>
+    // base_lr_val // fallback: no change` — compiled clean and silently
+    // trained at constant lr. (spec/05 advertised `Cosine`, which was one
+    // of the silent victims.)
+    let errs = section_contract_errors(
+        "    optimizer: AdamW(lr = 0.001)\n    scheduler: Cosine(t_max = 100)",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("unknown scheduler 'Cosine'")),
+        "expected unknown-scheduler refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn scheduler_typo_kwarg_is_refused_not_defaulted() {
+    // A typo'd kwarg was pushed into scheduler_args, never matched by any
+    // `.find()`, and the hardcoded default silently applied.
+    let errs = section_contract_errors(
+        "    optimizer: AdamW(lr = 0.001)\n    scheduler: warmup_cosine(warmup_step = 5)",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("unknown warmup_cosine kwarg 'warmup_step'")),
+        "expected scheduler typo refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn scheduler_non_literal_value_is_refused() {
+    let errs = section_contract_errors(
+        "    optimizer: AdamW(lr = 0.001)\n    scheduler: warmup_cosine(total_steps = ts)",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("scheduler 'total_steps' must be a numeric literal")),
+        "expected scheduler non-literal refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn scheduler_duplicate_kwarg_and_duplicate_section_are_refused() {
+    // Duplicate kwargs were FIRST-wins in the scheduler (Vec + .find) but
+    // last-wins in the optimizer — the divergence is refused away.
+    let errs = section_contract_errors(
+        "    optimizer: AdamW(lr = 0.001)\n    scheduler: step_lr(gamma = 0.1, gamma = 0.2)",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("duplicate scheduler kwarg 'gamma'")),
+        "expected duplicate-kwarg refusal, got {errs:?}"
+    );
+    let errs = section_contract_errors(
+        "    optimizer: AdamW(lr = 0.001)\n    scheduler: constant_lr()\n    scheduler: step_lr()",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("duplicate scheduler: section")),
+        "expected duplicate-section refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn unknown_callback_name_is_refused_at_check_time() {
+    // Previously collected and silently never emitted — the dispatch only
+    // knows on_step/on_epoch/on_epoch_end.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_stpe(step, loss):\n",
+        "            let s = step\n",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("unknown callback 'on_stpe'")),
+        "expected unknown-callback refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn valid_full_sections_produce_no_contract_errors() {
+    // Anti-overbreadth control: a fully-loaded valid program — every
+    // AdamW kwarg, int-literal scheduler steps (every committed scheduler
+    // call passes ints; the stdlib types them float), warmup > total (the
+    // coder-rl 12-step repro shape), and both callback names. The filter
+    // covers every contract message shape (audited against
+    // optim_config.rs: "optimizer", "scheduler", "callback", "kwarg",
+    // "no_decay", "ns_steps", "adamw_lr").
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.0003, weight_decay = 0.1, beta1 = 0.9, ",
+        "beta2 = 0.95, eps = 1e-8, no_decay = [\"vector\"])\n",
+        "    scheduler: warmup_cosine(warmup_steps = 20, total_steps = 12, min_lr = 0.00003)\n",
+        "    callbacks:\n",
+        "        on_step(step, loss):\n",
+        "            let s = step\n",
+        "        on_epoch(epoch, loss):\n",
+        "            let e = epoch\n",
+    ));
+    let contract_errs: Vec<_> = errs
+        .iter()
+        .filter(|m| {
+            m.contains("optimizer")
+                || m.contains("scheduler")
+                || m.contains("callback")
+                || m.contains("kwarg")
+                || m.contains("no_decay")
+                || m.contains("ns_steps")
+                || m.contains("adamw_lr")
+        })
+        .collect();
+    assert!(
+        contract_errs.is_empty(),
+        "valid sections must produce no contract errors, got {contract_errs:?}"
+    );
+}
+
+#[test]
+fn muon_camelcase_scheduler_spelling_is_accepted() {
+    // WarmupCosine (CamelCase) lowercases to the collapsed spelling the
+    // canonical map accepts — the pre-contract acceptance is preserved.
+    let errs = section_contract_errors(
+        "    optimizer: AdamW(lr = 0.001)\n    scheduler: WarmupCosine(warmup_steps = 10, total_steps = 100)",
+    );
+    assert!(
+        !errs.iter().any(|m| m.contains("unknown scheduler")),
+        "WarmupCosine must stay accepted, got {errs:?}"
+    );
+}
+
+#[test]
+fn distill_sections_get_the_same_contract_at_check_time() {
+    // Distill sections travel verbatim into the synthesized TrainBlock —
+    // without the distill-side call a typo'd optimizer kwarg passed
+    // `nsl check` and refused only at build.
+    let errs: Vec<String> = check_source(&distill_fixture(
+        "distill(teacher = t, student = s, epochs = 1):",
+    ))
+    .into_iter()
+    .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+    .map(|d| d.message)
+    .collect();
+    // The shared fixture's SGD(lr = 0.01) is valid — control.
+    assert!(
+        !errs.iter().any(|m| m.contains("kwarg") || m.contains("unknown optimizer")),
+        "valid distill optimizer must not refuse, got {errs:?}"
+    );
+
+    let src = distill_fixture("distill(teacher = t, student = s, epochs = 1):")
+        .replace("optimizer: SGD(lr = 0.01)", "optimizer: SGD(lrr = 0.01)");
+    let errs: Vec<String> = check_source(&src)
+        .into_iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        errs.iter().any(|m| m.contains("unknown SGD kwarg 'lrr'")),
+        "distill optimizer typo must refuse at check time, got {errs:?}"
+    );
+}
+
+#[test]
+fn typo_callback_param_is_refused_not_bound_to_zero() {
+    // Codegen binds callback params BY NAME with a silent zero fallback:
+    // on_step(step, lss) type-checked clean and logged a constant 0
+    // forever (review finding). The param namespace is closed per
+    // callback: on_step provides step/loss, on_epoch* provide epoch/loss.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step, lss):\n",
+        "            let s = step\n",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("unknown on_step callback parameter 'lss'")),
+        "expected the param refusal, got {errs:?}"
+    );
+    // Cross-context names refuse too: on_epoch provides epoch, not step.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_epoch(step, loss):\n",
+        "            let s = step\n",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("unknown on_epoch callback parameter 'step'")),
+        "expected the cross-context param refusal, got {errs:?}"
+    );
+    // Subsets stay legal: on_step(step) is a committed corpus shape.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step):\n",
+        "            let s = step\n",
+    ));
+    assert!(
+        !errs.iter().any(|m| m.contains("callback parameter")),
+        "on_step(step) must stay legal, got {errs:?}"
+    );
+}
+
+#[test]
+fn duplicate_callback_definition_is_refused() {
+    // Codegen compiles EVERY matching definition — a user redefining
+    // on_step (expecting override) silently got both bodies run per step
+    // (review finding). Same contract as duplicate optimizer:/scheduler:.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step, loss):\n",
+        "            let a = step\n",
+        "        on_step(step, loss):\n",
+        "            let b = step\n",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("duplicate callback 'on_step'")),
+        "expected the duplicate-callback refusal, got {errs:?}"
+    );
+    // Distinct callbacks across two callbacks: sections stay legal.
+    let errs = section_contract_errors(concat!(
+        "    optimizer: AdamW(lr = 0.001)\n",
+        "    callbacks:\n",
+        "        on_step(step, loss):\n",
+        "            let a = step\n",
+        "    callbacks:\n",
+        "        on_epoch(epoch, loss):\n",
+        "            let b = epoch\n",
+    ));
+    assert!(
+        !errs.iter().any(|m| m.contains("duplicate callback")),
+        "distinct callbacks across sections must stay legal, got {errs:?}"
+    );
+}

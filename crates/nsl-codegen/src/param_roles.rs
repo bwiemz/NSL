@@ -49,10 +49,12 @@ pub(crate) struct ParamRoleTable {
     pub warnings: Vec<String>,
 }
 
-/// Every role name `no_decay=[...]` accepts. Kept next to the classifier so
-/// the accepted set cannot drift from the set the classifier can produce —
-/// an unknown name is a compile error, never a silently-ignored entry.
-pub(crate) const VALID_ROLES: &[&str] = &["vector", "embedding", "head", "hidden"];
+// Every role name `no_decay=[...]` accepts is defined at
+// `nsl_semantic::optim_config::VALID_ROLES` — it moved there with the
+// section contract (the resolver validates `no_decay` at `nsl check`
+// time). The `classifier_roles_are_valid_roles` test below keeps that set
+// from drifting from the set the classifier can produce — an unknown name
+// is a compile error, never a silently-ignored entry.
 
 /// Resolved `no_decay=[...]`: which roles are exempt from weight decay.
 ///
@@ -270,4 +272,32 @@ mod tests {
     // crates/nsl-cli/tests/muon_optimizer_gate.rs (routing-table asserts on
     // real models); resolve_param_owner's array hop is covered there via
     // the `[TransformerBlock; N]` paths of the mixed-routing fixtures.
+
+    /// The classifier's producible roles and `VALID_ROLES` are the SAME
+    /// set, both directions — the drift guard the accepted set relied on
+    /// when it was defined in this file. (`ParamRoleEntry.role` documents
+    /// the producible set; the classifier arms emit exactly these four
+    /// strings. The reverse direction matters too: a stray VALID_ROLES
+    /// entry would let `no_decay=["gibberish-role"]` validate while
+    /// exempting nothing — the silently-accepted-role class returning
+    /// through the front door; review finding.)
+    #[test]
+    fn classifier_roles_are_valid_roles() {
+        let producible = ["embedding", "head", "hidden", "vector"];
+        for role in producible {
+            assert!(
+                nsl_semantic::optim_config::VALID_ROLES.contains(&role),
+                "classifier-producible role '{role}' is missing from \
+                 nsl_semantic::optim_config::VALID_ROLES"
+            );
+        }
+        for role in nsl_semantic::optim_config::VALID_ROLES {
+            assert!(
+                producible.contains(role),
+                "VALID_ROLES entry '{role}' is not producible by the \
+                 classifier — no parameter could ever carry it, so \
+                 no_decay=[\"{role}\"] would validate and exempt nothing"
+            );
+        }
+    }
 }
