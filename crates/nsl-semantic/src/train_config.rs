@@ -83,12 +83,16 @@ pub enum TrainConfigPurpose {
     DistillLowering,
 }
 
-/// Fold an integer literal INCLUDING a leading unary minus: `-3` parses as
-/// `UnaryOp(Neg, IntLiteral(3))`, and telling its author "-3 must be an
-/// integer literal" reads as nonsense — the range message is the right one.
+/// Fold an integer literal INCLUDING a leading unary minus and parens:
+/// `-3` parses as `UnaryOp(Neg, IntLiteral(3))` and `(2)` as
+/// `Paren(IntLiteral(2))` — telling either author "must be an integer
+/// literal" reads as nonsense. (Parenthesized literals were refused by the
+/// old codegen match too; transparency here is an improvement, not a
+/// compatibility need.)
 fn fold_int_literal(kind: &ExprKind) -> Option<i64> {
     match kind {
         ExprKind::IntLiteral(n) => Some(*n),
+        ExprKind::Paren(inner) => fold_int_literal(&inner.kind),
         ExprKind::UnaryOp {
             op: nsl_ast::operator::UnaryOp::Neg,
             operand,
@@ -105,6 +109,7 @@ fn fold_numeric_literal(kind: &ExprKind) -> Option<f64> {
     match kind {
         ExprKind::FloatLiteral(f) => Some(*f),
         ExprKind::IntLiteral(n) => Some(*n as f64),
+        ExprKind::Paren(inner) => fold_numeric_literal(&inner.kind),
         ExprKind::UnaryOp {
             op: nsl_ast::operator::UnaryOp::Neg,
             operand,
@@ -207,15 +212,22 @@ pub fn resolve_train_config(
             "grad_clip" => {
                 let lit = fold_numeric_literal(&arg.value.kind);
                 match lit {
-                    Some(v) if v > 0.0 => grad_clip = Some(v),
+                    // Finite and strictly below the f64::MAX sentinel codegen
+                    // uses for "no clipping" — an inf/MAX threshold would be
+                    // accepted-but-inert, the exact defect class this
+                    // contract refuses.
+                    Some(v) if v > 0.0 && v.is_finite() && v < f64::MAX => {
+                        grad_clip = Some(v)
+                    }
                     Some(v) => diags.push(
                         Diagnostic::error(format!(
-                            "train 'grad_clip' must be > 0 (got {v}) — the \
-                             runtime scales gradients by max_norm/norm, so 0 \
-                             zeroes every gradient each step and a negative \
-                             value flips their signs"
+                            "train 'grad_clip' must be a positive finite \
+                             threshold (got {v}) — the runtime scales \
+                             gradients by max_norm/norm, so 0 zeroes every \
+                             gradient each step, a negative value flips their \
+                             signs, and an infinite threshold never clips"
                         ))
-                        .with_label(arg.span, "expected a positive numeric literal"),
+                        .with_label(arg.span, "expected a positive finite numeric literal"),
                     ),
                     None => diags.push(
                         // Previously the ONLY key with a fully silent bad-value
@@ -274,8 +286,11 @@ pub fn resolve_train_config(
 
     // Pairing: a save path with no cadence would never fire, and a cadence
     // with no path is inert — both are the accepted-but-ignored shape this
-    // contract refuses.
-    if checkpoint_save.is_some() && checkpoint_every == 0 {
+    // contract refuses. Presence is judged from the KEYS WRITTEN (`seen`),
+    // not the validated values: `checkpoint_save="x", checkpoint_every=0`
+    // already got the range error, and telling that author checkpoint_every
+    // is MISSING would be factually false.
+    if checkpoint_save.is_some() && !seen.contains("checkpoint_every") {
         let mut d = Diagnostic::error(
             "train 'checkpoint_save' requires checkpoint_every=<N optimizer \
              steps> (a positive integer literal)",
@@ -285,7 +300,7 @@ pub fn resolve_train_config(
         }
         diags.push(d);
     }
-    if checkpoint_every > 0 && checkpoint_save.is_none() {
+    if checkpoint_every > 0 && !seen.contains("checkpoint_save") {
         let mut d = Diagnostic::error(
             "train 'checkpoint_every' without checkpoint_save= is inert — \
              nothing would be saved",
@@ -296,7 +311,11 @@ pub fn resolve_train_config(
         diags.push(d);
     }
 
-    if model.is_none() && purpose == TrainConfigPurpose::UserTrainBlock {
+    // Presence judged from the KEY WRITTEN, not the validated value: a
+    // `model = 5` already got the identifier error, and telling that author
+    // the key is MISSING would be factually false (same rule as the
+    // checkpoint pairing above).
+    if !seen.contains("model") && purpose == TrainConfigPurpose::UserTrainBlock {
         diags.push(
             Diagnostic::error("train block requires a 'model' config arg")
                 .with_label(train.span, "add model=<your model variable>"),
@@ -316,5 +335,25 @@ pub fn resolve_train_config(
         })
     } else {
         Err(diags)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TRAIN_CONFIG_KEYS ↔ EXPECTED_KEYS_LABEL drift guard. (The third copy
+    /// — the resolver's match arms — is pinned by the checker-level
+    /// `train_valid_full_header_produces_no_config_errors` test, which
+    /// writes every key from source and asserts no unknown-key error.)
+    #[test]
+    fn the_expected_keys_label_lists_every_accepted_key() {
+        for key in TRAIN_CONFIG_KEYS {
+            assert!(
+                EXPECTED_KEYS_LABEL.contains(&format!("{key}=")),
+                "EXPECTED_KEYS_LABEL is missing '{key}=' — the unknown-key \
+                 diagnostic would list a stale set"
+            );
+        }
     }
 }

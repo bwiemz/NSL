@@ -184,11 +184,26 @@ impl<'a> TypeChecker<'a> {
         let mut teacher_sym: Option<Symbol> = None;
         let mut student_sym: Option<Symbol> = None;
 
+        // Duplicate config keys, same contract as train's resolver: without
+        // this, a duplicated `grad_accumulation=` passed `nsl check` and only
+        // refused at build time (via the synthesized TrainBlock hitting the
+        // train resolver's duplicate rule — with a message naming a construct
+        // the program does not contain).
+        let mut seen_config: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for arg in &distill.config {
             let key = arg
                 .name
                 .map(|s| self.resolve_name(s))
                 .unwrap_or_default();
+            if !key.is_empty() && !seen_config.insert(key.clone()) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("duplicate distill config key '{key}'"))
+                        .with_label(arg.span, "already specified"),
+                );
+                continue;
+            }
             match key.as_str() {
                 "teacher" | "student" => {
                     if let ExprKind::Ident(sym) = arg.value.kind {
@@ -218,25 +233,38 @@ impl<'a> TypeChecker<'a> {
                     // `compile_distill_block` — so `let n = 8` followed by
                     // `distill(..., epochs = n)` compiled clean, reported
                     // "Epochs: 1", and trained the student on an eighth of
-                    // the requested work. `train(model = m, epochs = n)`
-                    // refuses the identical input; the asymmetry was the bug,
-                    // not the strictness.
+                    // the requested work. The asymmetry was the bug, not the
+                    // strictness — and the Training Configuration Contract
+                    // (`crate::train_config`, called from `check_train_block`)
+                    // has since lifted train's refusals into this layer too:
+                    // both blocks now refuse at `nsl check` time with spans.
                     //
-                    // Deliberately stricter than train AT THIS LAYER: train's
-                    // refusal lives in codegen (`stmt.rs`), so `nsl check` on
-                    // a train block with a non-literal `epochs` is green and
-                    // only `nsl build` refuses. Putting distill's here means
-                    // `nsl check` catches it and the diagnostic carries a
-                    // span. Lifting train's into this checker would make the
-                    // two layers agree, but that changes train-block
-                    // behaviour and belongs in its own change.
-                    if !matches!(arg.value.kind, ExprKind::IntLiteral(_)) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "distill 'epochs' must be an integer literal",
-                            )
-                            .with_label(arg.span, "expected an integer literal"),
-                        );
+                    // `>= 1` because distill epochs never travel through the
+                    // train resolver (they ride the typed `DistillAsTrain`
+                    // field and OVERWRITE the resolved value after it ran) —
+                    // without this arm, `epochs = 0` silently trained the
+                    // student zero epochs while the identical train header
+                    // refuses (review finding on 7e3aa7fa).
+                    match arg.value.kind {
+                        ExprKind::IntLiteral(n) if n >= 1 => {}
+                        ExprKind::IntLiteral(n) => {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "distill 'epochs' must be >= 1 (got {n}) — \
+                                     the epoch loop would run zero iterations \
+                                     and silently train nothing"
+                                ))
+                                .with_label(arg.span, "expected an integer literal >= 1"),
+                            );
+                        }
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "distill 'epochs' must be an integer literal",
+                                )
+                                .with_label(arg.span, "expected an integer literal"),
+                            );
+                        }
                     }
                     self.check_expr(&arg.value);
                 }

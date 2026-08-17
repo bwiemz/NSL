@@ -2524,18 +2524,87 @@ fn train_grad_clip_zero_negative_and_non_literal_are_refused() {
     // one key with a FULLY silent bad-value path (no else arm at all).
     let errs = train_config_errors("train(model = m, grad_clip = 0.0):");
     assert!(
-        errs.iter().any(|m| m.contains("'grad_clip' must be > 0")),
+        errs.iter()
+            .any(|m| m.contains("'grad_clip' must be a positive finite threshold")),
         "grad_clip=0 must refuse, got {errs:?}"
     );
     let errs = train_config_errors("train(model = m, grad_clip = -1.0):");
     assert!(
-        errs.iter().any(|m| m.contains("'grad_clip' must be > 0")),
+        errs.iter()
+            .any(|m| m.contains("'grad_clip' must be a positive finite threshold")),
         "negative grad_clip must refuse, got {errs:?}"
     );
     let errs = train_config_errors("train(model = m, grad_clip = gc):");
     assert!(
         errs.iter().any(|m| m.contains("'grad_clip' must be a numeric literal")),
         "non-literal grad_clip must refuse, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_model_non_identifier_is_refused() {
+    let errs = train_config_errors("train(model = 5):");
+    assert!(
+        errs.iter().any(|m| m.contains("'model' arg must be an identifier")),
+        "model=5 must refuse with the identifier message, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_checkpoint_value_shapes_are_refused() {
+    // Each refusal arm exercised so none can be silently deleted (review
+    // finding: the value arms had zero negative coverage).
+    let errs = train_config_errors(
+        r#"train(model = m, checkpoint_save = "", checkpoint_every = 5):"#,
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("'checkpoint_save' arg must be a non-empty")),
+        "empty save path must refuse, got {errs:?}"
+    );
+    let errs = train_config_errors(
+        r#"train(model = m, checkpoint_save = "ck.nslm", checkpoint_every = 0):"#,
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("'checkpoint_every' must be a positive")),
+        "checkpoint_every=0 must refuse, got {errs:?}"
+    );
+    // The range error must be the ONLY pairing-adjacent diagnostic: the
+    // cadence key IS present, so the "requires checkpoint_every" pairing
+    // message would be factually false here.
+    assert!(
+        !errs.iter().any(|m| m.contains("requires checkpoint_every")),
+        "a present-but-invalid cadence must not be reported as missing, got {errs:?}"
+    );
+    let errs = train_config_errors(
+        r#"train(model = m, checkpoint_save = "ck.nslm", checkpoint_every = n):"#,
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("'checkpoint_every' must be a positive")),
+        "non-literal checkpoint_every must refuse, got {errs:?}"
+    );
+    let errs = train_config_errors("train(model = m, checkpoint_load = 5):");
+    assert!(
+        errs.iter().any(|m| m.contains("'checkpoint_load' arg must be a non-empty")),
+        "non-string checkpoint_load must refuse, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_parenthesized_and_infinite_values_fold_and_refuse_correctly() {
+    // (2) folds through Paren — an improvement over the old codegen match,
+    // which refused any parenthesized literal outright.
+    let errs = train_config_errors("train(model = m, epochs = (2)):");
+    assert!(
+        !errs.iter().any(|m| m.contains("train '")),
+        "parenthesized literal epochs must fold clean, got {errs:?}"
+    );
+    // An infinite threshold collides with codegen's f64::MAX no-clipping
+    // sentinel — accepted-but-inert, so it refuses.
+    let errs = train_config_errors("train(model = m, grad_clip = 1e400):");
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("'grad_clip' must be a positive finite threshold")),
+        "an infinite grad_clip must refuse, got {errs:?}"
     );
 }
 
@@ -2574,10 +2643,90 @@ fn train_valid_full_header_produces_no_config_errors() {
     );
     let config_errs: Vec<_> = errs
         .iter()
-        .filter(|m| m.contains("train config") || m.contains("train '"))
+        .filter(|m| {
+            // Every contract message shape, including the missing-model one
+            // ("train block requires a 'model' config arg"), which matches
+            // neither of the first two patterns (review finding: the control
+            // was blind to a missing-model false positive).
+            m.contains("train config")
+                || m.contains("train '")
+                || m.contains("train block requires")
+        })
         .collect();
     assert!(
         config_errs.is_empty(),
         "valid header must produce no contract errors, got {config_errs:?}"
+    );
+}
+
+/// A minimal distill program with `{header}` spliced as the distill header.
+fn distill_fixture(header: &str) -> String {
+    format!(
+        r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let t = Tiny()
+let s = Tiny()
+let x = ones([4, 2])
+
+{header}
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = s.forward(x)
+"#
+    )
+}
+
+#[test]
+fn distill_epochs_zero_is_refused_like_train() {
+    // epochs rides the typed DistillAsTrain field, never the train
+    // resolver — without the checker's own >= 1 arm, distill(epochs = 0)
+    // silently trained the student ZERO epochs while the identical train
+    // header refuses (review finding on 7e3aa7fa).
+    let errs: Vec<String> = check_source(&distill_fixture(
+        "distill(teacher = t, student = s, epochs = 0):",
+    ))
+    .into_iter()
+    .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+    .map(|d| d.message)
+    .collect();
+    assert!(
+        errs.iter().any(|m| m.contains("distill 'epochs' must be >= 1")),
+        "distill epochs=0 must refuse, got {errs:?}"
+    );
+}
+
+#[test]
+fn distill_duplicate_config_key_is_refused_at_check_time() {
+    // Without this, a duplicated key passed `nsl check` and refused only at
+    // build time via the synthesized TrainBlock — with a message naming
+    // 'train', a construct the program does not contain.
+    let errs: Vec<String> = check_source(&distill_fixture(
+        "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2, grad_accumulation = 4):",
+    ))
+    .into_iter()
+    .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+    .map(|d| d.message)
+    .collect();
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("duplicate distill config key 'grad_accumulation'")),
+        "expected the distill-named duplicate refusal, got {errs:?}"
+    );
+}
+
+#[test]
+fn train_model_written_but_invalid_is_not_reported_as_missing() {
+    // Presence is judged from the key WRITTEN: `model = 5` gets the
+    // identifier error and must NOT also get "requires a 'model' config
+    // arg" — a factually false second diagnostic.
+    let errs = train_config_errors("train(model = 5):");
+    assert!(
+        !errs.iter().any(|m| m.contains("requires a 'model' config arg")),
+        "a written-but-invalid model must not be reported as missing, got {errs:?}"
     );
 }

@@ -98,6 +98,15 @@ fn a_typo_key_refuses_on_the_run_path_too() {
         stderr.contains("unknown train config key 'epochz'"),
         "the run path must carry the same refusal:\n{stderr}"
     );
+    // The refusal must come from the LOADER's semantic pass, not the codegen
+    // backstop: the backstop prefixes its (span-less) error with
+    // "train config refused:", so its absence pins that analysis caught it
+    // first — "refuses before codegen" is the property, not just "refuses".
+    assert!(
+        !stderr.contains("train config refused:"),
+        "the codegen backstop fired — the semantic layer should have refused \
+         first:\n{stderr}"
+    );
 }
 
 #[test]

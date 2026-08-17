@@ -85,7 +85,7 @@ model CNN:
 let cnn = CNN().to(cuda)
 let dataset = nsl.data.CIFAR10(root="./data", train=true)
 
-train(model=cnn, epochs=20, precision=fp32):
+train(model=cnn, epochs=20):
     # Data configuration
     data:
         source = dataset
@@ -131,10 +131,8 @@ let corpus = dataset("webtext"):
 train(
     model=llm,
     epochs=1,
-    precision=bf16,                    # automatic mixed precision
-    grad_scaler=auto,                   # dynamic loss scaling for bf16
-    accumulate=8,                       # 8 micro-batches per optimizer step
-    clip_grad_norm=1.0                  # global gradient norm clipping
+    grad_accumulation=8,                # 8 micro-batches per optimizer step
+    grad_clip=1.0                       # global gradient norm clipping
 ):
     data:
         source = corpus
@@ -215,7 +213,7 @@ let finetune_data = dataset("instruct"):
     )
     max_length = 2048
 
-train(model=lora_model, epochs=3, precision=bf16):
+train(model=lora_model, epochs=3):
     data:
         source = finetune_data
         batch_size = 8
@@ -263,9 +261,8 @@ distribute(strategy=fsdp, ranks=8):
 train(
     model=model,
     epochs=1,
-    precision=bf16,
-    accumulate=4,
-    clip_grad_norm=1.0
+    grad_accumulation=4,
+    grad_clip=1.0
 ):
     data:
         source = corpus
@@ -311,7 +308,7 @@ reward_model.freeze()
 let prompts = dataset("prompts"):
     source = nsl.data.JSONL("data/prompts.jsonl")
 
-train(model=policy, epochs=1, precision=bf16):
+train(model=policy, epochs=1):
     data:
         source = prompts
         batch_size = 16
@@ -369,7 +366,7 @@ The compiler can optimize the `train` block holistically:
    structure. Mitigation: the `step` block is arbitrary NSL code, giving full flexibility
    where it matters most. Only the outer structure (data, optimizer, scheduler) is declarative.
 
-2. **Implicit vs Explicit**: `train(accumulate=8)` hides the accumulation loop. Users who
+2. **Implicit vs Explicit**: `train(grad_accumulation=8)` hides the accumulation loop. Users who
    need to customize accumulation behavior (e.g., different scaling per accumulation step)
    must drop to the manual `grad` + `GradAccumulator` API from Section 3.
 
