@@ -31,6 +31,20 @@ impl<'a> TypeChecker<'a> {
             self.diagnostics.extend(diags);
         }
 
+        // Same contract for the optimizer:/scheduler:/callbacks: sections
+        // (crate::optim_config's module doc records the pre-contract holes:
+        // typo'd kwargs silently defaulted, unknown scheduler names
+        // silently trained at constant lr, unknown callback names were
+        // never emitted).
+        if let Err(diags) = crate::optim_config::resolve_optim_config(
+            &train.sections,
+            train.span,
+            &|sym| self.resolve_name(sym),
+            crate::train_config::TrainConfigPurpose::UserTrainBlock,
+        ) {
+            self.diagnostics.extend(diags);
+        }
+
         let mut has_step = false;
 
         for section in &train.sections {
@@ -70,13 +84,20 @@ impl<'a> TypeChecker<'a> {
                         self.check_stmt(stmt);
                     }
                 }
-                TrainSection::Optimizer(expr) => {
-                    self.check_expr(expr);
+                TrainSection::Optimizer(_expr) => {
+                    // Validated by resolve_optim_config above: constructor
+                    // name against the closed set, kwargs against the
+                    // per-optimizer table, values as literals with range
+                    // rules. Generic check_expr would add nothing (every
+                    // legal value is a literal) and the constructors are
+                    // variadic builtins that disable arity checking anyway.
                 }
                 TrainSection::Scheduler(_expr) => {
-                    // Skip type-checking the scheduler call: codegen auto-injects
-                    // base_lr and step as the first two arguments, so the user-facing
-                    // arg count is intentionally less than the stdlib signature.
+                    // Validated by resolve_optim_config above. Generic
+                    // expression checking stays off: codegen auto-injects
+                    // base_lr and step as the first two arguments, so the
+                    // user-facing arg count is intentionally less than the
+                    // stdlib signature.
                 }
                 TrainSection::Step { param, body } => {
                     has_step = true;
@@ -440,6 +461,22 @@ impl<'a> TypeChecker<'a> {
 
         // Shared sections — identical semantics to train, including the
         // `distribute:` refusal, which `train` makes too.
+        //
+        // The optimizer/scheduler/callbacks contract runs here as well:
+        // distill sections travel VERBATIM into the synthesized TrainBlock
+        // (cpkd.rs documents the guarantee), so without this call a typo'd
+        // optimizer kwarg passed `nsl check` and refused only at build —
+        // with a message naming `train`, a construct the program does not
+        // contain.
+        if let Err(diags) = crate::optim_config::resolve_optim_config(
+            &distill.sections,
+            distill.span,
+            &|sym| self.resolve_name(sym),
+            crate::train_config::TrainConfigPurpose::DistillLowering,
+        ) {
+            self.diagnostics.extend(diags);
+        }
+
         let mut has_step = false;
         for section in &distill.sections {
             match section {
@@ -469,11 +506,15 @@ impl<'a> TypeChecker<'a> {
                         self.check_stmt(stmt);
                     }
                 }
-                TrainSection::Optimizer(expr) => {
-                    self.check_expr(expr);
+                TrainSection::Optimizer(_expr) => {
+                    // Validated by resolve_optim_config above (same
+                    // contract as train — the sections are the same
+                    // sections).
                 }
                 TrainSection::Scheduler(_expr) => {
-                    // Same as train: codegen auto-injects base_lr/step args.
+                    // Validated by resolve_optim_config above. Generic
+                    // checking stays off: codegen auto-injects base_lr/step
+                    // args.
                 }
                 TrainSection::Step { param, body } | TrainSection::Eval { param, body } => {
                     if matches!(section, TrainSection::Step { .. }) {

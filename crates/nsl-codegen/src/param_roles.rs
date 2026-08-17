@@ -49,10 +49,12 @@ pub(crate) struct ParamRoleTable {
     pub warnings: Vec<String>,
 }
 
-/// Every role name `no_decay=[...]` accepts. Kept next to the classifier so
-/// the accepted set cannot drift from the set the classifier can produce —
-/// an unknown name is a compile error, never a silently-ignored entry.
-pub(crate) const VALID_ROLES: &[&str] = &["vector", "embedding", "head", "hidden"];
+// Every role name `no_decay=[...]` accepts is defined at
+// `nsl_semantic::optim_config::VALID_ROLES` — it moved there with the
+// section contract (the resolver validates `no_decay` at `nsl check`
+// time). The `classifier_roles_are_valid_roles` test below keeps that set
+// from drifting from the set the classifier can produce — an unknown name
+// is a compile error, never a silently-ignored entry.
 
 /// Resolved `no_decay=[...]`: which roles are exempt from weight decay.
 ///
@@ -270,4 +272,19 @@ mod tests {
     // crates/nsl-cli/tests/muon_optimizer_gate.rs (routing-table asserts on
     // real models); resolve_param_owner's array hop is covered there via
     // the `[TransformerBlock; N]` paths of the mixed-routing fixtures.
+
+    /// The classifier can only assign roles from `VALID_ROLES` — the drift
+    /// guard the accepted set relied on when it was defined in this file.
+    /// (`ParamRoleEntry.role` documents the producible set; the classifier
+    /// arms emit exactly these four strings.)
+    #[test]
+    fn classifier_roles_are_valid_roles() {
+        for role in ["embedding", "head", "hidden", "vector"] {
+            assert!(
+                nsl_semantic::optim_config::VALID_ROLES.contains(&role),
+                "classifier-producible role '{role}' is missing from \
+                 nsl_semantic::optim_config::VALID_ROLES"
+            );
+        }
+    }
 }

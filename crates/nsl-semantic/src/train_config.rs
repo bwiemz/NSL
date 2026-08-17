@@ -89,7 +89,7 @@ pub enum TrainConfigPurpose {
 /// literal" reads as nonsense. (Parenthesized literals were refused by the
 /// old codegen match too; transparency here is an improvement, not a
 /// compatibility need.)
-fn fold_int_literal(kind: &ExprKind) -> Option<i64> {
+pub(crate) fn fold_int_literal(kind: &ExprKind) -> Option<i64> {
     match kind {
         ExprKind::IntLiteral(n) => Some(*n),
         ExprKind::Paren(inner) => fold_int_literal(&inner.kind),
@@ -105,7 +105,7 @@ fn fold_int_literal(kind: &ExprKind) -> Option<i64> {
 }
 
 /// Same folding for a numeric (float-or-int) literal.
-fn fold_numeric_literal(kind: &ExprKind) -> Option<f64> {
+pub(crate) fn fold_numeric_literal(kind: &ExprKind) -> Option<f64> {
     match kind {
         ExprKind::FloatLiteral(f) => Some(*f),
         ExprKind::IntLiteral(n) => Some(*n as f64),

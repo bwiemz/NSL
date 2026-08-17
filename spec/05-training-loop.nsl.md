@@ -27,10 +27,9 @@ train_stmt      ::= 'data' ':' data_config
 
 optim_config    ::= optim_type '(' optim_params ')'
 optim_type      ::= 'Adam' | 'AdamW' | 'SGD' | 'Lion' | 'Muon' | 'SOAP'
-                   | 'Adagrad' | 'RMSProp' | 'LARS' | 'LAMB'
 
 sched_config    ::= sched_type '(' sched_params ')'
-sched_type      ::= 'Cosine' | 'WarmupCosine' | 'LinearDecay' | 'OneCycle'
+sched_type      ::= 'WarmupCosine' | 'CosineAnneal' | 'LinearDecay' | 'OneCycle'
                    | 'ConstantLR' | 'StepLR' | 'ExponentialLR'
 
 # Distributed training annotations
@@ -43,22 +42,22 @@ dist_strategy   ::= 'ddp' | 'fsdp' | 'pipeline' | 'tensor_parallel' | 'zero3'
 
 | Optimizer | Constructor                                                          | Description                              |
 |-----------|----------------------------------------------------------------------|------------------------------------------|
-| `Adam`    | `Adam(lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)`     | Standard Adam                            |
-| `AdamW`   | `AdamW(lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)`   | Adam with decoupled weight decay         |
-| `SGD`     | `SGD(lr=0.01, momentum=0.9, nesterov=false)`                         | Stochastic gradient descent              |
-| `Lion`    | `Lion(lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0)`                | Google Brain's Lion optimizer            |
-| `Muon`    | `Muon(lr=0.02, momentum=0.95, nesterov=true, ns_steps=5)`           | Mixed Muon/AdamW: Newton-Schulz orthogonalized momentum on rank-2 hidden weights; AdamW (beta1/beta2/eps args) on embeddings, the LM head and non-rank-2 params |
-| `SOAP`    | `SOAP(lr=1e-3, betas=(0.95, 0.95), shampoo_beta=0.95)`              | SOAP preconditioned optimizer            |
+| `Adam`    | `Adam(lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)` | Standard Adam                            |
+| `AdamW`   | `AdamW(lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01, no_decay=["vector"])` | Adam with decoupled weight decay; `no_decay=[role...]` exempts parameter roles from decay |
+| `SGD`     | `SGD(lr=0.01, momentum=0.9, dampening=0.0, weight_decay=0.0, nesterov=false)` | Stochastic gradient descent              |
+| `Lion`    | `Lion(lr=1e-4, beta1=0.9, beta2=0.99, weight_decay=0.0)`            | Google Brain's Lion optimizer            |
+| `Muon`    | `Muon(lr=0.02, momentum=0.95, nesterov=true, ns_steps=5, adamw_lr=3e-4)` | Mixed Muon/AdamW: Newton-Schulz orthogonalized momentum on rank-2 hidden weights; AdamW (beta1/beta2/eps args) on embeddings, the LM head and non-rank-2 params |
+| `SOAP`    | `SOAP(lr=1e-3, beta1=0.95, beta2=0.95, eps=1e-8)`                   | SOAP preconditioned optimizer            |
 
 ## Built-in Schedulers
 
 | Scheduler       | Constructor                                                    | Description                              |
 |-----------------|----------------------------------------------------------------|------------------------------------------|
-| `Cosine`        | `Cosine(T_max, eta_min=0.0)`                                  | Cosine annealing                         |
-| `WarmupCosine`  | `WarmupCosine(warmup_steps, total_steps, min_lr=0.0)`          | Linear warmup then cosine decay          |
-| `LinearDecay`   | `LinearDecay(total_steps, end_factor=0.0)`                     | Linear learning rate decay               |
-| `OneCycle`      | `OneCycle(max_lr, total_steps, pct_start=0.3)`                 | 1cycle policy (super-convergence)        |
-| `StepLR`        | `StepLR(step_size, gamma=0.1)`                                 | Decay by gamma every step_size epochs    |
+| `CosineAnneal`  | `CosineAnneal(t_max=1000, eta_min=0.0)`                        | Cosine annealing                         |
+| `WarmupCosine`  | `WarmupCosine(warmup_steps=100, total_steps=1000, min_lr=1e-5)` | Linear warmup then cosine decay          |
+| `LinearDecay`   | `LinearDecay(total_steps=1000, end_factor=0.0)`                | Linear learning rate decay               |
+| `OneCycle`      | `OneCycle(max_lr=10*lr, total_steps=1000, pct_start=0.3)`      | 1cycle policy (super-convergence); `max_lr` defaults to 10x the optimizer lr |
+| `StepLR`        | `StepLR(step_size=10, gamma=0.1)`                              | Decay by gamma every step_size steps     |
 | `ConstantLR`    | `ConstantLR()`                                                 | No scheduling (constant LR)             |
 
 ## 5 Complete Training Loop Examples
@@ -142,13 +141,11 @@ train(
 
     optimizer: AdamW(
         lr=6e-4,
-        betas=(0.9, 0.95),
+        beta1=0.9,
+        beta2=0.95,
         weight_decay=0.1,
-        # Per-parameter group: no weight decay on biases and norms
-        groups=[
-            {params: model.params(filter="*.weight"), weight_decay: 0.1},
-            {params: model.params(filter="*.bias|*.norm*"), weight_decay: 0.0}
-        ]
+        # No weight decay on non-rank-2 params (biases, norms):
+        no_decay=["vector"]
     )
 
     scheduler: WarmupCosine(
@@ -271,7 +268,7 @@ train(
         # Automatically uses DistributedSampler — each GPU gets different data
         distributed = true
 
-    optimizer: AdamW(lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+    optimizer: AdamW(lr=3e-4, beta1=0.9, beta2=0.95, weight_decay=0.1)
     scheduler: WarmupCosine(warmup_steps=1000, total_steps=50000)
 
     step(batch):

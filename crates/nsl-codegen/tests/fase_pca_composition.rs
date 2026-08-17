@@ -143,7 +143,7 @@ fn pca_active_without_fase_when_grad_accumulation_one() {
             "train(model = m, grad_accumulation = 1):\n",
             "    data:\n",
             "        source = PretrainCorpus\n",
-            "    optimizer: AdamW\n",
+            "    optimizer: AdamW(lr = 0.001)\n",
         )
     );
     let (ast, interner, diags) = parse_and_check(&src);
@@ -181,7 +181,7 @@ fn fase_active_without_pca_when_dataset_has_no_packing() {
             "train(model = m, grad_accumulation = 4):\n",
             "    data:\n",
             "        source = PretrainCorpus\n",
-            "    optimizer: AdamW\n",
+            "    optimizer: AdamW(lr = 0.001)\n",
         )
     );
     let (ast, interner, diags) = parse_and_check(&src);
@@ -216,7 +216,7 @@ fn fase_grad_clip_composes_with_pca_packing() {
             "train(model = m, grad_accumulation = 4, grad_clip = 1.0):\n",
             "    data:\n",
             "        source = PretrainCorpus\n",
-            "    optimizer: AdamW\n",
+            "    optimizer: AdamW(lr = 0.001)\n",
         )
     );
     let (ast, interner, diags) = parse_and_check(&src);
@@ -296,7 +296,7 @@ fn data_section_unknown_key_is_refused() {
             "train(model = m, grad_accumulation = 4):\n",
             "    data:\n",
             "        surce = PretrainCorpus\n", // typo for `source`
-            "    optimizer: AdamW\n",
+            "    optimizer: AdamW(lr = 0.001)\n",
         )
     );
     let (_ast, _interner, diags) = parse_and_check(&src);
@@ -326,7 +326,7 @@ fn separator_token_id_accepted_and_threaded_through() {
             "train(model = m, grad_accumulation = 4):\n",
             "    data:\n",
             "        source = PretrainCorpus\n",
-            "    optimizer: AdamW\n",
+            "    optimizer: AdamW(lr = 0.001)\n",
         )
     );
     let (ast, interner, diags) = parse_and_check(&src);

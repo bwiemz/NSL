@@ -58,7 +58,7 @@ fn single_cpdt_decorator_is_clean() {
 @cpdt(num_gpus=4)
 train Toy:
     data: []
-    optimizer: adam
+    optimizer: adam(lr = 0.001)
 "#;
     let errs = cpdt_errs(src);
     assert!(
@@ -78,12 +78,12 @@ fn duplicate_cpdt_decorator_emits_diagnostic_with_two_labels() {
 @cpdt(num_gpus=4)
 train A:
     data: []
-    optimizer: adam
+    optimizer: adam(lr = 0.001)
 
 @cpdt(num_gpus=2)
 train B:
     data: []
-    optimizer: adam
+    optimizer: adam(lr = 0.001)
 "#;
     let diags = analyze_full(src);
     let single_instance_diag = diags
@@ -123,7 +123,7 @@ fn cpdt_weight_aware_false_parses_clean() {
 @cpdt(num_gpus=4, weight_aware=false)
 train Toy:
     data: []
-    optimizer: adam
+    optimizer: adam(lr = 0.001)
 "#;
     let errs = cpdt_errs(src);
     assert!(
