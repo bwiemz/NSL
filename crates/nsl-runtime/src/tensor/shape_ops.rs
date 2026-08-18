@@ -1190,6 +1190,30 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
         return tensor_ptr;
     }
 
+    // A materializing contiguous must still be DIFFERENTIABLE on the tape:
+    // the copy carries a fresh tape_id, so without a recorded node the
+    // graph silently disconnects here and everything upstream gets NO
+    // gradient. This is not hypothetical — the GQA KV path is
+    // `expand(...).contiguous().reshape(...)` (stdlib gqa.nsl) while Q goes
+    // through no contiguous, so under tape AD every K/V projection trained
+    // with EXACTLY ZERO gradient (caught by the item-5 AD differential's
+    // per-parameter checksums; the loss curves alone looked healthy). A
+    // same-shape Reshape is the established metadata-only relabel — the
+    // backward passes the gradient through unchanged (see the identity
+    // dropout arm in tensor/mod.rs for the precedent).
+    let record_relabel = |out: i64| {
+        if autodiff::is_recording() {
+            let input_shape: Vec<i64> =
+                (0..ndim).map(|i| unsafe { *t.shape.add(i) }).collect();
+            autodiff::maybe_record(autodiff::TapeOp::Reshape {
+                a: tensor_ptr,
+                out,
+                input_shape,
+            });
+        }
+        out
+    };
+
     // GPU path: native on-device strided copy kernel (no CPU round-trip)
     if t.device > 0 {
         #[cfg(feature = "cuda")]
@@ -1211,7 +1235,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             // exactly the cases `gpu_strided_copy_f32` would have read at
             // 4 bytes per element out of a 2-byte-per-element allocation.
             crate::cuda::assert_gpu_f32(t, "nsl_tensor_contiguous", "input");
-            return crate::cuda::gpu_strided_copy_f32(tensor_ptr);
+            return record_relabel(crate::cuda::gpu_strided_copy_f32(tensor_ptr));
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -1219,7 +1243,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
             let gpu_contig = super::nsl_tensor_to_device(cpu_t, t.device as i64);
             super::nsl_tensor_free(cpu_t);
-            return gpu_contig;
+            return record_relabel(gpu_contig);
         }
     }
 
@@ -1257,5 +1281,5 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
         1,
         0,
     ));
-    NslTensor::publish(result)
+    record_relabel(NslTensor::publish(result))
 }

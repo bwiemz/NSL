@@ -31,9 +31,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn run_fixture(extra: &[&str], tmp: &std::path::Path) -> (bool, Vec<f64>, String) {
+fn run_fixture(fixture_name: &str, extra: &[&str], tmp: &std::path::Path) -> (bool, Vec<f64>, String) {
     let root = workspace_root();
-    let fixture = root.join("crates/nsl-cli/tests/fixtures/tape_loader_train.nsl");
+    let fixture = root.join("crates/nsl-cli/tests/fixtures").join(fixture_name);
     assert!(fixture.exists(), "fixture missing: {}", fixture.display());
     let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
         .arg("run")
@@ -51,7 +51,7 @@ fn run_fixture(extra: &[&str], tmp: &std::path::Path) -> (bool, Vec<f64>, String
         .take_while(|l| !l.contains("LOSS_STREAM_END"))
         .filter_map(|l| l.trim().parse::<f64>().ok())
         .collect();
-    let complete = stdout.contains("TAPE_LOADER_TRAIN_COMPLETE");
+    let complete = stdout.contains("LOSS_STREAM_END");
     (out.status.success() && complete, losses, stderr)
 }
 
@@ -60,15 +60,15 @@ fn tape_loader_train_runs_learns_and_agrees_with_source_ad() {
     let tmp = tempfile::TempDir::new().unwrap();
 
     // ── leg 1: bare run = tape AD; must complete and learn ─────────────
-    let (tape_ok, tape_losses, tape_stderr) = run_fixture(&[], tmp.path());
+    let (tape_ok, tape_losses, tape_stderr) = run_fixture("tape_loader_train.nsl", &[], tmp.path());
     assert!(
         tape_ok,
         "loader-driven train block failed under default tape AD:\n{tape_stderr}"
     );
     // 2 epochs × 16 batches = 32 micro-steps; on_step fires per micro-batch.
     assert!(
-        tape_losses.len() >= 16,
-        "expected a loss stream, got {} values (stderr:\n{tape_stderr})",
+        tape_losses.len() >= 32,
+        "expected 32 micro-step losses, got {} (stderr:\n{tape_stderr})",
         tape_losses.len()
     );
     let first = tape_losses[0];
@@ -86,7 +86,8 @@ fn tape_loader_train_runs_learns_and_agrees_with_source_ad() {
     );
 
     // ── leg 2: source AD on the identical program/data/order ───────────
-    let (src_ok, src_losses, src_stderr) = run_fixture(&["--source-ad"], tmp.path());
+    let (src_ok, src_losses, src_stderr) =
+        run_fixture("tape_loader_train.nsl", &["--source-ad"], tmp.path());
     assert!(src_ok, "--source-ad control failed:\n{src_stderr}");
     assert_eq!(
         tape_losses.len(),
@@ -105,6 +106,38 @@ fn tape_loader_train_runs_learns_and_agrees_with_source_ad() {
         let denom = s.abs().max(1e-12);
         assert!(
             ((t - s) / denom).abs() < 1e-6,
+            "AD modes diverged at micro-step {i}: tape={t} source={s}"
+        );
+    }
+}
+
+/// The GQA composition leg. TinyLM above has no attention, and that gap
+/// hid a total gradient disconnection: the stdlib GQA K/V path is
+/// `expand(...).contiguous().reshape(...)`, and a materializing
+/// `contiguous` recorded NOTHING on the tape — every K/V projection
+/// trained with exactly zero gradient while the loss curve looked
+/// healthy (caught by the item-5 AD differential's per-parameter
+/// checksums, invisible to trajectory eyeballing). The tolerance is
+/// wider than leg 3's because the masked-SDPA chain reorders more f64
+/// math between the modes (measured max ≈ 3e-7), but a dead K/V
+/// diverges the trajectory by percent-scale within a few steps.
+#[test]
+fn tape_gqa_train_agrees_with_source_ad() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (tape_ok, tape_losses, tape_stderr) =
+        run_fixture("wggo_packed_pretrain.nsl", &[], tmp.path());
+    assert!(tape_ok, "GQA loader fixture failed under tape AD:\n{tape_stderr}");
+    let (src_ok, src_losses, src_stderr) =
+        run_fixture("wggo_packed_pretrain.nsl", &["--source-ad"], tmp.path());
+    assert!(src_ok, "GQA --source-ad control failed:\n{src_stderr}");
+    assert_eq!(tape_losses.len(), src_losses.len());
+    assert!(tape_losses.len() >= 32, "expected 64 micro-steps, got {}", tape_losses.len());
+    let first = tape_losses[0];
+    let last = *tape_losses.last().unwrap();
+    assert!(last.is_finite() && last < first * 0.7, "GQA tape run did not learn: {first} -> {last}");
+    for (i, (t, s)) in tape_losses.iter().zip(src_losses.iter()).enumerate() {
+        assert!(
+            ((t - s) / s.abs().max(1e-12)).abs() < 1e-5,
             "AD modes diverged at micro-step {i}: tape={t} source={s}"
         );
     }

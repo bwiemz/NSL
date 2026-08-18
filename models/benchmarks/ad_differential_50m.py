@@ -157,6 +157,13 @@ def main() -> None:
         tape_a = run_once(args.nsl, f"seed{seed}/tape-A", seed, False)
         tape_b = run_once(args.nsl, f"seed{seed}/tape-B", seed, False)
 
+        # All four runs must have seen the SAME micro-step count — the
+        # window comparisons below zip() and would silently truncate
+        # (review finding on the item-5 commit).
+        counts = {len(r.losses) for r in (src_a, src_b, tape_a, tape_b)}
+        if len(counts) != 1:
+            sys.exit(f"[seed {seed}] runs saw different step counts: {counts}")
+
         # Same-mode step-0 reproducibility is the foundation everything
         # else stands on — refuse to interpret anything if it fails.
         if src_a.losses[0] != src_b.losses[0] or tape_a.losses[0] != tape_b.losses[0]:

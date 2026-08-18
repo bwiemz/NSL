@@ -238,13 +238,24 @@ pub extern "C" fn nsl_model_forward_grad(
     struct TapeGuard;
     impl Drop for TapeGuard {
         fn drop(&mut self) {
-            crate::autodiff::TAPE.with(|t| {
+            // Two phases like nsl_tape_stop: collect the deferred transient
+            // frees under the borrow, release them after dropping it (a free
+            // can re-enter is_recording, and recording is false by then).
+            // Without this drain, the grad path retained one full session's
+            // skipped transients (per-layer score/softmax matrices) until
+            // the NEXT tape_start on the thread — and forever after the
+            // last call (review finding on the item-5 commit).
+            let deferred = crate::autodiff::TAPE.with(|t| {
                 let mut tape = t.borrow_mut();
                 crate::autodiff::release_tape_op_refs(&tape.ops);
                 tape.ops.clear();
                 tape.recording = false;
                 tape.pause_depth = 0;
+                std::mem::take(&mut tape.deferred_transients)
             });
+            for ptr in deferred {
+                crate::tensor::nsl_tensor_free_if_valid(ptr);
+            }
         }
     }
 

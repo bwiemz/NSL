@@ -177,6 +177,21 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
 /// The element count must match (panics otherwise).
 pub(crate) fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    // Device bounce (see broadcast_grad_along_dim): the memcpy below reads
+    // tensor.data through a HOST pointer, and it previously published the
+    // host copy as device-resident — the Unsqueeze/Expand GPU tape
+    // backward would either segfault or hand a bogus device pointer to the
+    // next kernel (review finding: the same class as the
+    // scatter_gather_grad bounce this commit added).
+    if tensor.device > 0 {
+        let device = tensor.device as i64;
+        let cpu_t = nsl_tensor_to_device(tensor_ptr, 0);
+        let cpu_out = reshape_to_shape(cpu_t, shape);
+        let gpu_out = nsl_tensor_to_device(cpu_out, device);
+        tensor_free(cpu_t);
+        tensor_free(cpu_out);
+        return gpu_out;
+    }
     let ndim = shape.len() as i64;
     let total: i64 = shape.iter().product();
     assert_eq!(total, tensor.len, "reshape_to_shape: size mismatch {} vs {}", total, tensor.len);
