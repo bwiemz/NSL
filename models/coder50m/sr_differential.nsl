@@ -1,0 +1,84 @@
+# models/coder50m/sr_differential.nsl
+# ============================================================================
+# NSL-Coder-50M — SR-BF16 vs F32-oracle differential (roadmap item 6)
+# ============================================================================
+#
+# One program, two parameter dtypes: run under the CSLA + weight-stream
+# composition `--param-dtype bf16-sr` requires, once with `--param-dtype
+# f32` (the ORACLE — the identical residency schedule, so the comparison
+# isolates authoritative bf16 storage + the fused stochastically-rounded
+# AdamW step, not the stack) and once with `bf16-sr`. Driven by
+# models/benchmarks/sr_differential_50m.py.
+#
+# Differences from pretrain_srbf16_cert.nsl, all deliberate:
+#   - REAL corpus: the 2026-07-30 banked trajectories used a synthetic
+#     memorizable stream whose loss collapses to ~0.01 — a regime where a
+#     rounding-induced quality delta cannot show. This program trains one
+#     epoch over an 8.39M-token slice of data/tokens/train_new.bin and
+#     then evaluates a HELD-OUT 512-batch tail slice the training never
+#     touches (both slices are materialized by the harness).
+#   - VAL_LOSS: forward-only held-out cross-entropy after training — the
+#     quality metric the roadmap item asks for ("quantify real quality
+#     delta before calling SR default").
+# Kept from the cert program (banked conventions):
+#   - fixed-lr AdamW (no scheduler), grad_accumulation=2 (bf16-sr needs
+#     the FASE-Deferred fused window), NO grad_clip (--layerwise-accum
+#     refuses two-phase clipping), NO @fused_lm_ce (its backward
+#     accumulation order shifts curves ~1e-5 relative from step 2).
+#   - training=true (dropout 0.1 active): under --deterministic + --seed
+#     the masks are identical across arms, so dropout does not decouple
+#     the comparison — and the quality question is about the PRODUCTION
+#     configuration, which trains with dropout.
+#
+# RUN (from models/coder50m), F32 oracle vs SR:
+#   nsl run --seed N --source-ad --deterministic --checkpoint-blocks \
+#       --layerwise-accum --weight-stream [--param-dtype bf16-sr] \
+#       sr_differential.nsl
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+let tokens = load_mmap("../../data/tokens/sr_train_slice.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 8 == 0:
+                print(step)
+                print(loss)
+
+print("LOSS_STREAM_END")
+
+# ── held-out validation: forward-only CE over the tail slice ────────────
+let val_tokens = load_mmap("../../data/tokens/sr_val_slice.bin", 3)
+let val_loader = DataLoader(val_tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+let val_total = 0.0
+let val_count = 0.0
+for batch in val_loader:
+    let logits = m.forward_train(batch.input_ids, false)
+    let ls = logits.shape
+    let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+    let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+    let vloss = cross_entropy(flat_logits, flat_labels)
+    val_total = val_total + vloss.item()
+    val_count = val_count + 1.0
+
+print("VAL_LOSS")
+print(val_total / val_count)
+print("VAL_BATCHES")
+print(val_count)
+print("SR_DIFFERENTIAL_COMPLETE")
