@@ -454,6 +454,23 @@ pub(crate) fn scatter_gather_grad(
 ) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
     let indices = NslTensor::from_ptr(indices_ptr);
+    // Device bounce (see broadcast_grad_along_dim). This was the LAST
+    // unguarded host loop in this file: its siblings above bounce, so the
+    // first GPU tape backward through a Gather (the 50M model's very
+    // first micro-batch) segfaulted HERE while every neighboring arm
+    // survived. Indices bounce too — the loader can hand device-resident
+    // index tensors.
+    if grad.device > 0 || indices.device > 0 {
+        let device = grad.device.max(indices.device) as i64;
+        let cpu_g = if grad.device > 0 { nsl_tensor_to_device(grad_ptr, 0) } else { grad_ptr };
+        let cpu_i = if indices.device > 0 { nsl_tensor_to_device(indices_ptr, 0) } else { indices_ptr };
+        let cpu_out = scatter_gather_grad(cpu_g, input_shape, dim, cpu_i);
+        let gpu_out = nsl_tensor_to_device(cpu_out, device);
+        if cpu_g != grad_ptr { tensor_free(cpu_g); }
+        if cpu_i != indices_ptr { tensor_free(cpu_i); }
+        tensor_free(cpu_out);
+        return gpu_out;
+    }
     let grad_dtype = grad.dtype;
 
     // Create zero gradient with input_shape, matching grad dtype

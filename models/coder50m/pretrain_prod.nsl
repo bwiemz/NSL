@@ -38,13 +38,12 @@
 #
 # RUN (from models/coder50m):
 #   nsl run --source-ad pretrain_prod.nsl
-# Source AD is the production path. KNOWN LIMIT (pinned by
-# pretrain_prod_agreement_gate): tape AD does not yet support
-# DataLoader-driven train blocks — bare `nsl run` / `--tape-ad` refuse
-# with "train step body must assign to a variable named 'loss'" (the
-# tape lowering never finds the binding when a loader drives the step;
-# every committed coder50m program shares this). The roadmap's AD
-# differential campaign (item 5) needs that fixed first.
+# Source AD is the production path (fused LCE/SDPA only exist there —
+# a bare tape run materializes the full [batch*seq, vocab] logits
+# surface and is reference-speed, not production-speed). Tape AD
+# supports DataLoader-driven train blocks as of the item-5 campaign;
+# pretrain_prod_agreement_gate pins that BOTH modes build, and
+# tape_dataloader_train_gate runs the composition end to end.
 
 from model import NSLCoder
 from nsl.nn.losses import cross_entropy

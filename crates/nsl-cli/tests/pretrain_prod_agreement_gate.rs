@@ -183,15 +183,15 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
     assert!((prod_kwarg(&prod, "hidden_size") - d_model).abs() < 1e-12);
     assert!((prod_kwarg(&prod, "seq_len") - seq_len).abs() < 1e-12);
 
-    // ── the file COMPILES under the production AD mode, and the tape
-    //    limitation is pinned, not assumed ─────────────────────────────
+    // ── the file COMPILES under BOTH AD modes ──────────────────────────
     // Source AD is the production path (validated end-to-end on GPU).
-    // Tape AD does not yet support DataLoader-driven train blocks: it
-    // refuses with "must assign to a variable named 'loss'" (the tape
-    // lowering never finds the binding when a loader drives the step).
-    // Item 5 (tape-vs-source differential) needs that fixed; this pin
-    // flips CONSCIOUSLY when it is. Both are codegen-time outcomes, so a
-    // no-cuda build exercises them.
+    // Tape AD gained DataLoader-driven train blocks in the item-5
+    // campaign (the loader path's packing-registry stash used to leave
+    // state.current_block on a terminated block, so compile_stmt
+    // silently skipped the whole step body and the tape lowering refused
+    // with "must assign to a variable named 'loss'"). Both arms are
+    // codegen-time outcomes, so a no-cuda build exercises them; the
+    // runtime leg lives in tape_dataloader_train_gate.rs.
     let tmp = std::env::temp_dir().join(format!("nsl_prodgate_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let run_build = |extra: &[&str]| {
@@ -211,9 +211,7 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
         )
     };
     // Collect BOTH outcomes, remove the temp dir, THEN assert — a panic
-    // must not leak a 125 MB prod_gate.o onto the 31G tmpfs (review
-    // finding: the tape pin below is DESIGNED to fire when item 5's fix
-    // lands, which is exactly when the leak would start).
+    // must not leak a 125 MB prod_gate.o onto the 31G tmpfs.
     let (srcad_ok, srcad_stderr) = run_build(&["--source-ad"]);
     let (tape_ok, tape_stderr) = run_build(&[]);
     let _ = std::fs::remove_dir_all(&tmp);
@@ -223,10 +221,13 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
          mode):\n{srcad_stderr}"
     );
     assert!(
-        !tape_ok && tape_stderr.contains("must assign to a variable named 'loss'"),
-        "the tape x DataLoader limitation moved — if tape AD now supports \
-         loader-driven train blocks, item 5 is unblocked: update this pin \
-         and the pretrain_prod.nsl header together.\n{tape_stderr}"
+        tape_ok,
+        "pretrain_prod.nsl must build under default tape AD too — \
+         loader-driven tape train blocks are supported as of the item-5 \
+         campaign, and the AD differential depends on this arm. If this \
+         regressed, the misleading historical symptom was \"train step \
+         body must assign to a variable named 'loss'\" from a silently \
+         skipped step body.\n{tape_stderr}"
     );
 
     // ── CORPUS_TOKENS is real, when the local corpus is present ────────

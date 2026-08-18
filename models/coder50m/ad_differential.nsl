@@ -1,0 +1,53 @@
+# models/coder50m/ad_differential.nsl
+# ============================================================================
+# NSL-Coder-50M — AD differential program (roadmap item 5)
+# ============================================================================
+#
+# One program, two AD modes: run under `--source-ad` (production) and under
+# bare tape AD (reference), same seed, same data order, and compare the
+# per-step loss trajectories. Driven by
+# models/benchmarks/ad_differential_50m.py, which runs a source-vs-source
+# control pair per seed to measure the run-to-run noise envelope before
+# judging tape-vs-source (never claim parity without running the control).
+#
+# Differences from pretrain_prod.nsl — each is a deliberate isolation:
+#   - NO @fused_lm_ce: the fused kernel exists only on the source-AD path;
+#     leaving it off makes both modes compute the same unfused math
+#     (fused-vs-unfused equivalence has its own parity gates).
+#   - training=false (dropout OFF): the two AD implementations draw mask
+#     RNG through different code paths, so active dropout would compare
+#     noise, not gradients (tape dropout parity is separately gated by
+#     dropout_backward_parity_gate).
+#   - 128 micro-steps over a 128Ki-token slice of the production corpus
+#     (the harness materializes ../../data/tokens/ad_differential_slice.bin
+#     from train_new.bin), accum=1 so every step is an optimizer update.
+#   - on_step prints EVERY loss — the trajectory is the measurement.
+#
+# The harness also sets NSL_MATMUL_TF32=0: full-f32 gemms shrink the
+# run-to-run envelope the differential is judged against.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+let tokens = load_mmap("../../data/tokens/ad_differential_slice.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=1, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=10, total_steps=128, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, false)
+        let flat_logits = logits.reshape([1024, 49152])
+        let flat_labels = batch.labels.reshape([1024])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("AD_DIFFERENTIAL_COMPLETE")

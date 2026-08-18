@@ -1,0 +1,58 @@
+# Tape-AD × DataLoader end-to-end fixture (CPU, self-contained data).
+#
+# Bare `nsl run` (default tape AD) on a DataLoader-driven train block.
+# This composition had NEVER executed before the item-5 campaign: every
+# committed loader-driven program was run with --source-ad, which masked
+# two independent bugs pinned by tape_dataloader_train_gate.rs:
+#   1. codegen: the packing-registry stash (loader path only) left
+#      state.current_block on a terminated block, so compile_stmt
+#      silently skipped the ENTIRE step body and the tape path refused
+#      with "must assign to a variable named 'loss'";
+#   2. runtime: the tape's MatMul backward returned the batch-shaped
+#      unreduced gradient for a broadcast operand ([b,s,d] @ [d,v] gave
+#      a [b,s,v] dW), aborting in the optimizer's in-place update.
+#
+# The token stream is built in-program (no corpus file), so the fixture
+# runs anywhere. grad_accumulation=2 exercises the grad-accum in-place
+# add; grad_clip exercises the clip path on the reduced shapes.
+
+from nsl.nn.losses import cross_entropy
+
+model TinyLM:
+    embed: Tensor = randn([32, 8]) * 0.1
+    w: Tensor = randn([8, 32]) * 0.1
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let b = ids_shape[0]
+        let s = ids_shape[1]
+        let flat_ids = input_ids.reshape([b * s])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([b, s, 8])
+        # 3D @ 2D: the broadcast batched matmul whose backward the tape
+        # previously returned unreduced.
+        return h @ self.w
+
+let m = TinyLM()
+
+# Deterministic token stream cycling 1..8 — trivially learnable.
+let unit = arange(8) + full([8], 1.0)
+let tokens = unit.reshape([1, 8]).expand([32, 8]).contiguous().reshape([256])
+let loader = DataLoader(tokens, batch_size=2, seq_len=8, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=2, grad_accumulation=2, grad_clip=1.0):
+    optimizer: AdamW(lr=0.01, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("TAPE_LOADER_TRAIN_COMPLETE")

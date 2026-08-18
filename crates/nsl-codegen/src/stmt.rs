@@ -8182,7 +8182,7 @@ impl Compiler<'_> {
             // backward can re-install micro-batch b's metadata before
             // replaying its adjoint — the registry is per-batch state read
             // at @flash_attention LAUNCH time).
-            self.emit_packing_registry_stash(builder, batch_val)?;
+            self.emit_packing_registry_stash(builder, state, batch_val)?;
         }
 
         let prev_batch_scope = state.flags.in_dataloader_batch_scope;
@@ -14946,7 +14946,7 @@ impl Compiler<'_> {
                     // range: the registry is thread-local per-batch state
                     // read at @flash_attention launch time, and any range
                     // may contain attention backward ops.
-                    self.emit_packing_registry_stash(builder, d)?;
+                    self.emit_packing_registry_stash(builder, state, d)?;
                     Some(d)
                 } else {
                     None
@@ -17101,6 +17101,7 @@ impl Compiler<'_> {
     fn emit_packing_registry_stash(
         &mut self,
         builder: &mut FunctionBuilder,
+        state: &mut FuncState,
         batch_val: Value,
     ) -> Result<(), CodegenError> {
         use cranelift_codegen::ir::condcodes::IntCC;
@@ -17159,6 +17160,15 @@ impl Compiler<'_> {
 
         builder.switch_to_block(after_block);
         builder.seal_block(after_block);
+        // The probe's brif TERMINATED the block the caller was in; leaving
+        // `state.current_block` pointing at it makes compile_stmt's
+        // filled-block guard silently SKIP every subsequent statement.
+        // That was the entire tape×DataLoader failure: the step body
+        // compiled to nothing, so the 'loss' binding never landed and the
+        // tape path refused with "must assign to a variable named 'loss'"
+        // (source AD never noticed — it lowers the extracted Wengert list
+        // without consulting current_block).
+        state.current_block = Some(after_block);
 
         // PCA Tier A (spec §6.1): when a segment-masked kernel was
         // synthesized for this module, warn once if no segment_ids ever

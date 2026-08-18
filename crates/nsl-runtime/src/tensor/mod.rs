@@ -1432,6 +1432,13 @@ pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_free_transient(ptr: i64) {
     if crate::autodiff::is_recording() {
+        // Deferred, not dropped: the tape holds bare pointers so the free
+        // cannot land NOW, but dropping it entirely leaked every recorded
+        // transient permanently — one score matrix + one softmax per
+        // attention layer per forward at Coder-50M (~784 MB/micro-batch,
+        // OOM inside 6 micro-batches). `nsl_tape_stop` performs the
+        // deferred decrement once the backward has consumed the tape.
+        crate::autodiff::defer_transient_free(ptr);
         return;
     }
     nsl_tensor_free_if_valid(ptr);
