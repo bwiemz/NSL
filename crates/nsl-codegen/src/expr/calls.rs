@@ -1481,16 +1481,33 @@ impl Compiler<'_> {
             let v_val = self.compile_nested_expr(builder, state, &args[2].value)?;
             let scale_val = self.compile_nested_expr(builder, state, &args[3].value)?;
 
-            // Check for causal named arg
-            let mut causal = false;
+            // Causal flag: POSITIONAL arg 5 or named `causal=`, defaulting to
+            // TRUE when absent — the same contract source AD reads
+            // (`source_ad.rs`'s ScaledDotProductAttention arm inspects
+            // `input_vars[4]` positionally and defaults to causal) and the
+            // same default `@flash_attention` documents.
+            //
+            // This path previously honoured ONLY the named spelling and
+            // defaulted to FALSE, so the two AD modes disagreed on both
+            // conventions at once. The stdlib GQA passes the flag
+            // POSITIONALLY (`scaled_dot_product_attention(q, k, v, scale,
+            // true)` in nsl/nn/gqa.nsl), which meant every tape-mode causal
+            // LM — including the 50M coder model — silently trained with
+            // BIDIRECTIONAL attention: each position could read its own
+            // future tokens. It shows up as a systematically LOWER tape loss
+            // (label leakage helps once training starts), which is exactly
+            // the residual the item-5 AD differential could not explain.
+            let mut causal = true;
             if args.len() > 4 {
                 for arg in &args[4..] {
-                    if let Some(name_sym) = arg.name {
-                        let name = self.resolve_sym(name_sym).to_string();
-                        if name == "causal" {
-                            if let ExprKind::BoolLiteral(b) = arg.value.kind {
-                                causal = b;
-                            }
+                    let is_causal_slot = match arg.name {
+                        Some(name_sym) => self.resolve_sym(name_sym) == "causal",
+                        // First unnamed arg after `scale` is the causal slot.
+                        None => true,
+                    };
+                    if is_causal_slot {
+                        if let ExprKind::BoolLiteral(b) = arg.value.kind {
+                            causal = b;
                         }
                     }
                 }

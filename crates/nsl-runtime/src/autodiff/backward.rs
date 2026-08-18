@@ -2131,6 +2131,13 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
         let grad = NslTensor::from_ptr(actual_ptr);
         let len = grad.len as usize;
         let mut sum_abs: f64 = 0.0;
+        // Signed sum too: it is the directional derivative of the loss
+        // along the all-ones perturbation of this parameter, so a
+        // finite-difference probe (L(w+eps) - L(w-eps)) / 2eps can verify
+        // it INDEPENDENTLY of any AD implementation — the arbiter that
+        // settled which AD mode's wq/wk gradients were wrong (item-5
+        // handoff investigation).
+        let mut sum_signed: f64 = 0.0;
         let mut has_nan = false;
         let mut has_inf = false;
         let mut all_zero = true;
@@ -2142,6 +2149,7 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
                 if v.is_infinite() { has_inf = true; }
                 if v != 0.0 { all_zero = false; }
                 sum_abs += v.abs();
+                sum_signed += v;
             }
         } else {
             for j in 0..len {
@@ -2150,6 +2158,7 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
                 if v.is_infinite() { has_inf = true; }
                 if v != 0.0 { all_zero = false; }
                 sum_abs += v.abs();
+                sum_signed += v;
             }
         }
 
@@ -2162,7 +2171,10 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
         } else {
             "ok"
         };
-        eprintln!("  param[{}]: sum|grad|={:.6e}  len={}  [{}]", i, sum_abs, len, status);
+        eprintln!(
+            "  param[{}]: sum|grad|={:.6e}  sum(grad)={:.9e}  len={}  [{}]",
+            i, sum_abs, sum_signed, len, status
+        );
         if needs_free { tensor_free(actual_ptr); }
     }
 }

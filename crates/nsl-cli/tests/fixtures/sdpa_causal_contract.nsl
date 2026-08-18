@@ -1,0 +1,61 @@
+# The causal contract of `scaled_dot_product_attention`, as a runnable
+# program. CAUSAL_SPELLING is substituted by sdpa_causal_contract_gate.rs
+# with each of: `, true` / `, false` / `, causal=true` / `, causal=false` /
+# `` (absent).
+#
+# The gate runs every spelling under BOTH AD modes and requires:
+#   - the two modes agree EXACTLY (they must compile the same function),
+#   - the causal spellings differ from the non-causal ones (so agreement
+#     cannot be satisfied vacuously by ignoring the flag — which is
+#     precisely the bug this pins: the eager/tape lowering honoured only
+#     the NAMED spelling and defaulted to non-causal, while source AD read
+#     the POSITIONAL slot and defaulted to causal, so the stdlib GQA's
+#     positional `true` silently trained tape-mode LMs with bidirectional
+#     attention).
+#
+# Small, deterministic, self-contained: 16 micro-steps, CPU f64, fixed
+# token stream, no dropout.
+
+from nsl.nn.losses import cross_entropy
+
+model Probe:
+    embed: Tensor = randn([64, 16]) * 0.1
+    wq: Tensor = randn([16, 16]) * 0.2
+    wk: Tensor = randn([16, 16]) * 0.2
+    wv: Tensor = randn([16, 16]) * 0.2
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let b = ids_shape[0]
+        let s = ids_shape[1]
+        let flat_ids = input_ids.reshape([b * s])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([b, s, 16])
+        let q = (h @ self.wq).reshape([b, 2, s, 8])
+        let k = (h @ self.wk).reshape([b, 2, s, 8])
+        let v = (h @ self.wv).reshape([b, 2, s, 8])
+        let a = scaled_dot_product_attention(q, k, v, 0.35355339CAUSAL_SPELLING)
+        let at = a.reshape([b, s, 16])
+        return at @ self.embed.transpose(0, 1)
+
+let m = Probe()
+let unit = arange(8) + full([8], 1.0)
+let tokens = unit.reshape([1, 8]).expand([32, 8]).contiguous().reshape([256])
+let loader = DataLoader(tokens, batch_size=2, seq_len=8, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=1):
+    optimizer: AdamW(lr=0.001, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("SDPA_CAUSAL_CONTRACT_COMPLETE")

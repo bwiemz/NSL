@@ -131,14 +131,26 @@ class Verdict:
         return self.step0_gap <= STEP0_FLOOR and self.end_gap <= self.end_allowed
 
 
-# Absolute floors. step-0: the two modes lower the SAME forward math
-# differently (eager runtime ops vs Cranelift-lowered Wengert primal), so
-# f32 reduction-order deltas through 6 blocks × seq 1024 × 49152-way CE
-# land ~5e-2 at loss≈10.9; the floor rejects anything structural (a wrong
-# op is orders of magnitude larger). The endpoint floor serves the case
-# of a perfectly quiet control pair (the tape IS fully deterministic).
-STEP0_FLOOR = 0.15
-END_FLOOR = 0.10
+# Absolute floors, RECALIBRATED after the causal-flag fix.
+#
+# The original floors (step-0 0.15, endpoint 0.10) were set against
+# measurements taken while the tape path silently ran NON-causal
+# attention: the step-0 forwards then differed by ~5e-2 and the endpoint
+# by up to 8e-2 with the tape systematically LOWER (label leakage). Both
+# floors sat just above that signal, so the gate passed on runs where one
+# arm was computing a different function. Floors calibrated against a
+# known-broken baseline encode the breakage.
+#
+# With both modes computing the same function, the measured values are:
+#   step-0    2e-06 .. 1e-05  (pure f32 reduction-order noise)
+#   endpoint  6e-04 .. 1e-02  (source control spread 2e-03 .. 2e-02;
+#                              the tape control spread is EXACTLY 0 —
+#                              tape AD is run-to-run deterministic)
+# The floors below sit ~2 orders above the step-0 noise and just above
+# the observed source control spread — tight enough that a structural
+# divergence (a dropped mask, a missed reduction) cannot hide under them.
+STEP0_FLOOR = 0.002
+END_FLOOR = 0.03
 MULT = 3.0
 
 
