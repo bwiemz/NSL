@@ -528,45 +528,67 @@ fn resolve_optimizer_expr(
         }
 
         // A named numeric kwarg with a rule; nesterov / ns_steps / no_decay
-        // / adamw_lr have bespoke shapes below.
-        let numeric = |target: &mut f64, rule: NumRule, diags: &mut Vec<Diagnostic>| {
+        // / adamw_lr have bespoke shapes below. Returns whether `target` was
+        // actually written — callers use this to gate their `_set` flag the
+        // same way the `nesterov` arm below does, so a rule-failing value
+        // (which leaves `target` at its prior default and pushes a
+        // diagnostic) doesn't mark the knob as user-set and skip the Muon
+        // spec-default backfill.
+        let numeric = |target: &mut f64, rule: NumRule, diags: &mut Vec<Diagnostic>| -> bool {
             match fold_numeric_literal(&arg.value.kind) {
-                Some(v) if rule.admits(v) => *target = v,
-                Some(v) => diags.push(
-                    Diagnostic::error(format!(
-                        "optimizer '{key}' must be {} (got {v})",
-                        rule.expectation()
-                    ))
-                    .with_label(arg.span, format!("expected {}", rule.expectation())),
-                ),
-                None => diags.push(
-                    // Previously the silent half of the defect: a known key
-                    // with a non-matching literal shape (int where float,
-                    // any computed expr, a negative literal — which parses
-                    // as UnaryOp(Neg, ..)) fell through its own match arm
-                    // and kept the default.
-                    Diagnostic::error(format!(
-                        "optimizer '{key}' must be a numeric literal"
-                    ))
-                    .with_label(arg.span, format!("expected {}", rule.expectation())),
-                ),
+                Some(v) if rule.admits(v) => {
+                    *target = v;
+                    true
+                }
+                Some(v) => {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "optimizer '{key}' must be {} (got {v})",
+                            rule.expectation()
+                        ))
+                        .with_label(arg.span, format!("expected {}", rule.expectation())),
+                    );
+                    false
+                }
+                None => {
+                    diags.push(
+                        // Previously the silent half of the defect: a known key
+                        // with a non-matching literal shape (int where float,
+                        // any computed expr, a negative literal — which parses
+                        // as UnaryOp(Neg, ..)) fell through its own match arm
+                        // and kept the default.
+                        Diagnostic::error(format!(
+                            "optimizer '{key}' must be a numeric literal"
+                        ))
+                        .with_label(arg.span, format!("expected {}", rule.expectation())),
+                    );
+                    false
+                }
             }
         };
 
         match key.as_str() {
             "lr" => {
-                numeric(&mut lr, NumRule::NonNegative, diags);
-                lr_set = true;
+                lr_set |= numeric(&mut lr, NumRule::NonNegative, diags);
             }
             "momentum" => {
-                numeric(&mut momentum, NumRule::NonNegative, diags);
-                momentum_set = true;
+                momentum_set |= numeric(&mut momentum, NumRule::NonNegative, diags);
             }
-            "dampening" => numeric(&mut dampening, NumRule::NonNegative, diags),
-            "weight_decay" => numeric(&mut weight_decay, NumRule::NonNegative, diags),
-            "beta1" => numeric(&mut beta1, NumRule::Beta, diags),
-            "beta2" => numeric(&mut beta2, NumRule::Beta, diags),
-            "eps" => numeric(&mut eps, NumRule::Positive, diags),
+            "dampening" => {
+                numeric(&mut dampening, NumRule::NonNegative, diags);
+            }
+            "weight_decay" => {
+                numeric(&mut weight_decay, NumRule::NonNegative, diags);
+            }
+            "beta1" => {
+                numeric(&mut beta1, NumRule::Beta, diags);
+            }
+            "beta2" => {
+                numeric(&mut beta2, NumRule::Beta, diags);
+            }
+            "eps" => {
+                numeric(&mut eps, NumRule::Positive, diags);
+            }
             "adamw_lr" => {
                 // A non-literal or non-positive adamw_lr silently falling
                 // back to `lr` would train the embedding/head at Muon's
@@ -1152,6 +1174,43 @@ mod tests {
         let cfg = resolve(&interner, &[TrainSection::Optimizer(call)]).expect("valid");
         assert!((cfg.optimizer.lr - 0.005).abs() < 1e-12);
         assert!((cfg.optimizer.momentum - 0.95).abs() < 1e-12, "unset knob still backfills");
+    }
+
+    /// A rule-failing `lr`/`momentum` value must NOT count as "user set" —
+    /// otherwise the Muon spec-default backfill is skipped and the knob is
+    /// left at the wrong (generic) default instead of the Muon one. Calls
+    /// `resolve_optimizer_expr` directly (not the `resolve_optim_config`
+    /// wrapper, which discards the optimizer entirely once any diagnostic
+    /// is pushed) so the backfilled-but-otherwise-discarded value is
+    /// observable. Review finding: `lr_set`/`momentum_set` were set
+    /// unconditionally after the `numeric()` call, unlike `nesterov_set`
+    /// which is only set on the success arm.
+    #[test]
+    fn muon_invalid_momentum_still_backfills_spec_default() {
+        let mut interner = nsl_lexer::Interner::new();
+        let momentum = mk_kwarg(
+            &mut interner,
+            "momentum",
+            mk_expr(ExprKind::UnaryOp {
+                op: nsl_ast::operator::UnaryOp::Neg,
+                operand: Box::new(mk_expr(ExprKind::FloatLiteral(1.0))),
+            }),
+        );
+        let call = mk_call(&mut interner, "Muon", vec![momentum]);
+        let mut diags = Vec::new();
+        let resolve_sym = |sym: Symbol| interner.resolve(sym.0).unwrap_or("<unknown>").to_string();
+        let resolved = resolve_optimizer_expr(&call, &resolve_sym, &mut diags)
+            .expect("resolve_optimizer_expr always returns Some past the name-parse stage");
+        assert!(
+            !diags.is_empty(),
+            "momentum = -1 must be rejected by the NonNegative rule"
+        );
+        assert!(
+            (resolved.momentum - 0.95).abs() < 1e-12,
+            "an invalid momentum must not suppress the Muon spec-default \
+             backfill (got {}, want 0.95)",
+            resolved.momentum
+        );
     }
 
     /// Non-Muon optimizers keep the generic defaults.
