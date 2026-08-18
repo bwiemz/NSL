@@ -7,8 +7,11 @@ let V = randn([1, 4, 8, 16])
 
 let scale = 1.0 / sqrt(16.0)
 
-# Naive path: softmax((Q @ K.T) * scale) @ V
-let out = scaled_dot_product_attention(Q, K, V, scale)
+# Naive path: softmax((Q @ K.T) * scale) @ V.
+# `causal` is EXPLICIT here: it defaults to true (matching source AD and
+# the @flash_attention decorator), so the non-causal contrast this example
+# draws against `out_causal` below has to say so.
+let out = scaled_dot_product_attention(Q, K, V, scale, causal=false)
 print("FlashAttention naive path OK")
 
 # Causal variant

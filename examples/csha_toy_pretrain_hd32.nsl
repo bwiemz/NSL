@@ -32,7 +32,9 @@ model TinyAttn:
         let k = x_norm @ self.wk
         let v = x_norm @ self.wv
         let scale = 1.0 / sqrt(32.0)
-        return scaled_dot_product_attention(q, k, v, scale)
+        # Causal by default; explicit because this is a pretraining toy
+        # and the flag decides whether it can see its own future tokens.
+        return scaled_dot_product_attention(q, k, v, scale, causal=true)
 
 let m = TinyAttn()
 let x = ones([32, 32])

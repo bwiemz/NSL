@@ -1497,24 +1497,82 @@ impl Compiler<'_> {
             // future tokens. It shows up as a systematically LOWER tape loss
             // (label leakage helps once training starts), which is exactly
             // the residual the item-5 AD differential could not explain.
+            // `causal` is a COMPILE-TIME branch here (it decides whether the
+            // mask is built at all, below), so anything this path cannot
+            // resolve to a literal must REFUSE rather than fall back to the
+            // default: a silent default compiles a different attention
+            // function than the source says, which is the whole bug class
+            // this contract exists to close (deferral-must-refuse; the
+            // unresolved-dropout-p refusal in `source_ad.rs` is the
+            // precedent). Refusing is also what keeps the two AD modes
+            // honest: source AD resolves `let`-bound constants through the
+            // Wengert graph and this path cannot, so a program that differs
+            // between them fails loudly instead of training two different
+            // models.
             let mut causal = true;
-            if args.len() > 4 {
-                for arg in &args[4..] {
-                    let is_causal_slot = match arg.name {
-                        Some(name_sym) => self.resolve_sym(name_sym) == "causal",
-                        // First unnamed arg after `scale` is the causal slot.
-                        None => true,
-                    };
-                    if is_causal_slot {
-                        if let ExprKind::BoolLiteral(b) = arg.value.kind {
-                            causal = b;
+            let mut explicit_causal: Option<bool> = None;
+            let mut positional_seen = false;
+            for arg in args.iter().skip(4) {
+                match arg.name {
+                    Some(name_sym) => {
+                        let name = self.resolve_sym(name_sym).to_string();
+                        if name != "causal" {
+                            return Err(CodegenError::new(format!(
+                                "scaled_dot_product_attention() has no keyword argument \
+                                 '{name}' (the only optional argument is `causal`). \
+                                 Source AD reads this slot POSITIONALLY, so a \
+                                 misspelled keyword would silently mean different \
+                                 things in the two AD modes"
+                            )));
                         }
+                    }
+                    None => {
+                        if positional_seen {
+                            return Err(CodegenError::new(
+                                "scaled_dot_product_attention() takes at most 5 arguments \
+                                 (Q, K, V, scale, causal)",
+                            ));
+                        }
+                        positional_seen = true;
+                    }
+                }
+                match arg.value.kind {
+                    ExprKind::BoolLiteral(b) => {
+                        causal = b;
+                        explicit_causal = Some(b);
+                    }
+                    _ => {
+                        return Err(CodegenError::new(
+                            "scaled_dot_product_attention()'s `causal` argument must be a \
+                             bool literal (`true` / `false`): it selects the attention \
+                             function at COMPILE time, so a variable, config field or \
+                             non-bool literal cannot be honoured here. Write the literal \
+                             at the call site, or branch on the flag in NSL and call \
+                             scaled_dot_product_attention() with a literal in each arm",
+                        ));
                     }
                 }
             }
 
             // Check if the enclosing function has @flash_attention decorator
-            if self.kernels.flash_attention_context.is_some() {
+            if let Some(fa_ctx) = self.kernels.flash_attention_context.as_ref() {
+                // The decorator, not the call site, governs causality on this
+                // path (the flag is baked into the synthesized kernel name).
+                // Source AD honours the CALL SITE for the same program, so a
+                // disagreement is the same silent two-functions-one-program
+                // split this contract closes — refuse instead of letting the
+                // decorator quietly win.
+                let decorator_causal = fa_ctx.config.causal;
+                if let Some(site) = explicit_causal {
+                    if site != decorator_causal {
+                        return Err(CodegenError::new(format!(
+                            "scaled_dot_product_attention(causal = {site}) contradicts the \
+                             enclosing @flash_attention(causal = {decorator_causal}) \
+                             decorator, whose value is baked into the synthesized kernel. \
+                             Make them agree, or drop the decorator to take the naive path"
+                        )));
+                    }
+                }
                 return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
             }
 

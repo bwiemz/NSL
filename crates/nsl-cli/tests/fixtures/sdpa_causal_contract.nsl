@@ -1,6 +1,6 @@
 # The causal contract of `scaled_dot_product_attention`, as a runnable
-# program. CAUSAL_SPELLING is substituted by sdpa_causal_contract_gate.rs
-# with each of: `, true` / `, false` / `, causal=true` / `, causal=false` /
+# program. The placeholder token below (the one the gate substitutes) is
+# replaced by sdpa_causal_contract_gate.rs with each of: `, true` / `, false` / `, causal=true` / `, causal=false` /
 # `` (absent).
 #
 # The gate runs every spelling under BOTH AD modes and requires:
@@ -34,6 +34,9 @@ model Probe:
         let q = (h @ self.wq).reshape([b, 2, s, 8])
         let k = (h @ self.wk).reshape([b, 2, s, 8])
         let v = (h @ self.wv).reshape([b, 2, s, 8])
+        # bound, in scope, and a compile-time constant — but not a LITERAL
+        # at the call site, which is what the refusal arm exercises
+        let use_causal = false
         let a = scaled_dot_product_attention(q, k, v, 0.35355339CAUSAL_SPELLING)
         let at = a.reshape([b, s, 16])
         return at @ self.embed.transpose(0, 1)

@@ -19,11 +19,13 @@ control).
    the loss curves looked healthy. Fixed (same-shape Reshape relabel);
    the CI gate gained a GQA leg so the class stays pinned.
 
-2. **After the fix, the gated windows agree on all 3 seeds** (table below
-   from the post-fix run): step-0 forward gaps 0.03–0.06 (deterministic
-   f32 lowering difference between the two forwards, well under the 0.15
-   structural floor) and endpoint means within the control-derived
-   allowance.
+2. **After BOTH fixes, the gated windows agree on all 3 seeds** at
+   step-0 gaps of 2e-06..1e-05 and endpoint gaps of 6e-04..1e-02.
+   The 0.03–0.06 step-0 gaps the first version of this document
+   attributed to "f32 lowering noise" were nothing of the kind — that
+   explanation was REFUTED by the causal-flag finding below: two modes
+   computing different attention functions cannot be reconciled by a
+   precision argument, and a 5e-2 gap at CPU f64 never supported one.
 
 3. **The tape is run-to-run deterministic end-to-end** (tape-A == tape-B
    to every printed digit through step 128, every seed). Source pairs
@@ -35,8 +37,9 @@ control).
    of the legitimate step-0 offset, and same-mode controls cannot
    envelope it (each pair shares its forward exactly).
 
-Post-fix measured windows (gating run banked in the PR; endpoint allowance
-= max(3×control, 0.10)):
+Post-fix measured windows (gating run banked in the PR; step-0 floor
+2e-3, endpoint allowance = max(3×control, 0.03) — both recalibrated, see
+the third finding):
 
 | seed | step0 gap (gated, floor 2e-3) | early gap (reported) | endpoint gap | verdict |
 |------|-------------------------------|----------------------|--------------|---------|
@@ -104,6 +107,33 @@ Two lessons worth carrying:
    measure 2e-06..1e-05 and 6e-04..1e-02, and the floors are now 2e-3 /
    0.03 — set from the source control spread, not from the observed
    cross-mode gap.
+
+### Which window would actually catch a repeat
+
+Worth being precise, because it is tempting to assume the recalibrated
+endpoint floor is the safeguard. It is not:
+
+- **step-0 is the strong gate for this class.** Any forward-function
+  divergence — a dropped mask, a wrong flag, a missing op — changes the
+  loss on the very first evaluation, before any optimizer step. The
+  leakage showed there as 3.5e-02..6.1e-02 against a floor now set at
+  2e-03, i.e. caught by more than an order of magnitude.
+- **the endpoint window is weak, and honestly so.** With the measured
+  source control spreads (2.3e-03..1.9e-02) the allowance works out to
+  0.03..0.057, which is *above* part of the historical leakage signal
+  (1.5e-02..7.6e-02). It cannot be tightened past the control spread
+  without failing on source AD's own run-to-run noise. It is a
+  backstop for gradient/optimizer divergence that leaves the forward
+  intact, not a detector for a changed forward.
+- **the contract gate is the real pin** for this specific class, because
+  it compares the two lowerings directly instead of inferring from
+  trajectories.
+
+The general form: a trajectory-level differential detects *that*
+something diverged and bounds *how much*, but the cheap direct
+comparison (same-step forward, per-parameter gradient checksum, FD
+probe) is what identifies *what*. Reach for the differential to raise
+the alarm and for the direct instruments to answer it.
 
 Regression pin: `crates/nsl-cli/tests/sdpa_causal_contract_gate.rs` runs
 all five spellings (positional true/false, named true/false, absent)

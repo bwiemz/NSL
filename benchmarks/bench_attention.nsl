@@ -30,8 +30,11 @@ let naive_out = naive_attention(Q, K, V, scale)
 print("Naive attention output mean:")
 print(mean(naive_out))
 
-# Test 2: SDPA intrinsic (FlashAttention path)
-let flash_out = scaled_dot_product_attention(Q, K, V, scale)
+# Test 2: SDPA intrinsic (FlashAttention path), non-causal to match
+# Test 1's hand-rolled chain — `causal` defaults to TRUE, so the
+# comparison against `naive_out` must pass it explicitly or it stops
+# being a comparison.
+let flash_out = scaled_dot_product_attention(Q, K, V, scale, causal=false)
 print("FlashAttention output mean:")
 print(mean(flash_out))
 
