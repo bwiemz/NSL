@@ -32,6 +32,29 @@ use super::grad_utils::{
 };
 use super::{ones_from_shape, TapeOp, TAPE};
 
+/// Read a tensor's shape into an owned Vec (for capture before an eager free).
+fn shape_vec_of(ptr: i64) -> Vec<i64> {
+    let t = NslTensor::from_ptr(ptr);
+    (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect()
+}
+
+/// Batched-matmul broadcast reduction. When one operand carries fewer batch
+/// dims than the other (e.g. `[b,s,d] @ [d,v]` — every transformer LM head
+/// and FFN), the forward broadcasts it across the batch, so its gradient is
+/// the SUM over the broadcast dims — the same rule elementwise ops apply via
+/// `reduce_grad_for_broadcast`. Without this, `dW` came back batch-shaped
+/// (`[b,s,v]` instead of `[d,v]`) and the optimizer aborted on a length
+/// mismatch. Returns `grad_full` unchanged on the all-matched fast path
+/// (all-2D matmuls); otherwise consumes it and returns the reduced tensor.
+fn reduce_matmul_grad(grad_full: i64, orig_shape: &[i64]) -> i64 {
+    if shape_vec_of(grad_full) == orig_shape {
+        return grad_full;
+    }
+    let reduced = reduce_grad_for_broadcast(grad_full, orig_shape);
+    tensor_free(grad_full);
+    reduced
+}
+
 /// ReLU backward: grad * (input > 0 ? 1 : 0)
 fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
@@ -1415,6 +1438,8 @@ pub(crate) fn run_backward_core_strict(
                 if let Some(&g) = grad_map.get(out) {
                     // d/dA(A@B) = G @ B^T, d/dB(A@B) = A^T @ G
                     // Use -2,-1 to transpose the last two dims (correct for batched matmul)
+                    let a_orig_shape = shape_vec_of(*saved_a);
+                    let b_orig_shape = shape_vec_of(*saved_b);
                     let b_t = tensor_transpose(*saved_b, -2, -1);
                     let a_t = tensor_transpose(*saved_a, -2, -1);
                     // Eagerly free saved tensors — they're no longer needed after transpose
@@ -1424,8 +1449,8 @@ pub(crate) fn run_backward_core_strict(
                     *saved_b = 0;
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
-                    let grad_a = tensor_matmul(g_clone1, b_t, 0);
-                    let grad_b = tensor_matmul(a_t, g_clone2, 0);
+                    let grad_a = reduce_matmul_grad(tensor_matmul(g_clone1, b_t, 0), &a_orig_shape);
+                    let grad_b = reduce_matmul_grad(tensor_matmul(a_t, g_clone2, 0), &b_orig_shape);
                     tensor_free(g_clone1);
                     tensor_free(g_clone2);
                     tensor_free(b_t);
@@ -1699,7 +1724,14 @@ pub(crate) fn run_backward_core_strict(
                         if idx < vocab_size {
                             for j in 0..embed_dim {
                                 if grad_w_dtype == 1 {
-                                    let g_val = unsafe { *g_t.data_f32().add(i * embed_dim + j) };
+                                    // The f64 arm here is not hypothetical: a GPU
+                                    // f32 grad DOWNLOADS as f64 (nsl_tensor_to_device
+                                    // converts by ABI design), while grad_w is the
+                                    // runtime's f32 zeros — reading g as f32
+                                    // unconditionally was the first GPU tape
+                                    // backward's abort site.
+                                    let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) } }
+                                                else { unsafe { *g_t.data_f64().add(i * embed_dim + j) as f32 } };
                                     unsafe { *grad_w_t.data_f32().add(idx * embed_dim + j) += g_val };
                                 } else {
                                     let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) as f64 } }
@@ -1959,10 +1991,13 @@ pub(crate) fn run_backward_core_strict(
                     // reference form, gated by its own tests) does inside.
                     let g_q = crate::fp8::nsl_fp8_quantize_e5m2(g, 0.0);
 
+                    let a_orig_shape = shape_vec_of(*saved_a);
+                    let b_orig_shape = shape_vec_of(*saved_b);
                     let b_t = tensor_transpose(*saved_b, -2, -1);
                     let b_q = crate::fp8::nsl_fp8_quantize_e5m2(b_t, *scale_b as f64);
                     tensor_free(b_t);
-                    let grad_a = crate::tensor::nsl_tensor_matmul(g_q, b_q, 0);
+                    let grad_a =
+                        reduce_matmul_grad(crate::tensor::nsl_tensor_matmul(g_q, b_q, 0), &a_orig_shape);
                     tensor_free(b_q);
 
                     let a_t = tensor_transpose(*saved_a, -2, -1);
@@ -1973,7 +2008,8 @@ pub(crate) fn run_backward_core_strict(
                     *saved_b = 0;
                     let a_q = crate::fp8::nsl_fp8_quantize_e5m2(a_t, *scale_a as f64);
                     tensor_free(a_t);
-                    let grad_b = crate::tensor::nsl_tensor_matmul(a_q, g_q, 0);
+                    let grad_b =
+                        reduce_matmul_grad(crate::tensor::nsl_tensor_matmul(a_q, g_q, 0), &b_orig_shape);
                     tensor_free(a_q);
                     tensor_free(g_q);
 
@@ -2014,8 +2050,20 @@ pub(crate) fn run_backward_core_strict(
     // Build result list: look up by tape_id when active, raw ptr fallback
     let result_list = crate::list::nsl_list_new();
     let mut zeros_fallbacks = 0usize;
+    // NSL_TAPE_DEBUG_DUMP=1: print each param's tape key and the length of
+    // the grad about to be returned for it. This is the tool that localized
+    // the batched-matmul broadcast bug (a [b,s,v]-shaped dW landing on a
+    // [d,v] param) — the param/grad length alignment here is the tape's
+    // output contract, and a mismatch aborts far away, inside the
+    // optimizer's in-place update.
+    let debug_dump = std::env::var("NSL_TAPE_DEBUG_DUMP").ok().as_deref() == Some("1");
     for ptr in param_ptrs {
         let key = { let t = crate::tensor::NslTensor::from_ptr(*ptr); if t.tape_id != 0 { t.tape_id } else { *ptr } };
+        if debug_dump {
+            let t = crate::tensor::NslTensor::from_ptr(*ptr);
+            let glen = grad_map.get(&key).map(|g| crate::tensor::NslTensor::from_ptr(*g).len);
+            eprintln!("[tape-dump] param ptr={ptr:#x} tape_id={} len={} -> grad len={:?}", t.tape_id, t.len, glen);
+        }
         if let Some(grad) = grad_map.remove(&key) {
             crate::list::nsl_list_push(result_list, grad);
         } else {

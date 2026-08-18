@@ -18,11 +18,13 @@ python prepare_nsl.py path/to/codeforge.json path/to/tokens.bin
 nsl run models/coder50m/pretrain.nsl --source-ad
 ```
 
-`--source-ad` is required, not optional: without it the train block fails to
-compile with "train step body must assign to a variable named 'loss'". It is
-also the only path with flash attention and the fused cross-entropy that
-`pretrain.nsl`'s `@fused_lm_ce` decorator asks for. `--pretrain-optimized`
-implies `--source-ad` and adds the WGGO/CSHA planning stack on top.
+`--source-ad` is the production path: it is the only one with flash
+attention and the fused cross-entropy that `pretrain.nsl`'s `@fused_lm_ce`
+decorator asks for. A bare `nsl run` (tape AD) also works — since the
+item-5 campaign it is the reference implementation the AD differential
+compares against — but it materializes the full logits surface and runs at
+reference speed, not production speed. `--pretrain-optimized` implies
+`--source-ad` and adds the WGGO/CSHA planning stack on top.
 
 Edit the `load_mmap` path at the top of the script to point at the
 `tokens.bin` step 1 produced.

@@ -120,11 +120,22 @@ pub(crate) struct Tape {
     pub(crate) recording: bool,
     pub(crate) pause_depth: i32,
     pub(crate) next_id: i64,
+    /// Transient frees SKIPPED during recording (`nsl_tensor_free_transient`
+    /// is a lifetime no-op while the tape holds bare pointers), deferred to
+    /// `nsl_tape_stop`. Without this, every skipped transient — one score
+    /// matrix and one softmax per attention layer per forward, per the
+    /// free_transient doc — leaked PERMANENTLY in tape-mode training:
+    /// ~784 MB/micro-batch at Coder-50M, OOM inside 6 micro-batches on a
+    /// 32 GB card. Each entry owns exactly the one refcount decrement the
+    /// skipped call would have performed; the address cannot be reused
+    /// while an entry is pending because the deferral is what keeps the
+    /// allocation alive.
+    pub(crate) deferred_transients: Vec<i64>,
 }
 
 impl Tape {
     fn new() -> Self {
-        Tape { ops: Vec::new(), param_set: HashSet::new(), recording: false, pause_depth: 0, next_id: 1 }
+        Tape { ops: Vec::new(), param_set: HashSet::new(), recording: false, pause_depth: 0, next_id: 1, deferred_transients: Vec::new() }
     }
     fn get_or_assign_id(&mut self, ptr: i64) -> i64 {
         if ptr == 0 { return 0; }
@@ -255,6 +266,16 @@ pub fn test_tape_pause_depth() -> i32 {
 
 pub fn is_recording() -> bool {
     TAPE.with(|t| { let tape = t.borrow(); tape.recording && tape.pause_depth == 0 })
+}
+
+/// Record a transient free that `nsl_tensor_free_transient` skipped because
+/// the tape was recording. The deferred decrement lands in `nsl_tape_stop`
+/// (or is swept as stale by the next `nsl_tape_start`).
+pub(crate) fn defer_transient_free(ptr: i64) {
+    if ptr == 0 {
+        return;
+    }
+    TAPE.with(|t| t.borrow_mut().deferred_transients.push(ptr));
 }
 
 /// Debug-only invariant check for `desc_to_nsl_tensor`'s tape_id import path.
@@ -402,13 +423,23 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
             }
         }
     }
-    TAPE.with(|t| {
+    let stale_deferred = TAPE.with(|t| {
         let mut tape = t.borrow_mut();
         // Release any saved tensor refs from a previous tape session
         // (prevents refcount leaks if tape_start is called without tape_stop)
         release_tape_op_refs(&tape.ops);
         tape.ops.clear();
         tape.param_set.clear();
+        std::mem::take(&mut tape.deferred_transients)
+    });
+    // Stale deferred transients from an unstopped session: free them outside
+    // the borrow and BEFORE recording turns on, so the frees take the normal
+    // path (see nsl_tape_stop for the re-entrancy note).
+    for ptr in stale_deferred {
+        crate::tensor::nsl_tensor_free_if_valid(ptr);
+    }
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
         tape.recording = true;
         tape.pause_depth = 0;
         // Do NOT reset next_id — parameters retain their tape_ids across steps.
@@ -516,7 +547,11 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
 /// This prevents memory leaks even if backward is never called.
 #[no_mangle]
 pub extern "C" fn nsl_tape_stop() {
-    TAPE.with(|t| {
+    // Two phases: release refs/collect the deferred list under the borrow,
+    // then free the deferred transients AFTER dropping it — a free can
+    // re-enter tape code (is_recording checks in the tensor layer), and
+    // recording is already false so re-entrant frees take the normal path.
+    let deferred = TAPE.with(|t| {
         let mut tape = t.borrow_mut();
         tape.recording = false;
         tape.pause_depth = 0;
@@ -526,7 +561,14 @@ pub extern "C" fn nsl_tape_stop() {
         tape.ops.clear();
         tape.param_set.clear();
         // Do NOT reset next_id — monotonic across steps to avoid collisions
+        std::mem::take(&mut tape.deferred_transients)
     });
+    // The backward has consumed the tape (train epilogues call stop right
+    // after it), so the skipped transient frees can now land. Refcounted:
+    // any live alias (a view's data_owner, a returned grad) keeps storage.
+    for ptr in deferred {
+        crate::tensor::nsl_tensor_free_if_valid(ptr);
+    }
 }
 
 /// Pause recording (used by @no_grad). Increments pause depth.
