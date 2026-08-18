@@ -1,0 +1,65 @@
+# models/coder50m/sr_determinism_check.nsl
+# ============================================================================
+# Same-arm determinism probe for the CSLA + weight-stream composition
+# ============================================================================
+# Run TWICE with identical flags and diff the loss streams:
+#   nsl run --seed 1000 --source-ad --deterministic --checkpoint-blocks \
+#       --layerwise-accum --weight-stream sr_determinism_check.nsl
+# (128 micro-steps over the item-5 corpus slice, dropout off, val eval.)
+#
+# Measured 2026-08-18 at Coder-50M (banked in SR_DIFFERENTIAL_50M_2026_08_18.md):
+#   TF32 on  (default):    replicates diverge from step 0, max gap 2.9e-4
+#   NSL_MATMUL_TF32=0:     still diverge, max gap 1.1e-4  (3x smaller, not 0)
+#   dropout on adds ~8x:   max gap 2.4e-3
+# Meanwhile srbf16_e2e_deterministic_and_sane_gpu (tiny model, 6 steps)
+# passes bit-identically — the loss of determinism is SCALE-dependent.
+# M46 documents --deterministic as device bit-reproducibility, so this is
+# a filed bug (see bugs.md), not flag semantics.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+let tokens = load_mmap("../../data/tokens/ad_differential_slice.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 4 == 0:
+                print(step)
+                print(loss)
+
+print("LOSS_STREAM_END")
+
+# ── held-out validation: forward-only CE over the tail slice ────────────
+let val_tokens = load_mmap("../../data/tokens/sr_val_slice.bin", 3)
+let val_loader = DataLoader(val_tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+let val_total = 0.0
+let val_count = 0.0
+for batch in val_loader:
+    let logits = m.forward_train(batch.input_ids, false)
+    let ls = logits.shape
+    let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+    let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+    let vloss = cross_entropy(flat_logits, flat_labels)
+    val_total = val_total + vloss.item()
+    val_count = val_count + 1.0
+
+print("VAL_LOSS")
+print(val_total / val_count)
+print("VAL_BATCHES")
+print(val_count)
+print("SR_DIFFERENTIAL_COMPLETE")

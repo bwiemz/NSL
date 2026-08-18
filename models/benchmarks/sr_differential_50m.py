@@ -56,7 +56,10 @@ BASE_FLAGS = [
 ]
 
 LOSS_RE = re.compile(r"^(?:tensor\(\[)?([0-9]+\.[0-9]+(?:e-?[0-9]+)?)\]?\)?$")
-SR_TEARDOWN_RE = re.compile(r"\[sr-bf16\] teardown: (\d+) bf16-authoritative param\(s\)")
+SR_TEARDOWN_RE = re.compile(
+    r"\[sr-bf16\] teardown: (\d+) bf16-authoritative param\(s\), "
+    r"(\d+) SR optimizer step\(s\), (\d+) widen-upload\(s\)"
+)
 
 
 @dataclass
@@ -113,8 +116,16 @@ def run_arm(nsl: str, label: str, seed: int, sr: bool, _retried: bool = False) -
     # whole comparison. The teardown counters are the runtime's own receipt.
     m = SR_TEARDOWN_RE.search(err)
     if sr:
-        if not m or int(m.group(1)) == 0:
-            sys.exit(f"[{label}] no [sr-bf16] teardown counters — the SR arm ran f32?\n{err[-1500:]}")
+        # params>0 alone evidences REGISTRATION, not stepping (mirrors are
+        # registered at step-body top regardless of which kernel later
+        # runs) — the e2e gate asserts params, steps AND uploads separately
+        # for exactly that reason (review finding on the first version,
+        # which checked only params).
+        if not m or int(m.group(1)) == 0 or int(m.group(2)) == 0 or int(m.group(3)) == 0:
+            sys.exit(
+                f"[{label}] [sr-bf16] teardown counters missing or vacuous "
+                f"(params/steps/uploads must all be > 0) — the SR arm ran f32?\n{err[-1500:]}"
+            )
     elif "[sr-bf16]" in err:
         sys.exit(f"[{label}] f32 oracle arm shows [sr-bf16] markers")
 
@@ -165,13 +176,17 @@ def main() -> None:
     args = ap.parse_args()
 
     materialize_slices()
-    runs: dict[str, list[Run]] = {"f32": [], "sr": []}
+    by_seed: dict[int, dict[str, list[Run]]] = {}
     for i in range(args.seeds):
         seed = 1000 + i
         print(f"\n=== seed {seed} ===")
+        by_seed[seed] = {"f32": [], "sr": []}
         for rep in range(args.replicates):
-            runs["f32"].append(run_arm(args.nsl, f"seed{seed}/f32-r{rep}", seed, sr=False))
-            runs["sr"].append(run_arm(args.nsl, f"seed{seed}/bf16sr-r{rep}", seed, sr=True))
+            by_seed[seed]["f32"].append(run_arm(args.nsl, f"seed{seed}/f32-r{rep}", seed, sr=False))
+            by_seed[seed]["sr"].append(run_arm(args.nsl, f"seed{seed}/bf16sr-r{rep}", seed, sr=True))
+    runs: dict[str, list[Run]] = {
+        arm: [r for seed in by_seed for r in by_seed[seed][arm]] for arm in ("f32", "sr")
+    }
 
     def stats(vals: list[float]) -> tuple[float, float]:
         n = len(vals)
@@ -193,23 +208,61 @@ def main() -> None:
             f"| {min(vals):.6f}..{max(vals):.6f} | {tm:.6f} |"
         )
 
+    # ── PRIMARY: seed-paired analysis ──────────────────────────────────
+    # Seeds are shared across arms, so the seed (init) effect cancels in
+    # the per-seed difference of replicate means; the paired test is the
+    # correctly specified one (the first version pooled 3 seeds × 2
+    # replicates as 6 i.i.d. samples AND sorted the printed VALs, which
+    # both mis-specified the SE and destroyed the seed pairing in the
+    # banked record — review findings). df = seeds-1; t-critical at 95%
+    # is large at df=2 (4.303), which is honest: three seeds is three
+    # seeds.
+    print("\n| seed | f32 VALs | sr VALs | seed dVAL (mean sr - mean f32) |")
+    print("|------|----------|---------|-------------------------------|")
+    paired_deltas = []
+    for seed in by_seed:
+        fv = [r.val_loss for r in by_seed[seed]["f32"]]
+        sv = [r.val_loss for r in by_seed[seed]["sr"]]
+        d = sum(sv) / len(sv) - sum(fv) / len(fv)
+        paired_deltas.append(d)
+        print(
+            f"| {seed} | {[f'{v:.6f}' for v in fv]} | {[f'{v:.6f}' for v in sv]} | {d:+.6f} |"
+        )
+    npair = len(paired_deltas)
+    dmean = sum(paired_deltas) / npair
+    dvar = sum((d - dmean) ** 2 for d in paired_deltas) / max(npair - 1, 1)
+    dse = (dvar / npair) ** 0.5
+    T_CRIT_95 = {2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 9: 2.262}
+    tcrit = T_CRIT_95.get(npair - 1, 2.262)
+    half = tcrit * dse
+    print(
+        f"\nPAIRED dVAL (SR - F32) = {dmean:+.6f}  (paired SE {dse:.6f}, "
+        f"df {npair - 1}, t-crit {tcrit}); 95% CI [{dmean - half:+.6f}, {dmean + half:+.6f}]"
+    )
+
+    # ── SECONDARY: pooled Welch (reported for scale, not for the verdict).
     (mf, sdf, nf), (ms, sds, ns) = summary["f32"], summary["sr"]
     delta = ms - mf
-    # Welch standard error of the mean difference; 2×SE ≈ a 95% bound.
     se = (sdf**2 / nf + sds**2 / ns) ** 0.5
-    print(f"\ndVAL (SR - F32) = {delta:+.6f}  (Welch SE {se:.6f}; 2SE bound ±{2*se:.6f})")
-    for arm in ("f32", "sr"):
-        vals = sorted(f"{r.val_loss:.4f}" for r in runs[arm])
-        print(f"  {arm} VALs: {vals}")
-    if abs(delta) <= 2 * se:
+    v1, v2 = sdf**2 / nf, sds**2 / ns
+    welch_df = (v1 + v2) ** 2 / (v1**2 / (nf - 1) + v2**2 / (ns - 1))
+    print(
+        f"pooled dVAL = {delta:+.6f} (Welch SE {se:.6f}, df {welch_df:.1f} — "
+        "reported for reference; the seed-paired CI above is the verdict)"
+    )
+
+    if abs(dmean) <= half:
         print(
-            "VERDICT: the SR-BF16 quality delta is statistically indistinguishable "
-            f"from run noise at 50M/1-epoch (|{delta:+.4f}| <= 2SE {2*se:.4f})"
+            "VERDICT: no detectable SR-BF16 quality delta at this design's "
+            f"power (paired 95% CI [{dmean - half:+.4f}, {dmean + half:+.4f}] "
+            "covers zero). This bounds the TRUE delta only to that interval — "
+            "it is absence of evidence at n_seeds="
+            f"{npair}, not demonstrated equivalence"
         )
     else:
         print(
-            f"VERDICT: SR-BF16 shifts held-out loss by {delta:+.4f} "
-            f"(beyond the 2SE noise bound {2*se:.4f}) — quantified above"
+            f"VERDICT: SR-BF16 shifts held-out loss by {dmean:+.4f} "
+            f"(paired 95% CI excludes zero) — quantified above"
         )
 
 

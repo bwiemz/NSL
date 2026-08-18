@@ -23,79 +23,107 @@ quality delta has nothing to show up in. The roadmap item's criterion:
 real corpus, an F32 oracle, and a quantified quality delta **before**
 calling SR the default.
 
-## Finding 1: this composition is not run-to-run deterministic — the
-## paired-comparison design is invalid, and the banked doc never tested it
+## Finding 1: run-to-run determinism is LOST at 50M scale under this
+## composition — filed as a bug, and it invalidated the paired design
 
-The first harness assumed `--deterministic` reproduces an arm
-bit-for-bit and compared one F32/SR pair per seed. The determinism
-control refuted it: same-seed same-arm replicates diverge **from the
-first sampled step**, with dropout on or off (probe:
-max step-gap 2.4e-3 with dropout, 2.9e-4 without, both diverging at
-sample 0; VAL scatter across three same-seed F32 runs ≈ 0.1 over a
-4096-update epoch). `--deterministic` covers RNG seeding and
-compile-time nondeterminism detection — not the GPU backward's atomic
-accumulation order under the CSLA + weight-stream composition.
+The first harness assumed `--deterministic` reproduces an arm bit-for-bit
+and compared one F32/SR pair per seed. The determinism control refuted
+it: same-seed same-arm replicates diverge **from the first sampled
+step**. The committed probe (`models/coder50m/sr_determinism_check.nsl`)
+pins the numbers: max step-gap 2.9e-4 with TF32 on (the campaign
+configuration), 1.1e-4 with `NSL_MATMUL_TF32=0` (3× smaller, not zero),
+2.4e-3 with dropout active; VAL scatter across same-seed F32 epochs
+≈ 0.09–0.11.
 
-The 2026-07-30 campaign asserted "loss stream is deterministic" from
-**cross-arm first-loss identity**, which pins only the shared init — it
-never reran the same arm twice. This campaign is the first same-arm
-replicate test of the composition, and it fails. (Same lesson as the
-item-5 floors: a property assumed from adjacent evidence is not a
-property measured.)
+Two facts sharpen this from "flag scope" into a **bug**:
 
-Consequence: the verdict below is statistical — N replicates per
-seed × arm, pooled per-arm means judged by Welch SE — not paired.
+- M46's documented contract is device bit-reproducibility (kernel-variant
+  routing exists for exactly this: the no-atomics embedding backward and
+  the non-coalesced sum_dim route are both gated on `--deterministic`).
+  The clap help's narrower phrasing ("compile-time non-determinism
+  detection") undersells the repo's own docs.
+- `srbf16_e2e_deterministic_and_sane_gpu` — a same-arm bit-identity
+  rerun of this exact composition at toy scale (6 steps) — **passes on
+  this machine today** (re-verified during this campaign). So the
+  contract holds at gate scale and breaks at 50M: scale-dependent,
+  consistent with shape-dependent kernel/algorithm selection rather than
+  a single unguarded op. The 2026-07-30 doc cited that gate when calling
+  its dice "bit-identical rerun asserted"; what had never been tested
+  before this campaign is same-arm determinism **at trajectory length
+  and model scale** — and there it fails.
+
+Filed in `bugs.md` (memory) for a dedicated campaign; out of scope here.
+Consequence for this campaign: the verdict below is statistical, and
+seed-PAIRED — seeds are shared across arms, so init effects cancel in
+the per-seed difference (the first version of this harness pooled
+3 seeds × 2 replicates as 6 i.i.d. samples and printed SORTED VALs,
+which both mis-specified the SE and destroyed the seed pairing in the
+banked record — caught in review; the tables below preserve pairing).
 
 ## Results
 
-Per-arm pooled statistics (3 seeds × 2 replicates per arm; every run one
-epoch = 4096 optimizer updates over 8.39M real-corpus tokens, VAL = mean
-held-out CE over 512 never-trained batches):
+Per-seed VALs (mean held-out CE over 512 never-trained batches; each cell
+is [replicate-0, replicate-1]; every run one epoch = 4096 optimizer
+updates over 8.39M real-corpus tokens):
 
-| arm | n | VAL mean | VAL sd | VAL min..max | train tail64 mean | tok/s |
-|-----|---|----------|--------|--------------|-------------------|-------|
-| F32 oracle | 6 | 9.011521 | 0.114712 | 8.817903..9.136416 | 6.490777 | ~13.57k |
-| SR-BF16 | 6 | 9.082296 | 0.139863 | 8.920083..9.254822 | 6.498234 | ~13.56k |
+| seed | F32 oracle VALs | SR-BF16 VALs | seed ΔVAL (mean SR − mean F32) |
+|------|-----------------|--------------|--------------------------------|
+| 1000 | [9.060671, 8.936207] | [9.177453, 9.053670] | +0.117123 |
+| 1001 | [9.136416, 9.051269] | [9.164089, 9.254822] | +0.115613 |
+| 1002 | [9.066659, 8.817903] | [8.920083, 8.923660] | −0.020410 |
 
-Raw VALs — F32: 8.8179, 8.9362, 9.0513, 9.0607, 9.0667, 9.1364 ·
-SR: 8.9201, 8.9237, 9.0537, 9.1641, 9.1775, 9.2548.
-
-Per-seed first losses pin the shared init (F32 vs SR first losses differ
-by only ~3e-4 — the bf16 storage quantization of the first forward), and
-the two watchdog-retried arms reproduce the same statistics as their
-neighbors.
+Pooled per-arm (for scale): F32 9.0115 ± 0.1147 (n=6), SR 9.0823 ± 0.1399
+(n=6). Within-seed replicate scatter (σ_rep ≈ 0.095) dominates the seed
+effect (σ_seed ≈ 0.04): the nondeterminism noise, not the init, is the
+limiting factor of this design's power. Train tail (last 64 samples =
+final 512 micro-steps, i.e. the last 6.25% of the epoch): F32 6.4908,
+SR 6.4982 — directionally consistent with the VAL delta and equally
+inside noise. Throughput ~13.57k tok/s both arms.
 
 ## Finding 2: the quality delta
 
-**ΔVAL (SR − F32) = +0.0708, Welch SE 0.0738, 2SE bound ±0.1477 —
-statistically indistinguishable from run noise.**
+**Seed-paired ΔVAL (SR − F32) = +0.0708, paired SE 0.0456 (df 2,
+t-crit 4.303): 95% CI [−0.125, +0.267] — covers zero; no detectable
+delta.** The secondary pooled Welch view: SE 0.0738 at df 9.6
+(t-crit 2.24 → CI [−0.095, +0.236]); it agrees, and it is reported for
+reference only since it ignores the seed pairing.
 
-Reading it honestly in both directions: the 95%-ish interval is
-[−0.077, +0.219] nats of held-out CE. The data is consistent with SR
-being slightly better, identical, or up to ~0.22 nats worse; the point
-estimate leans 0.07 worse but at less than 1 SE of separation. Train-loss
-tails are practically identical (6.491 vs 6.498). Wall time is a wash at
-50M (the banked 07-30 campaign's PCIe-traffic advantage for SR — 3.8 GB/s
-→ 0.2-0.8 GB/s rx — is the real systems win; it reproduces here as equal
-throughput with far less bus traffic).
+What this design can and cannot say, stated plainly:
+
+- Two of three seeds landed +0.12 against SR, one landed −0.02. The
+  point estimate leans against SR at well under significance.
+- Power is limited: against the paired criterion, a true 0.05-nat SR
+  regression would be flagged only rarely; 80% power needs a true delta
+  around ~0.2 nats. So this campaign RULES OUT a large regression
+  (≳0.25 nats) and is silent below that — "no detectable delta" is
+  absence of evidence at n_seeds=3, not demonstrated equivalence.
+- **Coverage disclosure:** under `--param-dtype bf16-sr`, the tied
+  embedding (25.2M of ~48.8M parameters, ~52% of the mass — it is
+  view-rooted through the weight-tied LM head and therefore resident,
+  not streamed) stays **f32-authoritative in BOTH arms**; SR rounds the
+  streamed transformer-block parameters only. The measured delta is the
+  cost of bf16-ing roughly half the model. That is the flag's genuine
+  production behavior, so the arms are validly compared — but at 500M+
+  the embedding fraction shrinks and SR coverage grows, which is one
+  more reason the default call belongs there.
+- Wall time is a wash at 50M; the banked 07-30 PCIe advantage (3.8 GB/s
+  → 0.2–0.8 GB/s rx) is the systems win that motivates SR.
 
 ## Recommendation on "SR as default"
 
-**Not promoted to default.** No quality blocker was found — the delta is
-bounded by run noise — but "indistinguishable at n=6, 50M, 1 epoch" is an
-absence of evidence, not a demonstrated equivalence, and the point
-estimate leans slightly against SR. The measurement power here is capped
-by Finding 1 (the composition's ~0.11-0.14 VAL run scatter); each extra
-replicate pair costs ~21 GPU-minutes and shrinks the bound slowly
-(SE ∝ 1/√n).
+**Not promoted to default.** No large regression (the paired 95% CI caps
+a true SR cost at ~+0.27 nats, and the evidence leans well under that),
+but three seeds cannot certify equivalence, the point estimate leans
+slightly against SR, and half the parameter mass at 50M isn't covered by
+SR at all (the resident tied embedding). The measurement power is capped
+by Finding 1's nondeterminism noise; each extra replicate pair costs
+~21 GPU-minutes and shrinks the CI slowly.
 
-Recommendation: keep `--param-dtype f32` the default; carry SR forward as
-the certified memory/bandwidth option it already is; and make the
-default call at the 500M campaign (roadmap item 9), where (a) the same
-harness applies unchanged, (b) bf16 rounding error has more surface to
-matter, and (c) the VRAM/PCIe savings become decisive rather than
-convenient — so whichever way the quality bound lands there, the decision
-is being made where the stakes are real.
+Recommendation: keep `--param-dtype f32` the default; carry SR forward
+as the certified memory/bandwidth option it already is; make the default
+call at the 500M campaign (roadmap item 9), where (a) this harness
+applies unchanged, (b) SR actually covers most of the parameter mass,
+and (c) the VRAM/PCIe savings become decisive rather than convenient.
 
 ## Environment notes
 
