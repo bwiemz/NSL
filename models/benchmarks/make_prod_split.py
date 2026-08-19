@@ -9,11 +9,15 @@ held-out TAIL they never read:
     [ 0 .............. TRAIN_TOKENS ) [ gap ) [ .... VAL_TOKENS .... ]
       prod_train_slice.bin                     prod_val_slice.bin
 
-The gap is deliberate. `DataLoader(..., drop_last=true)` consumes whole
-`seq_len` windows, so without it a training window could end mid-way into the
-first validation window and leak a suffix the val loss then scores itself on.
-Sized so the split lands on whole 1024-token windows for both batch=1 (50M)
-and batch=2 (500M).
+The gap is deliberate, but NOT because a window could straddle it — the two
+slices are separate files, so the loaders cannot cross between them at all,
+and any prefix/tail cut is index-disjoint even with a zero gap. What the gap
+buys is SEPARATION: this corpus is a concatenation of source trees, so tokens
+immediately after the training prefix are usually the continuation of the same
+file or project. Starting the held-out set right at the boundary would score
+the model on text whose preceding context it just trained on, flattering the
+val loss. Both slices are also whole numbers of 1024-token windows, so
+`drop_last=true` discards nothing and the derived step counts are exact.
 
 The corpus is local data, not committed. This script is idempotent: it
 rewrites a slice only when it is missing or the wrong size.
@@ -68,9 +72,26 @@ def main() -> int:
         (TRAIN_SLICE, data[: TRAIN_TOKENS * 2]),
         (VAL_SLICE, data[val_start * 2 :]),
     ):
+        # Size alone is NOT enough to call a slice current: TRAIN_TOKENS and
+        # VAL_TOKENS are fixed, so a REGENERATED corpus (retokenized, or a
+        # different mix) produces slices of exactly the same length with
+        # different contents. A size-only guard would leave the old slices in
+        # place and every downstream gate would stay green while the recipe
+        # trained on stale data. Compare content — cheaply, over the ends and
+        # a strided interior sample rather than the whole 16 MB.
         if path.exists() and path.stat().st_size == len(blob):
-            print(f"[split] {path.name} already correct ({len(blob)} bytes)")
-            continue
+            existing = path.read_bytes()
+            probe = slice(None, 1 << 16)
+            tail = slice(-(1 << 16), None)
+            stride = max(1, len(blob) // (1 << 16))
+            if (
+                existing[probe] == blob[probe]
+                and existing[tail] == blob[tail]
+                and existing[::stride] == blob[::stride]
+            ):
+                print(f"[split] {path.name} already correct ({len(blob)} bytes)")
+                continue
+            print(f"[split] {path.name} is stale — corpus changed under it; rewriting")
         path.write_bytes(blob)
         print(f"[split] wrote {path.name} ({len(blob)} bytes)")
 

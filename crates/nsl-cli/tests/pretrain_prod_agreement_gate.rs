@@ -45,11 +45,10 @@ struct ProdPair {
     /// above, so a recorded count cannot drift from the bytes on disk.
     token_counts: &'static [(&'static str, &'static str)],
     /// Whether the training loader shuffles. `None` for a model whose config
-    /// does not record the choice (50M predates the const). Load-bearing at
-    /// 500M: read sequentially, this concatenated corpus makes the training
-    /// loss track corpus POSITION (r = 0.915 against per-region unigram
-    /// entropy) rather than learning, and a silent flip back to sequential
-    /// would restore that without any other symptom.
+    /// does not record the choice (50M predates the const). Pinned at 500M
+    /// because it is a deliberate choice with a recorded rationale — a
+    /// concatenated corpus fed in file order — that carries no other symptom
+    /// if it silently flips back.
     shuffle: Option<bool>,
 }
 
@@ -222,24 +221,40 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
             pair.load_sites.len(),
             load_lines.len()
         );
-        for line in &load_lines {
-            assert!(
-                pair.load_sites
-                    .iter()
-                    .any(|(p, _)| line.contains(&format!("\"{p}\""))),
-                "{dir}: load_mmap site is not one of the declared corpus \
-                 paths: {line}"
+        // SURJECTIVE, not just "each site is allowed". Review finding: with an
+        // any() check alone, a recipe whose VAL loader pointed at the TRAIN
+        // slice satisfied every assertion here — two allowed sites, both in
+        // the list — while scoring validation on training data. Each declared
+        // path must be used EXACTLY once.
+        for (path, _) in pair.load_sites {
+            let uses = load_lines
+                .iter()
+                .filter(|l| l.contains(&format!("\"{path}\"")))
+                .count();
+            assert_eq!(
+                uses, 1,
+                "{dir}: declared corpus path {path} is loaded {uses} times, \
+                 expected exactly 1 — two loaders naming the SAME slice is how \
+                 a validation set silently becomes the training set"
             );
         }
-        // config.nsl's documented path must be the one the recipe loads (this
-        // const was previously unchecked at 50M and had drifted to a
-        // directory that never existed).
+        // config.nsl's documented paths must be the ones the recipe loads
+        // (PRETRAIN_DATA was previously unchecked at 50M and had drifted to a
+        // directory that never existed). PRETRAIN_VAL_DATA likewise, where the
+        // model declares one.
         let documented = pair.load_sites[0].0;
         assert!(
             config.contains(&format!("const PRETRAIN_DATA = \"{documented}\"")),
             "{dir}: config.nsl PRETRAIN_DATA disagrees with the corpus \
              pretrain_prod.nsl loads ({documented})"
         );
+        if let Some((val_path, _)) = pair.load_sites.get(1) {
+            assert!(
+                config.contains(&format!("const PRETRAIN_VAL_DATA = \"{val_path}\"")),
+                "{dir}: config.nsl PRETRAIN_VAL_DATA disagrees with the \
+                 held-out slice pretrain_prod.nsl loads ({val_path})"
+            );
+        }
         // Denylist as belt-and-braces.
         for (file, text) in [("pretrain_prod.nsl", &prod), ("config.nsl", &config)] {
             for bad in [
@@ -256,11 +271,16 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
         // ── the shuffle choice, where the config records it ────────────────
         if let Some(want) = pair.shuffle {
             let want_str = if want { "shuffle=true" } else { "shuffle=false" };
+            // Anchor on the exact binding the training loop consumes, and
+            // strip any trailing comment first: a substring test over the raw
+            // line is satisfied by the word appearing in a comment, and a
+            // looser line-finder also matches `let val_loader = DataLoader(
+            // val_tokens, ...)`.
             let train_loader = prod
                 .lines()
-                .filter(|l| !l.trim_start().starts_with('#'))
-                .find(|l| l.contains("DataLoader(") && l.contains("tokens,"))
-                .unwrap_or_else(|| panic!("{dir}: no training DataLoader line"));
+                .map(|l| l.split('#').next().unwrap_or(l))
+                .find(|l| l.trim_start().starts_with("let loader = DataLoader("))
+                .unwrap_or_else(|| panic!("{dir}: no `let loader = DataLoader(` line"));
             assert!(
                 train_loader.contains(want_str),
                 "{dir}: the training DataLoader must use {want_str} — see \
@@ -322,20 +342,59 @@ fn the_held_out_split_does_not_overlap_the_training_slice() {
         "TRAIN_TOKENS({train}) + VAL_TOKENS({val}) >= CORPUS_TOKENS({corpus}) — \
          the validation tail would overlap the training prefix"
     );
-    // A strictly positive gap is not enough: DataLoader(drop_last=true)
-    // consumes whole seq_len windows, so a sub-window gap still lets the last
-    // training window read into the first validation window.
+    // A strictly positive gap is not enough — but NOT because a window could
+    // straddle it: the slices are separate files, so they are index-disjoint
+    // even at zero gap. The gap buys SEPARATION. This corpus is a
+    // concatenation of source trees, so the tokens immediately after the
+    // training prefix are usually the continuation of the same file, and a
+    // held-out set starting there is scored on text whose preceding context
+    // was trained on. One window is the minimum that means anything.
     let gap = corpus - train - val;
     assert!(
         gap >= seq,
         "the unused gap between the training prefix and the held-out tail is \
-         {gap} tokens, under one {seq}-token window — a training window could \
-         straddle the boundary and leak a suffix the val loss then scores on"
+         {gap} tokens, under one {seq}-token window — too close for the \
+         held-out set to be scoring anything but the continuation of the last \
+         file trained on"
     );
-    // Both slices must be whole windows, or drop_last silently discards a
-    // partial batch and the derived step count is wrong.
-    assert_eq!(train % seq, 0.0, "TRAIN_TOKENS is not a whole number of windows");
-    assert_eq!(val % seq, 0.0, "VAL_TOKENS is not a whole number of windows");
+    // Both slices must be a whole number of DELIVERY SLOTS, and a slot is
+    // batch_size * seq_len contiguous tokens — `build_simple_batch` reads one
+    // flat span per slot and reshapes it to [batch, seq]. Checking modulo
+    // seq_len alone (the first version of this gate) passes token counts that
+    // leave a partial batch for `drop_last=true` to discard, which silently
+    // shortens the epoch below the derived step count.
+    let batch = config_const(&config, "PRETRAIN_BATCH_SIZE", "coder500m");
+    let slot = seq * batch;
+    assert_eq!(
+        train % slot,
+        0.0,
+        "TRAIN_TOKENS({train}) is not a whole number of {slot}-token delivery \
+         slots — drop_last would discard the remainder and the derived step \
+         count would overstate the epoch"
+    );
+    assert_eq!(
+        val % slot,
+        0.0,
+        "VAL_TOKENS({val}) is not a whole number of {slot}-token delivery slots"
+    );
+
+    // CORPUS_TOKENS is the sole input to the gap arithmetic above, so pin it
+    // to the bytes on disk when the local corpus is present — otherwise the
+    // "held out" guarantee rests on a number nothing checks.
+    let corpus_path = root.join("data/tokens/train_new.bin");
+    if corpus_path.exists() {
+        let bytes = std::fs::metadata(&corpus_path).unwrap().len();
+        assert_eq!(
+            bytes / 2,
+            corpus as u64,
+            "coder500m CORPUS_TOKENS={corpus} disagrees with the on-disk \
+             corpus ({} u16 tokens) — the gap assertion above is derived from \
+             it",
+            bytes / 2
+        );
+    } else {
+        eprintln!("[gate] data/tokens/train_new.bin absent — CORPUS_TOKENS arm skipped");
+    }
 
     // The materializer's constants must match config.nsl — it is what writes
     // the files the recipe reads.

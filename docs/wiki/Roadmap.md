@@ -211,12 +211,13 @@ Validated on GPU, not just compiled — see
 [`PROD500M_VALIDATION_2026_08_19.md`](../../models/benchmarks/PROD500M_VALIDATION_2026_08_19.md).
 Two results worth carrying forward: `--checkpoint-blocks` is **required** (the
 bare configuration OOMs with 168 MB free of 31.39 GB; recomputation puts the
-activation peak at 8.34 GB), and reading this concatenated corpus
-**sequentially made the training loss track corpus position rather than
-learning** — per-region unigram entropy vs per-region loss came out at
-r = 0.915, which read as a diverging run and was not one. The recipe shuffles,
-which only became possible once item 8 made the single-rank shuffle seeded
-rather than entropy-keyed.
+activation peak at 8.34 GB alongside 8.25 GB of persistent state), and **both
+arms destabilize late in the epoch with the cause unresolved** — a 10.94
+excursion sequential, 12.17 shuffled. The leading untested hypothesis is that
+`lr = 3e-4`, carried unchanged across d_model 512/1280/2048 in this repo, is
+too high at 500M for a 512-optimizer-step schedule. The recipe shuffles
+because a concatenated corpus should not be fed in file order and item 8 made
+a seeded shuffle resumable — not because it was measured to help.
 
 ## Currently in flight
 

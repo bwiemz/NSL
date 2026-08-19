@@ -15,7 +15,9 @@
 # tokenization at vocab 49152; see
 # models/benchmarks/TOKENIZER_AND_MFU_2026_07_29.md). The held-out tail,
 # prod_val_slice.bin, is the LAST 524,288 tokens; 13,020 tokens between them
-# are read by neither, so no training window can straddle into validation.
+# are read by neither. Disjointness is automatic (separate files); the gap is
+# there so the held-out set does not begin in the immediate continuation of
+# the last file the model trained on.
 # Both are materialized by models/benchmarks/make_prod_split.py and are local
 # data, not committed.
 #
@@ -47,8 +49,11 @@
 # restored, and a corpus or `--seed` mismatch refuses rather than silently
 # training a different stream.
 #
-# RUN (from models/coder500m):
-#   python ../benchmarks/make_prod_split.py     # once, from the repo root
+# RUN — the split script resolves the repo from its own path, so it works from
+# any cwd; the nsl invocation must be from THIS directory (the corpus paths and
+# `from model import ...` are relative to it):
+#   python models/benchmarks/make_prod_split.py     # once
+#   cd models/coder500m
 #   nsl run --source-ad --checkpoint-blocks pretrain_prod.nsl
 #
 # `--checkpoint-blocks` IS REQUIRED, and that is a measurement, not caution.
@@ -76,31 +81,25 @@ print("  NSL-Coder-500M production pretrain")
 print("  49152 vocab | batch=2 seq=1024 accum=8 | 1 epoch = 4096 steps")
 print("================================================================")
 
-# SHUFFLE IS ON, for MONITORING INTERPRETABILITY — not for quality. Both
-# claims are measured; see models/benchmarks/PROD500M_VALIDATION_2026_08_19.md.
+# SHUFFLE IS ON — on general grounds, NOT on a measured improvement. A
+# concatenated corpus (this repo, then 15 unrelated projects) should not be
+# presented to the optimizer in file order, and item 8 (PR #516) made a seeded
+# shuffle reproducible and resumable, which it was not before: the single-rank
+# path drew its permutation from ENTROPY, so shuffling would have made every
+# run's data order irreproducible and every checkpoint's recorded position
+# meaningless.
 #
-# The corpus is a CONCATENATION (this repo, then 15 unrelated projects), so
-# read sequentially its local difficulty swings: per-512-step region, unigram
-# entropy ranges 7.94..8.57 nats, and the first shuffle=false arm's training
-# loss tracked it at Pearson r = 0.915 (slope 1.21 nats of loss per nat of
-# entropy). That arm looked like a diverging run — loss climbing from 8.43 to
-# a 10.94 excursion — and was nothing of the kind: it came back DOWN wherever
-# the corpus got easier. A loss stream that reports where you are in the
-# corpus rather than how well you are learning is worse than useless as the
-# monitoring signal a production recipe exists to emit. Shuffled, the same
-# epoch stays inside 8.80..9.21 with no excursion.
-#
-# What it does NOT buy is a better model: held-out VAL_LOSS was 9.765
-# (sequential) vs 9.793 (shuffled), 0.028 nats apart with no replicate scatter
-# measured — under the item-6 methodology that is not a difference, and its
-# sign is against shuffling anyway.
-#
-# Shuffling is only affordable at all because of item 8 (PR #516): the
-# single-rank shuffle used to be seeded from ENTROPY, so `shuffle=true` would
-# have made every run's data order irreproducible and every checkpoint's
-# recorded position meaningless. It is now keyed by (seed, epoch), so the
-# order is reproducible AND resumable — validated at this scale by resuming
-# arm B's step-4000 checkpoint to within 0.006 nats of the uninterrupted run.
+# What the measurements do NOT support (see
+# models/benchmarks/PROD500M_VALIDATION_2026_08_19.md, corrected):
+#   - shuffling does not improve held-out loss here: VAL_LOSS 9.765
+#     (sequential) vs 9.793 (shuffled), 0.028 nats apart with no replicate
+#     scatter measured, sign against shuffling;
+#   - it does not remove the late-epoch loss excursions. BOTH arms have one
+#     (10.94 sequential, 12.17 shuffled), and the shuffled arm cannot have a
+#     corpus-position artifact by construction. Cause is OPEN; the leading
+#     untested hypothesis is that lr=3e-4 — carried unchanged across d_model
+#     512/1280/2048 in this repo — is too high at 500M for a 512-optimizer-step
+#     schedule with 25 steps of warmup.
 let tokens = load_mmap("../../data/tokens/prod_train_slice.bin", 3)
 let loader = DataLoader(tokens, batch_size=2, seq_len=1024, shuffle=true, drop_last=true)
 

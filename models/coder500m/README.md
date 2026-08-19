@@ -53,8 +53,9 @@ Two things this recipe deliberately does not hide:
   A bigger corpus is roadmap item 15.
 - **The held-out tail.** Training reads a prefix slice; `VAL_LOSS` is scored
   on the last 524,288 tokens, with 13,020 tokens between them that neither
-  side reads (a sub-window gap would let a `drop_last=true` training window
-  straddle the boundary). At this token budget the train/val gap is the
+  side reads. They are separate files, so disjointness is automatic; the gap
+  keeps the held-out set from starting in the immediate continuation of the
+  last file trained on. At this token budget the train/val gap is the
   measurement that matters, which is why a training loss alone would be
   misleading.
 

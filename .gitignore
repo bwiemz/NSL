@@ -33,10 +33,17 @@ models/coder50m/data/tokenizer/
 # untracked-but-not-ignored. At 500M that sidecar is 4 GB (m and v for 218
 # params), and this repo has already lost work to `git add -A` sweeping up
 # test artifacts.
+# Ignore the CONTENTS but keep the directory: `train(checkpoint_save=...)`
+# writes into a relative `checkpoints/` and does not create it, so a fresh
+# clone that follows the recipe header must find it already there. coder50m
+# already carried a tracked .gitkeep for exactly this reason.
 *.nslm.optim
-models/coder50m/checkpoints/
-models/coder500m/checkpoints/
-models/coder1b/checkpoints/
+models/coder50m/checkpoints/*
+!models/coder50m/checkpoints/.gitkeep
+models/coder500m/checkpoints/*
+!models/coder500m/checkpoints/.gitkeep
+models/coder1b/checkpoints/*
+!models/coder1b/checkpoints/.gitkeep
 
 # Compiled NSL build artifacts (regenerated from .nsl sources)
 *.exp
