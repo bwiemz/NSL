@@ -275,25 +275,38 @@ thread_local! {
     static DISPATCH_MODE: RefCell<Option<DispatchMode>> = const { RefCell::new(None) };
 }
 
-/// Free the impl result tensors captured during a dispatch, skipping any
-/// pointer that is a registered model weight.
+/// Release the impl result tensors captured during a dispatch — one decref
+/// per capture, unconditionally.
 ///
-/// An `@export` that returns a parameter directly hands back the weight
-/// tensor ITSELF (not a copy): freeing it would drop the weight's refcount
-/// from 1 to 0 and free the storage out from under the live model. Views of
-/// weights are NOT skipped — `nsl_tensor_free` on a view decrements the
-/// `data_owner`'s refcount, which the view's creation incremented, so that
-/// release is balanced by construction.
-fn free_captured(captured: &[i64], model: &NslModel) {
+/// **Every captured pointer carries its own owning reference.** A compiled
+/// NSL function's return path hands back an OWNING reference even when the
+/// returned value is a parameter or a model weight (verified empirically:
+/// 3000 `fn ident(x) -> x` dispatches through `nsl_model_call_into` neither
+/// double-free nor grow). So:
+///   - a fresh result arrives at refcount 1 and this decref frees it (the
+///     legacy alias-and-leak path is what leaks it);
+///   - a returned INPUT arrives at 2 (the wrapper's borrow + the return's
+///     incref); the typed wrapper's own input free takes one, this takes the
+///     other;
+///   - a returned WEIGHT arrives at 2 (the model's + the return's); this
+///     takes the return's, leaving the model's intact for `nsl_model_destroy`.
+///
+/// An earlier version SKIPPED registered weights here, on the theory that a
+/// returned weight arrives holding only the model's single reference. That
+/// stranded the return's reference on every call, so weight storage was
+/// never freed even after `nsl_model_destroy`. Do not reintroduce the skip
+/// without re-establishing the return-incref contract it depends on.
+///
+/// Duplicates are still coalesced: the same pointer captured twice (an
+/// export returning the same tensor in two output slots) holds ONE returned
+/// reference, not two.
+fn free_captured(captured: &[i64], _model: &NslModel) {
     let mut seen: Vec<i64> = Vec::with_capacity(captured.len());
     for &ptr in captured {
         if ptr == 0 || seen.contains(&ptr) {
             continue;
         }
         seen.push(ptr);
-        if model.weight_ptrs.contains(&ptr) {
-            continue;
-        }
         crate::tensor::nsl_tensor_free(ptr);
     }
 }
@@ -364,6 +377,17 @@ pub extern "C" fn nsl_dispatch_ownership_finish_alloc(
     out_dl_ptr: i64,
     num_outputs: i64,
 ) -> i64 {
+    // Null every slot up front so EVERY refusal below satisfies the
+    // documented contract ("on any refusal every slot is NULL and nothing
+    // needs freeing") without each branch having to remember. A host that
+    // frees non-NULL slots after rc != 0 would otherwise chase whatever
+    // garbage its stack held.
+    if out_dl_ptr != 0 && num_outputs > 0 {
+        let slots = out_dl_ptr as *mut *mut crate::dlpack::DLManagedTensor;
+        for i in 0..num_outputs as usize {
+            unsafe { *slots.add(i) = std::ptr::null_mut() };
+        }
+    }
     let captured = match DISPATCH_MODE.with(|m| m.borrow_mut().take()) {
         Some(DispatchMode::Alloc { captured }) => captured,
         Some(other) => {
@@ -413,17 +437,14 @@ pub extern "C" fn nsl_dispatch_ownership_finish_alloc(
 
     let out_slots = out_dl_ptr as *mut *mut crate::dlpack::DLManagedTensor;
     for (i, &tensor_ptr) in captured.iter().enumerate() {
-        let is_weight = model.weight_ptrs.contains(&tensor_ptr);
+        // NO extra incref for weight-aliased results. The capture already
+        // holds the return path's owning reference (see `free_captured`),
+        // and that is exactly the reference the consumer's deleter consumes;
+        // the model keeps its own. An earlier version added one here on the
+        // theory that the return did not incref — which stranded a reference
+        // and leaked the weight storage past `nsl_model_destroy`.
         match crate::dlpack::nsl_tensor_to_dlpack_owned(tensor_ptr) {
             Ok(managed) => {
-                if is_weight {
-                    // The export returned a registered weight tensor ITSELF.
-                    // The DLPack consumer's deleter will decref it; balance
-                    // that now so deleter-vs-`nsl_model_destroy` ordering is
-                    // irrelevant (whichever runs last frees the storage).
-                    let t = NslTensor::from_ptr(tensor_ptr);
-                    t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
                 unsafe { *out_slots.add(i) = managed };
             }
             Err(why) => {
@@ -1025,6 +1046,19 @@ fn model_call_alloc_core(
         ));
         return -1;
     }
+    // Null every output slot BEFORE anything can fail. The contract ("on any
+    // refusal every slot is NULL and nothing needs freeing") has to hold for
+    // refusals raised inside the dispatch too — e.g. a scalar-returning
+    // export refuses in `nsl_dispatch_apply_scalar_result`, which returns
+    // rc != 0 below and never reaches `finish_alloc`'s own nulling. A host
+    // that frees non-NULL slots after rc = -1 would otherwise chase whatever
+    // its stack held.
+    if out_dl_ptr != 0 && num_outputs > 0 {
+        let slots = out_dl_ptr as *mut *mut crate::dlpack::DLManagedTensor;
+        for i in 0..num_outputs as usize {
+            unsafe { *slots.add(i) = std::ptr::null_mut() };
+        }
+    }
     let model = unsafe { &*(model_ptr as *const NslModel) };
     let ffis = match model.exports.as_ref().and_then(|r| r.ownership_ffis()) {
         Some(f) => f,
@@ -1324,11 +1358,16 @@ pub extern "C" fn nsl_model_forward(
 /// Run the model's forward pass with DLPack tensors (zero-copy).
 ///
 /// Compatibility shim that delegates to
-/// `nsl_model_call_dlpack(model, "forward", ...)`. Bridges the historical
-/// `num_outputs_ptr` (out-pointer style) ABI to the registry-based dispatch
-/// that takes a fixed `num_outputs` count, allocating an output array of
-/// `*num_outputs_ptr` slots before the call and writing the actual count
-/// back afterwards.
+/// `nsl_model_call_dlpack(model, "forward", ...)`, bridging the historical
+/// `num_outputs_ptr` in/out ABI to the registry dispatch's fixed
+/// `num_outputs`.
+///
+/// `*num_outputs_ptr` on entry is an EXACT arity, not a slot capacity: the
+/// dispatch wrapper refuses any count that is not the export's own arity
+/// (1 in v1), so declaring "I have room for 8" fails rather than filling one
+/// slot. `0`/unset reads as 1, the single-output forward case. On return it
+/// carries the number of slots written: the requested count on success, 0 on
+/// refusal.
 ///
 /// Returns 0 on success, -1 on error. On success each output slot holds an
 /// ownership-transferring `DLManagedTensor*` — see [`nsl_model_call_dlpack`]
@@ -1743,6 +1782,63 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
     match plan {
         ApplyPlan::AllocSkip => return 0,
         ApplyPlan::Into { slot, capacity } => {
+            // The deep copy below moves `byte_count` CONTIGUOUS bytes, a size
+            // derived from the shape product. A non-contiguous result breaks
+            // that equivalence in both directions: a stride-0 broadcast view
+            // (`expand`) has a backing buffer SMALLER than its shape product,
+            // so the memcpy would read past the allocation (out-of-bounds heap
+            // read, segfault at scale); a permuted/sliced view would copy the
+            // wrong elements. Refuse rather than copy wrongly — the ownership
+            // path (nsl_model_call_alloc) carries strides natively and is the
+            // supported way to return a view.
+            if src.ndim > 0 && !src.strides.is_null() {
+                if src.shape.is_null() {
+                    set_error(format!(
+                        "nsl_dispatch_apply_result: output {slot} has strides but \
+                         a null shape\0"
+                    ));
+                    return -1;
+                }
+                let n = src.ndim as usize;
+                let mut expect: i64 = 1;
+                let mut contiguous = true;
+                for i in (0..n).rev() {
+                    let stride = unsafe { std::ptr::read_unaligned(src.strides.add(i)) };
+                    let dim = unsafe { std::ptr::read_unaligned(src.shape.add(i)) };
+                    // A dim of 1 pins nothing: any stride addresses the same
+                    // single element, so do not treat it as non-contiguous.
+                    if dim != 1 && stride != expect {
+                        contiguous = false;
+                        break;
+                    }
+                    expect = expect.saturating_mul(dim.max(0));
+                }
+                if !contiguous {
+                    set_error(format!(
+                        "nsl_dispatch_apply_result: output {slot} is a \
+                         non-contiguous view (broadcast/permuted/sliced strides). \
+                         nsl_model_call_into deep-copies a contiguous block and \
+                         cannot express this layout — use nsl_model_call_alloc \
+                         (DLPack carries strides), or return a materialized \
+                         tensor\0"
+                    ));
+                    return -1;
+                }
+            }
+            // A device pointer cannot be host-memcpy'd. The Alloc path refuses
+            // GPU residency explicitly; this path must too, BEFORE the copy —
+            // src.device_type is otherwise only mirrored onto the caller's desc
+            // after the fact, i.e. after the fault.
+            if src.device_type != 0 && byte_count > 0 {
+                set_error(format!(
+                    "nsl_dispatch_apply_result: output {slot} is GPU-resident \
+                     (device_type={}); nsl_model_call_into copies on the host \
+                     and cannot read device memory — move the result to CPU in \
+                     the export\0",
+                    src.device_type
+                ));
+                return -1;
+            }
             if byte_count as u64 > capacity {
                 set_error(format!(
                     "nsl_dispatch_apply_result: output {slot} requires {byte_count} \

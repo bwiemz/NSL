@@ -145,6 +145,16 @@ const WEIGHTS_ENV: &str = "NSL_DLPACK_REFUSAL_WEIGHTS";
 ///   * `delta` — 64Ki elements (256 KiB), the leak-loop payload: big enough
 ///     that a per-call impl-result leak moves RSS by ~500 MiB over the loop
 ///     while a leak-free path stays flat.
+///   * `memcpy` — the NAME is load-bearing: the reverse-interposition gate.
+///     The artifact's statically-linked runtime references libc `memcpy` on
+///     every dispatch copy. When item 7's first interposition fix
+///     (-Bsymbolic-functions) was in place, every intra-image reference
+///     bound at link time — so this export's wrapper CAPTURED the runtime's
+///     own memcpy calls (pointer-args ABI meets memcpy's semantics: crash or
+///     heap corruption on model create / first dispatch). The codegen fix
+///     (dispatch calls a Linkage::Local sibling; no linker flag) must keep
+///     libc references resolving to libc. `assert_survived` plus the value
+///     check on THIS export is the gate; do not rename it.
 const EXPORT_SRC: &str = concat!(
     "\n@export\nfn alpha(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 2.0\n",
     "\n@export\nfn beta(x: Tensor<[4], f32>, y: Tensor<[4], f32>) -> Tensor<[4], f32>:\n",
@@ -152,6 +162,8 @@ const EXPORT_SRC: &str = concat!(
     "\n@export\nfn forward(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 2.0\n",
     "\n@export\nfn gamma(x: Tensor<[4], f32>) -> f64:\n    return 7.5\n",
     "\n@export\nfn delta(x: Tensor<[65536], f32>) -> Tensor<[65536], f32>:\n    return x * 2.0\n",
+    "\n@export\nfn memcpy(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 3.0\n",
+    "\n@export\nfn ident(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x\n",
 );
 
 // ---------------------------------------------------------------------------
@@ -426,8 +438,9 @@ fn run_model_scenario(scenario: &str) {
                 caps.as_ptr() as i64,
             );
             println!(
-                "CHILD-RESULT rc={rc} out={out_buf:?} ndim={} shape0={} err={}",
-                output.ndim, out_shape[0], last_error()
+                "CHILD-RESULT rc={rc} out={out_buf:?} ndim={} shape0={} dtype={} \
+                 stride0={} err={}",
+                output.ndim, out_shape[0], output.dtype, out_strides[0], last_error()
             );
             println!("CHILD-LIBERR {}", lib_last_error(&lib_path));
         }
@@ -505,7 +518,10 @@ fn run_model_scenario(scenario: &str) {
         "call_alloc_scalar_refused" => {
             let gamma_name = CString::new("gamma").unwrap();
             let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
-            let mut outs: Vec<*mut DLManagedTensor> = vec![std::ptr::null_mut()];
+            // POISON, not null: a null-initialised slot cannot distinguish
+            // "the callee nulled every slot" (the documented contract) from
+            // "the callee never touched them".
+            let mut outs: Vec<*mut DLManagedTensor> = vec![0xDEAD_BEEF_usize as *mut _];
             nsl_runtime::c_api::nsl_clear_error();
             let rc = nsl_runtime::c_api::nsl_model_call_alloc(
                 model,
@@ -583,6 +599,135 @@ fn run_model_scenario(scenario: &str) {
             println!(
                 "CHILD-RESULT rc=0 rss_before={rss_before} rss_after={rss_after} \
                  grown_kb={grown_kb} err="
+            );
+        }
+        // Item 7 — reverse-interposition gate: an export named `memcpy`
+        // must not capture the runtime's own libc memcpy calls (see the
+        // EXPORT_SRC docs). Reaching CHILD-RESULT at all is half the gate —
+        // under -Bsymbolic-functions this crashed before or during dispatch.
+        "reverse_interpose" => {
+            let memcpy_name = CString::new("memcpy").unwrap();
+            let mut out_buf: Vec<f32> = vec![0.0; 4];
+            let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            let mut output = desc(out_buf.as_mut_ptr() as *mut c_void, shape_o.as_mut_ptr(), 1);
+            nsl_runtime::c_api::nsl_clear_error();
+            let rc = nsl_runtime::c_api::nsl_model_call(
+                model,
+                memcpy_name.as_ptr() as i64,
+                &mut input as *mut _ as i64,
+                1,
+                &mut output as *mut _ as i64,
+                1,
+            );
+            println!("CHILD-RESULT rc={rc} out={out_buf:?} err={}", last_error());
+        }
+        // Item 7 — an export returning its INPUT parameter. Three properties
+        // in one child, all previously uncovered:
+        //   (a) call_alloc must REFUSE it — the result aliases the caller's
+        //       buffer, so ownership cannot be transferred (a consumer would
+        //       outlive the input and the deleter would free foreign memory);
+        //   (b) call_into must handle it repeatedly without crashing or
+        //       leaking — the captured result and the typed wrapper's input
+        //       wrapper are the SAME pointer, so the release accounting has
+        //       to be exactly one decref each (the return path increfs);
+        //   (c) a REFUSED armed dispatch must leave the thread-local mode
+        //       disarmed: a later call in the same thread must still work.
+        "ident_alias" => {
+            let ident_name = CString::new("ident").unwrap();
+            let mut outs: Vec<*mut DLManagedTensor> = vec![0xDEAD_BEEF_usize as *mut _];
+            let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            nsl_runtime::c_api::nsl_clear_error();
+            let rc_alloc = nsl_runtime::c_api::nsl_model_call_alloc(
+                model,
+                ident_name.as_ptr() as i64,
+                &mut input as *mut _ as i64,
+                1,
+                outs.as_mut_ptr() as i64,
+                1,
+            );
+            // The aliasing refusal is raised by finish_alloc INSIDE the model
+            // image (the ownership FFIs are dlsym'd from it), so the exe-side
+            // slot is empty by construction — read the library's slot, the
+            // same way the emitted-wrapper refusals are read.
+            println!(
+                "CHILD-ALLOC rc={rc_alloc} slot_null={} err={}",
+                outs[0].is_null(),
+                last_error()
+            );
+            println!("CHILD-LIBERR {}", lib_last_error(&lib_path));
+
+            // (b) repeated call_into on the aliasing export.
+            let mut ok_all = true;
+            for _ in 0..500 {
+                let mut inp = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+                let mut ob: Vec<f32> = vec![0.0; 4];
+                let mut osh: Vec<i64> = vec![0; 8];
+                let mut ost: Vec<i64> = vec![0; 8];
+                let mut out = NslTensorDesc {
+                    data: ob.as_mut_ptr() as *mut c_void,
+                    shape: osh.as_mut_ptr(),
+                    strides: ost.as_mut_ptr(),
+                    ndim: 8,
+                    dtype: 1,
+                    device_type: 0,
+                    device_id: 0,
+                    tape_id: 0,
+                };
+                let caps: Vec<u64> = vec![16];
+                let rc = nsl_runtime::c_api::nsl_model_call_into(
+                    model,
+                    ident_name.as_ptr() as i64,
+                    &mut inp as *mut _ as i64,
+                    1,
+                    &mut out as *mut _ as i64,
+                    1,
+                    caps.as_ptr() as i64,
+                );
+                if rc != 0 || ob != vec![1.0f32, 2.0, 3.0, 4.0] {
+                    ok_all = false;
+                    break;
+                }
+            }
+
+            // (c) refusal, then a successful call on the SAME thread.
+            let mut inp = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            let mut ob: Vec<f32> = vec![0.0; 4];
+            let mut osh: Vec<i64> = vec![0; 8];
+            let mut ost: Vec<i64> = vec![0; 8];
+            let mut out = NslTensorDesc {
+                data: ob.as_mut_ptr() as *mut c_void,
+                shape: osh.as_mut_ptr(),
+                strides: ost.as_mut_ptr(),
+                ndim: 8,
+                dtype: 1,
+                device_type: 0,
+                device_id: 0,
+                tape_id: 0,
+            };
+            let small: Vec<u64> = vec![8];
+            let rc_refused = nsl_runtime::c_api::nsl_model_call_into(
+                model,
+                ident_name.as_ptr() as i64,
+                &mut inp as *mut _ as i64,
+                1,
+                &mut out as *mut _ as i64,
+                1,
+                small.as_ptr() as i64,
+            );
+            let mut inp2 = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            let caps: Vec<u64> = vec![16];
+            let rc_after = nsl_runtime::c_api::nsl_model_call_into(
+                model,
+                ident_name.as_ptr() as i64,
+                &mut inp2 as *mut _ as i64,
+                1,
+                &mut out as *mut _ as i64,
+                1,
+                caps.as_ptr() as i64,
+            );
+            println!(
+                "CHILD-RESULT rc=0 loop_ok={ok_all} rc_refused={rc_refused} \
+                 rc_after={rc_after} out={ob:?} err="
             );
         }
         // Item 7 — signature introspection.
@@ -759,11 +904,14 @@ fn run_model_scenario(scenario: &str) {
 #[cfg(target_os = "linux")]
 fn rss_kb() -> u64 {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    // No unwrap_or(0) fallback: a broken read would make the leak gate
+    // compare 0 against 0 and pass vacuously forever.
     let pages: u64 = statm
         .split_whitespace()
         .nth(1)
         .and_then(|t| t.parse().ok())
-        .unwrap_or(0);
+        .expect("/proc/self/statm must yield a resident-pages field");
+    assert!(pages > 0, "resident pages must be non-zero");
     pages * 4 // 4 KiB pages
 }
 
@@ -1077,6 +1225,19 @@ fn dlpack_and_export_wrappers_refuse_unsupported_dtypes_without_killing_the_host
          and set ndim to the result rank, got: {}",
         into_ok.stdout
     );
+    assert!(
+        into_ok.stdout.contains("dtype=1"),
+        "call_into must report the RESULT's dtype tag (1 = f32) — a regression \
+         to f64 would have the caller read the buffer at the wrong width, got: {}",
+        into_ok.stdout
+    );
+    assert!(
+        into_ok.stdout.contains("stride0=1"),
+        "call_into must deep-copy STRIDES into the caller's array too (element \
+         strides; 1 for a contiguous 1-D f32 result). Without this the \
+         documented strides half of the contract is unenforced, got: {}",
+        into_ok.stdout
+    );
 
     let into_small = run_child("call_into_undersized", &ctx, false);
     into_small.assert_survived("call_into_undersized");
@@ -1146,7 +1307,10 @@ fn dlpack_and_export_wrappers_refuse_unsupported_dtypes_without_killing_the_host
     );
     assert!(
         alloc_scalar.stdout.contains("slot_null=true"),
-        "a refused alloc call must leave the output slot NULL, got: {}",
+        "a refused alloc call must NULL every output slot — the child poisons \
+         the slot with 0xDEADBEEF first, so this proves the callee wrote it \
+         rather than merely never touching it (a host that frees non-NULL \
+         slots after rc=-1 would otherwise chase garbage), got: {}",
         alloc_scalar.stdout
     );
     if cfg!(unix) {
@@ -1182,6 +1346,69 @@ fn dlpack_and_export_wrappers_refuse_unsupported_dtypes_without_killing_the_host
             );
         }
     }
+
+    // ── ITEM-7 GATE: reverse interposition ───────────────────────────────
+    // An export deliberately named `memcpy` — the runtime's dispatch copy
+    // path calls libc memcpy, and a regression toward link-time
+    // self-binding (-Bsymbolic-functions or equivalent) makes that call hit
+    // the export wrapper instead: crash before CHILD-RESULT.
+    let rev = run_child("reverse_interpose", &ctx, false);
+    rev.assert_survived("reverse_interpose");
+    assert_eq!(
+        rev.rc(),
+        0,
+        "the memcpy-named export must dispatch cleanly (its presence must \
+         not disturb the runtime's own libc calls)\n{}",
+        rev.stdout
+    );
+    assert!(
+        rev.stdout.contains("out=[3.0, 6.0, 9.0, 12.0]"),
+        "the memcpy-named export must compute ITS OWN body (x * 3.0), got: {}",
+        rev.stdout
+    );
+
+    // ── ITEM-7 GATE: input-aliasing, refcount hygiene, re-arm ────────────
+    let alias = run_child("ident_alias", &ctx, false);
+    alias.assert_survived("ident_alias");
+    let alloc_line = alias
+        .stdout
+        .lines()
+        .find(|l| l.contains("CHILD-ALLOC"))
+        .unwrap_or_else(|| panic!("no CHILD-ALLOC in\n{}", alias.stdout));
+    assert!(
+        alloc_line.contains("rc=-1"),
+        "call_alloc must REFUSE an export that returns its input: the result \
+         aliases the caller's buffer, so a DLPack consumer could outlive it \
+         and the deleter would free memory NSL never allocated. got: {alloc_line}"
+    );
+    assert!(
+        alloc_line.contains("slot_null=true"),
+        "the aliasing refusal must still NULL the poisoned slot: {alloc_line}"
+    );
+    if cfg!(unix) {
+        let lerr = alias.lib_err();
+        assert!(
+            lerr.contains("aliases memory NSL does not own"),
+            "the refusal must explain WHY and point at the alternative; note it \
+             is raised in the MODEL IMAGE's runtime copy, so it is only \
+             readable through that library's nsl_get_last_error. got: {lerr}"
+        );
+    }
+    assert!(
+        alias.stdout.contains("loop_ok=true"),
+        "500 call_into dispatches of an input-returning export must all \
+         succeed with correct values — the captured result and the typed \
+         wrapper's input wrapper are the same pointer, so a mis-accounted \
+         release shows up as a double-free crash or wrong data.\n{}",
+        alias.stdout
+    );
+    assert!(
+        alias.stdout.contains("rc_refused=-1") && alias.stdout.contains("rc_after=0"),
+        "a REFUSED armed dispatch must leave the thread-local ownership mode \
+         disarmed, so the next call on the same thread still succeeds \
+         (rc_refused=-1 then rc_after=0).\n{}",
+        alias.stdout
+    );
 
     // ── ITEM-7 GATE: export-signature introspection ──────────────────────
     let sig = run_child("sig_json", &ctx, false);

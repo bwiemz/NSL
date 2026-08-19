@@ -253,6 +253,37 @@ fn build_dlpack(tensor: &NslTensor, tensor_ptr: i64, owned: bool) -> *mut DLMana
     Box::into_raw(managed)
 }
 
+/// Does this tensor's storage bottom out in memory NSL itself allocated?
+///
+/// Walks the `data_owner` view chain to its root and reports whether that
+/// root actually owns its buffer. A root with `owns_data == 0` is a BORROW
+/// wrapper over foreign memory — the caller's input buffer, when an
+/// `@export` returns one of its parameters (or a view of one) — and its
+/// storage must never be handed to a DLPack consumer as owned: the consumer
+/// can outlive the caller's buffer (use-after-free), and the deleter would
+/// be releasing storage NSL never allocated.
+///
+/// Slab-managed buffers count as NSL-owned (the slab is NSL's; `nsl_tensor_free`
+/// correctly declines to free individual slab offsets).
+///
+/// The walk is depth-bounded: a corrupted or cyclic chain returns `false`
+/// (refuse) rather than spinning.
+fn storage_is_nsl_owned(tensor_ptr: i64) -> bool {
+    const MAX_VIEW_DEPTH: usize = 64;
+    let mut cur = tensor_ptr;
+    for _ in 0..MAX_VIEW_DEPTH {
+        if cur == 0 {
+            return false;
+        }
+        let t = NslTensor::from_ptr(cur);
+        if t.data_owner == 0 {
+            return t.owns_data == 1 || t.slab_managed == 1;
+        }
+        cur = t.data_owner;
+    }
+    false
+}
+
 /// Convert an NslTensor to a DLManagedTensor (zero-copy, BORROW export).
 ///
 /// The returned DLManagedTensor shares the same data pointer; the NslTensor's
@@ -281,6 +312,16 @@ pub fn nsl_tensor_to_dlpack_owned(
         return Err("nsl_tensor_to_dlpack_owned: null tensor pointer".to_string());
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    if !storage_is_nsl_owned(tensor_ptr) {
+        return Err(
+            "output aliases memory NSL does not own (the export returned an \
+             input, or a view of one). Ownership cannot be transferred: the \
+             consumer would outlive the caller's buffer and the deleter would \
+             free storage NSL never allocated. Return a computed tensor (e.g. \
+             `x * 1.0`) or use nsl_model_call_into to copy into caller memory"
+                .to_string(),
+        );
+    }
     if tensor.device != 0 {
         return Err(format!(
             "output tensor is GPU-resident (device={}); DLPack ownership \

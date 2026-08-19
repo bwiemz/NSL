@@ -100,6 +100,19 @@ impl Compiler<'_> {
                             "failed to declare wrapper fn '{wrapper_symbol}': {e}"
                         ))
                     })?;
+                // Non-preemptible sibling for INTERNAL callers (the dispatch
+                // wrapper) — see `ExportWrapper::local_func_id` for why a
+                // call through the exported name is a symbol-interposition
+                // hazard in both directions.
+                let local_symbol = format!("__nsl_typed_local_{}", wrapper_symbol);
+                let local_func_id = self
+                    .module
+                    .declare_function(&local_symbol, Linkage::Local, &wrapper_sig)
+                    .map_err(|e| {
+                        CodegenError::new(format!(
+                            "failed to declare local wrapper fn '{local_symbol}': {e}"
+                        ))
+                    })?;
 
                 // 3. Track for wrapper-body emission + header emission.
                 self.features
@@ -108,6 +121,7 @@ impl Compiler<'_> {
                         impl_func_id,
                         impl_sig: sig,
                         wrapper_func_id,
+                        local_func_id,
                         raw_name: raw_name.clone(),
                         export_info: info.clone(),
                         is_model_method: false,
@@ -459,6 +473,23 @@ impl Compiler<'_> {
                                         "failed to declare @export wrapper '{wrapper_symbol}': {e}"
                                     ))
                                 })?;
+                            // Non-preemptible sibling for internal callers —
+                            // see `ExportWrapper::local_func_id`.
+                            let local_symbol =
+                                format!("__nsl_typed_local_{}", wrapper_symbol);
+                            let local_func_id = self
+                                .module
+                                .declare_function(
+                                    &local_symbol,
+                                    Linkage::Local,
+                                    &wrapper_sig,
+                                )
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to declare local wrapper \
+                                         '{local_symbol}': {e}"
+                                    ))
+                                })?;
 
                             self.features
                                 .export_wrappers
@@ -466,6 +497,7 @@ impl Compiler<'_> {
                                     impl_func_id,
                                     impl_sig: impl_sig.clone(),
                                     wrapper_func_id,
+                                    local_func_id,
                                     raw_name: method_name.clone(),
                                     export_info: info.clone(),
                                     is_model_method: true,

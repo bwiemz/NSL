@@ -291,7 +291,16 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str(" * and .strides must point at caller-owned arrays whose slot capacity is\n");
     out.push_str(" * declared in outputs[i].ndim ON ENTRY; the result's dims are deep-copied\n");
     out.push_str(" * into them and ndim is set to the result rank. The runtime frees its\n");
-    out.push_str(" * internal result tensor — nothing leaks and nothing is borrowed. */\n");
+    out.push_str(" * internal result tensor — nothing leaks and nothing is borrowed.\n");
+    out.push_str(" * Refuses non-contiguous (broadcast/permuted/sliced) and GPU-resident\n");
+    out.push_str(" * results, which a host-side contiguous copy cannot express — use\n");
+    out.push_str(" * nsl_model_call_alloc for those.\n");
+    out.push_str(" * ERROR VISIBILITY: dispatch-side refusals (including the capacity\n");
+    out.push_str(" * message carrying the required byte count) are raised inside THIS\n");
+    out.push_str(" * library's statically-linked runtime copy. Read them with the\n");
+    out.push_str(" * nsl_get_last_error exported by THIS library, not one from a\n");
+    out.push_str(" * separately-linked libnsl_runtime — the two have distinct\n");
+    out.push_str(" * thread-local error slots, and probe-and-retry sizing needs this one. */\n");
     out.push_str("int64_t   nsl_model_call_into(NslModel* model, const char* name,\n");
     out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
     out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs,\n");

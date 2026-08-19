@@ -618,13 +618,23 @@ class NslModel:
         name_buf = (ctypes.c_char * len(name_bytes))(*name_bytes)
         name_ptr = ctypes.cast(name_buf, ctypes.c_void_p).value or 0
 
-        in_descs, in_keepalive = build_input_descs(inputs)
         n_in = len(inputs)
-        inputs_ptr = ctypes.cast(in_descs, ctypes.c_void_p).value or 0 if n_in > 0 else 0
+        probe_descs, probe_keepalive = build_input_descs(inputs)
+        capacity = self._output_capacity_hint(name, probe_descs, n_in)
+        _ = probe_keepalive
 
         n_out = 1
-        capacity = self._output_capacity_hint(name, in_descs, n_in)
         for attempt in range(2):
+            # Rebuild the input descs per attempt. A capacity refusal happens
+            # AFTER the compiled export has run, so the retry re-executes it —
+            # and the runtime borrows these buffers rather than copying them,
+            # so attempt 1 may have mutated them in place (NSL elides copies
+            # into inputs it can prove dead). Feeding attempt 2 the mutated
+            # buffers would silently compute on the wrong values.
+            in_descs, in_keepalive = build_input_descs(inputs)
+            inputs_ptr = (
+                ctypes.cast(in_descs, ctypes.c_void_p).value or 0 if n_in > 0 else 0
+            )
             out_descs, out_buffers, caps = allocate_output_descs_sized(n_out, capacity)
             outputs_ptr = ctypes.cast(out_descs, ctypes.c_void_p).value or 0
             caps_ptr = ctypes.cast(caps, ctypes.c_void_p).value or 0
@@ -735,7 +745,7 @@ class NslModel:
         from nslpy._bridge import (
             build_input_descs,
             allocate_output_descs_sized,
-            read_f32_output_desc,
+            read_output_desc,
         )
 
         if self._handle == 0 or self._destroyed:
@@ -781,8 +791,12 @@ class NslModel:
             msg = _fetch_last_error(self._lib)
             raise NslError(f"nsl_model_forward_grad returned rc={rc}: {msg}")
 
-        output = read_f32_output_desc(out_descs[0])
+        # Wrap the ctx BEFORE parsing the output: parsing can raise (a rank-0
+        # scalar-loss result, an unsupported dtype), and the runtime has
+        # already handed us an owning ctx pointer by this point — raising
+        # first would strand it with no way for the caller to destroy it.
         ctx = GradContext(self._lib, ctx_slot.value)
+        output = read_output_desc(out_descs[0])
         return output, ctx
 
     def __call__(self, *inputs):

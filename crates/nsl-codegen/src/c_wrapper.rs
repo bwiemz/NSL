@@ -13,6 +13,18 @@ pub struct ExportWrapper {
     pub impl_func_id: FuncId,
     pub impl_sig: Signature,
     pub wrapper_func_id: FuncId,
+    /// Non-preemptible sibling of `wrapper_func_id` (`Linkage::Local`,
+    /// symbol `__nsl_typed_local_<name>`) holding the REAL typed-wrapper
+    /// body; the exported `<name>` is a thin forwarder to it. Every
+    /// INTERNAL call (the dispatch wrapper) targets this one: a call to the
+    /// exported name goes through the PLT because default-visibility ELF
+    /// symbols are preemptible, and BOTH directions of that preemption were
+    /// observed as live bugs — libm's `gamma(3)` capturing an export named
+    /// `gamma` inside a Python process, and (with -Bsymbolic-functions as
+    /// the attempted fix) an export named `log` capturing the statically
+    /// linked runtime's own libm `log` calls. Local symbols bind at static
+    /// link time and are immune in both directions.
+    pub local_func_id: FuncId,
     pub raw_name: String,
     pub export_info: ExportInfo,
     /// True if this wraps a model method — wrapper must thread
@@ -399,10 +411,53 @@ pub fn emit_c_abi_wrapper(
         builder.finalize();
     }
 
+    // The REAL body lands in the non-preemptible local sibling; internal
+    // callers (the dispatch wrapper) target it directly. See
+    // `ExportWrapper::local_func_id` for the two live interposition bugs
+    // this split closes.
+    compiler
+        .module
+        .define_function(wrapper.local_func_id, &mut ctx)
+        .map_err(|e| CodegenError::new(format!("define local wrapper fn: {e:?}")))?;
+
+    emit_export_forwarder(compiler, wrapper)?;
+    Ok(())
+}
+
+/// Define the EXPORTED `<name>` symbol as a thin forwarder into the local
+/// sibling that holds the real typed-wrapper body. External hosts keep the
+/// exact ABI and symbol they always had; only the symbol's body changed
+/// from "the wrapper" to "call the wrapper".
+fn emit_export_forwarder(
+    compiler: &mut Compiler,
+    wrapper: &ExportWrapper,
+) -> Result<(), CodegenError> {
+    let call_conv = compiler.module.target_config().default_call_conv;
+    let sig = build_c_abi_wrapper_signature(&wrapper.export_info, call_conv);
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, compiler.next_func_index()),
+        sig,
+    ));
+    let mut fb_ctx = FunctionBuilderContext::new();
+    {
+        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+        let args: Vec<_> = fb.block_params(entry).to_vec();
+        let local_ref = compiler
+            .module
+            .declare_func_in_func(wrapper.local_func_id, fb.func);
+        let call = fb.ins().call(local_ref, &args);
+        let rets = fb.inst_results(call).to_vec();
+        fb.ins().return_(&rets);
+        fb.finalize();
+    }
     compiler
         .module
         .define_function(wrapper.wrapper_func_id, &mut ctx)
-        .map_err(|e| CodegenError::new(format!("define wrapper fn: {e:?}")))?;
+        .map_err(|e| CodegenError::new(format!("define export forwarder: {e:?}")))?;
     Ok(())
 }
 
@@ -594,9 +649,12 @@ pub fn emit_c_abi_dispatch_wrapper(
                 .store(MemFlags::trusted(), zero_i64_init, scratch_ptr, off as i32);
         }
 
+        // Call the LOCAL sibling, never the exported name: the exported
+        // symbol is preemptible (see `ExportWrapper::local_func_id` — an
+        // export named `gamma` was observed bound to libm's gamma(3) here).
         let typed_ref = compiler
             .module
-            .declare_func_in_func(wrapper.wrapper_func_id, builder.func);
+            .declare_func_in_func(wrapper.local_func_id, builder.func);
 
         let mut typed_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
         typed_args.push(model_ptr);

@@ -128,6 +128,10 @@ fn run_build_shared_single(
         "nsl_model_create_with_lib",
         "nsl_model_destroy",
         "nsl_model_forward",
+        // nslpy binds this on the shared-lib path (NslModel.forward); it was
+        // missing from both lists while every OTHER dispatch symbol was here,
+        // so MSVC stripped it and forward() was dead on Windows.
+        "nsl_model_forward_dlpack",
         "nsl_model_forward_grad",
         "nsl_model_backward",
         "nsl_grad_context_destroy",
@@ -517,6 +521,10 @@ fn run_build_shared_multi(
         "nsl_model_create_with_lib",
         "nsl_model_destroy",
         "nsl_model_forward",
+        // nslpy binds this on the shared-lib path (NslModel.forward); it was
+        // missing from both lists while every OTHER dispatch symbol was here,
+        // so MSVC stripped it and forward() was dead on Windows.
+        "nsl_model_forward_dlpack",
         "nsl_model_forward_grad",
         "nsl_model_backward",
         "nsl_grad_context_destroy",

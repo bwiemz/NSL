@@ -222,8 +222,13 @@ def read_output_desc(desc: NslTensorDesc):
     n_elems = 1
     for i in range(desc.ndim):
         n_elems *= int(desc.shape[i])
-    if n_elems <= 0:
-        raise ValueError(f"output desc resolves to <=0 elements: {n_elems}")
+    if n_elems == 0:
+        # A zero-element result is legitimate (the runtime succeeds with
+        # rc=0 and skips the copy); return the empty list rather than
+        # raising after a successful dispatch.
+        return []
+    if n_elems < 0:
+        raise ValueError(f"output desc resolves to a negative element count: {n_elems}")
     if desc.dtype == 0:  # f64
         arr = ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_double * n_elems))
         return list(arr.contents)
@@ -495,9 +500,19 @@ _NSL_IMPORT_KEEPALIVE: dict[int, Any] = {}
 def to_nsl_tensor(tensor: Any, lib: Optional[ctypes.CDLL] = None) -> int:
     """Convert a Python tensor to a BORROWING NSL tensor pointer via DLPack.
 
-    Returns the raw NslTensor* as an int. The source tensor's memory is kept
-    alive by an internal registry until :func:`release_nsl_tensor` is called
+    Returns the raw NslTensor* as an int. The source tensor's memory is
+    pinned by an internal registry until :func:`release_nsl_tensor` is called
     with the returned pointer.
+
+    .. important::
+
+       **Callers must call :func:`release_nsl_tensor` when done.** Otherwise
+       the producer tensor stays pinned for the process lifetime. This
+       registry is deliberate: previously the DLPack capsule was dropped on
+       return, so its GC-time destructor invoked the producer's deleter while
+       the borrowed NslTensor* was still live — a use-after-free. Trading
+       that for an explicit-release leak is the safe direction, but it IS a
+       leak if the release is skipped.
     """
     if lib is None:
         from nslpy._core import _get_lib
@@ -535,4 +550,8 @@ def from_nsl_tensor(nsl_ptr: int, lib: Optional[ctypes.CDLL] = None) -> Any:
     dlpack_ptr = lib.nsl_dlpack_export(nsl_ptr)
     if dlpack_ptr == 0:
         raise ValueError("Failed to export NslTensor to DLPack")
-    return _dlpack_to_torch(dlpack_ptr)
+    # Pass `lib` so a conversion failure releases the DLManagedTensor instead
+    # of leaking it. NOTE: this is the BORROW exporter — the returned torch
+    # tensor aliases NSL-managed memory and is only valid while `nsl_ptr`
+    # lives. Use NslModel.forward for an owned result.
+    return _dlpack_to_torch(dlpack_ptr, lib)
