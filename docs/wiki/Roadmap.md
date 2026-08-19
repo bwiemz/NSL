@@ -197,6 +197,27 @@ data position meaningless. **`epochs` is the run TOTAL under resume**, not "how
 many more". Design:
 [`2026-08-19-item8-resumable-training-state.md`](../superpowers/specs/2026-08-19-item8-resumable-training-state.md).
 
+### Production 500M recipe + validation (Shipped 2026-08-19, item 9)
+
+`models/coder500m/pretrain_prod.nsl` — the 50M production workflow (item 4) at
+500M, plus the held-out validation the roadmap item asks for. The 500M config
+still carried `total_steps = 305000` for a corpus this repo has never
+contained (item 4 only rewrote the 50M pair); the schedule is now derived from
+the corpus and `pretrain_prod_agreement_gate.rs` checks both sizes from one
+table, including a gate that the held-out tail cannot overlap the training
+prefix by even part of a window.
+
+Validated on GPU, not just compiled — see
+[`PROD500M_VALIDATION_2026_08_19.md`](../../models/benchmarks/PROD500M_VALIDATION_2026_08_19.md).
+Two results worth carrying forward: `--checkpoint-blocks` is **required** (the
+bare configuration OOMs with 168 MB free of 31.39 GB; recomputation puts the
+activation peak at 8.34 GB), and reading this concatenated corpus
+**sequentially made the training loss track corpus position rather than
+learning** — per-region unigram entropy vs per-region loss came out at
+r = 0.915, which read as a diverging run and was not one. The recipe shuffles,
+which only became possible once item 8 made the single-rank shuffle seeded
+rather than entropy-keyed.
+
 ## Currently in flight
 
 Cross-verified against `git log` as of commit `9a1b512e` (2026-04-21):
