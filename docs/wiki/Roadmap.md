@@ -197,6 +197,27 @@ data position meaningless. **`epochs` is the run TOTAL under resume**, not "how
 many more". Design:
 [`2026-08-19-item8-resumable-training-state.md`](../superpowers/specs/2026-08-19-item8-resumable-training-state.md).
 
+### Production 500M recipe + validation (Shipped 2026-08-19, item 9)
+
+`models/coder500m/pretrain_prod.nsl` — the 50M production workflow (item 4) at
+500M, plus the held-out validation the roadmap item asks for. The 500M config
+still carried `total_steps = 305000` for a corpus this repo has never
+contained (item 4 only rewrote the 50M pair); the schedule is now derived from
+the corpus and `pretrain_prod_agreement_gate.rs` checks both sizes from one
+table, including a gate that the held-out tail cannot overlap the training
+prefix by even part of a window.
+
+Validated on GPU, not just compiled — see
+[`PROD500M_VALIDATION_2026_08_19.md`](../../models/benchmarks/PROD500M_VALIDATION_2026_08_19.md).
+Two results worth carrying forward. `--checkpoint-blocks` is **required** —
+the bare configuration OOMs with 168 MB free of 31.39 GB; recomputation puts
+the activation peak at 8.34 GB alongside 8.25 GB of persistent state. And
+**the `lr = 3e-4` this repo carries unchanged across d_model 512 / 1280 / 2048
+is too high at 500M**: halving it and doubling the warmup turned an erratic
+epoch (excursions to 10.94 and 12.17) into a monotone one and took 0.57 nats
+off the held-out loss (9.765 → 9.197). The 1B config inherits the same
+constant and has never been trained long enough to find out.
+
 ## Currently in flight
 
 Cross-verified against `git log` as of commit `9a1b512e` (2026-04-21):

@@ -1,0 +1,156 @@
+# models/coder500m/pretrain_prod.nsl
+# ============================================================================
+# NSL-Coder-500M — production pretraining + held-out validation (item 9)
+# ============================================================================
+#
+# The 50M workflow (item 4 / PR #510), at 500M: no machine-specific paths, no
+# synthetic data, every number agreeing with models/coder500m/config.nsl —
+# enforced by crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which now
+# checks BOTH model sizes from one table. The 500M config previously carried
+# `total_steps=305000` for a corpus this repo has never contained, which is
+# the same fiction item 4 removed from the 50M pair.
+#
+# Corpus: ../../data/tokens/prod_train_slice.bin — the first 8,388,608 u16
+# tokens of data/tokens/train_new.bin (the shipped two-stage transition=40960
+# tokenization at vocab 49152; see
+# models/benchmarks/TOKENIZER_AND_MFU_2026_07_29.md). The held-out tail,
+# prod_val_slice.bin, is the LAST 524,288 tokens; 13,020 tokens between them
+# are read by neither. Disjointness is automatic (separate files); the gap is
+# there so the held-out set does not begin in the immediate continuation of
+# the last file the model trained on.
+# Both are materialized by models/benchmarks/make_prod_split.py and are local
+# data, not committed.
+#
+# Derivation (config.nsl carries the same numbers):
+#   micro-steps/epoch = floor(8,388,608 / (1024 * 2))    = 4096
+#   total micro-steps = 1 epoch x 4096                   = 4096
+#   warmup            = 400 micro-steps                  (~9.8%)
+#   optimizer steps   = floor(4096 / accum(8))           = 512
+#   checkpoints       = 512 / checkpoint_every(100)      = 5
+#
+# TOKEN BUDGET — stated plainly rather than buried: 8.39M train tokens
+# against ~505M parameters is ~0.017 tokens/param, roughly two orders of
+# magnitude below compute-optimal. This program validates the WORKFLOW at
+# 500M — real corpus, real schedule, real checkpoint/resume, held-out
+# validation — it does NOT produce a well-trained 500M model. Expect VAL_LOSS
+# to sit well above the training loss and to stop improving early; that gap
+# is the measurement, not a failure of the run. Closing it needs a larger
+# corpus, which is roadmap item 15.
+#
+# UNITS (same as the 50M recipe): the scheduler counts MICRO-batches (lr is
+# recomputed every micro-batch; with grad_accumulation=8 the effective warmup
+# is 400/8 = 50 optimizer steps). checkpoint_every counts OPTIMIZER steps —
+# codegen converts internally. Dropout is real: DROPOUT=0.1 trains an actual
+# RNG mask and its backward consumes that same mask (PR #507).
+#
+# RESUME (item 8 / PR #516): `epochs` is the run TOTAL, so an interrupted run
+# is resumed by re-running this file UNCHANGED with checkpoint_load= added —
+# the training epoch, the DataLoader's delivery slot and every RNG stream are
+# restored, and a corpus or `--seed` mismatch refuses rather than silently
+# training a different stream.
+#
+# RUN — the split script resolves the repo from its own path, so it works from
+# any cwd; the nsl invocation must be from THIS directory (the corpus paths and
+# `from model import ...` are relative to it):
+#   python models/benchmarks/make_prod_split.py     # once
+#   cd models/coder500m
+#   nsl run --source-ad --checkpoint-blocks pretrain_prod.nsl
+#
+# `--checkpoint-blocks` IS REQUIRED, and that is a measurement, not caution.
+# Without it this configuration OOMs on a 32 GB card: the run dies in the
+# first backward with "VRAM free: 168.2 MB / 31.39 GB" at allocation #3819
+# (matmul_f32). The persistent state is only 8.25 GB — weights 2.07 + optim_m
+# 2.06 + optim_v 2.06 + m_partial 2.06 — so it is the stored activations of 24
+# layers at batch 2 x seq 1024 that exhaust the card. Recomputing them brings
+# the activation surface to a 8.34 GB peak and the whole run to ~10.9 GB
+# driver-reported at step 5, measured with NSL_MEMSTATS=1 on an RTX PRO 4500
+# Blackwell (32 GB) with ~1.4 GB of ambient desktop VRAM in use.
+#
+# Source AD is the production path (fused LCE/SDPA only exist there). This is
+# the same posture as the 1B recipe, which documents its own required flag
+# set; the 50M recipe is small enough to run bare, which is why its header
+# does not carry one.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+print("================================================================")
+print("  NSL-Coder-500M production pretrain")
+print("  49152 vocab | batch=2 seq=1024 accum=8 | 1 epoch = 4096 steps")
+print("================================================================")
+
+# SHUFFLE IS ON — on general grounds, NOT on a measured improvement. A
+# concatenated corpus (this repo, then 15 unrelated projects) should not be
+# presented to the optimizer in file order, and item 8 (PR #516) made a seeded
+# shuffle reproducible and resumable, which it was not before: the single-rank
+# path drew its permutation from ENTROPY, so shuffling would have made every
+# run's data order irreproducible and every checkpoint's recorded position
+# meaningless.
+#
+# Shuffling does NOT improve held-out loss here — VAL_LOSS 9.765 (sequential)
+# vs 9.793 (shuffled) at the inherited LR, 0.028 nats apart with the sign
+# against it. What DID matter was the learning rate: see the LR note in
+# config.nsl and EC3 of the validation record. An early draft of that record
+# blamed these curves on corpus ordering; that was a statistic computed
+# mid-run over 5 of 8 regions and it did not survive the completed data.
+let tokens = load_mmap("../../data/tokens/prod_train_slice.bin", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=1024, shuffle=true, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+# The fused linear-CE kernel computes the loss straight from the hidden state
+# and the LM-head weight, so the [batch*seq, vocab] logits surface and its
+# gradient are never materialized — at 500M that surface would be
+# 2*1024*49152*4 B = 384 MiB live, twice. The four hints must be INT LITERALS
+# matching model.nsl / the DataLoader; a wrong one is refused at runtime by
+# `nsl_fused_lce_pin_hint_extents`. The reshape below must use the same
+# compile-time dims (a runtime `logits.shape` read keeps the composite chain
+# live and the compiler refuses the fusion) — this is why the step body here
+# does not use the `let ls = logits.shape` spelling that pretrain_cert.nsl,
+# which has no fusion, is free to use.
+@fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=1280, batch_size=2, seq_len=1024)
+train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
+    optimizer: AdamW(lr=0.00015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=400, total_steps=4096, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let flat_logits = logits.reshape([2048, 49152])
+        let flat_labels = batch.labels.reshape([2048])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 20 == 0:
+                print(step)
+                print(loss)
+
+print("LOSS_STREAM_END")
+
+# ── held-out validation ─────────────────────────────────────────────────
+# Forward-only (training=false: dropout is identity, so this measures the
+# model rather than a sampled sub-model) over the tail slice the training
+# above never read. This is the "+ validation" half of the roadmap item: a
+# training loss alone cannot tell an under-trained model from a memorizing
+# one, and at 0.017 tokens/param that distinction is the whole question.
+let val_tokens = load_mmap("../../data/tokens/prod_val_slice.bin", 3)
+let val_loader = DataLoader(val_tokens, batch_size=2, seq_len=1024, shuffle=false, drop_last=true)
+
+let val_total = 0.0
+let val_count = 0.0
+for batch in val_loader:
+    let vlogits = m.forward_train(batch.input_ids, false)
+    let vs = vlogits.shape
+    let vflat_logits = vlogits.reshape([vs[0] * vs[1], vs[2]])
+    let vflat_labels = batch.labels.reshape([vs[0] * vs[1]])
+    let vloss = cross_entropy(vflat_logits, vflat_labels)
+    val_total = val_total + vloss.item()
+    val_count = val_count + 1.0
+
+print("VAL_LOSS")
+print(val_total / val_count)
+print("VAL_BATCHES")
+print(val_count)
+
+model_save(m, "checkpoints/pretrain_prod_final.nslm")
+print("PRETRAIN_PROD_COMPLETE")

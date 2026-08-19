@@ -22,9 +22,53 @@ test for the FASE roadmap shipped in items #1-#6 of
 
 - `config.nsl` — hyperparameters (architecture + pretrain + finetune).
 - `model.nsl` — `NSLCoder`, `TransformerBlock`, `SwiGLUFFN` definitions.
+- **`pretrain_prod.nsl` — the production recipe (roadmap item 9).** Real
+  corpus, derived schedule, checkpoint/resume, and a held-out validation
+  pass. Start here for actual training.
 - `pretrain_fase.nsl` — runnable FASE demo using a `train(...)` block with
   `grad_accumulation=8`, AdamW, `grad_clip=1.0`. Synthetic tokens (no
   data pipeline needed).
+- `pretrain_cert.nsl`, `pretrain_srbf16_cert.nsl` — certification arms driven
+  by harnesses, not standalone recipes.
+
+## Production pretraining
+
+```bash
+python models/benchmarks/make_prod_split.py          # once, from the repo root
+cd models/coder500m
+nsl run --source-ad --checkpoint-blocks pretrain_prod.nsl
+```
+
+`--checkpoint-blocks` is **required**, and that is measured: without it the
+run dies in the first backward with 168 MB free of 31.39 GB. The persistent
+state is only 8.25 GB (weights 2.07 + optim m/v 2.06 each + m_partial 2.06) —
+it is the stored activations of 24 layers at batch 2 × seq 1024 that exhaust a
+32 GB card. Recomputing them puts the activation peak at 8.34 GB.
+
+The learning rate is **measured, not inherited**: `lr = 1.5e-4` with 400
+micro-steps of warmup, against the `3e-4 / 200` this repo carries at every
+model size. At 500M the inherited pair produced an erratic epoch with
+excursions to 10.94; the measured pair descends monotonically and lands 0.57
+nats lower on held-out loss.
+
+Two things this recipe deliberately does not hide:
+
+- **Token budget.** 8.39M train tokens against ~505M parameters is ~0.017
+  tokens/param, roughly two orders of magnitude under compute-optimal. This
+  validates the *workflow* at 500M; it does not produce a good 500M model.
+  A bigger corpus is roadmap item 15.
+- **The held-out tail.** Training reads a prefix slice; `VAL_LOSS` is scored
+  on the last 524,288 tokens, with 13,020 tokens between them that neither
+  side reads. They are separate files, so disjointness is automatic; the gap
+  keeps the held-out set from starting in the immediate continuation of the
+  last file trained on. At this token budget the train/val gap is the
+  measurement that matters, which is why a training loss alone would be
+  misleading.
+
+`crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs` re-derives the schedule
+from the corpus arithmetic for both this model and coder50m, so the two files
+cannot drift — or agree on a shared fiction, which is how the previous
+`total_steps = 305000` survived.
 
 ## Running the FASE demo
 
