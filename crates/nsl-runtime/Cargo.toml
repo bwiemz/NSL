@@ -19,6 +19,11 @@ once_cell = "1"
 libloading = "0.8"
 memmap2 = "0.9"
 rand = "0.9"
+# Direct dep on the generator `rand::rngs::StdRng` already resolves to, for
+# `get_word_pos`/`set_word_pos` — the O(1) RNG snapshot/restore that makes
+# training checkpoints resumable (item 8). Same version rand pulls in, so
+# this adds no new crate to the build graph.
+rand_chacha = "0.9"
 cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 safetensors = { version = "0.4" }
 hf-hub = { version = "0.3", optional = true }

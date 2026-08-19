@@ -7918,14 +7918,37 @@ impl Compiler<'_> {
         // restored micro-batch counter seeds step_count_var so bias
         // correction, the scheduler, and checkpoint cadence all continue
         // instead of re-warming.
+        //
+        // Item 8: the DataLoader handle travels with the call so the runtime
+        // can restore the data position too (and refuse a resume whose corpus
+        // or geometry drifted). 0 = this train block has no loader, which the
+        // sidecar records and cross-checks — a loader-less checkpoint resumed
+        // into a loader run (or the reverse) is a silently different training
+        // stream, not a continuation.
+        // Bound ONCE here and reused by the batch loop below, so the handle
+        // the checkpoint records and the handle the loop iterates are the
+        // same value by construction — two independent `.last()` reads could
+        // drift and silently record a position from a different loader.
+        let has_dataloader = state.cleanup.dataloader_vars.last().copied();
+        let checkpoint_dl_handle = has_dataloader
+            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
         if let Some(load_path) = checkpoint_load_path.clone() {
             self.intern_string(&load_path)?;
             let path_val = self.compile_string_literal(builder, &load_path)?;
             let path_len = builder.ins().iconst(cl_types::I64, load_path.len() as i64);
+            let epochs_val_for_resume = builder.ins().iconst(cl_types::I64, epochs);
             let restored = self.compile_call_by_name(
                 builder,
                 "nsl_train_checkpoint_load",
-                &[path_val, path_len, param_list, state_list_1, state_list_2],
+                &[
+                    path_val,
+                    path_len,
+                    param_list,
+                    state_list_1,
+                    state_list_2,
+                    checkpoint_dl_handle,
+                    epochs_val_for_resume,
+                ],
             )?;
             builder.def_var(step_count_var, restored);
         }
@@ -8052,8 +8075,19 @@ impl Compiler<'_> {
         // ── 6. Emit epoch loop ──────────────────────────────────────────
         let epoch_counter_var = state.new_variable();
         builder.declare_var(epoch_counter_var, cl_types::I64);
-        let zero = builder.ins().iconst(cl_types::I64, 0);
-        builder.def_var(epoch_counter_var, zero);
+        // Item 8: a resumed run starts at the epoch the checkpoint recorded,
+        // not 0. Without this the loop re-runs every completed epoch while
+        // the step counter (and therefore the LR schedule and bias
+        // correction) says the run is far past them — the model re-reads old
+        // data under a late-training schedule. The runtime publishes the
+        // value from the load above; it is 0 for a fresh run and for a v1
+        // sidecar (which cannot carry a data position at all).
+        let epoch_start = if checkpoint_load_path.is_some() {
+            self.compile_call_by_name(builder, "nsl_train_resume_epoch", &[])?
+        } else {
+            builder.ins().iconst(cl_types::I64, 0)
+        };
+        builder.def_var(epoch_counter_var, epoch_start);
 
         let epochs_val = builder.ins().iconst(cl_types::I64, epochs);
 
@@ -8078,7 +8112,7 @@ impl Compiler<'_> {
 
         // ── 7. Inner batch loop (when DataLoader exists) or single-step (backward compat) ──
 
-        let has_dataloader = state.cleanup.dataloader_vars.last().copied();
+        // `has_dataloader` is bound at the checkpoint-load site above.
 
         // Declare step parameter variable
         let step_param_var = state.new_variable();
@@ -16545,6 +16579,24 @@ impl Compiler<'_> {
             self.intern_string(&save_path)?;
             let path_val = self.compile_string_literal(builder, &save_path)?;
             let path_len = builder.ins().iconst(cl_types::I64, save_path.len() as i64);
+            // Item 8: the loader handle and the epoch make the saved state a
+            // position in the data stream, not just a step number. Read here
+            // — inside the fire block, at an optimizer-step boundary — so the
+            // recorded slot is the one the next batch would come from.
+            //
+            // What is recorded is the epoch to RESUME AT, which is not always
+            // the epoch in progress. With a DataLoader the epoch is a loop
+            // over batches and the checkpoint lands part-way through it, so
+            // the resume point is (this epoch, next slot). WITHOUT a loader
+            // the epoch body runs exactly once and has just finished, so the
+            // resume point is the NEXT epoch — recording the current one
+            // would re-run a completed epoch on every restart.
+            let epoch_ctr = builder.use_var(epoch_counter_var);
+            let epoch_now = if has_dataloader.is_some() {
+                epoch_ctr
+            } else {
+                builder.ins().iadd_imm(epoch_ctr, 1)
+            };
             self.compile_call_by_name(
                 builder,
                 "nsl_train_checkpoint_save",
@@ -16556,6 +16608,8 @@ impl Compiler<'_> {
                     state_list_1,
                     state_list_2,
                     sc_now,
+                    checkpoint_dl_handle,
+                    epoch_now,
                 ],
             )?;
             builder.ins().jump(cont_block, &[]);
@@ -17525,6 +17579,14 @@ impl Compiler<'_> {
             CodegenError::new(format!("train config refused: {}", msgs.join("; ")))
         })?;
         let model_sym: Option<nsl_ast::Symbol> = pipe_cfg.model;
+
+        // Item 8 note: checkpointing is not lowered on this path, and does
+        // not need a refusal HERE — `compile_train_block` already refuses
+        // checkpoint_save/load/every for every program that reaches this
+        // dispatch (the Milestone B arm above the pipelined branch). A
+        // second copy here would be dead code that reads like the only
+        // guard. Pinned by `pipelined_train_path_refuses_checkpoint_config`
+        // in crates/nsl-cli/tests/train_resume_dataloader_gate.rs.
 
         // Same optimizer/scheduler contract as the standard path — ONE
         // resolver. This also closes the pipelined path's own historical

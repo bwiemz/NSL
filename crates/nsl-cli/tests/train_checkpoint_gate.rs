@@ -138,11 +138,19 @@ fn resume_is_bit_exact_with_uninterrupted_control() {
     assert!(tmp.join("ck.nslm").exists(), "θ checkpoint missing");
     assert!(tmp.join("ck.nslm.optim").exists(), "optim sidecar missing");
 
-    // Phase B: NEW process, resume, 3 more steps.
+    // Phase B: NEW process, resume, run out to the TOTAL of 9.
+    //
+    // Item 8 fixed the meaning of `epochs` under resume: it is the run total,
+    // not "how many more". Before, a resumed run restarted the epoch counter
+    // at 0, so an unedited re-run of a recipe trained its full epoch budget a
+    // SECOND time, and an author who wanted the real remainder had to compute
+    // it by hand from a step counter. Now the checkpoint carries the epoch
+    // and the loop continues into it — which is also what makes the loader
+    // position meaningful (epoch 3 slot 412 is a position, 0 is not).
     let b = run_in(
         &tmp,
         "phase_b.nsl",
-        &fixture(r#", epochs = 3, checkpoint_load = "ck.nslm""#, "AdamW(lr = 0.01)"),
+        &fixture(r#", epochs = 9, checkpoint_load = "ck.nslm""#, "AdamW(lr = 0.01)"),
     );
     assert!(b.ok, "phase B failed:\n{}", b.stderr);
     assert!(

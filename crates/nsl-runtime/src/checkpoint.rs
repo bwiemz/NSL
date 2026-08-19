@@ -377,7 +377,30 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
 // ---------------------------------------------------------------------------
 
 const OPTIM_MAGIC: &[u8; 4] = b"NSLO";
-const OPTIM_VERSION: u32 = 1;
+/// v1: θ + m/v + micro-batch step counter.
+/// v2 (item 8): adds the `resume` header block — training/loader epoch, the
+/// loader's delivery slot, a corpus+geometry fingerprint, and every RNG
+/// stream's state. v1 sidecars still load (see [`nsl_train_checkpoint_load`]).
+const OPTIM_VERSION: u32 = 2;
+
+/// Item 8: the training epoch restored by the last successful
+/// [`nsl_train_checkpoint_load`], published to codegen through
+/// [`nsl_train_resume_epoch`].
+///
+/// A return value rather than a global would be cleaner, but Cranelift call
+/// lowering here returns a single i64 and the step counter already owns it;
+/// threading an out-pointer through the train-block emitter for one scalar is
+/// more moving parts than a value written and read on the same thread,
+/// microseconds apart, in the train block's own prologue.
+static RESUME_TRAIN_EPOCH: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// The training epoch to start the epoch loop at — 0 unless a v2 checkpoint
+/// was just loaded.
+#[no_mangle]
+pub extern "C" fn nsl_train_resume_epoch() -> i64 {
+    RESUME_TRAIN_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// A cheap signature tying the `.optim` sidecar to the exact `.nslm` it was
 /// saved with: FNV-1a over (file size, first MiB, last MiB). θ changes every
@@ -440,6 +463,24 @@ fn scan_header_numbers(header: &[u8], needle: &[u8]) -> Vec<u64> {
         }
     }
     out
+}
+
+/// The first `"<needle>"` string value in the header, verbatim (no escape
+/// handling — every string this runtime writes into the header is hex or a
+/// tensor name).
+fn scan_header_string(header: &[u8], needle: &[u8]) -> Option<Vec<u8>> {
+    let pos = header
+        .windows(needle.len())
+        .position(|w| w == needle)?;
+    let start = pos + needle.len();
+    let rest = &header[start..];
+    // Value starts at the opening quote right after `"key":`.
+    if rest.first() != Some(&b'"') {
+        return None;
+    }
+    let body = &rest[1..];
+    let end = body.iter().position(|&b| b == b'"')?;
+    Some(body[..end].to_vec())
 }
 
 /// In-order scan of `"shape":[...]` bodies (the bracketed text, verbatim).
@@ -529,10 +570,22 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
 ///
 /// Sidecar format (mirrors `.nslm` deliberately): magic `NSLO`, u32 LE
 /// version, u64 LE header size, JSON header
-/// `{"step_count":N,"params":[{name,shape,dtype,offset,nbytes}...]}` (all m
-/// entries in param order, then all v entries), zero-pad to 64, raw
+/// `{"step_count":N,"model_sig":S,"resume":{…},"params":[{name,shape,dtype,offset,nbytes}...]}`
+/// (all m entries in param order, then all v entries), zero-pad to 64, raw
 /// little-endian f32 data back to back.
+///
+/// Item 8 — the `resume` block. θ/m/v/step alone do not describe a training
+/// run: two more things determine what the next step computes, and both used
+/// to restart from scratch on resume.
+///
+/// * **Where in the data we are** — `loader_epoch` + `loader_slot`, plus
+///   `loader_id` fingerprinting the corpus and geometry they index into.
+///   `dl_ptr` may be 0 (a train block with no DataLoader), which records a
+///   loader-less checkpoint; mixing the two refuses at load.
+/// * **The RNG streams** — dropout masks on both CPU and GPU. Captured on the
+///   training thread, which is where the sampling RNG's thread-local lives.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_train_checkpoint_save(
     path_ptr: i64,
     path_len: i64,
@@ -541,6 +594,8 @@ pub extern "C" fn nsl_train_checkpoint_save(
     state1_ptr: i64,
     state2_ptr: i64,
     step_count: i64,
+    dl_ptr: i64,
+    train_epoch: i64,
 ) {
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
@@ -604,8 +659,58 @@ pub extern "C" fn nsl_train_checkpoint_save(
             data_offset += nbytes;
         }
     }
+    // Item 8: the resume block. Every field is a non-negative integer or a
+    // hex string, because the header parsers are needle scanners over ASCII
+    // digits — a '-' would silently truncate the value being read.
+    let rng = crate::rng_state::RngSnapshot::capture();
+    let mut train_epoch = train_epoch.max(0) as u64;
+    let (mut loader_epoch, mut loader_slot, loader_id) = if dl_ptr != 0 {
+        (
+            crate::dataloader::nsl_dataloader_epoch(dl_ptr).max(0) as u64,
+            crate::dataloader::nsl_dataloader_slot(dl_ptr).max(0) as u64,
+            crate::dataloader::nsl_dataloader_identity(dl_ptr) as u64,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    // NORMALIZE an exhausted epoch to the start of the next one. What the
+    // resume block must name is "the next thing to do", and `(epoch E, slot
+    // total_batches)` and `(epoch E+1, slot 0)` are the same position — but
+    // only the second one lets the loader's own bookkeeping AND the
+    // epochs-budget refusal at load see that epoch E is finished.
+    //
+    // Without this, a checkpoint that fires on an epoch's final delivery slot
+    // records `train_epoch = E`, which is `< epochs` for the last epoch of the
+    // run, so the "this budget is spent" refusal cannot fire. The resume then
+    // passed every guard, drew an empty epoch, and exited 0 having trained
+    // NOTHING — the exact silent no-op the refusal exists to prevent, in the
+    // shape (`epochs = 1`, a DataLoader) that the 1B recipe uses.
+    if dl_ptr != 0 {
+        let per_epoch = crate::dataloader::nsl_dataloader_total_batches(dl_ptr).max(0) as u64;
+        if loader_slot >= per_epoch {
+            train_epoch += 1;
+            loader_epoch += 1;
+            loader_slot = 0;
+        }
+    }
+    let resume = format!(
+        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset}}}"#,
+        hl = (dl_ptr != 0) as u64,
+        seed_hex = rng.seed_hex(),
+        hi = (rng.sampling_pos >> 64) as u64,
+        lo = rng.sampling_pos as u64,
+        ctr = rng.gpu_dropout_ctr,
+        // The `--seed` SCALAR, which is a live training-RNG input in its own
+        // right: SR-BF16's dither is `mix64(seed ^ step*SALT, ...)` and the
+        // composed ZeRO-3 slice update reads the same global. Recording only
+        // the sampling stream's ChaCha key would let a resume under a
+        // different `--seed` silently switch every parameter's
+        // stochastic-rounding stream mid-run.
+        gseed = crate::deterministic_ops::get_rng_seed(),
+        gset = crate::deterministic_ops::explicit_rng_seed().is_some() as u64,
+    );
     let header = format!(
-        r#"{{"step_count":{step_count},"model_sig":{sig},"params":[{}]}}"#,
+        r#"{{"step_count":{step_count},"model_sig":{sig},{resume},"params":[{}]}}"#,
         params_json.join(",")
     );
     let header_bytes = header.as_bytes();
@@ -652,26 +757,47 @@ pub extern "C" fn nsl_train_checkpoint_save(
         eprintln!("nsl: train_checkpoint_save: rename '{optim_tmp}' -> '{optim_path}': {e}");
         std::process::abort();
     }
-    eprintln!(
-        "[checkpoint] saved: {path} (+.optim) at micro-batch step {step_count} \
-         ({} params)",
-        m_list.len
-    );
+    if dl_ptr != 0 {
+        eprintln!(
+            "[checkpoint] saved: {path} (+.optim) at micro-batch step \
+             {step_count} ({} params, epoch {train_epoch} loader slot \
+             {loader_slot})",
+            m_list.len
+        );
+    } else {
+        eprintln!(
+            "[checkpoint] saved: {path} (+.optim) at micro-batch step {step_count} \
+             ({} params)",
+            m_list.len
+        );
+    }
 }
 
 /// Restore the FULL training state saved by [`nsl_train_checkpoint_save`]:
 /// θ from the `.nslm` (positional, via [`nsl_model_load`]), moments from the
-/// `<path>.optim` sidecar, and return the saved micro-batch step counter for
-/// codegen to seed `step_count_var` with. Aborts loudly on a missing or
-/// mismatched checkpoint — a resume that silently starts fresh (or restores
-/// half a state) is worse than no resume.
+/// `<path>.optim` sidecar, the RNG streams and the loader position (item 8),
+/// and return the saved micro-batch step counter for codegen to seed
+/// `step_count_var` with. The restored training epoch is published through
+/// [`nsl_train_resume_epoch`]. Aborts loudly on a missing or mismatched
+/// checkpoint — a resume that silently starts fresh (or restores half a
+/// state) is worse than no resume.
+///
+/// `epochs` is the train block's declared epoch count. Item 8 fixes its
+/// meaning under resume: it is the **total** for the run, not "how many
+/// more". A recipe says `epochs = 40`, crashes at epoch 12, and is re-run
+/// unchanged with `checkpoint_load` — it then trains epochs 12..40. The
+/// alternative ("N more") makes an unedited re-run train 2N epochs and
+/// forces the author to hand-compute the remainder from a step counter.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_train_checkpoint_load(
     path_ptr: i64,
     path_len: i64,
     param_tensors_ptr: i64,
     state1_ptr: i64,
     state2_ptr: i64,
+    dl_ptr: i64,
+    epochs: i64,
 ) -> i64 {
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
@@ -716,13 +842,19 @@ pub extern "C" fn nsl_train_checkpoint_load(
     let version = u32::from_le_bytes(
         data[4..8].try_into().unwrap_or_else(|_| std::process::abort()),
     );
-    if version != OPTIM_VERSION {
+    // v1 sidecars still load: θ, moments and the step counter are all
+    // honestly present in them, and refusing would strand every checkpoint
+    // written before item 8. What a v1 file CANNOT carry is the data
+    // position and RNG state — so say exactly that, loudly, instead of
+    // resuming into a silently different data order.
+    if version != OPTIM_VERSION && version != 1 {
         eprintln!(
             "nsl: train_checkpoint_load: unsupported sidecar version {version} \
-             (expected {OPTIM_VERSION})"
+             (this runtime writes {OPTIM_VERSION} and reads 1..={OPTIM_VERSION})"
         );
         std::process::abort();
     }
+    let is_v1 = version == 1;
     let header_size = u64::from_le_bytes(
         data[8..16].try_into().unwrap_or_else(|_| std::process::abort()),
     ) as usize;
@@ -782,6 +914,172 @@ pub extern "C" fn nsl_train_checkpoint_load(
                  — not a checkpoint this runtime wrote"
             );
             std::process::abort();
+        }
+    }
+
+    // ── Item 8: the resume block, parsed and VALIDATED here; applied only
+    // after every other check has passed (validate-before-mutate).
+    let resume = if is_v1 {
+        eprintln!(
+            "[nsl] WARNING: '{optim_path}' is a v1 sidecar — it carries θ, \
+             AdamW moments and the step counter, but NOT the data position \
+             or the RNG state. This resume restarts the DataLoader at epoch \
+             0 batch 0 and re-draws dropout masks from a fresh stream, so it \
+             is not a continuation of the interrupted run.\n\
+             [nsl] WARNING: it also has no epoch to restore, so the epoch \
+             loop starts at 0 and `epochs` keeps its PRE-item-8 meaning of \
+             'how many more' — a recipe edited to the documented total \
+             semantics will over-train by the epochs already completed, and \
+             the 'budget already spent' refusal cannot fire. Re-save a v2 \
+             checkpoint to get the documented behavior."
+        );
+        None
+    } else {
+        let num = |needle: &[u8], what: &str| -> u64 {
+            match scan_header_numbers(header_bytes, needle).first() {
+                Some(&v) => v,
+                None => {
+                    eprintln!(
+                        "nsl: train_checkpoint_load: v2 sidecar header is \
+                         missing '{what}' — malformed checkpoint"
+                    );
+                    std::process::abort();
+                }
+            }
+        };
+        // Counters that end up as i64 (epoch/slot bounds, the published
+        // resume epoch) must be range-checked HERE. `v as i64` on a value
+        // above i64::MAX wraps NEGATIVE, and a negative epoch start slips
+        // past the `>= epochs` budget refusal and seeds the epoch loop with
+        // i64::MIN — an effectively unbounded run out of a corrupt field,
+        // where every other malformed field in this block aborts.
+        let counter = |needle: &[u8], what: &str| -> u64 {
+            let v = num(needle, what);
+            if v > i64::MAX as u64 {
+                eprintln!(
+                    "nsl: train_checkpoint_load: '{what}' is {v}, past the \
+                     signed range every consumer of it uses — refusing rather \
+                     than wrapping to a negative counter"
+                );
+                std::process::abort();
+            }
+            v
+        };
+        let seed_hex = scan_header_string(header_bytes, b"\"rng_seed\":")
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "nsl: train_checkpoint_load: v2 sidecar header is missing \
+                     'rng_seed' — malformed checkpoint"
+                );
+                std::process::abort();
+            });
+        let sampling_seed = crate::rng_state::RngSnapshot::seed_from_hex(&seed_hex)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "nsl: train_checkpoint_load: 'rng_seed' is not 64 hex \
+                     digits — a partially-parsed seed would restore a \
+                     DIFFERENT random stream while looking successful"
+                );
+                std::process::abort();
+            });
+        let hi = num(b"\"rng_pos_hi\":", "rng_pos_hi");
+        let lo = num(b"\"rng_pos_lo\":", "rng_pos_lo");
+        Some(ResumeState {
+            train_epoch: counter(b"\"train_epoch\":", "train_epoch"),
+            had_loader: num(b"\"has_loader\":", "has_loader") != 0,
+            loader_epoch: counter(b"\"loader_epoch\":", "loader_epoch"),
+            loader_slot: counter(b"\"loader_slot\":", "loader_slot"),
+            loader_id: num(b"\"loader_id\":", "loader_id"),
+            global_seed: num(b"\"global_seed\":", "global_seed"),
+            global_seed_set: num(b"\"global_seed_set\":", "global_seed_set") != 0,
+            rng: crate::rng_state::RngSnapshot {
+                sampling_seed,
+                sampling_pos: ((hi as u128) << 64) | (lo as u128),
+                gpu_dropout_ctr: num(b"\"gpu_dropout_ctr\":", "gpu_dropout_ctr"),
+            },
+        })
+    };
+
+    // The loader the checkpoint describes must be the loader we are resuming
+    // into. Each direction of this mismatch silently changes what the resumed
+    // run trains on, which is exactly what item 8 exists to prevent.
+    if let Some(r) = &resume {
+        // The `--seed` scalar is not just provenance: SR-BF16 rounds every
+        // parameter with `mix64(seed ^ step*SALT, param_base + i)` and the
+        // composed ZeRO-3 slice update reads the same global. Restoring θ,
+        // the moments and the sampling stream while this silently changed
+        // would switch every parameter's stochastic-rounding stream mid-run —
+        // a resume that is not a continuation, with no diagnostic. Reachable
+        // from a routine operator slip, because the resume is documented as
+        // "re-run the recipe unchanged" and the seed lives on the command
+        // line, not in the recipe.
+        let live_seed_set = crate::deterministic_ops::explicit_rng_seed().is_some();
+        let live_seed = crate::deterministic_ops::get_rng_seed();
+        if live_seed_set != r.global_seed_set || live_seed != r.global_seed {
+            let fmt = |set: bool, v: u64| {
+                if set { format!("--seed {v}") } else { format!("no --seed (default {v})") }
+            };
+            eprintln!(
+                "nsl: train_checkpoint_load: this run has {} but '{optim_path}' \
+                 was saved with {} — the seed keys the stochastic-rounding and \
+                 ZeRO dither streams directly, so resuming would continue θ and \
+                 the moments while switching those streams. Re-run with the \
+                 saved seed, or start a new run.",
+                fmt(live_seed_set, live_seed),
+                fmt(r.global_seed_set, r.global_seed),
+            );
+            std::process::abort();
+        }
+
+        // `epochs` is the run TOTAL (see this function's doc). A checkpoint
+        // at or past it leaves the epoch loop with nothing to do: zero steps,
+        // no output, exit 0 — the silent-no-op anti-pattern this codebase
+        // refuses elsewhere (see the DataLoader's per-rank floor check).
+        if (r.train_epoch as i64) >= epochs {
+            eprintln!(
+                "nsl: train_checkpoint_load: '{optim_path}' is at epoch {} but \
+                 this train block declares epochs = {epochs}, so the epoch \
+                 loop would run ZERO steps and exit 0. `epochs` is the TOTAL \
+                 for the run, not a count of additional epochs: raise it past \
+                 {} to continue training, or drop checkpoint_load to start a \
+                 new run.",
+                r.train_epoch, r.train_epoch
+            );
+            std::process::abort();
+        }
+        if r.had_loader && dl_ptr == 0 {
+            eprintln!(
+                "nsl: train_checkpoint_load: '{optim_path}' was saved from a \
+                 DataLoader-driven run (epoch {}, slot {}) but this train \
+                 block has no DataLoader — the saved data position cannot be \
+                 restored. Use model_load(...) for a weights-only warm start.",
+                r.loader_epoch, r.loader_slot
+            );
+            std::process::abort();
+        }
+        if !r.had_loader && dl_ptr != 0 {
+            eprintln!(
+                "nsl: train_checkpoint_load: '{optim_path}' was saved from a \
+                 run with no DataLoader, but this train block has one — there \
+                 is no saved data position to continue from, so the loader \
+                 would silently start at epoch 0 batch 0. Use \
+                 model_load(...) for a weights-only warm start."
+            );
+            std::process::abort();
+        }
+        if r.had_loader && dl_ptr != 0 {
+            let live_id = crate::dataloader::nsl_dataloader_identity(dl_ptr) as u64;
+            if live_id != r.loader_id {
+                eprintln!(
+                    "nsl: train_checkpoint_load: the DataLoader does not match \
+                     the one '{optim_path}' was saved from (loader_id {live_id} \
+                     vs sidecar {}) — a different corpus, batch geometry, or \
+                     shuffle seed. Slot {} of a different permutation is \
+                     different data; refusing the resume.",
+                    r.loader_id, r.loader_slot
+                );
+                std::process::abort();
+            }
         }
     }
 
@@ -943,12 +1241,61 @@ pub extern "C" fn nsl_train_checkpoint_load(
         );
         std::process::abort();
     }
-    eprintln!(
-        "[checkpoint] resumed: {path} (+.optim) at micro-batch step {step_count} \
-         ({} params)",
-        m_list.len
-    );
+    // Item 8: apply the resume block LAST — after every byte of θ and m/v is
+    // in place, so an abort in the walk above cannot leave the loader armed
+    // for a position the weights never reached.
+    match &resume {
+        Some(r) => {
+            r.rng.restore();
+            RESUME_TRAIN_EPOCH.store(r.train_epoch as i64, std::sync::atomic::Ordering::SeqCst);
+            if dl_ptr != 0 {
+                crate::dataloader::nsl_dataloader_resume_to(
+                    dl_ptr,
+                    r.loader_epoch as i64,
+                    r.loader_slot as i64,
+                );
+            }
+            eprintln!(
+                "[checkpoint] resumed: {path} (+.optim) at micro-batch step \
+                 {step_count} ({} params, epoch {} loader slot {})",
+                m_list.len, r.train_epoch, r.loader_slot
+            );
+        }
+        None => {
+            // v1: no data position and no RNG state to restore. Explicitly
+            // reset the published epoch so a v1 load after a v2 load in the
+            // same process cannot inherit the v2 value.
+            RESUME_TRAIN_EPOCH.store(0, std::sync::atomic::Ordering::SeqCst);
+            eprintln!(
+                "[checkpoint] resumed: {path} (+.optim) at micro-batch step {step_count} \
+                 ({} params)",
+                m_list.len
+            );
+        }
+    }
     step_count
+}
+
+/// The item-8 half of a checkpoint: everything beyond θ/m/v/step that
+/// determines what the next training step computes.
+struct ResumeState {
+    train_epoch: u64,
+    /// Whether the SAVING run had a DataLoader. Distinguishes "loader at
+    /// epoch 0 slot 0" from "no loader at all" — without it, a loader-less
+    /// checkpoint and a loader checkpoint saved before its first batch are
+    /// the same three zeros.
+    had_loader: bool,
+    loader_epoch: u64,
+    loader_slot: u64,
+    loader_id: u64,
+    /// The `--seed` SCALAR at save time (not the sampling stream's ChaCha
+    /// key). A separate, live training-RNG input: SR-BF16's per-element
+    /// dither and the composed ZeRO-3 slice update both read it directly.
+    global_seed: u64,
+    /// Whether that seed was set explicitly — `--seed 42` is indistinguishable
+    /// from the default by value alone.
+    global_seed_set: bool,
+    rng: crate::rng_state::RngSnapshot,
 }
 
 fn check_tensor_contiguous(tensor: &NslTensor, idx: usize) {

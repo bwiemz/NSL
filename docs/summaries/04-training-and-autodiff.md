@@ -246,6 +246,36 @@ Binary format:
 
 No pickle, no Python — safe, portable, and fast.
 
+### Resumable training state (`.optim` sidecar)
+
+`train(checkpoint_save="ck.nslm", checkpoint_every=N)` writes θ as the `.nslm`
+above **plus** a `ck.nslm.optim` sidecar (magic `NSLO`, currently version 2)
+holding everything else that determines what the next step computes:
+
+| Restored | Why it is not optional |
+|---|---|
+| AdamW `m`/`v` | Bias correction re-warms without them (`m̂ = m/(1-β₁ᵗ)` is 10× at t=1) |
+| Micro-batch step counter | Drives the LR schedule and the checkpoint cadence |
+| Training epoch | The epoch loop continues instead of re-running completed epochs |
+| DataLoader epoch + delivery slot | The resumed run reads the data it had not read yet |
+| Corpus + geometry fingerprint | A resume onto different data **refuses** rather than reordering silently |
+| RNG state (CPU sampling stream, GPU dropout counter) | Dropout masks continue instead of restarting |
+| The `--seed` scalar | Keys the SR-BF16 and ZeRO dither directly; a resume under a different seed **refuses** |
+
+Both files are written to `.tmp` and renamed, so a crash mid-save leaves the
+previous checkpoint intact; the sidecar echoes a signature of the `.nslm` it
+was written beside, so a stale pair (a crash between the two renames) is
+refused instead of resuming θ@N with moments@N−k.
+
+**`epochs` is the run TOTAL under resume**, not "how many more". A recipe that
+says `epochs = 40` and dies at epoch 12 is re-run *unchanged* with
+`checkpoint_load` and trains epochs 12..40. Resuming with an `epochs` at or
+below the checkpoint's epoch refuses (it would run zero steps and exit 0).
+
+Sidecars written before this (version 1) still load, with a warning: they
+carry θ/moments/step but no data position or RNG state, so such a resume is
+not a continuation.
+
 ---
 
 ## Tensor Operations (Runtime)

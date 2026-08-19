@@ -8331,10 +8331,6 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     inner::set_oom_context("dropout_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::DROPOUT_F32_PTX;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    // Global seed counter — incremented per dropout call for unique masks
-    static DROPOUT_SEED: AtomicU64 = AtomicU64::new(42);
 
     let input = unsafe { &*(input_ptr as *const NslTensor) };
     assert_gpu_f32(input, "dropout_f32", "input");
@@ -8354,7 +8350,10 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     // u32::MAX * (1-p) gives the threshold
     let threshold = ((1.0 - p) * u32::MAX as f64) as u32;
     let scale = (1.0 / (1.0 - p)) as f32;
-    let seed = DROPOUT_SEED.fetch_add(len, Ordering::SeqCst);
+    // The counter lives in `rng_state` (not a function-local static) so a
+    // training checkpoint can capture and restore it, and so `--seed` can
+    // key it — see that module's header.
+    let seed = crate::rng_state::gpu_dropout_next_seed(len);
 
     let mut inp_data = input.data as u64;
     let mut out_val = out_data as u64;

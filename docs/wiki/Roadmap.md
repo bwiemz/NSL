@@ -184,6 +184,19 @@ Cross-node trace correlation; per-rank NaN/divergence detection; cluster-level C
 ### M62 -- Legacy interop / PyTorch FFI (Shipped; ownership models added 2026-08-18)
 `from_torch()`/`to_torch()` round-trips; `@export` decorator shipped 2026-04-15; grad-context bridge shipped 2026-04-16; per-function C wrappers + Python E2E shipped 2026-04-21 (PR #48/#96). Item 7 (2026-08-18) added the DLPack **output** ownership models: `nsl_model_call_into` (caller-alloc, capacity contract), `nsl_model_call_alloc` (DLManagedTensor transfer, deleter releases exactly once), `nsl_model_get_export_signature` introspection — `NslModel.forward` now returns owned torch tensors. Designs: [`2026-03-19-m62-legacy-interop-design.md`](../superpowers/specs/2026-03-19-m62-legacy-interop-design.md), [`2026-08-18-item7-dlpack-output-ownership.md`](../superpowers/specs/2026-08-18-item7-dlpack-output-ownership.md).
 
+### Resumable training state (Shipped 2026-08-19, item 8)
+
+`train(checkpoint_save=…)`'s `.optim` sidecar reached version 2: beyond θ, the
+AdamW moments and the micro-batch step counter, it now carries the training
+epoch, the DataLoader's epoch + delivery slot, a corpus/geometry fingerprint,
+and every RNG stream's state. A resumed run continues the data stream and the
+dropout masks instead of restarting them, and refuses (rather than silently
+reordering) when the corpus, geometry or loader presence drifted. The
+single-rank shuffle became seeded — it used entropy, which made any recorded
+data position meaningless. **`epochs` is the run TOTAL under resume**, not "how
+many more". Design:
+[`2026-08-19-item8-resumable-training-state.md`](../superpowers/specs/2026-08-19-item8-resumable-training-state.md).
+
 ## Currently in flight
 
 Cross-verified against `git log` as of commit `9a1b512e` (2026-04-21):
