@@ -69,6 +69,41 @@ fn header_contains_expected_prototypes() {
     assert!(header.contains("nsl_model_create"), "missing nsl_model_create proto: {header}");
     assert!(header.contains("nsl_model_destroy"), "missing nsl_model_destroy proto: {header}");
 
+    // Item-7 ownership models + introspection, WITH their ownership
+    // commentary — the comments are the contract a C host reads.
+    assert!(
+        header.contains("int64_t   nsl_model_call_into(NslModel* model, const char* name,"),
+        "missing nsl_model_call_into proto: {header}"
+    );
+    assert!(
+        header.contains("const uint64_t* out_capacities);"),
+        "call_into must declare the capacity array: {header}"
+    );
+    assert!(
+        header.contains("int64_t   nsl_model_call_alloc(NslModel* model, const char* name,"),
+        "missing nsl_model_call_alloc proto: {header}"
+    );
+    assert!(
+        header.contains("DLManagedTensor** out_dl"),
+        "call_alloc must take DLManagedTensor** slots: {header}"
+    );
+    assert!(
+        header.contains("typedef struct DLManagedTensor DLManagedTensor;"),
+        "the opaque DLManagedTensor typedef must precede its use: {header}"
+    );
+    assert!(
+        header.contains("deleter releases the underlying"),
+        "the alloc prototype must document the exactly-once deleter contract: {header}"
+    );
+    assert!(
+        header.contains("const char* nsl_model_get_export_signature(NslModel* model, const char* name);"),
+        "missing nsl_model_get_export_signature proto: {header}"
+    );
+    assert!(
+        header.contains("valid until\n * nsl_model_destroy") || header.contains("valid until"),
+        "the signature prototype must document the borrowed-pointer lifetime: {header}"
+    );
+
     // Export functions — prototypes
     assert!(header.contains("int forward(NslModel"), "missing forward prototype: {header}");
     assert!(header.contains("const NslTensorDesc*"), "missing const NslTensorDesc param type: {header}");

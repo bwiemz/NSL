@@ -461,16 +461,28 @@ pub fn emit_c_abi_dispatch_wrapper(
 
     // Determine whether this signature is dispatch-compatible.
     //   - All params must be tensors (packed-array ABI has no scalar slots).
-    //   - Return must be a single Tensor or Scalar (single output desc).
+    //   - Return must be a single Tensor, or a Scalar(f64) (single output
+    //     desc). Non-f64 scalar returns are routed to the refusal stub: the
+    //     scalar apply helper stores exactly 8 f64 bits and tags the desc
+    //     dtype 0, so any other width/interpretation would mislabel the
+    //     caller's read. (Before item 7 EVERY scalar return here was worse
+    //     than unsupported — the typed wrapper stores the scalar bits where
+    //     the scratch desc's data POINTER lives, and the old flow handed
+    //     that desc to `nsl_dispatch_apply_result`, which memcpy'd FROM the
+    //     value-reinterpreted-as-address: a wild read on every call.)
     let all_tensor_params = wrapper
         .export_info
         .params
         .iter()
         .all(|p| matches!(p.ty, ExportTypeInfo::Tensor { .. }));
+    let scalar_f64_return = matches!(
+        wrapper.export_info.return_type,
+        ExportTypeInfo::Scalar(crate::c_header::ExportDtype::F64)
+    );
     let single_output = matches!(
         wrapper.export_info.return_type,
-        ExportTypeInfo::Tensor { .. } | ExportTypeInfo::Scalar(_)
-    );
+        ExportTypeInfo::Tensor { .. }
+    ) || scalar_f64_return;
     let supported = all_tensor_params && single_output;
 
     let expected_inputs = wrapper.export_info.params.len() as i64;
@@ -503,7 +515,8 @@ pub fn emit_c_abi_dispatch_wrapper(
             // any call routes to a clear error rather than miscompiling.
             let msg = format!(
                 "export '{}' has a signature unsupported by nsl_model_call \
-                 (only all-Tensor params + single Tensor/Scalar return are dispatchable)",
+                 (only all-Tensor params + single Tensor/Scalar-f64 return are \
+                 dispatchable)",
                 wrapper.export_info.raw_name
             );
             emit_set_error(&mut builder, &mut compiler.module, &msg)?;
@@ -624,10 +637,20 @@ pub fn emit_c_abi_dispatch_wrapper(
         builder.switch_to_block(copy_block);
         builder.seal_block(copy_block);
 
-        // Fold scratch → caller's preallocated output desc.
+        // Fold scratch → caller's preallocated output desc. Scalar returns
+        // use the scalar sibling: the typed wrapper stored the raw f64 bits
+        // at scratch offset 0 (the desc's data-pointer storage), so the
+        // tensor apply helper must never see this desc — it would memcpy
+        // FROM the scalar value reinterpreted as an address (the item-7
+        // wild-read fix; see `nsl_dispatch_apply_scalar_result`).
+        let apply_fn_name = if scalar_f64_return {
+            "nsl_dispatch_apply_scalar_result"
+        } else {
+            "nsl_dispatch_apply_result"
+        };
         let apply_fid = declare_runtime_fn(
             &mut compiler.module,
-            "nsl_dispatch_apply_result",
+            apply_fn_name,
             &[cw_types::I64, cw_types::I64],
             &[cw_types::I64],
         )?;

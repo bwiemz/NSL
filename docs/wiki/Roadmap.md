@@ -181,8 +181,8 @@ Distributed data pipeline for exabyte-scale corpora; streaming without full data
 ### M61 -- Cluster debugging (Planned, Phase 12)
 Cross-node trace correlation; per-rank NaN/divergence detection; cluster-level Chrome trace export. Design: [`2026-03-19-m61-cluster-debugging-design.md`](../superpowers/specs/2026-03-19-m61-cluster-debugging-design.md).
 
-### M62 -- Legacy interop / PyTorch FFI (In flight, Phase 10)
-`from_torch()`/`to_torch()` round-trips; `@export` decorator shipped 2026-04-15; grad-context bridge shipped 2026-04-16; per-function C wrappers and Python E2E tests pending. Design: [`2026-03-19-m62-legacy-interop-design.md`](../superpowers/specs/2026-03-19-m62-legacy-interop-design.md).
+### M62 -- Legacy interop / PyTorch FFI (Shipped; ownership models added 2026-08-18)
+`from_torch()`/`to_torch()` round-trips; `@export` decorator shipped 2026-04-15; grad-context bridge shipped 2026-04-16; per-function C wrappers + Python E2E shipped 2026-04-21 (PR #48/#96). Item 7 (2026-08-18) added the DLPack **output** ownership models: `nsl_model_call_into` (caller-alloc, capacity contract), `nsl_model_call_alloc` (DLManagedTensor transfer, deleter releases exactly once), `nsl_model_get_export_signature` introspection — `NslModel.forward` now returns owned torch tensors. Designs: [`2026-03-19-m62-legacy-interop-design.md`](../superpowers/specs/2026-03-19-m62-legacy-interop-design.md), [`2026-08-18-item7-dlpack-output-ownership.md`](../superpowers/specs/2026-08-18-item7-dlpack-output-ownership.md).
 
 ## Currently in flight
 

@@ -114,7 +114,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
 | M56-M61 | Multi-Agent, FPGA, Elastic, Topology, Exabyte, Cluster Debug | Mixed | M58 elastic fault-tolerance runtime pieces and M60 distributed data-streaming modules are present; the rest remain not started or partial |
-| M62 | Legacy Interop (C API / PyTorch FFI) | **Production** | NslTensorDesc, dtype mapping, **real model_forward** (calls compiled function), DLPack v0.8 |
+| M62 | Legacy Interop (C API / PyTorch FFI) | **Production** | NslTensorDesc, dtype mapping, **real model_forward** (calls compiled function), DLPack v0.8 with **two output-ownership models** (item 7, 2026-08-18): `nsl_model_call_into` (caller-alloc, capacity-checked) + `nsl_model_call_alloc`/`_dlpack` (ownership transfer, deleter releases exactly once) + `nsl_model_get_export_signature` introspection. Before item 7 the DLPack output path refused every tensor-returning export |
 
 ---
 

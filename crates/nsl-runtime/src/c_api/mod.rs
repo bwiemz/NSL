@@ -191,23 +191,6 @@ fn set_error(msg: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(cstr));
 }
 
-/// The thread-local error text, or `""` if none is set. Lets a caller that
-/// wants to ADD context to a callee's refusal read it first instead of
-/// clobbering it.
-///
-/// Note this reads THIS image's thread-local. A `.so` produced by
-/// `nsl build --shared-lib` statically links its own copy of the runtime, so a
-/// refusal raised inside the emitted wrapper is not visible here — see the
-/// module docs of `tests/dlpack_unsupported_dtype_refusal.rs`.
-fn last_error_text() -> String {
-    LAST_ERROR.with(|e| {
-        e.borrow()
-            .as_ref()
-            .map(|c| c.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    })
-}
-
 /// Spec B §5.2/§5.5 helper: set the thread-local error from an already-
 /// constructed `CString`. Used by `grad_context.rs` to avoid the
 /// `String → CString` allocation churn for the small set of static
@@ -220,6 +203,253 @@ fn capi_trace(msg: impl AsRef<str>) {
     if std::env::var_os("NSL_CAPI_TRACE").is_some() {
         eprintln!("[nsl-capi] {}", msg.as_ref());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch ownership mode (item 7)
+// ---------------------------------------------------------------------------
+//
+// The codegen-emitted typed wrapper hands every impl result tensor to the
+// runtime via `nsl_tensor_to_desc_ffi(result_tensor, scratch_desc)`, and the
+// dispatch wrapper then folds scratch onto the caller's desc via
+// `nsl_dispatch_apply_result`. Neither generated symbol can change signature
+// (the `ExportRegistry` transmutes any dlsym'd `<name>__nsl_dispatch` to
+// `ExportFnPtr` — a silent-UB hazard if the ABI forked), so the two new
+// ownership-model entry points communicate with those runtime helpers through
+// a THREAD-LOCAL mode instead:
+//
+//   - `Into`  (`nsl_model_call_into`):  capacity-checked deep-copy into
+//     caller-owned buffers; the captured impl tensors are freed by the entry
+//     point afterwards (the legacy `nsl_model_call` path leaks them by
+//     contract — its callers alias the leaked tensor's shape/strides).
+//   - `Alloc` (`nsl_model_call_alloc`): no caller buffers; the captured impl
+//     tensors are wrapped into `DLManagedTensor`s whose deleter transfers
+//     ownership to the consumer.
+//
+// Dispatch is synchronous on the calling thread, and NSL impl code never
+// re-enters the model C API mid-dispatch, so a thread-local is sound. With
+// the mode unarmed (plain `nsl_model_call`) every helper behaves
+// bit-identically to the pre-item-7 runtime.
+//
+// **The thread-local is PER-IMAGE.** A `nsl build --shared-lib` artifact
+// statically links its own runtime copy, so its generated wrapper calls the
+// .so's `nsl_tensor_to_desc_ffi` / `nsl_dispatch_apply_result` — which read
+// the .so's `DISPATCH_MODE`, not a host-linked runtime's. The entry points
+// therefore never touch `DISPATCH_MODE` directly: they arm/release/finish
+// through the three `nsl_dispatch_ownership_*` FFIs below, resolved via
+// dlsym FROM THE SAME IMAGE as the dispatch wrapper (`ExportRegistry` owns
+// that dlopen handle). In the single-image production topology (nslpy binds
+// the model .so directly) those pointers are simply the image's own
+// functions. This also keeps every allocation/free pair same-image (slab
+// bookkeeping is per-image state).
+enum DispatchMode {
+    Into {
+        /// Byte capacity of each caller output slot's `data` buffer.
+        capacities: Vec<u64>,
+        /// Next output slot index to be applied (monotonic per dispatch).
+        cursor: usize,
+        /// Impl result tensors captured via `nsl_tensor_to_desc_ffi`.
+        captured: Vec<i64>,
+    },
+    Alloc {
+        captured: Vec<i64>,
+    },
+}
+
+impl DispatchMode {
+    fn captured_mut(&mut self) -> &mut Vec<i64> {
+        match self {
+            DispatchMode::Into { captured, .. } => captured,
+            DispatchMode::Alloc { captured } => captured,
+        }
+    }
+    fn captured(&self) -> &[i64] {
+        match self {
+            DispatchMode::Into { captured, .. } => captured,
+            DispatchMode::Alloc { captured } => captured,
+        }
+    }
+}
+
+thread_local! {
+    static DISPATCH_MODE: RefCell<Option<DispatchMode>> = const { RefCell::new(None) };
+}
+
+/// Free the impl result tensors captured during a dispatch, skipping any
+/// pointer that is a registered model weight.
+///
+/// An `@export` that returns a parameter directly hands back the weight
+/// tensor ITSELF (not a copy): freeing it would drop the weight's refcount
+/// from 1 to 0 and free the storage out from under the live model. Views of
+/// weights are NOT skipped — `nsl_tensor_free` on a view decrements the
+/// `data_owner`'s refcount, which the view's creation incremented, so that
+/// release is balanced by construction.
+fn free_captured(captured: &[i64], model: &NslModel) {
+    let mut seen: Vec<i64> = Vec::with_capacity(captured.len());
+    for &ptr in captured {
+        if ptr == 0 || seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        if model.weight_ptrs.contains(&ptr) {
+            continue;
+        }
+        crate::tensor::nsl_tensor_free(ptr);
+    }
+}
+
+/// Arm THIS image's dispatch ownership mode. `mode`: 1 = Into (capacity
+/// contract; `caps_ptr`/`n_caps` describe the caller's `uint64_t` capacity
+/// array), 2 = Alloc (capture-only). Called by the ownership entry points
+/// through a registry-dlsym'd pointer so the armed thread-local lives in the
+/// same image as the dispatch wrapper's runtime helpers.
+#[no_mangle]
+pub extern "C" fn nsl_dispatch_ownership_arm(mode: i64, caps_ptr: i64, n_caps: i64) -> i64 {
+    let armed = match mode {
+        1 => {
+            let capacities: Vec<u64> = if n_caps > 0 && caps_ptr != 0 {
+                unsafe { std::slice::from_raw_parts(caps_ptr as *const u64, n_caps as usize) }
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+            DispatchMode::Into { capacities, cursor: 0, captured: Vec::new() }
+        }
+        2 => DispatchMode::Alloc { captured: Vec::new() },
+        _ => {
+            set_error(format!(
+                "nsl_dispatch_ownership_arm: unknown mode {mode} (1=into, 2=alloc)\0"
+            ));
+            return -1;
+        }
+    };
+    DISPATCH_MODE.with(|m| *m.borrow_mut() = Some(armed));
+    0
+}
+
+/// Disarm THIS image's dispatch ownership mode and free the captured impl
+/// result tensors (weight-guarded via [`free_captured`]). This is both the
+/// success epilogue of `nsl_model_call_into` (the payload was deep-copied,
+/// the impl tensors are ours to release — the legacy path leaks them) and
+/// the error epilogue of every armed dispatch. Idempotent: a second call
+/// finds the mode already taken.
+#[no_mangle]
+pub extern "C" fn nsl_dispatch_ownership_release(model_ptr: i64) -> i64 {
+    let mode = DISPATCH_MODE.with(|m| m.borrow_mut().take());
+    if let Some(mode) = mode {
+        if model_ptr != 0 {
+            let model = unsafe { &*(model_ptr as *const NslModel) };
+            free_captured(mode.captured(), model);
+        } else {
+            for &ptr in mode.captured() {
+                if ptr != 0 {
+                    crate::tensor::nsl_tensor_free(ptr);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Disarm THIS image's Alloc mode and transfer the captured impl results to
+/// the caller as ownership-transferring `DLManagedTensor`s. On any refusal
+/// the captured set is released, already-wrapped outputs are unwound via
+/// their deleters, every slot is nulled, and the error lands in THIS image's
+/// thread-local (a cross-image host reads it off the model library handle,
+/// exactly like the generated wrappers' refusals).
+#[no_mangle]
+pub extern "C" fn nsl_dispatch_ownership_finish_alloc(
+    model_ptr: i64,
+    name_ptr: i64,
+    out_dl_ptr: i64,
+    num_outputs: i64,
+) -> i64 {
+    let captured = match DISPATCH_MODE.with(|m| m.borrow_mut().take()) {
+        Some(DispatchMode::Alloc { captured }) => captured,
+        Some(other) => {
+            // Wrong mode — release what was captured and refuse.
+            if model_ptr != 0 {
+                let model = unsafe { &*(model_ptr as *const NslModel) };
+                free_captured(other.captured(), model);
+            }
+            set_error(
+                "nsl_dispatch_ownership_finish_alloc: dispatch was not armed in \
+                 alloc mode\0"
+                    .to_string(),
+            );
+            return -1;
+        }
+        None => Vec::new(),
+    };
+    if model_ptr == 0 {
+        for &ptr in &captured {
+            if ptr != 0 {
+                crate::tensor::nsl_tensor_free(ptr);
+            }
+        }
+        set_error("nsl_dispatch_ownership_finish_alloc: null model pointer\0".to_string());
+        return -1;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    let name = if name_ptr != 0 {
+        unsafe { CStr::from_ptr(name_ptr as *const c_char) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        String::from("<unknown>")
+    };
+
+    if captured.len() != num_outputs.max(0) as usize {
+        free_captured(&captured, model);
+        set_error(format!(
+            "nsl_model_call_alloc: export '{}' produced {} result tensor(s) but \
+             the caller requested {} output slot(s)\0",
+            name,
+            captured.len(),
+            num_outputs
+        ));
+        return -1;
+    }
+
+    let out_slots = out_dl_ptr as *mut *mut crate::dlpack::DLManagedTensor;
+    for (i, &tensor_ptr) in captured.iter().enumerate() {
+        let is_weight = model.weight_ptrs.contains(&tensor_ptr);
+        match crate::dlpack::nsl_tensor_to_dlpack_owned(tensor_ptr) {
+            Ok(managed) => {
+                if is_weight {
+                    // The export returned a registered weight tensor ITSELF.
+                    // The DLPack consumer's deleter will decref it; balance
+                    // that now so deleter-vs-`nsl_model_destroy` ordering is
+                    // irrelevant (whichever runs last frees the storage).
+                    let t = NslTensor::from_ptr(tensor_ptr);
+                    t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                unsafe { *out_slots.add(i) = managed };
+            }
+            Err(why) => {
+                // Unwind: release the outputs already wrapped (their owned
+                // deleters free the tensors), free the not-yet-wrapped
+                // remainder, and null every slot so the caller holds nothing.
+                for k in 0..i {
+                    unsafe {
+                        crate::dlpack::nsl_dlpack_free(*out_slots.add(k) as i64);
+                        *out_slots.add(k) = std::ptr::null_mut();
+                    }
+                }
+                for j in i..captured.len() {
+                    unsafe { *out_slots.add(j) = std::ptr::null_mut() };
+                }
+                free_captured(&captured[i..], model);
+                set_error(format!(
+                    "nsl_model_call_alloc: output {i} of export '{}' cannot \
+                     transfer ownership via DLPack: {why}\0",
+                    name
+                ));
+                return -1;
+            }
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +470,15 @@ pub const NSL_ABI_VERSION_MAJOR: u32 = 1;
 /// Bump this for backward-compatible additions (new exported symbols, new
 /// trailing optional behavior). A host built against minor `m` can safely use a
 /// runtime with minor `>= m` and the same major.
-pub const NSL_ABI_VERSION_MINOR: u32 = 0;
+///
+/// **Minor 1 (item 7):** adds `nsl_model_call_into`, `nsl_model_call_alloc`,
+/// `nsl_model_get_export_signature`, `nsl_dispatch_apply_scalar_result`, and
+/// makes `nsl_model_call_dlpack` / `nsl_model_forward_dlpack` actually return
+/// ownership-transferring outputs (they previously refused every
+/// tensor-returning export — no working caller existed, and the refusal note
+/// was contracted to be deleted with this change, so this is additive, not
+/// breaking). `NslTensorDesc` stays 48 bytes.
+pub const NSL_ABI_VERSION_MINOR: u32 = 1;
 
 /// Return the runtime's C-ABI version packed as `(major << 16) | minor`.
 ///
@@ -598,20 +836,252 @@ pub extern "C" fn nsl_model_call(
     unsafe { fn_ptr(model_ptr, inputs_ptr, num_inputs, outputs_ptr, num_outputs) }
 }
 
+/// Resolve an export's dispatch fn-pointer, mirroring `nsl_model_call`'s
+/// refusal shapes with the given `caller` prefix. Sets the thread-local
+/// error and returns `Err(())` on every refusal.
+fn resolve_export_fn(
+    caller: &str,
+    model_ptr: i64,
+    name_ptr: i64,
+) -> Result<(String, crate::c_api::exports::ExportFnPtr), ()> {
+    if model_ptr == 0 || name_ptr == 0 {
+        set_error(format!("{caller}: null model or name pointer\0"));
+        return Err(());
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    let registry = match &model.exports {
+        Some(r) => r,
+        None => {
+            set_error(format!(
+                "{caller}: model created without export registry; \
+                 use nsl_model_create_with_lib(weights, lib)\0"
+            ));
+            return Err(());
+        }
+    };
+    let name = unsafe { CStr::from_ptr(name_ptr as *const c_char) }
+        .to_string_lossy()
+        .into_owned();
+    match registry.lookup(&name) {
+        Some(p) => Ok((name, p)),
+        None => {
+            let available = registry.available_names();
+            set_error(format!(
+                "{caller}: export '{}' not in registry. Available: {:?}\0",
+                name, available
+            ));
+            Err(())
+        }
+    }
+}
+
+/// Caller-allocates dispatch with an explicit capacity contract
+/// (item 7, ownership model A).
+///
+/// Same ABI as [`nsl_model_call`] plus `out_capacities_ptr`: an array of
+/// `num_outputs` u64s, where `out_capacities[i]` is the allocated byte size
+/// of `outputs[i].data`. The output-desc contract differs from
+/// `nsl_model_call` in two load-bearing ways:
+///
+///   - **An undersized buffer REFUSES** (rc = -1) and the error text reports
+///     the required byte count — instead of the legacy path's unchecked
+///     memcpy, which silently overran the caller's heap whenever the caller
+///     guessed the output size wrong. A refusal-and-retry probe is also the
+///     supported sizing strategy for exports whose output shape is symbolic
+///     (batch-dependent).
+///   - **Shape/strides are deep-copied into caller-owned arrays.**
+///     `outputs[i].shape` / `.strides` must point at caller arrays, and
+///     `outputs[i].ndim` ON ENTRY declares their slot capacity; on success
+///     `ndim` is set to the result rank. (The legacy path mirrors pointers
+///     into a leaked impl tensor — valid only until someone fixes the leak.)
+///
+/// The impl result tensor is freed before returning: this path does NOT
+/// leak per call. Exports that return a model weight directly are handled
+/// (the weight is copied out and NOT freed).
+#[no_mangle]
+pub extern "C" fn nsl_model_call_into(
+    model_ptr: i64,
+    name_ptr: i64,
+    inputs_ptr: i64,
+    num_inputs: i64,
+    outputs_ptr: i64,
+    num_outputs: i64,
+    out_capacities_ptr: i64,
+) -> i64 {
+    let (name, fn_ptr) = match resolve_export_fn("nsl_model_call_into", model_ptr, name_ptr) {
+        Ok(v) => v,
+        Err(()) => return -1,
+    };
+    if num_outputs > 0 && (outputs_ptr == 0 || out_capacities_ptr == 0) {
+        set_error(format!(
+            "nsl_model_call_into: num_outputs={num_outputs} but the output desc \
+             array or the capacity array is null\0"
+        ));
+        return -1;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    let ffis = match model.exports.as_ref().and_then(|r| r.ownership_ffis()) {
+        Some(f) => f,
+        None => {
+            set_error(
+                "nsl_model_call_into: this artifact predates the item-7 ownership \
+                 FFIs (nsl_dispatch_ownership_*) — rebuild it with the current \
+                 compiler\0"
+                    .to_string(),
+            );
+            return -1;
+        }
+    };
+    capi_trace(format!(
+        "model_call_into name={} num_inputs={} num_outputs={}",
+        name, num_inputs, num_outputs
+    ));
+
+    // Arm/dispatch/release run through the MODEL IMAGE's FFIs so the mode
+    // thread-local, the capacity checks, and every free stay same-image with
+    // the generated wrapper's runtime helpers (see the DispatchMode docs).
+    if unsafe { (ffis.arm)(1, out_capacities_ptr, num_outputs) } != 0 {
+        return -1;
+    }
+    let rc = unsafe { fn_ptr(model_ptr, inputs_ptr, num_inputs, outputs_ptr, num_outputs) };
+    // Success or refusal, the impl result tensors are the runtime's to
+    // release: on success their payload was deep-copied into caller buffers;
+    // on refusal the caller never saw them. (The legacy path must NOT free —
+    // its callers alias the leaked tensor. This path deep-copies, so it must.)
+    unsafe { (ffis.release)(model_ptr) };
+    rc
+}
+
+/// NSL-allocates dispatch: outputs transfer ownership via DLPack
+/// (item 7, ownership model B).
+///
+/// `out_dl_ptr` is an array of `num_outputs` slots of `*mut DLManagedTensor`.
+/// On rc == 0 each slot holds a DLManagedTensor whose **deleter releases the
+/// underlying NSL tensor exactly once** — consuming the capsule in
+/// `torch.utils.dlpack.from_dlpack` hands the memory to torch's GC, which is
+/// what makes the resulting torch tensor *owned*. A host that does not
+/// consume a slot must release it with `nsl_dlpack_free`, exactly once.
+///
+/// Refusals (rc = -1, error text says which): GPU-resident results, dtypes
+/// with no DLPack representation, scalar-returning exports (no DLPack
+/// scalar; use `nsl_model_call_into`), and everything `nsl_model_call`
+/// itself refuses. Refusal is leak-free: any tensors already produced are
+/// released before returning and every slot is nulled.
+///
+/// `tape_id` does not survive this path (DLPack has no field for it):
+/// alloc outputs are terminal for NSL autodiff. Use the desc-based
+/// `nsl_model_forward_grad` for grad-tracked forwards.
+///
+/// **Image lifetime:** each output's deleter is code inside the model's
+/// shared library. The library must stay loaded until every transferred
+/// output has been released — unloading it first leaves dangling deleter
+/// pointers that the consumer's GC will call. nslpy keeps model libraries
+/// mapped for the process lifetime for exactly this reason.
+#[no_mangle]
+pub extern "C" fn nsl_model_call_alloc(
+    model_ptr: i64,
+    name_ptr: i64,
+    inputs_ptr: i64,
+    num_inputs: i64,
+    out_dl_ptr: i64,
+    num_outputs: i64,
+) -> i64 {
+    let (name, fn_ptr) = match resolve_export_fn("nsl_model_call_alloc", model_ptr, name_ptr) {
+        Ok(v) => v,
+        Err(()) => return -1,
+    };
+    model_call_alloc_core(
+        "nsl_model_call_alloc",
+        &name,
+        name_ptr,
+        fn_ptr,
+        model_ptr,
+        inputs_ptr,
+        num_inputs,
+        out_dl_ptr,
+        num_outputs,
+    )
+}
+
+/// Shared alloc-dispatch core for `nsl_model_call_alloc` and the DLPack
+/// entry points. Expects the export already resolved; owns the whole
+/// capture → wrap → publish sequence including leak-free unwinding.
+#[allow(clippy::too_many_arguments)]
+fn model_call_alloc_core(
+    caller: &str,
+    name: &str,
+    name_ptr: i64,
+    fn_ptr: crate::c_api::exports::ExportFnPtr,
+    model_ptr: i64,
+    inputs_ptr: i64,
+    num_inputs: i64,
+    out_dl_ptr: i64,
+    num_outputs: i64,
+) -> i64 {
+    if num_outputs > 0 && out_dl_ptr == 0 {
+        set_error(format!(
+            "{caller}: num_outputs={num_outputs} but the DLPack output slot \
+             array is null\0"
+        ));
+        return -1;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    let ffis = match model.exports.as_ref().and_then(|r| r.ownership_ffis()) {
+        Some(f) => f,
+        None => {
+            set_error(format!(
+                "{caller}: this artifact predates the item-7 ownership FFIs \
+                 (nsl_dispatch_ownership_*) — rebuild it with the current \
+                 compiler\0"
+            ));
+            return -1;
+        }
+    };
+
+    // Scratch descs: the typed wrapper writes result metadata here and the
+    // Alloc-mode `nsl_dispatch_apply_result` deliberately ignores them (the
+    // captured tensor pointer carries everything).
+    let mut scratch: Vec<NslTensorDesc> =
+        (0..num_outputs.max(0)).map(|_| NslTensorDesc::default()).collect();
+
+    capi_trace(format!(
+        "model_call name={} num_inputs={} num_outputs={}",
+        name, num_inputs, num_outputs
+    ));
+
+    // Same-image discipline: arm/finish/release run inside the model image —
+    // see the DispatchMode docs.
+    if unsafe { (ffis.arm)(2, 0, 0) } != 0 {
+        return -1;
+    }
+    let rc = unsafe {
+        fn_ptr(
+            model_ptr,
+            inputs_ptr,
+            num_inputs,
+            scratch.as_mut_ptr() as i64,
+            num_outputs,
+        )
+    };
+    if rc != 0 {
+        unsafe { (ffis.release)(model_ptr) };
+        return rc;
+    }
+    let rc = unsafe { (ffis.finish_alloc)(model_ptr, name_ptr, out_dl_ptr, num_outputs) };
+    drop(scratch);
+    rc
+}
+
 /// DLPack variant of `nsl_model_call`. Bridges `DLManagedTensor*`-ABI
 /// inputs and outputs to the `NslTensorDesc*`-ABI export entry-point
 /// and reuses the same dispatcher.
 ///
-/// **Known gap — the output path is unimplemented.** This function builds its
-/// output descs with [`NslTensorDesc::default()`], so `dst.data` is null and
-/// `nsl_dispatch_apply_result` refuses the null caller buffer. It therefore
-/// **cannot return 0 for a tensor-returning export**; every such call comes
-/// back `-1`. Fixing it needs an output-allocation strategy the C ABI does not
-/// have today. Until then, use [`nsl_model_call`] with preallocated
-/// `NslTensorDesc` outputs — the note appended to the error below says the same
-/// thing to the host, because the underlying refusal ("null data pointer
-/// (caller buffer or impl result)") otherwise blames a buffer this ABI gives
-/// the caller no way to supply.
+/// Outputs use the **ownership-transfer** model (item 7): each output slot
+/// receives a `DLManagedTensor*` whose deleter releases the underlying NSL
+/// tensor exactly once — see [`nsl_model_call_alloc`], which this function
+/// shares its output core with. Inputs remain borrow-imported: the caller's
+/// producers keep ownership of input memory and NSL frees only its borrowed
+/// wrappers before returning.
 #[no_mangle]
 pub extern "C" fn nsl_model_call_dlpack(
     model_ptr: i64,
@@ -699,84 +1169,30 @@ pub extern "C" fn nsl_model_call_dlpack(
             desc
         })
         .collect();
-    let mut output_descs: Vec<NslTensorDesc> =
-        (0..num_outputs).map(|_| NslTensorDesc::default()).collect();
-    let rc = nsl_model_call(
-        model_ptr,
-        name_ptr,
-        input_descs.as_mut_ptr() as i64,
-        num_inputs,
-        output_descs.as_mut_ptr() as i64,
-        num_outputs,
-    );
-    // The output descs above are `NslTensorDesc::default()`, so `dst.data` is
-    // null and `nsl_dispatch_apply_result` refuses with "null data pointer
-    // (caller buffer or impl result)" — a message that blames a caller buffer
-    // this ABI gives the caller no way to supply, sending a correct host off to
-    // debug its own code. Say what is actually wrong.
-    //
-    // APPENDED, not substituted: an arity or registry refusal on the same call
-    // is still the caller's to read, and this note is true alongside it (the
-    // output path is unimplemented regardless of why the dispatch stopped).
-    // Placed AFTER the dispatch on purpose — an early return here would skip
-    // `nsl_model_call`'s `model_call name=` trace, which is the observable the
-    // gate uses to prove the int64 refusal happens BEFORE dispatch. Delete this
-    // block in the same change that gives the DLPack path an output allocator.
-    if rc != 0 && num_outputs > 0 {
-        let prev = last_error_text();
-        let sep = if prev.is_empty() { "" } else { " — " };
-        set_error(format!(
-            "{prev}{sep}note: nsl_model_call_dlpack cannot allocate DLPack \
-             outputs, so it passes zero-initialised output descs and a \
-             tensor-returning export always refuses here. Use nsl_model_call \
-             with preallocated NslTensorDesc outputs.\0"
-        ));
-    }
-    if rc == 0 && dl_outputs_ptr != 0 {
-        let out_slot = dl_outputs_ptr as *mut *mut DLManagedTensor;
-        for (i, desc) in output_descs.iter().enumerate() {
-            // TRIP-WIRE, not a live null site. `desc_to_nsl_tensor` returns 0
-            // only for a dtype tag outside 0..=9, and reaching this loop
-            // requires `rc == 0` from `nsl_model_call` — which can only come
-            // from a codegen dispatch wrapper (`ExportRegistry` binds
-            // `<name>__nsl_dispatch` and has no fallback), whose sole
-            // non-negative return is `nsl_dispatch_apply_result`'s. That
-            // function validates `src.dtype` against 0..=9 and returns -1
-            // otherwise BEFORE mirroring `dst.dtype = src.dtype`, so on
-            // `rc == 0` the tag here is always in range. Kept as a trip-wire
-            // for a future registry entry that writes caller descs directly,
-            // the same way `nsl_dtype_to_capi`'s dead abort branch is kept and
-            // documented above; nothing gates it, because nothing can reach it.
-            let tensor_ptr = desc_to_nsl_tensor(desc);
-            if tensor_ptr == 0 {
-                // Unwind the outputs already exported so a refusal does not
-                // hand the caller half a result set to free.
-                for k in 0..i {
-                    unsafe {
-                        crate::dlpack::nsl_dlpack_free(*out_slot.add(k) as i64);
-                        *out_slot.add(k) = std::ptr::null_mut();
-                    }
-                }
-                unsafe {
-                    *out_slot.add(i) = std::ptr::null_mut();
-                }
+    // Resolve AFTER the input-import refusals above: the contract gate proves
+    // an unsupported-dtype input is refused BEFORE dispatch by asserting the
+    // `model_call name=` trace (emitted inside the alloc core) is absent.
+    let (name, fn_ptr) =
+        match resolve_export_fn("nsl_model_call_dlpack", model_ptr, name_ptr) {
+            Ok(v) => v,
+            Err(()) => {
                 for &p in &input_tensor_ptrs {
                     crate::tensor::nsl_tensor_free(p);
                 }
-                set_error(format!(
-                    "nsl_model_call_dlpack: output {i} carries an unrecognized dtype \
-                     tag {} (valid: {})\0",
-                    desc.dtype, CAPI_DTYPE_TAGS
-                ));
                 return -1;
             }
-            let tensor = NslTensor::from_ptr(tensor_ptr);
-            let dl_ptr = crate::dlpack::nsl_tensor_to_dlpack(tensor, tensor_ptr);
-            unsafe {
-                *out_slot.add(i) = dl_ptr;
-            }
-        }
-    }
+        };
+    let rc = model_call_alloc_core(
+        "nsl_model_call_dlpack",
+        &name,
+        name_ptr,
+        fn_ptr,
+        model_ptr,
+        if input_descs.is_empty() { 0 } else { input_descs.as_mut_ptr() as i64 },
+        num_inputs,
+        dl_outputs_ptr,
+        num_outputs,
+    );
     for ptr in &input_tensor_ptrs {
         crate::tensor::nsl_tensor_free(*ptr);
     }
@@ -813,6 +1229,51 @@ pub extern "C" fn nsl_model_lookup_function(model_ptr: i64, name_ptr: i64) -> i6
     match registry.lookup(&name) {
         Some(p) => p as usize as i64,
         None => 0,
+    }
+}
+
+/// Return the JSON signature of an `@export` by name (item 7 introspection).
+///
+/// The returned pointer is a null-terminated JSON object — the serialized
+/// codegen `ExportInfo`: `{"symbol_name", "raw_name", "params": [{"name",
+/// "ty"}...], "return_type"}` with tensor types carrying stringified shape
+/// dims (symbolic dims stay named, e.g. `"B"`), dtype, and device. Hosts use
+/// it to size `nsl_model_call_into` buffers exactly and to learn output
+/// arity before calling.
+///
+/// The pointer aliases static data inside the model's dlopen'd artifact:
+/// valid until `nsl_model_destroy`, never freed by the caller.
+///
+/// Returns NULL and sets the thread-local error when: the model or name is
+/// null, the model has no export registry, the artifact predates the
+/// signature table (rebuild), or the name is not an export.
+#[no_mangle]
+pub extern "C" fn nsl_model_get_export_signature(model_ptr: i64, name_ptr: i64) -> i64 {
+    if model_ptr == 0 || name_ptr == 0 {
+        set_error("nsl_model_get_export_signature: null model or name pointer\0".to_string());
+        return 0;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    let registry = match &model.exports {
+        Some(r) => r,
+        None => {
+            set_error(
+                "nsl_model_get_export_signature: model created without export \
+                 registry; use nsl_model_create_with_lib(weights, lib)\0"
+                    .to_string(),
+            );
+            return 0;
+        }
+    };
+    let name = unsafe { CStr::from_ptr(name_ptr as *const c_char) }
+        .to_string_lossy()
+        .into_owned();
+    match registry.lookup_signature(&name) {
+        Ok(ptr) => ptr,
+        Err(why) => {
+            set_error(format!("nsl_model_get_export_signature: {why}\0"));
+            0
+        }
     }
 }
 
@@ -869,10 +1330,9 @@ pub extern "C" fn nsl_model_forward(
 /// `*num_outputs_ptr` slots before the call and writing the actual count
 /// back afterwards.
 ///
-/// Returns 0 on success, -1 on error — but see the **known gap** on
-/// [`nsl_model_call_dlpack`]: that path cannot allocate DLPack outputs, so a
-/// tensor-returning `forward` always comes back `-1` today. This shim inherits
-/// the limitation verbatim.
+/// Returns 0 on success, -1 on error. On success each output slot holds an
+/// ownership-transferring `DLManagedTensor*` — see [`nsl_model_call_dlpack`]
+/// and [`nsl_model_call_alloc`] for the deleter contract.
 #[no_mangle]
 pub extern "C" fn nsl_model_forward_dlpack(
     model_ptr: i64,
@@ -1156,11 +1616,24 @@ pub extern "C" fn nsl_desc_to_tensor(desc_ptr: i64) -> i64 {
 /// C-ABI version of `nsl_tensor_to_desc` for use by Cranelift-emitted
 /// `@export` wrapper bodies. Writes the NslTensor pointed to by `tensor_ptr`
 /// into the `NslTensorDesc` pointed to by `desc_ptr`.
+///
+/// **Item-7 capture point.** The typed wrapper calls this with the IMPL
+/// RESULT tensor pointer — the only place the runtime ever sees it (the desc
+/// carries data/shape pointers, not the tensor struct). When a dispatch
+/// ownership mode is armed ([`nsl_model_call_into`] / [`nsl_model_call_alloc`]),
+/// the pointer is recorded so the entry point can free or transfer the result
+/// after dispatch returns. Unarmed (legacy `nsl_model_call`, direct typed-
+/// symbol callers, grad-context forwards), behavior is unchanged.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_to_desc_ffi(tensor_ptr: i64, desc_ptr: i64) {
     if tensor_ptr == 0 || desc_ptr == 0 {
         return;
     }
+    DISPATCH_MODE.with(|m| {
+        if let Some(mode) = m.borrow_mut().as_mut() {
+            mode.captured_mut().push(tensor_ptr);
+        }
+    });
     let desc = unsafe { &mut *(desc_ptr as *mut NslTensorDesc) };
     nsl_tensor_to_desc(tensor_ptr, desc);
 }
@@ -1236,6 +1709,122 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
 
     let byte_count = n_elem.saturating_mul(elem_bytes);
 
+    // ── Item-7 ownership modes ────────────────────────────────────────────
+    //
+    // `Alloc` (`nsl_model_call_alloc`): no caller buffer exists — the entry
+    // point owns the captured impl tensor and wraps it into a DLManagedTensor
+    // after dispatch. Nothing to copy here; the scratch dst is never read.
+    //
+    // `Into` (`nsl_model_call_into`): capacity-checked deep-copy. Refuse an
+    // undersized buffer REPORTING THE REQUIRED SIZE (the legacy path below
+    // memcpys unchecked into whatever the caller guessed — a silent heap
+    // overrun for any output larger than the guess), and deep-copy
+    // shape/strides into caller-owned arrays instead of mirroring pointers
+    // into the impl tensor (which the entry point frees after dispatch).
+    enum ApplyPlan {
+        Legacy,
+        AllocSkip,
+        Into { slot: usize, capacity: u64 },
+    }
+    let plan = DISPATCH_MODE.with(|m| {
+        let mut mode = m.borrow_mut();
+        match mode.as_mut() {
+            None => ApplyPlan::Legacy,
+            Some(DispatchMode::Alloc { .. }) => ApplyPlan::AllocSkip,
+            Some(DispatchMode::Into { capacities, cursor, .. }) => {
+                let slot = *cursor;
+                *cursor += 1;
+                let capacity = capacities.get(slot).copied().unwrap_or(0);
+                ApplyPlan::Into { slot, capacity }
+            }
+        }
+    });
+
+    match plan {
+        ApplyPlan::AllocSkip => return 0,
+        ApplyPlan::Into { slot, capacity } => {
+            if byte_count as u64 > capacity {
+                set_error(format!(
+                    "nsl_dispatch_apply_result: output {slot} requires {byte_count} \
+                     bytes but the caller buffer capacity is {capacity} bytes — \
+                     reallocate and retry with at least {byte_count} bytes\0"
+                ));
+                return -1;
+            }
+            let src_ndim = src.ndim.max(0);
+            if src_ndim > 0 {
+                if dst.shape.is_null() {
+                    set_error(format!(
+                        "nsl_dispatch_apply_result: output {slot} has rank {src_ndim} \
+                         but the caller shape array is null (the call_into contract \
+                         deep-copies dims into caller-owned arrays)\0"
+                    ));
+                    return -1;
+                }
+                if src_ndim > dst.ndim {
+                    set_error(format!(
+                        "nsl_dispatch_apply_result: output {slot} has rank {src_ndim} \
+                         but the caller shape/strides arrays declare only {} slot(s) \
+                         (set dst.ndim to the allocated slot count on entry)\0",
+                        dst.ndim
+                    ));
+                    return -1;
+                }
+            }
+            if byte_count > 0 {
+                if dst.data.is_null() || src.data.is_null() {
+                    set_error(
+                        "nsl_dispatch_apply_result: null data pointer (caller buffer \
+                         or impl result)\0"
+                            .to_string(),
+                    );
+                    return -1;
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.data as *const u8,
+                        dst.data as *mut u8,
+                        byte_count,
+                    );
+                }
+            }
+            // Deep-copy dims/strides into the caller's arrays. If the impl
+            // result has no strides (contiguous), synthesize row-major
+            // element strides so the caller always sees a complete desc.
+            for i in 0..src_ndim as usize {
+                unsafe {
+                    let d = std::ptr::read_unaligned(src.shape.add(i));
+                    *dst.shape.add(i) = d;
+                }
+            }
+            if src_ndim > 0 && !dst.strides.is_null() {
+                if !src.strides.is_null() {
+                    for i in 0..src_ndim as usize {
+                        unsafe {
+                            let s = std::ptr::read_unaligned(src.strides.add(i));
+                            *dst.strides.add(i) = s;
+                        }
+                    }
+                } else {
+                    let mut stride: i64 = 1;
+                    for i in (0..src_ndim as usize).rev() {
+                        unsafe {
+                            *dst.strides.add(i) = stride;
+                            stride *= std::ptr::read_unaligned(src.shape.add(i)).max(1);
+                        }
+                    }
+                }
+            }
+            dst.ndim = src_ndim;
+            dst.dtype = src.dtype;
+            dst.device_type = src.device_type;
+            dst.device_id = src.device_id;
+            dst.tape_id = src.tape_id;
+            return 0;
+        }
+        ApplyPlan::Legacy => {}
+    }
+
     let caller_buf = dst.data;
     if byte_count > 0 {
         if caller_buf.is_null() || src.data.is_null() {
@@ -1264,6 +1853,13 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
     // `nsl_tensor_to_desc_ffi`, and we forward it onto the caller's desc here
     // so `nsl_model_forward_grad` can reconstruct the loss-seed tape_id when
     // it re-wraps the output desc via `desc_to_nsl_tensor`.
+    //
+    // These mirrored pointers alias the impl result tensor, which the LEGACY
+    // path leaks by contract — callers (nslpy `read_f32_output_desc`, direct
+    // ctypes hosts) read them after the call returns. Do not "fix" the leak
+    // here: freeing the impl tensor under this mode converts the leak into a
+    // use-after-free. The leak-free paths are `nsl_model_call_into` (deep
+    // copy above) and `nsl_model_call_alloc` (ownership transfer).
     dst.shape = src.shape;
     dst.strides = src.strides;
     dst.ndim = src.ndim;
@@ -1271,6 +1867,87 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
     dst.device_type = src.device_type;
     dst.device_id = src.device_id;
     dst.tape_id = src.tape_id;
+    0
+}
+
+/// Scalar sibling of [`nsl_dispatch_apply_result`], called by the dispatch
+/// wrapper for `Scalar(f64)`-returning exports (item 7 scalar fix).
+///
+/// The typed wrapper stores the raw scalar bits at offset 0 of the scratch
+/// desc (the `data` field's storage). The PREVIOUS dispatch flow handed that
+/// desc to `nsl_dispatch_apply_result`, which interpreted the scalar VALUE as
+/// the source ADDRESS of a memcpy — a wild read reachable from any
+/// scalar-returning export via `nsl_model_call`. This helper reads the bits
+/// AT the scratch desc instead of THROUGH them and stores the 8-byte f64 into
+/// the caller's buffer, setting `ndim = 0` and dtype tag 0 (f64).
+///
+/// Ownership modes: `Into` capacity-checks (>= 8 bytes) against the armed
+/// slot; `Alloc` refuses — a scalar has no DLPack representation (use
+/// `nsl_model_call_into` or `nsl_model_call`).
+#[no_mangle]
+pub extern "C" fn nsl_dispatch_apply_scalar_result(src_desc_ptr: i64, dst_desc_ptr: i64) -> i64 {
+    if src_desc_ptr == 0 || dst_desc_ptr == 0 {
+        set_error("nsl_dispatch_apply_scalar_result: null desc pointer\0".to_string());
+        return -1;
+    }
+    // The scalar bits occupy the first 8 bytes of the scratch desc.
+    let bits = unsafe { *(src_desc_ptr as *const u64) };
+    let dst = unsafe { &mut *(dst_desc_ptr as *mut NslTensorDesc) };
+
+    enum ScalarPlan {
+        Write,
+        AllocRefuse,
+        IntoChecked { slot: usize, capacity: u64 },
+    }
+    let plan = DISPATCH_MODE.with(|m| {
+        let mut mode = m.borrow_mut();
+        match mode.as_mut() {
+            None => ScalarPlan::Write,
+            Some(DispatchMode::Alloc { .. }) => ScalarPlan::AllocRefuse,
+            Some(DispatchMode::Into { capacities, cursor, .. }) => {
+                let slot = *cursor;
+                *cursor += 1;
+                let capacity = capacities.get(slot).copied().unwrap_or(0);
+                ScalarPlan::IntoChecked { slot, capacity }
+            }
+        }
+    });
+    match plan {
+        ScalarPlan::AllocRefuse => {
+            set_error(
+                "nsl_dispatch_apply_scalar_result: scalar-returning exports have \
+                 no DLPack representation; use nsl_model_call_into or \
+                 nsl_model_call with an 8-byte output buffer\0"
+                    .to_string(),
+            );
+            return -1;
+        }
+        ScalarPlan::IntoChecked { slot, capacity } => {
+            if capacity < 8 {
+                set_error(format!(
+                    "nsl_dispatch_apply_scalar_result: output {slot} requires 8 \
+                     bytes (f64 scalar) but the caller buffer capacity is \
+                     {capacity} bytes\0"
+                ));
+                return -1;
+            }
+        }
+        ScalarPlan::Write => {}
+    }
+    if dst.data.is_null() {
+        set_error(
+            "nsl_dispatch_apply_scalar_result: null caller data buffer (a scalar \
+             return needs an 8-byte output buffer)\0"
+                .to_string(),
+        );
+        return -1;
+    }
+    unsafe { *(dst.data as *mut u64) = bits };
+    dst.ndim = 0;
+    dst.dtype = 0; // f64
+    dst.device_type = 0;
+    dst.device_id = 0;
+    dst.tape_id = 0;
     0
 }
 

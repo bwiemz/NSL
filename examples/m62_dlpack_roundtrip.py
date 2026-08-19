@@ -44,6 +44,22 @@ def main(lib_path: str) -> None:
                 f"double output mismatch: {out_double}"
             )
             print("Named dispatch verified.")
+
+            # Item 7: the actual DLPack ROUND-TRIP this file is named for —
+            # torch tensor in (zero-copy import), OWNED torch tensor out
+            # (ownership transfer; torch's GC releases the NSL result via
+            # the DLPack deleter).
+            try:
+                import torch
+            except ImportError:
+                print("torch not installed — skipping the torch round-trip.")
+            else:
+                t = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+                out = model.forward(t)
+                print(f"forward(torch {t.tolist()}) = torch {out.tolist()}")
+                assert isinstance(out, torch.Tensor)
+                assert out.tolist() == [2.0, 4.0, 6.0, 8.0]
+                print("DLPack round-trip verified (owned torch output).")
         finally:
             model.close()
 

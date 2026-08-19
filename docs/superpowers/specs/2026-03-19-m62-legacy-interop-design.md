@@ -358,8 +358,16 @@ pub enum DLDataTypeCode {
 
 ### Memory Management: Ownership Protocol
 
+> **Superseded in part by item 7** (see
+> `2026-08-18-item7-dlpack-output-ownership.md`): the wrapper-only deleter
+> below describes the BORROW export (`nsl_dlpack_export`), which keeps these
+> semantics. Model-call outputs (`nsl_model_call_alloc` /
+> `nsl_model_call_dlpack`) now use an OWNED export whose deleter releases
+> the underlying NslTensor via `nsl_tensor_free` exactly once — that is what
+> makes `NslModel.forward`'s torch tensors owned.
+
 ```rust
-/// When NSL exports a tensor to Python via DLPack:
+/// When NSL exports a tensor to Python via DLPack (BORROW export):
 /// 1. NSL allocates the DLManagedTensor wrapper (Box::new)
 /// 2. The dl_tensor.data points to NSL's existing tensor memory
 /// 3. Python calls the deleter when it's done with the DLManagedTensor

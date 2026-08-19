@@ -146,7 +146,21 @@ fn run_build_shared_single(
         "nsl_tensor_free",
         "nsl_get_num_exports",
         "nsl_get_export_name",
+        "nsl_get_export_signature_json",
         "nsl_dispatch_apply_result",
+        "nsl_dispatch_apply_scalar_result",
+        "nsl_dispatch_ownership_arm",
+        "nsl_dispatch_ownership_release",
+        "nsl_dispatch_ownership_finish_alloc",
+        "nsl_model_call_into",
+        "nsl_model_call_alloc",
+        "nsl_model_get_export_signature",
+        // The DLPack trio was missing from this list while nslpy binds all
+        // three — Linux worked only by ELF default visibility; on MSVC the
+        // symbols were stripped.
+        "nsl_dlpack_export",
+        "nsl_dlpack_import",
+        "nsl_dlpack_free",
         "nsl_dl_path_for_fn_addr",
         "nsl_free_cstr",
     ];
@@ -521,7 +535,21 @@ fn run_build_shared_multi(
         "nsl_tensor_free",
         "nsl_get_num_exports",
         "nsl_get_export_name",
+        "nsl_get_export_signature_json",
         "nsl_dispatch_apply_result",
+        "nsl_dispatch_apply_scalar_result",
+        "nsl_dispatch_ownership_arm",
+        "nsl_dispatch_ownership_release",
+        "nsl_dispatch_ownership_finish_alloc",
+        "nsl_model_call_into",
+        "nsl_model_call_alloc",
+        "nsl_model_get_export_signature",
+        // The DLPack trio was missing from this list while nslpy binds all
+        // three — Linux worked only by ELF default visibility; on MSVC the
+        // symbols were stripped.
+        "nsl_dlpack_export",
+        "nsl_dlpack_import",
+        "nsl_dlpack_free",
         "nsl_dl_path_for_fn_addr",
         "nsl_free_cstr",
     ];

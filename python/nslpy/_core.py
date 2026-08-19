@@ -264,6 +264,57 @@ def _bind_named_dispatch_ffis(lib: ctypes.CDLL) -> None:
             [ctypes.c_int64, ctypes.c_int64],
             ctypes.c_int64,
         ),
+        # The DLPack forward shim + standalone bridge FFIs. These were bound
+        # ONLY in `_load_lib` (the standalone-runtime path); a shared-lib
+        # model's handle got ctypes' DEFAULT int conversion — 32-bit — so
+        # every pointer argument was silently truncated. The old forward
+        # path refused before dereferencing anything, which is why this
+        # never surfaced until forward actually worked (item 7).
+        (
+            "nsl_model_forward_dlpack",
+            [
+                ctypes.c_int64,  # model_ptr
+                ctypes.c_int64,  # inputs_ptr (DLManagedTensor**)
+                ctypes.c_int64,  # num_inputs
+                ctypes.c_int64,  # outputs_ptr (DLManagedTensor**)
+                ctypes.c_int64,  # num_outputs_ptr (in/out)
+            ],
+            ctypes.c_int64,
+        ),
+        ("nsl_dlpack_export", [ctypes.c_int64], ctypes.c_int64),
+        ("nsl_dlpack_import", [ctypes.c_int64], ctypes.c_int64),
+        ("nsl_dlpack_free", [ctypes.c_int64], None),
+        # Item-7 ownership-model entry points.
+        (
+            "nsl_model_call_into",
+            [
+                ctypes.c_int64,  # model_ptr
+                ctypes.c_int64,  # name_ptr
+                ctypes.c_int64,  # inputs_desc_ptr
+                ctypes.c_int64,  # num_inputs
+                ctypes.c_int64,  # outputs_desc_ptr
+                ctypes.c_int64,  # num_outputs
+                ctypes.c_int64,  # out_capacities_ptr (const uint64_t*)
+            ],
+            ctypes.c_int64,
+        ),
+        (
+            "nsl_model_call_alloc",
+            [
+                ctypes.c_int64,  # model_ptr
+                ctypes.c_int64,  # name_ptr
+                ctypes.c_int64,  # inputs_desc_ptr
+                ctypes.c_int64,  # num_inputs
+                ctypes.c_int64,  # out_dl_ptr (DLManagedTensor**)
+                ctypes.c_int64,  # num_outputs
+            ],
+            ctypes.c_int64,
+        ),
+        (
+            "nsl_model_get_export_signature",
+            [ctypes.c_int64, ctypes.c_int64],
+            ctypes.c_int64,  # *const c_char as int (0 = error)
+        ),
     ):
         if not hasattr(lib, sym_name):
             # Optional symbols — older runtimes may pre-date the named-
@@ -278,6 +329,10 @@ def _bind_named_dispatch_ffis(lib: ctypes.CDLL) -> None:
 # Lazy-loaded library singleton
 _lib: Optional[ctypes.CDLL] = None
 
+# Model shared libraries stay mapped for the process lifetime — owned DLPack
+# outputs carry deleter fn-pointers into their image (see NslModel.__init__).
+_MODEL_LIB_KEEPALIVE: list[ctypes.CDLL] = []
+
 
 def _get_lib() -> ctypes.CDLL:
     global _lib
@@ -288,6 +343,25 @@ def _get_lib() -> ctypes.CDLL:
             # Allow import without library for documentation/type-checking
             raise
     return _lib
+
+
+_REQUIRED_BYTES_RE = None
+
+
+def _parse_required_bytes(msg: str) -> Optional[int]:
+    """Extract the required byte count from a capacity-refusal error.
+
+    The runtime's `nsl_dispatch_apply_result` Into-mode refusal reports
+    "output N requires B bytes but the caller buffer capacity is C bytes";
+    `call` uses this to reallocate exactly once. Returns None for any other
+    error shape.
+    """
+    global _REQUIRED_BYTES_RE
+    if _REQUIRED_BYTES_RE is None:
+        import re
+        _REQUIRED_BYTES_RE = re.compile(r"requires (\d+) bytes")
+    m = _REQUIRED_BYTES_RE.search(msg)
+    return int(m.group(1)) if m else None
 
 
 def _check_error(result: int, lib: ctypes.CDLL) -> int:
@@ -356,6 +430,15 @@ class NslModel:
             _bind_grad_context_ffis(lib)
             self._lib = lib
             self._owns_lib_handle = True
+            # Owned DLPack outputs (item 7) embed a deleter fn-pointer that
+            # lives in THIS library's code. torch calls it from GC at an
+            # arbitrary later time — possibly after this model (and its CDLL
+            # reference) is gone. Unloading the image then means a dangling
+            # deleter and a crash inside torch's GC, so model libraries are
+            # kept mapped for the life of the process. (dlclose with escaping
+            # callbacks is unsafe in general; the bytes cost is one mapping
+            # per distinct model library.)
+            _MODEL_LIB_KEEPALIVE.append(lib)
 
             if not hasattr(lib, "nsl_model_create_with_lib"):
                 raise NslError(
@@ -420,39 +503,115 @@ class NslModel:
             return 0
         return int(self._lib.nsl_model_export_count(self._handle))
 
+    def export_signature(self, name: str) -> dict:
+        """Return the JSON signature of an ``@export`` as a Python dict.
+
+        The dict is the compiler's serialized ``ExportInfo``: ``symbol_name``,
+        ``raw_name``, ``params`` (name + type), and ``return_type``. Tensor
+        types carry stringified shape dims — symbolic dims stay named (e.g.
+        ``"B"``), so a caller can tell exactly which outputs it can pre-size.
+
+        Raises:
+            NslError: if the symbol is missing (old runtime), the name is not
+                an export, or the artifact predates the signature table.
+        """
+        import json
+
+        if self._handle == 0 or self._destroyed:
+            raise NslError("NslModel.export_signature: model is closed or invalid")
+        if not hasattr(self._lib, "nsl_model_get_export_signature"):
+            raise NslError(
+                "NslModel.export_signature: nsl_model_get_export_signature not "
+                "present in this library — rebuild against an item-7 runtime."
+            )
+        name_bytes = name.encode("utf-8") + b"\x00"
+        name_buf = (ctypes.c_char * len(name_bytes))(*name_bytes)
+        name_ptr = ctypes.cast(name_buf, ctypes.c_void_p).value or 0
+        ptr = self._lib.nsl_model_get_export_signature(
+            ctypes.c_int64(self._handle), ctypes.c_int64(name_ptr)
+        )
+        _ = name_buf
+        if not ptr:
+            raise NslError(
+                f"export_signature('{name}'): {_fetch_last_error(self._lib)}"
+            )
+        raw = ctypes.cast(ptr, ctypes.c_char_p).value
+        return json.loads(raw.decode("utf-8"))
+
+    def _output_capacity_hint(self, name: str, in_descs, n_in: int) -> int:
+        """Best-known byte capacity for a single-output export's result.
+
+        Prefers the export signature (exact for all-concrete output shapes);
+        falls back to the legacy input-size heuristic for symbolic dims or
+        pre-signature artifacts. Either way `call` retries once with the
+        exact size reported by a capacity refusal, so this is a starting
+        point, not a correctness contract.
+        """
+        from nslpy._bridge import DTYPE_SIZES
+
+        try:
+            sig = self.export_signature(name)
+            ret = sig.get("return_type", {})
+            if isinstance(ret, dict) and "Tensor" in ret:
+                t = ret["Tensor"]
+                elem = DTYPE_SIZES.get(t.get("dtype", "F32"), 4)
+                count = 1
+                for dim in t.get("shape", []):
+                    if not str(dim).isdigit():
+                        raise ValueError("symbolic dim")
+                    count *= int(dim)
+                return max(count * elem, 8)
+            if isinstance(ret, dict) and "Scalar" in ret:
+                return 8
+        except (NslError, ValueError, KeyError):
+            pass
+        # Legacy heuristic: max input element count (f32), floor 4096 elems.
+        n_elems = 4096
+        for i in range(n_in):
+            cnt = 1
+            for j in range(int(in_descs[i].ndim)):
+                cnt *= int(in_descs[i].shape[j])
+            n_elems = max(n_elems, cnt)
+        return n_elems * 4
+
     def call(self, name: str, *inputs):
         """Dispatch an ``@export``'d function by name.
+
+        Uses ``nsl_model_call_into`` (item 7): output buffers are sized from
+        the export signature when available, every copy is capacity-checked
+        by the runtime (an undersized buffer refuses and reports the required
+        byte count, upon which this method reallocates and retries once), and
+        the result's shape is deep-copied into caller-owned arrays — nothing
+        aliases runtime memory and nothing leaks per call.
 
         Args:
             name: The user-facing name of the ``@export`` (e.g. ``"forward"``,
                   ``"generate"``).
             *inputs: One or more input tensors. Each input may be a Python
-                  sequence of floats (treated as a 1-D ``f32`` tensor) or any
-                  object supporting ``__dlpack__`` / ``__array__``.
+                  sequence of floats (treated as a 1-D ``f32`` tensor).
 
         Returns:
-            The output as a Python ``list[float]`` (v1 — single-output exports
-            of ``Tensor<[N], f32>`` returning their result through a
-            caller-allocated ``NslTensorDesc`` slot).
+            The output as a Python ``list[float]`` for tensor returns, or a
+            single ``float`` for scalar-f64 returns.
 
         Raises:
-            RuntimeError: if the export name is not in the registry, or if
-                the dispatch returns a non-zero status code. The error
-                message includes the runtime's thread-local error string,
-                which names the missing export and lists available ones.
+            NslError: if the export name is not in the registry, or if the
+                dispatch returns a non-zero status code. The error message
+                includes the runtime's thread-local error string.
         """
         from nslpy._bridge import (
             build_input_descs,
-            allocate_output_descs,
-            read_f32_output_desc,
+            allocate_output_descs_sized,
+            read_output_desc,
         )
 
         if self._handle == 0 or self._destroyed:
             raise NslError("NslModel.call: model is closed or invalid")
-        if not hasattr(self._lib, "nsl_model_call"):
+        if not hasattr(self._lib, "nsl_model_call_into"):
             raise NslError(
-                "NslModel.call: nsl_model_call symbol not present in this "
-                "library — rebuild against a runtime with named-dispatch support."
+                "NslModel.call: nsl_model_call_into symbol not present in this "
+                "library — rebuild against an item-7 runtime (the legacy "
+                "nsl_model_call path has no output capacity contract)."
             )
 
         name_bytes = name.encode("utf-8") + b"\x00"
@@ -464,25 +623,31 @@ class NslModel:
         inputs_ptr = ctypes.cast(in_descs, ctypes.c_void_p).value or 0 if n_in > 0 else 0
 
         n_out = 1
-        out_descs, out_buffers = allocate_output_descs(n_out, in_descs, n_in)
-        outputs_ptr = ctypes.cast(out_descs, ctypes.c_void_p).value or 0
-
-        rc = self._lib.nsl_model_call(
-            ctypes.c_int64(self._handle),
-            ctypes.c_int64(name_ptr),
-            ctypes.c_int64(inputs_ptr),
-            ctypes.c_int64(n_in),
-            ctypes.c_int64(outputs_ptr),
-            ctypes.c_int64(n_out),
-        )
-        # Keep input buffers alive across the FFI call.
-        _ = in_keepalive
-        _ = out_buffers
-        if rc != 0:
+        capacity = self._output_capacity_hint(name, in_descs, n_in)
+        for attempt in range(2):
+            out_descs, out_buffers, caps = allocate_output_descs_sized(n_out, capacity)
+            outputs_ptr = ctypes.cast(out_descs, ctypes.c_void_p).value or 0
+            caps_ptr = ctypes.cast(caps, ctypes.c_void_p).value or 0
+            rc = self._lib.nsl_model_call_into(
+                ctypes.c_int64(self._handle),
+                ctypes.c_int64(name_ptr),
+                ctypes.c_int64(inputs_ptr),
+                ctypes.c_int64(n_in),
+                ctypes.c_int64(outputs_ptr),
+                ctypes.c_int64(n_out),
+                ctypes.c_int64(caps_ptr),
+            )
+            # Keep buffers alive across the FFI call.
+            _ = in_keepalive
+            _ = out_buffers
+            if rc == 0:
+                return read_output_desc(out_descs[0])
             msg = _fetch_last_error(self._lib)
-            raise NslError(f"nsl_model_call('{name}') returned rc={rc}: {msg}")
-
-        return read_f32_output_desc(out_descs[0])
+            required = _parse_required_bytes(msg)
+            if attempt == 0 and required is not None and required > capacity:
+                capacity = required
+                continue
+            raise NslError(f"nsl_model_call_into('{name}') returned rc={rc}: {msg}")
 
     def close(self) -> None:
         """Explicitly destroy the underlying NSL model handle.
@@ -499,51 +664,54 @@ class NslModel:
                 self._handle = 0
 
     def forward(self, *inputs):
-        """Run the model forward pass.
+        """Run the model forward pass, returning OWNED torch tensors.
+
+        Inputs cross into NSL via zero-copy DLPack import; the output comes
+        back through the ownership-transfer path (``nsl_model_call_alloc``
+        core): NSL allocates the result, wraps it in a ``DLManagedTensor``
+        whose deleter releases it exactly once, and
+        ``torch.utils.dlpack.from_dlpack`` hands that responsibility to
+        torch's GC. The returned tensor owns its memory — it stays valid
+        after further forwards and after ``close()``.
 
         .. warning::
 
-           **The DLPack path this method uses cannot currently return a
-           result.** ``nsl_model_call_dlpack`` has no way to allocate output
-           buffers, so it passes zero-initialised output descs and the
-           dispatcher refuses them: any tensor-returning export comes back
-           ``-1`` and this method raises :class:`NslError`. Use
-           :meth:`call` (the ``NslTensorDesc`` ABI, which preallocates the
-           output buffer) until the DLPack output path is implemented.
-
-           Separately, ``torch.int8``/``torch.int32`` inputs are NOT refused
-           here: they map onto NSL dtype tags, clear every boundary guard, and
-           then abort the interpreter inside the compiled kernel. Only dtypes
+           ``torch.int8``/``torch.int32`` inputs are NOT refused here: they
+           map onto NSL dtype tags, clear every boundary guard, and then
+           abort the interpreter inside the compiled kernel. Only dtypes
            with no NSL mapping (``torch.int64`` — torch's *default* integer
            dtype — ``uint8``, ``bool``, …) are refused with an error code.
 
         Args:
             *inputs: Input tensors. Accepts torch.Tensor (via DLPack),
-                     numpy arrays, or raw ctypes pointers.
+                     numpy arrays, or raw DLManagedTensor* ints.
 
         Returns:
-            Output tensor(s) as torch.Tensor if torch is available,
-            otherwise as raw DLPack pointers.
+            Output tensor(s) as owned torch.Tensor (a tuple for multi-output
+            exports).
         """
         from nslpy._bridge import prepare_inputs, convert_outputs
         dl_inputs, cleanup = prepare_inputs(inputs, self._lib)
 
-        # Allocate output buffer (up to 8 outputs)
-        max_outputs = 8
-        out_buf = (ctypes.c_int64 * max_outputs)()
-        num_out = ctypes.c_int64(0)
+        try:
+            # Single-output v1: the packed dispatch enforces one output slot.
+            out_buf = (ctypes.c_int64 * 1)()
+            num_out = ctypes.c_int64(1)
 
-        result = self._lib.nsl_model_forward_dlpack(
-            self._handle,
-            ctypes.cast(dl_inputs, ctypes.c_int64) if dl_inputs else 0,
-            len(inputs),
-            ctypes.cast(out_buf, ctypes.c_int64),
-            ctypes.addressof(num_out),
-        )
-        _check_error(result, self._lib)
+            result = self._lib.nsl_model_forward_dlpack(
+                self._handle,
+                (ctypes.cast(dl_inputs, ctypes.c_void_p).value or 0)
+                if dl_inputs
+                else 0,
+                len(inputs),
+                ctypes.cast(out_buf, ctypes.c_void_p).value or 0,
+                ctypes.addressof(num_out),
+            )
+            _check_error(result, self._lib)
 
-        outputs = convert_outputs(out_buf, num_out.value, self._lib)
-        cleanup()
+            outputs = convert_outputs(out_buf, num_out.value, self._lib)
+        finally:
+            cleanup()
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def forward_grad(self, *inputs):
@@ -566,7 +734,7 @@ class NslModel:
         """
         from nslpy._bridge import (
             build_input_descs,
-            allocate_output_descs,
+            allocate_output_descs_sized,
             read_f32_output_desc,
         )
 
@@ -585,8 +753,14 @@ class NslModel:
             ctypes.cast(in_descs, ctypes.c_void_p).value or 0 if n_in > 0 else 0
         )
 
+        # Signature-driven sizing where possible. NOTE: this grad path has no
+        # capacity contract (it predates item 7) — the size hint narrows the
+        # window where the runtime's unchecked memcpy could overrun, but only
+        # a concrete-shape signature closes it.
         n_out = 1
-        out_descs, out_buffers = allocate_output_descs(n_out, in_descs, n_in)
+        out_descs, out_buffers, _caps = allocate_output_descs_sized(
+            n_out, self._output_capacity_hint("forward", in_descs, n_in)
+        )
         outputs_ptr = ctypes.cast(out_descs, ctypes.c_void_p).value or 0
 
         ctx_slot = ctypes.c_int64(0)

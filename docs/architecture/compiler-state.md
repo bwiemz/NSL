@@ -99,6 +99,7 @@ including the autodiff `TAPE` itself.)
 | `nsl-runtime/src/cuda/mod.rs` | `TRANSFER_STREAM`, `COMPUTE_STREAM`, `WS`, `SR_WS`, `CE_SCRATCH`, `MUON_STATS_BUF` | RUNTIME-OK | `!Send` CUDA stream handles and persistent kernel workspaces — thread-local is the correct ownership model. |
 | `nsl-runtime/src/muon_batch.rs` | `WS_CACHE` | RUNTIME-OK | Batched Newton-Schulz workspace cache, same model as `WS`. |
 | `nsl-runtime/src/c_api/mod.rs` | `LAST_ERROR` | FFI/RUNTIME-OK | Per-thread C-ABI error slot (`nsl_get_last_error` / `nsl_clear_error`). |
+| `nsl-runtime/src/c_api/mod.rs` | `DISPATCH_MODE` | FFI/RUNTIME-OK | Item-7 dispatch ownership mode (Into/Alloc), armed only for the synchronous span of one `nsl_model_call_into`/`_alloc` dispatch on the calling thread; the generated wrapper ABI is frozen (`ExportRegistry` transmutes it), so a thread-local side channel is the design, and it is armed via same-image `nsl_dispatch_ownership_*` FFIs because each artifact statically links its own runtime copy. |
 | `nsl-runtime/src/cuda/mod.rs` | `OOM_CONTEXT` | FFI/RUNTIME-OK | Current-operation description used only to enrich OOM diagnostics. |
 | `nsl-runtime/src/inspect/stream.rs` | `INSPECT_STREAM` | FFI/RUNTIME-OK | Lazily-initialized CUDA stream for inspection ops. |
 | `nsl-runtime/src/sampling.rs` | `RNG` | FFI/RUNTIME-OK | Per-thread RNG seeded by `nsl_manual_seed`; per-thread seeding is the determinism model. |

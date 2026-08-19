@@ -83,33 +83,41 @@
 //!     computed values (`x * 2.0`), so the `call_desc42` refusal on the same
 //!     export cannot be a call that was broken to begin with.
 //!
-//! ## Known gap (pre-existing, NOT introduced here)
+//! ## Item 7: the DLPack output path now WORKS, and this file gates it
 //!
-//! `ok_f32_dlpack` asserts the call reaches the dispatcher, not `rc == 0`:
-//! `nsl_model_call_dlpack` builds its output descs with
-//! `NslTensorDesc::default()`, so `dst.data` is null, and
-//! `nsl_dispatch_apply_result` refuses a null caller buffer
-//! (`c_api/mod.rs:1081`). The DLPack path therefore cannot currently succeed
-//! for a tensor-returning export. That is a separate defect — the output desc
-//! needs an allocation strategy the C ABI does not currently have — and is
-//! tracked as a follow-up. It does not weaken these gates, because the
-//! trace-marker pair above discriminates on WHERE the call stopped, not on
-//! whether it finished.
+//! Until item 7, `nsl_model_call_dlpack` could not return a tensor result
+//! (its output descs were zero-initialised and `nsl_dispatch_apply_result`
+//! refused the null buffer); `ok_f32_dlpack` asserted the appended
+//! "cannot allocate DLPack outputs" note. That note's own comment mandated
+//! deleting it in the change that added an output allocator — this is that
+//! change. `ok_f32_dlpack` now asserts `rc == 0`, the computed values read
+//! THROUGH the returned `DLManagedTensor`, and the ownership contract
+//! (deleter releases the NSL tensor exactly once — observed via refcount in
+//! `dlpack.rs`'s unit tests and via the RSS-bounded leak loop here).
 //!
-//! The gap is now disclosed where a host will actually see it: on the doc
-//! comments of `nsl_model_call_dlpack` and `nsl_model_forward_dlpack`, in
-//! `NslModel.forward`'s docstring, and — at runtime — as a note APPENDED to the
-//! refusal, because the underlying message ("null data pointer (caller buffer
-//! or impl result)") blames a caller buffer this ABI gives the caller no way to
-//! supply. `ok_f32_dlpack` asserts that note is present, which is also what
-//! makes its `err=` a live observable instead of the empty string it used to
-//! be.
+//! The item-7 scenarios also gate:
+//!   * `call_into_*` — the capacity contract: exact-fit succeeds with the
+//!     result shape deep-copied into caller-owned arrays; an undersized
+//!     buffer REFUSES and reports the required byte count (before item 7
+//!     the same call memcpy'd unchecked into the caller's guess — a silent
+//!     heap overrun).
+//!   * `call_scalar_*` — the scalar-return wild read. The typed wrapper
+//!     stores the scalar's raw bits where the scratch desc's data POINTER
+//!     lives; the old flow handed that desc to `nsl_dispatch_apply_result`,
+//!     which memcpy'd FROM the value-reinterpreted-as-address. Any
+//!     scalar-returning export driven through `nsl_model_call` hit it.
+//!   * `alloc_leak_loop` / `into_leak_loop` — the new entry points must not
+//!     inherit the legacy path's impl-result leak (256 KiB per call on the
+//!     `delta` export; 2000 iterations would grow RSS by ~500 MiB if either
+//!     path leaked).
+//!   * `sig_json` — `nsl_model_get_export_signature` returns the compiler's
+//!     `ExportInfo` JSON (shape/dtype/arity), and refuses unknown names.
 
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 
 use nsl_runtime::c_api::NslTensorDesc;
-use nsl_runtime::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType, DLManagedTensor, DLTensor};
+use nsl_runtime::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLManagedTensor, DLTensor, KDL_CPU};
 
 const SCENARIO: &str = "NSL_DLPACK_REFUSAL_SCENARIO";
 const LIB_ENV: &str = "NSL_DLPACK_REFUSAL_LIB";
@@ -130,11 +138,20 @@ const WEIGHTS_ENV: &str = "NSL_DLPACK_REFUSAL_WEIGHTS";
 ///     every scenario, and the commit's leak-free-refusal claim was unverified.
 ///   * `forward` — the fixed name `nsl_model_forward_grad` dispatches to, so
 ///     the grad path's own `desc_to_nsl_tensor` refusal can be driven.
+///   * `gamma` — a SCALAR-f64 return. Before item 7 this shape wild-read on
+///     every `nsl_model_call` (the scalar bits were dereferenced as the
+///     memcpy source address); now it routes through
+///     `nsl_dispatch_apply_scalar_result` and must produce the exact value.
+///   * `delta` — 64Ki elements (256 KiB), the leak-loop payload: big enough
+///     that a per-call impl-result leak moves RSS by ~500 MiB over the loop
+///     while a leak-free path stays flat.
 const EXPORT_SRC: &str = concat!(
     "\n@export\nfn alpha(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 2.0\n",
     "\n@export\nfn beta(x: Tensor<[4], f32>, y: Tensor<[4], f32>) -> Tensor<[4], f32>:\n",
     "    return x * 2.0 + y\n",
     "\n@export\nfn forward(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 2.0\n",
+    "\n@export\nfn gamma(x: Tensor<[4], f32>) -> f64:\n    return 7.5\n",
+    "\n@export\nfn delta(x: Tensor<[65536], f32>) -> Tensor<[65536], f32>:\n    return x * 2.0\n",
 );
 
 // ---------------------------------------------------------------------------
@@ -145,7 +162,7 @@ fn managed(shape: &mut [i64], data: *mut c_void, code: u8, bits: u8) -> DLManage
     DLManagedTensor {
         dl_tensor: DLTensor {
             data,
-            device: DLDevice { device_type: DLDeviceType::KDLCpu, device_id: 0 },
+            device: DLDevice { device_type: KDL_CPU, device_id: 0 },
             ndim: shape.len() as std::os::raw::c_int,
             dtype: DLDataType { code, bits, lanes: 1 },
             shape: shape.as_mut_ptr(),
@@ -353,7 +370,260 @@ fn run_model_scenario(scenario: &str) {
                 outs.as_mut_ptr() as i64,
                 1,
             );
-            println!("CHILD-RESULT rc={rc} err={}", last_error());
+            // Item 7: on success, read the values THROUGH the returned
+            // ownership-transferring DLManagedTensor, then release it via its
+            // deleter — the full consumer contract in one scenario.
+            let mut out_vals: Vec<f32> = Vec::new();
+            let mut out_meta = String::new();
+            if rc == 0 && !outs[0].is_null() {
+                let m = unsafe { &*outs[0] };
+                let t = &m.dl_tensor;
+                out_meta = format!(
+                    "ndim={} bits={} code={} dev={}",
+                    t.ndim, t.dtype.bits, t.dtype.code, t.device.device_type
+                );
+                if t.ndim == 1 && !t.shape.is_null() && !t.data.is_null() {
+                    let n = unsafe { *t.shape } as usize;
+                    out_vals =
+                        unsafe { std::slice::from_raw_parts(t.data as *const f32, n) }.to_vec();
+                }
+                nsl_runtime::dlpack::nsl_dlpack_free(outs[0] as i64);
+            }
+            println!(
+                "CHILD-RESULT rc={rc} out={out_vals:?} meta=[{out_meta}] err={}",
+                last_error()
+            );
+        }
+        // Item 7 — ownership model A: capacity-checked caller-alloc.
+        "call_into_ok" | "call_into_undersized" => {
+            let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            // Caller-owned output buffers per the call_into contract: data
+            // capacity in `caps`, shape/strides arrays with slot capacity
+            // declared via ndim ON ENTRY.
+            let cap: u64 = if scenario == "call_into_ok" { 16 } else { 8 };
+            let mut out_buf: Vec<f32> = vec![0.0; 4];
+            let mut out_shape: Vec<i64> = vec![0; 8];
+            let mut out_strides: Vec<i64> = vec![0; 8];
+            let mut output = NslTensorDesc {
+                data: out_buf.as_mut_ptr() as *mut c_void,
+                shape: out_shape.as_mut_ptr(),
+                strides: out_strides.as_mut_ptr(),
+                ndim: 8,
+                dtype: 1,
+                device_type: 0,
+                device_id: 0,
+                tape_id: 0,
+            };
+            let caps: Vec<u64> = vec![cap];
+            nsl_runtime::c_api::nsl_clear_error();
+            let rc = nsl_runtime::c_api::nsl_model_call_into(
+                model,
+                name.as_ptr() as i64,
+                &mut input as *mut _ as i64,
+                1,
+                &mut output as *mut _ as i64,
+                1,
+                caps.as_ptr() as i64,
+            );
+            println!(
+                "CHILD-RESULT rc={rc} out={out_buf:?} ndim={} shape0={} err={}",
+                output.ndim, out_shape[0], last_error()
+            );
+            println!("CHILD-LIBERR {}", lib_last_error(&lib_path));
+        }
+        // Item 7 — the scalar-return wild read (gamma returns f64 7.5).
+        "call_scalar_model_call" | "call_scalar_into" => {
+            let gamma_name = CString::new("gamma").unwrap();
+            let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            let mut scalar_out: f64 = 0.0;
+            let mut out_shape: Vec<i64> = vec![0; 8];
+            let mut output = NslTensorDesc {
+                data: &mut scalar_out as *mut f64 as *mut c_void,
+                shape: out_shape.as_mut_ptr(),
+                strides: std::ptr::null_mut(),
+                ndim: 8,
+                dtype: 1,
+                device_type: 0,
+                device_id: 0,
+                tape_id: 0,
+            };
+            nsl_runtime::c_api::nsl_clear_error();
+            let rc = if scenario == "call_scalar_model_call" {
+                nsl_runtime::c_api::nsl_model_call(
+                    model,
+                    gamma_name.as_ptr() as i64,
+                    &mut input as *mut _ as i64,
+                    1,
+                    &mut output as *mut _ as i64,
+                    1,
+                )
+            } else {
+                let caps: Vec<u64> = vec![8];
+                nsl_runtime::c_api::nsl_model_call_into(
+                    model,
+                    gamma_name.as_ptr() as i64,
+                    &mut input as *mut _ as i64,
+                    1,
+                    &mut output as *mut _ as i64,
+                    1,
+                    caps.as_ptr() as i64,
+                )
+            };
+            println!(
+                "CHILD-RESULT rc={rc} scalar={scalar_out} ndim={} dtype={} err={}",
+                output.ndim, output.dtype, last_error()
+            );
+        }
+        // Item 7 — ownership model B: NSL allocates, DLPack transfers.
+        "call_alloc_ok" => {
+            let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            let mut outs: Vec<*mut DLManagedTensor> = vec![std::ptr::null_mut()];
+            nsl_runtime::c_api::nsl_clear_error();
+            let rc = nsl_runtime::c_api::nsl_model_call_alloc(
+                model,
+                name.as_ptr() as i64,
+                &mut input as *mut _ as i64,
+                1,
+                outs.as_mut_ptr() as i64,
+                1,
+            );
+            let mut out_vals: Vec<f32> = Vec::new();
+            if rc == 0 && !outs[0].is_null() {
+                let m = unsafe { &*outs[0] };
+                let t = &m.dl_tensor;
+                if t.ndim == 1 && !t.shape.is_null() && !t.data.is_null() {
+                    let n = unsafe { *t.shape } as usize;
+                    out_vals =
+                        unsafe { std::slice::from_raw_parts(t.data as *const f32, n) }.to_vec();
+                }
+                nsl_runtime::dlpack::nsl_dlpack_free(outs[0] as i64);
+            }
+            println!("CHILD-RESULT rc={rc} out={out_vals:?} err={}", last_error());
+        }
+        // Item 7 — scalar exports must REFUSE the alloc path (no DLPack
+        // scalar), not wild-read or crash.
+        "call_alloc_scalar_refused" => {
+            let gamma_name = CString::new("gamma").unwrap();
+            let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
+            let mut outs: Vec<*mut DLManagedTensor> = vec![std::ptr::null_mut()];
+            nsl_runtime::c_api::nsl_clear_error();
+            let rc = nsl_runtime::c_api::nsl_model_call_alloc(
+                model,
+                gamma_name.as_ptr() as i64,
+                &mut input as *mut _ as i64,
+                1,
+                outs.as_mut_ptr() as i64,
+                1,
+            );
+            println!(
+                "CHILD-RESULT rc={rc} slot_null={} err={}",
+                outs[0].is_null(),
+                last_error()
+            );
+            println!("CHILD-LIBERR {}", lib_last_error(&lib_path));
+        }
+        // Item 7 — leak gates. 2000 × 256 KiB outputs: a per-call impl-result
+        // leak (the legacy path's contract) would grow RSS ~500 MiB; the new
+        // entry points must stay flat. RSS is read from /proc/self/statm.
+        "alloc_leak_loop" | "into_leak_loop" => {
+            let delta_name = CString::new("delta").unwrap();
+            const N_ELEM: usize = 65536;
+            let mut big: Vec<f32> = (0..N_ELEM).map(|i| i as f32).collect();
+            let mut big_shape: Vec<i64> = vec![N_ELEM as i64];
+            // Warm up allocator pools before the baseline read.
+            const WARMUP: usize = 50;
+            const ITERS: usize = 2000;
+            let mut rss_before = 0u64;
+            for i in 0..(WARMUP + ITERS) {
+                if i == WARMUP {
+                    rss_before = rss_kb();
+                }
+                let mut input =
+                    desc(big.as_mut_ptr() as *mut c_void, big_shape.as_mut_ptr(), 1);
+                if scenario == "alloc_leak_loop" {
+                    let mut outs: Vec<*mut DLManagedTensor> = vec![std::ptr::null_mut()];
+                    let rc = nsl_runtime::c_api::nsl_model_call_alloc(
+                        model,
+                        delta_name.as_ptr() as i64,
+                        &mut input as *mut _ as i64,
+                        1,
+                        outs.as_mut_ptr() as i64,
+                        1,
+                    );
+                    assert_eq!(rc, 0, "alloc iteration {i} failed: {}", last_error());
+                    nsl_runtime::dlpack::nsl_dlpack_free(outs[0] as i64);
+                } else {
+                    let mut out_buf: Vec<f32> = vec![0.0; N_ELEM];
+                    let mut out_shape: Vec<i64> = vec![0; 8];
+                    let mut output = NslTensorDesc {
+                        data: out_buf.as_mut_ptr() as *mut c_void,
+                        shape: out_shape.as_mut_ptr(),
+                        strides: std::ptr::null_mut(),
+                        ndim: 8,
+                        dtype: 1,
+                        device_type: 0,
+                        device_id: 0,
+                        tape_id: 0,
+                    };
+                    let caps: Vec<u64> = vec![(N_ELEM * 4) as u64];
+                    let rc = nsl_runtime::c_api::nsl_model_call_into(
+                        model,
+                        delta_name.as_ptr() as i64,
+                        &mut input as *mut _ as i64,
+                        1,
+                        &mut output as *mut _ as i64,
+                        1,
+                        caps.as_ptr() as i64,
+                    );
+                    assert_eq!(rc, 0, "into iteration {i} failed: {}", last_error());
+                }
+            }
+            let rss_after = rss_kb();
+            let grown_kb = rss_after.saturating_sub(rss_before);
+            println!(
+                "CHILD-RESULT rc=0 rss_before={rss_before} rss_after={rss_after} \
+                 grown_kb={grown_kb} err="
+            );
+        }
+        // Item 7 — signature introspection.
+        "sig_json" => {
+            let gamma_name = CString::new("gamma").unwrap();
+            let missing = CString::new("no_such_export").unwrap();
+            nsl_runtime::c_api::nsl_clear_error();
+            let alpha_ptr = nsl_runtime::c_api::nsl_model_get_export_signature(
+                model,
+                name.as_ptr() as i64,
+            );
+            let gamma_ptr = nsl_runtime::c_api::nsl_model_get_export_signature(
+                model,
+                gamma_name.as_ptr() as i64,
+            );
+            let alpha_json = if alpha_ptr != 0 {
+                unsafe { CStr::from_ptr(alpha_ptr as *const c_char) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                String::new()
+            };
+            let gamma_json = if gamma_ptr != 0 {
+                unsafe { CStr::from_ptr(gamma_ptr as *const c_char) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                String::new()
+            };
+            nsl_runtime::c_api::nsl_clear_error();
+            let missing_ptr = nsl_runtime::c_api::nsl_model_get_export_signature(
+                model,
+                missing.as_ptr() as i64,
+            );
+            println!("CHILD-SIG-ALPHA {alpha_json}");
+            println!("CHILD-SIG-GAMMA {gamma_json}");
+            println!(
+                "CHILD-RESULT rc={} err={}",
+                if missing_ptr == 0 { 0 } else { 99 },
+                last_error()
+            );
         }
         // A null ELEMENT inside a real array.
         "null_dlpack" => {
@@ -482,6 +752,24 @@ fn run_model_scenario(scenario: &str) {
         other => panic!("unknown scenario '{other}'"),
     }
     nsl_runtime::c_api::nsl_model_destroy(model);
+}
+
+/// Resident set size in KiB, from /proc/self/statm (Linux). Returns 0
+/// elsewhere; the leak-loop assertions are cfg-gated to match.
+#[cfg(target_os = "linux")]
+fn rss_kb() -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let pages: u64 = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
+    pages * 4 // 4 KiB pages
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rss_kb() -> u64 {
+    0
 }
 
 /// A CPU, contiguous, 1-D `NslTensorDesc` over a caller-owned buffer.
@@ -751,15 +1039,200 @@ fn dlpack_and_export_wrappers_refuse_unsupported_dtypes_without_killing_the_host
          dispatch wrapper.\n--- stderr ---\n{}",
         ok_dl.stderr
     );
-    // …and the refusal it DOES get must name the real cause. The underlying
-    // message ("null data pointer (caller buffer or impl result)") blames a
-    // caller buffer the DLPack ABI gives no way to supply.
+    // …and (item 7) the call now SUCCEEDS end-to-end: the values are read
+    // through the returned ownership-transferring DLManagedTensor, whose
+    // metadata must describe a 1-D f32 CPU tensor, and the child releases it
+    // via its deleter without dying.
+    assert_eq!(
+        ok_dl.rc(),
+        0,
+        "a well-formed f32 DLPack call must now return 0 — the output \
+         allocator landed with item 7.\n{}",
+        ok_dl.stdout
+    );
     assert!(
-        ok_dl.err().contains("cannot allocate DLPack outputs"),
-        "a well-formed f32 DLPack call still fails (the output path is \
-         unimplemented) — the error must say THAT rather than blame the \
-         caller's buffer, got: {}",
-        ok_dl.err()
+        ok_dl.stdout.contains("out=[2.0, 4.0, 6.0, 8.0]"),
+        "the DLPack output must carry the computed x * 2.0 values, got: {}",
+        ok_dl.stdout
+    );
+    assert!(
+        ok_dl.stdout.contains("meta=[ndim=1 bits=32 code=2 dev=1]"),
+        "the DLManagedTensor metadata must describe a 1-D f32 CPU tensor \
+         (code 2 = kDLFloat, dev 1 = kDLCPU), got: {}",
+        ok_dl.stdout
+    );
+
+    // ── ITEM-7 GATE: call_into capacity contract ─────────────────────────
+    let into_ok = run_child("call_into_ok", &ctx, false);
+    into_ok.assert_survived("call_into_ok");
+    assert_eq!(into_ok.rc(), 0, "exact-capacity call_into must succeed\n{}", into_ok.stdout);
+    assert!(
+        into_ok.stdout.contains("out=[2.0, 4.0, 6.0, 8.0]"),
+        "call_into must deep-copy the computed values, got: {}",
+        into_ok.stdout
+    );
+    assert!(
+        into_ok.stdout.contains("ndim=1 shape0=4"),
+        "call_into must deep-copy the result shape into the CALLER'S arrays \
+         and set ndim to the result rank, got: {}",
+        into_ok.stdout
+    );
+
+    let into_small = run_child("call_into_undersized", &ctx, false);
+    into_small.assert_survived("call_into_undersized");
+    assert_eq!(
+        into_small.rc(),
+        -1,
+        "an undersized output buffer must REFUSE (the legacy path memcpy'd \
+         into it unchecked — a silent heap overrun)\n{}",
+        into_small.stdout
+    );
+    if cfg!(unix) {
+        let lerr = into_small.lib_err();
+        assert!(
+            lerr.contains("requires 16 bytes") && lerr.contains("8 bytes"),
+            "the capacity refusal must report the REQUIRED byte count so the \
+             caller can reallocate and retry, got: {lerr}\n{}",
+            into_small.stdout
+        );
+    }
+    assert!(
+        into_small.stdout.contains("out=[0.0, 0.0, 0.0, 0.0]"),
+        "a capacity refusal must not have written the caller's buffer, got: {}",
+        into_small.stdout
+    );
+
+    // ── ITEM-7 GATE: the scalar-return wild read is fixed ────────────────
+    // gamma returns f64 7.5. Before the fix the dispatch flow memcpy'd FROM
+    // the bit pattern of 7.5 reinterpreted as an address — at best garbage,
+    // at worst SIGSEGV (assert_survived is load-bearing here).
+    let sc_call = run_child("call_scalar_model_call", &ctx, false);
+    sc_call.assert_survived("call_scalar_model_call");
+    assert_eq!(sc_call.rc(), 0, "scalar export via nsl_model_call must succeed\n{}", sc_call.stdout);
+    assert!(
+        sc_call.stdout.contains("scalar=7.5 ndim=0 dtype=0"),
+        "the scalar value must arrive AS A VALUE (7.5, rank 0, f64 tag) — not \
+         be dereferenced as an address, got: {}",
+        sc_call.stdout
+    );
+
+    let sc_into = run_child("call_scalar_into", &ctx, false);
+    sc_into.assert_survived("call_scalar_into");
+    assert_eq!(sc_into.rc(), 0, "scalar export via call_into must succeed\n{}", sc_into.stdout);
+    assert!(
+        sc_into.stdout.contains("scalar=7.5 ndim=0 dtype=0"),
+        "call_into's scalar path must produce the same value, got: {}",
+        sc_into.stdout
+    );
+
+    // ── ITEM-7 GATE: call_alloc ownership transfer ───────────────────────
+    let alloc_ok = run_child("call_alloc_ok", &ctx, false);
+    alloc_ok.assert_survived("call_alloc_ok");
+    assert_eq!(alloc_ok.rc(), 0, "call_alloc must succeed\n{}", alloc_ok.stdout);
+    assert!(
+        alloc_ok.stdout.contains("out=[2.0, 4.0, 6.0, 8.0]"),
+        "call_alloc's DLManagedTensor must carry the computed values, got: {}",
+        alloc_ok.stdout
+    );
+
+    let alloc_scalar = run_child("call_alloc_scalar_refused", &ctx, false);
+    alloc_scalar.assert_survived("call_alloc_scalar_refused");
+    assert_eq!(
+        alloc_scalar.rc(),
+        -1,
+        "a scalar-returning export must REFUSE the alloc path (no DLPack \
+         scalar representation)\n{}",
+        alloc_scalar.stdout
+    );
+    assert!(
+        alloc_scalar.stdout.contains("slot_null=true"),
+        "a refused alloc call must leave the output slot NULL, got: {}",
+        alloc_scalar.stdout
+    );
+    if cfg!(unix) {
+        assert!(
+            alloc_scalar.lib_err().contains("scalar"),
+            "the refusal must say the problem is the scalar return, got: {}",
+            alloc_scalar.lib_err()
+        );
+    }
+
+    // ── ITEM-7 GATE: the new paths do not inherit the legacy leak ────────
+    // 2000 × 256 KiB. Leaking the impl result (struct + owns_data buffer)
+    // would grow RSS by ~500 MiB; 64 MiB of headroom absorbs allocator
+    // fragmentation while still failing a real leak by an order of magnitude.
+    if cfg!(target_os = "linux") {
+        for scen in ["alloc_leak_loop", "into_leak_loop"] {
+            let leak = run_child(scen, &ctx, false);
+            leak.assert_survived(scen);
+            let grown_kb: u64 = leak
+                .stdout
+                .lines()
+                .find(|l| l.contains("CHILD-RESULT"))
+                .and_then(|l| l.split_whitespace().find_map(|t| t.strip_prefix("grown_kb=")))
+                .and_then(|t| t.parse().ok())
+                .unwrap_or_else(|| panic!("{scen}: no grown_kb in\n{}", leak.stdout));
+            eprintln!("[item7-leak-gate] {scen}: RSS grew {grown_kb} KiB over 2000 calls");
+            assert!(
+                grown_kb < 64 * 1024,
+                "{scen}: RSS grew {grown_kb} KiB over 2000 calls with 256 KiB \
+                 outputs — the ownership path is leaking the impl result \
+                 (~500 MiB expected from the legacy leak).\n{}",
+                leak.stdout
+            );
+        }
+    }
+
+    // ── ITEM-7 GATE: export-signature introspection ──────────────────────
+    let sig = run_child("sig_json", &ctx, false);
+    sig.assert_survived("sig_json");
+    assert_eq!(
+        sig.rc(),
+        0,
+        "an unknown export name must return NULL from \
+         nsl_model_get_export_signature\n{}",
+        sig.stdout
+    );
+    // `find` + slice, not `strip_prefix`: the child's FIRST stdout line is
+    // glued to libtest's "test zz_... ..." prefix, so the marker is not at
+    // column 0 there.
+    let alpha_sig = sig
+        .stdout
+        .lines()
+        .find_map(|l| l.find("CHILD-SIG-ALPHA ").map(|i| &l[i + "CHILD-SIG-ALPHA ".len()..]))
+        .unwrap_or_else(|| panic!("no CHILD-SIG-ALPHA in\n{}", sig.stdout));
+    let alpha_json: serde_json::Value =
+        serde_json::from_str(alpha_sig).expect("alpha signature must be valid JSON");
+    assert_eq!(alpha_json["symbol_name"], "alpha");
+    assert_eq!(
+        alpha_json["return_type"]["Tensor"]["shape"],
+        serde_json::json!(["4"]),
+        "alpha's return shape must be the declared [4]: {alpha_json}"
+    );
+    assert_eq!(
+        alpha_json["return_type"]["Tensor"]["dtype"], "F32",
+        "alpha's return dtype must be F32: {alpha_json}"
+    );
+    assert_eq!(
+        alpha_json["params"].as_array().map(Vec::len),
+        Some(1),
+        "alpha takes one parameter: {alpha_json}"
+    );
+    let gamma_sig = sig
+        .stdout
+        .lines()
+        .find_map(|l| l.find("CHILD-SIG-GAMMA ").map(|i| &l[i + "CHILD-SIG-GAMMA ".len()..]))
+        .unwrap_or_else(|| panic!("no CHILD-SIG-GAMMA in\n{}", sig.stdout));
+    let gamma_json: serde_json::Value =
+        serde_json::from_str(gamma_sig).expect("gamma signature must be valid JSON");
+    assert_eq!(
+        gamma_json["return_type"]["Scalar"], "F64",
+        "gamma's return type must be Scalar F64: {gamma_json}"
+    );
+    assert!(
+        sig.err().contains("no_such_export"),
+        "the unknown-name refusal must name the missing export, got: {}",
+        sig.err()
     );
 
     // ── GATE (a): int64 DLPack input ─────────────────────────────────────

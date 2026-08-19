@@ -277,6 +277,44 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
     out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs);\n\n");
 
+    // Item-7 ownership-model entry points. The DLManagedTensor definition
+    // lives in the DLPack standard header (dlpack/dlpack.h, v0.8); hosts
+    // that use the alloc path include it themselves — this header only
+    // needs the opaque name.
+    out.push_str("/* DLPack v0.8 managed tensor — see dlpack/dlpack.h for the definition. */\n");
+    out.push_str("typedef struct DLManagedTensor DLManagedTensor;\n\n");
+    out.push_str("/* Ownership model A — CALLER allocates. Like nsl_model_call, plus an\n");
+    out.push_str(" * explicit capacity contract: out_capacities[i] is the allocated byte\n");
+    out.push_str(" * size of outputs[i].data. An undersized buffer REFUSES (rc=-1) and the\n");
+    out.push_str(" * error text reports the required byte count (probe-and-retry is the\n");
+    out.push_str(" * supported sizing strategy for symbolic-dim outputs). outputs[i].shape\n");
+    out.push_str(" * and .strides must point at caller-owned arrays whose slot capacity is\n");
+    out.push_str(" * declared in outputs[i].ndim ON ENTRY; the result's dims are deep-copied\n");
+    out.push_str(" * into them and ndim is set to the result rank. The runtime frees its\n");
+    out.push_str(" * internal result tensor — nothing leaks and nothing is borrowed. */\n");
+    out.push_str("int64_t   nsl_model_call_into(NslModel* model, const char* name,\n");
+    out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
+    out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs,\n");
+    out.push_str("                          const uint64_t* out_capacities);\n\n");
+    out.push_str("/* Ownership model B — NSL allocates, ownership TRANSFERS. On rc==0 each\n");
+    out.push_str(" * out_dl[i] holds a DLManagedTensor* whose deleter releases the underlying\n");
+    out.push_str(" * NSL tensor exactly once. Consume it (torch.utils.dlpack.from_dlpack) or\n");
+    out.push_str(" * release it with nsl_dlpack_free — exactly one of the two, exactly once.\n");
+    out.push_str(" * Refuses GPU-resident results, dtypes without a DLPack mapping, and\n");
+    out.push_str(" * scalar-returning exports (use nsl_model_call_into). Refusal is\n");
+    out.push_str(" * leak-free: every slot is NULL and nothing needs freeing.\n");
+    out.push_str(" * LIFETIME: each deleter is code inside THIS shared library — do not\n");
+    out.push_str(" * unload the library while any transferred output is still alive. */\n");
+    out.push_str("int64_t   nsl_model_call_alloc(NslModel* model, const char* name,\n");
+    out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
+    out.push_str("                          DLManagedTensor** out_dl, int64_t n_outputs);\n\n");
+    out.push_str("/* Introspection: per-export signature as JSON (serialized ExportInfo:\n");
+    out.push_str(" * params + return type, shapes with symbolic dims as strings, dtypes,\n");
+    out.push_str(" * devices). BORROWED pointer into the model's artifact — valid until\n");
+    out.push_str(" * nsl_model_destroy, never freed by the caller. NULL + error if the name\n");
+    out.push_str(" * is unknown or the artifact predates the signature table. */\n");
+    out.push_str("const char* nsl_model_get_export_signature(NslModel* model, const char* name);\n\n");
+
     // The error contract in docs/abi/README.md tells hosts that detail is
     // "retrievable via nsl_get_last_error(); clear with nsl_clear_error()" —
     // so a host following the documented contract needs these declared. They
