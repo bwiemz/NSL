@@ -23,7 +23,11 @@ One invocation runs the milestone's exit criteria as ASSERTIONS, not prose:
   phase 2  f32         the F32 reference arm, same schedule — banks the
                        reference trajectory next to the SR-BF16 one
   phase 3  resume      new process, checkpoint_load of phase 1's step-50
-                       checkpoint, token stream sliced at the same boundary;
+                       checkpoint, same UNSLICED token stream (item 8: the
+                       sidecar carries the loader's epoch + delivery slot, so
+                       the data position is restored rather than emulated by
+                       hand-slicing the corpus — which the loader-identity
+                       check would now refuse);
                        asserts the [checkpoint] resumed witness and loss
                        continuity against the parent tail (no re-warm spike).
                        Bit-identity is NOT asserted at 1B — TF32 GEMMs and
@@ -465,16 +469,21 @@ def main() -> None:
     # ── phase 3: checkpoint resume ─────────────────────────────────────
     if not args.skip_resume:
         # The checkpoint on disk is the LAST boundary save (each save
-        # overwrites the same path), so both the token slice and the
-        # step-numbering assertion anchor on last_save_step — slicing at the
-        # FIRST boundary would replay steps the checkpoint already trained
-        # and fail the numbering check.
-        boundary_tokens = last_save_step * TOKENS_PER_OPT_STEP
-        sliced = args.out / "tokens_resume.bin"
-        raw = tokens.read_bytes()
-        sliced.write_bytes(raw[boundary_tokens * 2:])  # u16 = 2 bytes/token
+        # overwrites the same path), so the step-numbering assertion anchors
+        # on last_save_step.
+        #
+        # Item 8 (2026-08-19): the resume arm now reads the SAME, UNSLICED
+        # token stream. This harness used to hand-slice the corpus at the
+        # save boundary because the checkpoint could not carry a data
+        # position — the loader always restarted at batch 0, so feeding it a
+        # pre-advanced file was the only way to approximate a continuation.
+        # The sidecar now records the loader's epoch and delivery slot and
+        # restores them, which makes the slice both unnecessary and REFUSED:
+        # a sliced corpus is a different corpus, and the loader-identity
+        # check exists precisely to stop a resume from continuing "slot N"
+        # of a permutation over data it was not built from.
         work_r = args.out / "resume"
-        prog_r = build_workdir(work_r, sliced,
+        prog_r = build_workdir(work_r, tokens,
                                ', checkpoint_load = "b2048.ckpt.nslm"')
         for suffix in ("", ".optim"):
             shutil.copy2(work / f"b2048.ckpt.nslm{suffix}",

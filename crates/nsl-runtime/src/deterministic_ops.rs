@@ -18,8 +18,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Global deterministic mode flag — set at program start when --deterministic is active.
 static DETERMINISTIC_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Value of [`RNG_SEED`] when no `--seed` was given. Consumers that need to
+/// distinguish "seeded run" from "default" (e.g. the DataLoader's shuffle key)
+/// compare against this rather than hard-coding 42 in a second place.
+pub const RNG_SEED_DEFAULT: u64 = 42;
+
 /// Global RNG seed — set when --deterministic is active to ensure reproducible RNG.
-static RNG_SEED: AtomicU64 = AtomicU64::new(42);
+static RNG_SEED: AtomicU64 = AtomicU64::new(RNG_SEED_DEFAULT);
+
+/// Whether [`nsl_rng_seed`] actually ran. Consumers that only want to change
+/// behavior for an EXPLICITLY seeded run must not infer that from the seed
+/// VALUE: `--seed 42` is indistinguishable from the default by value alone,
+/// so `--seed 42` would silently behave differently from `--seed 43`.
+static RNG_SEED_SET: AtomicBool = AtomicBool::new(false);
 
 /// Set global deterministic mode flag.
 /// Called from compiled main() when --deterministic is active.
@@ -42,6 +53,7 @@ pub fn is_deterministic() -> bool {
 #[no_mangle]
 pub extern "C" fn nsl_rng_seed(seed: i64) -> i64 {
     RNG_SEED.store(seed as u64, Ordering::SeqCst);
+    RNG_SEED_SET.store(true, Ordering::SeqCst);
     // P0 certification (--seed): the SAMPLING thread-local RNG feeds
     // randn/rand model init, but it was only reseedable via
     // nsl_manual_seed — "seed all RNG sources" silently excluded the one
@@ -49,6 +61,13 @@ pub extern "C" fn nsl_rng_seed(seed: i64) -> i64 {
     // SAME init. Reseed it here (program start runs on the thread that
     // executes model init).
     crate::sampling::nsl_manual_seed(seed);
+    // Same omission on the GPU side: `gpu_dropout_f32`'s counter started at a
+    // hard-coded 42 regardless of --seed, so GPU dropout masks were identical
+    // across seeds AND unreachable by "seed all RNG sources". Key it off the
+    // seed (offset by the historical default so an unseeded run is unchanged).
+    crate::rng_state::set_gpu_dropout_counter(
+        (seed as u64).wrapping_add(crate::rng_state::GPU_DROPOUT_SEED_DEFAULT),
+    );
     eprintln!("[nsl] deterministic RNG seed set to {seed}");
     0
 }
@@ -56,6 +75,13 @@ pub extern "C" fn nsl_rng_seed(seed: i64) -> i64 {
 /// Retrieve the current RNG seed (used by stochastic ops to thread the seed).
 pub fn get_rng_seed() -> u64 {
     RNG_SEED.load(Ordering::Relaxed)
+}
+
+/// The seed only if the program explicitly set one — see [`RNG_SEED_SET`].
+pub fn explicit_rng_seed() -> Option<u64> {
+    RNG_SEED_SET
+        .load(Ordering::Relaxed)
+        .then(|| RNG_SEED.load(Ordering::Relaxed))
 }
 
 /// Deterministic reduce_sum — uses sequential single-thread GPU kernels for GPU tensors,

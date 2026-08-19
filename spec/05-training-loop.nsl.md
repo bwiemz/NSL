@@ -433,6 +433,19 @@ Semantics and constraints (v1):
   rather than defaulted — on both blocks. (`distill` used to accept the
   expression and then train ONE epoch, reporting `Epochs: 1`; `train` used
   to accept `epochs = 0` and silently train nothing.)
+- Under `checkpoint_load`, **`epochs` is the TOTAL for the run**, not a count
+  of additional epochs. A recipe that says `epochs = 40` and dies at epoch 12
+  is re-run *unchanged* with `checkpoint_load` and trains epochs 12..40; the
+  restored epoch, the DataLoader's position within it, and the RNG streams all
+  continue. An `epochs` at or below the checkpoint's epoch is refused, because
+  the epoch loop would run zero steps and exit 0. (Before this the epoch
+  counter restarted at 0, so an unedited re-run trained its whole budget a
+  second time over data the model had already seen.)
+- A resume refuses, rather than reordering silently, when the DataLoader it is
+  resuming into is not the one the checkpoint was written from: a different
+  corpus, batch geometry or shuffle seed, or a loader-less `train` block
+  resuming a loader checkpoint (and vice versa). `model_load(...)` is the
+  weights-only warm start for those cases.
 - A `distill` block is a training loop, and the module-level analyses that
   decide how it trains now see it as one: `nsl check --training-report`
   reports its FASE plan under `Kind: distill` with the student as `Model:`,

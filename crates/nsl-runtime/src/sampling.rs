@@ -2,9 +2,9 @@
 
 use std::cell::RefCell;
 
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha12Rng;
 
 use crate::autodiff;
 use crate::cpu::{create_tensor_with_shape_rs, create_tensor_with_shape_rs_dtype, get_shape_vec, get_strides_vec};
@@ -44,20 +44,46 @@ fn redirect_gpu_input_to_host(tensor_ptr: i64, op: impl FnOnce(i64) -> i64) -> i
 // Thread-local RNG
 // ---------------------------------------------------------------------------
 
+// The training RNG. Spelled as the CONCRETE `ChaCha12Rng` rather than
+// `rand::rngs::StdRng`, which in rand 0.9 *is* `ChaCha12Rng` — so the stream
+// is unchanged bit-for-bit — because only the concrete type exposes
+// `get_word_pos`/`set_word_pos`. Item 8 needs an O(1) snapshot/restore of
+// this stream for checkpoint resume; replaying draws to catch up is
+// O(elements dropped out so far), i.e. billions of draws at 50M scale.
 thread_local! {
-    static RNG: RefCell<StdRng> = RefCell::new(StdRng::seed_from_u64(0));
+    static RNG: RefCell<ChaCha12Rng> = RefCell::new(ChaCha12Rng::seed_from_u64(0));
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_manual_seed(seed: i64) {
     RNG.with(|r| {
-        *r.borrow_mut() = StdRng::seed_from_u64(seed as u64);
+        *r.borrow_mut() = ChaCha12Rng::seed_from_u64(seed as u64);
     });
 }
 
 /// Generate a uniform random f64 in [0, 1) using the thread-local seeded RNG.
 pub fn rng_f64() -> f64 {
     RNG.with(|r| r.borrow_mut().random::<f64>())
+}
+
+/// Capture this thread's RNG as (seed bytes, word position) — see
+/// [`crate::rng_state::RngSnapshot`]. The seed alone is not the state: the
+/// stream has advanced, and resuming from the seed would re-draw masks the
+/// pre-crash run already used.
+pub fn rng_snapshot() -> ([u8; 32], u128) {
+    RNG.with(|r| {
+        let rng = r.borrow();
+        (rng.get_seed(), rng.get_word_pos())
+    })
+}
+
+/// Restore this thread's RNG to a captured (seed, position).
+pub fn rng_restore(seed: [u8; 32], pos: u128) {
+    RNG.with(|r| {
+        let mut rng = ChaCha12Rng::from_seed(seed);
+        rng.set_word_pos(pos);
+        *r.borrow_mut() = rng;
+    });
 }
 
 // ---------------------------------------------------------------------------

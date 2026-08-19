@@ -139,7 +139,7 @@ This list includes both production-ready features and higher-value functional su
 3. **Type system**: Compile-time shape checking, named dimensions, dtype tracking, borrowing (`&T`)
 4. **Autodiff**: Tape-based + source-to-source with 50+ backward rules (softmax, layernorm, cross-entropy, dropout, conv2d, attention, RoPE)
 5. **Models**: model keyword, parameter management, serialization (.nslm), @shared weights
-6. **Training**: train block, 6 optimizers, 7 schedulers, loss functions, gradient checkpointing
+6. **Training**: train block, 6 optimizers, 7 schedulers, loss functions, gradient checkpointing, **resumable training state** (`.optim` sidecar v2, item 8 2026-08-19: θ + AdamW moments + step counter + training/loader epoch + loader delivery slot + corpus fingerprint + RNG streams — a resumed run continues the data order and the dropout masks, and refuses a corpus/geometry mismatch)
 7. **GPU**: 15+ PTX kernels, .to(cuda), kernel keyword, FlashAttention-3 scaffolding with Hopper-specific wgmma/TMA work still partially placeholder
 8. **Quantization**: INT4/8, FP8 E4M3/E5M2 (H100 MMA), AWQ, GPTQ (full OBQ with Hessian-based error compensation)
 9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding core with Lookahead plus partial EAGLE-2/Medusa tree-method scaffolding

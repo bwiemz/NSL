@@ -90,7 +90,14 @@ impl DataLoaderConfig {
             emit_attention_mask: v["emit_attention_mask"].as_bool().unwrap_or(false),
             world_size: v["world_size"].as_u64().unwrap_or(1).max(1) as usize,
             shard_by_rank: v["shard_by_rank"].as_bool().unwrap_or(false),
-            seed: v["seed"].as_u64().unwrap_or(DEFAULT_DP_SHUFFLE_SEED),
+            // Item 8: with no explicit loader seed, fall back to the global
+            // `--seed` store when the program set one, so `--seed` controls
+            // the data ORDER too (it already controls init and dropout).
+            // Unseeded runs keep the historical constant.
+            seed: v["seed"].as_u64().unwrap_or_else(|| {
+                crate::deterministic_ops::explicit_rng_seed()
+                    .unwrap_or(DEFAULT_DP_SHUFFLE_SEED)
+            }),
         }
     }
 }
@@ -133,6 +140,14 @@ struct DataLoader {
     /// ranks (lockstep resets in SPMD).
     epoch: Arc<AtomicUsize>,
     _shuffle_offsets: Vec<usize>,
+    /// Item 8: a pending checkpoint resume, `(epoch, slot)`, consumed by the
+    /// NEXT [`nsl_dataloader_reset`]. That reset pins the epoch instead of
+    /// incrementing it (so the permutation is the saved epoch's) and starts
+    /// the cursor at `slot` instead of 0 (so the batches already trained on
+    /// are not re-delivered). Armed rather than applied immediately because
+    /// the train block's epoch loop resets at the top of every epoch,
+    /// including the first one after the resume.
+    pending_resume: Option<(usize, usize)>,
 }
 
 unsafe impl Send for DataLoader {}
@@ -284,13 +299,18 @@ impl DataLoader {
             rank,
             epoch: Arc::new(AtomicUsize::new(0)),
             _shuffle_offsets: Vec::new(),
+            pending_resume: None,
         }
     }
 
-    fn start_workers(&mut self) {
+    /// Start (or restart) workers at delivery slot `start_slot`. Everything
+    /// before `start_slot` in this epoch's permutation is never claimed, so a
+    /// resume skips it in O(1) instead of building and discarding batches.
+    fn start_workers_at(&mut self, start_slot: usize) {
         self.stop_flag.store(false, Ordering::Release);
-        self.cursor.store(0, Ordering::Relaxed);
-        self.expected_batch_id.store(0, Ordering::Relaxed);
+        let start_slot = start_slot.min(self.total_batches);
+        self.cursor.store(start_slot, Ordering::Relaxed);
+        self.expected_batch_id.store(start_slot, Ordering::Relaxed);
 
         // D3 v3: build the GLOBAL batch order first, then (only when sharding
         // is opted in) stride to this rank's shard. When NOT sharding this
@@ -300,19 +320,20 @@ impl DataLoader {
         let sharding = self.config.world_size > 1 && self.config.shard_by_rank;
         let mut batch_order: Vec<usize> = (0..self.global_total_batches).collect();
         if self.config.shuffle {
-            if sharding {
-                // Cross-rank-consistent deterministic shuffle: EVERY rank must
-                // produce the identical global permutation for this epoch, or
-                // the strided partition is neither disjoint nor complete. Key
-                // by (seed, epoch) so epochs differ but ranks agree.
-                let epoch = self.epoch.load(Ordering::Relaxed) as u64;
-                let mut rng = StdRng::seed_from_u64(self.config.seed ^ epoch);
-                batch_order.shuffle(&mut rng);
-            } else {
-                // Not sharding: preserve the original entropy-seeded shuffle.
-                let mut rng = rand::rng();
-                batch_order.shuffle(&mut rng);
-            }
+            // Deterministic shuffle keyed by (seed, epoch) on EVERY path.
+            //
+            // Sharded: every rank must derive the identical global permutation
+            // or the strided partition is neither disjoint nor complete.
+            //
+            // Single-rank: this used to be `rand::rng()` — entropy. Item 8
+            // makes it seeded because a checkpoint that records "resume at
+            // epoch 3, slot 412" is meaningless if epoch 3's permutation is a
+            // fresh random draw each process. The cost is that an unseeded
+            // run now repeats the same order run-to-run (standard seeded-
+            // training behavior); epochs still differ via the XOR.
+            let epoch = self.epoch.load(Ordering::Relaxed) as u64;
+            let mut rng = StdRng::seed_from_u64(self.config.seed ^ epoch);
+            batch_order.shuffle(&mut rng);
         }
         // Strided per-rank shard: rank r takes global slots where slot % ws == r,
         // capped to total_batches (floor) so every rank yields an equal count.
@@ -444,6 +465,75 @@ impl DataLoader {
             });
             self.worker_handles.push(handle);
         }
+    }
+
+    fn start_workers(&mut self) {
+        self.start_workers_at(0);
+    }
+
+    /// FNV-1a over the loader's geometry and a corpus fingerprint. Recorded in
+    /// the checkpoint and compared on resume: "resume at epoch 3, slot 412"
+    /// only means anything against the same corpus, batch geometry and shuffle
+    /// key. Fingerprint (not full hash) because the corpus is multi-GB and
+    /// this runs on every save — length + dtype + the first and last MiB catch
+    /// a swapped, truncated or re-tokenized corpus, which is what the guard is
+    /// for. It is a pairing check, not an integrity check (same doctrine as
+    /// `model_file_sig`).
+    fn identity_sig(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        let c = &self.config;
+        for v in [
+            c.batch_size as u64,
+            c.seq_len as u64,
+            c.shuffle as u64,
+            c.drop_last as u64,
+            c.packing as u64,
+            c.pack_separator as u64,
+            c.world_size as u64,
+            c.shard_by_rank as u64,
+            c.seed,
+            self.rank as u64,
+            self.total_batches as u64,
+            self.global_total_batches as u64,
+            self.data_len as u64,
+            self.data_dtype as u64,
+            self.has_labels as u64,
+            self.labels_len as u64,
+            self.labels_dtype as u64,
+        ] {
+            mix(&v.to_le_bytes());
+        }
+        // Corpus fingerprint: the loader holds CPU-contiguous buffers, so
+        // these are plain host reads. Labels are fingerprinted too — a run
+        // that swapped only the label stream trains on entirely different
+        // targets while the token stream (and every count above) matches.
+        let elem_size = |dtype: u16| match dtype {
+            DTYPE_U16_TOKEN => 2usize,
+            1 => 4,
+            _ => 8,
+        };
+        for (ptr, len, dtype) in [
+            (self.data, self.data_len, self.data_dtype),
+            (self.labels, self.labels_len, self.labels_dtype),
+        ] {
+            let nbytes = len * elem_size(dtype);
+            if ptr.is_null() || nbytes == 0 {
+                continue;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, nbytes) };
+            const CHUNK: usize = 1 << 20;
+            mix(&bytes[..CHUNK.min(nbytes)]);
+            if nbytes > CHUNK {
+                mix(&bytes[nbytes - CHUNK..]);
+            }
+        }
+        h
     }
 
     fn stop_workers(&mut self) {
@@ -667,6 +757,25 @@ pub extern "C" fn nsl_dataloader_reset(dl_ptr: i64) {
         }
     }
 
+    // Item 8: a pending checkpoint resume replaces this reset's epoch advance
+    // and start slot. Consumed exactly once — later epochs advance normally.
+    if let Some((epoch, slot)) = dl.pending_resume.take() {
+        dl.epoch.store(epoch, Ordering::Relaxed);
+        if slot >= dl.total_batches {
+            // The saved run finished this epoch; nothing of it is left to
+            // replay. Yield an empty epoch rather than clamping to the last
+            // batch (which would train on it a second time) — the epoch loop
+            // then moves on to the next epoch, freshly permuted.
+            eprintln!(
+                "[checkpoint] resume slot {slot} is at/after this epoch's \
+                 {} batches — resuming at the next epoch boundary",
+                dl.total_batches
+            );
+        }
+        dl.start_workers_at(slot);
+        return;
+    }
+
     dl.cursor.store(0, Ordering::Relaxed);
     dl.expected_batch_id.store(0, Ordering::Relaxed);
     // D3 v3: advance the epoch BEFORE restarting workers so each epoch's global
@@ -676,6 +785,66 @@ pub extern "C" fn nsl_dataloader_reset(dl_ptr: i64) {
     // — stay identical, keeping the strided shard partition disjoint+complete.
     dl.epoch.fetch_add(1, Ordering::Relaxed);
     dl.start_workers();
+}
+
+// ---------------------------------------------------------------------------
+// Item 8: resumable-position FFIs
+// ---------------------------------------------------------------------------
+
+/// This loader's current epoch counter (the key its permutation is derived
+/// from). Recorded in a training checkpoint; `0` for a null handle so the
+/// checkpoint writer can pass "no loader" without a branch.
+#[no_mangle]
+pub extern "C" fn nsl_dataloader_epoch(dl_ptr: i64) -> i64 {
+    if dl_ptr == 0 {
+        return 0;
+    }
+    let dl = unsafe { &*(dl_ptr as *const DataLoader) };
+    dl.epoch.load(Ordering::Relaxed) as i64
+}
+
+/// The NEXT delivery slot this loader would yield.
+///
+/// This is `expected_batch_id`, deliberately NOT a count of batches handed
+/// out: the ragged-packed-tail sentinel advances the slot without yielding a
+/// batch, so the two diverge — and only the slot indexes the permutation.
+/// Called after `next_batch` returned the batch currently being trained on,
+/// it is already the correct resume point.
+#[no_mangle]
+pub extern "C" fn nsl_dataloader_slot(dl_ptr: i64) -> i64 {
+    if dl_ptr == 0 {
+        return 0;
+    }
+    let dl = unsafe { &*(dl_ptr as *const DataLoader) };
+    dl.expected_batch_id.load(Ordering::Relaxed) as i64
+}
+
+/// Fingerprint of the corpus + loader geometry — see `identity_sig`.
+#[no_mangle]
+pub extern "C" fn nsl_dataloader_identity(dl_ptr: i64) -> i64 {
+    if dl_ptr == 0 {
+        return 0;
+    }
+    let dl = unsafe { &*(dl_ptr as *const DataLoader) };
+    dl.identity_sig() as i64
+}
+
+/// Arm a checkpoint resume: the next [`nsl_dataloader_reset`] pins `epoch` and
+/// starts at delivery `slot`. See `DataLoader::pending_resume`.
+#[no_mangle]
+pub extern "C" fn nsl_dataloader_resume_to(dl_ptr: i64, epoch: i64, slot: i64) {
+    if dl_ptr == 0 {
+        return;
+    }
+    if epoch < 0 || slot < 0 {
+        eprintln!(
+            "nsl: dataloader_resume_to: negative position (epoch {epoch}, slot \
+             {slot}) — refusing rather than wrapping to a huge usize"
+        );
+        std::process::abort();
+    }
+    let dl = unsafe { &mut *(dl_ptr as *mut DataLoader) };
+    dl.pending_resume = Some((epoch as usize, slot as usize));
 }
 
 /// Stop all worker threads (without freeing the DataLoader).
@@ -740,6 +909,224 @@ mod tests {
             r#"{{"batch_size":{},"seq_len":{},"num_workers":{},"packing":{},"shuffle":false,"prefetch":2,"pin_memory":false,"drop_last":false,"pack_separator":0}}"#,
             batch_size, seq_len, num_workers, packing
         )
+    }
+
+    fn make_shuffled_config_json(batch_size: usize, seq_len: usize, seed: u64) -> String {
+        format!(
+            r#"{{"batch_size":{batch_size},"seq_len":{seq_len},"num_workers":2,"packing":false,"shuffle":true,"prefetch":2,"pin_memory":false,"drop_last":true,"pack_separator":0,"seed":{seed}}}"#
+        )
+    }
+
+    /// Drain a loader, returning the first token id of every delivered batch —
+    /// a cheap fingerprint of WHICH slice of the corpus each batch came from,
+    /// and therefore of the permutation.
+    fn drain_first_tokens(dl_ptr: i64) -> Vec<i64> {
+        let mut out = Vec::new();
+        loop {
+            let batch = nsl_dataloader_next_batch(dl_ptr);
+            if batch == 0 {
+                break;
+            }
+            let k = nsl_str_from_rust("input_ids");
+            let tensor_ptr = crate::dict::nsl_dict_get_str(batch, k);
+            let tensor = NslTensor::from_ptr(tensor_ptr);
+            out.push(unsafe { *(tensor.data as *const i32) } as i64);
+            crate::string::nsl_string_free(k);
+            nsl_dict_free(batch);
+        }
+        out
+    }
+
+    /// Item 8: the single-rank shuffle must be a function of (seed, epoch) and
+    /// nothing else. Before this it was `rand::rng()` — entropy — so "resume
+    /// at epoch 3, slot 412" named a position in a permutation that no longer
+    /// existed. Two independently constructed loaders on the same corpus must
+    /// agree batch for batch, and consecutive epochs must still differ (or the
+    /// XOR-by-epoch decorrelation is silently broken).
+    #[test]
+    fn shuffle_is_reproducible_across_loaders() {
+        let data: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let cfg = make_shuffled_config_json(1, 4, 7);
+
+        let mut per_epoch: Vec<Vec<Vec<i64>>> = Vec::new();
+        for _run in 0..2 {
+            let dl = nsl_dataloader_create(
+                tensor_from_f64_slice(&data),
+                0,
+                cfg.as_ptr() as i64,
+                cfg.len() as i64,
+            );
+            nsl_dataloader_start(dl);
+            let mut epochs = Vec::new();
+            for _ in 0..3 {
+                nsl_dataloader_reset(dl);
+                epochs.push(drain_first_tokens(dl));
+            }
+            nsl_dataloader_stop(dl);
+            nsl_dataloader_free(dl);
+            per_epoch.push(epochs);
+        }
+
+        assert_eq!(
+            per_epoch[0], per_epoch[1],
+            "two loaders with the same seed must produce identical permutations \
+             — an entropy-seeded shuffle makes a checkpointed data position \
+             meaningless"
+        );
+        assert_ne!(
+            per_epoch[0][0], per_epoch[0][1],
+            "consecutive epochs must differ (seed ^ epoch); identical epochs \
+             would mean the epoch is not reaching the shuffle key"
+        );
+        assert_eq!(per_epoch[0][0].len(), 16, "16 batches of 4 tokens from 64");
+    }
+
+    /// Item 8: resuming at delivery slot `k` must yield exactly the batches an
+    /// uninterrupted loader would have yielded from `k` on — same permutation,
+    /// no repeats, no skips. This is what makes a checkpoint a continuation
+    /// rather than a restart.
+    #[test]
+    fn dataloader_resume_yields_the_exact_tail() {
+        let data: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let cfg = make_shuffled_config_json(1, 4, 11);
+
+        // Reference: epoch 2 in full.
+        let dl = nsl_dataloader_create(
+            tensor_from_f64_slice(&data),
+            0,
+            cfg.as_ptr() as i64,
+            cfg.len() as i64,
+        );
+        nsl_dataloader_start(dl);
+        nsl_dataloader_reset(dl); // epoch 1
+        nsl_dataloader_reset(dl); // epoch 2
+        let full = drain_first_tokens(dl);
+        nsl_dataloader_stop(dl);
+        nsl_dataloader_free(dl);
+        assert_eq!(full.len(), 16);
+
+        // Resumed: a fresh loader armed for (epoch 2, slot 9).
+        const SLOT: usize = 9;
+        let dl2 = nsl_dataloader_create(
+            tensor_from_f64_slice(&data),
+            0,
+            cfg.as_ptr() as i64,
+            cfg.len() as i64,
+        );
+        nsl_dataloader_start(dl2);
+        nsl_dataloader_resume_to(dl2, 2, SLOT as i64);
+        assert_eq!(
+            nsl_dataloader_slot(dl2),
+            0,
+            "arming must not move the position — the pending resume is applied \
+             by the next reset, which is where the epoch loop enters"
+        );
+        nsl_dataloader_reset(dl2);
+        assert_eq!(
+            nsl_dataloader_epoch(dl2),
+            2,
+            "the consuming reset must PIN the saved epoch, not increment past it"
+        );
+        let tail = drain_first_tokens(dl2);
+
+        // And the resume is consumed exactly once: the following epoch must
+        // advance and start from slot 0 like any other.
+        nsl_dataloader_reset(dl2);
+        assert_eq!(nsl_dataloader_epoch(dl2), 3);
+        let next_epoch = drain_first_tokens(dl2);
+        nsl_dataloader_stop(dl2);
+        nsl_dataloader_free(dl2);
+
+        assert_eq!(
+            tail,
+            full[SLOT..].to_vec(),
+            "resumed tail must equal the uninterrupted loader's tail"
+        );
+        assert_eq!(
+            next_epoch.len(),
+            16,
+            "the epoch after a resume must be complete — a sticky pending \
+             resume would truncate every later epoch"
+        );
+    }
+
+    /// A resume slot past the end of the epoch (checkpointed on the epoch's
+    /// last batch) yields an EMPTY epoch rather than replaying the final
+    /// batch — the epoch loop then moves on to the next, freshly permuted one.
+    #[test]
+    fn resume_at_or_past_the_epoch_end_yields_nothing() {
+        let data: Vec<f64> = (0..16).map(|i| i as f64).collect();
+        let cfg = make_shuffled_config_json(1, 4, 3);
+        let dl = nsl_dataloader_create(
+            tensor_from_f64_slice(&data),
+            0,
+            cfg.as_ptr() as i64,
+            cfg.len() as i64,
+        );
+        nsl_dataloader_start(dl);
+        nsl_dataloader_resume_to(dl, 1, 4); // 16 tokens / 4 = exactly 4 batches
+        nsl_dataloader_reset(dl);
+        assert!(
+            drain_first_tokens(dl).is_empty(),
+            "slot == total_batches must deliver nothing, not clamp back onto \
+             the last batch (which would train on it twice)"
+        );
+        nsl_dataloader_stop(dl);
+        nsl_dataloader_free(dl);
+    }
+
+    /// The identity fingerprint must separate corpora and geometries — it is
+    /// the guard that stops a resume from continuing "slot 9" of a
+    /// permutation over different data.
+    #[test]
+    fn identity_separates_corpus_and_geometry() {
+        let a: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let mut b = a.clone();
+        b[17] = 999.0;
+        let cfg = make_shuffled_config_json(1, 4, 5);
+        let cfg_wide = make_shuffled_config_json(2, 4, 5);
+        let cfg_seed = make_shuffled_config_json(1, 4, 6);
+
+        let mk = |data: &[f64], cfg: &str| -> i64 {
+            let dl = nsl_dataloader_create(
+                tensor_from_f64_slice(data),
+                0,
+                cfg.as_ptr() as i64,
+                cfg.len() as i64,
+            );
+            let id = nsl_dataloader_identity(dl);
+            nsl_dataloader_free(dl);
+            id
+        };
+
+        let base = mk(&a, &cfg);
+        assert_eq!(base, mk(&a, &cfg), "identity must be stable for the same inputs");
+        assert_ne!(base, mk(&b, &cfg), "a changed corpus must change the identity");
+        assert_ne!(base, mk(&a, &cfg_wide), "batch geometry is part of the identity");
+        assert_ne!(base, mk(&a, &cfg_seed), "the shuffle seed is part of the identity");
+
+        // Same tokens, different LABELS: every count matches, so only the
+        // label fingerprint separates these two runs.
+        let labels_a: Vec<f64> = (0..64).map(|i| (i % 7) as f64).collect();
+        let mut labels_b = labels_a.clone();
+        labels_b[5] = 42.0;
+        let mk_labelled = |labels: &[f64]| -> i64 {
+            let dl = nsl_dataloader_create(
+                tensor_from_f64_slice(&a),
+                tensor_from_f64_slice(labels),
+                cfg.as_ptr() as i64,
+                cfg.len() as i64,
+            );
+            let id = nsl_dataloader_identity(dl);
+            nsl_dataloader_free(dl);
+            id
+        };
+        assert_ne!(
+            mk_labelled(&labels_a),
+            mk_labelled(&labels_b),
+            "a changed label stream must change the identity — the token \
+             stream and every count are identical here"
+        );
     }
 
     /// Review H1: a ragged packed tail must not become a permanent HOLE in

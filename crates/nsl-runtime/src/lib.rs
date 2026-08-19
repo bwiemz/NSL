@@ -245,6 +245,7 @@ pub mod onnx_rt_op;
 mod interop_stubs;
 
 pub mod sampling;
+pub mod rng_state;
 pub mod data_source;
 pub mod packing;
 pub mod dataloader;

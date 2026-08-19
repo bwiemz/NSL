@@ -766,13 +766,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64],
         None,
     ),
-    // Milestone B: full training-state checkpoint (θ .nslm + .optim sidecar
-    // with m/v moments + micro-batch step counter). Save: (path_ptr,
-    // path_len, names_list, param_list, state_list_1, state_list_2,
-    // step_count). Load returns the saved step counter.
+    // Milestone B + item 8: full training-state checkpoint (θ .nslm + .optim
+    // sidecar with m/v moments, micro-batch step counter, data position and
+    // RNG state). Save: (path_ptr, path_len, names_list, param_list,
+    // state_list_1, state_list_2, step_count, dataloader_handle_or_0,
+    // train_epoch). Load: (path_ptr, path_len, param_list, state_list_1,
+    // state_list_2, dataloader_handle_or_0) -> saved step counter; the
+    // restored training epoch comes back through nsl_train_resume_epoch.
     (
         "nsl_train_checkpoint_save",
         &[
+            types::I64,
+            types::I64,
             types::I64,
             types::I64,
             types::I64,
@@ -785,9 +790,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     (
         "nsl_train_checkpoint_load",
-        &[types::I64, types::I64, types::I64, types::I64, types::I64],
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
         Some(types::I64),
     ),
+    ("nsl_train_resume_epoch", &[], Some(types::I64)),
     // Scalar math (M14)
     ("nsl_floor", &[types::F64], Some(types::F64)),
     // Activation functions (M15)
@@ -1207,6 +1221,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_dataloader_reset", &[types::I64], None),
     ("nsl_dataloader_stop", &[types::I64], None),
     ("nsl_dataloader_free", &[types::I64], None),
+    // Item 8: resumable data position. `slot` is the loader's next DELIVERY
+    // slot (not a batch count — the ragged-packed-tail sentinel makes those
+    // differ), `identity` fingerprints the corpus + geometry it indexes.
+    ("nsl_dataloader_epoch", &[types::I64], Some(types::I64)),
+    ("nsl_dataloader_slot", &[types::I64], Some(types::I64)),
+    ("nsl_dataloader_identity", &[types::I64], Some(types::I64)),
+    (
+        "nsl_dataloader_resume_to",
+        &[types::I64, types::I64, types::I64],
+        None,
+    ),
     // Packing efficiency (M19)
     ("nsl_packing_efficiency", &[types::I64], Some(types::F64)),
     // Custom dtype registry (M23)
