@@ -45,6 +45,12 @@ state is only 8.25 GB (weights 2.07 + optim m/v 2.06 each + m_partial 2.06) —
 it is the stored activations of 24 layers at batch 2 × seq 1024 that exhaust a
 32 GB card. Recomputing them puts the activation peak at 8.34 GB.
 
+The learning rate is **measured, not inherited**: `lr = 1.5e-4` with 400
+micro-steps of warmup, against the `3e-4 / 200` this repo carries at every
+model size. At 500M the inherited pair produced an erratic epoch with
+excursions to 10.94; the measured pair descends monotonically and lands 0.57
+nats lower on held-out loss.
+
 Two things this recipe deliberately does not hide:
 
 - **Token budget.** 8.39M train tokens against ~505M parameters is ~0.017

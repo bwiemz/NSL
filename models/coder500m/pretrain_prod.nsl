@@ -24,7 +24,7 @@
 # Derivation (config.nsl carries the same numbers):
 #   micro-steps/epoch = floor(8,388,608 / (1024 * 2))    = 4096
 #   total micro-steps = 1 epoch x 4096                   = 4096
-#   warmup            = 200 micro-steps                  (~4.9%)
+#   warmup            = 400 micro-steps                  (~9.8%)
 #   optimizer steps   = floor(4096 / accum(8))           = 512
 #   checkpoints       = 512 / checkpoint_every(100)      = 5
 #
@@ -39,7 +39,7 @@
 #
 # UNITS (same as the 50M recipe): the scheduler counts MICRO-batches (lr is
 # recomputed every micro-batch; with grad_accumulation=8 the effective warmup
-# is 200/8 = 25 optimizer steps). checkpoint_every counts OPTIMIZER steps —
+# is 400/8 = 50 optimizer steps). checkpoint_every counts OPTIMIZER steps —
 # codegen converts internally. Dropout is real: DROPOUT=0.1 trains an actual
 # RNG mask and its backward consumes that same mask (PR #507).
 #
@@ -89,17 +89,12 @@ print("================================================================")
 # run's data order irreproducible and every checkpoint's recorded position
 # meaningless.
 #
-# What the measurements do NOT support (see
-# models/benchmarks/PROD500M_VALIDATION_2026_08_19.md, corrected):
-#   - shuffling does not improve held-out loss here: VAL_LOSS 9.765
-#     (sequential) vs 9.793 (shuffled), 0.028 nats apart with no replicate
-#     scatter measured, sign against shuffling;
-#   - it does not remove the late-epoch loss excursions. BOTH arms have one
-#     (10.94 sequential, 12.17 shuffled), and the shuffled arm cannot have a
-#     corpus-position artifact by construction. Cause is OPEN; the leading
-#     untested hypothesis is that lr=3e-4 — carried unchanged across d_model
-#     512/1280/2048 in this repo — is too high at 500M for a 512-optimizer-step
-#     schedule with 25 steps of warmup.
+# Shuffling does NOT improve held-out loss here — VAL_LOSS 9.765 (sequential)
+# vs 9.793 (shuffled) at the inherited LR, 0.028 nats apart with the sign
+# against it. What DID matter was the learning rate: see the LR note in
+# config.nsl and EC3 of the validation record. An early draft of that record
+# blamed these curves on corpus ordering; that was a statistic computed
+# mid-run over 5 of 8 regions and it did not survive the completed data.
 let tokens = load_mmap("../../data/tokens/prod_train_slice.bin", 3)
 let loader = DataLoader(tokens, batch_size=2, seq_len=1024, shuffle=true, drop_last=true)
 
@@ -117,8 +112,8 @@ print("LOSS_STREAM_BEGIN")
 # which has no fusion, is free to use.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=1280, batch_size=2, seq_len=1024)
 train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
-    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=200, total_steps=4096, min_lr=0.00003)
+    optimizer: AdamW(lr=0.00015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=400, total_steps=4096, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
         let flat_logits = logits.reshape([2048, 49152])

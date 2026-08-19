@@ -209,15 +209,14 @@ prefix by even part of a window.
 
 Validated on GPU, not just compiled — see
 [`PROD500M_VALIDATION_2026_08_19.md`](../../models/benchmarks/PROD500M_VALIDATION_2026_08_19.md).
-Two results worth carrying forward: `--checkpoint-blocks` is **required** (the
-bare configuration OOMs with 168 MB free of 31.39 GB; recomputation puts the
-activation peak at 8.34 GB alongside 8.25 GB of persistent state), and **both
-arms destabilize late in the epoch with the cause unresolved** — a 10.94
-excursion sequential, 12.17 shuffled. The leading untested hypothesis is that
-`lr = 3e-4`, carried unchanged across d_model 512/1280/2048 in this repo, is
-too high at 500M for a 512-optimizer-step schedule. The recipe shuffles
-because a concatenated corpus should not be fed in file order and item 8 made
-a seeded shuffle resumable — not because it was measured to help.
+Two results worth carrying forward. `--checkpoint-blocks` is **required** —
+the bare configuration OOMs with 168 MB free of 31.39 GB; recomputation puts
+the activation peak at 8.34 GB alongside 8.25 GB of persistent state. And
+**the `lr = 3e-4` this repo carries unchanged across d_model 512 / 1280 / 2048
+is too high at 500M**: halving it and doubling the warmup turned an erratic
+epoch (excursions to 10.94 and 12.17) into a monotone one and took 0.57 nats
+off the held-out loss (9.765 → 9.197). The 1B config inherits the same
+constant and has never been trained long enough to find out.
 
 ## Currently in flight
 

@@ -36,11 +36,20 @@ const DROPOUT = 0.1
 # checkpoint/resume, held-out validation — it does not produce a
 # well-trained 500M model, and VAL_LOSS is expected to part company with
 # the training loss. Fixing that needs a corpus, which is roadmap item 15.
+# LR AND WARMUP ARE MEASURED, not inherited. This repo carried lr = 3e-4
+# unchanged across d_model 512 / 1280 / 2048; at 500M on this 512-optimizer-
+# step schedule it is too high. Three full-epoch arms
+# (models/benchmarks/PROD500M_VALIDATION_2026_08_19.md):
+#   lr 3e-4, warmup 200, sequential : erratic, max loss 13.82, VAL 9.765
+#   lr 3e-4, warmup 200, shuffled   : erratic, max loss 19.37, VAL 9.793
+#   lr 1.5e-4, warmup 400, shuffled : MONOTONE 9.12 -> 7.44,   VAL 9.197
+# 0.57 nats of held-out improvement, twenty times the 0.028 that separates the
+# two shuffle arms.
 const CORPUS_TOKENS = 8925916
 const TRAIN_TOKENS = 8388608
 const VAL_TOKENS = 524288
-const PRETRAIN_LR = 0.0003
-const PRETRAIN_WARMUP = 200
+const PRETRAIN_LR = 0.00015
+const PRETRAIN_WARMUP = 400
 const PRETRAIN_TOTAL_STEPS = 4096
 const PRETRAIN_MIN_LR = 0.00003
 const PRETRAIN_BATCH_SIZE = 2
