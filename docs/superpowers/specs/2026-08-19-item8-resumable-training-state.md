@@ -58,13 +58,22 @@ stream and the RNG.
 - The GPU dropout counter moves out of `gpu_dropout_f32`'s function-local
   `static` into `rng_state`, so it is (a) snapshot-able from CPU-only builds
   and (b) seeded by `nsl_rng_seed` — `--seed` now actually reaches GPU dropout.
-- **SR-BF16 needs nothing added.** Its dither is the pure function
-  `mix64(seed ^ opt_step·SALT, param_base + i)`, and `opt_step` is derived in
-  codegen from `step_count_var` — which the checkpoint already restores. The
-  process-global `SRBF16_STEPS` is telemetry only (the teardown line and
-  `nsl_sr_bf16_step_count`), not the stream key. Checked rather than assumed:
-  a stochastic-rounding stream that silently repeated from step 0 on every
-  resume would correlate rounding error with the earlier part of training.
+- **SR-BF16's `step` needs nothing added, but its `seed` does.** The dither is
+  `mix64(seed ^ opt_step·SALT, param_base + i)`. `opt_step` is derived in
+  codegen from `step_count_var`, which the checkpoint already restores (the
+  process-global `SRBF16_STEPS` is telemetry only — the teardown line and
+  `nsl_sr_bf16_step_count` — not the stream key). But `seed` is the `--seed`
+  **scalar** from `deterministic_ops::RNG_SEED`, read live by `sr_bf16.rs` and
+  by the composed ZeRO-3 slice update — a second, independent RNG input that
+  the sampling stream's ChaCha key says nothing about. It lives on the command
+  line rather than in the recipe, so "re-run the recipe unchanged" makes
+  dropping it a routine slip. The sidecar records it (`global_seed`, plus
+  `global_seed_set` because `--seed 42` is indistinguishable from the default
+  by value) and a mismatch refuses.
+
+  *This was caught in review.* The first version of this section claimed
+  SR-BF16 needed nothing at all — true of the `step` half, which is what had
+  actually been checked.
 
 ### 3. Sidecar v2 (`checkpoint.rs`)
 
@@ -100,3 +109,36 @@ stream and the RNG.
 | `rng_snapshot_restores_the_stream` (unit) | Draw *k*, snapshot, draw *n*, restore, redraw *n* ⇒ identical |
 | `resume_refuses_a_foreign_corpus` (CLI) | Identity mismatch aborts instead of silently reordering |
 | `v1_sidecar_warns_about_data_order` (CLI) | Old checkpoints load, loudly |
+| `resume_is_bit_exact_under_grad_accumulation` (CLI) | The save cadence (and so the recorded slot) is `every x accum` |
+| `resume_tail_is_exact_with_a_padded_final_batch` (unit) | `drop_last=false` keeps a real final slot |
+| `resume_tail_is_exact_under_packing_with_a_ragged_tail` (unit) | Slots ≠ delivered batches; only the slot indexes the permutation |
+| `sidecar_v2_header_carries_the_whole_resume_block` (CLI) | The wire format itself — the bit-exactness gates would pass if a field were written and read under the same *wrong* key |
+| `resume_of_a_finished_run_refuses_instead_of_training_nothing` (CLI) | **Review finding.** See below |
+| `resume_refuses_a_different_global_seed` (CLI) | The `--seed` scalar is a second RNG input, and it lives on the command line rather than in the recipe |
+| `pipelined_train_path_refuses_checkpoint_config` (CLI) | The Milestone B `@pipeline` refusal, which had no test |
+
+## What review caught
+
+**An exhausted epoch was unrepresentable, so the budget refusal could not fire
+for the case the feature is about.** With a DataLoader, codegen records the
+*in-progress* epoch, so a run's own final checkpoint always has `train_epoch <=
+epochs - 1` and `train_epoch >= epochs` was structurally unreachable. A
+checkpoint landing on an epoch's last delivery slot then passed every guard,
+drew an empty epoch, and exited 0 having run no optimizer step — exactly the
+silent no-op the refusal exists to prevent, in the exact shape (`epochs = 1`
+plus a DataLoader) that `models/coder1b/pretrain_1b2048.nsl` uses. Two
+independent refuters failed to refute it; one traced the reaching path into
+`endurance_1b.py`, where any `--steps ≡ 48 (mod 50)` puts the final save on the
+epoch's last slot and phase 3 would train nothing and exit 0.
+
+The fix normalizes at *save* time: `(epoch E, slot total_batches)` and
+`(epoch E+1, slot 0)` are the same position, but only the second lets both the
+loader's bookkeeping and the budget refusal see that E is finished.
+
+Six other findings were raised and refuted. The most instructive: the claim
+that a `seed + 42` GPU dropout base makes adjacent seeds produce *shifted
+copies* of one mask tape. The refuter reimplemented the PTX mixer and measured
+same-position mask agreement at 0.8204 for offsets 1..4096 against an
+independent baseline of 0.8200 — adjacent counters decorrelate, which is the
+defining property of a counter-based RNG. The seed is still mixed rather than
+added, but only to stop `--seed 0` landing on the unseeded default.

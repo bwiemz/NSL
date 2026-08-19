@@ -260,6 +260,7 @@ holding everything else that determines what the next step computes:
 | DataLoader epoch + delivery slot | The resumed run reads the data it had not read yet |
 | Corpus + geometry fingerprint | A resume onto different data **refuses** rather than reordering silently |
 | RNG state (CPU sampling stream, GPU dropout counter) | Dropout masks continue instead of restarting |
+| The `--seed` scalar | Keys the SR-BF16 and ZeRO dither directly; a resume under a different seed **refuses** |
 
 Both files are written to `.tmp` and renamed, so a crash mid-save leaves the
 previous checkpoint intact; the sidecar echoes a signature of the `.nslm` it

@@ -331,8 +331,18 @@ impl DataLoader {
             // fresh random draw each process. The cost is that an unseeded
             // run now repeats the same order run-to-run (standard seeded-
             // training behavior); epochs still differ via the XOR.
+            // MIXED, not `seed ^ epoch`. XOR is not injective across small
+            // (seed, epoch) pairs — seed 1 epoch 0 and seed 0 epoch 1 are the
+            // same key. That was harmless while `config.seed` was almost
+            // always the large `DEFAULT_DP_SHUFFLE_SEED` constant, but the
+            // fallback added just above routes a small `--seed` in, which
+            // makes the collision reachable: an 8-seed sweep would have its
+            // arms enumerate ONE shared set of permutations in a swapped
+            // order. All ranks compute this identically, which is the only
+            // property the sharded path requires of the key.
             let epoch = self.epoch.load(Ordering::Relaxed) as u64;
-            let mut rng = StdRng::seed_from_u64(self.config.seed ^ epoch);
+            let key = crate::sr_bf16::sr_mix64(self.config.seed, epoch);
+            let mut rng = StdRng::seed_from_u64(key);
             batch_order.shuffle(&mut rng);
         }
         // Strided per-rank shard: rank r takes global slots where slot % ws == r,
@@ -819,6 +829,18 @@ pub extern "C" fn nsl_dataloader_slot(dl_ptr: i64) -> i64 {
     dl.expected_batch_id.load(Ordering::Relaxed) as i64
 }
 
+/// Delivery slots this loader yields per epoch. Used by the checkpoint writer
+/// to tell "part-way through epoch E" from "epoch E is finished", which are
+/// the same `(epoch, slot)` pair apart from this bound.
+#[no_mangle]
+pub extern "C" fn nsl_dataloader_total_batches(dl_ptr: i64) -> i64 {
+    if dl_ptr == 0 {
+        return 0;
+    }
+    let dl = unsafe { &*(dl_ptr as *const DataLoader) };
+    dl.total_batches as i64
+}
+
 /// Fingerprint of the corpus + loader geometry — see `identity_sig`.
 #[no_mangle]
 pub extern "C" fn nsl_dataloader_identity(dl_ptr: i64) -> i64 {
@@ -1073,6 +1095,110 @@ mod tests {
         );
         nsl_dataloader_stop(dl);
         nsl_dataloader_free(dl);
+    }
+
+    /// `drop_last=false` over a corpus that does not divide evenly keeps a
+    /// PADDED final batch (`div_ceil`), so the slot space is one longer than
+    /// the whole-batch count. A resume must land on the same slots either way
+    /// — the padded tail is a real delivery, not a boundary.
+    #[test]
+    fn resume_tail_is_exact_with_a_padded_final_batch() {
+        // 22 tokens at seq 4 → ceil = 6 slots, the last one padded.
+        let data: Vec<f64> = (0..22).map(|i| i as f64).collect();
+        let cfg = format!(
+            r#"{{"batch_size":1,"seq_len":4,"num_workers":2,"packing":false,"shuffle":true,"prefetch":2,"pin_memory":false,"drop_last":false,"pack_separator":0,"seed":21}}"#
+        );
+
+        let full = {
+            let dl = nsl_dataloader_create(
+                tensor_from_f64_slice(&data),
+                0,
+                cfg.as_ptr() as i64,
+                cfg.len() as i64,
+            );
+            nsl_dataloader_start(dl);
+            nsl_dataloader_reset(dl);
+            let v = drain_first_tokens(dl);
+            nsl_dataloader_stop(dl);
+            nsl_dataloader_free(dl);
+            v
+        };
+        assert_eq!(full.len(), 6, "drop_last=false keeps the padded tail slot");
+
+        const SLOT: usize = 4;
+        let dl2 = nsl_dataloader_create(
+            tensor_from_f64_slice(&data),
+            0,
+            cfg.as_ptr() as i64,
+            cfg.len() as i64,
+        );
+        nsl_dataloader_start(dl2);
+        nsl_dataloader_resume_to(dl2, 1, SLOT as i64);
+        nsl_dataloader_reset(dl2);
+        let tail = drain_first_tokens(dl2);
+        nsl_dataloader_stop(dl2);
+        nsl_dataloader_free(dl2);
+        assert_eq!(tail, full[SLOT..].to_vec());
+    }
+
+    /// Packing makes delivery slots and delivered batches DIFFER: a ragged
+    /// tail inserts a sentinel that advances the slot without yielding a
+    /// batch. The resume position is the slot, so it must still land exactly
+    /// — this is the case a "count the batches we handed out" cursor gets
+    /// wrong.
+    #[test]
+    fn resume_tail_is_exact_under_packing_with_a_ragged_tail() {
+        // Same corpus shape as test_dataloader_packed_ragged_tail_terminates:
+        // 4 docs of 5 tokens + 3 strays = 23 tokens, 1x8 → 3 slots, the last
+        // of which cannot pack and yields the sentinel.
+        let mut data: Vec<f64> = Vec::new();
+        for d in 0..4 {
+            for t in 0..4 {
+                data.push((d * 10 + t + 1) as f64);
+            }
+            data.push(0.0);
+        }
+        data.extend([91.0, 92.0, 93.0]);
+        let cfg = r#"{"batch_size":1,"seq_len":8,"num_workers":2,"packing":true,"shuffle":false,"prefetch":2,"pin_memory":false,"drop_last":false,"pack_separator":0}"#;
+
+        let mk = || {
+            let dl = nsl_dataloader_create(
+                tensor_from_f64_slice(&data),
+                0,
+                cfg.as_ptr() as i64,
+                cfg.len() as i64,
+            );
+            nsl_dataloader_start(dl);
+            dl
+        };
+
+        let dl = mk();
+        nsl_dataloader_reset(dl);
+        let full = drain_first_tokens(dl);
+        let slots_consumed = nsl_dataloader_slot(dl);
+        nsl_dataloader_stop(dl);
+        nsl_dataloader_free(dl);
+        assert!(
+            (slots_consumed as usize) > full.len(),
+            "the sentinel must advance the SLOT past the number of delivered \
+             batches ({slots_consumed} slots vs {} batches) — otherwise this \
+             test is not exercising the case it exists for",
+            full.len()
+        );
+
+        const SLOT: usize = 1;
+        let dl2 = mk();
+        nsl_dataloader_resume_to(dl2, 1, SLOT as i64);
+        nsl_dataloader_reset(dl2);
+        let tail = drain_first_tokens(dl2);
+        nsl_dataloader_stop(dl2);
+        nsl_dataloader_free(dl2);
+        assert_eq!(
+            tail,
+            full[SLOT..].to_vec(),
+            "resuming at a slot must skip exactly the slots before it, \
+             sentinel included"
+        );
     }
 
     /// The identity fingerprint must separate corpora and geometries — it is

@@ -663,7 +663,8 @@ pub extern "C" fn nsl_train_checkpoint_save(
     // hex string, because the header parsers are needle scanners over ASCII
     // digits — a '-' would silently truncate the value being read.
     let rng = crate::rng_state::RngSnapshot::capture();
-    let (loader_epoch, loader_slot, loader_id) = if dl_ptr != 0 {
+    let mut train_epoch = train_epoch.max(0) as u64;
+    let (mut loader_epoch, mut loader_slot, loader_id) = if dl_ptr != 0 {
         (
             crate::dataloader::nsl_dataloader_epoch(dl_ptr).max(0) as u64,
             crate::dataloader::nsl_dataloader_slot(dl_ptr).max(0) as u64,
@@ -672,14 +673,41 @@ pub extern "C" fn nsl_train_checkpoint_save(
     } else {
         (0, 0, 0)
     };
+    // NORMALIZE an exhausted epoch to the start of the next one. What the
+    // resume block must name is "the next thing to do", and `(epoch E, slot
+    // total_batches)` and `(epoch E+1, slot 0)` are the same position — but
+    // only the second one lets the loader's own bookkeeping AND the
+    // epochs-budget refusal at load see that epoch E is finished.
+    //
+    // Without this, a checkpoint that fires on an epoch's final delivery slot
+    // records `train_epoch = E`, which is `< epochs` for the last epoch of the
+    // run, so the "this budget is spent" refusal cannot fire. The resume then
+    // passed every guard, drew an empty epoch, and exited 0 having trained
+    // NOTHING — the exact silent no-op the refusal exists to prevent, in the
+    // shape (`epochs = 1`, a DataLoader) that the 1B recipe uses.
+    if dl_ptr != 0 {
+        let per_epoch = crate::dataloader::nsl_dataloader_total_batches(dl_ptr).max(0) as u64;
+        if loader_slot >= per_epoch {
+            train_epoch += 1;
+            loader_epoch += 1;
+            loader_slot = 0;
+        }
+    }
     let resume = format!(
-        r#""resume":{{"train_epoch":{te},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr}}}"#,
-        te = train_epoch.max(0) as u64,
+        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset}}}"#,
         hl = (dl_ptr != 0) as u64,
         seed_hex = rng.seed_hex(),
         hi = (rng.sampling_pos >> 64) as u64,
         lo = rng.sampling_pos as u64,
         ctr = rng.gpu_dropout_ctr,
+        // The `--seed` SCALAR, which is a live training-RNG input in its own
+        // right: SR-BF16's dither is `mix64(seed ^ step*SALT, ...)` and the
+        // composed ZeRO-3 slice update reads the same global. Recording only
+        // the sampling stream's ChaCha key would let a resume under a
+        // different `--seed` silently switch every parameter's
+        // stochastic-rounding stream mid-run.
+        gseed = crate::deterministic_ops::get_rng_seed(),
+        gset = crate::deterministic_ops::explicit_rng_seed().is_some() as u64,
     );
     let header = format!(
         r#"{{"step_count":{step_count},"model_sig":{sig},{resume},"params":[{}]}}"#,
@@ -897,8 +925,13 @@ pub extern "C" fn nsl_train_checkpoint_load(
              AdamW moments and the step counter, but NOT the data position \
              or the RNG state. This resume restarts the DataLoader at epoch \
              0 batch 0 and re-draws dropout masks from a fresh stream, so it \
-             is not a continuation of the interrupted run. Re-save a v2 \
-             checkpoint to get one."
+             is not a continuation of the interrupted run.\n\
+             [nsl] WARNING: it also has no epoch to restore, so the epoch \
+             loop starts at 0 and `epochs` keeps its PRE-item-8 meaning of \
+             'how many more' — a recipe edited to the documented total \
+             semantics will over-train by the epochs already completed, and \
+             the 'budget already spent' refusal cannot fire. Re-save a v2 \
+             checkpoint to get the documented behavior."
         );
         None
     } else {
@@ -913,6 +946,24 @@ pub extern "C" fn nsl_train_checkpoint_load(
                     std::process::abort();
                 }
             }
+        };
+        // Counters that end up as i64 (epoch/slot bounds, the published
+        // resume epoch) must be range-checked HERE. `v as i64` on a value
+        // above i64::MAX wraps NEGATIVE, and a negative epoch start slips
+        // past the `>= epochs` budget refusal and seeds the epoch loop with
+        // i64::MIN — an effectively unbounded run out of a corrupt field,
+        // where every other malformed field in this block aborts.
+        let counter = |needle: &[u8], what: &str| -> u64 {
+            let v = num(needle, what);
+            if v > i64::MAX as u64 {
+                eprintln!(
+                    "nsl: train_checkpoint_load: '{what}' is {v}, past the \
+                     signed range every consumer of it uses — refusing rather \
+                     than wrapping to a negative counter"
+                );
+                std::process::abort();
+            }
+            v
         };
         let seed_hex = scan_header_string(header_bytes, b"\"rng_seed\":")
             .unwrap_or_else(|| {
@@ -934,11 +985,13 @@ pub extern "C" fn nsl_train_checkpoint_load(
         let hi = num(b"\"rng_pos_hi\":", "rng_pos_hi");
         let lo = num(b"\"rng_pos_lo\":", "rng_pos_lo");
         Some(ResumeState {
-            train_epoch: num(b"\"train_epoch\":", "train_epoch"),
+            train_epoch: counter(b"\"train_epoch\":", "train_epoch"),
             had_loader: num(b"\"has_loader\":", "has_loader") != 0,
-            loader_epoch: num(b"\"loader_epoch\":", "loader_epoch"),
-            loader_slot: num(b"\"loader_slot\":", "loader_slot"),
+            loader_epoch: counter(b"\"loader_epoch\":", "loader_epoch"),
+            loader_slot: counter(b"\"loader_slot\":", "loader_slot"),
             loader_id: num(b"\"loader_id\":", "loader_id"),
+            global_seed: num(b"\"global_seed\":", "global_seed"),
+            global_seed_set: num(b"\"global_seed_set\":", "global_seed_set") != 0,
             rng: crate::rng_state::RngSnapshot {
                 sampling_seed,
                 sampling_pos: ((hi as u128) << 64) | (lo as u128),
@@ -951,6 +1004,33 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // into. Each direction of this mismatch silently changes what the resumed
     // run trains on, which is exactly what item 8 exists to prevent.
     if let Some(r) = &resume {
+        // The `--seed` scalar is not just provenance: SR-BF16 rounds every
+        // parameter with `mix64(seed ^ step*SALT, param_base + i)` and the
+        // composed ZeRO-3 slice update reads the same global. Restoring θ,
+        // the moments and the sampling stream while this silently changed
+        // would switch every parameter's stochastic-rounding stream mid-run —
+        // a resume that is not a continuation, with no diagnostic. Reachable
+        // from a routine operator slip, because the resume is documented as
+        // "re-run the recipe unchanged" and the seed lives on the command
+        // line, not in the recipe.
+        let live_seed_set = crate::deterministic_ops::explicit_rng_seed().is_some();
+        let live_seed = crate::deterministic_ops::get_rng_seed();
+        if live_seed_set != r.global_seed_set || live_seed != r.global_seed {
+            let fmt = |set: bool, v: u64| {
+                if set { format!("--seed {v}") } else { format!("no --seed (default {v})") }
+            };
+            eprintln!(
+                "nsl: train_checkpoint_load: this run has {} but '{optim_path}' \
+                 was saved with {} — the seed keys the stochastic-rounding and \
+                 ZeRO dither streams directly, so resuming would continue θ and \
+                 the moments while switching those streams. Re-run with the \
+                 saved seed, or start a new run.",
+                fmt(live_seed_set, live_seed),
+                fmt(r.global_seed_set, r.global_seed),
+            );
+            std::process::abort();
+        }
+
         // `epochs` is the run TOTAL (see this function's doc). A checkpoint
         // at or past it leaves the epoch loop with nothing to do: zero steps,
         // no output, exit 0 — the silent-no-op anti-pattern this codebase
@@ -1208,6 +1288,13 @@ struct ResumeState {
     loader_epoch: u64,
     loader_slot: u64,
     loader_id: u64,
+    /// The `--seed` SCALAR at save time (not the sampling stream's ChaCha
+    /// key). A separate, live training-RNG input: SR-BF16's per-element
+    /// dither and the composed ZeRO-3 slice update both read it directly.
+    global_seed: u64,
+    /// Whether that seed was set explicitly — `--seed 42` is indistinguishable
+    /// from the default by value alone.
+    global_seed_set: bool,
     rng: crate::rng_state::RngSnapshot,
 }
 

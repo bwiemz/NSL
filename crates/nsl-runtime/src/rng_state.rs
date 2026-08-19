@@ -46,6 +46,17 @@ pub fn set_gpu_dropout_counter(v: u64) {
     GPU_DROPOUT_COUNTER.store(v, Ordering::SeqCst);
 }
 
+/// Serializes the tests that assert on the PROCESS-GLOBAL RNG state.
+///
+/// Before item 8 the GPU dropout counter was a function-local `static` inside
+/// a cuda-gated fn, unreachable from any test. Now three tests in the same
+/// lib-test binary write it — this module's counter test, `RngSnapshot::
+/// restore`, and `nsl_rng_seed` — and cargo runs them on parallel threads.
+/// Without this lock the absolute-value assertions would fail a few times a
+/// year as an unexplained CI red, which is worse than a consistent failure.
+#[cfg(test)]
+pub(crate) static GLOBAL_RNG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A point-in-time snapshot of every training RNG stream.
 ///
 /// `sampling_seed` is the ChaCha seed **as bytes** rather than the `u64` that
@@ -138,6 +149,7 @@ mod tests {
     /// would re-use dropout masks the interrupted run already consumed.
     #[test]
     fn rng_snapshot_restores_the_stream() {
+        let _guard = GLOBAL_RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::sampling::nsl_manual_seed(1234);
         // Advance to a non-trivial position (and across a ChaCha block
         // boundary — 16 words per block — so the word-position restore is
@@ -170,6 +182,7 @@ mod tests {
     /// is the natural-looking shortcut, and it silently rewinds the stream.
     #[test]
     fn seed_alone_does_not_reproduce_a_mid_stream_position() {
+        let _guard = GLOBAL_RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::sampling::nsl_manual_seed(77);
         for _ in 0..10 {
             let _ = crate::sampling::rng_f64();
@@ -185,6 +198,7 @@ mod tests {
 
     #[test]
     fn gpu_dropout_counter_advances_by_launch_length() {
+        let _guard = GLOBAL_RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_gpu_dropout_counter(1000);
         assert_eq!(gpu_dropout_next_seed(64), 1000);
         assert_eq!(gpu_dropout_counter(), 1064);

@@ -312,6 +312,10 @@ fn sidecar_v2_header_carries_the_whole_resume_block() {
         "\"rng_pos_hi\":",
         "\"rng_pos_lo\":",
         "\"gpu_dropout_ctr\":",
+        // The --seed SCALAR, separate from the sampling stream's ChaCha key:
+        // it keys the SR-BF16 and ZeRO dither directly.
+        "\"global_seed\":",
+        "\"global_seed_set\":",
     ] {
         assert!(header.contains(key), "sidecar header lacks {key}:\n{header}");
     }
@@ -381,6 +385,109 @@ fn resume_refuses_an_epoch_budget_already_spent() {
     assert!(
         b.stderr.contains("TOTAL for the run"),
         "refusal must explain the epochs semantics:\n{}",
+        b.stderr
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Review finding (high): the epochs-budget refusal could not fire for a
+/// DataLoader run.
+///
+/// With a loader, codegen records the IN-PROGRESS epoch, so a run's own final
+/// checkpoint always has `train_epoch <= epochs - 1` and `train_epoch >=
+/// epochs` was unreachable. A checkpoint landing on an epoch's LAST delivery
+/// slot then passed every guard, drew an empty epoch, and exited 0 having run
+/// no optimizer step — precisely the silent no-op the refusal exists for, in
+/// the exact shape (`epochs = 1` + a DataLoader) that the 1B recipe uses.
+///
+/// The fix normalizes an exhausted epoch to the start of the next one at SAVE
+/// time, so "epoch E is finished" is recorded as `E+1` and the budget check
+/// sees it.
+#[test]
+fn resume_of_a_finished_run_refuses_instead_of_training_nothing() {
+    let tmp = fresh_dir("finished");
+    // 8 batches/epoch, every=4 → the last save is at micro-batch 16, which is
+    // the final delivery slot of the final epoch: the run is complete.
+    let a = run_in(
+        &tmp,
+        "phase_a.nsl",
+        &fixture(r#", epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 4"#),
+    );
+    assert!(a.ok, "phase A failed:\n{}", a.stderr);
+    assert!(
+        a.stderr.contains("at micro-batch step 16"),
+        "the last save must be the run's final step:\n{}",
+        a.stderr
+    );
+    // Normalized: the exhausted epoch 1 is recorded as epoch 2 slot 0, not
+    // epoch 1 slot 8. Without this the refusal below cannot fire.
+    assert!(
+        a.stderr.contains("epoch 2 loader slot 0"),
+        "an exhausted epoch must be normalized to the start of the next one, \
+         or 'this run is finished' is unrepresentable:\n{}",
+        a.stderr
+    );
+
+    let b = run_in(
+        &tmp,
+        "phase_b.nsl",
+        &fixture(r#", epochs = 2, checkpoint_load = "ck.nslm""#),
+    );
+    assert!(
+        !b.ok,
+        "re-running a FINISHED recipe unchanged must refuse, not train zero \
+         steps and exit 0:\nstdout:{}\nstderr:{}",
+        b.stdout, b.stderr
+    );
+    assert!(
+        b.stderr.contains("TOTAL for the run"),
+        "refusal must explain the epochs semantics:\n{}",
+        b.stderr
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Review finding: the `--seed` SCALAR is a live training-RNG input in its own
+/// right — SR-BF16's per-element dither is `mix64(seed ^ step*SALT, ...)` and
+/// the composed ZeRO-3 slice update reads the same global. Restoring θ, the
+/// moments and the sampling stream while that silently changed would switch
+/// every parameter's stochastic-rounding stream mid-run. The seed lives on the
+/// command line, not in the recipe, so "re-run the recipe unchanged" makes
+/// dropping it a routine slip.
+#[test]
+fn resume_refuses_a_different_global_seed() {
+    let tmp = fresh_dir("seed");
+    let root = repo_root();
+    let src = fixture(r#", epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 3"#);
+    let prog = tmp.join("phase_a.nsl");
+    std::fs::write(&prog, &src).unwrap();
+    let a = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args(["run", "--source-ad", "--seed", "1234"])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .output()
+        .expect("spawn nsl run");
+    assert!(
+        a.status.success(),
+        "seeded phase A failed:\n{}",
+        String::from_utf8_lossy(&a.stderr)
+    );
+
+    // Resume without the flag — everything else identical.
+    let b = run_in(
+        &tmp,
+        "phase_b.nsl",
+        &fixture(r#", epochs = 3, checkpoint_load = "ck.nslm""#),
+    );
+    assert!(
+        !b.ok,
+        "a resume under a different --seed must refuse:\n{}",
+        b.stdout
+    );
+    assert!(
+        b.stderr.contains("saved with --seed 1234"),
+        "refusal must name the saved seed:\n{}",
         b.stderr
     );
     let _ = std::fs::remove_dir_all(&tmp);
@@ -512,7 +619,12 @@ fn v1_sidecar_loads_but_warns_about_the_data_order() {
     assert!(
         b.stderr.contains("v1 sidecar")
             && b.stderr.contains("NOT the data position")
-            && b.stderr.contains("is not a continuation"),
+            && b.stderr.contains("is not a continuation")
+            // A v1 file also has no epoch, so `epochs` silently reverts to
+            // its pre-item-8 "how many more" meaning and the budget refusal
+            // cannot fire — the warning must say so, since the spec now
+            // documents the total semantics unconditionally.
+            && b.stderr.contains("PRE-item-8 meaning"),
         "a v1 resume must state exactly what it does not restore:\n{}",
         b.stderr
     );
