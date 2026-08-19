@@ -112,6 +112,33 @@ They mirror the invariants documented in `crates/nsl-runtime/ARCHITECTURE.md`.
 | **Unwinding**   | **No unwinding across the ABI.** Panics are treated as aborts; they must never propagate into foreign frames. |
 | **Threading**   | Error state is thread-local. Functions document any shared/global state they touch. |
 
+### Output ownership models (item 7)
+
+The blanket "returned heap pointers are owned by the caller" rule cannot
+describe `@export` outputs, which is why the dispatch surface names its
+ownership model explicitly per entry point:
+
+- **`nsl_model_call` — alias-and-leak (legacy).** The caller's output desc
+  receives a copy of the data, but its `shape`/`strides` fields are
+  pointer-mirrors into a runtime-internal result tensor that is deliberately
+  leaked (callers read those pointers after the call). No capacity check on
+  the caller's buffer. Kept bit-stable for existing hosts; prefer
+  `call_into`.
+- **`nsl_model_call_into` — caller-allocated, capacity-checked.**
+  `out_capacities[i]` declares the byte size of `outputs[i].data`;
+  undersized refuses and reports the required count. Shape/strides are
+  deep-copied into caller-owned arrays (`ndim` on entry = slot capacity).
+  The internal result tensor is freed — nothing leaks, nothing is borrowed.
+- **`nsl_model_call_alloc` / `nsl_model_call_dlpack` /
+  `nsl_model_forward_dlpack` — ownership transfer.** Each output is a
+  `DLManagedTensor*` whose deleter releases the underlying tensor exactly
+  once. Consume it (`torch.utils.dlpack.from_dlpack`) or free it
+  (`nsl_dlpack_free`) — exactly one of the two.
+- **`nsl_model_get_export_signature` — borrowed.** Points into the model
+  artifact; valid until `nsl_model_destroy`; never freed by the caller.
+- **`nsl_dlpack_export` — borrow export.** The deleter frees only the
+  wrapper; the tensor stays NSL-managed.
+
 When adding a new exported symbol, document each of the above in its doc comment,
 add it to the generated header if host-facing, and decide whether it is a
 **minor** (additive) ABI bump.

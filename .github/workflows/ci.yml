@@ -210,6 +210,36 @@ jobs:
         working-directory: python
         run: python -m pytest tests/test_m62_onnx_op.py -v
 
+  # Item 7 — host interop ownership. The completion criterion ("NslModel.forward
+  # returns OWNED PyTorch tensors") is a Python-observable property, so it needs
+  # a lane with torch installed: the Rust gates cover the C ABI, but only this
+  # one exercises torch.utils.dlpack consuming an NSL-allocated output, the
+  # capsule pointer ABI, and outputs outliving model.close(). Without it the
+  # item's own acceptance test never runs anywhere.
+  python-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps (CPU torch)
+        run: |
+          pip install pytest numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build nsl-cli
+        # The suite compiles real @export shared libraries via this binary.
+        run: cargo build -p nsl-cli
+
+      - name: Python interop tests
+        working-directory: python
+        run: python -m pytest tests/ -v
+
   # M57 FPGA/Neuromorphic — Verilator + Yosys gate (from origin/main PR #193).
   fpga:
     runs-on: ubuntu-latest

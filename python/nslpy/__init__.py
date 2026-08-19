@@ -17,7 +17,7 @@ Usage:
 __version__ = "0.2.0"
 
 from nslpy._core import NslModel, NslError, GradContext, find_library
-from nslpy._bridge import to_nsl_tensor, from_nsl_tensor
+from nslpy._bridge import to_nsl_tensor, from_nsl_tensor, release_nsl_tensor
 
 __all__ = [
     "NslModel",
@@ -26,4 +26,5 @@ __all__ = [
     "find_library",
     "to_nsl_tensor",
     "from_nsl_tensor",
+    "release_nsl_tensor",
 ]

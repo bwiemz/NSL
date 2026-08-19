@@ -124,7 +124,11 @@ fn c_header_abi_version_matches_golden() {
     // Bump these together with `nsl_runtime::c_api::NSL_ABI_VERSION_{MAJOR,MINOR}`
     // whenever the C ABI changes.
     const EXPECTED_ABI_MAJOR: u32 = 1;
-    const EXPECTED_ABI_MINOR: u32 = 0;
+    // Minor 1 (item 7): nsl_model_call_into / nsl_model_call_alloc /
+    // nsl_model_get_export_signature / nsl_dispatch_apply_scalar_result added;
+    // nsl_model_call_dlpack's output path went from always-refusing to
+    // ownership-transferring (additive — no working caller could exist).
+    const EXPECTED_ABI_MINOR: u32 = 1;
 
     // Anchor the runtime constants to the goldens (catches an undocumented bump
     // of the constants without updating this test / the ABI policy).

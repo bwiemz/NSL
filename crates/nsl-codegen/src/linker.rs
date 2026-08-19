@@ -1013,6 +1013,19 @@ fn link_shared_gcc(
         if let Some(filename) = output_path.file_name() {
             cmd.arg(format!("-Wl,-soname,{}", filename.to_string_lossy()));
         }
+        // DELIBERATELY NO -Bsymbolic-functions HERE (item 7 review). The
+        // dispatch→typed-wrapper interposition bug (an `@export fn gamma`
+        // bound to libm's gamma(3) inside a Python process) was first
+        // "fixed" with that flag — which REVERSED the hazard with a wider
+        // blast radius: it binds EVERY intra-image function reference, so an
+        // `@export fn log` became the definition the statically-linked
+        // runtime's own libm `log` calls bound to (f64 in xmm0 meets a
+        // wrapper reading pointer args — SIGSEGV or garbage), confirmed by
+        // empirical repro during review. The real fix is in codegen: the
+        // dispatch wrapper calls a `Linkage::Local` sibling of the typed
+        // wrapper (`__nsl_typed_local_<name>`), non-preemptible in both
+        // directions, while load-order interposition keeps resolving the
+        // runtime's libm/libc references to libm/libc as it always did.
     }
 
     // macOS: inject platform version — see `link_gcc_multi` above for why.

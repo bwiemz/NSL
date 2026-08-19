@@ -193,6 +193,12 @@ fn generated_header_prototypes_agree_with_runtime_externs() {
         "nsl_model_create",
         "nsl_model_destroy",
         "nsl_model_call",
+        // Item-7 ownership models + introspection. Without these entries a
+        // dropped prototype would pass silently — the pairwise comparison
+        // above only checks names present in BOTH lists.
+        "nsl_model_call_into",
+        "nsl_model_call_alloc",
+        "nsl_model_get_export_signature",
         "nsl_get_last_error",
         "nsl_clear_error",
     ] {

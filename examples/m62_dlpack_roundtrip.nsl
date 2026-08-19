@@ -13,3 +13,9 @@ fn identity(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
 @export
 fn double(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
     return x + x
+
+# `forward` is the conventional name NslModel.forward dispatches to — the
+# item-7 torch-in/torch-out DLPack round-trip in the Python harness uses it.
+@export
+fn forward(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return x + x

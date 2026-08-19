@@ -22,12 +22,36 @@ use std::path::Path;
 /// (model_ptr, inputs_desc_ptr, n_inputs, outputs_desc_ptr, n_outputs) -> rc
 pub type ExportFnPtr = unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64;
 
+/// The item-7 dispatch-ownership FFIs, dlsym'd from the SAME image as the
+/// dispatch wrappers so the mode thread-local and every allocation/free stay
+/// same-image (a `--shared-lib` artifact statically links its own runtime
+/// copy — arming a host-linked runtime's thread-local would be invisible to
+/// the wrapper's helpers).
+#[derive(Clone, Copy)]
+pub struct OwnershipFfis {
+    /// `nsl_dispatch_ownership_arm(mode, caps_ptr, n_caps) -> rc`
+    pub arm: unsafe extern "C" fn(i64, i64, i64) -> i64,
+    /// `nsl_dispatch_ownership_release(model_ptr) -> rc`
+    pub release: unsafe extern "C" fn(i64) -> i64,
+    /// `nsl_dispatch_ownership_finish_alloc(model, name, out_dl, n) -> rc`
+    pub finish_alloc: unsafe extern "C" fn(i64, i64, i64, i64) -> i64,
+}
+
 /// Per-model export dispatch table. Owns the dlopen handle and the
 /// dlsym'd function pointers.
 pub struct ExportRegistry {
     #[allow(dead_code)]
     library: libloading::Library,
     table: HashMap<CString, ExportFnPtr>,
+    /// Per-export JSON signature pointers (item 7 introspection), keyed like
+    /// `table`. The `i64` is a `*const c_char` into the dlopen'd image's
+    /// static data — valid exactly as long as `library` (which this struct
+    /// owns), so storing the raw pointer is sound. Empty when the artifact
+    /// predates the `nsl_get_export_signature_json` accessor.
+    signatures: HashMap<CString, i64>,
+    /// `None` when the artifact's statically-linked runtime predates the
+    /// ownership FFIs; `nsl_model_call_into`/`_alloc` refuse in that case.
+    ownership: Option<OwnershipFfis>,
 }
 
 impl std::fmt::Debug for ExportRegistry {
@@ -159,7 +183,55 @@ impl ExportRegistry {
             table.insert(user_cname, fn_ptr);
         }
 
-        Ok(Self { library, table })
+        // Item-7 introspection: bind the OPTIONAL per-export signature
+        // accessor. Same index space as `nsl_get_export_name` — both are
+        // emitted from the same exports slice in declaration order. Absent
+        // in artifacts built before the signature table existed; that is
+        // not an error here (lookup_signature reports it per-query).
+        let mut signatures: HashMap<CString, i64> = HashMap::new();
+        if let Ok(get_sig) = unsafe {
+            library.get::<unsafe extern "C" fn(i64) -> *const c_char>(
+                b"nsl_get_export_signature_json",
+            )
+        } {
+            for (i, name) in names.iter().enumerate() {
+                let sig_ptr = unsafe { get_sig(i as i64) };
+                if sig_ptr.is_null() {
+                    continue;
+                }
+                let cname = CString::new(name.as_str())
+                    .expect("export name from codegen enumeration must not contain interior NUL");
+                signatures.insert(cname, sig_ptr as i64);
+            }
+        }
+
+        // Item-7 ownership FFIs — all-or-none, from the same image as the
+        // dispatch wrappers. Absent in pre-item-7 artifacts (not an error;
+        // the ownership entry points refuse per-call with a rebuild hint).
+        let ownership = unsafe {
+            let arm = library
+                .get::<unsafe extern "C" fn(i64, i64, i64) -> i64>(b"nsl_dispatch_ownership_arm");
+            let release = library
+                .get::<unsafe extern "C" fn(i64) -> i64>(b"nsl_dispatch_ownership_release");
+            let finish_alloc = library.get::<unsafe extern "C" fn(i64, i64, i64, i64) -> i64>(
+                b"nsl_dispatch_ownership_finish_alloc",
+            );
+            match (arm, release, finish_alloc) {
+                (Ok(a), Ok(r), Ok(f)) => Some(OwnershipFfis {
+                    arm: *a,
+                    release: *r,
+                    finish_alloc: *f,
+                }),
+                _ => None,
+            }
+        };
+
+        Ok(Self { library, table, signatures, ownership })
+    }
+
+    /// The item-7 ownership FFIs, or `None` for pre-item-7 artifacts.
+    pub fn ownership_ffis(&self) -> Option<OwnershipFfis> {
+        self.ownership
     }
 
     pub fn len(&self) -> usize {
@@ -173,6 +245,30 @@ impl ExportRegistry {
     pub fn lookup(&self, name: &str) -> Option<ExportFnPtr> {
         let cname = CString::new(name).ok()?;
         self.table.get(&cname).copied()
+    }
+
+    /// Look up an export's JSON signature pointer (`*const c_char` as i64,
+    /// valid for the registry's lifetime). `Err` carries a human-readable
+    /// reason: signature table absent (old artifact) vs unknown name.
+    pub fn lookup_signature(&self, name: &str) -> Result<i64, String> {
+        if self.signatures.is_empty() {
+            return Err(
+                "this artifact has no export-signature table (built before \
+                 nsl_get_export_signature_json existed) — rebuild it with the \
+                 current compiler"
+                    .to_string(),
+            );
+        }
+        let cname = CString::new(name)
+            .map_err(|_| format!("export name '{name}' contains an interior NUL"))?;
+        match self.signatures.get(&cname) {
+            Some(&ptr) => Ok(ptr),
+            None => Err(format!(
+                "export '{}' not in registry. Available: {:?}",
+                name,
+                self.available_names()
+            )),
+        }
     }
 
     pub fn available_names(&self) -> Vec<String> {

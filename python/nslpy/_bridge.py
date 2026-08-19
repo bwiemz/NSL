@@ -159,6 +159,88 @@ def allocate_output_descs(
     return arr, keepalive
 
 
+# Byte sizes for the compiler's ExportDtype names (as they appear in the
+# export-signature JSON).
+DTYPE_SIZES = {
+    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
+    "I8": 1, "I16": 2, "I32": 4, "I64": 8,
+    "U8": 1, "U16": 2, "U32": 4, "U64": 8,
+    "Bool": 1,
+}
+
+# Maximum output rank the sized allocator provisions shape/strides slots for.
+# The runtime refuses (reporting the actual rank) if an output exceeds it.
+_MAX_OUT_NDIM = 8
+
+
+def allocate_output_descs_sized(n_out: int, capacity_bytes: int):
+    """Allocate output descs for the ``nsl_model_call_into`` contract.
+
+    Each desc gets a ``capacity_bytes`` data buffer, caller-owned
+    shape/strides arrays of ``_MAX_OUT_NDIM`` slots, and ``ndim`` set to the
+    slot capacity ON ENTRY (the call_into contract: the runtime validates
+    the result rank against it, deep-copies dims in, then sets ``ndim`` to
+    the result rank).
+
+    Returns ``(descs_array, keepalive_buffers, capacities_array)`` where
+    ``capacities_array`` is the ``uint64_t[n_out]`` passed as
+    ``out_capacities``.
+    """
+    capacity_bytes = max(int(capacity_bytes), 8)
+    arr = (NslTensorDesc * n_out)()
+    caps = (ctypes.c_uint64 * n_out)()
+    keepalive: list[Any] = []
+    for i in range(n_out):
+        data_buf = (ctypes.c_char * capacity_bytes)()
+        shape_buf = (ctypes.c_int64 * _MAX_OUT_NDIM)()
+        strides_buf = (ctypes.c_int64 * _MAX_OUT_NDIM)()
+        arr[i] = NslTensorDesc(
+            data=ctypes.cast(data_buf, ctypes.c_void_p),
+            shape=shape_buf,
+            strides=strides_buf,
+            ndim=_MAX_OUT_NDIM,
+            dtype=_DTYPE_F32,
+            device_type=0,
+            device_id=0,
+        )
+        caps[i] = capacity_bytes
+        keepalive.extend((data_buf, shape_buf, strides_buf))
+    return arr, keepalive, caps
+
+
+def read_output_desc(desc: NslTensorDesc):
+    """Read a call_into output desc into Python values.
+
+    Handles the shapes the item-7 dispatch contract can produce: rank-0
+    f64 scalars (returned as ``float``) and CPU f32/f64 tensors (returned
+    as ``list[float]``).
+    """
+    if not desc.data:
+        raise ValueError("output desc has null data pointer")
+    if desc.ndim == 0:
+        return ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_double))[0]
+    n_elems = 1
+    for i in range(desc.ndim):
+        n_elems *= int(desc.shape[i])
+    if n_elems == 0:
+        # A zero-element result is legitimate (the runtime succeeds with
+        # rc=0 and skips the copy); return the empty list rather than
+        # raising after a successful dispatch.
+        return []
+    if n_elems < 0:
+        raise ValueError(f"output desc resolves to a negative element count: {n_elems}")
+    if desc.dtype == 0:  # f64
+        arr = ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_double * n_elems))
+        return list(arr.contents)
+    if desc.dtype == _DTYPE_F32:
+        arr = ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_float * n_elems))
+        return list(arr.contents)
+    raise ValueError(
+        f"read_output_desc: unsupported output dtype tag {desc.dtype} "
+        "(v1 reads f64/f32 CPU results)"
+    )
+
+
 def read_f32_output_desc(desc: NslTensorDesc) -> list[float]:
     """Read a CPU f32 ``NslTensorDesc`` into a Python ``list[float]``.
 
@@ -226,8 +308,48 @@ def _needs_defensive_copy(tensor: Any, mutates_input: bool = False) -> bool:
 # PyTorch ↔ DLPack conversion
 # ---------------------------------------------------------------------------
 
-def _torch_to_dlpack(tensor: Any) -> int:
-    """Convert a torch.Tensor to a DLManagedTensor* (as int pointer)."""
+# CPython capsule FFI, configured ONCE at module scope. `PyCapsule_GetPointer`
+# had no declared restype anywhere in this module, so ctypes applied its
+# default of c_int: the returned DLManagedTensor* was silently TRUNCATED to
+# 32 bits — every heap allocation above 4 GiB produced a corrupt pointer.
+ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+ctypes.pythonapi.PyCapsule_New.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+]
+ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
+ctypes.pythonapi.PyCapsule_SetName.argtypes = [ctypes.py_object, ctypes.c_char_p]
+ctypes.pythonapi.PyCapsule_SetName.restype = ctypes.c_int
+
+
+def _capsule_pointer(capsule: Any) -> int:
+    """Extract the DLManagedTensor* from a 'dltensor' capsule (full width)."""
+    ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule, b"dltensor")
+    return int(ptr or 0)
+
+
+def _mark_capsule_consumed(capsule: Any) -> None:
+    """Rename a 'dltensor' capsule to 'used_dltensor'.
+
+    This is the DLPack exactly-once convention: a consumer that takes
+    responsibility for the deleter renames the capsule so the producer's
+    capsule destructor (which only fires on the name 'dltensor') becomes a
+    no-op — otherwise the deleter can fire twice, once from the consumer and
+    once from capsule GC.
+    """
+    ctypes.pythonapi.PyCapsule_SetName(capsule, b"used_dltensor")
+
+
+def _torch_to_dlpack(tensor: Any) -> tuple[int, Any]:
+    """Convert a torch.Tensor to ``(DLManagedTensor* as int, keepalive)``.
+
+    The caller MUST hold the returned keepalive (the capsule) for as long as
+    the pointer is dereferenced: the previous version returned the bare int
+    and dropped the capsule, whose GC-time destructor calls the DLPack
+    deleter — a use-after-free window on every standalone conversion.
+    """
     import torch
     import torch.utils.dlpack
 
@@ -236,41 +358,46 @@ def _torch_to_dlpack(tensor: Any) -> int:
         tensor = tensor.contiguous()
 
     capsule = torch.utils.dlpack.to_dlpack(tensor)
-    # Extract raw pointer from PyCapsule
-    ptr = ctypes.pythonapi.PyCapsule_GetPointer(
-        ctypes.py_object(capsule),
-        b"dltensor",
-    )
-    return ptr
+    ptr = _capsule_pointer(capsule)
+    return ptr, capsule
 
 
-def _dlpack_to_torch(dlpack_ptr: int) -> Any:
-    """Convert a DLManagedTensor* (as int pointer) back to torch.Tensor."""
+def _dlpack_to_torch(dlpack_ptr: int, lib: Optional[ctypes.CDLL] = None) -> Any:
+    """Convert an NSL-owned DLManagedTensor* into an OWNED torch.Tensor.
+
+    torch consumes the capsule (renaming it 'used_dltensor') and takes
+    responsibility for calling the deleter from its GC — for tensors produced
+    by ``nsl_model_call_alloc`` that deleter releases the underlying NSL
+    tensor, which is what makes the returned torch tensor owned.
+
+    If conversion fails the DLManagedTensor is released via
+    ``nsl_dlpack_free`` (exactly once) instead of leaking, and the error
+    propagates.
+    """
     import torch
     import torch.utils.dlpack
 
-    # Create PyCapsule wrapping the DLManagedTensor*
-    capsule_name = b"dltensor"
-    ctypes.pythonapi.PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
-    capsule = ctypes.pythonapi.PyCapsule_New(dlpack_ptr, capsule_name, None)
-    return torch.utils.dlpack.from_dlpack(capsule)
+    capsule = ctypes.pythonapi.PyCapsule_New(dlpack_ptr, b"dltensor", None)
+    try:
+        return torch.utils.dlpack.from_dlpack(capsule)
+    except Exception:
+        if lib is not None and hasattr(lib, "nsl_dlpack_free"):
+            lib.nsl_dlpack_free(dlpack_ptr)
+        raise
 
 
-def _numpy_to_dlpack(array: Any, lib: ctypes.CDLL) -> int:
-    """Convert a numpy array to an NslTensor then export as DLPack."""
+def _numpy_to_dlpack(array: Any, lib: ctypes.CDLL) -> tuple[int, Any]:
+    """Convert a numpy array to ``(DLManagedTensor*, keepalive)`` via torch."""
     import numpy as np
-    # For numpy: create an NslTensor with borrowed data, then export
-    # This is a simple path — just pass the raw data pointer
     if not array.flags.c_contiguous:
         array = np.ascontiguousarray(array)
 
-    # Create NslTensor from numpy via the C API.
-    # For now, use a simple approach: convert to torch first if available
     try:
         import torch
         t = torch.from_numpy(array)
-        return _torch_to_dlpack(t)
+        ptr, capsule = _torch_to_dlpack(t)
+        # The torch tensor aliases the numpy buffer; keep all three alive.
+        return ptr, (capsule, t, array)
     except ImportError:
         raise RuntimeError("NumPy → DLPack conversion requires PyTorch. Install torch.")
 
@@ -300,20 +427,16 @@ def prepare_inputs(
     for i, tensor in enumerate(inputs):
         if hasattr(tensor, "__dlpack__"):
             # Modern DLPack protocol (torch >= 2.0)
-            import torch
-            import torch.utils.dlpack
             if _needs_defensive_copy(tensor):
                 tensor = tensor.contiguous()
             _kept_alive.append(tensor)
-            capsule = torch.utils.dlpack.to_dlpack(tensor)
+            ptr, capsule = _torch_to_dlpack(tensor)
             _kept_alive.append(capsule)
-            ptr = ctypes.pythonapi.PyCapsule_GetPointer(
-                ctypes.py_object(capsule), b"dltensor",
-            )
             dlpack_ptrs[i] = ptr
         elif hasattr(tensor, "__array__"):
             # numpy array
-            ptr = _numpy_to_dlpack(tensor, lib)
+            ptr, keepalive = _numpy_to_dlpack(tensor, lib)
+            _kept_alive.append(keepalive)
             dlpack_ptrs[i] = ptr
         elif isinstance(tensor, int):
             # Raw pointer (already a DLPack pointer)
@@ -335,7 +458,14 @@ def convert_outputs(
     num_outputs: int,
     lib: ctypes.CDLL,
 ) -> list[Any]:
-    """Convert DLPack output pointers back to torch tensors."""
+    """Convert owned DLPack output pointers into owned torch tensors.
+
+    Each pointer's ownership moves to exactly one place: torch's GC on
+    success, or ``nsl_dlpack_free`` on failure. The previous version fell
+    back to returning the raw int pointer on conversion failure — handing
+    the caller a leak with no API to release it and a value that crashes
+    anything treating it as a tensor.
+    """
     results = []
     for i in range(num_outputs):
         ptr = out_buf[i]
@@ -343,10 +473,14 @@ def convert_outputs(
             results.append(None)
             continue
         try:
-            results.append(_dlpack_to_torch(ptr))
+            results.append(_dlpack_to_torch(ptr, lib))
         except Exception:
-            # Fallback: return raw pointer
-            results.append(ptr)
+            # _dlpack_to_torch already released THIS pointer; release the
+            # not-yet-converted remainder so a partial failure leaks nothing.
+            for j in range(i + 1, num_outputs):
+                if out_buf[j] and hasattr(lib, "nsl_dlpack_free"):
+                    lib.nsl_dlpack_free(out_buf[j])
+            raise
     return results
 
 
@@ -354,23 +488,54 @@ def convert_outputs(
 # Standalone conversion functions
 # ---------------------------------------------------------------------------
 
-def to_nsl_tensor(tensor: Any, lib: Optional[ctypes.CDLL] = None) -> int:
-    """Convert a Python tensor to an NSL tensor pointer via DLPack.
+# Keepalives for standalone `to_nsl_tensor` imports: the NSL wrapper BORROWS
+# the producer's memory, so the producer-side capsule/tensor must outlive the
+# NslTensor*. Keyed by the NslTensor pointer; released via
+# `release_nsl_tensor`. (Before this existed the capsule was dropped on
+# return — its GC destructor fired the producer's deleter while the borrowed
+# NslTensor* was still live: a use-after-free, not a leak.)
+_NSL_IMPORT_KEEPALIVE: dict[int, Any] = {}
 
-    Returns the raw NslTensor* as an int.
+
+def to_nsl_tensor(tensor: Any, lib: Optional[ctypes.CDLL] = None) -> int:
+    """Convert a Python tensor to a BORROWING NSL tensor pointer via DLPack.
+
+    Returns the raw NslTensor* as an int. The source tensor's memory is
+    pinned by an internal registry until :func:`release_nsl_tensor` is called
+    with the returned pointer.
+
+    .. important::
+
+       **Callers must call :func:`release_nsl_tensor` when done.** Otherwise
+       the producer tensor stays pinned for the process lifetime. This
+       registry is deliberate: previously the DLPack capsule was dropped on
+       return, so its GC-time destructor invoked the producer's deleter while
+       the borrowed NslTensor* was still live — a use-after-free. Trading
+       that for an explicit-release leak is the safe direction, but it IS a
+       leak if the release is skipped.
     """
     if lib is None:
         from nslpy._core import _get_lib
         lib = _get_lib()
 
     if hasattr(tensor, "__dlpack__"):
-        dlpack_ptr = _torch_to_dlpack(tensor)
-        return lib.nsl_dlpack_import(dlpack_ptr)
+        dlpack_ptr, keepalive = _torch_to_dlpack(tensor)
     elif hasattr(tensor, "__array__"):
-        dlpack_ptr = _numpy_to_dlpack(tensor, lib)
-        return lib.nsl_dlpack_import(dlpack_ptr)
+        dlpack_ptr, keepalive = _numpy_to_dlpack(tensor, lib)
     else:
         raise TypeError(f"Cannot convert {type(tensor).__name__} to NslTensor")
+    nsl_ptr = lib.nsl_dlpack_import(dlpack_ptr)
+    if nsl_ptr:
+        _NSL_IMPORT_KEEPALIVE[int(nsl_ptr)] = (keepalive, tensor)
+    return nsl_ptr
+
+
+def release_nsl_tensor(nsl_ptr: int) -> None:
+    """Drop the keepalive for a pointer returned by :func:`to_nsl_tensor`.
+
+    After this the borrowed NslTensor* must not be dereferenced again.
+    """
+    _NSL_IMPORT_KEEPALIVE.pop(int(nsl_ptr), None)
 
 
 def from_nsl_tensor(nsl_ptr: int, lib: Optional[ctypes.CDLL] = None) -> Any:
@@ -385,4 +550,8 @@ def from_nsl_tensor(nsl_ptr: int, lib: Optional[ctypes.CDLL] = None) -> Any:
     dlpack_ptr = lib.nsl_dlpack_export(nsl_ptr)
     if dlpack_ptr == 0:
         raise ValueError("Failed to export NslTensor to DLPack")
-    return _dlpack_to_torch(dlpack_ptr)
+    # Pass `lib` so a conversion failure releases the DLManagedTensor instead
+    # of leaking it. NOTE: this is the BORROW exporter — the returned torch
+    # tensor aliases NSL-managed memory and is only valid while `nsl_ptr`
+    # lives. Use NslModel.forward for an owned result.
+    return _dlpack_to_torch(dlpack_ptr, lib)
