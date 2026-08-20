@@ -17,23 +17,103 @@ const MAX_SEQ_LEN = 2048
 const ROPE_THETA = 500000.0
 const DROPOUT = 0.0
 
-# Pretrain hyperparameters
-const PRETRAIN_LR = 0.0003
-const PRETRAIN_WARMUP = 2000
-const PRETRAIN_TOTAL_STEPS = 100000
+# Pretrain hyperparameters — MUST agree with pretrain_prod.nsl; enforced by
+# crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which checks all THREE
+# model sizes. The scheduler numbers are DERIVED from the real corpus:
+#   PRETRAIN_TOTAL_STEPS = PRETRAIN_EPOCHS
+#                        * floor(TRAIN_TOKENS / (MAX_SEQ_LEN * PRETRAIN_BATCH_SIZE))
+#
+# (Roadmap item 10. The previous 100000/2000 pair described a corpus this repo
+# has never contained — the same fiction item 4 removed at 50M and item 9 at
+# 500M. `PRETRAIN_GRAD_ACCUM` was renamed to the 50M/500M spelling
+# `PRETRAIN_GRAD_ACCUMULATION` so ONE gate covers every size; nothing imported
+# the old name.)
+#
+# The schedule deliberately MATCHES the 500M recipe where it can: 16,384
+# tokens per optimizer step, 512 optimizer steps, the same corpus slice and the
+# same held-out tail. batch 2 x seq 2048 = 4096 tokens per micro-step is four
+# times the 500M micro-step, hence grad_accumulation 4 rather than 8.
+# That makes the two runs comparable, NOT controlled: they also differ in
+# DROPOUT (0.1 at 500M, 0.0 here) and ROPE_THETA (10000 vs 500000), and
+# dropout is exactly the knob that moves a train-to-held-out gap. Do not read
+# a VAL_LOSS difference between the sizes as a size effect.
+#
+# TOKEN BUDGET, stated plainly: 8.39M train tokens against ~1.07B params is
+# ~0.008 tokens/param — a factor of ~2,550 short of a Chinchilla-ish
+# ~20 tokens/param, and HALF the 500M recipe's ratio on the same corpus. This
+# recipe validates the WORKFLOW at 1B — real corpus, real schedule,
+# checkpoint/resume, held-out validation — it does not produce a well-trained
+# 1B model. Fixing that needs a corpus, which is roadmap item 15.
+const CORPUS_TOKENS = 8925916
+const TRAIN_TOKENS = 8388608
+const VAL_TOKENS = 524288
+# LR AND WARMUP — THIS VALUE IS NOT MEASURED AT 1B. Read the provenance.
+#
+# This config carried lr = 3e-4, the same constant coder50m / coder500m /
+# coder7b all carry across d_model 512 / 1280 / 2048 / 4096. That uniformity IS
+# the defect: the value was never checked at any size until item 9 found it too
+# high at 500M, where halving it was worth 0.57 nats of held-out loss.
+#
+# Item 10 tried to repeat that comparison at 1B rather than assume a 500M result
+# transfers across a 1.6x width change. It ran two full epochs — 3e-4 and
+# 1.5e-4 — and THE ARMS DID NOT SEPARATE INTO AN ANSWER:
+#   - neither descends. armA's last-half train mean (9.408) is WORSE than its
+#     first half (9.166); armB's is flat (9.162 -> 9.101).
+#   - both land just under the ln(49152) = 10.803 uniform-predictor bound:
+#     VAL 10.284 at 3e-4, 10.525 at 1.5e-4.
+#   - the ordering FLIPS with the horizon (1.5e-4 leads early, trails on
+#     held-out), one seed each, and no null control was ever obtained.
+#   - worse: 1.5e-4's held-out number is driven by a late excursion that DID
+#     NOT REPRODUCE when the same run was resumed from its own step-1200
+#     checkpoint. The comparison rests on a value its own rerun contradicts.
+# So the sign of "which LR is better at 1B" is not established, and this file
+# must not launder either arm into a measured constant.
+#
+# The value below is therefore the WIDTH SCALING of the one LR result this repo
+# does own — item 9's 1.5e-4 at d_model 1280 — carried to d_model 2048:
+#   1.5e-4 * 1280/2048 = 9.4e-5, rounded to 1e-4.
+# It is a principled default, not a measurement. The reason it cannot be
+# validated here is TOKEN BUDGET, not tooling: see the note above — 0.008
+# tokens/param cannot resolve a learning rate. Settling it needs the corpus
+# roadmap item 15 provides.
+#
+# The arms, the corrected statistics, and what the earlier partial-window
+# numbers got wrong are in models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
+const PRETRAIN_LR = 0.0001
+const PRETRAIN_WARMUP = 200
+const PRETRAIN_TOTAL_STEPS = 2048
 const PRETRAIN_MIN_LR = 0.00003
 const PRETRAIN_BATCH_SIZE = 2
-const PRETRAIN_GRAD_ACCUM = 8
+const PRETRAIN_GRAD_ACCUMULATION = 4
 const PRETRAIN_WEIGHT_DECAY = 0.1
 const PRETRAIN_BETA1 = 0.9
 const PRETRAIN_BETA2 = 0.95
 const PRETRAIN_EPOCHS = 1
 const PRETRAIN_GRAD_CLIP = 1.0
+const PRETRAIN_CHECKPOINT_EVERY = 100
+# Shuffled, for the reason the 500M recipe records: a concatenated corpus
+# should not be fed in file order, and item 8 made a seeded shuffle
+# reproducible and resumable (it was entropy-keyed before). NOT measured to
+# improve quality at 500M.
+const PRETRAIN_SHUFFLE = 1
 
 # Inference
 const TOP_K = 40
 const TEMPERATURE = 0.8
 const MAX_GEN_TOKENS = 512
+
+# Paths (relative to this directory). The train/val slices are a byte-exact
+# prefix/tail cut of the shared corpus, materialized by
+# models/benchmarks/make_prod_split.py — the same two files the 500M recipe
+# reads, so the two sizes are scored on identical held-out text. The 13,020
+# tokens between TRAIN_TOKENS and the start of the val tail are consumed by
+# neither. Disjointness is automatic — they are separate files — so the gap
+# buys SEPARATION: in a concatenated corpus the tokens just past the training
+# prefix usually continue the same file.
+const PRETRAIN_CORPUS = "../../data/tokens/train_new.bin"
+const PRETRAIN_DATA = "../../data/tokens/prod_train_slice.bin"
+const PRETRAIN_VAL_DATA = "../../data/tokens/prod_val_slice.bin"
+const CHECKPOINT_DIR = "checkpoints"
 
 # Parameter budget (approximate, f32):
 #   Embedding (tied LM head): 49152 × 2048 =   100.66M

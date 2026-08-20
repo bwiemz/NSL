@@ -6,7 +6,8 @@
 # The 50M workflow (item 4 / PR #510), at 500M: no machine-specific paths, no
 # synthetic data, every number agreeing with models/coder500m/config.nsl —
 # enforced by crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which now
-# checks BOTH model sizes from one table. The 500M config previously carried
+# checks every model size from one table (three of them as of item 10). The
+# 500M config previously carried
 # `total_steps=305000` for a corpus this repo has never contained, which is
 # the same fiction item 4 removed from the 50M pair.
 #
@@ -29,8 +30,9 @@
 #   checkpoints       = 512 / checkpoint_every(100)      = 5
 #
 # TOKEN BUDGET — stated plainly rather than buried: 8.39M train tokens
-# against ~505M parameters is ~0.017 tokens/param, roughly two orders of
-# magnitude below compute-optimal. This program validates the WORKFLOW at
+# against ~505M parameters is ~0.017 tokens/param, a factor of ~1,200 below a
+# Chinchilla-ish ~20 tokens/param (item 10 corrected "two orders of magnitude",
+# which understated the gap by more than 10x). This program validates the WORKFLOW at
 # 500M — real corpus, real schedule, real checkpoint/resume, held-out
 # validation — it does NOT produce a well-trained 500M model. Expect VAL_LOSS
 # to sit well above the training loss and to stop improving early; that gap

@@ -1,0 +1,270 @@
+# models/coder1b/pretrain_prod.nsl
+# ============================================================================
+# NSL-Coder-1B — production pretraining + held-out validation (item 10)
+# ============================================================================
+#
+# THE REAL RECIPE, kept separate from the endurance benchmark. Its sibling
+# pretrain_1b2048.nsl is Milestone B's certification workload: it carries
+# `B2048_TOKENS_PATH` / `B2048_CKPT_ARGS` marker strings that only
+# models/benchmarks/endurance_1b.py can rewrite, prints WITNESS_* blocks for
+# the harness to assert on, runs no scheduler, and reports no held-out loss.
+# It cannot be run by hand and it does not answer "what would I train with".
+# This file is that answer, at the same geometry: no machine-specific paths,
+# no marker strings, every number agreeing with models/coder1b/config.nsl —
+# enforced by crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which now
+# checks all three sizes from one table. Neither file replaces the other:
+# the benchmark certifies the memory stack, this one trains.
+#
+# Corpus: the SAME two slices the 500M recipe reads
+# (models/benchmarks/make_prod_split.py) — train on the first 8,388,608 u16
+# tokens of data/tokens/train_new.bin, score on the last 524,288. Reusing them
+# is deliberate: the two production runs are then scored on identical held-out
+# text, so their VAL_LOSS numbers can be compared to each other and not only
+# to themselves. The 13,020 tokens in between are read by neither.
+#
+# Derivation (config.nsl carries the same numbers):
+#   micro-steps/epoch = floor(8,388,608 / (2048 * 2))    = 2048
+#   total micro-steps = 1 epoch x 2048                   = 2048
+#   warmup            = 200 micro-steps                  (~9.8%)
+#   optimizer steps   = floor(2048 / accum(4))           = 512
+#   tokens/opt step   = 2 * 2048 * 4                     = 16,384
+#   checkpoints       = 512 / checkpoint_every(100)      = 5
+#
+# The last three lines are the 500M recipe's numbers exactly. That is the
+# point: a 1B micro-step carries 4096 tokens against 500M's 2048, so
+# grad_accumulation drops 8 -> 4 and the two runs then share an effective
+# batch, an optimizer-step count, and a warmup fraction. The corpus and the
+# held-out set are shared too.
+#
+# What that does NOT buy is a controlled experiment. The two models also
+# differ in DROPOUT (0.1 at 500M, 0.0 here) and RoPE base (10000 vs 500000),
+# and dropout in particular is the knob that moves a train-to-held-out gap. So
+# the two VAL_LOSS numbers are measured on identical text under an identical
+# schedule, which makes them worth putting side by side — but a difference
+# between them is NOT attributable to model size alone, and this header is not
+# claiming it is.
+#
+# TOKEN BUDGET — 8.39M train tokens against ~1.07B parameters is ~0.008
+# tokens/param. Against a Chinchilla-ish ~20 tokens/param that is a factor of
+# ~2,550 short (the README states the same thing as ~0.04% of compute-optimal),
+# and it is HALF the ratio the 500M recipe gets from the same corpus. This program
+# validates the WORKFLOW at 1B; it does NOT produce a well-trained 1B model,
+# and it is not evidence that 1B beats 500M on this corpus — at this budget
+# the larger model sees fewer tokens per parameter, not more. Expect VAL_LOSS
+# to sit well above the training loss. Closing that needs a corpus, which is
+# roadmap item 15.
+#
+# THE LEARNING RATE BELOW IS NOT MEASURED AT THIS SCALE — say so plainly,
+# because item 9 DID measure one at 500M and the two look identical in a diff.
+# Every coder config in this repo carried lr = 3e-4 across d_model 512/1280/
+# 2048/4096; item 9 found it too high at 500M, where halving it (with warmup
+# doubled) was worth 0.57 nats of held-out loss. Item 10 asked the same question
+# at 1B, with the LR as the ONLY difference between the arms — item 9 moved the
+# learning rate and the warmup together, so its 0.57 nats was never attributable
+# to the learning rate alone. Two full epochs, 3e-4 and 1.5e-4, warmup 200 in
+# both — AND THE ARMS DID NOT SEPARATE:
+# neither descends (3e-4's last-half train mean, 9.408, is worse than its first
+# half, 9.166; 1.5e-4 is flat at 9.162 -> 9.101), both land just under the
+# ln(49152) = 10.803 uniform bound (VAL 10.284 vs 10.525), the ordering flips
+# between the early and the held-out horizon, and there is one seed and no null
+# control behind either. On top of that 1.5e-4 destabilizes over its final ~25
+# optimizer steps while the cosine is at min_lr — AND THAT EXCURSION DID NOT
+# REPRODUCE: resumed from its own step-1200 checkpoint, with the same weights,
+# optimizer state and data order, the rerun never entered it. So the number that
+# makes 1.5e-4 look worse is partly a one-off chaotic event. None of that is an
+# answer.
+#
+# So lr = 1e-4 here is the WIDTH SCALING of item 9's measurement, not a repeat
+# of it: 1.5e-4 * 1280/2048 = 9.4e-5. A principled default, chosen because the
+# budget above cannot resolve a learning rate — 0.008 tokens/param is not an
+# experiment, and no LR rescues it. Item 15's corpus is what settles this.
+# Arms, corrected statistics, and the per-flag table:
+# models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
+#
+# UNITS (same as the 50M/500M recipes): the scheduler counts MICRO-batches (lr
+# is recomputed every micro-batch; with grad_accumulation=4 the effective
+# warmup is 200/4 = 50 optimizer steps). checkpoint_every counts OPTIMIZER
+# steps — codegen converts internally. DROPOUT is 0.0 at this size, so the
+# dropout op elides entirely (Milestone B: a p=0 config that could not resolve
+# its p ran REAL dropout at 0.1 and cost 1.5 GiB; PR #507 made an unresolved p
+# refuse instead of defaulting).
+#
+# RESUME (item 8 / PR #516): `epochs` is the run TOTAL, so an interrupted run
+# is resumed by re-running this file UNCHANGED with checkpoint_load= added —
+# the training epoch, the DataLoader's delivery slot and every RNG stream are
+# restored, and a corpus or `--seed` mismatch refuses rather than silently
+# training a different stream. At 1B a checkpoint pair is 4.30 GB of theta
+# plus an 8.59 GB `.optim` sidecar (m and v for 146 parameters) — measured, not
+# estimated — so checkpoint_every=100 optimizer steps rewrites 12.9 GB five
+# times over the run. Budget the disk: `checkpoints/` is gitignored except for
+# its `.gitkeep`, and the runtime does NOT create the directory (it does
+# File::create and aborts), which is why that placeholder is tracked.
+#
+# RUN — the split script resolves the repo from its own path, so it works from
+# any cwd; the nsl invocation must be from THIS directory (the corpus paths and
+# `from model import ...` are relative to it):
+#   python models/benchmarks/make_prod_split.py     # once
+#   cd models/coder1b
+#   nsl run --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
+#           --optim-state-offload pretrain_prod.nsl
+#
+# THE FLAGS ARE NOT ALL THE SAME KIND OF THING, and an earlier draft of this
+# header flattened them into "every flag is required", which is false:
+#
+#   --source-ad             the production path. The fused LCE and SDPA
+#                           kernels exist only there.
+#   --optim-state-offload   REQUIRED, measured. Without it this configuration
+#                           OOMs; see below.
+#   --checkpoint-blocks     activation recomputation. See the per-flag table in
+#                           PROD1B_VALIDATION_2026_08_19.md EC6 for what
+#                           dropping it actually does at this geometry.
+#   --fuse-rmsnorm-backward NOT a memory requirement — `nsl build --help`
+#                           calls it an "opt-in speedup" that "matches the
+#                           decomposition to an f32 tolerance" (the fused paths
+#                           are bit-deterministic run-to-run, but they are not
+#                           bit-equal to the unfused decomposition). It is in
+#                           the recommended line because it is free at this
+#                           scale, not because the run needs it. Drop it if you
+#                           want the reference backward.
+#
+# Dropping `--optim-state-offload` exhausts VRAM on a 32 GB card. Measured
+# twice, and the run does not fail the same way both times: it first DEGRADES
+# ("[nsl] GPU OOM in <op> — falling back to CPU", which does not stop the run,
+# it just makes 1B unusably slow), and then aborts outright at a later
+# allocation ("VRAM free: 182.8 MB / 31.39 GB", allocation #1199, nsl_mul_f32).
+# The second probe reached only the fallback stage inside its time budget, so
+# treat the allocation number and op name as ONE INSTANCE, not a signature —
+# what reproduces is the cause, not the crash site. That cause is measured
+# identically in both runs: f32 AdamW at 1.07B parameters puts 16.02 GiB of
+# PERSISTENT state on the device before a single activation is stored —
+# weights 4.02 + optim_m 4.00 + optim_v 4.00 + m_partial 4.00, all four visible
+# in the `[gpu-mem] surfaces:` line at step 0 — and the stored activations of
+# 16 layers at batch 2 x seq 2048 do not fit in what is left.
+# Host-resident moments move all
+# three optimizer surfaces off the device and leave weights 4.02 GiB against a
+# 16.54 GiB activation peak, for an allocator peak of 20.56 GiB, on an RTX PRO
+# 4500 Blackwell (32 GB, 31.39 usable). Units are GiB throughout: the
+# allocator's memstats lines say "MB" and its OOM dump says "GB", and both
+# divide by 1024. See PROD1B_VALIDATION_2026_08_19.md EC1 for the full-run
+# driver-level peak (which is higher, and is the number to size a card
+# against) and for the alternatives that were measured and rejected.
+#
+# WHY NOT `--layerwise-accum`, which Milestone B's benchmark uses: it REFUSES
+# grad_clip ("two-phase clipping needs the GLOBAL L2 norm over every
+# parameter's completed m_partial before any update, which the layerwise
+# schedule never materializes"). At 500M the failure mode this recipe family
+# actually hits is a loss excursion, so trading gradient clipping away for
+# memory the offload already buys is the wrong trade for a PRODUCTION run.
+# `nsl check --training-report` prints `two_phase_clip: true` for this file,
+# and the agreement gate asserts it — the clip is planned, not merely written
+# down in a kwarg the flag set silently dropped.
+#
+# Source AD is the production path (fused LCE/SDPA only exist there).
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+print("================================================================")
+print("  NSL-Coder-1B production pretrain")
+print("  49152 vocab | batch=2 seq=2048 accum=4 | 1 epoch = 2048 steps")
+print("================================================================")
+
+# SHUFFLE IS ON — on general grounds, NOT on a measured improvement. A
+# concatenated corpus (this repo, then 15 unrelated projects) should not be
+# presented to the optimizer in file order, and item 8 (PR #516) made a seeded
+# shuffle reproducible and resumable, which it was not before: the single-rank
+# path drew its permutation from ENTROPY, so shuffling would have made every
+# run's data order irreproducible and every checkpoint's recorded position
+# meaningless. At 500M shuffling did not improve held-out loss (9.765
+# sequential vs 9.793 shuffled); it was not re-measured at 1B.
+let tokens = load_mmap("../../data/tokens/prod_train_slice.bin", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=2048, shuffle=true, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+# The fused linear-CE kernel computes the loss straight from the hidden state
+# and the LM-head weight, so the [batch*seq, vocab] logits surface and its
+# gradient are never materialized — at 1B@2048 that surface would be
+# 2*2048*49152*4 B = 768 MiB live, twice. The four hints must be INT LITERALS
+# matching model.nsl / the DataLoader; a wrong one is refused at runtime by
+# `nsl_fused_lce_pin_hint_extents`. The reshape below must use the same
+# compile-time dims (a runtime `logits.shape` read keeps the composite chain
+# live and the compiler refuses the fusion) — which is why this step body does
+# NOT use the `let ls = logits.shape` spelling that pretrain_1b2048.nsl, whose
+# fusion is requested by flag instead, is free to use.
+#
+# `enabled = true` REFUSES a head the fusion cannot match, with one exception:
+# if source-AD extraction of the step body fails outright, codegen WARNS —
+# "[fused-lm-ce] ... it will NOT run and the full [batch*seq, vocab] logits
+# gradient will be materialized" — and falls back to tape, because that path
+# has a legitimate reading. At 1B that fallback is a 768 MiB surface plus its
+# gradient and the run will not fit. The BUILD IS STILL GREEN in that case, so
+# the agreement gate cannot catch it; the detectors are that stderr warning,
+# the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
+# below.
+@fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
+    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=200, total_steps=2048, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let flat_logits = logits.reshape([4096, 49152])
+        let flat_labels = batch.labels.reshape([4096])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 20 == 0:
+                print(step)
+                print(loss)
+
+print("LOSS_STREAM_END")
+
+# ── the run states its own memory posture ────────────────────────────────
+# The at-peak decomposition, not the step-boundary [gpu-mem] sample: those
+# print where the activation surface is 0, and reading one as "the peak" is a
+# mistake this repo has made twice. Surfaces: 1 weights, 2 optim_m, 3 optim_v,
+# 4 m_partial, 6 activations. Under --optim-state-offload, 2/3/4 must read 0
+# at the peak — that is the whole reason this configuration fits, and a silent
+# regression to device-resident moments would otherwise only show up as an OOM
+# on someone else's card.
+print("PEAK_BYTES")
+print(gpu_peak_bytes())
+print("PEAK_WEIGHTS")
+print(gpu_surface_at_peak_bytes(1))
+print("PEAK_OPTIM_M")
+print(gpu_surface_at_peak_bytes(2))
+print("PEAK_OPTIM_V")
+print(gpu_surface_at_peak_bytes(3))
+print("PEAK_M_PARTIAL")
+print(gpu_surface_at_peak_bytes(4))
+print("PEAK_ACTIVATIONS")
+print(gpu_surface_at_peak_bytes(6))
+
+# ── held-out validation ─────────────────────────────────────────────────
+# Forward-only (training=false) over the tail slice the training above never
+# read. This is the "+ validation" half of the roadmap item: a training loss
+# alone cannot tell an under-trained model from a memorizing one, and at 0.008
+# tokens/param that distinction is the whole question.
+let val_tokens = load_mmap("../../data/tokens/prod_val_slice.bin", 3)
+let val_loader = DataLoader(val_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let val_total = 0.0
+let val_count = 0.0
+for batch in val_loader:
+    let vlogits = m.forward_train(batch.input_ids, false)
+    let vs = vlogits.shape
+    let vflat_logits = vlogits.reshape([vs[0] * vs[1], vs[2]])
+    let vflat_labels = batch.labels.reshape([vs[0] * vs[1]])
+    let vloss = cross_entropy(vflat_logits, vflat_labels)
+    val_total = val_total + vloss.item()
+    val_count = val_count + 1.0
+
+print("VAL_LOSS")
+print(val_total / val_count)
+print("VAL_BATCHES")
+print(val_count)
+
+model_save(m, "checkpoints/pretrain_prod_final.nslm")
+print("PRETRAIN_PROD_COMPLETE")

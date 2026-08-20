@@ -37,18 +37,77 @@ trained with. `crates/nsl-cli/tests/model_config_drift.rs` now fails if
 | Activations + CUDA ctx | ~1 GB | ~1 GB |
 | **Total peak** | **~18 GB → OOM on 16 GB** | **~14 GB → fits** |
 
+That table is the `pretrain_fase.nsl` demo, which runs at **seq 512**. The
+production recipe runs at seq 2048, where the activation surface is the
+dominant term rather than a rounding error, and the numbers are measured
+rather than budgeted (item 10, RTX PRO 4500 Blackwell / 32 GB):
+
+All figures in **GiB**, because that is what both the allocator's memstats
+lines (which say "MB" but divide by 1024) and its OOM dump (`format_bytes`,
+likewise) actually print. Mixing the two conventions makes the same 4112 MiB
+weight surface look like two different numbers:
+
+| | bare `--source-ad --checkpoint-blocks --fuse-rmsnorm-backward` | `+ --optim-state-offload` |
+|---|---|---|
+| weights | 4.02 GiB | 4.02 GiB (same surface) |
+| optim m / v / m_partial, on device | 4.00 / 4.00 / 4.00 GiB | **0 / 0 / 0** (host-resident) |
+| persistent subtotal | **16.02 GiB** | **4.02 GiB** |
+| activations, at the allocator peak | — (never reached: VRAM is gone first) | 16.54 GiB |
+| **outcome** | **unusable** — degrades to CPU (`GPU OOM in <op> — falling back to CPU`, 0 steps in 900 s), then aborts at a later allocation | allocator peak **20.56 GiB**, driver **24.60–26.11 GiB** over a full epoch |
+
+The allocator peak is the *stable* number — two full epochs of the same
+program reported it byte-identically (22,073,520,640 B) while their
+driver-level peaks differed by 1548 MiB. **Size a card against the driver
+maximum (~26.1 GiB), not the allocator figure.** Per-flag necessity — which of
+the four flags above is actually load-bearing, measured rather than asserted —
+is `PROD1B_VALIDATION_2026_08_19.md` §EC6; the short version is that
+`--checkpoint-blocks` is required and `--fuse-rmsnorm-backward` is worth 3 MiB.
+
+**`--optim-state-offload` is what makes 1B@2048 fit here**, and it is not
+interchangeable with the endurance benchmark's `--layerwise-accum`: that
+flag refuses `grad_clip` outright. The recipe prints `PEAK_OPTIM_M` /
+`PEAK_OPTIM_V` / `PEAK_M_PARTIAL` at the end of every run so a regression
+to device-resident moments shows up as a number rather than as someone
+else's OOM.
+
 ## Files
 
 - `config.nsl` — hyperparameters.
 - `model.nsl` — `NSLCoder`, `TransformerBlock`, `SwiGLUFFN` definitions.
+- **`pretrain_prod.nsl` — the production recipe** (roadmap item 10): real
+  corpus, derived schedule, checkpoint/resume, held-out validation. This is
+  the one to run if you want to train the model.
+- `pretrain_1b2048.nsl` — Milestone B's **certification workload**, not a
+  recipe. It carries `B2048_TOKENS_PATH` / `B2048_CKPT_ARGS` marker strings
+  that only `models/benchmarks/endurance_1b.py` rewrites, prints `WITNESS_*`
+  blocks for that harness to assert on, runs no scheduler and reports no
+  held-out loss. It cannot be run by hand. The two files are kept separate on
+  purpose — a benchmark that certifies the memory stack and a recipe that
+  trains a model want different things —
+  and `pretrain_prod_agreement_gate.rs` holds that separation in both
+  directions.
 - `pretrain_fase.nsl` — runnable FASE demo with `grad_accumulation=8`,
   AdamW, `grad_clip=1.0`.
 
 ## Running
 
+**The production recipe.** It must run from `models/coder1b/` — its corpus
+paths and `from model import ...` are relative to that directory — so the `cd`
+is inside a subshell, and everything after it stays repo-root-relative:
+
 ```bash
 cargo build --release --bin nsl --features cuda
+python models/benchmarks/make_prod_split.py      # materializes the corpus split, once
 
+( cd models/coder1b && ../../target/release/nsl run \
+    --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
+    --optim-state-offload pretrain_prod.nsl )
+```
+
+The demos below are a different thing — a memory demo at seq 512, not a
+recipe — and run from the repo root:
+
+```bash
 # Tape-AD baseline — EXPECTED TO OOM on 16 GB:
 ./target/release/nsl run --profile-memory models/coder1b/pretrain_fase.nsl
 
@@ -86,40 +145,61 @@ step=0 completes.
 This is the headline demo: **FASE turns a 1B-param training run from
 an H100-class workload into a consumer-GPU workload.**
 
-## Reading the cert curves: this is a compute-limited budget
+## Reading the curves: this is a corpus-limited budget
 
-`config.nsl`'s pretrain schedule is sized to one 16 GB consumer GPU, not
-to a compute-optimal recipe. Read any loss curve from it with that in
-mind.
+Until item 10 this section described a 100,000-step / ~3.28B-token
+schedule. **That corpus does not exist in this repo** — the same fiction
+item 4 removed at 50M and item 9 at 500M. The real budget is one epoch
+over an 8.39M-token slice, and it is a good deal smaller than the old
+table implied:
 
 | | value |
 |---|---|
-| tokens / optimizer step | `batch 2 × accum 8 × seq 2048` = **32,768** |
-| total steps | 100,000 |
-| **total token budget** | **~3.28B** |
+| tokens / optimizer step | `batch 2 × accum 4 × seq 2048` = **16,384** |
+| optimizer steps | 512 (2048 micro-steps ÷ accum 4) |
+| **total token budget** | **8.39M** |
 | Chinchilla-ish compute-optimal for 1.07B params (~20 tok/param) | ~21.4B |
-| **fraction of compute-optimal** | **~15%** (about 6.5x short) |
+| **fraction of compute-optimal** | **~0.04%** |
 
-Consequences worth stating up front, so nobody reads a cert curve as a
+That 16,384-token effective batch and 512-step count are the 500M
+recipe's exactly, and both sizes read the same corpus slice and the same
+held-out tail. That makes the two VAL_LOSS numbers worth putting side by
+side — but it is **not** a controlled experiment: the models also differ
+in `DROPOUT` (0.1 at 500M, 0.0 here) and `ROPE_THETA` (10000 vs 500000),
+and dropout is precisely the knob that moves a train-to-held-out gap.
+
+Consequences worth stating up front, so nobody reads a curve as a
 quality claim:
 
-- **The run does not converge.** Loss should still be falling when the
-  schedule ends. A final loss from this budget is not comparable to a
-  published 1B-model number — those are trained on 1-3T tokens, i.e.
-  300-1000x this budget.
+- **The run does not converge, and it is not close.** A final loss from
+  this budget is not comparable to a published 1B-model number — those
+  are trained on 1-3T tokens.
+- **1B here is not "better than 500M".** On a fixed corpus the larger
+  model gets *fewer* tokens per parameter: 0.008 against the 500M
+  recipe's 0.017. Expect the held-out numbers to reflect that.
 - **The reference points are the entropy bounds, not a target loss.**
   Uniform over the 49,152-token vocab is `ln(49152) = 10.80` nats. A
   healthy run leaves that within the first few hundred steps (the model
   learns the unigram distribution), then descends much more slowly. The
-  useful signal from these demos is *monotone descent and stable VRAM*,
-  not the absolute value.
-- **`PRETRAIN_LR = 3e-4` is aggressive for a 32K-token effective batch.**
-  For scale: GPT-3 1.3B used 2e-4 at ~1M-token batches, Llama-1 7B used
-  3e-4 at ~4M-token batches. At 32K tokens per step this LR is roughly an
-  order of magnitude high relative to those references. If a real run
-  shows loss spikes, the two levers are raising `PRETRAIN_GRAD_ACCUM`
-  (bigger effective batch, same VRAM) or lowering `PRETRAIN_LR` — prefer
-  the former, since the budget is already batch-starved.
+  useful signal is *monotone descent and stable VRAM*, not the absolute
+  value.
+- **`PRETRAIN_LR` has a provenance now — and it is *not* "measured at 1B".**
+  This README used to argue from published references that 3e-4 was
+  aggressive here, and to recommend raising `PRETRAIN_GRAD_ACCUM` in
+  preference to lowering the LR. Item 9 measured the LR at 500M — halving
+  it was worth 0.57 nats of held-out loss — and item 10 tried to repeat
+  that at 1B rather than assume it transfers. **The 1B arms did not
+  separate:** two full epochs at 3e-4 and 1.5e-4, neither descending,
+  both landing just under the `ln(49152) = 10.80` uniform bound (10.284
+  vs 10.525), with the ordering flipping between the early and the
+  held-out horizon and no null control behind either. The shipped
+  `1e-4` is therefore the *width scaling* of item 9's result
+  (`1.5e-4 × 1280/2048 = 9.4e-5`), a principled default rather than a
+  measurement — the budget above cannot resolve a learning rate. Arms and
+  corrected statistics: `models/benchmarks/PROD1B_VALIDATION_2026_08_19.md`.
+  The old recommendation to prefer a bigger batch does not survive a
+  corpus this small, where accumulation buys effective batch by *spending
+  optimizer steps* there are only 512 of.
 
 Note the `pretrain_fase.nsl` demo itself runs at `seq_len=512`, not 2048,
 so its per-step token count is 8,192. It exists to exercise the FASE
@@ -135,7 +215,7 @@ which names parameter ROLES to exempt:
 ```nsl
 train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0):
     # decay the projections; exempt norms and biases (the usual convention)
-    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95,
+    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95,
                      eps=1e-8, no_decay=["vector"])
 ```
 

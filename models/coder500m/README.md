@@ -54,7 +54,9 @@ nats lower on held-out loss.
 Two things this recipe deliberately does not hide:
 
 - **Token budget.** 8.39M train tokens against ~505M parameters is ~0.017
-  tokens/param, roughly two orders of magnitude under compute-optimal. This
+  tokens/param, a factor of ~1,200 under a Chinchilla-ish ~20 tokens/param
+  (item 10 corrected "roughly two orders of magnitude", which understated it
+  by more than 10x). This
   validates the *workflow* at 500M; it does not produce a good 500M model.
   A bigger corpus is roadmap item 15.
 - **The held-out tail.** Training reads a prefix slice; `VAL_LOSS` is scored
