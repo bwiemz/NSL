@@ -29,7 +29,7 @@
 //! is a build error under Milestone A's inert-request enforcement) and requires
 //! the header's RUN block to name exactly those flags. It deliberately does NOT
 //! claim those flags are each necessary: item 10 measured that one of the 1B
-//! line's three is worth 3 MiB. And
+//! line's three has no memory effect the measurement can resolve. And
 //! `two_phase_clip` asserts, through `nsl check --training-report`, that a
 //! recipe declaring `grad_clip` still PLANS the clip under its own flag set:
 //! `--layerwise-accum`, which Milestone B's endurance benchmark uses, refuses
@@ -45,6 +45,53 @@ fn repo_root() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+/// The line constructing the loader the TRAIN BLOCK consumes, comment-stripped.
+///
+/// Codegen binds `state.cleanup.dataloader_vars.last()` — the last DataLoader
+/// constructed before the train block — so the variable NAME carries no
+/// meaning. Anchoring on a literal `let loader = DataLoader(` instead lets a
+/// recipe rename its loaders and have these assertions land on the validation
+/// loader while the training loader goes unchecked.
+fn training_loader_line<'a>(prod: &'a str, dir: &str) -> &'a str {
+    let train_line = prod
+        .lines()
+        .position(|l| l.trim_start().starts_with("train("))
+        .unwrap_or_else(|| panic!("{dir}: no `train(` block"));
+    let loaders: Vec<&str> = prod
+        .lines()
+        .take(train_line)
+        .map(|l| l.split('#').next().unwrap_or(l))
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("let ") && t.contains("= DataLoader(")
+        })
+        .collect();
+    // Every `DataLoader(` before the train block must be one of these simple
+    // `let` bindings. A construction the parse below cannot see — inside an
+    // `if`, say, where codegen INTERSECTS `dataloader_vars` across branches —
+    // would make this line-order rule disagree with codegen's `.last()`.
+    let constructions = prod
+        .lines()
+        .take(train_line)
+        .map(|l| l.split('#').next().unwrap_or(l))
+        .map(|l| l.matches("DataLoader(").count())
+        .sum::<usize>();
+    assert_eq!(
+        constructions,
+        loaders.len(),
+        "{dir}: {constructions} `DataLoader(` constructions before the train \
+         block but only {} are plain `let NAME = DataLoader(` bindings. This \
+         gate resolves the training loader by source order, which only tracks \
+         codegen's `dataloader_vars.last()` while every construction is \
+         unconditional and top-level",
+        loaders.len()
+    );
+    loaders
+        .last()
+        .copied()
+        .unwrap_or_else(|| panic!("{dir}: no DataLoader is constructed before the train block"))
 }
 
 /// One model size's production pair.
@@ -86,8 +133,10 @@ struct ProdPair {
     ///
     /// NOT "required" — this field used to be called `required_flags`, and item
     /// 10 MEASURED that the name was wrong. Dropping `--fuse-rmsnorm-backward`
-    /// at 1B changes the driver peak by 3 MiB (23,259 -> 23,256 net of ambient)
-    /// and the run survives; dropping `--checkpoint-blocks` OOMs at step 0. Both
+    /// at 1B leaves the run surviving 40 micro-steps, with a driver-peak
+    /// difference (19 MiB raw, 3 MiB net, opposite signs) far below the
+    /// ~1548 MiB run-to-run spread on that quantity — i.e. no resolvable
+    /// effect; dropping `--checkpoint-blocks` OOMs at step 0. Both
     /// are in the RUN line, only one is load-bearing. The recommended line is
     /// the thing worth pinning against drift — necessity is a separate,
     /// measured question, and its per-flag table lives in
@@ -367,16 +416,16 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
         // ── the shuffle choice, where the config records it ────────────────
         if let Some(want) = pair.shuffle {
             let want_str = if want { "shuffle=true" } else { "shuffle=false" };
-            // Anchor on the exact binding the training loop consumes, and
-            // strip any trailing comment first: a substring test over the raw
-            // line is satisfied by the word appearing in a comment, and a
-            // looser line-finder also matches `let val_loader = DataLoader(
-            // val_tokens, ...)`.
-            let train_loader = prod
-                .lines()
-                .map(|l| l.split('#').next().unwrap_or(l))
-                .find(|l| l.trim_start().starts_with("let loader = DataLoader("))
-                .unwrap_or_else(|| panic!("{dir}: no `let loader = DataLoader(` line"));
+            // Resolve the training loader the way CODEGEN does — the last
+            // DataLoader constructed before the train block — not by its
+            // variable name. Review finding: anchoring on the literal string
+            // `let loader = DataLoader(` let a recipe rename its training
+            // loader to `trainer`, name the VALIDATION loader `loader`, and
+            // train unshuffled with this assertion passing against the val
+            // loader. That is exactly the silent flip-back this field exists
+            // to catch, and it is the same name-independence
+            // `loader_bindings_name_the_right_slice` already argues for.
+            let train_loader = training_loader_line(&prod, dir);
             assert!(
                 train_loader.contains(want_str),
                 "{dir}: the training DataLoader must use {want_str} — see \
@@ -387,6 +436,61 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
                 "{dir}: config.nsl PRETRAIN_SHUFFLE disagrees with the recipe"
             );
         }
+
+        // ── the step body's reshape literals ───────────────────────────────
+        // `logits.reshape([N, V])` / `labels.reshape([N])` carry BARE literals,
+        // so `prod_kwarg` (which parses `key=value`) cannot see them and every
+        // other check in this gate is blind to them.
+        //
+        // Review finding, confirmed by building the mutants: a wrong N is NOT a
+        // build error. Under `--source-ad` the fused-LCE substitution DISCARDS
+        // the reshape, so the build links clean and still reports
+        // `[fused-lce] forward route=gemm` — while under tape AD, the gate's
+        // other arm, the reshape actually executes. A stale literal therefore
+        // makes the two AD modes compute different things with the whole gate
+        // green, which is the exact class of silent cross-mode divergence that
+        // cost this repo the SDPA causal-flag bug.
+        let n = (prod_kwarg(&prod, "batch_size", dir) * prod_kwarg(&prod, "seq_len", dir)) as u64;
+        let v = config_const(&config, "VOCAB_SIZE", dir) as u64;
+        for (want, what) in [
+            (format!("reshape([{n}, {v}])"), "logits"),
+            (format!("reshape([{n}])"), "labels"),
+        ] {
+            assert!(
+                prod.contains(&want),
+                "{dir}: the step body must flatten {what} with `{want}` — \
+                 batch_size * seq_len = {n}, vocab = {v}. A wrong literal here \
+                 is invisible: source-AD's fused-LCE substitution discards the \
+                 reshape and links clean, while tape AD executes it, so the two \
+                 AD modes silently diverge"
+            );
+        }
+
+        // ── drop_last is LOAD-BEARING for the derivation above ─────────────
+        // The scheduler length is derived with `floor(train_tokens / slot)`.
+        // That is only the number of batches the loader actually yields when
+        // `drop_last` is TRUE: the runtime defaults it to FALSE
+        // (`dataloader.rs`, `as_bool().unwrap_or(false)`) and then uses
+        // `data_len.div_ceil(tokens_per_batch)` instead.
+        //
+        // Review finding: nothing pinned this, and the premise lived only in a
+        // comment. At 50M it has a live consequence — CORPUS_TOKENS 8,925,916
+        // over a 1024-token slot leaves a remainder of 732, so floor gives
+        // 8716 batches/epoch (26,148 over 3 epochs, the committed
+        // PRETRAIN_TOTAL_STEPS) while div_ceil gives 8717 (26,151). Dropping
+        // `drop_last=true` would run 3 micro-steps past the end of the cosine
+        // with this whole gate green. 500M and 1B divide exactly, so the
+        // remainder never bites there — which is precisely why the assertion
+        // has to be unconditional rather than "where it matters today".
+        let train_loader = training_loader_line(&prod, dir);
+        assert!(
+            train_loader.contains("drop_last=true"),
+            "{dir}: the training DataLoader must set `drop_last=true` — the \
+             scheduler length is derived with floor(train_tokens / slot), and \
+             the runtime DEFAULTS drop_last to false and switches to div_ceil, \
+             which yields more batches than the schedule covers. Line: \
+             {train_loader}"
+        );
 
         // ── the fused-CE hints match the architecture consts ───────────────
         let vocab = config_const(&config, "VOCAB_SIZE", dir);
@@ -511,6 +615,42 @@ fn the_held_out_split_does_not_overlap_the_training_slice() {
                  from it",
                 bytes / 2
             );
+            // ── and the slices must actually BE that prefix and that tail ──
+            // Everything above is arithmetic over CONSTANTS. Review finding:
+            // the disjointness this test is named for lives in
+            // make_prod_split.py's slice expressions, which nothing here read.
+            // Rewriting `data[val_start * 2 :]` as
+            // `data[(TRAIN_TOKENS - VAL_TOKENS) * 2 : TRAIN_TOKENS * 2]` makes
+            // the "held-out" set a SUBSET of the training prefix while every
+            // constant, every byte COUNT, and the whole gap computation stay
+            // identical — the recipe would then report a held-out loss
+            // measured on trained text. Compare content, not lengths.
+            let corpus = std::fs::read(&corpus_path).unwrap();
+            for (rel, want) in [
+                (
+                    "data/tokens/prod_train_slice.bin",
+                    &corpus[..(train as usize) * 2],
+                ),
+                (
+                    "data/tokens/prod_val_slice.bin",
+                    &corpus[corpus.len() - (val as usize) * 2..],
+                ),
+            ] {
+                let p = root.join(rel);
+                if !p.exists() {
+                    continue;
+                }
+                let got = std::fs::read(&p).unwrap();
+                assert!(
+                    got == want,
+                    "{dir}: {rel} is not the cut make_prod_split.py documents. \
+                     The train slice must be the first TRAIN_TOKENS of \
+                     train_new.bin and the val slice its last VAL_TOKENS; a \
+                     slice of the right LENGTH taken from the wrong offset \
+                     passes every count-based check in this test while \
+                     scoring held-out loss on trained text"
+                );
+            }
         } else {
             eprintln!("[gate] data/tokens/train_new.bin absent — CORPUS_TOKENS arm skipped");
         }

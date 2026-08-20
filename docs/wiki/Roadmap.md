@@ -254,16 +254,20 @@ nonzero every step).
 measured end to end.** This is the first exercise anywhere of checkpoint/resume
 × `--optim-state-offload`, where `m` and `v` live on the host. Resuming 848 of
 2048 micro-steps (41% of the epoch, against item 9's 2% at 500M): the first two
-prints after restore are **bit-identical**, and on a stable arm the resumed run
-reproduces the final held-out loss to **0.0055 nats** — inside the 0.0356-nat
-run-to-run noise floor. The one arm that disagreed (0.673 nats) disagreed
-because **its own late excursion did not reproduce**, which is a fact about that
-trajectory, not about the mechanism — and which weakens the LR comparison
-further, since the number making 1.5e-4 look worse is a one-off chaotic event.
+prints after restore agree to ~5 significant figures (|Δ| ≈ 5e-05 — *not*
+bit-identical, as an earlier draft claimed by reading equality off 3-decimal
+output), and on one arm the resumed run reproduces the final held-out loss to
+**0.0055 nats**. The other arm missed by 0.673, and its parent contained a late
+excursion the rerun did not repeat. That pairing is suggestive but not a
+demonstration: per-print divergence turns out to be generic — the *smooth* arm's
+resume actually diverges sooner and further than the unstable one's — and no 1B
+held-out noise floor was ever measured, so the record says plainly what the
+evidence does and does not support.
 
 Three more things worth carrying forward. **Per-flag necessity is now measured
 rather than asserted**: dropping `--checkpoint-blocks` OOMs at step 0, while dropping
-`--fuse-rmsnorm-backward` costs **3 MiB** and the run survives — so the gate's
+`--fuse-rmsnorm-backward` has **no resolvable memory effect** and the run
+survives without it — so the gate's
 `required_flags` field was renamed `run_line_flags`, because the measurement
 contradicted the name. And **the allocator peak is the stable number, not the
 driver's**: two arms of the same program reported a byte-identical

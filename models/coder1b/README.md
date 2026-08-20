@@ -53,7 +53,7 @@ weight surface look like two different numbers:
 | optim m / v / m_partial, on device | 4.00 / 4.00 / 4.00 GiB | **0 / 0 / 0** (host-resident) |
 | persistent subtotal | **16.02 GiB** | **4.02 GiB** |
 | activations, at the allocator peak | — (never reached: VRAM is gone first) | 16.54 GiB |
-| **outcome** | **unusable** — degrades to CPU (`GPU OOM in <op> — falling back to CPU`, 0 steps in 900 s), then aborts at a later allocation | allocator peak **20.56 GiB**, driver **24.60–26.11 GiB** over a full epoch |
+| **outcome** | **unusable** — degrades to CPU (`GPU OOM in <op> — falling back to CPU`) and produced no micro-step in the ~38 s it ran; an earlier, separate probe went on to abort at a later allocation | allocator peak **20.56 GiB**, driver **24.60–26.11 GiB** over a full epoch |
 
 The allocator peak is the *stable* number — two full epochs of the same
 program reported it byte-identically (22,073,520,640 B) while their
@@ -61,7 +61,10 @@ driver-level peaks differed by 1548 MiB. **Size a card against the driver
 maximum (~26.1 GiB), not the allocator figure.** Per-flag necessity — which of
 the four flags above is actually load-bearing, measured rather than asserted —
 is `PROD1B_VALIDATION_2026_08_19.md` §EC6; the short version is that
-`--checkpoint-blocks` is required and `--fuse-rmsnorm-backward` is worth 3 MiB.
+`--checkpoint-blocks` and `--optim-state-offload` are both load-bearing (each
+OOMs when dropped), while `--fuse-rmsnorm-backward` shows no memory effect the
+measurement can resolve — the probes differ by less than 20 MiB in *opposite*
+directions, against a ~1548 MiB run-to-run spread on that same quantity.
 
 **`--optim-state-offload` is what makes 1B@2048 fit here**, and it is not
 interchangeable with the endurance benchmark's `--layerwise-accum`: that

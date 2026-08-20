@@ -93,7 +93,18 @@
 # is resumed by re-running this file UNCHANGED with checkpoint_load= added —
 # the training epoch, the DataLoader's delivery slot and every RNG stream are
 # restored, and a corpus or `--seed` mismatch refuses rather than silently
-# training a different stream. At 1B a checkpoint pair is 4.30 GB of theta
+# training a different stream.
+#
+# USE THE SAME FLAG SET on the resume, because nothing enforces that one: the
+# guard validates the `--seed` scalar and a corpus+geometry loader_id, NOT the
+# codegen flags. Resuming without --fuse-rmsnorm-backward silently changes the
+# backward arithmetic mid-run (the fused path is deterministic but not bit-equal
+# to the decomposition), and resuming without --optim-state-offload simply OOMs.
+# Measured: a 41% mid-epoch resume reproduced the held-out loss to 0.0055 nats
+# on one arm — see PROD1B_VALIDATION_2026_08_19.md EC4, which is also explicit
+# about what that single agreement does NOT establish.
+#
+# At 1B a checkpoint pair is 4.30 GB of theta
 # plus an 8.59 GB `.optim` sidecar (m and v for 146 parameters) — measured, not
 # estimated — so checkpoint_every=100 optimizer steps rewrites 12.9 GB five
 # times over the run. Budget the disk: `checkpoints/` is gitignored except for
@@ -115,10 +126,18 @@
 #                           kernels exist only there.
 #   --optim-state-offload   REQUIRED, measured. Without it this configuration
 #                           OOMs; see below.
-#   --checkpoint-blocks     activation recomputation. See the per-flag table in
-#                           PROD1B_VALIDATION_2026_08_19.md EC6 for what
-#                           dropping it actually does at this geometry.
-#   --fuse-rmsnorm-backward NOT a memory requirement — `nsl build --help`
+#   --checkpoint-blocks     REQUIRED, measured. Activation recomputation.
+#                           Dropping it OOMs at step 0 (`Requested 67108864`,
+#                           `VRAM free: 252.2 MB / 31.39 GB`, allocation #1296,
+#                           sum_dim_f32) — as hard a requirement as the offload
+#                           below. Stated inline rather than behind a reference,
+#                           because a reader skimming this table otherwise
+#                           concludes exactly one flag is load-bearing.
+#   --fuse-rmsnorm-backward NOT a memory requirement — dropping it leaves the
+#                           run surviving, with a driver-peak difference below
+#                           what that quantity can even resolve (19 MiB raw and
+#                           3 MiB net, in OPPOSITE directions, against a
+#                           ~1548 MiB run-to-run spread). `nsl build --help`
 #                           calls it an "opt-in speedup" that "matches the
 #                           decomposition to an f32 tolerance" (the fused paths
 #                           are bit-deterministic run-to-run, but they are not

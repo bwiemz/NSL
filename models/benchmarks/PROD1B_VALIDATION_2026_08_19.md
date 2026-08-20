@@ -51,8 +51,10 @@ through both epochs:
 | 3e-4 | 1738 MiB | 25,186 MiB | 23,448 MiB |
 | 1.5e-4 | 1652 MiB | 26,734 MiB | 25,082 MiB |
 
-Same program, same allocator peak to the byte, **1548 MiB apart at the driver
-level.** Size a card against the maximum (~26.1 GiB) and treat the allocator
+These two runs differ only in the AdamW `lr` literal — so they are not
+bit-identical programs, and their trajectories diverge numerically from the
+first step. Even so: same allocator peak **to the byte**, **1548 MiB apart at
+the driver level.** Size a card against the maximum (~26.1 GiB) and treat the allocator
 number as the property of the program. Milestone B's rule applies here too: the
 peak is at END-OF-FORWARD, not at a step boundary, so a step-boundary sample is
 not a peak.
@@ -105,11 +107,15 @@ state and the same data order, the rerun never entered the excursion (tail
 number that makes 1.5e-4 look worse is partly a one-off chaotic event, and the
 comparison rests on a value its own rerun contradicts.
 
-It is also one seed per arm, no null
-control, and an ordering that **flips with the horizon**: over the first 400
-micro-steps the means order the other way (9.285 at 3e-4, 9.218 at 1.5e-4,
-8.947 at 1e-4 — lower LR looks better), and the held-out numbers reverse it. An
-effect whose sign depends on where you stop measuring is not an effect yet.
+It is also one seed per arm, no null control, and an ordering that **is not
+stable across horizons**. Over the first **720** micro-steps the means order
+monotonically the other way — 9.285 at 3e-4, 9.218 at 1.5e-4, 8.947 at 1e-4,
+lower LR looking better — while the held-out numbers reverse it. But that
+monotonicity is itself a property of the window: over the first **400**
+micro-steps the means are 9.224 / 9.230 / 9.188, which is not monotone in the
+learning rate at all. (An earlier draft labelled the 720-micro-step means as
+"the first 400".) An effect whose sign depends on where you stop measuring is
+not an effect yet.
 
 The shipped `lr = 1e-4` is therefore `1.5e-4 × 1280/2048 = 9.4e-5`, the width
 scaling of the one LR result this repo owns. A principled default. Settling it
@@ -120,31 +126,44 @@ on this budget.
 
 It claimed "three LRs spanning 3× produce one curve (pearson +0.963/+0.964/
 +0.969, mean |Δ| 0.13–0.24 nats)" and read that as *the model is barely
-updating*. **Those numbers do not reproduce.** They were computed over an early
-~10–20-print window while the runs were still going:
+updating*.
+
+Those numbers are **arithmetically correct on the window they were computed
+over** — prints 4..20, while the runs were still in flight. Recomputing on that
+exact window reproduces them to four decimals. **What is wrong is that they do
+not generalize**, and they were banked as a property of the arms rather than of
+a 17-print slice of them:
 
 | window (prints) | A~B | A~C | B~C |
 |---|---|---|---|
-| 10 | +0.776 | +0.807 | +0.988 |
-| 20 | +0.806 | +0.794 | +0.979 |
-| 36 | +0.374 | +0.569 | +0.717 |
-| **102 (full epoch)** | **+0.217** | — | — |
+| **4..20 (the banked window)** | **+0.9629** | **+0.9636** | **+0.9691** |
+| 1..10 | +0.776 | +0.807 | +0.988 |
+| 1..20 | +0.806 | +0.794 | +0.979 |
+| 1..36 | +0.374 | +0.569 | +0.717 |
+| **1..102 (full epoch)** | **+0.217** | — | — |
 
-Over the finished epochs the correlation is +0.217, and the "one curve" reading
-was never supported. This repo already carries that lesson from a prior campaign
-(a banked r=0.915 over 5 of 8 regions whose true value was 0.220 — landing, as
-it happens, within 0.003 of the number here). It was re-committed inside the
-very campaign that recorded it. **No derived statistic gets banked until the run
-feeding it has exited.**
+Over the finished epochs A~B is **+0.217**, so the "one curve, the LR is
+ignored" reading was never supported by the runs — only by their opening. This
+repo already carries that lesson from a prior campaign (a banked r=0.915 over 5
+of 8 regions whose true value was 0.220 — landing, as it happens, within 0.003
+of the number here), and it was re-committed inside the very campaign that
+recorded it. **No derived statistic gets banked until the run feeding it has
+exited.**
+
+An earlier draft of *this section* then overcorrected, asserting the banked
+numbers "do not reproduce" — which is false, and was written inside the section
+whose purpose is correcting false claims. They reproduce; they do not
+generalize. Those are different failures and only the second one happened.
 
 The conclusion did not rest on the correlation and is unchanged.
 
 ## EC4 — mid-epoch resume across host-resident optimizer state
 
-The first test anywhere of checkpoint/resume × `--optim-state-offload`, where
-`m` and `v` live on the **host**. Resumed from armB's step-1200 checkpoint, so
-**848 of the epoch's 2048 micro-steps (41%) are re-run** — item 9's resume
-covered 2% and correctly refused to call a 0.006-nat agreement evidence.
+The first test anywhere of checkpoint/resume x `--optim-state-offload`, where
+`m` and `v` live on the **host**. Both arms were resumed from their own
+step-1200 checkpoints, so **848 of the epoch's 2048 micro-steps (41%) are
+re-run** — item 9's resume covered 2% and correctly refused to call a
+0.006-nat agreement evidence.
 
 Mechanically it is exact:
 
@@ -154,69 +173,87 @@ Mechanically it is exact:
 [checkpoint] saved:   ... at micro-batch step 2000 (146 params, epoch 0 loader slot 2000)
 ```
 
-- **848 micro-steps executed**, not 2048 — `epochs` is the run TOTAL under
-  resume, so the run finishes the epoch instead of restarting it.
+- **848 micro-steps executed**, not 2048, in BOTH resumes — `epochs` is the run
+  TOTAL under resume, so the run finishes the epoch instead of restarting it.
 - The restored position is the loader's **delivery slot**, not a batch count.
-- The witness block is byte-identical to armB's (`PEAK_BYTES 22073520640`,
-  optimizer surfaces `0/0/0`).
-- **The first two prints after restore are bit-identical to armB's** (8.756,
-  9.275, |Δ| = 0.000). Theta, `m`, `v` and the loader slot all come back
-  exactly, host-resident moments included.
+- The witness block is byte-identical to the parent arm's
+  (`PEAK_BYTES 22073520640`, optimizer surfaces `0/0/0`).
+- The first print after restore agrees to **~5 significant figures**: armB
+  8.755580 vs 8.755627 (|D| = 4.7e-05), armA 9.550095 vs 9.550007
+  (|D| = 8.8e-05).
 
-**But the held-out numbers differ by 0.673 nats** (11.198 resumed vs 10.525),
-and that is worth being precise about rather than filing as noise:
+**That is agreement, not identity, and the difference matters.** An earlier
+draft of this record called the restart "bit-identical" and used it as proof
+that theta, `m` and `v` come back *exactly*. They are not bit-identical — the
+claim came from reading equality off values printed to three decimals, which is
+the same confirm-theater this repo already files under "byte-compares below f32
+ulp". A ~5e-05 first-step difference is consistent with exact restoration plus
+nondeterministic float reduction order, and it is also consistent with a tiny
+restoration error. **This evidence does not separate those two.**
 
-| micro-step | armB | resumed | \|Δ\| |
-|---|---|---|---|
-| 1200 | 8.756 | 8.756 | **0.000** |
-| 1220 | 9.275 | 9.275 | **0.000** |
-| 1400 | 9.214 | 9.276 | 0.062 |
-| 1460 | 8.453 | 8.511 | 0.057 |
-| 1940 | 11.181 | 9.379 | **1.802** |
-| 2000 | 11.211 | 9.053 | **2.158** |
-| 2020 | 10.665 | 9.128 | **1.537** |
+### The end-to-end result, and why the per-print story does not work
 
-Mean |Δ| over the first five prints is **0.009**; over the last five, **1.561**.
-The two runs track for ~260 micro-steps and then separate — and the separation
-runs the *wrong way for a restore bug*: **armB destabilizes and the resumed run
-does not.** armB's tail is 11.18 / 10.03 / 10.35 / 11.21 / 10.67 while the
-resumed tail is 9.38 / 9.34 / 8.72 / 9.05 / 9.13.
-
-So the divergence is chaotic amplification downstream of a **real training
-instability**, not a defect in restoration — which the bit-identical restart
-independently establishes. A float-noise difference decides whether the run
-enters the excursion.
-
-**This feeds back into §EC3.** armB's late destabilization is *not
-reproducible*: given the same weights, the same optimizer state and the same
-data order, the second run did not repeat it. So armB's VAL of 10.525 is partly
-an artifact of a one-off excursion, and the arm comparison is weaker still than
-§EC3 already says — not merely uncontrolled, but resting on a number that its
-own rerun did not reproduce.
-
-Note also that the resumed run's held-out loss, **11.198, is *above* the
-`ln(49152) = 10.803` uniform bound** — on this budget the model is not reliably
-better than a uniform predictor on unseen text. §EC5.
-
-### The control: resume on a STABLE arm reproduces the held-out loss
-
-A bit-identical restart proves *restoration*. It does not prove the practically
-useful claim — that a resumed run ends up at the same model. armB could not
-answer that, because its own tail was chaotic. So the same test was run against
-**armA**, whose tail is smooth (8.6–9.3, no excursion):
-
-| arm | tail | original VAL | resumed VAL | Δ |
+| arm | tail of the original | original VAL | resumed VAL | \|D\| |
 |---|---|---|---|---|
-| **armA** (stable) | 8.6–9.3 | 10.284266 | **10.278813** | **0.0055** |
-| armB (unstable) | 11.18–10.67 | 10.525391 | 11.198396 | 0.673 |
+| **armA** (smooth tail) | 8.6-9.3 | 10.284266 | **10.278813** | **0.0055** |
+| armB (late excursion) | 11.18-10.67 | 10.525391 | 11.198396 | 0.673 |
 
-**0.0055 nats over 41% of an epoch re-run**, against a run-to-run noise floor of
-0.0356 measured in §EC7. That is the end-to-end claim: on a stable trajectory,
-mid-epoch resume across host-resident optimizer state reproduces the final
-held-out loss. The armB gap is the excursion, not the mechanism — which is what
-the bit-identical restart implied and what this control confirms independently.
+On armA the held-out loss reproduces to **0.0055 nats** (0.05% relative) over
+41% of an epoch re-run. On armB it does not, by 0.673.
 
-Both resumes executed exactly 848 micro-steps.
+An earlier draft explained that split as "armB is chaotic, armA is stable", on
+the strength of armB's per-print trajectory tracking its parent for ~260
+micro-steps before separating. **The control refutes that explanation.**
+Per-print, armA's resume diverges from its parent *sooner and further* than
+armB's does:
+
+| | first-5 mean \|D\| | mean \|D\| | max \|D\| |
+|---|---|---|---|
+| armA vs resumed armA | **0.584** | 0.527 | 2.789 |
+| armB vs resumed armB | 0.009 | 0.287 | 2.158 |
+
+armA's resume is already 0.44 off by its third print and 1.92 off by its
+fourth. So **per-print divergence is generic** at this scale — it happens in
+both arms, it is not a property of armB's learning rate, and it does not
+discriminate between them. What the single-batch prints show is that training
+here amplifies float-level differences within a few steps, in every arm.
+
+The held-out number behaves differently because it is an average over 128
+batches rather than a single batch, and averaging is what makes armA's 0.0055
+meaningful at all.
+
+### What can and cannot be concluded
+
+**Supported:** the resume machinery restores the epoch, the loader delivery
+slot, the parameter set and the optimizer state well enough that a 41% re-run
+of a full epoch lands within 0.0055 nats of held-out loss on armA — with `m`
+and `v` resident on the host, a composition nothing had exercised before.
+
+**Not supported, and previously overstated here:**
+
+- *"Bit-identical restart proves restoration is exact."* It is not bit-identical
+  (above).
+- *"0.0055 is inside the noise floor."* The 0.0356 figure in EC7 is a **500M
+  training-loss** max-|D| over 20 prints at seq 1024. It is a different model, a
+  different size, a different geometry and a different quantity from a **1B
+  held-out** loss. This record's own ledger states the rule that forbids that
+  transfer, and an earlier draft made the move anyway. **There is no measured 1B
+  held-out noise floor**, so how much of armA's 0.0055 is fidelity and how much
+  is luck is genuinely unknown.
+- *"armB's excursion did not reproduce, therefore the excursion is chaotic."*
+  The excursion did not recur in the resumed run — that part is observed. But
+  since armA's resume also diverges per-print, non-recurrence is not by itself
+  evidence about armB's learning rate.
+
+**The missing control** is the cheap one and it was not run: resume the SAME arm
+twice, or run two identical full arms, to get a 1B held-out spread. Without it
+the honest statement is "reproduced to 0.0055 on one arm, failed to reproduce by
+0.673 on the other, and the arm where it failed is the one whose parent
+contained a late excursion" — a suggestive pairing, not a demonstration.
+
+Note also that the resumed armB's held-out loss, **11.198, is *above* the
+`ln(49152) = 10.803` uniform bound** — on this budget the model is not reliably
+better than a uniform predictor on unseen text. See EC5.
 
 ## EC5 — the token budget, stated rather than buried
 
@@ -247,7 +284,14 @@ with ambient recorded per probe:
 | `--checkpoint-blocks` | **OOM at step 0** | 31,935 MiB | 30,065 MiB |
 | `--optim-state-offload` | **unusable** (see below) | 31,868 MiB | 30,212 MiB |
 
-`--fuse-rmsnorm-backward` is worth **3 MiB** — it is in the recommended line
+`--fuse-rmsnorm-backward` shows **no memory effect this table can resolve.**
+The two probes' driver peaks differ by 19 MiB raw (25,054 with vs 25,073
+without) and 3 MiB net of ambient (23,259 vs 23,256) — *in opposite directions*,
+and both are three orders of magnitude below the ~1548 MiB run-to-run spread
+EC1 measures on this very quantity. An earlier draft of this record quoted the
+3 MiB as if it were a measurement; it is noise, and reading a sign off it was
+wrong. What the probe does establish is the thing that matters: **the run
+survives 40 micro-steps without the flag.** It is in the recommended line
 because it is a free speedup at this scale, *not* because the run needs it.
 `nsl build --help` calls it an opt-in speedup matching the decomposition to an
 f32 tolerance. Drop it if you want the reference backward.
@@ -257,7 +301,9 @@ f32 tolerance. Drop it if you want the reference backward.
 
 `--optim-state-offload` fails in **two stages, and not the same way twice.**
 The run first *degrades* — `[nsl] GPU OOM in <op> — falling back to CPU`, which
-does not stop it, it just makes 1B unusably slow (0 micro-steps in 900 s) — and
+does not stop it, and it produced **no micro-step at all in the ~38 s it ran**
+(an earlier draft said "0 micro-steps in 900 s"; 900 s was the probe's watchdog
+ceiling, not an observed duration) — and
 in an earlier probe went on to abort at a later allocation
 (`VRAM free: 182.8 MB / 31.39 GB`, allocation #1199, `nsl_mul_f32`). Treat that
 allocation number and op name as **one instance, not a signature**. What
@@ -334,9 +380,12 @@ nsl run --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
         --optim-state-offload pretrain_prod.nsl
 ```
 
-**69–72 minutes** end to end on the reference card (compile + 2048 micro-steps
-+ 128 validation batches), measured from the 0.5 s VRAM sampler's own cadence
-across the two arms. `checkpoints/` must exist — the
+**73–75 minutes** end to end on the reference card (compile + 2048 micro-steps
++ 128 validation batches): armA 19:03:00 → 20:15:48 (72.8 min), armB
+20:18:56 → 21:34:22 (75.4 min), from the driver log's own timestamps. An
+earlier draft said 69–72, derived by multiplying the 0.5 s VRAM sampler's
+sample count — which undercounts, because each iteration also pays for an
+`nvidia-smi` invocation, and an exact clock was recorded alongside it. `checkpoints/` must exist — the
 runtime does `File::create` and aborts rather than creating it, which is why a
 `.gitkeep` is tracked. A checkpoint pair is 4.30 GB of theta plus an 8.59 GB
 `.optim` sidecar, rewritten 5 times over the run: budget ~13 GB of disk churn.
