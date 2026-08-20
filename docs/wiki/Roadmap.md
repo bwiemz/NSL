@@ -203,9 +203,9 @@ many more". Design:
 500M, plus the held-out validation the roadmap item asks for. The 500M config
 still carried `total_steps = 305000` for a corpus this repo has never
 contained (item 4 only rewrote the 50M pair); the schedule is now derived from
-the corpus and `pretrain_prod_agreement_gate.rs` checks both sizes from one
-table, including a gate that the held-out tail cannot overlap the training
-prefix by even part of a window.
+the corpus and `pretrain_prod_agreement_gate.rs` checks every size from one
+table (two at the time, three since item 10), including a gate that the
+held-out tail cannot overlap the training prefix by even part of a window.
 
 Validated on GPU, not just compiled — see
 [`PROD500M_VALIDATION_2026_08_19.md`](../../models/benchmarks/PROD500M_VALIDATION_2026_08_19.md).
@@ -215,8 +215,69 @@ the activation peak at 8.34 GB alongside 8.25 GB of persistent state. And
 **the `lr = 3e-4` this repo carries unchanged across d_model 512 / 1280 / 2048
 is too high at 500M**: halving it and doubling the warmup turned an erratic
 epoch (excursions to 10.94 and 12.17) into a monotone one and took 0.57 nats
-off the held-out loss (9.765 → 9.197). The 1B config inherits the same
-constant and has never been trained long enough to find out.
+off the held-out loss (9.765 → 9.197). Two caveats on that result, both of
+them item 10's doing: it varied the learning rate and the warmup *together*,
+so the attribution to the learning rate alone was not controlled; and the "1B
+config inherits the same constant and has never been trained long enough to
+find out" that closed this section is no longer true — item 10 trained it.
+
+### Production 1B recipe + validation (Shipped 2026-08-20, item 10)
+
+`models/coder1b/pretrain_prod.nsl` — the same production workflow at 1B,
+separated from Milestone B's endurance benchmark (`pretrain_1b2048.nsl`), which
+carries machine-rewritable marker strings, runs no scheduler and reports no
+held-out loss. Neither replaces the other: the benchmark certifies the memory
+stack, this one trains. The 1B config carried `total_steps = 100000` /
+`warmup = 2000` — a ~3.28B-token budget for a corpus of 8.93M — and that
+fiction is gone; the schedule is derived from the corpus and
+`pretrain_prod_agreement_gate.rs` now covers all three sizes from one table
+(3 → 9 tests).
+
+Validated on GPU — see
+[`PROD1B_VALIDATION_2026_08_19.md`](../../models/benchmarks/PROD1B_VALIDATION_2026_08_19.md).
+
+**The headline is a negative, and it is the useful part.** Item 9's result did
+not reproduce at 1B: two full epochs at 3e-4 and 1.5e-4, *neither descending*,
+both landing just under the `ln(49152) = 10.803` uniform bound (held-out 10.284
+vs 10.525), with the ordering flipping between the early and the held-out
+horizon and no null control behind either. So the recipe ships `lr = 1e-4` as
+the **width scaling** of item 9's measurement (`1.5e-4 × 1280/2048 = 9.4e-5`),
+explicitly labelled a principled default rather than a measurement. The reason
+is budget, not tooling: **0.008 tokens/param is not an experiment**, and a run
+that never leaves the neighbourhood of the unigram bound cannot rank two
+learning rates. Settling it needs item 15's corpus. Three defect hypotheses
+were tested and all refuted — offload correctness (against a null control),
+grad-clip saturation, and `--grad-integrity` (146/146 parameters finite and
+nonzero every step).
+
+**Mid-epoch resume across host-resident optimizer state works, and is now
+measured end to end.** This is the first exercise anywhere of checkpoint/resume
+× `--optim-state-offload`, where `m` and `v` live on the host. Resuming 848 of
+2048 micro-steps (41% of the epoch, against item 9's 2% at 500M): the first two
+prints after restore agree to ~5 significant figures (|Δ| ≈ 5e-05 — *not*
+bit-identical, as an earlier draft claimed by reading equality off 3-decimal
+output), and on one arm the resumed run reproduces the final held-out loss to
+**0.0055 nats**. The other arm missed by 0.673, and its parent contained a late
+excursion the rerun did not repeat. That pairing is suggestive but not a
+demonstration: per-print divergence turns out to be generic — the *smooth* arm's
+resume actually diverges sooner and further than the unstable one's — and no 1B
+held-out noise floor was ever measured, so the record says plainly what the
+evidence does and does not support.
+
+Three more things worth carrying forward. **Per-flag necessity is now measured
+rather than asserted**: dropping `--checkpoint-blocks` OOMs at step 0, while dropping
+`--fuse-rmsnorm-backward` has **no resolvable memory effect** and the run
+survives without it — so the gate's
+`required_flags` field was renamed `run_line_flags`, because the measurement
+contradicted the name. And **the allocator peak is the stable number, not the
+driver's**: two arms of the same program reported a byte-identical
+`PEAK_BYTES = 20.56 GiB` while their driver-level peaks differed by 1548 MiB.
+
+Also recorded, because it was re-committed inside the campaign that already
+carried the lesson: a correlation banked from a *partial-run* window (r ≈ 0.96)
+did not survive recomputation over the finished epochs (r = +0.217), and the
+reading built on it was never supported. No derived statistic gets banked until
+the run feeding it has exited.
 
 ## Currently in flight
 

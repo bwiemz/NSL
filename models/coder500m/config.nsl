@@ -19,20 +19,25 @@ const ROPE_THETA = 10000.0
 const DROPOUT = 0.1
 
 # Pretrain hyperparameters — MUST agree with pretrain_prod.nsl; enforced by
-# crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which checks BOTH
-# model sizes. The scheduler numbers are DERIVED from the real corpus:
+# crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which checks every
+# model size (three since item 10; coder1b reads these same two slices at a
+# 4096-token delivery slot rather than 2048). The scheduler numbers are
+# DERIVED from the real corpus:
 #   PRETRAIN_TOTAL_STEPS = PRETRAIN_EPOCHS
 #                        * floor(TRAIN_TOKENS / (MAX_SEQ_LEN * PRETRAIN_BATCH_SIZE))
 #
 # (Roadmap item 9. The previous 305000/3000 pair described a corpus this
 # repo has never contained — the same fiction item 4 removed from the 50M
 # config. `PRETRAIN_GRAD_ACCUM` was also renamed to the 50M spelling
-# `PRETRAIN_GRAD_ACCUMULATION` so ONE gate covers both sizes; nothing
+# `PRETRAIN_GRAD_ACCUMULATION` so ONE gate covers every size; nothing
 # imported the old name.)
 #
 # TOKEN BUDGET, stated plainly: 8.39M train tokens against ~505M params is
-# ~0.017 tokens/param, two orders of magnitude under compute-optimal. This
-# recipe validates the WORKFLOW at 500M — real corpus, real schedule,
+# ~0.017 tokens/param — a factor of ~1,200 short of a Chinchilla-ish ~20
+# tokens/param. (Item 10 corrected this: it read "two orders of magnitude",
+# which understates the gap by more than 10x and contradicted the 1B recipe's
+# "HALF the 500M ratio".) This recipe validates the WORKFLOW at 500M — real
+# corpus, real schedule,
 # checkpoint/resume, held-out validation — it does not produce a
 # well-trained 500M model, and VAL_LOSS is expected to part company with
 # the training loss. Fixing that needs a corpus, which is roadmap item 15.

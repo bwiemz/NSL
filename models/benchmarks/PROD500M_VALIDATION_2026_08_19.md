@@ -127,7 +127,9 @@ evidence for *correct* position restore is the bit-exact CPU gate in
 ## EC5 — the token budget, stated rather than buried
 
 8.39M train tokens against ~505M parameters is ~0.017 tokens/param, roughly
-two orders of magnitude below compute-optimal. The best arm ends at 9.197
+a factor of ~1,200 below a Chinchilla-ish ~20 tokens/param — item 10
+corrected this line, which read "roughly two orders of magnitude" and
+understated the gap by more than 10x. The best arm ends at 9.197
 held-out against ln(49152) = 10.80 for a uniform predictor — the model has
 learned something, and not much. **This recipe validates the workflow at 500M; it does
 not produce a good 500M model.** Closing that needs a corpus, which is roadmap

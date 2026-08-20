@@ -36,11 +36,16 @@ CORPUS = REPO / "data/tokens/train_new.bin"
 TRAIN_SLICE = REPO / "data/tokens/prod_train_slice.bin"
 VAL_SLICE = REPO / "data/tokens/prod_val_slice.bin"
 
-# Must match models/coder{50m,500m}/config.nsl — pinned by
+# Must match models/coder{50m,500m,1b}/config.nsl — pinned by
 # crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs, which reads the
-# consts out of config.nsl and this file's numbers out of here.
-TRAIN_TOKENS = 8_388_608  # 8192 windows of 1024
-VAL_TOKENS = 524_288  # 512 windows of 1024
+# consts out of config.nsl and this file's numbers out of here, for EVERY size
+# that reads the split. 500M and 1B deliberately share these two files so the
+# two production runs are scored on identical held-out text; both counts are
+# whole numbers of delivery slots at both geometries (a slot is
+# batch_size * seq_len contiguous tokens: 2 * 1024 = 2048 at 500M,
+# 2 * 2048 = 4096 at 1B), so `drop_last=true` discards nothing either way.
+TRAIN_TOKENS = 8_388_608  # 8192 windows of 1024, or 4096 of 2048
+VAL_TOKENS = 524_288  # 512 windows of 1024, or 256 of 2048
 
 
 def main() -> int:
