@@ -358,7 +358,17 @@ pub(crate) struct CheckArgs {
         #[arg(long)]
         pub(crate) nan_analysis: bool,
 
-        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        /// M46: Deterministic mode. Compile-time non-determinism detection AND
+        /// runtime routing to bit-reproducible kernel variants: the no-atomics
+        /// embedding backward, the non-coalesced `sum_dim` route, and the
+        /// flash-attention backward (whose phase-2 kernel accumulates dK/dV
+        /// with float atomicAdd, so its rounding follows scheduling order).
+        ///
+        /// The flash backward has no deterministic GPU variant yet, so this
+        /// routes it to the CPU reference — correct, and roughly 36x the
+        /// per-step cost at Coder-50M. `--deterministic` already makes that
+        /// trade elsewhere (its deterministic sum/mean kernels are sequential
+        /// single-thread PTX); budget for it before using this on a long run.
         #[arg(long)]
         pub(crate) deterministic: bool,
 
@@ -649,7 +659,17 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "zero_stage")]
         pub(crate) zero_elementwise: bool,
 
-        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        /// M46: Deterministic mode. Compile-time non-determinism detection AND
+        /// runtime routing to bit-reproducible kernel variants: the no-atomics
+        /// embedding backward, the non-coalesced `sum_dim` route, and the
+        /// flash-attention backward (whose phase-2 kernel accumulates dK/dV
+        /// with float atomicAdd, so its rounding follows scheduling order).
+        ///
+        /// The flash backward has no deterministic GPU variant yet, so this
+        /// routes it to the CPU reference — correct, and roughly 36x the
+        /// per-step cost at Coder-50M. `--deterministic` already makes that
+        /// trade elsewhere (its deterministic sum/mean kernels are sequential
+        /// single-thread PTX); budget for it before using this on a long run.
         #[arg(long)]
         pub(crate) deterministic: bool,
 
@@ -1248,7 +1268,17 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) trace_ops: bool,
 
-        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        /// M46: Deterministic mode. Compile-time non-determinism detection AND
+        /// runtime routing to bit-reproducible kernel variants: the no-atomics
+        /// embedding backward, the non-coalesced `sum_dim` route, and the
+        /// flash-attention backward (whose phase-2 kernel accumulates dK/dV
+        /// with float atomicAdd, so its rounding follows scheduling order).
+        ///
+        /// The flash backward has no deterministic GPU variant yet, so this
+        /// routes it to the CPU reference — correct, and roughly 36x the
+        /// per-step cost at Coder-50M. `--deterministic` already makes that
+        /// trade elsewhere (its deterministic sum/mean kernels are sequential
+        /// single-thread PTX); budget for it before using this on a long run.
         #[arg(long)]
         pub(crate) deterministic: bool,
 

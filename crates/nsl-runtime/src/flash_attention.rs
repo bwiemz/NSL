@@ -36,6 +36,25 @@ static SDPA_FUSED_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// How many device-side flash BACKWARD calls were routed to the deterministic
+/// CPU reference instead of the atomicAdd phase-2 kernel.
+///
+/// Always live (one relaxed increment per backward). A determinism gate that
+/// only diffs two loss streams passes just as well when the routing it means to
+/// exercise never happened — at toy scale the atomics do not collide, so the
+/// nondeterministic kernel is bit-reproducible too, and that is exactly how the
+/// existing toy gate certified a guarantee the 50M model did not have. Asserting
+/// this counter is non-zero is what makes such a gate non-vacuous.
+pub static FLASH_BWD_DET_ROUTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// In-process getter (same family as `nsl_fase_fused_step_count`): lets a gate
+/// assert the deterministic backward route fired without scraping stderr.
+#[no_mangle]
+pub extern "C" fn nsl_flash_bwd_det_routed_count() -> i64 {
+    FLASH_BWD_DET_ROUTED.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
 /// Test/diagnostic probe: number of successful fused-forward launches for
 /// `variant` (0 = base kernel, 1 = Tier-B tile-skip). Any other variant
 /// returns -1. Counts whole FFI calls, not per-batch-row kernel launches.
@@ -6717,11 +6736,56 @@ pub extern "C" fn nsl_flash_attention_backward(
         // across runs (the FASE-vs-plain-AdamW parity gate, M46-style
         // determinism audits, bisections) needs this knob until a
         // deterministic-reduction backward variant exists.
-        let force_cpu_bwd = std::env::var("NSL_FLASH_BWD_CPU").ok().as_deref() == Some("1");
-        if force_cpu_bwd && flash_debug && dout_t.device > 0 {
-            eprintln!(
-                "[flash-bwd] NSL_FLASH_BWD_CPU=1 — deterministic CPU reference backward forced"
-            );
+        //
+        // `--deterministic` NOW IMPLIES IT. That paragraph named "M46-style
+        // determinism audits" as a caller needing the knob, but M46 is the
+        // flag itself, and it was never wired here — so the flag's documented
+        // device bit-reproducibility contract was silently false for any model
+        // whose backward reaches this kernel.
+        //
+        // Measured (models/coder50m/det_train_check.nsl, 3 replicates, 16
+        // micro-steps at Coder-50M, --seed 1000 --source-ad --deterministic):
+        //   baseline                  max spread 1.09e-4, first diff at step 2
+        //   NSL_FLASH_BWD_CPU=1       max spread 0.000e+00  (all 3 identical)
+        //   NSL_EMBEDDING_BWD_CPU=1   max spread 1.39e-4    (NOT the cause)
+        //   NSL_SDPA_FUSED_DISABLE=1  max spread 1.78e-4    (NOT the cause)
+        // The forward is already bit-deterministic at this scale (3 replicates
+        // x 8 passes, spread 0.000e+00), which is why the divergence first
+        // appears at the step AFTER an optimizer update rather than at step 0.
+        //
+        // WHY THIS IS SCALE-DEPENDENT, i.e. why the toy-scale gate passed while
+        // 50M failed: the atomics only collide when several query blocks reduce
+        // into the same dK/dV tile. A 6-step toy model is small enough that the
+        // race has no room to express itself, so bit-identity there certifies
+        // nothing about a real model. A determinism gate must run AT SCALE.
+        //
+        // COST: this routes the whole flash backward to the host reference,
+        // which is slow (nsys once put the CPU GQA backward at ~50% of process
+        // CPU time at the 16M base config). That is the same trade M46 already
+        // makes elsewhere — its deterministic sum/mean kernels are sequential
+        // single-thread PTX. Correctness first; the standing fix is a
+        // deterministic-reduction phase-2 kernel (own each dK/dV tile with one
+        // block and loop the query blocks, as the deterministic embedding
+        // backward already does), which is a kernel project, not a routing one.
+        let deterministic_mode = crate::deterministic_ops::is_deterministic();
+        let force_cpu_bwd = deterministic_mode
+            || std::env::var("NSL_FLASH_BWD_CPU").ok().as_deref() == Some("1");
+        if force_cpu_bwd && dout_t.device > 0 {
+            // Counted, not just logged: a gate needs to prove the deterministic
+            // route was actually TAKEN. A determinism test that only compares
+            // two loss streams passes just as well when the kernel it means to
+            // exercise never ran.
+            FLASH_BWD_DET_ROUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if flash_debug {
+                let why = if deterministic_mode {
+                    "--deterministic"
+                } else {
+                    "NSL_FLASH_BWD_CPU=1"
+                };
+                eprintln!(
+                    "[flash-bwd] {why} — deterministic CPU reference backward forced"
+                );
+            }
         }
 
         // GQA GPU envelope (scaling campaign item 1): the phase-1/phase-2
