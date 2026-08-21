@@ -694,8 +694,12 @@ pub extern "C" fn nsl_train_checkpoint_save(
         }
     }
     let resume = format!(
-        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset}}}"#,
+        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}"}}"#,
         hl = (dl_ptr != 0) as u64,
+        // The compile-flag record installed by main(). Empty for a program
+        // built before the fingerprint existed; the loader treats empty as
+        // "unknown" and skips the comparison rather than refusing.
+        exec_fp = crate::exec_fingerprint::exec_fingerprint(),
         seed_hex = rng.seed_hex(),
         hi = (rng.sampling_pos >> 64) as u64,
         lo = rng.sampling_pos as u64,
@@ -992,6 +996,18 @@ pub extern "C" fn nsl_train_checkpoint_load(
             loader_id: num(b"\"loader_id\":", "loader_id"),
             global_seed: num(b"\"global_seed\":", "global_seed"),
             global_seed_set: num(b"\"global_seed_set\":", "global_seed_set") != 0,
+            exec: match scan_header_string(header_bytes, b"\"exec\":") {
+                None => String::new(),
+                Some(raw) => String::from_utf8(raw).unwrap_or_else(|_| {
+                    eprintln!(
+                        "nsl: train_checkpoint_load: the sidecar's 'exec' \
+                         record is not valid UTF-8. Treating it as absent \
+                         would silently disable the compile-flag check, so \
+                         this refuses instead — the checkpoint is corrupt."
+                    );
+                    std::process::abort();
+                }),
+            },
             rng: crate::rng_state::RngSnapshot {
                 sampling_seed,
                 sampling_pos: ((hi as u128) << 64) | (lo as u128),
@@ -1029,6 +1045,58 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 fmt(r.global_seed_set, r.global_seed),
             );
             std::process::abort();
+        }
+
+        // The compile flags that decided the arithmetic. `--seed` above is
+        // guarded because it is a live RNG input; these are guarded for the
+        // same reason one level up — they decide what the step COMPUTES, and
+        // they live on the command line, not in the recipe. Dropping
+        // `--source-ad` or `--deterministic` on a resume continues theta and
+        // the moments under different arithmetic, with no diagnostic.
+        //
+        // An empty record on EITHER side means "built before this existed".
+        // Refusing then would make every pre-existing checkpoint unresumable
+        // to enforce a property those builds never claimed, so it warns once
+        // and continues.
+        let live_exec = crate::exec_fingerprint::exec_fingerprint();
+        if r.exec.is_empty() || live_exec.is_empty() {
+            let which = if r.exec.is_empty() { "checkpoint" } else { "this run" };
+            eprintln!(
+                "nsl: train_checkpoint_load: no execution fingerprint in {which} \
+                 — the compile-flag check is SKIPPED for this resume. A build \
+                 predating the fingerprint cannot prove it used the same AD \
+                 mode, dtype or fusion settings; re-save from a current build \
+                 to restore the check."
+            );
+        } else {
+            let arith = crate::exec_fingerprint::arithmetic_diff(&r.exec, &live_exec);
+            if !arith.is_empty() {
+                eprintln!(
+                    "nsl: train_checkpoint_load: '{optim_path}' was written by a \
+                     build whose ARITHMETIC differs from this one:\n{}\n  \
+                     Resuming would continue theta and the optimizer moments \
+                     while changing what a step computes, which is not a \
+                     continuation of that run. Re-run with the saved flags, or \
+                     start a new run.",
+                    crate::exec_fingerprint::render(&arith)
+                );
+                std::process::abort();
+            }
+            // Placement-class changes are legitimate — the production 1B
+            // recipe resumes with --optim-state-offload toggled, and the
+            // arena carries its own byte-identity gate. Say so anyway: the
+            // operator asked for a continuation and should know the shape of
+            // the run changed under them.
+            let placement = crate::exec_fingerprint::placement_diff(&r.exec, &live_exec);
+            if !placement.is_empty() {
+                eprintln!(
+                    "nsl: train_checkpoint_load: resuming with different memory \
+                     placement than '{optim_path}' was saved under:\n{}\n  \
+                     These are value-neutral by construction, so the resume \
+                     continues.",
+                    crate::exec_fingerprint::render(&placement)
+                );
+            }
         }
 
         // `epochs` is the run TOTAL (see this function's doc). A checkpoint
@@ -1280,6 +1348,12 @@ pub extern "C" fn nsl_train_checkpoint_load(
 /// determines what the next training step computes.
 struct ResumeState {
     train_epoch: u64,
+    /// The compile-flag record (`k=v,k=v`) installed by the SAVING run's
+    /// `main()`. Empty when that program predates the fingerprint — which
+    /// is why the comparison skips rather than refuses on empty: every
+    /// checkpoint written before this feature would otherwise become
+    /// unresumable.
+    exec: String,
     /// Whether the SAVING run had a DataLoader. Distinguishes "loader at
     /// epoch 0 slot 0" from "no loader at all" — without it, a loader-less
     /// checkpoint and a loader checkpoint saved before its first batch are

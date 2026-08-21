@@ -1536,6 +1536,82 @@ pub struct CompileOptions {
         Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
 }
 
+impl CompileOptions {
+    /// The execution fingerprint written into the checkpoint sidecar.
+    ///
+    /// A stable, human-readable `k=v,k=v` rendering of the compile flags that
+    /// decide **what arithmetic the program performs** and **where it puts
+    /// bytes**. `nsl-runtime`'s `exec_fingerprint` module splits these keys
+    /// into an arithmetic class (a resume mismatch aborts) and a placement
+    /// class (it warns); see that module for why the split exists.
+    ///
+    /// Three properties this must keep, because a resume guard is only as
+    /// good as its fingerprint:
+    ///
+    /// 1. **Order is fixed here, not sorted at compare time.** The runtime
+    ///    parses by key, so ordering is cosmetic for correctness — but a
+    ///    stable order keeps the string diffable by eye in a saved sidecar.
+    /// 2. **Every value is a closed vocabulary, never a `Debug` rendering.**
+    ///    A `{:?}` on an enum silently changes the fingerprint of every
+    ///    checkpoint the day someone renames a variant, turning old sidecars
+    ///    into spurious refusals.
+    /// 3. **No key is omitted when false.** `fuse_rms=0` and an absent
+    ///    `fuse_rms` are different facts: absent means "a build that predates
+    ///    the key", which is the back-compatible case the runtime skips.
+    ///    Omitting false values would make every default build look like an
+    ///    old one.
+    pub fn exec_fingerprint(&self) -> String {
+        let b = |v: bool| if v { "1" } else { "0" };
+        let ckpt = if self.checkpoint_selective {
+            "selective".to_string()
+        } else if self.checkpoint_blocks {
+            match self.checkpoint_stride {
+                CheckpointStride::Fixed(n) => format!("blocks:{n}"),
+                CheckpointStride::Auto => "blocks:auto".to_string(),
+                CheckpointStride::Dp => "blocks:dp".to_string(),
+            }
+        } else {
+            "none".to_string()
+        };
+        let lmhead = match self.lm_head_fusion {
+            crate::lm_head_inference::LmHeadFusion::Off => "off",
+            crate::lm_head_inference::LmHeadFusion::Auto => "auto",
+            crate::lm_head_inference::LmHeadFusion::Require => "require",
+        };
+        let zero = match self.zero_stage {
+            Some(n) => n.to_string(),
+            None => "none".to_string(),
+        };
+        // `dtype` reaches us as a user-supplied string; a comma or an `=` in
+        // it would forge extra fields when the runtime parses the record.
+        // Sanitise rather than trust — the cost of a wrong split here is a
+        // silently skipped arithmetic check.
+        let dtype = self
+            .dtype
+            .replace([',', '='], "_")
+            .to_ascii_lowercase();
+        [
+            format!("ad={}", if self.source_ad { "source" } else { "tape" }),
+            format!("det={}", b(self.deterministic)),
+            format!("dtype={dtype}"),
+            format!("fusion={}", if self.disable_fusion { "off" } else { "on" }),
+            format!("fuse_rms={}", b(self.fuse_rmsnorm_backward)),
+            format!("fuse_wgrad={}", b(self.fuse_wgrad_accum)),
+            format!("zero={zero}"),
+            format!("zero_elem={}", b(self.zero_elementwise)),
+            format!("ws={}", self.world_size),
+            format!("muon_bns={}", b(self.muon_batch_ns)),
+            format!("muon_resmom={}", b(self.muon_resident_momentum)),
+            format!("lmhead={lmhead}"),
+            format!("arena={}", b(self.transient_arena)),
+            format!("graphs={}", b(self.cuda_graphs)),
+            format!("ckpt={ckpt}"),
+            format!("offload={}", b(self.optim_state_offload)),
+        ]
+        .join(",")
+    }
+}
+
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {

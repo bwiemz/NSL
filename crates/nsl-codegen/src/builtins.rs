@@ -2886,6 +2886,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // --- M46: Global deterministic mode flag + RNG seeding ---
     ("nsl_set_deterministic", &[types::I64], Some(types::I64)),
     ("nsl_rng_seed", &[types::I64], Some(types::I64)),
+    // Execution fingerprint: (ptr, len) of a .rodata k=v record naming the
+    // compile flags that decide training arithmetic. Installed before user
+    // code so a checkpoint written later carries it.
+    (
+        "nsl_set_exec_fingerprint",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     // --- M48: Multimodal primitives ---
     (
         "nsl_patch_embed",
