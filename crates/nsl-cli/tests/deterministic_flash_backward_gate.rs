@@ -1,9 +1,13 @@
 //! M46: `--deterministic` must actually deliver run-to-run bit-reproducibility
 //! for a program whose backward reaches the flash-attention kernel.
 //!
-//! THE BUG THIS PINS. The flash phase-2 backward accumulates dK/dV with float
-//! `atomicAdd`, so its rounding depends on scheduling order: two runs of the
-//! same program produce slightly different gradients. `flash_attention.rs`
+//! THE BUG THIS PINS. The flash phase-2 backward accumulates **dQ** with a
+//! cross-CTA `atom.global.add.f32`, so its rounding depends on scheduling
+//! order: two runs of the same program produce slightly different gradients.
+//! (It is dQ, not dK/dV. Each CTA owns one (batch-head, kv-tile) and loops the
+//! Q tiles, keeping dK/dV in its own SMEM; dQ is the only cross-block
+//! reduction. The contending-CTA count is batch x heads x ceil(seq/block_kv),
+//! which is the quantity the fixture's geometry preserves.) `flash_attention.rs`
 //! documented that and offered `NSL_FLASH_BWD_CPU=1`, naming "M46-style
 //! determinism audits" as a caller that needs the knob — but M46 *is*
 //! `--deterministic`, and the flag was never wired to it. Only two runtime
@@ -76,6 +80,10 @@ fn spawn_drain<R: Read + Send + 'static>(
 /// Run the fixture once. `NSL_FLASH_DEBUG=1` is always set: the routing
 /// decision is the thing under test, so the gate must be able to see it.
 fn run_fixture(tag: &str, deterministic: bool) -> RunOutput {
+    run_fixture_env(tag, deterministic, &[])
+}
+
+fn run_fixture_env(tag: &str, deterministic: bool, envs: &[(&str, &str)]) -> RunOutput {
     let root = repo_root();
     let src = std::fs::read_to_string(
         root.join("crates/nsl-cli/tests/fixtures/deterministic_flash_bwd.nsl"),
@@ -97,6 +105,7 @@ fn run_fixture(tag: &str, deterministic: bool) -> RunOutput {
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .env("NSL_FLASH_DEBUG", "1")
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -145,10 +154,27 @@ fn loss_text(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-fn det_route_count(stderr: &str) -> usize {
-    stderr
-        .matches("deterministic CPU reference backward forced")
-        .count()
+/// The routing witness, read from the program's own STDOUT.
+///
+/// This used to scrape an `NSL_FLASH_DEBUG` stderr line, which review correctly
+/// called out: the runtime counter added alongside the fix was exported but
+/// unreachable (no builtin registration, and `nsl run` execs the program as a
+/// separate process, so a test linking nsl-runtime reads its own always-zero
+/// copy). The counter is now a real builtin — `flash_bwd_det_routed_count()` —
+/// and the fixture prints it, so the gate asserts the value the runtime
+/// actually incremented rather than the presence of a debug string.
+fn det_route_count(stdout: &str) -> usize {
+    stdout
+        .split("DET_ROUTED")
+        .nth(1)
+        .and_then(|s| s.lines().map(str::trim).find(|l| !l.is_empty()))
+        .and_then(|l| {
+            l.trim_start_matches("tensor([")
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|p| !p.is_empty())
+                .and_then(|d| d.parse::<usize>().ok())
+        })
+        .unwrap_or_else(|| panic!("no DET_ROUTED witness in stdout:\n{stdout}"))
 }
 
 #[test]
@@ -175,7 +201,7 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
         // test passes when --deterministic silently stops routing and the
         // kernel merely happens to agree.
         assert!(
-            det_route_count(&out.stderr) > 0,
+            det_route_count(&out.stdout) > 0,
             "deterministic run {r} never reported the CPU-reference backward \
              route — --deterministic is no longer reaching the flash backward, \
              so any bit-identity below is accidental:\n{}",
@@ -208,7 +234,7 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
             out.stdout, out.stderr
         );
         assert_eq!(
-            det_route_count(&out.stderr),
+            det_route_count(&out.stdout),
             0,
             "plain run {r} took the deterministic CPU route without \
              --deterministic — the routing predicate is inverted or the env is \
@@ -238,10 +264,11 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
         assert!(
             dispatch.contains(want),
             "flash backward dispatched at the wrong geometry: expected {want} \
-             in `{dispatch}`. The fixture's contention (16 query blocks per \
-             dK/dV tile at 8 heads) is measured, not incidental — at 2 heads / \
-             seq 256 the kernel runs and is still bit-identical, which would \
-             make this whole gate vacuous"
+             in `{dispatch}`. The fixture's contention (batch 2 x 8 heads x 16 \
+             kv tiles = 256 CTAs all atomically accumulating into the same dQ \
+             rows) is measured, not incidental — at 2 heads / seq 256 that is \
+             32 CTAs, the kernel runs, and it is still bit-identical, which \
+             would make this whole gate vacuous"
         );
     }
 
@@ -254,5 +281,61 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
          expresses, or the phase-2 kernel is now deterministic — in both cases \
          the positive arm above has stopped being evidence and this gate needs \
          re-deriving, not deleting"
+    );
+}
+
+/// The `NSL_FLASH_BWD_CPU` escape hatch is TRI-STATE, and each state is pinned
+/// here because the middle one (unset) is the only one the main test covers.
+///
+/// The routing is correct by default but costs ~36x per step at Coder-50M, and
+/// several existing GPU gates pass `--deterministic` for reasons unrelated to
+/// attention. `=0` buys their speed back at the price of the guarantee, so it
+/// has to be LOUD — a silent opt-out would reintroduce exactly the situation
+/// this campaign fixed: a run that believes it is reproducible and is not.
+///
+/// Note what is asserted and what is not. The warning and the route count are
+/// deterministic facts about the routing decision. Whether the opted-out run
+/// then actually DIVERGES is a race, and the main test already carries that
+/// assertion once, where its reliability was measured (6/6 distinct streams).
+/// Asserting it twice would double the flake surface for no extra coverage.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn flash_bwd_cpu_env_overrides_deterministic_loudly() {
+    // `=0` under --deterministic: opt out, and say so.
+    let out = run_fixture_env("optout", true, &[("NSL_FLASH_BWD_CPU", "0")]);
+    assert!(
+        out.success,
+        "opt-out run failed:\nstdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    assert_eq!(
+        det_route_count(&out.stdout),
+        0,
+        "NSL_FLASH_BWD_CPU=0 did not disable the deterministic route — the \
+         opt-out is dead, so anyone setting it silently keeps paying the ~36x \
+         cost they set it to avoid:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("NSL_FLASH_BWD_CPU=0 overrides --deterministic"),
+        "opting out of --deterministic's bit-reproducibility printed no \
+         warning. A run that quietly loses the guarantee it was asked for is \
+         the bug this gate exists to prevent:\n{}",
+        out.stderr
+    );
+
+    // `=1` WITHOUT --deterministic: force the CPU reference anyway. This is the
+    // pre-existing contract the fix had to preserve, not replace.
+    let out = run_fixture_env("force", false, &[("NSL_FLASH_BWD_CPU", "1")]);
+    assert!(
+        out.success,
+        "forced-CPU run failed:\nstdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        det_route_count(&out.stdout) > 0,
+        "NSL_FLASH_BWD_CPU=1 no longer forces the CPU reference backward \
+         without --deterministic — the original knob regressed:\n{}",
+        out.stderr
     );
 }

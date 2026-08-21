@@ -120,6 +120,18 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // M46 anti-vacuity probe: how many device flash BACKWARD calls were routed
+    // to the deterministic CPU reference instead of the atomicAdd phase-2
+    // kernel. A determinism gate that only diffs loss streams passes just as
+    // well when the routing never fired, so the gate asserts this is non-zero.
+    def(
+        "flash_bwd_det_routed_count",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
     def(
         "gpu_alloc_count",
         Type::Function {

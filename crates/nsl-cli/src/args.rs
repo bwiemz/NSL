@@ -361,8 +361,9 @@ pub(crate) struct CheckArgs {
         /// M46: Deterministic mode. Compile-time non-determinism detection AND
         /// runtime routing to bit-reproducible kernel variants: the no-atomics
         /// embedding backward, the non-coalesced `sum_dim` route, and the
-        /// flash-attention backward (whose phase-2 kernel accumulates dK/dV
-        /// with float atomicAdd, so its rounding follows scheduling order).
+        /// flash-attention backward (whose phase-2 kernel accumulates dQ with
+        /// a cross-CTA float atomicAdd, so its rounding follows scheduling
+        /// order).
         ///
         /// The flash backward has no deterministic GPU variant yet, so this
         /// routes it to the CPU reference — correct, and roughly 36x the
@@ -662,8 +663,9 @@ pub(crate) struct BuildArgs {
         /// M46: Deterministic mode. Compile-time non-determinism detection AND
         /// runtime routing to bit-reproducible kernel variants: the no-atomics
         /// embedding backward, the non-coalesced `sum_dim` route, and the
-        /// flash-attention backward (whose phase-2 kernel accumulates dK/dV
-        /// with float atomicAdd, so its rounding follows scheduling order).
+        /// flash-attention backward (whose phase-2 kernel accumulates dQ with
+        /// a cross-CTA float atomicAdd, so its rounding follows scheduling
+        /// order).
         ///
         /// The flash backward has no deterministic GPU variant yet, so this
         /// routes it to the CPU reference — correct, and roughly 36x the
@@ -1271,8 +1273,9 @@ pub(crate) struct RunArgs {
         /// M46: Deterministic mode. Compile-time non-determinism detection AND
         /// runtime routing to bit-reproducible kernel variants: the no-atomics
         /// embedding backward, the non-coalesced `sum_dim` route, and the
-        /// flash-attention backward (whose phase-2 kernel accumulates dK/dV
-        /// with float atomicAdd, so its rounding follows scheduling order).
+        /// flash-attention backward (whose phase-2 kernel accumulates dQ with
+        /// a cross-CTA float atomicAdd, so its rounding follows scheduling
+        /// order).
         ///
         /// The flash backward has no deterministic GPU variant yet, so this
         /// routes it to the CPU reference — correct, and roughly 36x the

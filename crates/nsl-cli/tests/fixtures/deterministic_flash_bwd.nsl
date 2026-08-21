@@ -10,22 +10,26 @@
 # nothing about it.
 #
 # THE GEOMETRY BELOW IS MEASURED, NOT GUESSED. The flash phase-2 backward
-# accumulates dK/dV with float atomicAdd, so its rounding depends on scheduling
-# order — but the race only expresses when the launch is big enough for the
-# scheduler to vary. Two things both have to be true, and a fixture can satisfy
-# one while quietly failing the other:
+# accumulates **dQ** with a cross-CTA `atom.global.add.f32`, so its rounding
+# depends on scheduling order.
 #
-#   1. SEVERAL QUERY BLOCKS must reduce into the same dK/dV tile.
-#      head_dim = 64 -> select_backward_blocks(64) = (block_q 32, block_kv 32),
-#      so seq_len = 512 gives 16 query blocks. A fixture with head_dim <= 32
-#      (block_q 64) and a short sequence yields ONE query block and no
-#      contention at all.
+# IT IS dQ, NOT dK/dV — an earlier draft of this header said dK/dV and derived
+# its sizing rule from that, which is backwards. The phase-2 grid is
+# (B*nh, ceil(S/block_kv), 1): each CTA already OWNS one (batch-head, kv-tile)
+# and loops the Q tiles, accumulating dK/dV in its own SMEM. dQ is the only
+# cross-block reduction, because EVERY kv-tile CTA adds into the same dQ rows.
 #
-#   2. THE GRID must be large enough that the order actually varies. An earlier
-#      draft of this file used 2 heads at seq 256 and was BIT-IDENTICAL across 3
-#      replicates even with the bug present — the atomic kernel ran (verified by
-#      the dispatch line) and still agreed. That draft would have shipped a gate
-#      that passes whether or not the bug exists.
+# So the quantity that keeps the race alive is the NUMBER OF CONTENDING CTAs on
+# dQ = batch x heads x ceil(seq_len / block_kv), and a maintainer resizing this
+# fixture must preserve THAT, not a query-block count:
+#
+#   head_dim = 64 -> select_backward_blocks(64) = (block_q 32, block_kv 32)
+#   seq_len  = 512 -> 16 kv tiles;  x 8 heads x batch 2 = 256 contending CTAs
+#
+# An earlier draft at 2 heads / seq 256 gives 8 x 2 x 2 = 32 CTAs, and it was
+# BIT-IDENTICAL across 3 replicates even with the bug present — the atomic
+# kernel ran (verified by the dispatch line) and still agreed. That draft would
+# have shipped a gate that passes whether or not the bug exists.
 #
 # Measured divergence with the fix REMOVED, one run per row, 3 replicates each:
 #      heads 2, seq  256   max spread 9.5e-07   (marginal, and once 0.0)
@@ -54,7 +58,7 @@ model FlashProbe:
         let s = sh[1]
         let emb = embedding_lookup(self.embed, input_ids.reshape([b * s]))
         let h = emb.reshape([b, s, 512])
-        # 8 heads x head_dim 64 -> block_q 32; s=512 -> 16 query blocks per tile
+        # 8 heads x head_dim 64 -> block_kv 32; s=512 -> 16 kv tiles/head
         let q = (h @ self.wq).reshape([b, 8, s, 64])
         let k = (h @ self.wk).reshape([b, 8, s, 64])
         let v = (h @ self.wv).reshape([b, 8, s, 64])
@@ -89,4 +93,11 @@ train(model=m, epochs=1, grad_accumulation=1):
             print(loss)
 
 print("LOSS_STREAM_END")
+
+# Anti-vacuity witness, read by the gate from STDOUT. Counts device flash
+# BACKWARD calls routed to the deterministic CPU reference. Asserting this is
+# non-zero is what stops the gate from passing when --deterministic silently
+# stops reaching the kernel and the loss streams merely happen to agree.
+print("DET_ROUTED")
+print(flash_bwd_det_routed_count())
 print("DETERMINISTIC_FLASH_BWD_COMPLETE")

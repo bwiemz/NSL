@@ -145,6 +145,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // + stable allocation identity. First in-process VRAM-peak API — gates and
     // WGGO read these instead of scraping NSL_MEMSTATS stderr.
     ("nsl_gpu_peak_allocated_bytes", &[], Some(types::I64)),
+    ("nsl_flash_bwd_det_routed_count", &[], Some(types::I64)),
     ("nsl_gpu_cumulative_alloc_count", &[], Some(types::I64)),
     ("nsl_gpu_surface_peak_bytes", &[types::I8], Some(types::I64)),
     ("nsl_gpu_surface_at_peak_bytes", &[types::I8], Some(types::I64)),

@@ -6730,12 +6730,24 @@ pub extern "C" fn nsl_flash_attention_backward(
 
         // NSL_FLASH_BWD_CPU=1 forces the deterministic CPU reference backward
         // even when backward PTX is available. The GPU phase-2 kernel
-        // accumulates dK/dV with float atomicAdd, so its rounding depends on
-        // scheduling order: two training runs of the SAME program produce
-        // slightly different gradients. Anything that compares checkpoints
-        // across runs (the FASE-vs-plain-AdamW parity gate, M46-style
-        // determinism audits, bisections) needs this knob until a
+        // accumulates **dQ** with a cross-CTA `atom.global.add.f32`, so its
+        // rounding depends on scheduling order: two training runs of the SAME
+        // program produce slightly different gradients. Anything that compares
+        // checkpoints across runs (the FASE-vs-plain-AdamW parity gate,
+        // M46-style determinism audits, bisections) needs this knob until a
         // deterministic-reduction backward variant exists.
+        //
+        // IT IS dQ, NOT dK/dV. An earlier version of this comment (and of the
+        // clap help, bugs.md and the gate fixture) said dK/dV, which is exactly
+        // backwards and would send the next engineer at a no-op. The phase-2
+        // grid is (B*nh, ceil(S/block_kv), 1): each CTA already OWNS one
+        // (batch-head, kv-tile) and loops the Q tiles, and dK/dV accumulate in
+        // that CTA's SMEM via `emit_smem_atom_add_f32` — nsl-codegen's own
+        // header says "the group reduction never touches global atomics, so
+        // determinism matches the MHA kernel (dQ keeps the same cross-CTA
+        // atom.global.add it always had)". Every KV-tile CTA adds into the same
+        // dQ rows, so dQ is the only cross-block reduction and the contention
+        // scales with the NUMBER OF KV TILES, not with query blocks.
         //
         // `--deterministic` NOW IMPLIES IT. That paragraph named "M46-style
         // determinism audits" as a caller needing the knob, but M46 is the
@@ -6753,23 +6765,54 @@ pub extern "C" fn nsl_flash_attention_backward(
         // x 8 passes, spread 0.000e+00), which is why the divergence first
         // appears at the step AFTER an optimizer update rather than at step 0.
         //
-        // WHY THIS IS SCALE-DEPENDENT, i.e. why the toy-scale gate passed while
-        // 50M failed: the atomics only collide when several query blocks reduce
-        // into the same dK/dV tile. A 6-step toy model is small enough that the
-        // race has no room to express itself, so bit-identity there certifies
-        // nothing about a real model. A determinism gate must run AT SCALE.
+        // WHY THIS LOOKS SCALE-DEPENDENT: the dQ atomics only collide when many
+        // kv-tile CTAs write the same dQ rows, and that count is
+        // batch x heads x ceil(seq/block_kv). A small launch gives the race no
+        // room, so bit-identity there certifies nothing about a real model.
+        // (The toy gate had a second, independent problem: its fixture is
+        // attention-free by design, so it never ran this kernel at all.)
         //
         // COST: this routes the whole flash backward to the host reference,
         // which is slow (nsys once put the CPU GQA backward at ~50% of process
         // CPU time at the 16M base config). That is the same trade M46 already
         // makes elsewhere — its deterministic sum/mean kernels are sequential
-        // single-thread PTX. Correctness first; the standing fix is a
-        // deterministic-reduction phase-2 kernel (own each dK/dV tile with one
-        // block and loop the query blocks, as the deterministic embedding
-        // backward already does), which is a kernel project, not a routing one.
+        // single-thread PTX. Correctness first.
+        //
+        // THE STANDING FIX IS A dQ PASS, and it is NOT what an earlier draft of
+        // this comment claimed. "Own each dK/dV tile with one block and loop the
+        // query blocks" is already precisely what phase 2 does, so implementing
+        // it changes nothing and leaves the dQ atomic untouched. What is needed
+        // is to remove the cross-CTA reduction on dQ: either accumulate dQ into
+        // per-KV-tile scratch and reduce it in a fixed order, or add a second
+        // pass with the parallelization transposed (own each Q tile, loop the KV
+        // tiles) so each dQ row has exactly one writer — the standard FA-2
+        // split-kernel shape. Either is a PTX project, not a routing change.
+        // NSL_FLASH_BWD_CPU is tri-state, because the routing is correct by
+        // default but expensive (~36x/step at Coder-50M), and several existing
+        // GPU gates pass `--deterministic` for reasons that have nothing to do
+        // with the attention backward. Without a valve those all pay the cost.
+        //   unset  -> `--deterministic` decides
+        //   "1"    -> force the CPU reference even without the flag
+        //   "0"    -> OPT OUT of the deterministic routing, loudly
+        // The opt-out is deliberately noisy on stderr rather than silent: it
+        // gives back exactly the guarantee the flag advertises, so a run that
+        // takes it should say so in its own log.
         let deterministic_mode = crate::deterministic_ops::is_deterministic();
-        let force_cpu_bwd = deterministic_mode
-            || std::env::var("NSL_FLASH_BWD_CPU").ok().as_deref() == Some("1");
+        let bwd_cpu_env = std::env::var("NSL_FLASH_BWD_CPU").ok();
+        let opted_out = bwd_cpu_env.as_deref() == Some("0");
+        if opted_out && deterministic_mode && dout_t.device > 0 {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[flash-bwd] WARNING: NSL_FLASH_BWD_CPU=0 overrides --deterministic. \
+                     The phase-2 backward accumulates dQ with a cross-CTA atomicAdd, so this \
+                     run is NOT bit-reproducible run-to-run."
+                );
+            }
+        }
+        let force_cpu_bwd = !opted_out
+            && (deterministic_mode || bwd_cpu_env.as_deref() == Some("1"));
         if force_cpu_bwd && dout_t.device > 0 {
             // Counted, not just logged: a gate needs to prove the deterministic
             // route was actually TAKEN. A determinism test that only compares
@@ -7183,12 +7226,37 @@ pub extern "C" fn nsl_flash_attention_backward(
     let mut dk_ptr = make_tensor(&dk_data, &kv_shape);
     let mut dv_ptr = make_tensor(&dv_data, &kv_shape);
 
-    // If inputs were on GPU, transfer gradient tensors to GPU to match device
+    // If inputs were on GPU, transfer gradient tensors to GPU to match device.
+    //
+    // FREE THE HOST ORIGINALS. `make_tensor` above builds these with
+    // `Box::into_raw`, not `NslTensor::publish`, so they are not scope-tracked
+    // and no sweep will ever reclaim them; `nsl_tensor_to_device` allocates a
+    // NEW tensor and frees only its own internal `transfer_src` temp, never its
+    // argument. Overwriting the local therefore orphaned the host buffer once
+    // per attention backward.
+    //
+    // This leak predates the M46 routing change, but that change is what makes
+    // it matter: this path used to be reached only by tape AD, irregular GQA,
+    // or a GPU refusal, and `--deterministic` now sends EVERY GPU attention
+    // backward through it. At coder50m (b=1, h=8, kv_h=4, s=1024, d=64) the
+    // three tensors are ~4 MiB per call, x8 blocks = ~32 MiB per micro-step —
+    // a 26,148-step run would orphan hundreds of GiB of host RAM and be
+    // OOM-killed long before it finished.
+    //
+    // Guard on pointer identity rather than assuming a copy: when source and
+    // target device already match, `nsl_tensor_to_device` returns the SAME
+    // pointer with an incremented refcount, and freeing that would drop a live
+    // reference.
     let input_device = q_t.device;
     if input_device > 0 {
-        dq_ptr = crate::tensor::nsl_tensor_to_device(dq_ptr, input_device as i64);
-        dk_ptr = crate::tensor::nsl_tensor_to_device(dk_ptr, input_device as i64);
-        dv_ptr = crate::tensor::nsl_tensor_to_device(dv_ptr, input_device as i64);
+        for slot in [&mut dq_ptr, &mut dk_ptr, &mut dv_ptr] {
+            let host_ptr = *slot;
+            let dev_ptr = crate::tensor::nsl_tensor_to_device(host_ptr, input_device as i64);
+            if dev_ptr != host_ptr {
+                crate::tensor::nsl_tensor_free(host_ptr);
+            }
+            *slot = dev_ptr;
+        }
     }
 
     // Pack into an NslList [dq, dk, dv]
