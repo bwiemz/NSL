@@ -114,6 +114,27 @@ impl Compiler<'_> {
             // runtime registry so `NSL_WRGA_FUSED_CUDA=1` can launch them.
             self.emit_fused_ptx_registration(&mut builder)?;
 
+            // Execution fingerprint: record the compile flags that decide
+            // training arithmetic, BEFORE any user statement runs. Emitted
+            // unconditionally — unlike --deterministic, whose call is skipped
+            // when the flag is off, an absent fingerprint is indistinguishable
+            // from a build that predates the feature, and the resume guard
+            // treats that as "unknown" rather than as a mismatch. A default
+            // build must therefore still say so explicitly.
+            {
+                let fp = self.compile_options.exec_fingerprint();
+                let fp_len = fp.len() as i64;
+                let fp_data_id = self.intern_string(&fp)?;
+                let fp_gv = self.module.declare_data_in_func(fp_data_id, builder.func);
+                let fp_ptr = builder.ins().symbol_value(cl_types::I64, fp_gv);
+                let fp_len_val = builder.ins().iconst(cl_types::I64, fp_len);
+                self.compile_call_by_name(
+                    &mut builder,
+                    "nsl_set_exec_fingerprint",
+                    &[fp_ptr, fp_len_val],
+                )?;
+            }
+
             // M46: Set global deterministic mode flag + seed RNG at program
             // start. P0 certification: --seed overrides the historical 42
             // and also seeds NON-deterministic runs (distinct reproducible

@@ -1536,6 +1536,93 @@ pub struct CompileOptions {
         Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
 }
 
+impl CompileOptions {
+    /// The execution fingerprint written into the checkpoint sidecar.
+    ///
+    /// A stable, human-readable `k=v,k=v` rendering of the compile flags that
+    /// decide **what arithmetic the program performs** and **where it puts
+    /// bytes**. `nsl-runtime`'s `exec_fingerprint` module splits these keys
+    /// into an arithmetic class (a resume mismatch aborts) and a placement
+    /// class (it warns); see that module for why the split exists.
+    ///
+    /// Three properties this must keep, because a resume guard is only as
+    /// good as its fingerprint:
+    ///
+    /// 1. **Order is fixed here, not sorted at compare time.** The runtime
+    ///    parses by key, so ordering is cosmetic for correctness — but a
+    ///    stable order keeps the string diffable by eye in a saved sidecar.
+    /// 2. **Every value is a closed vocabulary, never a `Debug` rendering.**
+    ///    A `{:?}` on an enum silently changes the fingerprint of every
+    ///    checkpoint the day someone renames a variant, turning old sidecars
+    ///    into spurious refusals.
+    /// 3. **No key is omitted when false.** `fuse_rms=0` and an absent
+    ///    `fuse_rms` are different facts: absent means "a build that predates
+    ///    the key", which is the back-compatible case the runtime skips.
+    ///    Omitting false values would make every default build look like an
+    ///    old one.
+    pub fn exec_fingerprint(&self) -> String {
+        let b = |v: bool| if v { "1" } else { "0" };
+        let ckpt = if self.checkpoint_selective {
+            "selective".to_string()
+        } else if self.checkpoint_blocks {
+            match self.checkpoint_stride {
+                CheckpointStride::Fixed(n) => format!("blocks:{n}"),
+                CheckpointStride::Auto => "blocks:auto".to_string(),
+                CheckpointStride::Dp => "blocks:dp".to_string(),
+            }
+        } else {
+            "none".to_string()
+        };
+        let lmhead = match self.lm_head_fusion {
+            crate::lm_head_inference::LmHeadFusion::Off => "off",
+            crate::lm_head_inference::LmHeadFusion::Auto => "auto",
+            crate::lm_head_inference::LmHeadFusion::Require => "require",
+        };
+        let zero = match self.zero_stage {
+            Some(n) => n.to_string(),
+            None => "none".to_string(),
+        };
+        // `dtype` reaches us as a user-supplied `--dtype` string and ends up
+        // inside a JSON string literal in the checkpoint sidecar. An ALLOWLIST,
+        // not a blocklist of the two separators: `,` and `=` would forge extra
+        // fields when the runtime splits the record, but a `\"` or a `\\`
+        // terminates the JSON value and corrupts the whole header — turning a
+        // resume guard into an unreadable checkpoint. Everything outside
+        // [a-z0-9._-] becomes `_`.
+        let dtype: String = self
+            .dtype
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        [
+            format!("ad={}", if self.source_ad { "source" } else { "tape" }),
+            format!("det={}", b(self.deterministic)),
+            format!("dtype={dtype}"),
+            format!("fusion={}", if self.disable_fusion { "off" } else { "on" }),
+            format!("fuse_rms={}", b(self.fuse_rmsnorm_backward)),
+            format!("fuse_wgrad={}", b(self.fuse_wgrad_accum)),
+            format!("zero={zero}"),
+            format!("zero_elem={}", b(self.zero_elementwise)),
+            format!("ws={}", self.world_size),
+            format!("muon_bns={}", b(self.muon_batch_ns)),
+            format!("muon_resmom={}", b(self.muon_resident_momentum)),
+            format!("lmhead={lmhead}"),
+            format!("arena={}", b(self.transient_arena)),
+            format!("graphs={}", b(self.cuda_graphs)),
+            format!("ckpt={ckpt}"),
+            format!("offload={}", b(self.optim_state_offload)),
+        ]
+        .join(",")
+    }
+}
+
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
@@ -1939,5 +2026,83 @@ mod calib_options_tests {
     fn compile_options_default_has_no_calibration_grad_retention() {
         let opts = CompileOptions::default();
         assert!(opts.calibration_grad_retention.is_none());
+    }
+}
+
+#[cfg(test)]
+mod exec_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn default_options_emit_every_key() {
+        let fp = CompileOptions::default().exec_fingerprint();
+        // Absent is meaningfully different from false: the runtime reads an
+        // absent key as "a build that predates it" and SKIPS the check. A
+        // default build must therefore state every key explicitly.
+        for key in [
+            "ad=", "det=", "dtype=", "fusion=", "fuse_rms=", "fuse_wgrad=", "zero=", "zero_elem=",
+            "ws=", "muon_bns=", "muon_resmom=", "lmhead=", "arena=", "graphs=", "ckpt=", "offload=",
+        ] {
+            assert!(fp.contains(key), "default fingerprint is missing {key}: {fp}");
+        }
+    }
+
+    #[test]
+    fn a_hostile_dtype_cannot_break_out_of_the_sidecar_json() {
+        // The record is embedded as `"exec":"<fp>"` in the sidecar header. A
+        // quote or a backslash would terminate that string and corrupt the
+        // whole header; a comma or an `=` would forge a field the runtime
+        // then compares. None may survive.
+        let mut o = CompileOptions {
+            dtype: r#"f32","evil":"x,y=z\"#.to_string(),
+            ..Default::default()
+        };
+        let fp = o.exec_fingerprint();
+        let dtype_field = fp
+            .split(',')
+            .find(|s| s.starts_with("dtype="))
+            .expect("dtype field present");
+        assert!(
+            !dtype_field.contains('"') && !dtype_field.contains('\\'),
+            "quote or backslash survived into the record: {dtype_field}"
+        );
+        assert_eq!(
+            fp.matches("dtype=").count(),
+            1,
+            "a separator survived and forged a second field: {fp}"
+        );
+        // The hostile text may survive as literal characters INSIDE the dtype
+        // value — that is harmless. What must not survive is its structure:
+        // the record still has exactly the field count a default build emits,
+        // so nothing was forged into a key the runtime would compare.
+        assert_eq!(
+            fp.split(',').count(),
+            CompileOptions::default().exec_fingerprint().split(',').count(),
+            "a hostile dtype changed the FIELD COUNT of the record: {fp}"
+        );
+        assert!(
+            fp.split(',').all(|f| f.matches('=').count() == 1),
+            "a segment carries more than one '=', so key/value split is ambiguous: {fp}"
+        );
+
+        o.dtype = "BF16-SR".to_string();
+        assert!(
+            o.exec_fingerprint().contains("dtype=bf16-sr"),
+            "ordinary dtypes must round-trip lowercased, not be mangled"
+        );
+    }
+
+    #[test]
+    fn ad_and_determinism_are_reflected() {
+        let o = CompileOptions {
+            source_ad: true,
+            deterministic: true,
+            ..Default::default()
+        };
+        let fp = o.exec_fingerprint();
+        assert!(fp.contains("ad=source") && fp.contains("det=1"), "{fp}");
+        let o2 = CompileOptions::default();
+        let fp2 = o2.exec_fingerprint();
+        assert!(fp2.contains("ad=tape") && fp2.contains("det=0"), "{fp2}");
     }
 }
