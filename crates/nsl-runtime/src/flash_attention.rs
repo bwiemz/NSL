@@ -6788,7 +6788,8 @@ pub extern "C" fn nsl_flash_attention_backward(
         // tiles) so each dQ row has exactly one writer — the standard FA-2
         // split-kernel shape. Either is a PTX project, not a routing change.
         // NSL_FLASH_BWD_CPU is tri-state, because the routing is correct by
-        // default but expensive (~36x/step at Coder-50M), and several existing
+        // default but expensive (~36x/step at Coder-50M; ~18x whole-program on
+        // pretrain_cert -- see DETERMINISM_M46_2026_08_22.md EC4), and several existing
         // GPU gates pass `--deterministic` for reasons that have nothing to do
         // with the attention backward. Without a valve those all pay the cost.
         //   unset  -> `--deterministic` decides
