@@ -5180,12 +5180,15 @@ impl Compiler<'_> {
         num_params_val: Value,
         lists: (Value, Value, Value, Value),
         sc: &crate::stmt_fase::FusedAdamwScalars,
+        // Live learning rate — see `fase_emit_final_step`. `sc.lr` is the
+        // plan's base rate and folding it here discards the schedule.
+        lr_runtime: Value,
         bc: (Value, Value),
         groups: (Value, Value),
         mp_scale: Value,
     ) -> Result<(), CodegenError> {
         let (param_list, state_list_1, state_list_2, accum) = lists;
-        let lr_v = builder.ins().f64const(sc.lr);
+        let lr_v = lr_runtime;
         let b1_v = builder.ins().f64const(sc.beta1);
         let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
         let b2_v = builder.ins().f64const(sc.beta2);
@@ -13956,6 +13959,11 @@ impl Compiler<'_> {
                 two_state: bool,
                 accum_val: Value,
                 recipe: &crate::fase::UpdateRecipe,
+                // Live learning rate at this group's update point — see
+                // `fase_emit_final_step`. CSLA fires group updates at window
+                // boundaries rather than at the main optimizer site, so this
+                // is read from `lr_var` at the call, not threaded from there.
+                lr_runtime: Value,
                 bc: (Value, Value),
                 wrap_precision: bool,
                 wrap_offload: bool,
@@ -14010,7 +14018,10 @@ impl Compiler<'_> {
                             let iv = builder.ins().iconst(cl_types::I64, i);
                             c.compile_call_by_name(builder, "nsl_list_push", &[il, iv])?;
                         }
-                        let lr_v = builder.ins().f64const(sc.lr);
+                        // LIVE rate, not sc.lr: FusedAdamwScalars is a compile-time plan and
+                        // its lr is the optimizer constructor's base rate. Everything
+                        // else here (betas, eps, wd) genuinely is compile-time.
+                        let lr_v = lr_runtime;
                         let b1_v = builder.ins().f64const(sc.beta1);
                         let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
                         let b2_v = builder.ins().f64const(sc.beta2);
@@ -14174,7 +14185,10 @@ impl Compiler<'_> {
                                  elem_scalars",
                             )
                         })?;
-                        let lr_v = builder.ins().f64const(sc.lr);
+                        // LIVE rate, not sc.lr: FusedAdamwScalars is a compile-time plan and
+                        // its lr is the optimizer constructor's base rate. Everything
+                        // else here (betas, eps, wd) genuinely is compile-time.
+                        let lr_v = lr_runtime;
                         let b1_v = builder.ins().f64const(sc.beta1);
                         let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
                         let b2_v = builder.ins().f64const(sc.beta2);
@@ -14302,6 +14316,7 @@ impl Compiler<'_> {
                             m_partial,
                             v,
                             recipe,
+                            lr_runtime,
                             Some(bc),
                             wrap_precision,
                             wrap_offload,
@@ -15364,6 +15379,9 @@ impl Compiler<'_> {
                 // classification + the list-membership fixpoint — no later
                 // range reads these params' OLD θ. Update, then free the
                 // layer's accumulators.
+                // Bound before the call: `builder` is mutably borrowed by the
+                // call itself, so the live rate cannot be read inside the args.
+                let csla_lr = builder.use_var(lr_var);
                 emit_csla_group_update(
                     self,
                     builder,
@@ -15373,6 +15391,7 @@ impl Compiler<'_> {
                     two_state,
                     accum_val,
                     &fase_plan.recipe,
+                    csla_lr,
                     (bc1_inv, bc2_inv),
                     wrap_precision,
                     self.compile_options.optim_state_offload,
@@ -15441,6 +15460,9 @@ impl Compiler<'_> {
             // Epilogue: globals (embedding / final norm / LM head), tied and
             // cross-layer params, dead layers, and anything the extractor
             // never saw — after the whole backward, like the baseline.
+            // Bound before the call: `builder` is mutably borrowed by the
+            // call itself, so the live rate cannot be read inside the args.
+            let csla_lr = builder.use_var(lr_var);
             emit_csla_group_update(
                 self,
                 builder,
@@ -15450,6 +15472,7 @@ impl Compiler<'_> {
                 two_state,
                 accum_val,
                 &fase_plan.recipe,
+                csla_lr,
                 (bc1_inv, bc2_inv),
                 wrap_precision,
                 self.compile_options.optim_state_offload,
@@ -15900,6 +15923,7 @@ impl Compiler<'_> {
                             num_params_val,
                             (param_list, state_list_1, state_list_2, accum),
                             &sc,
+                            lr,
                             (bc1_inv, bc2_inv),
                             (exempt_list_v, exempt_nr2_v),
                             // mp_scale: the clip factor, folded into the
@@ -15989,6 +16013,7 @@ impl Compiler<'_> {
                         pb_mpart,
                         pb_v,
                         &fase_plan.recipe,
+                        lr,
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
                         self.compile_options.optim_state_offload,
@@ -16046,6 +16071,7 @@ impl Compiler<'_> {
                             num_params_val,
                             (param_list, state_list_1, state_list_2, accum),
                             &sc,
+                            lr,
                             (bc1_inv, bc2_inv),
                             // AdamW parameter groups. 0 = no no_decay, in
                             // which case the runtime takes `wd` for every
@@ -16130,6 +16156,7 @@ impl Compiler<'_> {
                         m_partial,
                         v,
                         &fase_plan.recipe,
+                        lr,
                         (bc1_inv, bc2_inv),
                         wrap_precision,
                         Some(opt_step),
