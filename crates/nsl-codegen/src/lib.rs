@@ -1582,14 +1582,25 @@ impl CompileOptions {
             Some(n) => n.to_string(),
             None => "none".to_string(),
         };
-        // `dtype` reaches us as a user-supplied string; a comma or an `=` in
-        // it would forge extra fields when the runtime parses the record.
-        // Sanitise rather than trust — the cost of a wrong split here is a
-        // silently skipped arithmetic check.
-        let dtype = self
+        // `dtype` reaches us as a user-supplied `--dtype` string and ends up
+        // inside a JSON string literal in the checkpoint sidecar. An ALLOWLIST,
+        // not a blocklist of the two separators: `,` and `=` would forge extra
+        // fields when the runtime splits the record, but a `\"` or a `\\`
+        // terminates the JSON value and corrupts the whole header — turning a
+        // resume guard into an unreadable checkpoint. Everything outside
+        // [a-z0-9._-] becomes `_`.
+        let dtype: String = self
             .dtype
-            .replace([',', '='], "_")
-            .to_ascii_lowercase();
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         [
             format!("ad={}", if self.source_ad { "source" } else { "tape" }),
             format!("det={}", b(self.deterministic)),
@@ -2015,5 +2026,83 @@ mod calib_options_tests {
     fn compile_options_default_has_no_calibration_grad_retention() {
         let opts = CompileOptions::default();
         assert!(opts.calibration_grad_retention.is_none());
+    }
+}
+
+#[cfg(test)]
+mod exec_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn default_options_emit_every_key() {
+        let fp = CompileOptions::default().exec_fingerprint();
+        // Absent is meaningfully different from false: the runtime reads an
+        // absent key as "a build that predates it" and SKIPS the check. A
+        // default build must therefore state every key explicitly.
+        for key in [
+            "ad=", "det=", "dtype=", "fusion=", "fuse_rms=", "fuse_wgrad=", "zero=", "zero_elem=",
+            "ws=", "muon_bns=", "muon_resmom=", "lmhead=", "arena=", "graphs=", "ckpt=", "offload=",
+        ] {
+            assert!(fp.contains(key), "default fingerprint is missing {key}: {fp}");
+        }
+    }
+
+    #[test]
+    fn a_hostile_dtype_cannot_break_out_of_the_sidecar_json() {
+        // The record is embedded as `"exec":"<fp>"` in the sidecar header. A
+        // quote or a backslash would terminate that string and corrupt the
+        // whole header; a comma or an `=` would forge a field the runtime
+        // then compares. None may survive.
+        let mut o = CompileOptions {
+            dtype: r#"f32","evil":"x,y=z\"#.to_string(),
+            ..Default::default()
+        };
+        let fp = o.exec_fingerprint();
+        let dtype_field = fp
+            .split(',')
+            .find(|s| s.starts_with("dtype="))
+            .expect("dtype field present");
+        assert!(
+            !dtype_field.contains('"') && !dtype_field.contains('\\'),
+            "quote or backslash survived into the record: {dtype_field}"
+        );
+        assert_eq!(
+            fp.matches("dtype=").count(),
+            1,
+            "a separator survived and forged a second field: {fp}"
+        );
+        // The hostile text may survive as literal characters INSIDE the dtype
+        // value — that is harmless. What must not survive is its structure:
+        // the record still has exactly the field count a default build emits,
+        // so nothing was forged into a key the runtime would compare.
+        assert_eq!(
+            fp.split(',').count(),
+            CompileOptions::default().exec_fingerprint().split(',').count(),
+            "a hostile dtype changed the FIELD COUNT of the record: {fp}"
+        );
+        assert!(
+            fp.split(',').all(|f| f.matches('=').count() == 1),
+            "a segment carries more than one '=', so key/value split is ambiguous: {fp}"
+        );
+
+        o.dtype = "BF16-SR".to_string();
+        assert!(
+            o.exec_fingerprint().contains("dtype=bf16-sr"),
+            "ordinary dtypes must round-trip lowercased, not be mangled"
+        );
+    }
+
+    #[test]
+    fn ad_and_determinism_are_reflected() {
+        let o = CompileOptions {
+            source_ad: true,
+            deterministic: true,
+            ..Default::default()
+        };
+        let fp = o.exec_fingerprint();
+        assert!(fp.contains("ad=source") && fp.contains("det=1"), "{fp}");
+        let o2 = CompileOptions::default();
+        let fp2 = o2.exec_fingerprint();
+        assert!(fp2.contains("ad=tape") && fp2.contains("det=0"), "{fp2}");
     }
 }
