@@ -22,7 +22,6 @@ use crate::compiler::Compiler;
 /// Scalars extracted from a structurally-matched AdamW/Adam `UpdateProgram`
 /// (p9 fused optimizer step admission — see `match_adamw_program`).
 pub(crate) struct FusedAdamwScalars {
-    pub(crate) lr: f64,
     pub(crate) wd: f64,
     pub(crate) beta1: f64,
     pub(crate) one_minus_beta1: f64,
@@ -117,11 +116,17 @@ impl Compiler<'_> {
             UpdateOp::Div { dst: Register::Tmp, src: Register::MHat, divisor: Register::Tmp } => {}
             _ => return None,
         }
-        let (lr, wd) = match &program.ops[6] {
-            UpdateOp::Update { lr, wd, scaled_m: Register::Tmp } => (*lr, *wd),
+        // NOTE: `lr` is deliberately NOT extracted here. It used to be, and
+        // the emitters folded it into an `f64const` — which silently discarded
+        // every `scheduler:` clause in the language while the scheduler was
+        // still called, validated and reported. The live rate is threaded to
+        // the emitters as a runtime Value instead; keeping a plan-time `lr`
+        // field on this struct would just invite the same fold back.
+        let wd = match &program.ops[6] {
+            UpdateOp::Update { wd, scaled_m: Register::Tmp, .. } => *wd,
             _ => return None,
         };
-        Some(FusedAdamwScalars { lr, wd, beta1, one_minus_beta1, beta2, one_minus_beta2, eps })
+        Some(FusedAdamwScalars { wd, beta1, one_minus_beta1, beta2, one_minus_beta2, eps })
     }
 
     pub(crate) fn fase_emit_final_step(
@@ -132,6 +137,16 @@ impl Compiler<'_> {
         m_partial_ptr: Value,
         v_ptr: Value,
         recipe: &crate::fase::UpdateRecipe,
+        // The LIVE learning rate, read from the training loop's `lr_var`.
+        //
+        // This must be a runtime Value, not `recipe.lr`. The update program is
+        // a compile-time plan and its `lr` field is the BASE rate from the
+        // optimizer constructor; the `scheduler:` clause modulates lr every
+        // micro-step and writes the result back to `lr_var`. Folding the plan's
+        // constant into the emitted update — which is what this did — silently
+        // discarded that, so every scheduler in the language was inert while
+        // still being called, validated, and reported.
+        lr_runtime: Value,
         bc_params: Option<(Value, Value)>,  // (bc1_inv, bc2_inv) — None for non-AdamW
         wrap_precision: bool,  // CPDT precision-adaptive: wrap m/v in F32 cast/uncast
         // Optimizer-state offload (scaling campaign item 4): m/v are
@@ -299,7 +314,10 @@ impl Compiler<'_> {
             ));
         }
         let fused_emitted = if let Some(((bc1_val, bc2_val), s)) = fused_scalars {
-            let lr_v = builder.ins().f64const(s.lr);
+            // s.lr is the plan's base rate; the live rate is the schedule's
+            // output. Everything else in FusedAdamwScalars is genuinely
+            // compile-time (betas, eps, wd), so only this one moves.
+            let lr_v = lr_runtime;
             let b1_v = builder.ins().f64const(s.beta1);
             let omb1_v = builder.ins().f64const(s.one_minus_beta1);
             let b2_v = builder.ins().f64const(s.beta2);
@@ -638,14 +656,19 @@ impl Compiler<'_> {
                     };
 
                     // adj = -lr * scaled_m  (owned)
-                    let neg_lr = builder.ins().f64const(-(*lr));
+                    // `lr` in the op is the plan's base rate — see the
+                    // lr_runtime doc on this function's signature.
+                    let _ = lr;
+                    let neg_lr = builder.ins().fneg(lr_runtime);
                     let adj = self.compile_call_by_name(
                         builder, "nsl_tensor_mul_scalar", &[scaled_m_ptr, neg_lr, flags_zero]
                     )?;
 
                     if *wd != 0.0 {
-                        // wd_term = (-lr * wd) * θ  (owned)
-                        let neg_lr_wd = builder.ins().f64const(-(*lr) * (*wd));
+                        // wd_term = (-lr * wd) * θ  (owned). wd IS compile-time;
+                        // only the lr factor is live, so fold wd and multiply.
+                        let wd_c = builder.ins().f64const(*wd);
+                        let neg_lr_wd = builder.ins().fmul(neg_lr, wd_c);
                         let wd_term = self.compile_call_by_name(
                             builder, "nsl_tensor_mul_scalar", &[theta_ptr, neg_lr_wd, flags_zero]
                         )?;
@@ -660,8 +683,9 @@ impl Compiler<'_> {
 
                 // ── SgdUpdate: θ -= lr * m_partial ──────────────────────────
                 UpdateOp::SgdUpdate { lr } => {
-                    // adj = -lr * m_partial  (owned)
-                    let neg_lr = builder.ins().f64const(-(*lr));
+                    // adj = -lr * m_partial  (owned) — live lr, as above.
+                    let _ = lr;
+                    let neg_lr = builder.ins().fneg(lr_runtime);
                     let adj = self.compile_call_by_name(
                         builder, "nsl_tensor_mul_scalar", &[m_partial_ptr, neg_lr, flags_zero]
                     )?;
@@ -974,6 +998,8 @@ impl Compiler<'_> {
         m_partial: Value,
         v: Value,
         recipe: &crate::fase::UpdateRecipe,
+        // Live learning rate — see `fase_emit_final_step`.
+        lr_runtime: Value,
         bc: (Value, Value),
         wrap_precision: bool,
         sr_step: Option<Value>,
@@ -983,7 +1009,7 @@ impl Compiler<'_> {
         let offload = self.compile_options.optim_state_offload;
         let Some((exempt_list, exempt_non_rank2)) = groups else {
             self.fase_emit_final_step(
-                builder, theta, m, m_partial, v, recipe, Some(bc), wrap_precision, offload,
+                builder, theta, m, m_partial, v, recipe, lr_runtime, Some(bc), wrap_precision, offload,
                 sr_step,
             )?;
             return Ok(None);
@@ -1018,6 +1044,7 @@ impl Compiler<'_> {
             m_partial,
             v,
             &no_wd_recipe,
+            lr_runtime,
             Some(bc),
             wrap_precision,
             offload,
@@ -1029,7 +1056,7 @@ impl Compiler<'_> {
         builder.switch_to_block(decay_blk);
         builder.seal_block(decay_blk);
         self.fase_emit_final_step(
-            builder, theta, m, m_partial, v, recipe, Some(bc), wrap_precision, offload, sr_step,
+            builder, theta, m, m_partial, v, recipe, lr_runtime, Some(bc), wrap_precision, offload, sr_step,
         )?;
 
         Ok(Some(join_blk))
@@ -1650,6 +1677,7 @@ impl Compiler<'_> {
                 m_partial,
                 s2,
                 &fase_plan.recipe,
+                lr,
                 (bc1_inv, bc2_inv),
                 cpdt_precision_dtypes.is_some(),
                 Some(opt_step),
