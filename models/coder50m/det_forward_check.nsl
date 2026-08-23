@@ -1,0 +1,55 @@
+# models/coder50m/det_forward_check.nsl
+# ============================================================================
+# FORWARD-ONLY determinism probe at Coder-50M
+# ============================================================================
+# sr_determinism_check.nsl showed that same-seed replicates of a TRAINING run
+# diverge at 50M. That probe cannot say whether the non-determinism enters in
+# the forward, the backward, or the optimizer, because a single perturbed
+# update contaminates every later step.
+#
+# This file removes the question: no train block, no backward, no optimizer.
+# It runs 8 forward passes over FIXED batches and prints each loss. Two runs
+# with identical flags must produce byte-identical streams; anything else is a
+# forward-path kernel that --deterministic is not routing.
+#
+# Run:
+#   nsl run --seed 1000 --source-ad --deterministic det_forward_check.nsl
+#
+# dropout is passed FALSE, so the dropout RNG is out of the picture and a
+# difference here cannot be explained by mask sampling.
+#
+# RESULT (2026-08-21, RTX PRO 4500, 3 replicates x 8 passes): max spread
+# 0.000e+00 in every config — with --deterministic, without it, and with
+# NSL_MATMUL_TF32=0 — and the with/without streams are identical to each other,
+# so the flag changes nothing in the forward. That is what narrowed the filed
+# determinism bug to the BACKWARD, where it turned out to be the flash phase-2
+# kernel's dK/dV atomicAdd, which --deterministic had never routed. Fixed; the
+# gate is crates/nsl-cli/tests/deterministic_flash_backward_gate.rs.
+#
+# Keep this probe: it is the arm that says "not the forward", and re-deriving
+# that took three replicate sweeps.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+let tokens = load_mmap("../../data/tokens/ad_differential_slice.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("FWD_STREAM_BEGIN")
+
+let seen = 0.0
+for batch in loader:
+    if seen < 8.0:
+        let logits = m.forward_train(batch.input_ids, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+        print(loss)
+        seen = seen + 1.0
+
+print("FWD_STREAM_END")
+print("DET_FORWARD_CHECK_COMPLETE")

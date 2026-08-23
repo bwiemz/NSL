@@ -1,0 +1,68 @@
+# models/coder50m/det_train_check.nsl
+# ============================================================================
+# Short TRAINING determinism probe at Coder-50M — 16 micro-steps
+# ============================================================================
+# THIS FILE IS CITED AS PROVENANCE by crates/nsl-runtime/src/flash_attention.rs
+# for the kill-switch table, the "first difference at step 2" localization, the
+# 128-routes-per-run verification and the ~36x cost slope. An earlier pass
+# deleted it as scratch and left the citation dangling — a reader following it
+# found nothing, and the backward evidence (the evidence that actually carries
+# the fix) was unreproducible. It is committed for that reason; keep it.
+#
+# It is SELF-CONTAINED on purpose: the version that produced those numbers read
+# a hand-generated `det_tiny.bin` that existed only on one machine, which is
+# what made it un-shippable. The token stream below is synthetic, and that costs
+# nothing here — the dQ atomic race depends on launch geometry, not on token
+# content.
+#
+# WHAT IT IS FOR. det_forward_check.nsl establishes that the FORWARD is
+# bit-deterministic at this scale. This probe covers the other half: run it
+# twice with identical flags and diff the loss streams.
+#
+#   nsl run --seed 1000 --source-ad --deterministic det_train_check.nsl
+#
+# Measured 2026-08-21 (RTX PRO 4500, 3 replicates, 16 micro-steps):
+#   baseline (pre-fix)        max spread 1.09e-4, first difference at step 2
+#   NSL_FLASH_BWD_CPU=1       max spread 0.000e+00   <- the discriminator
+#   NSL_EMBEDDING_BWD_CPU=1   max spread 1.39e-4     (not the cause)
+#   NSL_SDPA_FUSED_DISABLE=1  max spread 1.78e-4     (not the cause)
+#   with the fix              max spread 0.000e+00, 128 det routes/run
+#   with the fix, no flag     max spread 1.52e-4,   0 det routes/run
+#
+# Steps 0 and 1 are bit-identical even pre-fix: with grad_accumulation=2 the
+# first optimizer update lands at the end of step 1, so step 2 is the first
+# forward that can see a perturbed weight. That ordering is the localization.
+#
+# dropout is FALSE, so mask sampling cannot explain a difference.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+# 16 micro-steps x batch 1 x seq 1024 = 16384 tokens, generated in-file.
+# VOCAB_SIZE is 49152, so arange(1024) is comfortably in range.
+let unit = arange(1024)
+let tokens = unit.reshape([1, 1024]).expand([16, 1024]).contiguous().reshape([16384])
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("DET_ROUTED")
+print(flash_bwd_det_routed_count())
+print("DET_TRAIN_CHECK_COMPLETE")

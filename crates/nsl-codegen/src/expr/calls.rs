@@ -457,6 +457,12 @@ impl Compiler<'_> {
         if func_name == "gpu_peak_bytes" && args.is_empty() {
             return self.compile_call_by_name(builder, "nsl_gpu_peak_allocated_bytes", &[]);
         }
+        // M46: deterministic flash-backward routing counter. Lets a fixture
+        // prove the CPU-reference route actually fired, instead of the gate
+        // scraping an NSL_FLASH_DEBUG stderr line for it.
+        if func_name == "flash_bwd_det_routed_count" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_flash_bwd_det_routed_count", &[]);
+        }
         if func_name == "gpu_alloc_count" && args.is_empty() {
             return self.compile_call_by_name(builder, "nsl_gpu_cumulative_alloc_count", &[]);
         }

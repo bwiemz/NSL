@@ -1,0 +1,103 @@
+# deterministic_flash_bwd.nsl — fixture for deterministic_flash_backward_gate.rs
+#
+# WHY THIS FIXTURE EXISTS, stated plainly because the gate it supplements was
+# vacuous for exactly these reasons:
+#
+# `srbf16_e2e_deterministic_and_sane_gpu` was cited as proving `--deterministic`
+# gives run-to-run bit-identity. Its fixture (csla_layerwise_ffn.nsl) says on its
+# own line 4 that it is "deliberately attention-free", so it never invokes the
+# flash backward — the one kernel that broke the guarantee. Its bit-identity said
+# nothing about it.
+#
+# THE GEOMETRY BELOW IS MEASURED, NOT GUESSED. The flash phase-2 backward
+# accumulates **dQ** with a cross-CTA `atom.global.add.f32`, so its rounding
+# depends on scheduling order.
+#
+# IT IS dQ, NOT dK/dV — an earlier draft of this header said dK/dV and derived
+# its sizing rule from that, which is backwards. The phase-2 grid is
+# (B*nh, ceil(S/block_kv), 1): each CTA already OWNS one (batch-head, kv-tile)
+# and loops the Q tiles, accumulating dK/dV in its own SMEM. dQ is the only
+# cross-block reduction, because EVERY kv-tile CTA adds into the same dQ rows.
+#
+# So the quantity that keeps the race alive is the NUMBER OF CONTENDING CTAs on
+# dQ = batch x heads x ceil(seq_len / block_kv), and a maintainer resizing this
+# fixture must preserve THAT, not a query-block count:
+#
+#   head_dim = 64 -> select_backward_blocks(64) = (block_q 32, block_kv 32)
+#   seq_len  = 512 -> 16 kv tiles;  x 8 heads x batch 2 = 256 contending CTAs
+#
+# An earlier draft at 2 heads / seq 256 gives 8 x 2 x 2 = 32 CTAs, and it was
+# BIT-IDENTICAL across 3 replicates even with the bug present — the atomic
+# kernel ran (verified by the dispatch line) and still agreed. That draft would
+# have shipped a gate that passes whether or not the bug exists.
+#
+# Measured divergence with the fix REMOVED, one run per row, 3 replicates each:
+#      heads 2, seq  256   max spread 9.5e-07   (marginal, and once 0.0)
+#      heads 4, seq  512   max spread 1.9e-06
+#      heads 8, seq  512   max spread 2.1e-05   <- chosen
+#      heads 8, seq 1024   max spread 1.8e-05
+# At the chosen geometry, 6 replicates gave 6/6 DISTINCT streams and 15/15
+# differing pairs, first divergence at step 2. That is what makes the gate's
+# negative arm a real assertion rather than a coin flip.
+#
+# Cost is small despite the geometry: one attention layer, 8 micro-steps, ~2 s
+# per run even on the deterministic (CPU-reference) path.
+
+from nsl.nn.losses import cross_entropy
+
+model FlashProbe:
+    embed: Tensor = randn([128, 512]) * 0.1
+    wq: Tensor = randn([512, 512]) * 0.2
+    wk: Tensor = randn([512, 512]) * 0.2
+    wv: Tensor = randn([512, 512]) * 0.2
+    wo: Tensor = randn([512, 512]) * 0.2
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let sh = input_ids.shape
+        let b = sh[0]
+        let s = sh[1]
+        let emb = embedding_lookup(self.embed, input_ids.reshape([b * s]))
+        let h = emb.reshape([b, s, 512])
+        # 8 heads x head_dim 64 -> block_kv 32; s=512 -> 16 kv tiles/head
+        let q = (h @ self.wq).reshape([b, 8, s, 64])
+        let k = (h @ self.wk).reshape([b, 8, s, 64])
+        let v = (h @ self.wv).reshape([b, 8, s, 64])
+        let a = scaled_dot_product_attention(q, k, v, 0.125, true)
+        let at = a.reshape([b, s, 512])
+        return (at @ self.wo) @ self.embed.transpose(0, 1)
+
+let m = FlashProbe()
+# GPU_PLACEMENT
+
+# Synthetic, self-contained token stream — no corpus file, so the gate runs
+# anywhere. arange(128) is 0..127, exactly the valid index range for a 128-row
+# embedding; adding 1 (as a smaller sibling fixture does) walks off the end and
+# aborts with `embedding_lookup index 128 ... out of bounds`.
+# 8 micro-steps x batch 2 x seq 512 = 8192 tokens.
+let unit = arange(128)
+let tokens = unit.reshape([1, 128]).expand([64, 128]).contiguous().reshape([8192])
+let loader = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=1):
+    optimizer: AdamW(lr=0.001, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+# Anti-vacuity witness, read by the gate from STDOUT. Counts device flash
+# BACKWARD calls routed to the deterministic CPU reference. Asserting this is
+# non-zero is what stops the gate from passing when --deterministic silently
+# stops reaching the kernel and the loss streams merely happen to agree.
+print("DET_ROUTED")
+print(flash_bwd_det_routed_count())
+print("DETERMINISTIC_FLASH_BWD_COMPLETE")
