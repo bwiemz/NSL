@@ -54,6 +54,14 @@ observation.
 Throughput ≈ 2.25 micro-steps/s, ≈ 30 min/epoch. The held-out pass runs 256
 batches forward-only without additional memory pressure.
 
+> **SUPERSEDED (2026-08-23) — §EC3 in particular.** Every run in this record
+> predates PR #520, which found the `scheduler:` clause inert for
+> `grad_accumulation > 1`. All three arms therefore trained at CONSTANT lr no
+> matter what `warmup_steps` said, so this record cannot attribute anything to
+> warmup and its "0.57 nats" is the learning rate alone. The 2x2 that closes
+> the confound is `LR_WARMUP_ATTRIBUTION_500M_2026_08_23.md`; the lr finding
+> survives, the warmup half does not.
+
 ## EC3 — the inherited learning rate was too high at 500M
 
 Three complete arms, per-region mean training loss. Region entropy is the
