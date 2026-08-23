@@ -84,10 +84,29 @@ seconds** at step 1, `loss streams differ`. Pre-fix it was not passing quickly
 stage ~477 s in, where it fails for an unrelated, pre-existing reason
 (`regions=2 captured=0 taints=2`, "graphs arm captured nothing").
 
-The one real lane concern is a profile artifact, not the fix: the Rust wrapper
-`arena_parity_script_passes` invokes `env!("CARGO_BIN_EXE_nsl")`, and
+**That gate is ALREADY RED on `origin/main`, for the reason this fix
+addresses.** Measured 2026-08-23 against a pristine `origin/main` build
+(`03a0b750`), same script, same fixture: `rc=1` after **11 seconds**,
+`arena-parity: FAIL — loss streams differ`. The script demands byte-identical
+loss streams from two runs under `--deterministic`; with the backward racing,
+those streams cannot agree. There is no green state here for this fix to
+regress — the gate was failing at step 1, and `ci/gpu-cert-known-red.txt` does
+not list it, so the lane has been reporting it red.
+
+With the fix it clears byte-identity and reaches the CUDA-graph composition
+stage (~477 s, release), where it fails for a **different and unrelated**
+reason: `regions=2 captured=0 replays=0 taints=2` — "graphs arm captured
+nothing (vacuous)". That is a pre-existing capture problem this fix neither
+causes nor cures, and it needs its own investigation.
+
+So the fix moves this gate from *failing fast at step 1* to *failing late at
+step 5*. Worth knowing for lane budgeting: the Rust wrapper
+`arena_parity_script_passes` invokes `env!("CARGO_BIN_EXE_nsl")` and
 `scripts/gpu-cert.sh` runs `cargo test` without `--release`, so the lane
-executes a **debug** `nsl` through a CPU-reference backward.
+drives a **debug** `nsl` through the CPU-reference backward and will take
+considerably longer than 477 s to reach the same red verdict. A
+`ci/gpu-cert-long-arms.txt` entry would only buy a slower path to a failure
+that is already there; the thing actually worth fixing is the graph capture.
 
 ## EC6 — the kill switch is tri-state on purpose
 
