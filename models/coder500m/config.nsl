@@ -41,15 +41,31 @@ const DROPOUT = 0.1
 # checkpoint/resume, held-out validation — it does not produce a
 # well-trained 500M model, and VAL_LOSS is expected to part company with
 # the training loss. Fixing that needs a corpus, which is roadmap item 15.
-# LR AND WARMUP ARE MEASURED, not inherited. This repo carried lr = 3e-4
-# unchanged across d_model 512 / 1280 / 2048; at 500M on this 512-optimizer-
-# step schedule it is too high. Three full-epoch arms
-# (models/benchmarks/PROD500M_VALIDATION_2026_08_19.md):
-#   lr 3e-4, warmup 200, sequential : erratic, max loss 13.82, VAL 9.765
-#   lr 3e-4, warmup 200, shuffled   : erratic, max loss 19.37, VAL 9.793
-#   lr 1.5e-4, warmup 400, shuffled : MONOTONE 9.12 -> 7.44,   VAL 9.197
-# 0.57 nats of held-out improvement, twenty times the 0.028 that separates the
-# two shuffle arms.
+# THE LR IS MEASURED. THE WARMUP IS A DEFAULT. Read that distinction before
+# quoting either number.
+#
+# This repo carried lr = 3e-4 unchanged across d_model 512 / 1280 / 2048; at
+# 500M on this 512-optimizer-step schedule it is too high. A full 2x2
+# (models/benchmarks/LR_WARMUP_ATTRIBUTION_500M_2026_08_23.md) separates the
+# two knobs item 9 moved together:
+#   lr 3e-4,   warmup 200 : VAL 8.873
+#   lr 1.5e-4, warmup 200 : VAL 8.747      <- lr effect +0.126
+#   lr 3e-4,   warmup 400 : VAL 9.163      <- MORE warmup HURT at the high lr
+#   lr 1.5e-4, warmup 400 : VAL 8.716      <- shipped; lr effect +0.447
+# The lr wins at BOTH warmups, same direction, 4.7x and 16x the 0.027-nat
+# noise floor. That is why 1.5e-4 is here.
+#
+# Warmup 200 -> 400 is worth +0.031 nats at this lr — exactly ON that floor,
+# i.e. not resolvable. 400 is kept because it is the validated configuration,
+# NOT because it was measured to be better.
+#
+# The earlier record in PROD500M_VALIDATION_2026_08_19.md (VAL 9.765 / 9.793 /
+# 9.197, "0.57 nats") is SUPERSEDED. Those runs predate PR #520, where the
+# `scheduler:` clause was found to be inert for grad_accumulation > 1 — so
+# every one of them trained at constant lr regardless of its warmup setting,
+# and the 0.57 nats was the lr alone, measured against a high-lr arm that had
+# no warmup protecting it. The same recipe move is worth +0.157 nats once
+# schedules actually run.
 const CORPUS_TOKENS = 8925916
 const TRAIN_TOKENS = 8388608
 const VAL_TOKENS = 524288
