@@ -11907,6 +11907,55 @@ impl Compiler<'_> {
                         .assert_tape_unchanged_since("MemoryPlanner", &adjoint)
                         .map_err(CodegenError::new)?;
                 }
+                // Item 11: plan the per-segment forward early-free. Built
+                // here — after the CCR plan's owned-tensor restriction and
+                // after the weight-stream plan exists — so the eligibility
+                // conditions are all decidable:
+                //   * ws path: already sliced, keeps its own (post-forward)
+                //     free discipline; composing the two is future work and
+                //     silently changing ws lifetimes here is not it.
+                //   * CSLA: buffers the adjoint's primal imports across the
+                //     accumulation window; its retention contract is the
+                //     bulk-free's, not this pass's. Excluded.
+                //   * NSL_CCR_SEGMENT_FREE=0: kill switch for A/B under ONE
+                //     binary (the runtime-archive lesson: never A/B by
+                //     swapping binaries).
+                struct CcrSegmentFree {
+                    /// (segment index if this slice IS a segment, start, end)
+                    slices: Vec<(Option<usize>, usize, usize)>,
+                    lists: Vec<crate::wengert::WengertList>,
+                }
+                let ccr_segment_free: Option<CcrSegmentFree> = match &ccr_plan {
+                    Some(plan)
+                        if ws_fwd_plan.is_none()
+                            && !self.compile_options.layerwise_accum
+                            && std::env::var("NSL_CCR_SEGMENT_FREE").as_deref()
+                                != Ok("0") =>
+                    {
+                        let seg_bounds: Vec<(usize, usize)> = plan
+                            .segments
+                            .iter()
+                            .map(|seg| (seg.start, seg.end))
+                            .collect();
+                        let slices = crate::layerwise::forward_slices(
+                            &seg_bounds,
+                            effective_primal.ops.len(),
+                        )
+                        .map_err(CodegenError::new)?;
+                        let mut tagged = Vec::with_capacity(slices.len());
+                        for &(s_op, e_op) in &slices {
+                            let si = seg_bounds
+                                .iter()
+                                .position(|&(bs, be)| bs == s_op && be == e_op);
+                            tagged.push((si, s_op, e_op));
+                        }
+                        Some(CcrSegmentFree {
+                            slices: tagged,
+                            lists: crate::ccr::build_segment_free_lists(plan),
+                        })
+                    }
+                    _ => None,
+                };
                 self.emit_inplace_suppress(builder, true)?;
                 let full_lowered = if let Some(wsplan) = &ws_fwd_plan {
                     // Segment-streamed forward: lower the primal per CCR
@@ -12038,6 +12087,67 @@ impl Compiler<'_> {
                         explicit_freed_vars,
                         hook_freed_param_vars,
                     }
+                } else if let Some(seg_free) = &ccr_segment_free {
+                    // Item 11: per-segment forward early-free. Same sliced
+                    // emission the weight-streaming branch above uses — one
+                    // straight-line block chain, fold state threaded through
+                    // `compile_wengert_ops_range`, byte-identical op stream —
+                    // but between slices the only thing emitted is each
+                    // segment's FreeTensor mini-list. With the single
+                    // post-forward free list, EVERY segment's interiors were
+                    // still live at end-of-forward, which is where the global
+                    // peak sits: `--checkpoint-blocks` was reducing the
+                    // backward's activation wall and never the forward's.
+                    let mut var_map = primal_vars.clone();
+                    let mut var_types = effective_primal.var_types.clone();
+                    let mut owned_values = Vec::new();
+                    let mut hook_freed_input_vars = std::collections::HashSet::new();
+                    let mut explicit_freed_vars = std::collections::HashSet::new();
+                    let mut hook_freed_param_vars = std::collections::HashSet::new();
+                    let mut freed_count = 0usize;
+                    for &(si, s_op, e_op) in &seg_free.slices {
+                        crate::wengert_lower::compile_wengert_ops_range(
+                            self,
+                            builder,
+                            state,
+                            &effective_primal,
+                            s_op..e_op,
+                            &mut var_map,
+                            &mut var_types,
+                            &mut owned_values,
+                            &mut hook_freed_input_vars,
+                            &mut explicit_freed_vars,
+                            &mut hook_freed_param_vars,
+                            None,
+                        )?;
+                        if let Some(seg_idx) = si {
+                            let free_list = &seg_free.lists[seg_idx];
+                            if free_list.ops.is_empty() {
+                                continue;
+                            }
+                            let freed = crate::wengert_lower::compile_wengert_ops(
+                                self, builder, state, free_list, &var_map, None,
+                            )?;
+                            freed_count += freed.explicit_freed_vars.len();
+                            explicit_freed_vars.extend(freed.explicit_freed_vars);
+                        }
+                    }
+                    eprintln!(
+                        "[ccr] per-segment early-free: {} interior value(s) freed \
+                         across {} segment(s) during the forward",
+                        freed_count,
+                        seg_free.lists.iter().filter(|l| !l.ops.is_empty()).count(),
+                    );
+                    for v in self.sdpa_extra_owned.drain(..) {
+                        owned_values.push((u32::MAX, v, crate::wengert::WengertType::Tensor));
+                    }
+                    crate::wengert_lower::LoweredWengert {
+                        var_map,
+                        owned_values,
+                        hook_freed_input_vars,
+                        explicit_freed_vars,
+                        hook_freed_param_vars,
+                    }
                 } else {
                     crate::wengert_lower::compile_wengert_ops(
                         self,
@@ -12097,7 +12207,16 @@ impl Compiler<'_> {
                 // (Refcounted runtime: views holding a reference keep the
                 // storage alive, so this is a decrement, not a hard free.)
                 let ccr_freed_primal: std::collections::HashSet<crate::wengert::VarId> =
-                    if let Some(plan) = &ccr_plan {
+                    if ccr_segment_free.is_some() {
+                        // Item 11: already freed during the forward, one
+                        // segment at a time. Running the post-forward list too
+                        // would emit a SECOND FreeTensor per victim — on a
+                        // refcounted runtime that is a double-decrement, i.e.
+                        // a use-after-free for any view still holding the
+                        // storage. The sliced path's freed set flows into the
+                        // bulk-free exclusion exactly as this one did.
+                        full_lowered.explicit_freed_vars.clone()
+                    } else if let Some(plan) = &ccr_plan {
                         let free_list = crate::ccr::build_early_free_list(plan);
                         let freed_lowered = crate::wengert_lower::compile_wengert_ops(
                             self, builder, state, &free_list, full_vars, None,
