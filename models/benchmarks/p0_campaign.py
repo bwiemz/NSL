@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import gpu_guard
+
 REPO = Path(__file__).resolve().parents[2]
 NSL = REPO / "target" / "release" / "nsl"
 LOGS = REPO / "models" / "benchmarks" / "p0_logs"
@@ -591,6 +593,9 @@ def main() -> None:
     c.add_argument("--steps", type=int, required=True)
     c.add_argument("--seeds", type=int, nargs="+", default=[1])
     args = parser.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("p0_campaign")
     if args.cmd == "bench":
         cmd_bench(args.steps)
     else:

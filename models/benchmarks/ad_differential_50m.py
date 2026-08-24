@@ -47,6 +47,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import gpu_guard
+
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = REPO / "models/coder50m/ad_differential.nsl"
 CORPUS = REPO / "data/tokens/train_new.bin"
@@ -159,6 +161,9 @@ def main() -> None:
     ap.add_argument("--nsl", required=True, help="CUDA nsl binary")
     ap.add_argument("--seeds", type=int, default=3)
     args = ap.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("ad_differential_50m")
 
     materialize_slice()
     verdicts: list[Verdict] = []

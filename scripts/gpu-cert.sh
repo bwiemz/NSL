@@ -15,12 +15,13 @@
 #
 # PRIOR ART: tools/gpu-test.ps1 + tools/gpu-canary.txt already existed. Two
 # reasons it is not enough, neither of them a criticism of its design:
-#   - the canary is a deliberately CURATED set of 3 tests ("if they pass, the
-#     harness itself is working") — an acceptance check, not coverage;
+#   - the canary is a deliberately CURATED set ("if they pass, the harness
+#     itself is working") — an acceptance check, not coverage;
 #   - it is PowerShell, and the project's dev environment moved to Linux where
 #     pwsh is not installed, so it cannot run at all on the reference machine.
 # This script is complementary: it enumerates and runs EVERYTHING, in bash.
-# The canary keeps its job as the fast is-the-GPU-sane check.
+# The canary keeps its job as the fast is-the-GPU-sane check — it is the
+# `smoke` tier of scripts/gpu-tier.sh, and this lane is the `certify` tier.
 #
 # Usage:
 #   scripts/gpu-cert.sh --list                  inventory as TSV, no build
@@ -49,13 +50,19 @@
 #                      384s. Neither had room for a slower machine or a colder
 #                      cache.
 #   NSL_CERT_OUT       report path (default: target/gpu-cert-report.tsv)
-#   NSL_CERT_FEATURES  cargo features (default: cuda,test-hooks,test-helpers)
+#   NSL_CERT_FEATURES  cargo features
+#                      (default: cuda,test-hooks,test-helpers,nsl-test/cuda)
 #   CARGO_TARGET_DIR   respected as usual
+#
+# --run refuses to start when the device is busy or another guarded run holds
+# the lock — scripts/gpu-guard.sh, which also puts the lane in its own process
+# group. NSL_GPU_GUARD=0 skips the guard (debugging it, not bypassing a
+# refusal: the refusal means a result produced now would be untrustworthy).
 #
 # Report columns: file<TAB>test<TAB>status<TAB>elapsed. A '~' prefix on elapsed
 # means the value is the whole TARGET's wall time, shared by every gate of a
 # batched run; bare values come from the per-gate rerun path and are that gate's
-# own time.
+# own time. NOTFOUND rows carry '-' for elapsed — nothing ran.
 #
 # Set TMPDIR to a DISK-backed path before a full run. Many gates spawn `nsl`
 # builds; where /tmp is tmpfs the sweep exhausts it, and the resulting linker
@@ -178,19 +185,6 @@ classes_for_tier() {
         all)       printf 'gpu\ngpu-inferred\ntoolchain\nmultiproc\nisolate\n' ;;
         *) echo "gpu-cert: unknown tier '$1'" >&2; exit 2 ;;
     esac
-}
-
-# True when the target holds any `isolate`-class gate. Such a gate declares
-# that a faulting kernel poisons the CUDA context for everything sharing the
-# process, so it must not be batched with its siblings — and it DOES share a
-# target with 8 gpu-class gates. Previously `isolate` was a documented class
-# with no implementation behind it (review finding): under `--tier all` all 9
-# were batched into one process, exactly what the reason string forbids.
-target_has_isolate() {
-    inventory | awk -F'\t' -v k="$1" '
-        $3 == "isolate" { print $1 }' | while IFS= read -r f; do
-            [[ "$(target_args "${f}" | tr '\n' ' ')" == "$1" ]] && { echo yes; return; }
-        done
 }
 
 # ---------------------------------------------------------------------------
@@ -418,11 +412,30 @@ cmd_run() {
     SCRATCHDIR="$(mktemp -d)"
     trap 'rm -rf "${SCRATCHDIR:-}"' EXIT
     local tmpdir="${SCRATCHDIR}"
+    # ONE inventory pass, reused below. inventory() is a full-tree scan
+    # (~2.4 s over 1200 files); the old target_has_isolate() re-ran it once
+    # per target inside the run loop — ~5 minutes of pure re-scanning across
+    # 124 targets before any kernel launched.
+    local full_inv="${tmpdir}/full-inv.tsv"
+    inventory > "${full_inv}"
     inv="${tmpdir}/inv.tsv"
-    inventory | awk -F'\t' -v want="${wanted}" '
+    awk -F'\t' -v want="${wanted}" '
         BEGIN { n = split(want, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") keep[a[i]] = 1 }
         ($3 in keep) { print $1 "\t" $2 }
-    ' > "${inv}"
+    ' "${full_inv}" > "${inv}"
+
+    # Targets holding any `isolate`-class gate. Such a gate declares that a
+    # faulting kernel poisons the CUDA context for everything sharing the
+    # process, so it must not be batched with its siblings — and it DOES share
+    # a target with 8 gpu-class gates. Computed from the FULL inventory, not
+    # the tier-filtered one: the sibling gates run under --tier gpu even when
+    # the isolate gate itself does not, and they still must not batch with it.
+    declare -A ISOLATE_TARGET=()
+    local isof
+    while IFS= read -r isof; do
+        [[ -z "${isof}" ]] && continue
+        ISOLATE_TARGET["$(target_args "${isof}" | tr '\n' ' ')"]=1
+    done < <(awk -F'\t' '$3 == "isolate" { print $1 }' "${full_inv}" | sort -u)
 
     local total
     total="$(wc -l < "${inv}")"
@@ -499,7 +512,7 @@ cmd_run() {
         for miss in "${wanted_fns[@]}"; do
             case "${matched}" in
                 *" ${miss} "*) ;;
-                *) printf '%s\t%s\tNOTFOUND\n' "${key}" "${miss}" >> "${out}" ;;
+                *) printf '%s\t%s\tNOTFOUND\t-\n' "${key}" "${miss}" >> "${out}" ;;
             esac
         done
 
@@ -524,7 +537,7 @@ cmd_run() {
         # A target holding an `isolate` gate skips batching entirely and goes
         # straight to one-process-per-gate, honouring that class's contract
         # instead of merely labelling it.
-        if [[ -n "$(target_has_isolate "${key}")" ]]; then
+        if [[ -n "${ISOLATE_TARGET[${key}]:-}" ]]; then
             echo "  [${key}] ${nsel} gate(s) — isolate class: one process each"
             rc=1
             status=FAIL
@@ -660,7 +673,7 @@ cmd_run() {
     echo "gpu-cert: no unexpected failures"
 }
 
-usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,75p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # Bare invocation exits 2, not 0: a CI step that runs this with no argument
 # must not read as a green check that did nothing. Explicit --help still exits 0.
@@ -680,6 +693,16 @@ case "$1" in
             NSL_CERT_TIER="$2"; export NSL_CERT_TIER
         elif [[ -n "${1:-}" ]]; then
             echo "gpu-cert: unknown option after --run: $1" >&2; exit 2
+        fi
+        # Self-wrap under the concurrency guard (scripts/gpu-guard.sh): flock
+        # against other guarded runs, busy-device refusal against everything
+        # else (an orphaned `nsl run` child holding 22 GB reads as a compute
+        # bug otherwise), and the whole lane in its own process group so a
+        # killed lane cannot orphan a child on the device. The tier selection
+        # is already exported, so the re-exec needs no argument beyond --run.
+        if [[ "${NSL_GPU_GUARD:-1}" != "0" ]] \
+           && ! { [[ -n "${NSL_GPU_LOCK_HELD:-}" ]] && kill -0 "${NSL_GPU_LOCK_HELD}" 2>/dev/null; }; then
+            exec "${ROOT}/scripts/gpu-guard.sh" run -- "${ROOT}/scripts/gpu-cert.sh" --run
         fi
         cmd_run
         ;;

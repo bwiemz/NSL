@@ -42,6 +42,8 @@ from p0_campaign import (
     tokens_per_step_for,
 )
 
+import gpu_guard
+
 LOGS = REPO / "models" / "benchmarks" / "srbf16_logs"
 TOKENS_DIR = LOGS / "tokens"
 
@@ -133,6 +135,9 @@ def main() -> None:
                         help="run the bf16-sr arms under NSL_SR_HIST=1 "
                              "(update-magnitude/stall histograms in stderr)")
     args = parser.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("srbf16_campaign")
 
     model_dir, batch, seq, accum, per_micro_s = SCALES[args.scale]
     program = REPO / "models" / model_dir / "pretrain_srbf16_cert.nsl"

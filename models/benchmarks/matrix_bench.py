@@ -58,6 +58,8 @@ without it the column reports `n/a` rather than an estimate.
 
 from __future__ import annotations
 
+import gpu_guard
+
 import argparse
 import json
 import os
@@ -792,6 +794,9 @@ def main() -> None:
     ap.add_argument("--gpu-name", default=None)
     ap.add_argument("--skip-attribution", action="store_true")
     args = ap.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("matrix_bench")
 
     if not args.nsl.exists():
         sys.exit(f"compiler not found at {args.nsl} — build with:\n"
