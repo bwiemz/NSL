@@ -1,0 +1,22 @@
+{
+  "_comment": "Single source of truth for reserved token surfaces. extract.py neutralizes exactly these in raw text; train_tokenizer.py reserves exactly these; a surface listed in one place but not the other is a boundary any document could forge. The gate corpus_manifest_gate.rs enforces that no pipeline script carries its own copy.",
+  "surfaces": [
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|tool_call|>",
+    "<|tool_result|>",
+    "<|pad|>",
+    "<|file_sep|>"
+  ],
+  "tokenizer": "nsl_mix_v2_t40960_v49152.json",
+  "ids": {
+    "<|endoftext|>": 49145,
+    "<|im_start|>": 41256,
+    "<|im_end|>": 49146,
+    "<|tool_call|>": 49147,
+    "<|tool_result|>": 49148,
+    "<|pad|>": 49149,
+    "<|file_sep|>": 41190
+  }
+}

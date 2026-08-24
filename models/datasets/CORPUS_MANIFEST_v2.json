@@ -1,0 +1,170 @@
+{
+  "_comment": "Committed identity of the v2 pretraining corpus. The bins are local-only; this is what makes them checkable and rebuildable. Regenerate with tools/hfcorpus/manifest.py build; verify with check.",
+  "format": "little-endian u16 token ids, no header (load_mmap(path, 3))",
+  "tokenizer_of_record": "models/tokenizers/nsl_mix_v2_t40960_v49152.json",
+  "tokenizers_sha256": {
+    "models/tokenizers/nsl_code_v1_t40960_v49152.json": "f60e30a54d0fd5cae485d87a527287b0d2dde901c65bfecb865175f5125d8dea",
+    "models/tokenizers/nsl_mix_v2_t40960_v49152.json": "bf38e17ba37e91a3314ad2b4386519f08373b27bb2bcc4cfe15b333602d39481",
+    "models/tokenizers/special_tokens.json": "fac8efaed9547141e5983435ca194672b900bb86066a53678449df0142edd0b6"
+  },
+  "reserved": {
+    "surfaces": [
+      "<|endoftext|>",
+      "<|im_start|>",
+      "<|im_end|>",
+      "<|tool_call|>",
+      "<|tool_result|>",
+      "<|pad|>",
+      "<|file_sep|>"
+    ],
+    "ids": {
+      "<|endoftext|>": 49145,
+      "<|im_start|>": 41256,
+      "<|im_end|>": 49146,
+      "<|tool_call|>": 49147,
+      "<|tool_result|>": 49148,
+      "<|pad|>": 49149,
+      "<|file_sep|>": 41190
+    }
+  },
+  "sources": {
+    "stack": {
+      "repo": "HuggingFaceCode/stack-v3-train",
+      "sample": "20 of 8,192 shards, strided (indices k*409 for k in 0..20)",
+      "dedup": "no additional dedup; the 20 shards are disjoint partitions of one Spark job, sampled with a stride so the subset is not correlated with partition order",
+      "revision": "df4b205fbba4cc1c2fd1f205b10d66f730798bb9",
+      "files": [
+        "data/part-00000-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-00409-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-00818-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-01227-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-01636-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-02045-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-02454-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-02863-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-03272-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-03681-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-04090-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-04499-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-04908-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-05317-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-05726-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-06135-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-06544-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-06953-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-07362-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet",
+        "data/part-07771-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet"
+      ]
+    },
+    "fineweb": {
+      "repo": "HuggingFaceFW/fineweb",
+      "sample": "config sample-10BT, all 15 parquet files",
+      "dedup": "upstream MinHash-deduplicated by the FineWeb pipeline; train/val split cut at parquet-file granularity so the held-out file shares no crawl segment with train",
+      "revision": "9bb295ddab0e05d785b879661af7260fed5140fc",
+      "files": [
+        "sample/10BT/000_00000.parquet",
+        "sample/10BT/001_00000.parquet",
+        "sample/10BT/002_00000.parquet",
+        "sample/10BT/003_00000.parquet",
+        "sample/10BT/004_00000.parquet",
+        "sample/10BT/005_00000.parquet",
+        "sample/10BT/006_00000.parquet",
+        "sample/10BT/007_00000.parquet",
+        "sample/10BT/008_00000.parquet",
+        "sample/10BT/009_00000.parquet",
+        "sample/10BT/010_00000.parquet",
+        "sample/10BT/011_00000.parquet",
+        "sample/10BT/012_00000.parquet",
+        "sample/10BT/013_00000.parquet",
+        "sample/10BT/014_00000.parquet"
+      ]
+    },
+    "distill": {
+      "repo": "r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation",
+      "sample": "config canonical, the train-*-of-00006 series ONLY",
+      "dedup": "REQUIRED: the repo ships two overlapping shard series in one directory (train-*-of-00005 AND -of-00006); the default glob concatenates both and duplicates 41,682 traces. Only -of-00006 is read (52,205 + 2,872 + 2,860 = 57,937 rows, matching the dataset card)",
+      "revision": "7a3473446840bcc397928cd8183d4b3ba3ca13a7",
+      "files": [
+        "data/canonical/test-00000-of-00001.parquet",
+        "data/canonical/train-00000-of-00005.parquet",
+        "data/canonical/train-00000-of-00006.parquet",
+        "data/canonical/train-00001-of-00005.parquet",
+        "data/canonical/train-00001-of-00006.parquet",
+        "data/canonical/train-00002-of-00005.parquet",
+        "data/canonical/train-00002-of-00006.parquet",
+        "data/canonical/train-00003-of-00005.parquet",
+        "data/canonical/train-00003-of-00006.parquet",
+        "data/canonical/train-00004-of-00005.parquet",
+        "data/canonical/train-00004-of-00006.parquet",
+        "data/canonical/train-00005-of-00006.parquet",
+        "data/canonical/validation-00000-of-00001.parquet"
+      ]
+    },
+    "nsl": {
+      "repo": "local: data/tokcorpus/combined_train.txt",
+      "sample": "this repository + 15 unrelated local projects",
+      "dedup": "none (curated local corpus)"
+    }
+  },
+  "bins": {
+    "stack_train.bin": {
+      "sha256": "6cefcf31dd283da83e0eb2bb539b52ea25ca024bfecd87ad99cf4ab50a2772cb",
+      "tokens": 7749015576,
+      "bytes_per_token": 3.6993,
+      "max_token_id": 49145
+    },
+    "web_train.bin": {
+      "sha256": "a755e8c441d5fc7ee2f2ede8f09a543cfcae416ecdcd99f5d4e9d6bf26b6c059",
+      "tokens": 8993175632,
+      "bytes_per_token": 5.0351,
+      "max_token_id": 49145
+    },
+    "sft_train.bin": {
+      "sha256": "2c8cfa87c68acfa4fb91884e06368cbd9c07995b8e0fcf0a6bf98fd7d18e8ecb",
+      "tokens": 41020908,
+      "bytes_per_token": 4.9049,
+      "max_token_id": 49148
+    },
+    "nsl_train.bin": {
+      "sha256": "0d9615705dc74de99187b5aa4d4305a38bcdfc1acb3d28a8b647d9fe0179a8f8",
+      "tokens": 11413038,
+      "bytes_per_token": 4.2259,
+      "max_token_id": 49145
+    },
+    "web_val.bin": {
+      "sha256": "e08b9f688b240740e9b985e73f12395a426b56b37d8381b4ff6812f29d60b5f0",
+      "tokens": 11942304,
+      "bytes_per_token": 5.0242,
+      "max_token_id": 49145
+    },
+    "sft_val.bin": {
+      "sha256": "e66e8cf25f66265c162015f5eac1dc19578a26530504e7f59929db78e4fb62dc",
+      "tokens": 2258310,
+      "bytes_per_token": 4.9098,
+      "max_token_id": 49148
+    },
+    "pretrain_train.bin": {
+      "sha256": "205a8a5e1296632011f5098296f59dcd40d3803a1b25a8fe0bb55416d0e99426",
+      "tokens": 22595922912,
+      "composition": {
+        "base": {
+          "tokens": 8993175632,
+          "share": 0.398
+        },
+        "data/tokens/mix/stack_train.bin": {
+          "tokens": 13557553819,
+          "share": 0.6
+        },
+        "data/tokens/mix/nsl_train.bin": {
+          "tokens": 45193461,
+          "share": 0.002
+        }
+      },
+      "repetition": {
+        "data/tokens/mix/stack_train.bin": 1.75,
+        "data/tokens/mix/nsl_train.bin": 3.96
+      },
+      "seed": 1337
+    }
+  }
+}
