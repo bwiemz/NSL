@@ -12105,6 +12105,7 @@ impl Compiler<'_> {
                     let mut explicit_freed_vars = std::collections::HashSet::new();
                     let mut hook_freed_param_vars = std::collections::HashSet::new();
                     let mut freed_count = 0usize;
+                    let mut segments_freed = 0usize;
                     for &(si, s_op, e_op) in &seg_free.slices {
                         crate::wengert_lower::compile_wengert_ops_range(
                             self,
@@ -12125,18 +12126,43 @@ impl Compiler<'_> {
                             if free_list.ops.is_empty() {
                                 continue;
                             }
-                            let freed = crate::wengert_lower::compile_wengert_ops(
-                                self, builder, state, free_list, &var_map, None,
+                            // Through the RANGE fold, not the wrapper: the
+                            // wrapper drains `sdpa_extra_owned` into a return
+                            // value, and a mid-forward call here would steal
+                            // every fused-SDPA LSE pushed by the slices before
+                            // it — un-owning them so the end-of-step bulk free
+                            // never releases them. Review finding F1
+                            // (2026-08-24), confirmed as a +8 MB/micro-step
+                            // ramp at 1B (16 layers x [2,32,2048] f32) before
+                            // this fix; the drain happens ONCE, after the last
+                            // slice, exactly as the ws branch does.
+                            let before = explicit_freed_vars.len();
+                            let mut free_var_types = free_list.var_types.clone();
+                            crate::wengert_lower::compile_wengert_ops_range(
+                                self,
+                                builder,
+                                state,
+                                free_list,
+                                0..free_list.ops.len(),
+                                &mut var_map,
+                                &mut free_var_types,
+                                &mut owned_values,
+                                &mut hook_freed_input_vars,
+                                &mut explicit_freed_vars,
+                                &mut hook_freed_param_vars,
+                                None,
                             )?;
-                            freed_count += freed.explicit_freed_vars.len();
-                            explicit_freed_vars.extend(freed.explicit_freed_vars);
+                            let freed_here = explicit_freed_vars.len() - before;
+                            freed_count += freed_here;
+                            if freed_here > 0 {
+                                segments_freed += 1;
+                            }
                         }
                     }
                     eprintln!(
                         "[ccr] per-segment early-free: {} interior value(s) freed \
                          across {} segment(s) during the forward",
-                        freed_count,
-                        seg_free.lists.iter().filter(|l| !l.ops.is_empty()).count(),
+                        freed_count, segments_freed,
                     );
                     for v in self.sdpa_extra_owned.drain(..) {
                         owned_values.push((u32::MAX, v, crate::wengert::WengertType::Tensor));

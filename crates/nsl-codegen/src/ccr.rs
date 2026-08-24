@@ -1297,6 +1297,14 @@ pub const DEFAULT_STRIDE_CANDIDATES: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16, 24, 
 pub fn build_segment_free_lists(plan: &CcrPlan) -> Vec<WengertList> {
     let mut lists = Vec::with_capacity(plan.per_segment_recompute.len());
     for seg_victims in &plan.per_segment_recompute {
+        // Same dummy-id headroom refusal as build_early_free_list: descending
+        // ids minted from u32::MAX-1 must never approach real VarIds. (F2:
+        // the single-list guard did not carry over on its own.)
+        assert!(
+            seg_victims.len() < (1 << 16),
+            "[ccr] per-segment free list unreasonably large ({})",
+            seg_victims.len()
+        );
         let victims: Vec<VarId> = {
             let mut v: Vec<VarId> = seg_victims
                 .iter()

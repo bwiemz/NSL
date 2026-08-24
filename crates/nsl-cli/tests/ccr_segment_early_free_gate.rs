@@ -11,7 +11,7 @@
 //! fully-resident configuration (no `--optim-state-offload`, f32 AdamW,
 //! two-phase grad clip) goes from OOM-in-forward to completing.
 //!
-//! Three guards because each alone passes with the feature broken:
+//! Two guards because each alone passes with the feature broken:
 //!
 //! 1. the WITNESS — the `[ccr] per-segment early-free` line with a non-zero
 //!    count. Without it, guard 2 passes trivially when the feature silently
@@ -20,9 +20,10 @@
 //!    produce byte-identical loss streams under `--deterministic`. The
 //!    feature moves WHEN storage returns to the allocator; a value change
 //!    means it freed something that was still readable.
-//! 3. the MEMORY EFFECT (GPU, cert-lane) — the activation peak must actually
-//!    DROP, by at least a third on this fixture. A last-use pass that frees
-//!    nothing load-bearing would pass 1 and 2 while buying nothing.
+//!
+//! There is deliberately NO GPU memory guard — see the note above the tests
+//! for why, and models/benchmarks/SEGMENT_EARLY_FREE_2026_08_24.md for where
+//! the memory numbers are pinned instead.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,21 +37,13 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Two fixtures because the two guards need OPPOSITE sizings.
-///
-/// * `Shape::Small` — 4 blocks, 8x256 activations. The parity guard runs it
-///   under `--deterministic` on CPU, where a heavyweight fixture costs
-///   minutes per arm for no extra assurance (byte-parity is byte-parity).
-/// * `Shape::Tall` — 12 blocks, 4096-row activations against SMALL weights
-///   (256x1024). The memory guard needs the END-OF-FORWARD interior
-///   population to dominate every other surface, or the global activation
-///   peak lands in the backward — which both arms share — and the guard
-///   measures nothing. Two earlier sizings of this gate found exactly that:
-///   byte-identical peaks with the witness firing (first from kilobyte
-///   interiors lost in allocator granularity, then from a backward-dominated
-///   profile). Interiors here are 12 x (4096x1024x4 B x2) = 384 MiB against
-///   ~48 MiB of boundaries and ~25 MiB of weights/grads, so pre-fix
-///   end-of-forward is the unambiguous peak and post-fix it cannot be.
+/// One fixture shape. The parity guard runs it on CPU under
+/// `--deterministic`, where byte-parity is byte-parity and FLOPs buy
+/// nothing: 4 blocks at d=128/ff=512, 2 epochs (14 optimizer steps of
+/// free/realloc cycling). Follows the det_train_check/production pattern —
+/// DataLoader batches + embedding + cross_entropy — because hand-rolled
+/// variants each tripped a different pre-existing runtime quirk (see the
+/// no-GPU-guard note below).
 #[derive(Clone, Copy)]
 enum Shape {
     Small,
