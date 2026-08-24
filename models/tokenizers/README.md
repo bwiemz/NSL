@@ -8,7 +8,7 @@ unreproducible. Both files are ~1.7 MB.
 | file | corpus it encodes | reserved specials |
 |---|---|---|
 | `nsl_code_v1_t40960_v49152.json` | `data/tokens/train_new.bin` and its slices | none |
-| `nsl_mix_v2_t40960_v49152.json` | `data/tokens/mix/*.bin` (web + code + chat) | 6 |
+| `nsl_mix_v2_t40960_v49152.json` | `data/tokens/mix/*.bin` (web + code + chat) | 7 |
 
 Both are two-stage BPE, stage-1 `cl100k` relaxing to whole lines at
 `transition=40960`, `vocab_size=49152`, `min_freq=2`. 49152 is load-bearing: the
@@ -42,7 +42,8 @@ to new paths and changes none of them.
 
 ## Reserved ids are data, not a convention
 
-`v2`'s special-token ids are emitted at training time into
-`data/tokenizer/special_tokens.json`. Read them from there. They are assigned by
+`v2`'s special-token surfaces and ids live in `special_tokens.json` in THIS
+directory (committed; retraining rewrites it in place). Read them from there.
+They are assigned by
 `add_special_tokens` after the learned merges, so do not assume they are
 contiguous, or first, or last.

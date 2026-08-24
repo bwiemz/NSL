@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Render the corpus record from the artifacts themselves.
 
-Every number here is read out of a manifest or off the disk at render time.
-Nothing is transcribed by hand, and nothing is written from a run still in
-flight -- a corpus that is missing prints as missing rather than as a remembered
-figure.
+Sizes, token counts and B/tok are read out of manifests at render time -- a
+corpus that is missing prints as missing rather than as a remembered figure.
+The Verification section is the exception and says so inline: its structural
+counts (document/marker totals, decile densities, round-trip figures) were
+measured ONCE on the 2026-08-19 build and are recorded as literals here.
+Regenerating the report after rebuilding the corpus does NOT re-measure them;
+re-run the measurements or delete the section.
 
 Usage (from the repo root):
     tools/hfcorpus/.venv/bin/python tools/hfcorpus/report.py > \
@@ -112,8 +115,9 @@ def main() -> int:
     print("## Verification\n")
     print("`tools/hfcorpus/verify.py` checks token counts against manifests, that ids")
     print("fit the u16 stream, that the end-of-document id is present, and that the")
-    print("web val set is neither the head nor a suffix of train. Beyond that, three")
-    print("structural properties were measured directly:\n")
+    print("web val set is neither the head nor a suffix of train. Beyond that, the")
+    print("following structural properties were measured on the 2026-08-19 build and")
+    print("are recorded here as literals (a re-render does not re-measure them):\n")
     print("* Documents survive tokenization: `stack_train.bin` carries 424,728")
     print("  `<|endoftext|>` ids against 424,728 extracted documents, and 5,282,296")
     print("  `<|file_sep|>` markers — 12.4 files per repository.")

@@ -9,7 +9,7 @@ sequences that web prose does not contain, so it would encode the bulk of the
 corpus at a materially worse bytes/token -- a direct multiplier on the number of
 sequence positions every pretraining run has to pay for.
 
-v2 changes exactly two things: the training mixture, and six reserved special
+v2 changes exactly two things: the training mixture, and seven reserved special
 tokens (v1 reserved none, so it had no representable document boundary at all).
 Everything else -- two-stage cl100k->line training, vocab 49152, min_freq 2 --
 is held fixed so the two are comparable, and 49152 keeps the id space inside the
@@ -173,14 +173,30 @@ def main() -> int:
             if line.startswith("special "):
                 _, surface, _, tid = line.split()
                 ids[surface] = int(tid)
-        record = json.dumps({"tokenizer": v2.name, "ids": ids}, indent=2)
+        # PRESERVE THE FULL RECORD SHAPE. This file is the single source of
+        # truth that extract.py, manifest.py and this script itself load
+        # `surfaces` from — an earlier version wrote only {tokenizer, ids}
+        # here, so the first legitimate retraining run destroyed the ordered
+        # surfaces array (recoverable only from git) and every downstream
+        # consumer died on KeyError. The record is rewritten as a WHOLE, with
+        # the surfaces this run actually reserved, in their training order.
+        ssot = REPO / "models/tokenizers/special_tokens.json"
+        full = json.loads(ssot.read_text())
+        missing = [su for su in SPECIALS if su not in ids]
+        if missing:
+            raise SystemExit(
+                f"[train] reserved surfaces {missing} got no id from tokbench "
+                "— refusing to write a record that would drop them"
+            )
+        full["surfaces"] = list(SPECIALS)
+        full["tokenizer"] = v2.name
+        full["ids"] = {su: ids[su] for su in SPECIALS}
+        record = json.dumps(full, indent=2, ensure_ascii=False) + "\n"
         (OUT_DIR / "special_tokens.json").write_text(record)
         # Also beside the committed tokenizer: OUT_DIR is under gitignored
         # `data/`, so a fresh clone would get the tokenizer without the ids that
         # make it usable.
-        tracked = REPO / "models/tokenizers"
-        if tracked.is_dir():
-            (tracked / "special_tokens.json").write_text(record)
+        ssot.write_text(record)
         print(f"[train] reserved ids: {ids}", flush=True)
 
     # Held-out sets: two existing code sets, plus web and chat cut from splits

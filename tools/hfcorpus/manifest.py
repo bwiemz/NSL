@@ -146,6 +146,12 @@ def build() -> int:
         if not mf.exists():
             print(f"build: missing per-bin manifest {mf}", file=sys.stderr)
             return 1
+        if not (MIX / b).exists():
+            # A sidecar whose bin was deleted describes nothing; manifesting
+            # it would pin a hash no artifact carries.
+            print(f"build: {mf.name} exists but {b} does not — stale sidecar",
+                  file=sys.stderr)
+            return 1
         m = json.loads(mf.read_text())
         entry = {"sha256": m["sha256"], "tokens": m["tokens"]}
         for k in ("bytes_per_token", "max_token_id", "composition", "repetition", "seed"):

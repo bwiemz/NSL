@@ -126,27 +126,95 @@ fn reserved_ids_agree_between_manifest_record_and_tokenizer() {
 #[test]
 fn the_reserved_surface_list_has_exactly_one_copy() {
     let root = repo_root();
-    // The scripts that must agree on the list. report.py only *mentions* one
-    // surface in prose; the two that ACT on the list are extract (neutralizes)
-    // and train_tokenizer (reserves).
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("models/tokenizers/special_tokens.json")).unwrap(),
+    )
+    .unwrap();
+    let surfaces: Vec<String> = record["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+
+    // The two scripts that ACT on the list (extract neutralizes,
+    // train_tokenizer reserves) must actually LOAD it — the check is for the
+    // load expression, not for the filename appearing somewhere: a comment
+    // mentioning special_tokens.json while the code carries its own list is
+    // precisely the regression this test exists to refuse. (An earlier
+    // version checked `contains("special_tokens.json")`, which a comment
+    // satisfies — review finding, 2026-08-24.)
     for script in ["tools/hfcorpus/extract.py", "tools/hfcorpus/train_tokenizer.py"] {
         let src = std::fs::read_to_string(root.join(script)).unwrap();
+        let loads = src.lines().any(|l| {
+            !l.trim_start().starts_with('#')
+                && l.contains("special_tokens.json")
+                && (src.contains("[\"surfaces\"]") || src.contains("['surfaces']"))
+        });
         assert!(
-            src.contains("special_tokens.json"),
-            "{script} no longer loads the shared reserved-surface record"
+            loads,
+            "{script} no longer loads `surfaces` from the shared record"
         );
-        // An inline list literal is the failure mode this gate exists for:
-        // two copies "kept equal" by a comment. `SPECIALS = [` with a
-        // following string literal is the shape both dead copies had.
-        let forked = src
-            .lines()
-            .zip(src.lines().skip(1))
-            .any(|(a, b)| a.trim_start().starts_with("SPECIALS = [")
-                && b.trim().starts_with("\"<|"));
+    }
+
+    // No pipeline script may carry an inline copy, in ANY spelling: one-line
+    // lists, renamed variables and single quotes all evaded the old two-line
+    // pattern match. The detector counts reserved surfaces appearing as
+    // EXACTLY-QUOTED standalone string literals ("<|x|>" or '<|x|>') on one
+    // non-comment line — which is what a list's elements are, whatever the
+    // variable is named. It deliberately does NOT match a surface embedded
+    // inside a longer template string: extract.py's chat renderer
+    // legitimately EMITS `f"<|im_start|>{role}…"` when building documents,
+    // and the first version of this detector flagged exactly that line.
+    for entry in std::fs::read_dir(root.join("tools/hfcorpus")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("py") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        for (ln, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with('#') {
+                continue;
+            }
+            let hits = surfaces
+                .iter()
+                .filter(|s| {
+                    t.contains(&format!("\"{s}\"")) || t.contains(&format!("'{s}'"))
+                })
+                .count();
+            assert!(
+                hits < 2,
+                "{}:{}: {hits} reserved surfaces as literals on one code line \
+                 — an inline copy of the list. The single source of truth is \
+                 models/tokenizers/special_tokens.json:\n  {line}",
+                path.display(),
+                ln + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn every_committed_tokenizer_file_is_pinned_by_the_manifest() {
+    // The hash check walks the MANIFEST's list; a fourth .json quietly added
+    // to models/tokenizers/ would be pinned by nothing (review finding,
+    // 2026-08-24). The direction is inverted here: every committed file must
+    // be listed.
+    let root = repo_root();
+    let man = manifest();
+    let pinned = man["tokenizers_sha256"].as_object().unwrap();
+    for entry in std::fs::read_dir(root.join("models/tokenizers")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let rel = format!("models/tokenizers/{}", path.file_name().unwrap().to_str().unwrap());
         assert!(
-            !forked,
-            "{script} has grown back an inline SPECIALS list — the single \
-             source of truth is models/tokenizers/special_tokens.json"
+            pinned.contains_key(&rel),
+            "{rel} is committed but not pinned by the manifest — run \
+             manifest.py build (and mean it: an unpinned tokenizer is \
+             invisible to every hash check)"
         );
     }
 }

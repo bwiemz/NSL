@@ -81,6 +81,18 @@ def document_offsets(tokens: np.ndarray, eos: int) -> np.ndarray:
             "no end-of-document id in this stream — it was encoded without "
             "--doc-sep-token, so documents cannot be located"
         )
+    # Documents are [start, eos] spans, so tokens past the FINAL eos belong to
+    # no document and would be silently dropped from the mixture. The shipped
+    # streams all end in eos (verified: the mix's base count equals
+    # web_train.bin's exactly), so this refusal is currently vacuous — it
+    # exists for the input that breaks the assumption, which is precisely when
+    # a silent truncation would otherwise be unfindable.
+    if ends[-1] != tokens.size - 1:
+        raise SystemExit(
+            f"stream does not end with the end-of-document id: "
+            f"{tokens.size - 1 - ends[-1]} trailing token(s) after the last "
+            "eos would be silently dropped. Re-encode with --doc-sep-token."
+        )
     starts = np.empty(ends.size, dtype=np.int64)
     starts[0] = 0
     starts[1:] = ends[:-1] + 1

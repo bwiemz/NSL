@@ -3,7 +3,7 @@
 
 The on-disk format is what `load_mmap(path, 3)` already expects and is not
 changed here: little-endian u16 token ids, no header, no padding. Vocab 49152
-plus 6 reserved specials stays inside the u16 id space.
+plus 7 reserved specials stays inside the u16 id space.
 
 Each shard is encoded independently and the results are concatenated. That is
 exact, not approximate: `tokbench pretokenize` carries no encoder state across
@@ -121,6 +121,19 @@ def main() -> int:
     # a reaped shard vanishes from the glob, so a resumed run would concatenate
     # only the shards that had not been encoded yet and emit a manifest and a
     # plausible B/tok for a silently truncated corpus.
+    # The extractor's manifest records each text shard's sha256 at write time.
+    # Loading it here lets the roster pin CONTENT, not just names — without
+    # this, a re-extract that changes a shard's text under the same filename
+    # reuses the stale cached part and emits a manifest recording the new
+    # provenance over the old bytes (review finding, 2026-08-24).
+    extract_manifest = text_dir / "manifest.json"
+    extract_shas: dict[str, str] = {}
+    extract_bytes: dict[str, int] = {}
+    if extract_manifest.exists():
+        for e in json.loads(extract_manifest.read_text()).get("shards", []):
+            extract_shas[e["file"]] = e.get("sha256", "")
+            extract_bytes[e["file"]] = e.get("bytes", -1)
+
     roster_file = scratch / "roster.json"
     if roster_file.exists():
         roster = json.loads(roster_file.read_text())
@@ -133,10 +146,40 @@ def main() -> int:
                 f"never encoded (first: {missing[0]['shard']}). Re-extract the text "
                 f"or delete {scratch} to start over."
             )
+        # The reverse direction: shards on disk that the frozen roster has
+        # never heard of would be SILENTLY never encoded — the truncation twin
+        # of the reap case above. Refuse instead of guessing.
+        rostered = {r["shard"] for r in roster}
+        extras = sorted(present - rostered)
+        if extras:
+            raise SystemExit(
+                f"{len(extras)} shard(s) on disk are not in the recorded roster "
+                f"(first: {extras[0]}) — the text was re-extracted after encoding "
+                f"began. Delete {scratch} to re-encode the new extraction."
+            )
+        # Content pin: a shard whose bytes or recorded sha differ from the
+        # roster was re-extracted in place; its cached part is stale.
+        for r in roster:
+            sp = text_dir / r["shard"]
+            if sp.exists() and sp.stat().st_size != r["bytes"]:
+                raise SystemExit(
+                    f"{r['shard']}: on-disk size {sp.stat().st_size} != roster "
+                    f"{r['bytes']} — re-extracted in place. Delete {scratch} to "
+                    "re-encode."
+                )
+            want = r.get("sha256")
+            got = extract_shas.get(r["shard"])
+            if want and got and want != got:
+                raise SystemExit(
+                    f"{r['shard']}: extractor manifest sha256 {got[:12]}… != "
+                    f"roster {want[:12]}… — re-extracted in place. Delete "
+                    f"{scratch} to re-encode."
+                )
     else:
         if not shards:
             raise SystemExit(f"no *.txt shards under {text_dir} and no recorded roster")
-        roster = [{"shard": s.name, "bytes": s.stat().st_size} for s in shards]
+        roster = [{"shard": s.name, "bytes": s.stat().st_size,
+                   "sha256": extract_shas.get(s.name)} for s in shards]
         roster_file.write_text(json.dumps(roster, indent=2))
 
     started = time.time()

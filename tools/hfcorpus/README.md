@@ -18,7 +18,7 @@ interpreter: `tools/hfcorpus/.venv/bin/python`.
 
 | set | source | size |
 |---|---|---|
-| code | `HuggingFaceCode/stack-v3-train`, 20 of 8,192 shards | 8.43 GB parquet, ~46 GB text, ~11B tokens |
+| code | `HuggingFaceCode/stack-v3-train`, 20 of 8,192 shards | 8.43 GB parquet, 28.67 GB text, 7.75B v2-tokens |
 | web | `HuggingFaceFW/fineweb`, config `sample-10BT` | 15 parquet, 30.65 GB, 14.9M docs, ~8.05B v2-tokens |
 | chat | `r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation`, config `canonical` | 57,937 traces, 0.22 GB rendered |
 | nsl | `data/tokcorpus/combined_train.txt` (this repo + 15 unrelated local projects) | 48.23 MB, 11.6M tokens |
@@ -98,15 +98,17 @@ re-exported.
 unchanged and its corpora are untouched.
 
 `v2` (`nsl_mix_v2_t40960_v49152.json`) is trained for the new corpus. It changes
-exactly two things — the training mixture and six reserved special tokens
+exactly two things — the training mixture and seven reserved special tokens
 (`<|endoftext|>`, `<|im_start|>`, `<|im_end|>`, `<|tool_call|>`,
-`<|tool_result|>`, `<|pad|>`; v1 reserved none, so it had no representable
-document boundary). Two-stage cl100k→line training, vocab 49152 and min_freq 2
+`<|tool_result|>`, `<|pad|>`, `<|file_sep|>` — the last is the corpus's most
+frequent marker, one per rendered repository file; v1 reserved none, so it had
+no representable document boundary). Two-stage cl100k→line training, vocab 49152 and min_freq 2
 are held fixed so the two are comparable, and 49152 keeps the id space inside
 u16.
 
-Reserved ids are written to `data/tokenizer/special_tokens.json` at training
-time. Read them from there; do not assume they are contiguous or last.
+Reserved surfaces and ids live in `models/tokenizers/special_tokens.json`
+(committed; the training run rewrites it in place). Read them from there; do
+not assume they are contiguous or last.
 
 ## Resuming, and what invalidates a cache
 
@@ -142,7 +144,7 @@ Repetition is reported rather than hidden: every `--add` entry's manifest
 records how many epochs of that corpus its share works out to.
 
 Those epoch counts describe the FILE, not what a run reads. The shipped mixture
-is ~22.6B tokens and asks Stack for 2.04 epochs of its 6.66B unique tokens, but
+is ~22.6B tokens and asks Stack for 1.75 epochs of its 7.75B unique tokens, but
 a 2B-token run at 50M reads under 9% of the corpus — and because documents are
 interleaved at seeded random positions rather than blocked, the odds of both
 copies of a repository landing inside that prefix are small. Effective
