@@ -1270,6 +1270,71 @@ pub const DEFAULT_STRIDE_CANDIDATES: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16, 24, 
 /// and must not collide with real tape ids, which grow upward from 0.
 /// This list is built BEFORE the adjoint exists, so a max-over-both-lists
 /// fresh counter is not yet available.
+/// Item 11: the per-segment split of [`build_early_free_list`].
+///
+/// One `FreeTensor`-only mini-list per block segment, freeing that segment's
+/// recompute victims (interiors ∩ `free_eligible`) so the sliced forward can
+/// lower each list AT ITS SEGMENT'S END instead of once after the whole
+/// forward. The eligibility argument is unchanged from the post-forward
+/// list: an interior has, by classification (`escapes` at `plan_impl`), no
+/// primal consumer at or past `segment_end`, the adjoint reads recompute
+/// CLONES, and the force-saved classes (CSHA chains, dropout masks, compress
+/// victims) never enter `per_segment_recompute`. Moving the free earlier
+/// changes WHEN the storage returns to the allocator, not whether anything
+/// can still read it.
+///
+/// Why this matters: with the single post-forward list, EVERY segment's
+/// interiors are still live at end-of-forward — which is where the 1B global
+/// peak sits — so `--checkpoint-blocks` never reduced the forward peak at
+/// all, only the backward's. Freeing per segment caps the forward's interior
+/// population at one segment's worth.
+///
+/// Indices pair with `plan.segments` (and therefore with
+/// `layerwise::forward_slices`' per-segment slices, which preserve segment
+/// order). Dummy result ids are minted per-list in the adjoint half exactly
+/// as in [`build_early_free_list`] — nothing reads them; each list is lowered
+/// by its own `compile_wengert_ops` call.
+pub fn build_segment_free_lists(plan: &CcrPlan) -> Vec<WengertList> {
+    let mut lists = Vec::with_capacity(plan.per_segment_recompute.len());
+    for seg_victims in &plan.per_segment_recompute {
+        // Same dummy-id headroom refusal as build_early_free_list: descending
+        // ids minted from u32::MAX-1 must never approach real VarIds. (F2:
+        // the single-list guard did not carry over on its own.)
+        assert!(
+            seg_victims.len() < (1 << 16),
+            "[ccr] per-segment free list unreasonably large ({})",
+            seg_victims.len()
+        );
+        let victims: Vec<VarId> = {
+            let mut v: Vec<VarId> = seg_victims
+                .iter()
+                .copied()
+                .filter(|v| plan.free_eligible.contains(v))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let mut ops = Vec::new();
+        for (i, victim) in victims.into_iter().enumerate() {
+            ops.push(WengertOp {
+                id: crate::wengert::adjoint_op_id(i),
+                result: u32::MAX - 1 - i as u32,
+                op: PrimalOp::FreeTensor,
+                inputs: vec![victim],
+                saved_for_backward: false,
+                checkpointed: false,
+            });
+        }
+        lists.push(WengertList {
+            ops,
+            output: 0,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        });
+    }
+    lists
+}
+
 pub fn build_early_free_list(plan: &CcrPlan) -> WengertList {
     let victims = plan.early_free_vars();
     assert!(
