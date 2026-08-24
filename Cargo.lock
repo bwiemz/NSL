@@ -1272,6 +1272,7 @@ dependencies = [
  "predicates",
  "safetensors",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers",
  "toml",
