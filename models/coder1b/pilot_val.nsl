@@ -1,0 +1,79 @@
+# models/coder1b/pilot_val.nsl
+# ============================================================================
+# Held-out validation for the corpus-v2 pilot — SALVAGE RUNNER
+# ============================================================================
+#
+# WHY THIS FILE EXISTS. pretrain_pilot.nsl trained all 24,004 micro-steps
+# cleanly, then ABORTED on the first held-out forward:
+#   cuMemcpyHtoD_v2 failed: CUDA_ERROR_LAUNCH_TIMEOUT [nsl_mul_scalar_f32]
+#   ... nsl_tensor_to_device <- nsl_tensor_add <- GroupedQueryAttention_forward
+# The plain `for batch in loader:` inference path never stages the batch to
+# the model's device; each op reconciles ad hoc (host f64 operands, per-op
+# uploads, f64 fallback kernels). The 500M recipe's val loop is the same
+# shape and merely stayed under the ~2 s display watchdog; at 1B dims one
+# reconciliation kernel crossed it and the driver killed the context. So:
+#   - the batch is staged with .to(cuda) BEFORE the forward here, keeping
+#     every op on the all-GPU f32 path training ran for 24,000 micro-steps;
+#   - token ids survive the ABI's f64->f32 conversion exactly (49151 < 2^24);
+#   - the runtime-level fix (device-staging plain-loop inference inputs, or
+#     refusing the mixed graph the way item 2 refuses it for train Input
+#     leaves) is a follow-up item; this file is the measurement, not the fix.
+#
+# Model state: checkpoints/pretrain_pilot_state.nslm = opt step 6000 of
+# 6,001 (micro 24,000; the crash killed the final model_save). The single
+# missing update is the schedule's last min_lr step — stated, not hidden.
+#
+# RUN (from models/coder1b): nsl run pilot_val.nsl
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+model_load(m, "checkpoints/pretrain_pilot_state.nslm")
+m.to(cuda)
+
+print("PILOT_VAL_BEGIN")
+
+let sval_tokens = load_mmap("../../data/tokens/pilot_val_stack_2m.bin", 3)
+let sval_loader = DataLoader(sval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let sval_total = 0.0
+let sval_count = 0.0
+for batch in sval_loader:
+    let vids = batch.input_ids.to(cuda)
+    let vlabels = batch.labels.to(cuda)
+    let vlogits = m.forward_train(vids, false)
+    let vs = vlogits.shape
+    let vflat_logits = vlogits.reshape([vs[0] * vs[1], vs[2]])
+    let vflat_labels = vlabels.reshape([vs[0] * vs[1]])
+    let vloss = cross_entropy(vflat_logits, vflat_labels)
+    sval_total = sval_total + vloss.item()
+    sval_count = sval_count + 1.0
+
+print("VAL_LOSS_STACK")
+print(sval_total / sval_count)
+print("VAL_BATCHES_STACK")
+print(sval_count)
+
+let wval_tokens = load_mmap("../../data/tokens/pilot_val_web_2m.bin", 3)
+let wval_loader = DataLoader(wval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let wval_total = 0.0
+let wval_count = 0.0
+for batch in wval_loader:
+    let wids = batch.input_ids.to(cuda)
+    let wlabels = batch.labels.to(cuda)
+    let wlogits = m.forward_train(wids, false)
+    let ws = wlogits.shape
+    let wflat_logits = wlogits.reshape([ws[0] * ws[1], ws[2]])
+    let wflat_labels = wlabels.reshape([ws[0] * ws[1]])
+    let wloss = cross_entropy(wflat_logits, wflat_labels)
+    wval_total = wval_total + wloss.item()
+    wval_count = wval_count + 1.0
+
+print("VAL_LOSS_WEB")
+print(wval_total / wval_count)
+print("VAL_BATCHES_WEB")
+print(wval_count)
+
+print("PILOT_VAL_COMPLETE")
