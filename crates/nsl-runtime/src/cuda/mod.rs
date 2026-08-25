@@ -19,6 +19,256 @@ pub(crate) mod caching_allocator;
 
 pub(crate) mod graph_capture;
 
+/// Pointer-keyed cache for the per-launch PTX content hash (mfu-fusion C4).
+///
+/// `kernel_launch` keys its module cache by an FNV-1a hash of the FULL PTX
+/// string, and used to recompute that hash (a scan to the NUL terminator over
+/// kilobytes of PTX) on EVERY launch — ~19k times per training update. This
+/// cache maps the PTX *pointer* to its previously computed content hash, with
+/// a belt against heap-address reuse (the exact failure that forced the
+/// module cache off pointer keys in the first place): an entry revalidates by
+/// re-reading the string's first 8 bytes, last 8 bytes, and the NUL at the
+/// remembered length. Content that changed under the same pointer in any of
+/// those bytes forces a full rescan; a middle-only change with identical
+/// head/tail/length is not caught — accepted, because every PTX string that
+/// reaches `kernel_launch` on the hot path is a `'static` const or a
+/// `.rodata` embed whose bytes never change, and the belt exists only for
+/// transiently heap-allocated PTX (which also gets a fresh pointer or a
+/// different tail in practice).
+///
+/// Kill switch: `NSL_PTX_PTR_CACHE=0` bypasses the cache entirely (read once
+/// per process, like the file's other env toggles).
+///
+/// Compiled unconditionally (only the cuda launch path consults it) so the
+/// default-features test suite exercises the cache logic — CI clippy runs
+/// without `--features cuda` and would otherwise never see this code.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) mod ptx_ptr_cache {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    /// Distinct PTX pointers in a process number in the dozens ('static
+    /// consts + per-signature .rodata embeds). The bound only matters if
+    /// something starts launching from churning heap buffers; clearing on
+    /// overflow keeps that pathological case merely slow, never unbounded.
+    const MAX_ENTRIES: usize = 256;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        len: usize,
+        head: [u8; 8],
+        tail: [u8; 8],
+        hash: u64,
+    }
+
+    static CACHE: OnceLock<Mutex<HashMap<usize, Entry>>> = OnceLock::new();
+    /// Full scan-to-NUL FNV passes performed (misses, belt rejections, and
+    /// kill-switch bypasses). Test-observable: a cache hit does not move it.
+    static FULL_SCANS: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn full_scan_count() -> u64 {
+        FULL_SCANS.load(Ordering::Relaxed)
+    }
+
+    /// `NSL_PTX_PTR_CACHE=0` disables; anything else (including unset)
+    /// enables. Split out for direct testing — the process-global read
+    /// below goes through a `OnceLock` and cannot be re-driven by tests.
+    fn parse_enabled(v: Option<&str>) -> bool {
+        v != Some("0")
+    }
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| parse_enabled(std::env::var("NSL_PTX_PTR_CACHE").ok().as_deref()))
+    }
+
+    /// Full FNV-1a over the string at `ptx_ptr`, scanning to the NUL.
+    /// Byte-identical to the hash `kernel_launch` computed inline before this
+    /// cache existed (same offset basis/prime, NUL excluded) — module-cache
+    /// keys produced with and without the cache MUST collide.
+    ///
+    /// Caller contract (same as `kernel_launch`'s): `ptx_ptr` points to a
+    /// NUL-terminated C string.
+    fn full_scan(ptx_ptr: *const u8) -> (u64, usize) {
+        FULL_SCANS.fetch_add(1, Ordering::Relaxed);
+        let mut len = 0usize;
+        while unsafe { *ptx_ptr.add(len) } != 0 {
+            len += 1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
+        let mut h: u64 = FNV_OFFSET;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        (h, len)
+    }
+
+    fn make_entry(ptx_ptr: *const u8, hash: u64, len: usize) -> Entry {
+        let mut head = [0u8; 8];
+        let mut tail = [0u8; 8];
+        for (i, slot) in head.iter_mut().enumerate().take(len.min(8)) {
+            *slot = unsafe { *ptx_ptr.add(i) };
+        }
+        if len >= 8 {
+            for (i, slot) in tail.iter_mut().enumerate() {
+                *slot = unsafe { *ptx_ptr.add(len - 8 + i) };
+            }
+        }
+        Entry { len, head, tail, hash }
+    }
+
+    /// The belt: does the string at `ptx_ptr` still look like the one the
+    /// entry was built from? Head bytes are compared first and stop at any
+    /// NUL, so a shorter replacement string is rejected without reading past
+    /// its terminator; only once the head matches are the remembered tail
+    /// offsets probed (for a C string that genuinely still has this length
+    /// those reads are in-bounds; for one that shrank they read stale heap —
+    /// the same exposure `kernel_launch`'s scan-to-NUL contract already has
+    /// when handed a dangling pointer, and a mismatch merely forces a
+    /// rescan).
+    fn entry_matches(ptx_ptr: *const u8, e: &Entry) -> bool {
+        for i in 0..e.len.min(8) {
+            let b = unsafe { *ptx_ptr.add(i) };
+            if b == 0 || b != e.head[i] {
+                return false;
+            }
+        }
+        if e.len < 8 {
+            return unsafe { *ptx_ptr.add(e.len) } == 0;
+        }
+        for i in 0..8 {
+            if unsafe { *ptx_ptr.add(e.len - 8 + i) } != e.tail[i] {
+                return false;
+            }
+        }
+        (unsafe { *ptx_ptr.add(e.len) }) == 0
+    }
+
+    /// Content hash for the NUL-terminated PTX at `ptx_ptr`, consulting the
+    /// pointer cache first. This is the ONLY entry `kernel_launch` uses.
+    pub(crate) fn content_hash(ptx_ptr: *const u8) -> u64 {
+        content_hash_with(ptx_ptr, enabled())
+    }
+
+    /// Same, with the enable decision injected (tests drive the kill-switch
+    /// path through this without touching the process-global env read).
+    pub(crate) fn content_hash_with(ptx_ptr: *const u8, cache_on: bool) -> u64 {
+        if !cache_on {
+            return full_scan(ptx_ptr).0;
+        }
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = ptx_ptr as usize;
+        let mut guard = cache.lock().unwrap();
+        if let Some(e) = guard.get(&key) {
+            if entry_matches(ptx_ptr, e) {
+                return e.hash;
+            }
+        }
+        let (hash, len) = full_scan(ptx_ptr);
+        if guard.len() >= MAX_ENTRIES && !guard.contains_key(&key) {
+            guard.clear();
+        }
+        guard.insert(key, make_entry(ptx_ptr, hash, len));
+        hash
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `FULL_SCANS` is process-global and the test harness runs tests
+        /// concurrently — every test that asserts on scan-count deltas must
+        /// hold this lock so a neighbor's scans don't land inside its window.
+        static SCAN_COUNT_LOCK: Mutex<()> = Mutex::new(());
+
+        fn nul_terminated(s: &str) -> Vec<u8> {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0);
+            v
+        }
+
+        /// Reference FNV-1a, written independently of `full_scan`.
+        fn fnv(s: &str) -> u64 {
+            let mut h: u64 = FNV_OFFSET;
+            for &b in s.as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            h
+        }
+
+        #[test]
+        fn same_pointer_second_call_skips_the_full_scan() {
+            let _g = SCAN_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let buf = nul_terminated(".version 7.0 same-ptr-no-rehash kernel body text");
+            let p = buf.as_ptr();
+            let h1 = content_hash_with(p, true);
+            let scans_after_first = full_scan_count();
+            let h2 = content_hash_with(p, true);
+            assert_eq!(h1, h2);
+            assert_eq!(h1, fnv(".version 7.0 same-ptr-no-rehash kernel body text"));
+            assert_eq!(
+                full_scan_count(),
+                scans_after_first,
+                "second call at the same pointer must be a cache hit (no rescan)"
+            );
+        }
+
+        #[test]
+        fn changed_content_at_same_ptr_and_len_is_caught_by_the_belt() {
+            // Holds the lock even though it asserts no counts: its own full
+            // scans must not land inside a counter-asserting test's window.
+            let _g = SCAN_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut buf = nul_terminated(".version 7.0 belt-test kernel body AAAAAAAA");
+            let p = buf.as_ptr();
+            let h1 = content_hash_with(p, true);
+            // Mutate inside the last 8 bytes, same pointer, same length.
+            let n = buf.len();
+            buf[n - 2] = b'B';
+            let expected = String::from_utf8(buf[..n - 1].to_vec()).unwrap();
+            let h2 = content_hash_with(buf.as_ptr(), true);
+            assert_ne!(h1, h2, "tail belt failed: stale hash served for changed content");
+            assert_eq!(h2, fnv(&expected));
+            // And a head mutation, same pointer/len again.
+            buf[0] = b'X';
+            let expected2 = String::from_utf8(buf[..n - 1].to_vec()).unwrap();
+            let h3 = content_hash_with(buf.as_ptr(), true);
+            assert_ne!(h2, h3, "head belt failed: stale hash served for changed content");
+            assert_eq!(h3, fnv(&expected2));
+        }
+
+        #[test]
+        fn kill_switch_bypasses_the_cache() {
+            let _g = SCAN_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let buf = nul_terminated(".version 7.0 kill-switch bypass body");
+            let p = buf.as_ptr();
+            let before = full_scan_count();
+            let h1 = content_hash_with(p, false);
+            let h2 = content_hash_with(p, false);
+            assert_eq!(h1, h2);
+            assert_eq!(h1, fnv(".version 7.0 kill-switch bypass body"));
+            assert_eq!(
+                full_scan_count(),
+                before + 2,
+                "bypassed calls must full-scan every time"
+            );
+        }
+
+        #[test]
+        fn env_parse_default_on_zero_off() {
+            assert!(parse_enabled(None), "unset must enable the cache");
+            assert!(parse_enabled(Some("1")));
+            assert!(parse_enabled(Some("")), "junk values fall back to enabled");
+            assert!(!parse_enabled(Some("0")), "NSL_PTX_PTR_CACHE=0 must disable");
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
@@ -1778,19 +2028,13 @@ pub(crate) mod inner {
             // CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was allocated
             // at the same heap address as a previously-freed one — the cache
             // returned the stale old module and the new kernel name was not found.
-            let cache_key = {
-                // Compute length by scanning for the NUL terminator.
-                let mut len = 0usize;
-                while unsafe { *ptx_ptr.add(len) } != 0 { len += 1; }
-                let ptx_bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
-                // FNV-1a 64-bit hash (no external dep, no alloc).
-                let mut h: u64 = 14695981039346656037u64;
-                for &b in ptx_bytes {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(1099511628211u64);
-                }
-                h
-            };
+            //
+            // mfu-fusion C4: the hash itself now comes through the pointer-
+            // keyed `ptx_ptr_cache` (head/tail/NUL-position belt against that
+            // same heap-reuse hazard; `NSL_PTX_PTR_CACHE=0` restores the
+            // per-launch full scan), so the steady state pays a HashMap probe
+            // instead of a scan over the whole PTX string on every launch.
+            let cache_key = super::ptx_ptr_cache::content_hash(ptx_ptr);
             let module = if let Some(m) = guard.module_cache.get(&cache_key) {
                 *m
             } else {
@@ -1928,14 +2172,29 @@ pub(crate) mod inner {
         // Launch kernel (no lock held) — on the per-thread compute stream
         // (p8 PR-A; ordering-neutral vs the old NULL-stream launch, see
         // `current_stream`).
-        let mut kernel_args: Vec<*mut c_void> = args.to_vec();
+        //
+        // mfu-fusion C4: the kernelParams array is a fixed stack buffer for
+        // the common case (every launcher in this crate passes <= 8 args),
+        // replacing a per-launch `args.to_vec()` heap allocation. The Vec
+        // fallback keeps behavior identical for wider arg lists; `Vec::new()`
+        // does not allocate, so the fast path pays nothing for it.
+        // cuLaunchKernel only READS through kernelParams.
+        let mut stack_args: [*mut c_void; 16] = [std::ptr::null_mut(); 16];
+        let mut vec_args: Vec<*mut c_void> = Vec::new();
+        let kernel_args_ptr: *mut *mut c_void = if args.len() <= stack_args.len() {
+            stack_args[..args.len()].copy_from_slice(args);
+            stack_args.as_mut_ptr()
+        } else {
+            vec_args.extend_from_slice(args);
+            vec_args.as_mut_ptr()
+        };
         let res = unsafe {
             cuLaunchKernel(
                 func,
                 grid[0] as u32, grid[1] as u32, grid[2] as u32,
                 block[0] as u32, block[1] as u32, block[2] as u32,
                 shared_mem_bytes, current_stream(),
-                kernel_args.as_mut_ptr(), std::ptr::null_mut(),
+                kernel_args_ptr, std::ptr::null_mut(),
             )
         };
 
@@ -3506,6 +3765,129 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::ROTATE_HALF_F32_PTX.as_ptr(),
+        KERNEL_NAME.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU kernel '{}' failed: {}",
+        KERNEL_NAME.trim_end_matches('\0'),
+        result as u32
+    );
+    inner::sync_after_kernel();
+
+    if contiguous_ptr != tensor_ptr {
+        crate::tensor::nsl_tensor_free(contiguous_ptr);
+    }
+    out_ptr as i64
+}
+
+/// Fused RoPE-backward `neg(rotate_half(x))` (mfu-fusion C2): one launch and
+/// one full-size alloc where the decomposed pair paid two of each.
+///
+/// Clone of [`gpu_rotate_half_f32`] with the sign flip MOVED to match the
+/// composition, not a textbook formula: `nsl_rotate_half_f32` negates its
+/// FIRST-half outputs (`out[..h] = -in[h..]`, `out[h..] = in[..h]`), so
+/// negating that result cancels the first-half negation and introduces one
+/// on the second half — `out[..h] = in[h..]`, `out[h..] = -in[..h]`.
+/// f32 negation is a pure sign-bit flip, so the single-negation kernel is
+/// bit-identical to running `nsl_rotate_half_f32` then `nsl_neg_f32`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_rotate_half_neg_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+
+    // Degrade path mirrors gpu_rotate_half_f32's: compute the exact
+    // rotate-half-then-neg composition on CPU, then upload.
+    fn cpu_fallback_rotate_half_neg(ptr: i64, device: i32) -> i64 {
+        let cpu_input = crate::tensor::nsl_tensor_to_device(ptr, 0);
+        let cpu_out = crate::tensor::shape_ops::nsl_tensor_rotate_half_neg(cpu_input);
+        let gpu_out = crate::tensor::nsl_tensor_to_device(cpu_out, device as i64);
+        crate::tensor::nsl_tensor_free(cpu_input);
+        crate::tensor::nsl_tensor_free(cpu_out);
+        gpu_out
+    }
+
+    const KERNEL_NAME: &str = "nsl_rotate_half_neg_f32\0";
+
+    inner::set_oom_context(KERNEL_NAME.trim_end_matches('\0'));
+
+    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    assert!(tensor.device > 0, "gpu_rotate_half_neg_f32 requires a CUDA tensor");
+
+    // Dtype degrade BEFORE materialization, for the reason documented in
+    // gpu_rotate_half_f32: `nsl_tensor_contiguous` refuses non-f32 device
+    // tensors, so checking later would make the degrade stride-dependent.
+    if tensor.dtype != crate::tensor::DTYPE_F32 {
+        return cpu_fallback_rotate_half_neg(tensor_ptr, tensor.device as i32);
+    }
+
+    let contiguous_ptr = if tensor.is_contiguous() {
+        tensor_ptr
+    } else {
+        crate::tensor::nsl_tensor_contiguous(tensor_ptr)
+    };
+    let contiguous = unsafe { &*(contiguous_ptr as *const NslTensor) };
+
+    let ndim = contiguous.ndim as usize;
+    assert!(ndim > 0, "nsl: rotate_half_neg requires at least 1 dimension");
+
+    let last_dim = unsafe { *contiguous.shape.add(ndim - 1) } as usize;
+    assert!(
+        last_dim.is_multiple_of(2),
+        "nsl: rotate_half_neg requires even last dimension, got {}",
+        last_dim
+    );
+
+    debug_assert_eq!(contiguous.dtype, crate::tensor::DTYPE_F32);
+
+    let n = contiguous.len as usize;
+    let out_data = match inner::try_alloc_managed(n * 4) {
+        Some(ptr) => ptr,
+        None => {
+            let result = cpu_fallback_rotate_half_neg(contiguous_ptr, tensor.device as i32);
+            if contiguous_ptr != tensor_ptr {
+                crate::tensor::nsl_tensor_free(contiguous_ptr);
+            }
+            return result;
+        }
+    };
+
+    let shape = NslTensor::copy_shape(contiguous.shape, contiguous.ndim);
+    let strides = NslTensor::compute_strides(shape, contiguous.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        contiguous.ndim,
+        contiguous.len,
+        contiguous.device,
+        1,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = contiguous.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let mut last_dim_val = last_dim as u64;
+    let mut half_val = (last_dim / 2) as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut last_dim_val as *mut _ as *mut std::ffi::c_void,
+        &mut half_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::ROTATE_HALF_NEG_F32_PTX.as_ptr(),
         KERNEL_NAME.as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -5301,6 +5683,121 @@ pub(crate) fn gpu_backward_ternary(
         kernel_name.trim_end_matches('\0'),
         result as u32
     );
+    inner::sync_after_kernel();
+    out_ptr as i64
+}
+
+/// Fused elementwise-chain launch (mfu-fusion C3): `gpu_backward_ternary`'s
+/// pattern generalized to up to 6 inputs, with the compiler-synthesized PTX
+/// and kernel name arriving as raw NUL-terminated pointers (`.rodata` embeds,
+/// the fused-CE delivery precedent) instead of `'static` consts.
+///
+/// The synthesized kernel signature is `(param_out, param_in0..N-1,
+/// param_n: u64)` — output pointer FIRST (the `fusion.rs` emitter
+/// convention), unlike this file's hand-written elementwise kernels which
+/// take it after the inputs. kernelParams are marshaled to match.
+///
+/// Preconditions (the caller `nsl_fused_ew_chain` gates them; asserts here
+/// are belts): 1..=6 inputs, all GPU-resident contiguous f32 of one uniform
+/// length. Returns 0 on output-allocation failure or launch failure so the
+/// caller can degrade to its bit-exact decomposed replay instead of aborting
+/// mid-backward; the launch goes through the HOOKED `inner::kernel_launch`
+/// so cuda-graph capture, the kernel profiler, and launch counters all see
+/// it exactly as they see `nsl_mul_f32`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_fused_ew_launch(
+    inputs: &[&crate::tensor::NslTensor],
+    ptx: *const u8,
+    kname: *const u8,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    const MAX_INPUTS: usize = 6;
+    inner::set_oom_context("nsl_fused_ew_chain");
+    assert!(
+        !inputs.is_empty() && inputs.len() <= MAX_INPUTS,
+        "gpu_fused_ew_launch: {} inputs (contract is 1..=6)",
+        inputs.len()
+    );
+    assert!(
+        !ptx.is_null() && !kname.is_null(),
+        "gpu_fused_ew_launch: null ptx/kname (the caller's gate must reject these)"
+    );
+    let first = inputs[0];
+    for (i, t) in inputs.iter().enumerate() {
+        assert_gpu_f32(t, "nsl_fused_ew_chain", "chain input");
+        assert!(
+            t.len == first.len && t.is_contiguous(),
+            "gpu_fused_ew_launch: input {i} violates the uniform-contiguous gate \
+             (len {} vs {}, contiguous={})",
+            t.len,
+            first.len,
+            t.is_contiguous()
+        );
+    }
+
+    let n = first.len as usize;
+    let out_data = match inner::try_alloc_managed(n * 4) {
+        Some(ptr) => ptr,
+        None => {
+            eprintln!("[nsl] GPU OOM in nsl_fused_ew_chain — degrading to decomposed replay");
+            return 0;
+        }
+    };
+    let shape = NslTensor::copy_shape(first.shape, first.ndim);
+    let strides = NslTensor::compute_strides(shape, first.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        first.ndim,
+        first.len,
+        first.device,
+        1,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    // kernelParams = [&out, &in0.., &n] — one u64 local per pointer param,
+    // exactly as the sibling launchers marshal (raw pointers into locals
+    // that live until the launch returns).
+    let mut out_val = out_t.data as u64;
+    let mut in_vals = [0u64; MAX_INPUTS];
+    for (i, t) in inputs.iter().enumerate() {
+        in_vals[i] = t.data as u64;
+    }
+    let mut n_val = n as u64;
+    let mut args: [*mut c_void; MAX_INPUTS + 2] = [std::ptr::null_mut(); MAX_INPUTS + 2];
+    args[0] = &mut out_val as *mut _ as *mut c_void;
+    for (i, v) in in_vals.iter_mut().enumerate().take(inputs.len()) {
+        args[1 + i] = v as *mut _ as *mut c_void;
+    }
+    args[1 + inputs.len()] = &mut n_val as *mut _ as *mut c_void;
+
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx,
+        kname,
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args[..inputs.len() + 2],
+        0,
+    );
+    if result as u32 != 0 {
+        // Free the allocated tensor+data (no leak), report, and let the
+        // caller replay — same degrade contract as the OOM arm above.
+        eprintln!(
+            "[nsl] fused-ew GPU kernel launch failed ({}) — degrading to decomposed replay",
+            result as u32
+        );
+        unsafe {
+            let _ = Box::from_raw(out_ptr);
+        }
+        inner::free_managed(out_data);
+        return 0;
+    }
     inner::sync_after_kernel();
     out_ptr as i64
 }

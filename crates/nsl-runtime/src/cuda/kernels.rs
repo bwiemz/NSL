@@ -194,6 +194,64 @@ FIRST_HALF:\n\
 DONE: ret;\n\
 }\0";
 
+// Fused RoPE backward `neg(rotate_half(x))` (mfu-fusion C2). Clone of
+// ROTATE_HALF_F32_PTX with the negation MOVED to match the composition
+// being replaced, not the textbook rotate_half formula:
+//   rotate_half:  out[..h] = -in[h..],  out[h..] =  in[..h]   (neg on the
+//                 FIRST-half branch above)
+//   then neg:     out[..h] =  in[h..],  out[h..] = -in[..h]
+// So this kernel stores the FIRST-half outputs raw (the two negations
+// cancel) and negates the SECOND-half outputs. f32 negation is a pure
+// sign-bit flip, so one flip here is bit-identical to running
+// nsl_rotate_half_f32 then nsl_neg_f32 (which nsl_tensor_rotate_half's CPU
+// arm plus nsl_tensor_neg also compose to, elementwise).
+pub(crate) const ROTATE_HALF_NEG_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_rotate_half_neg_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n, .param .u64 last_dim, .param .u64 half\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<14>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    ld.param.u64 %rd4, [last_dim];\n\
+    ld.param.u64 %rd5, [half];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd6, %r3;\n\
+    setp.ge.u64 %p1, %rd6, %rd3;\n\
+    @%p1 bra DONE;\n\
+    rem.u64 %rd7, %rd6, %rd4;\n\
+    shl.b64 %rd8, %rd6, 2;\n\
+    setp.lt.u64 %p2, %rd7, %rd5;\n\
+    @%p2 bra FIRST_HALF;\n\
+    sub.u64 %rd9, %rd6, %rd5;\n\
+    shl.b64 %rd10, %rd9, 2;\n\
+    add.u64 %rd11, %rd1, %rd10;\n\
+    ld.global.f32 %fs1, [%rd11];\n\
+    neg.f32 %fs2, %fs1;\n\
+    add.u64 %rd12, %rd2, %rd8;\n\
+    st.global.f32 [%rd12], %fs2;\n\
+    bra DONE;\n\
+FIRST_HALF:\n\
+    add.u64 %rd9, %rd6, %rd5;\n\
+    shl.b64 %rd10, %rd9, 2;\n\
+    add.u64 %rd11, %rd1, %rd10;\n\
+    ld.global.f32 %fs1, [%rd11];\n\
+    add.u64 %rd12, %rd2, %rd8;\n\
+    st.global.f32 [%rd12], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
 // --- Unary ops ---
 
 pub(crate) const NEG_F32_PTX: &str = "\
@@ -427,6 +485,88 @@ pub(crate) const ADD_SCALAR_F32_PTX: &str = "\
     add.u64 %rd6, %rd1, %rd5;\n\
     ld.global.f32 %fs1, [%rd6];\n\
     add.f32 %fs1, %fs1, %fs2;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+// Scalar-RHS div (mfu-fusion C3 scalar sweep): out[i] = a[i] / s, with s a
+// .f32 kernel param so ONE kernel serves every immediate value. Replaces the
+// decomposed Div(x, Constant) chain: scalar CPU tensor + synchronous HtoD +
+// full-size broadcast materialize + nsl_div_f32.
+//
+// ARITHMETIC INSTRUCTION IS LOAD-BEARING: `div.approx.f32`, copied verbatim
+// from DIV_F32_PTX's nsl_div_f32 (NOT the correctly-rounded `div.rn.f32`) —
+// bit-exactness with the decomposed baseline requires the IDENTICAL opcode,
+// and the baseline kernel this replaces divides with div.approx. A
+// single-instruction kernel has no mul+add pair, so FMA contraction (the
+// usual reason for .rn) cannot arise here.
+pub(crate) const DIV_SCALAR_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_div_scalar_f32(\n\
+    .param .u64 a, .param .u64 c, .param .f32 s, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.f32 %fs2, [s];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    div.approx.f32 %fs1, %fs1, %fs2;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+// Scalar-RHS sub (mfu-fusion C3 scalar sweep): out[i] = a[i] - s. Same
+// contract as DIV_SCALAR_F32_PTX above; `sub.f32` copied verbatim from
+// SUB_F32_PTX's nsl_sub_f32 (identical-opcode rule; a lone sub has no
+// contraction partner, so bare sub.f32 and sub.rn.f32 are bitwise
+// equivalent here and the baseline's spelling wins).
+pub(crate) const SUB_SCALAR_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sub_scalar_f32(\n\
+    .param .u64 a, .param .u64 c, .param .f32 s, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.f32 %fs2, [s];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    sub.f32 %fs1, %fs1, %fs2;\n\
     add.u64 %rd6, %rd2, %rd5;\n\
     st.global.f32 [%rd6], %fs1;\n\
 DONE: ret;\n\
@@ -2085,12 +2225,15 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("MUL_F32_PTX", MUL_F32_PTX),
     ("DIV_F32_PTX", DIV_F32_PTX),
     ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
+    ("ROTATE_HALF_NEG_F32_PTX", ROTATE_HALF_NEG_F32_PTX),
     ("NEG_F32_PTX", NEG_F32_PTX),
     ("RELU_F32_PTX", RELU_F32_PTX),
     ("MUL_SCALAR_F32_PTX", MUL_SCALAR_F32_PTX),
     ("MUON_SCALE_INV_FROB_F32_PTX", MUON_SCALE_INV_FROB_F32_PTX),
     ("SCALAR_MUL_ADD_INPLACE_F32_PTX", SCALAR_MUL_ADD_INPLACE_F32_PTX),
     ("ADD_SCALAR_F32_PTX", ADD_SCALAR_F32_PTX),
+    ("DIV_SCALAR_F32_PTX", DIV_SCALAR_F32_PTX),
+    ("SUB_SCALAR_F32_PTX", SUB_SCALAR_F32_PTX),
     ("EXP_F32_PTX", EXP_F32_PTX),
     ("LOG_F32_PTX", LOG_F32_PTX),
     ("SQRT_F32_PTX", SQRT_F32_PTX),
