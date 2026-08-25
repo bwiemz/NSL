@@ -16,14 +16,20 @@
 # 98,304,000-token prefix of the SAME corpus (a prefix carries the mixture's
 # intended proportions: <|file_sep|> density varies 1.08x across deciles,
 # by the mixture's design):
-#   pilot tokens      = 24,000 micro-steps * 4096      = 98,304,000
-#   slice bytes       = (24,000*4096 + 8*2048) * 2     = 196,640,768
-#                       (one update of drop_last slack)
-#   total micro-steps = 24,000     optimizer steps      = 6,000
-#   warmup            = 2,400 micro (10% — the 500M-measured fraction; the
-#                       production 0.15% only makes sense at 22.6B scale)
+#   slice bytes       = 196,640,768 = 98,320,384 tokens = 4096 * 24,004
+#   micro-steps       = 24,004 (drop_last discards only PARTIAL batches;
+#                       an exact multiple has nothing to drop — the header
+#                       first called the last 16,384 tokens "slack", which
+#                       misunderstood drop_last: they RUN, as update 6,001)
+#   optimizer steps   = 6,001 — the last one past total_steps=24,000, where
+#                       warmup_cosine clamps to min_lr: one extra 3e-5
+#                       update, behaviorally cosmetic, stated not hidden
+#   warmup            = 2,400 micro (10% — the 500M recipe's SHIPPED
+#                       fraction, not a measured one — the 500M attribution
+#                       record is explicit that warmup was never resolved;
+#                       the production 0.15% only makes sense at 22.6B)
 #   checkpoint_every  = 500 optimizer steps             (~47 min resident)
-#   wall estimate     = 6,000 * ~5.6 s                  = ~9.4 h
+#   wall estimate     = 6,001 * ~5.6 s                  = ~9.4 h
 #   lr / min_lr / betas / wd / clip / geometry: pretrain_prod.nsl's exactly.
 #
 # Held-out: 2M-token prefixes of stack_val and web_val (the full sets are a
@@ -54,7 +60,7 @@ let m = NSLCoder()
 m.to(cuda)
 
 print("================================================================")
-print("  NSL-Coder-1B corpus-v2 PILOT: 98.3M tokens, 6000 opt steps")
+print("  NSL-Coder-1B corpus-v2 PILOT: 98.3M tokens, 6001 opt steps")
 print("================================================================")
 
 let tokens = load_mmap("../../data/tokens/pilot_train_98m.bin", 3)

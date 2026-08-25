@@ -73,14 +73,16 @@
 #
 # So lr = 1e-4 here is the WIDTH SCALING of item 9's measurement, not a repeat
 # of it: 1.5e-4 * 1280/2048 = 9.4e-5. A principled default, chosen because the
-# budget above cannot resolve a learning rate — 0.008 tokens/param is not an
-# experiment, and no LR rescues it. Item 15's corpus is what settles this.
+# budget could not resolve a learning rate then. Item 15's corpus is wired
+# in NOW (~21 tokens/param); the item-6 pilot's descent shape is the first
+# evidence on whether this default holds, and a controlled LR pair at a
+# rankable budget is the follow-up if it does not.
 # Arms, corrected statistics, and the per-flag table:
 # models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
 #
 # UNITS (same as the 50M/500M recipes): the scheduler counts MICRO-batches (lr
 # is recomputed every micro-batch; with grad_accumulation=4 the effective
-# warmup is 200/4 = 50 optimizer steps). checkpoint_every counts OPTIMIZER
+# warmup is 8192/4 = 2,048 optimizer steps). checkpoint_every counts OPTIMIZER
 # steps — codegen converts internally. DROPOUT is 0.0 at this size, so the
 # dropout op elides entirely (Milestone B: a p=0 config that could not resolve
 # its p ran REAL dropout at 0.1 and cost 1.5 GiB; PR #507 made an unresolved p
@@ -105,8 +107,8 @@
 #
 # At 1B a checkpoint pair is 4.30 GB of theta
 # plus an 8.59 GB `.optim` sidecar (m and v for 146 parameters) — measured, not
-# estimated — so checkpoint_every=100 optimizer steps rewrites 12.9 GB five
-# times over the run. Budget the disk: `checkpoints/` is gitignored except for
+# estimated — so checkpoint_every=2000 optimizer steps rewrites 12.9 GB about
+# 689 times over the full epoch (~3.1 h cadence). Budget the disk: `checkpoints/` is gitignored except for
 # its `.gitkeep`, and the runtime does NOT create the directory (it does
 # File::create and aborts), which is why that placeholder is tracked.
 #
@@ -185,7 +187,7 @@ let m = NSLCoder()
 m.to(cuda)
 print("================================================================")
 print("  NSL-Coder-1B production pretrain")
-print("  49152 vocab | batch=2 seq=2048 accum=4 | 1 epoch = 2048 steps")
+print("  49152 vocab | batch=2 seq=2048 accum=4 | 1 epoch = 5,516,582 micro-steps")
 print("================================================================")
 
 # SHUFFLE IS ON — on general grounds, NOT on a measured improvement. A
@@ -216,8 +218,9 @@ print("LOSS_STREAM_BEGIN")
 # if source-AD extraction of the step body fails outright, codegen WARNS —
 # "[fused-lm-ce] ... it will NOT run and the full [batch*seq, vocab] logits
 # gradient will be materialized" — and falls back to tape, because that path
-# has a legitimate reading. At 1B that fallback is a 768 MiB surface plus its
-# gradient and the run will not fit. The BUILD IS STILL GREEN in that case, so
+# has a legitimate reading. At 1B that fallback is a 768 MiB logits surface
+# plus its gradient per step — inside the resident margin, but a silent 1.5 GiB
+# tax and a throughput cliff. The BUILD IS STILL GREEN in that case, so
 # the agreement gate cannot catch it; the detectors are that stderr warning,
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
@@ -260,10 +263,11 @@ print("PEAK_ACTIVATIONS")
 print(gpu_surface_at_peak_bytes(6))
 
 # ── held-out validation ─────────────────────────────────────────────────
-# Forward-only (training=false) over the tail slice the training above never
-# read. This is the "+ validation" half of the roadmap item: a training loss
-# alone cannot tell an under-trained model from a memorizing one, and at 0.008
-# tokens/param that distinction is the whole question.
+# Forward-only (training=false) over the two v2 held-out sets, neither of
+# which shares a repository (stack_val, verified) or a parquet file
+# (web_val) with anything trained on. A training loss alone cannot tell an
+# under-trained model from a memorizing one; two held-out numbers on a
+# 60/40 code/prose mixture also tell you WHICH half is learning.
 # Two held-out sets, evaluated separately because they answer different
 # questions on a 60%-code corpus: stack_val (repository-disjoint code —
 # the in-domain signal) and web_val (parquet-file-disjoint prose). Both

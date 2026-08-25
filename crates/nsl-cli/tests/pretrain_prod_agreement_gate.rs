@@ -16,12 +16,14 @@
 //! length from the corpus arithmetic so the numbers cannot merely agree on a
 //! shared fiction.
 //!
-//! The recipes differ in ONE deliberate way, encoded in `train_tokens_const`
-//! below: 50M (item 4) schedules over the whole corpus, while 500M (item 9)
-//! and 1B (item 10) train on a prefix slice and report cross-entropy on a
-//! held-out tail. At 0.017 (500M) and 0.008 (1B) tokens/param a training loss
-//! alone cannot distinguish an under-trained model from a memorizing one,
-//! which is the question a run on this corpus actually raises.
+//! The recipes differ deliberately in corpus generation, encoded in
+//! `train_tokens_const` and `load_sites` below: 50M (item 4) schedules over
+//! the whole v1 corpus; 500M (item 9) trains on a prefix slice of it and
+//! reports cross-entropy on a held-out tail (0.017 tokens/param — a budget
+//! where a training loss cannot distinguish an under-trained model from a
+//! memorizing one); 1B (item 6) trains on the 22.6B-token v2 mixture
+//! (~21 tokens/param) and scores TWO separate held-out source bins,
+//! stack_val and web_val, whose disjointness the corpus machinery owns.
 //!
 //! Item 10 adds two things a size table alone would not catch. `run_line_flags`
 //! pins the flag set each header RECOMMENDS, in both directions — the gate
@@ -115,6 +117,13 @@ struct ProdPair {
     /// the training set — the same defect the surjectivity check was added to
     /// close, one level up.
     load_sites: &'static [(&'static str, &'static str)],
+    /// The `print("...")` label each held-out loop must emit, parallel to
+    /// `load_sites[1..]`. `loader_bindings_name_the_right_slice` binds each
+    /// post-train loop to its slice by ORDER; without this field the order
+    /// contract stopped at the loop, so swapping the two label prints in the
+    /// 1B recipe would report the stack loss as VAL_LOSS_WEB and vice versa
+    /// with the whole gate green (item-6 review finding).
+    val_labels: &'static [&'static str],
     /// `(config const, expected u16 token count)` for each local data file
     /// above, so a recorded count cannot drift from the bytes on disk.
     token_counts: &'static [(&'static str, &'static str)],
@@ -174,6 +183,7 @@ const PAIRS: &[ProdPair] = &[
             "../../data/tokens/train_new.bin",
             "data/tokens/train_new.bin",
         )],
+        val_labels: &[],
         token_counts: &[("CORPUS_TOKENS", "data/tokens/train_new.bin")],
         shuffle: None,
         run_line_flags: &[],
@@ -194,6 +204,7 @@ const PAIRS: &[ProdPair] = &[
                 "data/tokens/prod_val_slice.bin",
             ),
         ],
+        val_labels: &["VAL_LOSS"],
         token_counts: &[
             ("TRAIN_TOKENS", "data/tokens/prod_train_slice.bin"),
             ("VAL_TOKENS", "data/tokens/prod_val_slice.bin"),
@@ -228,6 +239,7 @@ const PAIRS: &[ProdPair] = &[
                 "data/tokens/mix/web_val.bin",
             ),
         ],
+        val_labels: &["VAL_LOSS_STACK", "VAL_LOSS_WEB"],
         token_counts: &[
             ("TRAIN_TOKENS", "data/tokens/mix/pretrain_train.bin"),
             ("STACK_VAL_TOKENS", "data/tokens/mix/stack_val.bin"),
@@ -806,10 +818,18 @@ fn every_cited_validation_record_exists() {
             // existence but must not count toward THIS size's floor.
             let counts_for_size = rel.starts_with(&format!("models/{}/", pair.dir));
             for raw in text.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '`') {
-                // Only the validation-record family: a general markdown-link
+                // Only the evidence-record families: a general markdown-link
                 // checker would drag in every doc reference in the tree and
                 // fail for reasons that have nothing to do with this contract.
-                if !raw.contains("_VALIDATION_") {
+                // Item-6 review finding: the 1B pair also cites the item-1
+                // THROUGHPUT record for its resident posture, and the original
+                // `_VALIDATION_`-only filter let exactly that citation dangle
+                // (the record lived on an unmerged branch). Throughput records
+                // are existence-checked but do NOT count toward the
+                // `cites_validation_record` floor — that floor is about LR
+                // provenance, and a throughput citation must not satisfy it.
+                let is_validation = raw.contains("_VALIDATION_");
+                if !is_validation && !raw.contains("_THROUGHPUT_") {
                     continue;
                 }
                 // A glob is prose naming the FAMILY of records, not a citation
@@ -832,7 +852,7 @@ fn every_cited_validation_record_exists() {
                     continue;
                 };
                 let tok = head[..end + 3].trim_start_matches(['(', '[', '"', '\'']);
-                if counts_for_size {
+                if counts_for_size && is_validation {
                     cited_here += 1;
                 }
                 let found = if tok.contains('/') {
@@ -990,10 +1010,16 @@ fn loader_bindings_name_the_right_slice() {
 
         // Every held-out site (item 6: a size may have SEVERAL — the 1B
         // scores stack_val and web_val separately). Each must be iterated by
-        // exactly one post-train loop, in load_sites ORDER (the printed
-        // VAL_LOSS_* labels follow that order), and no post-train loop may
-        // read anything else.
+        // exactly one post-train loop, in load_sites ORDER, no post-train
+        // loop may read anything else, and the first VAL_LOSS* label printed
+        // after each loop must be that slice's label from `val_labels` — the
+        // print is the only place the loop's identity reaches a human.
         let val_sites = &pair.load_sites[1..];
+        assert_eq!(
+            pair.val_labels.len(),
+            val_sites.len(),
+            "{dir}: val_labels must be parallel to load_sites[1..]"
+        );
         if !val_sites.is_empty() {
             checked_val += 1;
             let val_iters: Vec<&(usize, String)> =
@@ -1025,6 +1051,38 @@ fn loader_bindings_name_the_right_slice() {
                     val_name, train_name,
                     "{dir}: a held-out loop and the train block consume the \
                      SAME loader `{val_name}`"
+                );
+                // Label binding: scan from this loop's `for` line to the next
+                // held-out loop (or EOF) for the first print of a VAL_LOSS*
+                // label and require it to be THIS slice's label.
+                let region_start = val_iters[k].0;
+                let region_end = val_iters
+                    .get(k + 1)
+                    .map(|(i, _)| *i)
+                    .unwrap_or(code.len());
+                let printed = code[region_start..region_end]
+                    .iter()
+                    .find_map(|l| {
+                        l.trim()
+                            .strip_prefix("print(\"")
+                            .and_then(|rest| rest.split('"').next())
+                            .filter(|lab| lab.starts_with("VAL_LOSS"))
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{dir}: held-out loop #{k} (`{val_name}`) prints no \
+                             VAL_LOSS* label — its number reaches the log \
+                             unattributed"
+                        )
+                    });
+                assert_eq!(
+                    printed, pair.val_labels[k],
+                    "{dir}: held-out loop #{k} iterates the `{}` slice but the \
+                     first label printed after it is `{printed}`, not `{}`. A \
+                     swapped label reports one bin's loss under the other \
+                     bin's name with every loader binding still correct",
+                    val_sites[k].0, pair.val_labels[k]
                 );
             }
         }
@@ -1102,21 +1160,25 @@ fn documented_flags(prod: &str, dir: &str) -> Vec<String> {
 /// Item 10: the flag set a header documents as required must be the flag set
 /// the recipe actually builds under — in both directions.
 ///
-/// The 1B recipe needs three flags beyond `--source-ad` and OOMs on a 32 GB
-/// card without `--optim-state-offload`, so its header is the only place that
-/// knowledge lives. A header that omits a flag sends the next person to an
-/// OOM; a header that names one the recipe no longer needs sends them to a
-/// slower or larger configuration for nothing. Neither has any other symptom.
+/// The 1B recipe ran three flags beyond `--source-ad` until item 11's
+/// per-segment early-free made the RESIDENT posture fit; the run line is now
+/// two flags, `--optim-state-offload` is the documented smaller-card escape
+/// hatch, and the header is the only place that knowledge lives. A header
+/// that omits a flag sends the next person to an OOM; a header that names one
+/// the recipe no longer needs sends them to a slower or larger configuration
+/// for nothing. Neither has any other symptom.
 ///
 /// What the build arm establishes: Milestone A's inert-request enforcement
 /// makes a *requested* flag that records no disposition a hard error, and this
 /// codebase refuses incompatible compositions rather than degrading them
 /// silently. It does NOT establish that a flag is load-bearing at RUNTIME —
-/// dropping `--optim-state-offload` compiles fine and dies on the card. That
+/// dropping `--checkpoint-blocks` compiles fine and dies on the card. That
 /// half is a measurement, banked in
-/// models/benchmarks/PROD1B_VALIDATION_2026_08_19.md, and it is the recipe's
-/// own printed `PEAK_OPTIM_M` / `PEAK_OPTIM_V` / `PEAK_M_PARTIAL` witness that
-/// keeps it honest run to run.
+/// models/benchmarks/PROD1B_VALIDATION_2026_08_19.md (offload era, EC6) and
+/// models/benchmarks/RESIDENT_1B_THROUGHPUT_2026_08_25.md (resident), and it
+/// is the recipe's own printed `PEAK_OPTIM_M` / `PEAK_OPTIM_V` /
+/// `PEAK_M_PARTIAL` witness — resident, each must read ~4.0 GiB — that keeps
+/// it honest run to run.
 #[test]
 fn the_flag_set_each_header_documents_is_the_one_that_builds() {
     let root = repo_root();
@@ -1185,10 +1247,13 @@ fn the_flag_set_each_header_documents_is_the_one_that_builds() {
 /// uses, and reaching for it here is the obvious "make 1B fit" move. It
 /// refuses grad_clip — two-phase clipping needs the global L2 norm over every
 /// parameter's completed `m_partial` before any update, which the layerwise
-/// schedule never materializes. That refusal is the reason the 1B production
-/// flag set buys its memory from `--optim-state-offload` instead, and pinning
-/// it here means a future change that turns the refusal into a silent
-/// downgrade fails this test rather than shipping unclipped 1B pretraining.
+/// schedule never materializes. That refusal is why the offload-era 1B flag
+/// set bought its memory from `--optim-state-offload` instead — and though
+/// the resident posture (item 11) no longer needs either lever, the refusal
+/// still matters on any card where `--layerwise-accum` looks like the way to
+/// fit: pinning it means a future change that turns the refusal into a
+/// silent downgrade fails this test rather than shipping unclipped 1B
+/// pretraining.
 #[test]
 fn grad_clip_is_planned_and_the_incompatible_flag_still_refuses() {
     let root = repo_root();

@@ -77,10 +77,13 @@ const WEB_VAL_TOKENS = 11942304
 # The value below is therefore the WIDTH SCALING of the one LR result this repo
 # does own — item 9's 1.5e-4 at d_model 1280 — carried to d_model 2048:
 #   1.5e-4 * 1280/2048 = 9.4e-5, rounded to 1e-4.
-# It is a principled default, not a measurement. The reason it cannot be
-# validated here is TOKEN BUDGET, not tooling: see the note above — 0.008
-# tokens/param cannot resolve a learning rate. Settling it needs the corpus
-# roadmap item 15 provides.
+# It is a principled default, not a measurement. Item 15's corpus now
+# EXISTS and this config trains on it (~21 tokens/param), so the old excuse
+# — 0.008 tokens/param cannot resolve a learning rate — no longer holds.
+# What stands between this default and a measured value is the item-6
+# pilot's descent shape and, if warranted, a properly controlled LR pair at
+# a budget that can rank arms. Until then this value is a width-scaled
+# default and says so.
 #
 # The arms, the corrected statistics, and what the earlier partial-window
 # numbers got wrong are in models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
@@ -116,15 +119,13 @@ const TOP_K = 40
 const TEMPERATURE = 0.8
 const MAX_GEN_TOKENS = 512
 
-# Paths (relative to this directory). The train/val slices are a byte-exact
-# prefix/tail cut of the shared corpus, materialized by
-# models/benchmarks/make_prod_split.py — the same two files the 500M recipe
-# reads, so the two sizes are scored on identical held-out text. The 13,020
-# tokens between TRAIN_TOKENS and the start of the val tail are consumed by
-# neither. Disjointness is automatic — they are separate files — so the gap
-# buys SEPARATION: in a concatenated corpus the tokens just past the training
-# prefix usually continue the same file.
-const PRETRAIN_CORPUS = "../../data/tokens/train_new.bin"
+# Paths (relative to this directory). Item 6: the 1B trains on the v2
+# mixture and scores on its two SEPARATE held-out source bins — no
+# prefix/tail cut, no make_prod_split. Disjointness is owned by the corpus
+# machinery: verify.py's repo_id intersection for stack_val, parquet-file
+# granularity for web_val, and the corpus manifest gate's file-list check.
+# (The 500M recipe still reads the v1 prod slices; the two generations are
+# not loss-comparable.)
 const PRETRAIN_DATA = "../../data/tokens/mix/pretrain_train.bin"
 const PRETRAIN_VAL_DATA_STACK = "../../data/tokens/mix/stack_val.bin"
 const PRETRAIN_VAL_DATA_WEB = "../../data/tokens/mix/web_val.bin"
