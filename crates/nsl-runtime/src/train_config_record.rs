@@ -49,8 +49,12 @@ pub const MOMENT_KEYS: &[&str] = &[
     "nesterov", "ns_steps", "adamw_lr", "no_decay",
 ];
 
-/// Keys whose drift changes the future trajectory only.
-pub const TRAJECTORY_KEYS: &[&str] = &["lr", "sched", "sp1", "sp2", "sp3", "clip"];
+/// Keys whose drift changes the future trajectory only. sp4..sp6 are
+/// reserved ahead of any 4+-parameter scheduler: a parameter rendered
+/// under a key in neither class would be silently unguarded (review
+/// finding — absent-on-both-sides is not a difference by design).
+pub const TRAJECTORY_KEYS: &[&str] =
+    &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"];
 
 /// Install the record for the CURRENT train block. Codegen emits this at
 /// train-block entry — per block, not per program: a module can hold more
@@ -152,6 +156,22 @@ pub fn check_on_resume(saved: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact class contents are the policy — the review proved that
+    /// deleting most keys survived every behavioral gate (absent-on-both
+    /// is no-diff by design), so the arrays themselves are pinned here.
+    #[test]
+    fn class_membership_is_pinned_exactly() {
+        assert_eq!(
+            MOMENT_KEYS,
+            &["opt", "accum", "beta1", "beta2", "eps", "wd", "momentum",
+              "dampening", "nesterov", "ns_steps", "adamw_lr", "no_decay"],
+        );
+        assert_eq!(
+            TRAJECTORY_KEYS,
+            &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"],
+        );
+    }
 
     #[test]
     fn classes_are_disjoint_and_diff_routes_by_class() {

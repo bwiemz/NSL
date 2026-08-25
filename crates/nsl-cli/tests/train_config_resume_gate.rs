@@ -81,7 +81,9 @@ fn run_in(
     cmd.args(["run", "--source-ad"])
         .arg(&prog)
         .current_dir(dir)
-        .env("NSL_STDLIB_PATH", root.join("stdlib"));
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // A CI environment exporting the escape globally must not leak in.
+        .env_remove("NSL_RESUME_ALLOW_TRAJECTORY_DRIFT");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -128,10 +130,14 @@ fn record_is_written_and_a_matching_resume_passes_without_skipping() {
     save_phase(&dir);
 
     let header = sidecar_text(&dir);
+    // EVERY key the render emits, not a sample: the review proved a deleted
+    // render arm for an unpinned key is invisible to every behavioral test
+    // (absent-on-both-sides is no-diff by design). Values where the fixture
+    // fixes them, bare `key=` where only presence is checkable.
     for needle in [
         "\"train_cfg\":\"",
         "opt=adamw",
-        "lr=0.01",
+        ",lr=0.01",
         "accum=2",
         "clip=1",
         "sched=warmup_cosine",
@@ -139,7 +145,15 @@ fn record_is_written_and_a_matching_resume_passes_without_skipping() {
         "sp2=8",
         "sp3=0.001",
         "wd=0.01",
+        "beta1=0.9",
         "beta2=0.95",
+        "eps=0.00000001",
+        "momentum=",
+        "dampening=",
+        "nesterov=0",
+        "ns_steps=",
+        "adamw_lr=none",
+        "no_decay=none",
     ] {
         assert!(
             header.contains(needle),
