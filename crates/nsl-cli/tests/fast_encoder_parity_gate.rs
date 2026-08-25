@@ -122,7 +122,9 @@ const EDGE_CASES: &[&str] = &[
     // Repeated lines (cache hits) and a line beyond the memo cap.
     "}\n}\n}\n}\n",
     "import numpy as np\nimport numpy as np\n",
-    // 200 bytes, above MAX_CACHED_LINE_BYTES.
+    // 178 bytes: above the 128-byte cache-admission cap (always uncached)
+    // but still on the linear-scan merge path. Heap-path coverage is the
+    // dynamic cases in the test body, asserted against SMALL_MERGE_MAX.
     "this line is deliberately much longer than the one hundred and twenty eight byte cache \
      admission cap so it exercises the uncached path every single time it appears in a document\n",
 ];
@@ -138,6 +140,26 @@ fn fast_encoder_matches_hf_on_edge_cases() {
     // so divergence here isolates cache poisoning specifically.
     for doc in EDGE_CASES {
         assert_parity(&fast, &hf, &mut cache, doc);
+    }
+
+    // Heap-path cases, built dynamically so their lengths are asserted
+    // rather than eyeballed (review finding: a "200 byte" fixture was 178
+    // bytes and never left the scan path).
+    let long_scan = format!("{}\n", "word ".repeat(30)); // scan, uncached
+    let long_heap = format!("{}\n", "the quick brown fox jumps over it. ".repeat(12));
+    let heap_specials = format!("{}<|endoftext|>{}", "x".repeat(200), "= y ".repeat(60));
+    let minified = format!("{}\n", "f(x){return x&&x.y?x.y:0;};".repeat(20));
+    assert!(long_scan.len() <= nsl_runtime::tokenizer_fast::SMALL_MERGE_MAX);
+    for doc in [&long_heap, &heap_specials, &minified] {
+        let longest = doc.split(['\r', '\n']).map(str::len).max().unwrap();
+        assert!(
+            longest > nsl_runtime::tokenizer_fast::SMALL_MERGE_MAX,
+            "case no longer reaches the heap merge path ({longest} bytes)"
+        );
+    }
+    for doc in [&long_scan, &long_heap, &heap_specials, &minified] {
+        assert_parity(&fast, &hf, &mut cache, doc);
+        assert_parity(&fast, &hf, &mut cache, doc); // cached second pass
     }
 }
 
@@ -195,11 +217,24 @@ fn fast_encoder_matches_hf_on_a_generated_corpus() {
     let mut rng = Rng(0x5EED_2026_0824);
     let mut total_bytes = 0usize;
     let mut docs = 0usize;
+    let mut heap_lines = 0usize;
     while total_bytes < 2 << 20 {
         let doc = generate_doc(&mut rng);
         total_bytes += doc.len();
         docs += 1;
+        heap_lines += doc
+            .split(['\r', '\n'])
+            .filter(|l| l.len() > nsl_runtime::tokenizer_fast::SMALL_MERGE_MAX)
+            .count();
         assert_parity(&fast, &hf, &mut cache, &doc);
     }
     assert!(docs > 200, "generator degenerated: only {docs} docs");
+    // The generator reaches the heap merge path only through the empty
+    // LINE_ENDS entry concatenating rows; pin that it keeps happening (a
+    // pool/seed tweak could silently drop heap coverage to zero — review
+    // finding, 2026-08-24: 65 such lines at this seed).
+    assert!(
+        heap_lines >= 10,
+        "generated corpus produced only {heap_lines} heap-path lines"
+    );
 }

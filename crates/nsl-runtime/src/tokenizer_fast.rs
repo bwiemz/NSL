@@ -135,6 +135,19 @@ impl FastBpeEncoder {
         if !field(spec, "normalizer").is_null() {
             return Err("fast encoder: refusing a tokenizer with a normalizer".into());
         }
+        // The crate honors all three at encode time even with
+        // add_special_tokens=false (`TokenizerImpl::post_process` truncates
+        // unconditionally, runs the processor, then pads — review finding,
+        // 2026-08-24). This encoder reproduces none of them.
+        for k in ["truncation", "padding", "post_processor"] {
+            if !field(spec, k).is_null() {
+                return Err(format!(
+                    "fast encoder: refusing a tokenizer with {k} configured — \
+                     the tokenizers crate applies it during encode even with \
+                     add_special_tokens=false, and this encoder does not"
+                ));
+            }
+        }
         let pre = field(spec, "pre_tokenizer");
         let seq = field(pre, "pretokenizers");
         let ok_pre = field(pre, "type") == "Sequence"
@@ -191,6 +204,7 @@ impl FastBpeEncoder {
             .ok_or("fast encoder: model.vocab must be an object")?;
         // surface bytes -> id, for merge resolution below.
         let mut by_bytes: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
+        let mut ids_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut max_id = 0u32;
         for (surface, id) in vocab {
             let id = id
@@ -198,6 +212,13 @@ impl FastBpeEncoder {
                 .ok_or_else(|| format!("fast encoder: vocab id for '{surface}' is not an integer"))?
                 as u32;
             max_id = max_id.max(id);
+            // Non-injective ids would break the rank-staleness argument that
+            // makes both merge paths provably HF-order-equivalent.
+            if !ids_seen.insert(id) {
+                return Err(format!(
+                    "fast encoder: vocab id {id} is assigned to more than one surface"
+                ));
+            }
             let bytes = surface_to_bytes(surface, &inverse).ok_or_else(|| {
                 format!("fast encoder: vocab surface {surface:?} is not byte-level mapped")
             })?;
@@ -262,13 +283,18 @@ impl FastBpeEncoder {
         }
 
         // --- Added tokens. ------------------------------------------------
-        // The `tokenizers` crate silently RE-ASSIGNS a declared added-token
-        // id that is neither a reuse of that surface's learned id nor the
-        // next free slot (verified: id 70000 loads as 49150). Reproducing
-        // that would mean reproducing its internal assignment order, so any
-        // added token outside the two well-defined cases is refused.
+        // The `tokenizers` crate DISCARDS declared added-token ids on
+        // deserialize and re-assigns them (review finding, 2026-08-24, from
+        // the crate's serialization.rs/added_vocabulary.rs): a surface that
+        // exists in the model vocab gets its learned id; any other token
+        // gets `model_vocab_len + k` sequentially, in ARRAY ORDER. A file
+        // whose declared ids do not already equal that assignment therefore
+        // encodes differently under the crate than declared — refuse it
+        // rather than pick a side. (Empirically: swapped, gapped, and
+        // learned-surface-with-fresh-id declarations all silently diverge.)
         let mut specials = Vec::new();
         let mut special_lead = [false; 256];
+        let mut next_new_id = vocab.len() as u32;
         if let Some(added) = field(spec, "added_tokens").as_array() {
             for t in added {
                 let content = field(t, "content")
@@ -288,13 +314,33 @@ impl FastBpeEncoder {
                     ));
                 }
                 let learned = vocab.get(content).and_then(|v| v.as_u64()).map(|v| v as u32);
-                let reuse = learned == Some(id);
-                if !reuse && id <= max_id {
-                    return Err(format!(
-                        "fast encoder: added token {content:?} declares id {id} inside the \
-                         learned id space without matching its learned id — the tokenizers \
-                         crate would re-assign it, and parity cannot be guaranteed"
-                    ));
+                match learned {
+                    Some(lid) => {
+                        if id != lid {
+                            return Err(format!(
+                                "fast encoder: added token {content:?} declares id {id}, but \
+                                 its surface is learned at id {lid} and the tokenizers crate \
+                                 re-assigns learned surfaces to their learned id"
+                            ));
+                        }
+                    }
+                    None => {
+                        if id != next_new_id {
+                            return Err(format!(
+                                "fast encoder: added token {content:?} declares id {id}, but \
+                                 the tokenizers crate assigns new added tokens sequentially \
+                                 from the model vocab size (expected {next_new_id} here)"
+                            ));
+                        }
+                        if ids_seen.contains(&id) {
+                            return Err(format!(
+                                "fast encoder: added token {content:?} would take id {id}, \
+                                 which a learned token already holds (sparse vocabulary) — \
+                                 the id space is ambiguous"
+                            ));
+                        }
+                        next_new_id += 1;
+                    }
                 }
                 let id = u16::try_from(id).map_err(|_| {
                     format!("fast encoder: added token {content:?} id {id} exceeds u16")
@@ -538,8 +584,10 @@ const MAX_CACHED_LINE_BYTES: usize = 128;
 /// Longest line (in bytes = initial symbols) the linear-scan merge handles;
 /// beyond this the heap path's n·log n takes over so a minified-JS line
 /// cannot go quadratic. 192 covers the overwhelming majority of real corpus
-/// lines (web sentences and code lines sit at 40–120 bytes).
-const SMALL_MERGE_MAX: usize = 192;
+/// lines (web sentences and code lines sit at 40–120 bytes). Public so the
+/// parity gate can assert its generated corpus actually crosses into the
+/// heap path instead of trusting the generator's pools to keep doing so.
+pub const SMALL_MERGE_MAX: usize = 192;
 
 /// Whole-line encode memo with a byte budget. Insertion stops when the
 /// budget is reached (no eviction: the head of a corpus's line distribution
@@ -689,5 +737,115 @@ mod tests {
         assert!(FastBpeEncoder::from_tokenizer_json(&with_dropout)
             .unwrap_err()
             .contains("model config"));
+
+        // The crate honors these during encode even with
+        // add_special_tokens=false — empirically demonstrated in review
+        // (truncation cut ids, padding appended zeros, a TemplateProcessing
+        // processor duplicated the sequence).
+        for (k, v) in [
+            ("truncation", serde_json::json!({"max_length": 3})),
+            ("padding", serde_json::json!({"strategy": {"Fixed": 12}})),
+            ("post_processor", serde_json::json!({"type": "ByteLevel"})),
+        ] {
+            let mut with_it = base.clone();
+            with_it[k] = v;
+            let e = FastBpeEncoder::from_tokenizer_json(&with_it).unwrap_err();
+            assert!(e.contains(k), "expected a {k} refusal, got: {e}");
+        }
+    }
+
+    /// A tokenizer JSON's declared added-token ids are DISCARDED by the
+    /// tokenizers crate on load and re-assigned (learned surfaces get their
+    /// learned id; new tokens get model_vocab_len + k in array order). Each
+    /// recipe below was demonstrated in review to make the crate emit
+    /// different ids than declared — the loader must refuse all of them.
+    #[test]
+    fn refuses_added_token_ids_the_crate_would_reassign() {
+        let spec = crate::tokenizer_bpe::TrainSpec {
+            vocab_size: 300,
+            min_frequency: 1,
+            transition: 300,
+            max_token_bytes: 0,
+            stage1: crate::tokenizer_bpe::PreTokenizerKind::Line,
+            special_tokens: vec!["<|a|>".into(), "<|b|>".into()],
+        };
+        let trained = crate::tokenizer_bpe::train_two_stage(["abab abc\nabab\n"], &spec);
+        let tok = crate::tokenizer_bpe::assemble(&trained, &spec).expect("assemble");
+        let base: serde_json::Value =
+            serde_json::from_str(&tok.to_string(false).expect("serialize")).expect("json");
+        // The honest file loads.
+        FastBpeEncoder::from_tokenizer_json(&base).expect("trainer output must load");
+        let added = base["added_tokens"].as_array().expect("added tokens");
+        assert_eq!(added.len(), 2, "fixture precondition");
+        let (id_a, id_b) = (added[0]["id"].clone(), added[1]["id"].clone());
+
+        // Swapped declared ids: the crate assigns by array order, so both
+        // tokens would encode to the OTHER declared id.
+        let mut swapped = base.clone();
+        swapped["added_tokens"][0]["id"] = id_b.clone();
+        swapped["added_tokens"][1]["id"] = id_a.clone();
+        assert!(FastBpeEncoder::from_tokenizer_json(&swapped)
+            .unwrap_err()
+            .contains("sequentially"));
+
+        // Gapped declared id: the crate ignores the gap.
+        let mut gapped = base.clone();
+        gapped["added_tokens"][1]["id"] =
+            serde_json::json!(id_b.as_u64().unwrap() + 7);
+        assert!(FastBpeEncoder::from_tokenizer_json(&gapped)
+            .unwrap_err()
+            .contains("sequentially"));
+
+        // A learned surface declaring a fresh out-of-space id: the crate
+        // reuses the learned id instead.
+        let learned_surface = base["model"]["vocab"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .find(|k| k.len() > 1)
+            .expect("some learned multi-char surface")
+            .clone();
+        let mut fresh = base.clone();
+        fresh["added_tokens"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": 60000, "content": learned_surface, "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": false, "special": true
+        }));
+        assert!(FastBpeEncoder::from_tokenizer_json(&fresh)
+            .unwrap_err()
+            .contains("learned"));
+    }
+
+    #[test]
+    fn refuses_duplicate_merge_pairs_and_non_injective_ids() {
+        let spec = crate::tokenizer_bpe::TrainSpec {
+            vocab_size: 300,
+            min_frequency: 1,
+            transition: 300,
+            max_token_bytes: 0,
+            stage1: crate::tokenizer_bpe::PreTokenizerKind::Line,
+            special_tokens: Vec::new(),
+        };
+        let trained = crate::tokenizer_bpe::train_two_stage(["abab abc\nabab\n"], &spec);
+        let tok = crate::tokenizer_bpe::assemble(&trained, &spec).expect("assemble");
+        let base: serde_json::Value =
+            serde_json::from_str(&tok.to_string(false).expect("serialize")).expect("json");
+
+        let mut dup_merge = base.clone();
+        let first = dup_merge["model"]["merges"][0].clone();
+        dup_merge["model"]["merges"].as_array_mut().unwrap().push(first);
+        assert!(FastBpeEncoder::from_tokenizer_json(&dup_merge)
+            .unwrap_err()
+            .contains("duplicate merge pair"));
+
+        // Two surfaces sharing one id: breaks the staleness argument both
+        // merge paths rely on.
+        let mut dup_id = base.clone();
+        dup_id["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .insert("<|dup|>".into(), serde_json::json!(0));
+        assert!(FastBpeEncoder::from_tokenizer_json(&dup_id)
+            .unwrap_err()
+            .contains("more than one surface"));
     }
 }
