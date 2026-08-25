@@ -451,6 +451,25 @@ fn fase_perparam_interpreted_route_applies_the_schedule() {
     });
 }
 
+/// Route (b/c seam), TWO-PHASE-CLIP per-param Phase B: `grad_clip` with an
+/// optimizer that FAILS the multi admission (SGD's single state buffer)
+/// lands on the clip loop's per-param `fase_emit_final_step` call — a
+/// distinct lr forwarding the review's mutation M8 proved was covered by
+/// NO test (a #520-shaped fold there passed the entire suite), reachable
+/// with no env vars at all.
+#[test]
+fn clip_perparam_phase_b_route_applies_the_schedule() {
+    assert_route_freeze_differential(&Route {
+        tag: "clip_perparam",
+        train_cfg: "epochs = 1, grad_accumulation = 2, grad_clip = 1.0",
+        optimizer: "SGD(lr = 0.05)",
+        extra_flags: &[],
+        env: &[],
+        stderr_witness: None,
+        stderr_absent: None,
+    });
+}
+
 /// `--optim-state-offload` is not its own emitter but it CHANGES ROUTE
 /// SELECTION (excluded from the multi admission), and its staging wraps the
 /// per-param step — a scheduler regression specific to the offload
