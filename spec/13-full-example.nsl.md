@@ -194,12 +194,10 @@ print(f"Training data: {train_data.total_tokens():,} tokens")
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 train(
-    model       = model,
-    epochs      = 1,
-    precision   = bf16,
-    grad_scaler = auto,
-    accumulate  = CONFIG.accumulate,
-    clip_grad_norm = 1.0
+    model             = model,
+    epochs            = 1,
+    grad_accumulation = CONFIG.accumulate,
+    grad_clip         = 1.0
 ):
     data:
         source      = train_data
@@ -265,7 +263,7 @@ let qat_model = quant(
     model = model
 
 # Short QAT fine-tuning to recover quality
-train(model=qat_model, epochs=1, precision=bf16):
+train(model=qat_model, epochs=1):
     data:
         source     = train_data
         batch_size = CONFIG.batch_size
@@ -380,9 +378,9 @@ fn evaluate_loss(model: GPT2, data: Dataset, max_batches: int = -1) -> f32:
 | Weight tying                  | `@tie_weights(self.wte.weight)` on lm_head           |
 | Pipe operator                 | `gelu \|> self.c_fc_proj \|> self.mlp_drop`           |
 | Train block DSL               | Declarative training with data/optimizer/scheduler    |
-| Gradient accumulation         | `accumulate = 4` in train config                     |
-| Mixed precision               | `precision = bf16` in train config                   |
-| Gradient clipping             | `clip_grad_norm = 1.0` in train config               |
+| Gradient accumulation         | `grad_accumulation = 4` in train config               |
+| Mixed precision               | CLI `--param-dtype bf16-sr` (not a train-config key)  |
+| Gradient clipping             | `grad_clip = 1.0` in train config                     |
 | Parameter groups              | Weight decay exclusion for biases and norms           |
 | @no_grad                      | Evaluation function and inline validation             |
 | Quantization-aware training   | `quant(scheme=int8, mode=aware)` block               |

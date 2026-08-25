@@ -263,6 +263,24 @@ fn inference(model: MyModel, x: Tensor) -> Tensor:
 4. **Fusion**: The compiler can fuse forward and backward kernels when beneficial
    (e.g., fused softmax + cross-entropy backward).
 
+## Shipped AD modes (v0.9 reconciliation, 2026-08-25)
+
+This section was written for the tape. The shipped compiler has TWO modes:
+the runtime tape described above (the default) and ahead-of-time **source
+AD** (`--source-ad`), which lowers the backward pass at compile time through
+the WengertList representation. Two behaviors of the shipped source AD worth
+knowing that the tape prose does not cover:
+
+- **Dropout carries its exact forward mask to the backward** — never an
+  expected-value approximation. A dropout probability the compiler cannot
+  resolve statically REFUSES under source AD rather than defaulting; a
+  statically-known `p=0` is elided entirely.
+- **Unresolved `Input` leaves are a hard error**, not a warning: a leaf the
+  lowering cannot attribute would silently train a submodel.
+
+Cross-mode agreement is enforced by differential gates (tape vs source at
+matched seeds), not asserted.
+
 ## Design Tensions & Tradeoffs
 
 1. **Static vs Dynamic graphs**: NSL's `grad` is fundamentally a static graph system — the

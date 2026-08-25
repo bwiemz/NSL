@@ -44,8 +44,12 @@ fail=0
 err() { printf '  \xE2\x9C\x97 %s\n' "$1" >&2; fail=1; }
 ok() { printf '  \xE2\x9C\x93 %s\n' "$1"; }
 
-DOCS=(README.md SPECIFICATION.md)
-while IFS= read -r f; do DOCS+=("$f"); done < <(find docs/wiki -name '*.md' | sort)
+# STATUS.md and spec/ were added by item 19 (2026-08-25): both had drifted for
+# months — STATUS's review horizon predated seven shipped roadmap items, and
+# spec/ documented an open train-config namespace, LLVM compilation, and five
+# subcommands that do not exist — precisely because no gate ever read them.
+DOCS=(README.md SPECIFICATION.md STATUS.md)
+while IFS= read -r f; do DOCS+=("$f"); done < <(find docs/wiki spec -name '*.md' | sort)
 
 # ---------------------------------------------------------------------------
 # 1. Repo-relative markdown links must resolve.

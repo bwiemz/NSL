@@ -21,6 +21,16 @@ while keeping existing PyTorch code running.
 4. **Gradients flow across boundaries**: A hybrid NSL+PyTorch computation graph supports
    backpropagation across the boundary.
 
+## DLPack output ownership (shipped, item 7 — 2026-08-18)
+
+Model OUTPUTS crossing the C ABI have two explicit ownership models:
+`nsl_model_call_into` (caller-allocated, capacity-checked — refuses results
+that alias caller memory) and `nsl_model_call_alloc` (NSL allocates; a
+DLManagedTensor transfers ownership and its deleter releases exactly once),
+plus `nsl_model_get_export_signature` for introspection. `NslModel.forward`
+on the Python side returns owned PyTorch tensors. `call_into` refuses
+non-contiguous and GPU-resident targets.
+
 ## 4 Bridging Examples
 
 ### Example 1: Wrapping an NSL Model for PyTorch Consumption
@@ -143,7 +153,7 @@ let output = model.generate(input_ids, max_tokens=100, temperature=0.7)
 print(tokenizer.decode(output[0]))
 
 # Fine-tune with NSL's training DSL
-train(model=model, epochs=1, precision=bf16):
+train(model=model, epochs=1):
     data:
         source = my_finetune_data
         batch_size = 4
@@ -203,7 +213,7 @@ fn evaluate_model(model: Model, dataset_name: str) -> dict:
 
 # Practical example: training with wandb logging and matplotlib visualization
 let losses = []
-train(model=my_model, epochs=10, precision=bf16):
+train(model=my_model, epochs=10):
     data:
         source = train_data
         batch_size = 32

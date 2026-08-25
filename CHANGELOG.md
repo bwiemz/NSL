@@ -2349,7 +2349,15 @@ accumulation).
 - Refreshed `README.md` to reflect the current documentation layout and the current local validation snapshot instead of stale passing-test counts.
 - Refreshed `SPECIFICATION.md` to match the workspace version in `Cargo.toml` (`0.9.0`) and point readers at the current docs/research layout and validation status.
 
-## [0.9.1] - 2026-03-26
+### 2026-03-26 tranche — M41b / M35b / M54b
+
+> Everything below to the end of this subsection was previously headed
+> `## [0.9.1] - 2026-03-26`. No v0.9.1 was ever tagged and the workspace
+> version never left 0.9.0, so that heading recorded a release that did not
+> happen — and, being *ahead* of Cargo, it inverted the changelog/version
+> ordering the version-agreement gate now enforces (item 19, 2026-08-25).
+> The content is unreleased work on the 0.9 line, folded into
+> `[Unreleased]` where it belongs.
 
 ### M41b: NVLink/RDMA/TCP KV Transfer Backends
 - **TcpBackend**: TCP socket-based KV transfer for multi-node disaggregated inference (per-rank listener, retry logic, Nagle disabled)

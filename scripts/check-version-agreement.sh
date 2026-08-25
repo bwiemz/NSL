@@ -73,6 +73,57 @@ else
   err "CHANGELOG.md has neither an [Unreleased] nor a [${version}] section heading"
 fi
 
+# --- CHANGELOG's newest numbered release must not be AHEAD of Cargo ---
+# The landing-section check above is satisfiable while a HIGHER version sits
+# tagged in the changelog than the one Cargo declares — exactly what happened
+# with a phantom [0.9.1] recorded 2026-03-26 for a release that was never
+# tagged (item 19). sort -V puts the larger version last.
+newest_numbered="$(grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md \
+  | head -1 | tr -d '#[] ' || true)"
+if [[ -z "${newest_numbered}" ]]; then
+  ok "CHANGELOG.md has no numbered release sections (nothing to order-check)"
+elif [[ "$(printf '%s\n%s\n' "${newest_numbered}" "${version}" | sort -V | tail -1)" == "${version}" ]]; then
+  ok "CHANGELOG.md's newest numbered release (${newest_numbered}) <= ${version}"
+else
+  err "CHANGELOG.md's newest numbered release [${newest_numbered}] is AHEAD of Cargo's ${version} — a release that never happened, or a missed Cargo bump"
+fi
+
+# --- C API version string must derive from CARGO_PKG_VERSION ---
+# nsl_model_get_version() shipped a hardcoded "NSL 0.2.0" for seven releases:
+# it reaches Python users via NslModel.version, is absent from the generated C
+# header (so the header gates never saw it), and its only unit test asserted
+# starts_with("NSL"). Structural check: the literal must be built from the
+# crate version, which cannot drift. The exact-equality unit test lives in
+# c_api/mod.rs (test_version_string).
+capi="crates/nsl-runtime/src/c_api/mod.rs"
+if grep -qF 'concat!("NSL ", env!("CARGO_PKG_VERSION")' "${capi}"; then
+  ok "C API version string derives from CARGO_PKG_VERSION (${capi})"
+else
+  err "${capi}: nsl_model_get_version must build its string with concat!(\"NSL \", env!(\"CARGO_PKG_VERSION\"), ...) — a hardcoded literal is how 'NSL 0.2.0' survived seven releases"
+fi
+
+# --- Python package version fields ---
+py_toml="$(grep -oE '^version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' python/pyproject.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+if [[ "${py_toml}" == "${version}" ]]; then
+  ok "python/pyproject.toml version == ${version}"
+else
+  err "python/pyproject.toml version is '${py_toml:-<missing>}', expected ${version}"
+fi
+py_init="$(grep -oE '^__version__[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' python/nslpy/__init__.py | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+if [[ "${py_init}" == "${version}" ]]; then
+  ok "python/nslpy/__init__.py __version__ == ${version}"
+else
+  err "python/nslpy/__init__.py __version__ is '${py_init:-<missing>}', expected ${version}"
+fi
+
+# --- Wiki roadmap's "Current version" line ---
+roadmap_ver="$(grep -oE '\*\*Current version:\*\* `[0-9]+\.[0-9]+\.[0-9]+`' docs/wiki/Roadmap.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+if [[ "${roadmap_ver}" == "${version}" ]]; then
+  ok "docs/wiki/Roadmap.md 'Current version' == ${version}"
+else
+  err "docs/wiki/Roadmap.md 'Current version' is '${roadmap_ver:-<missing>}', expected ${version} (it claimed 0.9.1 — a version that was never tagged — until item 19)"
+fi
+
 echo
 if [[ "${fail}" -ne 0 ]]; then
   echo "Version agreement check FAILED — reconcile the drift above with Cargo.toml." >&2

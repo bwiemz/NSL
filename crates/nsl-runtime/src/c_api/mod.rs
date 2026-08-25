@@ -1421,9 +1421,14 @@ pub extern "C" fn nsl_model_forward_dlpack(
 // ---------------------------------------------------------------------------
 
 /// Get the NSL compiler/runtime version string.
+///
+/// Derived from the workspace version at compile time. A hardcoded literal
+/// here returned "NSL 0.2.0" for seven releases (item 19, 2026-08-24): the
+/// string reached Python users via `NslModel.version` but was outside every
+/// version gate — the only test on it asserted `starts_with("NSL")`.
 #[no_mangle]
 pub extern "C" fn nsl_model_get_version() -> i64 {
-    static VERSION: &[u8] = b"NSL 0.2.0\0";
+    static VERSION: &[u8] = concat!("NSL ", env!("CARGO_PKG_VERSION"), "\0").as_bytes();
     VERSION.as_ptr() as i64
 }
 
@@ -2258,7 +2263,10 @@ mod tests {
         assert_ne!(version_ptr, 0);
         let version = unsafe { CStr::from_ptr(version_ptr as *const c_char) };
         let version_str = version.to_str().unwrap();
-        assert!(version_str.starts_with("NSL"));
+        // Exact equality with the workspace version. The previous
+        // `starts_with("NSL")` was structurally incapable of catching the
+        // numeric drift this function shipped with for seven releases.
+        assert_eq!(version_str, format!("NSL {}", env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
