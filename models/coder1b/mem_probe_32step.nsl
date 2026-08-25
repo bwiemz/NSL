@@ -16,7 +16,7 @@
 #     --fuse-rmsnorm-backward [--optim-state-offload] mem_probe_32step.nsl
 # Numbers and the segment-early-free measurements:
 #   models/benchmarks/SEGMENT_EARLY_FREE_2026_08_24.md
-from model import ...` are relative to it):
+# Paths (`from model import ...` are relative to it):
 #   python models/benchmarks/make_prod_split.py     # once
 #   cd models/coder1b
 #   nsl run --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
