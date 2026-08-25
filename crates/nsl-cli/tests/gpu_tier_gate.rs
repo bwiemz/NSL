@@ -47,7 +47,7 @@ impl FakeDevice {
         let shim = bin.join("nvidia-smi");
         fs::write(
             &shim,
-            "#!/bin/sh\ncase \"$*\" in\n  *query-compute-apps*) cat \"$(dirname \"$0\")/../apps.csv\";;\n  *) echo \"GPU 0: Fake Device\";;\nesac\n",
+            "#!/bin/sh\nd=\"$(dirname \"$0\")/..\"\nif [ -f \"$d/fail_rc\" ]; then exit \"$(cat \"$d/fail_rc\")\"; fi\ncase \"$*\" in\n  *query-compute-apps*) cat \"$d/apps.csv\";;\n  *) echo \"GPU 0: Fake Device\";;\nesac\n",
         )
         .expect("write shim");
         let mut perms = fs::metadata(&shim).expect("stat").permissions();
@@ -66,6 +66,10 @@ impl FakeDevice {
 
     fn set_compute_apps(&self, csv: &str) {
         fs::write(self.dir.path().join("apps.csv"), csv).expect("write apps.csv");
+    }
+
+    fn set_smi_error(&self, rc: u8) {
+        fs::write(self.dir.path().join("fail_rc"), rc.to_string()).expect("write fail_rc");
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -145,12 +149,20 @@ fn guard_refuses_a_non_numeric_memory_reading() {
 #[test]
 fn guard_run_excludes_a_second_cooperating_run() {
     let dev = FakeDevice::new();
+    // Scrub the same env FakeDevice::run scrubs: an ambient NSL_GPU_GUARD=0
+    // (the guard's own debugging escape) would stop the holder from ever
+    // taking the lock and turn this test into a confusing dev-box flake.
+    // The holder's setsid'd `sleep 20` outlives holder.kill() by design
+    // (SIGKILL runs no trap); it holds only this test's private tempdir lock,
+    // so nothing else can collide with it.
     let mut holder = Command::new(repo_root().join("scripts/gpu-guard.sh"))
         .args(["run", "--", "sleep", "20"])
         .current_dir(repo_root())
         .env("PATH", &dev.path_env)
         .env("NSL_GPU_LOCK", dev.lock_path())
         .env_remove("NSL_GPU_LOCK_HELD")
+        .env_remove("NSL_GPU_GUARD")
+        .env_remove("NSL_GPU_GUARD_THRESHOLD_MIB")
         .spawn()
         .expect("spawn holder");
     // The guard writes holder metadata only AFTER acquiring the flock, so
@@ -279,6 +291,108 @@ fn listing_operations_stay_unguarded_on_a_busy_device() {
     assert!(
         out.status.success(),
         "--dry-run must not refuse: {}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn guard_refuses_when_nvidia_smi_itself_errors() {
+    // Fail CLOSED: an erroring nvidia-smi (wedged driver, post-Xid device)
+    // correlates with exactly the abnormal states the guard exists to catch.
+    // Treating its silence as "idle" would pass the one situation most
+    // likely to be busy-and-broken.
+    let dev = FakeDevice::new();
+    dev.set_smi_error(15);
+    let out = dev.run("scripts/gpu-guard.sh", &["check"]);
+    assert!(
+        !out.status.success(),
+        "an erroring nvidia-smi must refuse, not read as idle: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("REFUSING"),
+        "the refusal must be explicit: {}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn dry_run_is_honoured_in_any_argument_position() {
+    // `certify --tier all --dry-run` is the header's own composition example
+    // with --dry-run appended. A front door that only recognises --dry-run in
+    // position one would silently start a real 90-minute guarded run here.
+    // The device is BUSY, so if the dispatcher tried to actually run, the
+    // guard would refuse (non-zero) — exit 0 with the printed command IS the
+    // proof that nothing launched.
+    let dev = FakeDevice::new();
+    dev.set_compute_apps("4242, /tmp/nsl_run_1/prog, 21000\n");
+    let out = dev.run("scripts/gpu-tier.sh", &["certify", "--tier", "all", "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "--dry-run after pass-through args must still be a dry run: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout.contains("--tier all") && !stdout.contains("--dry-run"),
+        "the printed command must keep pass-through args and drop --dry-run: {stdout}"
+    );
+}
+
+/// starttime of a pid, parsed the way the guards parse it (fields after the
+/// LAST ')' — comm can contain spaces and parens).
+fn starttime_of(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit(')').next()?;
+    rest.split_whitespace().nth(19).map(str::to_owned)
+}
+
+#[test]
+fn a_stale_lock_held_token_cannot_disarm_the_guard() {
+    // NSL_GPU_LOCK_HELD leaking into a long-lived environment plus pid reuse
+    // must NOT silently skip the busy check: the token carries pid:starttime,
+    // and a recycled pid has a different starttime. pid 1 is always alive,
+    // so a bare-liveness check would be fooled here.
+    let dev = FakeDevice::new();
+    dev.set_compute_apps("4242, /tmp/nsl_run_1/prog, 21000\n");
+    let out = Command::new(repo_root().join("scripts/gpu-guard.sh"))
+        .args(["check"])
+        .current_dir(repo_root())
+        .env("PATH", &dev.path_env)
+        .env("NSL_GPU_LOCK", dev.lock_path())
+        .env("NSL_GPU_LOCK_HELD", "1:0")
+        .env_remove("NSL_GPU_GUARD")
+        .output()
+        .expect("spawn");
+    assert!(
+        !out.status.success(),
+        "a stale pid:starttime token must not skip the busy check: {}",
+        stderr_of(&out)
+    );
+
+    // The positive arm: a GENUINE enclosing token (live process, matching
+    // starttime) does skip — otherwise nesting would self-refuse on the
+    // workload's own allocations.
+    let mut sleeper = Command::new("sleep").arg("20").spawn().expect("sleeper");
+    let token = format!(
+        "{}:{}",
+        sleeper.id(),
+        starttime_of(sleeper.id()).expect("starttime")
+    );
+    let out = Command::new(repo_root().join("scripts/gpu-guard.sh"))
+        .args(["check"])
+        .current_dir(repo_root())
+        .env("PATH", &dev.path_env)
+        .env("NSL_GPU_LOCK", dev.lock_path())
+        .env("NSL_GPU_LOCK_HELD", &token)
+        .env_remove("NSL_GPU_GUARD")
+        .output()
+        .expect("spawn");
+    sleeper.kill().ok();
+    sleeper.wait().ok();
+    assert!(
+        out.status.success(),
+        "a live matching token must skip (nesting would self-refuse otherwise): {}",
         stderr_of(&out)
     );
 }

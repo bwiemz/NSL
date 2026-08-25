@@ -691,8 +691,14 @@ case "$1" in
         if [[ "${1:-}" == "--tier" ]]; then
             [[ -n "${2:-}" ]] || { echo "gpu-cert: --tier needs a value" >&2; exit 2; }
             NSL_CERT_TIER="$2"; export NSL_CERT_TIER
-        elif [[ -n "${1:-}" ]]; then
-            echo "gpu-cert: unknown option after --run: $1" >&2; exit 2
+            shift 2
+        fi
+        if [[ $# -gt 0 ]]; then
+            # Refuse, don't drop: silently ignoring trailing arguments turned
+            # a mistyped `--run --tier all --something` into a full run with
+            # the option unapplied — an hour of hardware time answering a
+            # question nobody asked.
+            echo "gpu-cert: unknown argument(s) after --run: $*" >&2; exit 2
         fi
         # Self-wrap under the concurrency guard (scripts/gpu-guard.sh): flock
         # against other guarded runs, busy-device refusal against everything
@@ -700,8 +706,9 @@ case "$1" in
         # bug otherwise), and the whole lane in its own process group so a
         # killed lane cannot orphan a child on the device. The tier selection
         # is already exported, so the re-exec needs no argument beyond --run.
-        if [[ "${NSL_GPU_GUARD:-1}" != "0" ]] \
-           && ! { [[ -n "${NSL_GPU_LOCK_HELD:-}" ]] && kill -0 "${NSL_GPU_LOCK_HELD}" 2>/dev/null; }; then
+        # `held` is the loop-break: it verifies the enclosing guard's
+        # pid:starttime token, so a stale variable cannot skip the wrap.
+        if [[ "${NSL_GPU_GUARD:-1}" != "0" ]] && ! "${ROOT}/scripts/gpu-guard.sh" held; then
             exec "${ROOT}/scripts/gpu-guard.sh" run -- "${ROOT}/scripts/gpu-cert.sh" --run
         fi
         cmd_run

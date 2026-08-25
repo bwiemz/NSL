@@ -51,7 +51,7 @@ done
 # whole sweep in its own process group so killing it cannot orphan a child on
 # the device. --list runs nothing on the device, so it stays unguarded.
 if [[ "${list_only}" -eq 0 && "${NSL_GPU_GUARD:-1}" != "0" ]] \
-   && ! { [[ -n "${NSL_GPU_LOCK_HELD:-}" ]] && kill -0 "${NSL_GPU_LOCK_HELD}" 2>/dev/null; }; then
+   && ! "${repo_root}/scripts/gpu-guard.sh" held; then
     exec "${repo_root}/scripts/gpu-guard.sh" run -- "${repo_root}/tools/gpu-test.sh" "${orig_args[@]}"
 fi
 

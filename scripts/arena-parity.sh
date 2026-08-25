@@ -35,6 +35,14 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Refuse-to-start GPU guard. BEFORE the mktemp below: an exec after the EXIT
+# trap is armed would orphan the workdir. Hard exit, never a warning — see
+# scripts/gpu-guard.sh for the incident.
+if [[ "${NSL_GPU_GUARD:-1}" != "0" ]] && ! "${REPO}/scripts/gpu-guard.sh" held; then
+    exec "${REPO}/scripts/gpu-guard.sh" run -- "${REPO}/scripts/arena-parity.sh" "$@"
+fi
+
 NSL="${1:-${REPO}/target/release/nsl}"
 WORK="$(mktemp -d /tmp/nsl_arena_parity.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT

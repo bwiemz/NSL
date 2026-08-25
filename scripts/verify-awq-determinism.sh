@@ -13,6 +13,15 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Refuse-to-start GPU guard. BEFORE the mktemp below: an exec after the EXIT
+# trap is armed would orphan the tmpdir. Hard exit, never a warning — see
+# scripts/gpu-guard.sh for the incident.
+if [[ "${NSL_GPU_GUARD:-1}" != "0" ]] && ! "${ROOT}/scripts/gpu-guard.sh" held; then
+    exec "${ROOT}/scripts/gpu-guard.sh" run -- "${ROOT}/scripts/verify-awq-determinism.sh" "$@"
+fi
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 

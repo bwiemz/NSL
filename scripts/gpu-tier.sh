@@ -29,9 +29,10 @@
 # Budgets (measured on the reference box — RTX PRO 4500 Blackwell 32GB,
 # warm CARGO_TARGET_DIR; see models/benchmarks/GPU_TIERS_2026_08_24.md):
 #
-#   smoke      ~10 min
-#   certify    ~90 min
-#   endurance  ~270 min (three phases; --skip-f32/--skip-resume shorten it)
+#   smoke      ~5 min (measured 36 s warm, 1 m 35 s on first build, 29/29 PASS)
+#   certify    ~90 min (measured 63 m 32 s warm, 397 gates / 124 targets)
+#   endurance  ~270 min (three phases, bounded by 3 x 90-min per-phase
+#              timeouts; --skip-f32/--skip-resume shorten it)
 #
 # A budget overrun WARNS but does not change the exit status: the budget
 # documents expectation on the reference box, while correctness enforcement
@@ -59,17 +60,32 @@ if [[ $# -eq 0 ]]; then
 fi
 tier="$1"; shift
 
+# --dry-run is honoured in ANY position, not just first: `certify --tier all
+# --dry-run` (the composition example above with --dry-run appended) must
+# never silently start a real hour-long run. It is removed from the
+# pass-through so the runner never sees an option it does not know.
 dry=0
-if [[ "${1:-}" == "--dry-run" ]]; then dry=1; shift; fi
+passthrough=()
+for arg in "$@"; do
+    if [[ "${arg}" == "--dry-run" ]]; then dry=1; else passthrough+=("${arg}"); fi
+done
 
 # Budget minutes per tier, measured on the reference box (see header).
 case "${tier}" in
-    smoke)     cmd=(tools/gpu-test.sh);                          budget_min=10 ;;
+    smoke)     cmd=(tools/gpu-test.sh);                          budget_min=5 ;;
     certify)   cmd=(scripts/gpu-cert.sh --run);                  budget_min=90 ;;
     endurance) cmd=(python3 models/benchmarks/endurance_1b.py);  budget_min=270 ;;
     *) echo "gpu-tier: unknown tier '${tier}' (want smoke|certify|endurance)" >&2; exit 2 ;;
 esac
-cmd+=("$@")
+cmd+=("${passthrough[@]}")
+
+# EVERY tier runs under the guard — flock + busy-device refusal + own process
+# group. The shell runners also self-wrap (for direct invocation), and their
+# `gpu-guard.sh held` loop-break makes this outer layer the one that holds
+# the lock; without this wrapper the endurance tier's python driver would
+# refuse-on-busy but get no process-group protection, recreating the
+# kill-the-launcher-orphan-the-child incident this whole guard exists for.
+cmd=(scripts/gpu-guard.sh run -- "${cmd[@]}")
 
 if [[ "${dry}" -eq 1 ]]; then
     printf '%q ' "${cmd[@]}"; printf '\n'

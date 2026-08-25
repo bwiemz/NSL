@@ -33,15 +33,25 @@
 #   run -- CMD ARG...  flock (exit 1 if another guarded run holds it), then
 #                      check, then run CMD in its own process group. Exits
 #                      with CMD's status.
+#   held               exit 0 iff an enclosing guard's NSL_GPU_LOCK_HELD token
+#                      names a process that is still alive (pid AND starttime
+#                      match). The single implementation of the loop-break the
+#                      self-wrapping entry points use before re-exec'ing into
+#                      `run`.
 #   path               print the lock path (for non-bash callers; the python
 #                      twin models/benchmarks/gpu_guard.py uses the same path
 #                      and threshold variables).
 #
 # Environment:
-#   NSL_GPU_LOCK                 lock path. Default: $XDG_RUNTIME_DIR/nsl-gpu.lock,
-#                                falling back to /tmp/nsl-gpu.lock. One path per
-#                                machine on purpose — the GPU is one shared
-#                                resource, so the lock must be too.
+#   NSL_GPU_LOCK                 lock path. Default: /tmp/nsl-gpu.lock — ONE
+#                                fixed path per machine, unconditionally. An
+#                                $XDG_RUNTIME_DIR default was rejected: it
+#                                differs between an interactive shell and a
+#                                runner/cron service, which would split the
+#                                "machine-wide" lock into two files that never
+#                                exclude each other — precisely during the
+#                                minutes-long build window before the busy
+#                                check could catch the collision.
 #   NSL_GPU_GUARD_THRESHOLD_MIB  per-process refusal threshold (default 256).
 #                                Not zero: a Wayland desktop's compositor holds
 #                                ~125 MiB as a compute app while completely
@@ -54,30 +64,50 @@
 #                                guard itself — NOT for getting past a refusal:
 #                                the refusal means a measurement made now would
 #                                be untrustworthy.
-#   NSL_GPU_LOCK_HELD            internal. Set to the guard's pid for the
-#                                wrapped workload, so a guarded script invoking
-#                                another guarded script does not deadlock on
-#                                the lock it already holds (and does not
-#                                re-run the busy check against its own
-#                                allocations).
+#   NSL_GPU_LOCK_HELD            internal. Set to "pid:starttime" of the guard
+#                                for the wrapped workload, so a guarded script
+#                                invoking another guarded script does not
+#                                deadlock on the lock it already holds (and
+#                                does not re-run the busy check against its own
+#                                allocations). The starttime half makes a
+#                                leaked value harmless: a recycled pid has a
+#                                different starttime, so a stale variable in a
+#                                long-lived environment cannot silently disarm
+#                                the guard.
 #
 # A non-numeric memory reading (some platforms report "[N/A]" per process) is
-# treated as OVER threshold, not under: the guard cannot prove the device is
-# idle, and "cannot prove idle" refuses for the same reason "no nvidia-smi"
-# does. NSL_GPU_GUARD=0 is the operator override for platforms where that
-# reading never becomes numeric.
+# treated as OVER threshold, not under, and an ERRORING nvidia-smi refuses
+# outright: the guard cannot prove the device is idle, and "cannot prove idle"
+# refuses for the same reason "no nvidia-smi" does — a wedged driver
+# correlates with exactly the abnormal states this guard exists to catch.
+# NSL_GPU_GUARD=0 is the operator override for platforms where the reading
+# never becomes numeric.
 
 set -euo pipefail
 
-LOCK="${NSL_GPU_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/nsl-gpu.lock}"
+LOCK="${NSL_GPU_LOCK:-/tmp/nsl-gpu.lock}"
 THRESHOLD_MIB="${NSL_GPU_GUARD_THRESHOLD_MIB:-256}"
 
-# True when an enclosing guard already holds the lock and is still alive. Both
-# the lock AND the busy check are skipped then: the outer guard performed both
-# before any GPU work started, and by the time a nested invocation runs, the
-# workload's own allocations would read as "foreign" and self-refuse.
+# Kernel start time of a pid (field 22 of /proc/<pid>/stat), empty if gone.
+# comm can contain spaces and parens, so strip through the LAST ')' before
+# counting fields — starttime is then field 20 of the remainder.
+proc_starttime() {
+    sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}' || true
+}
+
+# True when an enclosing guard already holds the lock and is still alive —
+# pid AND starttime must match the token, so a stale NSL_GPU_LOCK_HELD in a
+# long-lived environment plus pid reuse cannot disarm the guard. When true,
+# both the lock AND the busy check are skipped: the outer guard performed
+# both before any GPU work started, and by the time a nested invocation runs,
+# the workload's own allocations would read as "foreign" and self-refuse.
 enclosing_guard_alive() {
-    [[ -n "${NSL_GPU_LOCK_HELD:-}" ]] && kill -0 "${NSL_GPU_LOCK_HELD}" 2>/dev/null
+    local held="${NSL_GPU_LOCK_HELD:-}" pid st
+    [[ "${held}" == *:* ]] || return 1
+    pid="${held%%:*}"
+    st="${held##*:}"
+    [[ -n "${pid}" && -n "${st}" ]] || return 1
+    [[ "$(proc_starttime "${pid}")" == "${st}" ]]
 }
 
 busy_check() {
@@ -90,8 +120,15 @@ busy_check() {
         exit 1
     fi
     local rows offenders
-    rows="$(nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
-            --format=csv,noheader,nounits 2>/dev/null || true)"
+    if ! rows="$(nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
+            --format=csv,noheader,nounits 2>/dev/null)"; then
+        # Fail CLOSED: an erroring nvidia-smi (wedged driver, post-Xid device)
+        # correlates with exactly the abnormal states this guard exists to
+        # catch; treating its silence as "idle" would pass the one situation
+        # most likely to be busy-and-broken.
+        echo "gpu-guard: REFUSING — nvidia-smi failed; cannot prove the device is idle." >&2
+        exit 1
+    fi
     # Third field over threshold OR not a number (see header). `$3 + 0 != $3`
     # is the numeric test: "[N/A]" fails it, "22000" passes it.
     offenders="$(awk -F', ' -v t="${THRESHOLD_MIB}" '
@@ -129,7 +166,11 @@ cmd_run() {
         exit 2
     fi
 
-    if ! enclosing_guard_alive && [[ "${NSL_GPU_GUARD:-1}" != "0" ]]; then
+    if enclosing_guard_alive; then
+        # Never skip silently: a skip that prints nothing is indistinguishable
+        # from a guard that was never wired.
+        echo "gpu-guard: enclosing guard (${NSL_GPU_LOCK_HELD}) holds the lock — nesting" >&2
+    elif [[ "${NSL_GPU_GUARD:-1}" != "0" ]]; then
         # Append mode: opening with '>' would truncate the holder metadata of
         # a lock we are about to FAIL to take.
         exec 9>>"${LOCK}"
@@ -138,6 +179,8 @@ cmd_run() {
                 echo "gpu-guard: REFUSING — another guarded GPU run holds ${LOCK}:"
                 sed 's/^/    /' "${LOCK}" 2>/dev/null || true
                 echo "Wait for it to finish; two concurrent runs corrupt both measurements."
+                echo "(If that pid is dead, its setsid'd workload tree inherited the lock fd"
+                echo "and still holds it — the lock releases when the workload itself exits.)"
             } >&2
             exit 1
         fi
@@ -148,7 +191,7 @@ cmd_run() {
         busy_check
     fi
 
-    export NSL_GPU_LOCK_HELD="$$"
+    export NSL_GPU_LOCK_HELD="$$:$(proc_starttime "$$")"
 
     # Own process group via setsid, signals forwarded to the GROUP. `wait`
     # returns early when a trapped signal arrives, so loop until the child is
@@ -168,9 +211,10 @@ cmd_run() {
 case "${1:-}" in
     check) cmd_check ;;
     run)   shift; cmd_run "$@" ;;
+    held)  enclosing_guard_alive ;;
     path)  printf '%s\n' "${LOCK}" ;;
-    -h|--help) sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help) sed -n "2,$(awk '/^set -euo/{print NR-2; exit}' "$0")p" "$0" | sed 's/^# \{0,1\}//' ;;
     # Anything else exits non-zero: a typo'd subcommand in a CI line must not
     # read as a green check that did nothing (same posture as gpu-cert.sh).
-    *) echo "gpu-guard: unknown subcommand: ${1:-<none>} (want check|run|path)" >&2; exit 2 ;;
+    *) echo "gpu-guard: unknown subcommand: ${1:-<none>} (want check|run|held|path)" >&2; exit 2 ;;
 esac
