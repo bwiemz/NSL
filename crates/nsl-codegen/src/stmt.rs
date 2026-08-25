@@ -8771,6 +8771,26 @@ impl Compiler<'_> {
                     }
                 }
 
+                // Item 2 (2026-08-25): every bound Input leaf gets a device
+                // guard call — a host-resident dense-float input on a
+                // GPU-parameter model REFUSES at runtime instead of silently
+                // reconciling every weight down to the host (f64,
+                // single-threaded; the defect that made #524's first gate
+                // fixture look like a hang). Covers inputs bound by EITHER
+                // pass above; the runtime no-ops for CPU models, scalars,
+                // and index-typed tensors.
+                for op in &extractor.wengert_list().ops {
+                    if matches!(op.op, crate::wengert::PrimalOp::Input(_)) {
+                        if let Some(&val) = primal_vars.get(&op.result) {
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_train_input_device_guard",
+                                &[val, param_list],
+                            )?;
+                        }
+                    }
+                }
+
                 // Also populate model parameter VarIds from param_list.
                 // MemberAccess expressions (e.g., m.w) are registered in the extractor
                 // under the member symbol, but those aren't in state.variables — they're

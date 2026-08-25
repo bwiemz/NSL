@@ -47,11 +47,20 @@ fn repo_root() -> PathBuf {
 #[derive(Clone, Copy)]
 enum Shape {
     Small,
+    /// Sized for the GPU memory guards (item 2, 2026-08-25): per-segment
+    /// interiors must be individually >= the caching allocator's 2 MB
+    /// large-class quantum and collectively >> its 20 MB segment growth, or
+    /// moving WHEN they free cannot move the measured peak (the
+    /// tiny-fixture trap: an earlier KB-interior fixture measured IDENTICAL
+    /// peaks with the witness firing). d=512/ff=2048 at 2048 rows makes
+    /// each block's interiors ~16-32 MB — dozens of rounding quanta.
+    GpuSized,
 }
 
 fn fixture(gpu: bool, shape: Shape) -> String {
     let (blocks, rows, d, ff, epochs) = match shape {
         Shape::Small => (4, 8, 128, 512, 2),
+        Shape::GpuSized => (4, 8, 512, 2048, 1),
     };
     // seq_len 64 x batch `rows/64`... keep it simpler: batch 4, seq = rows.
     // The program follows the det_train_check/production pattern — DataLoader
@@ -90,8 +99,8 @@ model Seg:
 let m = Seg()
 {place}
 let unit = arange(128)
-let tokens = unit.reshape([1, 128]).expand([16, 128]).contiguous().reshape([2048])
-let loader = DataLoader(tokens, batch_size=4, seq_len=64, shuffle=false, drop_last=true)
+let tokens = unit.reshape([1, 128]).expand([{tiles}, 128]).contiguous().reshape([{n_tokens}])
+let loader = DataLoader(tokens, batch_size=4, seq_len={seq}, shuffle=false, drop_last=true)
 
 print("LOSS_STREAM_BEGIN")
 train(model = m, epochs = {epochs}):
@@ -109,8 +118,20 @@ print("LOSS_STREAM_END")
 print("SEG_FREE_FIXTURE_DONE")
 "#,
         place = if gpu { "m.to(cuda)" } else { "" },
+        tiles = match shape {
+            Shape::Small => 16,
+            Shape::GpuSized => 128, // 16,384 tokens = 8 micro-steps of 4x512
+        },
+        n_tokens = match shape {
+            Shape::Small => 2048,
+            Shape::GpuSized => 16384,
+        },
+        seq = match shape {
+            Shape::Small => 64,
+            Shape::GpuSized => 512,
+        },
         peak = if gpu {
-            "print(\"PEAK_ACTIVATIONS\")\nprint(gpu_surface_at_peak_bytes(6))"
+            "print(\"PEAK_BYTES\")\nprint(gpu_peak_bytes())\nprint(\"PEAK_ACTIVATIONS\")\nprint(gpu_surface_at_peak_bytes(6))"
         } else {
             ""
         },
@@ -131,6 +152,17 @@ struct Run {
 /// peak it measures is run-to-run stable without the flag (the 1B record's
 /// EC1: byte-identical allocator peaks across non-deterministic arms).
 fn run(tag: &str, gpu: bool, shape: Shape, det: bool, seg_free: bool) -> Run {
+    run_with_events(tag, gpu, shape, det, seg_free, None)
+}
+
+fn run_with_events(
+    tag: &str,
+    gpu: bool,
+    shape: Shape,
+    det: bool,
+    seg_free: bool,
+    events: Option<&std::path::Path>,
+) -> Run {
     let root = repo_root();
     let dir = std::env::temp_dir().join(format!("nsl_segfree_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -147,6 +179,10 @@ fn run(tag: &str, gpu: bool, shape: Shape, det: bool, seg_free: bool) -> Run {
     }
     if !seg_free {
         cmd.env("NSL_CCR_SEGMENT_FREE", "0");
+    }
+    if let Some(ev) = events {
+        let _ = std::fs::remove_file(ev);
+        cmd.env("NSL_EVENTS", ev);
     }
     let out = cmd.output().expect("spawn nsl run");
     Run {
@@ -217,21 +253,180 @@ fn per_segment_free_engages_and_is_bit_exact_with_the_kill_switch() {
     );
 }
 
-// NO GPU MEMORY GUARD HERE, stated so nobody mistakes the omission for
-// coverage. Three fixture attempts each tripped a DIFFERENT pre-existing
-// runtime quirk before the feature was exercised: (1) a host-resident
-// `full()` input makes an upstream adjoint op emit CPU gradients — a
-// single-threaded host backward that runs ~forever under the debug binary
-// CARGO_BIN_EXE_nsl resolves to; (2) a bare `zeros().to(cuda)` target hits a
-// `data_f64() on non-f64 tensor` abort in the loss path; (3) a 2D-logits
-// cross_entropy variant aborts in `nsl_tensor_compare`. Each is logged in
-// the memory bug ledger; none involves this feature (all reproduce with the
-// kill switch set).
+// The GPU memory guards below exist as of item 2 (2026-08-25). Their
+// original absence was blocked by what looked like THREE runtime quirks and
+// root-caused to TWO: (a) mixed-dtype `nsl_tensor_compare`/`nsl_tensor_where`
+// aborted every GPU relu-backward Condition (misattributed at the time to
+// mse targets and 2D-logits cross_entropy — both were this), fixed with
+// per-operand dtype dispatch; (b) a host-resident dense-float input dragged
+// the whole graph to the host via left-operand device reconciliation, now a
+// train-entry REFUSAL (`nsl_train_input_device_guard`). This fixture uses
+// relu deliberately: every GPU run of these guards also regression-tests (a).
 //
-// The memory effect is pinned instead by models/benchmarks/
-// SEGMENT_EARLY_FREE_2026_08_24.md: the 32-micro-step 1B probe (committed
-// alongside) reproduces the full-epoch allocator peak to the byte and
-// measures activations 16.54 GiB -> 3.66 GiB, with the fully-resident
-// configuration going from OOM-in-forward to completing at 19.71 GiB. Item
-// 12's re-profile re-measures it on every change to this machinery.
+// The 1B-scale numbers stay pinned by models/benchmarks/
+// SEGMENT_EARLY_FREE_2026_08_24.md and the committed mem_probe_32step.nsl;
+// the guards below pin the MECHANISM at fixture scale, sized above the
+// allocator's rounding quanta (see Shape::GpuSized).
 
+fn peak_value(stdout: &str, marker: &str) -> u64 {
+    let mut lines = stdout.lines().skip_while(|l| l.trim() != marker);
+    lines.next();
+    lines
+        .next()
+        .and_then(|l| l.trim().parse::<f64>().ok())
+        .map(|v| v as u64)
+        .unwrap_or_else(|| panic!("no {marker} value in stdout:\n{stdout}"))
+}
+
+/// Peak guard: per-segment freeing must move the measured FORWARD activation
+/// peak by a margin far above allocator granularity — a kill-switch A/B on
+/// the same binary, non-deterministic (deterministic mode routes reductions
+/// to a single-threaded host path that crawls under the debug test binary,
+/// and allocator peaks are run-to-run byte-stable without it).
+#[test]
+#[ignore = "requires CUDA GPU (two training runs, kill-switch A/B)"]
+fn gpu_forward_activation_peak_drops_with_per_segment_free() {
+    let on = run("gpu_on", true, Shape::GpuSized, false, true);
+    assert!(on.ok, "feature-on GPU run failed:\n{}", on.stderr);
+    let n = witness_count(&on.stderr)
+        .unwrap_or_else(|| panic!("no witness on GPU run:\n{}", on.stderr));
+    assert!(n > 0, "witness reports zero interiors freed");
+
+    let off = run("gpu_off", true, Shape::GpuSized, false, false);
+    assert!(off.ok, "kill-switch GPU run failed:\n{}", off.stderr);
+
+    let (on_act, off_act) = (
+        peak_value(&on.stdout, "PEAK_ACTIVATIONS"),
+        peak_value(&off.stdout, "PEAK_ACTIVATIONS"),
+    );
+    // 32 MiB margin: interiors on this fixture total >100 MB, allocator
+    // quanta are 2 MiB blocks / 20 MiB segments — a real effect clears this
+    // by 3x, a granularity artifact cannot reach it.
+    const MARGIN: u64 = 32 << 20;
+    assert!(
+        on_act + MARGIN <= off_act,
+        "per-segment freeing did not move the forward activation peak: \
+         on={on_act} off={off_act} (need >= {MARGIN} drop). The witness \
+         fired (n={n}), so the pass ran but freed nothing the peak felt — \
+         the item-11 regression shape."
+    );
+}
+
+/// Allocation-slope guard: the post-cleanup allocated-bytes series from
+/// NSL_EVENTS must be FLAT from steady state on — byte equality, the
+/// assertion class that catches what a peak assertion hides (the +8 MB/step
+/// fused-SDPA LSE leak shipped INSIDE item 11's first draft and was found
+/// by ramp, not by any peak). Exact bytes, every step, from one snapshot
+/// per emission — no stderr parsing, no MB rounding.
+#[test]
+#[ignore = "requires CUDA GPU (one training run)"]
+fn gpu_allocation_is_flat_across_steps() {
+    let ev = std::env::temp_dir().join(format!("nsl_segfree_events_{}.jsonl", std::process::id()));
+    let r = run_with_events("gpu_flat", true, Shape::GpuSized, false, true, Some(&ev));
+    assert!(r.ok, "GPU run failed:\n{}", r.stderr);
+
+    // Per step, the LAST gpu_mem_step event (highest seq) is the
+    // post-cleanup snapshot — the step-boundary state a leak inflates.
+    let text = std::fs::read_to_string(&ev).expect("events file");
+    let mut by_step: std::collections::BTreeMap<i64, (i64, u64)> = Default::default();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "gpu_mem_step" {
+            continue;
+        }
+        let (Some(step), Some(seq), Some(alloc)) = (
+            v["step"].as_i64(),
+            v["seq"].as_i64(),
+            v["fields"]["allocated_bytes"].as_u64(),
+        ) else {
+            continue;
+        };
+        let e = by_step.entry(step).or_insert((seq, alloc));
+        if seq >= e.0 {
+            *e = (seq, alloc);
+        }
+    }
+    let series: Vec<(i64, u64)> = by_step.into_iter().map(|(s, (_, a))| (s, a)).collect();
+    assert!(
+        series.len() >= 6,
+        "expected >= 6 stepped gpu_mem_step events, got {} — the fixture \
+         shrank below the point where a slope is measurable:\n{text}",
+        series.len()
+    );
+    // Steady state after the first two steps (allocator warm-up: pools grow,
+    // caches fill). From there: byte equality.
+    let steady = &series[2..];
+    let first = steady[0].1;
+    for &(step, alloc) in steady {
+        assert_eq!(
+            alloc, first,
+            "allocated bytes moved at step {step}: {alloc} != {first} — a \
+             per-step allocation slope (the LSE-leak class). Full series: \
+             {series:?}"
+        );
+    }
+    let _ = std::fs::remove_file(&ev);
+}
+
+
+
+/// Defect-1 refusal (item 2): a host-resident dense-float step input on a
+/// GPU-parameter model must REFUSE at the first step with the fix named —
+/// not silently reconcile every weight down to a single-threaded f64 host
+/// graph (which under this debug test binary presents as a hang).
+#[test]
+#[ignore = "requires CUDA GPU (one refused run)"]
+fn gpu_train_refuses_a_host_resident_float_input() {
+    let root = repo_root();
+    let dir = std::env::temp_dir().join(format!("nsl_hostinput_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let prog = dir.join("p.nsl");
+    std::fs::write(
+        &prog,
+        r#"from nsl.nn.losses import mse_loss
+
+model Tiny:
+    w: Tensor = randn([64, 64]) * 0.02
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return relu(x @ self.w)
+
+let m = Tiny()
+m.to(cuda)
+let x = full([8, 64], 0.5)
+let y = full([8, 64], 1.0).to(cuda)
+
+train(model = m, epochs = 1):
+    optimizer: AdamW(lr = 0.001)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+print("SHOULD_NOT_COMPLETE")
+"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args(["run", "--source-ad", "--seed", "11"])
+        .arg(&prog)
+        .current_dir(&dir)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .output()
+        .expect("spawn nsl run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "a host-resident float input on a GPU train must refuse; it completed:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("host-resident while the model's parameters are on the GPU"),
+        "refusal must name the hazard and the fix; stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_COMPLETE"),
+        "program ran to completion despite the refusal claim"
+    );
+}

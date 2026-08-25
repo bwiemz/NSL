@@ -710,6 +710,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_grad_integrity_step_end", &[], None),
     // Prefetch tensor to GPU asynchronously
     ("nsl_tensor_prefetch", &[types::I64, types::I64], None),
+    // Item 2 (2026-08-25): refuse a host-resident dense-float step input on
+    // a GPU-parameter train — the left-operand device-reconciliation rule
+    // would otherwise silently drag the whole graph to the host.
+    ("nsl_train_input_device_guard", &[types::I64, types::I64], None),
     // Milestone C p2 Stage-2B: the placed transient arena. `bind` arms a
     // single-shot, size-exact pin that the device allocator consumes; `unbind`
     // disarms it so an op that took a non-allocating path cannot leak the pin
