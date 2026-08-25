@@ -48,7 +48,7 @@ HF = REPO / "data/hf"
 # the mix directory must show up as "unexpected", not get silently manifested.
 BINS = [
     "stack_train.bin", "web_train.bin", "sft_train.bin", "nsl_train.bin",
-    "web_val.bin", "sft_val.bin", "pretrain_train.bin",
+    "web_val.bin", "sft_val.bin", "stack_val.bin", "pretrain_train.bin",
 ]
 
 DATASETS = {
@@ -58,6 +58,28 @@ DATASETS = {
         "dedup": "no additional dedup; the 20 shards are disjoint partitions "
                  "of one Spark job, sampled with a stride so the subset is "
                  "not correlated with partition order",
+    },
+    "stack-val": {
+        "repo": "HuggingFaceCode/stack-v3-train",
+        "sample": "1 shard off the training stride (index 204), held out "
+                  "whole for validation",
+        "dedup": "repository-disjoint from stack train by shard partitioning "
+                 "AND verified: verify.py intersects the repo_id columns of "
+                 "both directories and requires an empty overlap",
+    },
+    "humaneval": {
+        "repo": "openai/openai_humaneval",
+        "sample": "the full test split (164 problems)",
+        "dedup": "decontamination reference only — never enters any corpus "
+                 "bin; every validation set is scanned clean against it "
+                 "(see the decontamination record)",
+    },
+    "mbpp": {
+        "repo": "google-research-datasets/mbpp",
+        "sample": "full + sanitized configs, all splits",
+        "dedup": "decontamination reference only — never enters any corpus "
+                 "bin; every validation set is scanned clean against it "
+                 "(see the decontamination record)",
     },
     "fineweb": {
         "repo": "HuggingFaceFW/fineweb",
@@ -164,6 +186,43 @@ def build() -> int:
         print(f"build: unexpected bins in {MIX}: {unexpected}", file=sys.stderr)
         return 1
 
+    # The decontamination record (item 5): produced by decontaminate.py,
+    # REQUIRED here — a corpus manifested for evaluation without a stated
+    # decontamination method is a claim with no evidence.
+    decon_path = REPO / "data/text/decontamination.json"
+    if not decon_path.exists():
+        print("build: no decontamination report at "
+              f"{decon_path} — run tools/hfcorpus/decontaminate.py first",
+              file=sys.stderr)
+        return 1
+    decon_raw = json.loads(decon_path.read_text())
+    # Freshness: the report's per-set document counts must match the
+    # CURRENT extractions, or a set re-cut after the scan would commit a
+    # stale-but-passing record (review finding).
+    for set_name, entry in decon_raw["sets"].items():
+        em = REPO / "data/text" / set_name / "manifest.json"
+        if not em.exists():
+            continue
+        extracted = json.loads(em.read_text()).get("documents")
+        if extracted is not None and extracted != entry["documents"]:
+            print(f"build: decontamination report scanned {entry['documents']} "
+                  f"documents of {set_name} but the extraction now has "
+                  f"{extracted} — re-run decontaminate.py",
+                  file=sys.stderr)
+            return 1
+    decontamination = {
+        "method": decon_raw["method"],
+        "benchmarks": decon_raw["benchmarks"],
+        "benchmark_line_count": decon_raw["benchmark_line_count"],
+        "sets": {
+            name: {
+                "documents": e["documents"],
+                "contaminated_documents": e["contaminated_documents"],
+            }
+            for name, e in decon_raw["sets"].items()
+        },
+    }
+
     manifest = {
         "_comment": "Committed identity of the v2 pretraining corpus. The bins "
                     "are local-only; this is what makes them checkable and "
@@ -175,6 +234,7 @@ def build() -> int:
         "reserved": {"surfaces": specials["surfaces"], "ids": specials["ids"]},
         "sources": sources,
         "bins": bins,
+        "decontamination": decontamination,
     }
     MANIFEST.parent.mkdir(parents=True, exist_ok=True)
     MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")

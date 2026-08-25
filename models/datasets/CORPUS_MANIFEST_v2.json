@@ -56,6 +56,40 @@
         "data/part-07771-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet"
       ]
     },
+    "stack-val": {
+      "repo": "HuggingFaceCode/stack-v3-train",
+      "sample": "1 shard off the training stride (index 204), held out whole for validation",
+      "dedup": "repository-disjoint from stack train by shard partitioning AND verified: verify.py intersects the repo_id columns of both directories and requires an empty overlap",
+      "revision": "df4b205fbba4cc1c2fd1f205b10d66f730798bb9",
+      "files": [
+        "data/part-00204-990b4288-3824-41ac-94a0-b6fd6fa23ffe-c000.snappy.parquet"
+      ]
+    },
+    "humaneval": {
+      "repo": "openai/openai_humaneval",
+      "sample": "the full test split (164 problems)",
+      "dedup": "decontamination reference only — never enters any corpus bin; every validation set is scanned clean against it (see the decontamination record)",
+      "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+      "files": [
+        "openai_humaneval/test-00000-of-00001.parquet"
+      ]
+    },
+    "mbpp": {
+      "repo": "google-research-datasets/mbpp",
+      "sample": "full + sanitized configs, all splits",
+      "dedup": "decontamination reference only — never enters any corpus bin; every validation set is scanned clean against it (see the decontamination record)",
+      "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+      "files": [
+        "full/prompt-00000-of-00001.parquet",
+        "full/test-00000-of-00001.parquet",
+        "full/train-00000-of-00001.parquet",
+        "full/validation-00000-of-00001.parquet",
+        "sanitized/prompt-00000-of-00001.parquet",
+        "sanitized/test-00000-of-00001.parquet",
+        "sanitized/train-00000-of-00001.parquet",
+        "sanitized/validation-00000-of-00001.parquet"
+      ]
+    },
     "fineweb": {
       "repo": "HuggingFaceFW/fineweb",
       "sample": "config sample-10BT, all 15 parquet files",
@@ -138,10 +172,16 @@
       "max_token_id": 49145
     },
     "sft_val.bin": {
-      "sha256": "e66e8cf25f66265c162015f5eac1dc19578a26530504e7f59929db78e4fb62dc",
-      "tokens": 2258310,
-      "bytes_per_token": 4.9098,
+      "sha256": "f56e03d03c342577ddcd4d65ed0e265e723bc14f3ab36a9bc520a722d58b02b3",
+      "tokens": 2251516,
+      "bytes_per_token": 4.9103,
       "max_token_id": 49148
+    },
+    "stack_val.bin": {
+      "sha256": "26342038e0157bed70dcf0f38cd392e061630b84a825b23d390520ff998515c5",
+      "tokens": 15377827,
+      "bytes_per_token": 3.9037,
+      "max_token_id": 49145
     },
     "pretrain_train.bin": {
       "sha256": "205a8a5e1296632011f5098296f59dcd40d3803a1b25a8fe0bb55416d0e99426",
@@ -165,6 +205,44 @@
         "data/tokens/mix/nsl_train.bin": 3.96
       },
       "seed": 1337
+    }
+  },
+  "decontamination": {
+    "method": "exact normalized-line matching (lowercase, whitespace-collapsed); benchmark lines >= 30 chars, import/from lines excluded (boilerplate, not benchmark identity — 'from collections import counter' flagged an innocent repo on first contact); a document is contaminated at >= 2 distinct matched lines or one matched line >= 60 chars; catches verbatim inclusion only, not paraphrase",
+    "benchmarks": {
+      "humaneval": 1981,
+      "mbpp": 5288
+    },
+    "benchmark_line_count": 7269,
+    "sets": {
+      "val-stack": {
+        "documents": 1774,
+        "contaminated_documents": 0
+      },
+      "val-web": {
+        "documents": 20145,
+        "contaminated_documents": 0
+      },
+      "val-sft": {
+        "documents": 2858,
+        "contaminated_documents": 0
+      },
+      "stack-train": {
+        "documents": 424728,
+        "contaminated_documents": 17
+      },
+      "web-train": {
+        "documents": 14587198,
+        "contaminated_documents": 0
+      },
+      "sft-train": {
+        "documents": 52205,
+        "contaminated_documents": 273
+      },
+      "code-train": {
+        "documents": 4152,
+        "contaminated_documents": 0
+      }
     }
   }
 }

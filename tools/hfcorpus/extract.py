@@ -88,10 +88,16 @@ def sanitize(text: str) -> str:
 class ShardWriter:
     """Writes NUL-separated documents into size-bounded shard files."""
 
-    def __init__(self, out_dir: Path, prefix: str, target_bytes: int) -> None:
+    def __init__(self, out_dir: Path, prefix: str, target_bytes: int,
+                 contamination_lines: set | None = None) -> None:
         self.out_dir = out_dir
         self.prefix = prefix
         self.target = target_bytes
+        # --drop-contaminated: the benchmark line set; the rule itself is
+        # decontaminate.doc_is_contaminated (ONE copy, so the dropping
+        # filter and the verifying scan cannot disagree).
+        self.contamination_lines = contamination_lines
+        self.contaminated_dropped = 0
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.index = 0
         self.fh = None
@@ -131,6 +137,13 @@ class ShardWriter:
         self.fh = None
 
     def add(self, text: str) -> None:
+        if self.contamination_lines is not None:
+            from decontaminate import doc_is_contaminated
+
+            bad, _ = doc_is_contaminated(text, self.contamination_lines)
+            if bad:
+                self.contaminated_dropped += 1
+                return
         if self.fh is None:
             self._open()
         blob = text.encode("utf-8")
@@ -227,6 +240,11 @@ def main() -> int:
         help="keep every Nth document; used to build a bounded tokenizer sample",
     )
     ap.add_argument("--max-bytes", type=int, default=0, help="0 = no cap")
+    ap.add_argument("--drop-contaminated", action="store_true",
+                    help="drop documents matching the benchmark line set "
+                    "(decontaminate.doc_is_contaminated — the same rule the "
+                    "verifying scan applies). Recommended for every val "
+                    "extraction; the count lands in the manifest")
     ap.add_argument("--min-chars", type=int, default=1, help="drop shorter documents")
     ap.add_argument("--max-doc-bytes", type=int, default=4_000_000,
                     help="stack: start a new document once a repository passes this "
@@ -241,6 +259,14 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    contamination_lines = None
+    if args.drop_contaminated:
+        from decontaminate import benchmark_lines
+
+        _, contamination_lines = benchmark_lines()
+        print(f"[extract] --drop-contaminated armed: "
+              f"{len(contamination_lines)} benchmark lines", flush=True)
+
     out = args.out if args.out.is_absolute() else REPO / args.out
 
     if args.source == "code":
@@ -248,7 +274,7 @@ def main() -> int:
         if not src.exists():
             print(f"missing {src}", file=sys.stderr)
             return 1
-        writer = ShardWriter(out, "code", args.shard_bytes)
+        writer = ShardWriter(out, "code", args.shard_bytes, contamination_lines)
         docs = src.read_text(encoding="utf-8", errors="replace").split("\x00")
         kept = 0
         for i, doc in enumerate(docs):
@@ -268,6 +294,8 @@ def main() -> int:
                     "rows_seen": len(docs),
                     "documents": writer.total_docs,
                     "bytes": writer.total_bytes,
+                    "contaminated_dropped": writer.contaminated_dropped,
+                    "drop_contaminated_armed": args.drop_contaminated,
                     "specials_neutralized": SPECIALS,
                     "shards": writer.shards,
                 },
@@ -278,13 +306,19 @@ def main() -> int:
         return 0
 
     if args.source == "stack":
-        src = REPO / "data/hf/stack/data"
+        # val reads the SEPARATE stack-val dir (a shard off the training
+        # stride, fetched by fetch.py --only stack-val) so the split is
+        # repository-disjoint by construction — and verifiably so:
+        # verify.py intersects the repo_id columns of both dirs.
+        subdir = "stack-val" if args.split == "val" else "stack"
+        src = REPO / f"data/hf/{subdir}/data"
         files = sorted(src.glob("*.parquet"))
         if not files:
-            print(f"no parquet under {src} — run fetch.py --only stack", file=sys.stderr)
+            hint = "--only stack-val" if args.split == "val" else "--only stack"
+            print(f"no parquet under {src} — run fetch.py {hint}", file=sys.stderr)
             return 1
         print(f"[extract] stack: {len(files)} parquet files from {src}", flush=True)
-        writer = ShardWriter(out, "stack", args.shard_bytes)
+        writer = ShardWriter(out, "stack", args.shard_bytes, contamination_lines)
         seen = kept = skipped = 0
         for row in iter_parquet(files, ["repo_path", "files"]):
             seen += 1
@@ -334,7 +368,10 @@ def main() -> int:
             "stride": args.stride, "max_bytes": args.max_bytes,
             "max_doc_bytes": args.max_doc_bytes,
             "rows_seen": seen, "documents": writer.total_docs, "skipped": skipped,
-            "bytes": writer.total_bytes, "specials_neutralized": SPECIALS,
+            "bytes": writer.total_bytes,
+            "contaminated_dropped": writer.contaminated_dropped,
+            "drop_contaminated_armed": args.drop_contaminated,
+            "specials_neutralized": SPECIALS,
             "shards": writer.shards,
         }, indent=2))
         print(f"[extract] {writer.total_docs:,} documents from {seen:,} repos, "
@@ -379,7 +416,7 @@ def main() -> int:
 
     print(f"[extract] {args.source}: {len(files)} parquet files from {src}", flush=True)
 
-    writer = ShardWriter(out, prefix, args.shard_bytes)
+    writer = ShardWriter(out, prefix, args.shard_bytes, contamination_lines)
     seen = 0
     kept = 0
     skipped = 0
@@ -423,6 +460,8 @@ def main() -> int:
         "documents": writer.total_docs,
         "skipped": skipped,
         "bytes": writer.total_bytes,
+        "contaminated_dropped": writer.contaminated_dropped,
+        "drop_contaminated_armed": args.drop_contaminated,
         "specials_neutralized": SPECIALS,
         "shards": writer.shards,
     }

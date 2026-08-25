@@ -190,7 +190,7 @@ and `web_val.bin` as-is — not another tail cut.
 
 | file | what it is |
 |---|---|
-| `stack_train.bin` | Stack v3 source code, repo-grouped |
+| `stack_train.bin` / `stack_val.bin` | Stack v3 source code, repo-grouped; val is one shard OFF the training stride, repo_id-disjointness VERIFIED by verify.py |
 | `web_train.bin` / `web_val.bin` | FineWeb, split at parquet-file granularity |
 | `nsl_train.bin` | this repo's own sources (`combined_train.txt`) |
 | `sft_train.bin` / `sft_val.bin` | distillation chat traces, separate SFT stage |
@@ -199,3 +199,17 @@ and `web_val.bin` as-is — not another tail cut.
 `nsl_train.bin` and `stack_train.bin` are both code and are deliberately named
 apart: they differ by three orders of magnitude in size and by their role, and a
 recipe that pointed at the wrong one would still run.
+
+## Evaluation hygiene (item 5)
+
+Every validation set is scanned against HumanEval and MBPP
+(`decontaminate.py`; exact normalized-line matching, method string recorded
+verbatim in the manifest) and must be CLEAN — the first scan found 14
+genuine benchmark problems (7 HumanEval, 7 MBPP) inside the distillation
+validation split, which is
+why `extract.py --drop-contaminated` exists (it applies the SAME rule the
+verifying scan does, imported from one place). Training sets are scanned
+and REPORTED, not filtered: the corpus is shipped, and the committed
+contamination rate is what makes its evaluations honest. `stack_val` is
+fetched into `data/hf/stack-val/` — a SEPARATE dir, because manifest.py
+globs `data/hf/stack/**` into the train source's provenance.
