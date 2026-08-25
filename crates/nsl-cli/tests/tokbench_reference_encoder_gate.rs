@@ -206,6 +206,38 @@ fn tokbench_pretokenize_matches_the_crate_and_guards_the_u16_cast() {
         "tokbench's u16 stream without separators diverges from the crate"
     );
 
+    // Both backends of the built BINARY must agree byte-for-byte — the
+    // CLI-level twin of fast_encoder_parity_gate (which diffs the library
+    // against the crate). `--backend hf` is what the runs above exercised
+    // only if it is the default; pass both explicitly so this stays true
+    // whichever way the default points.
+    for (backend, sep, want) in [
+        ("hf", true, &got),
+        ("fast", true, &got),
+        ("hf", false, &got_plain),
+        ("fast", false, &got_plain),
+    ] {
+        let out_b = dir.path().join(format!("{backend}_{sep}.bin"));
+        let mut cmd = Command::new(&tokbench);
+        cmd.args(["pretokenize", "--tokenizer"])
+            .arg(committed_tokenizer_path())
+            .arg("--corpus")
+            .arg(&corpus)
+            .arg("--out")
+            .arg(&out_b)
+            .args(["--backend", backend]);
+        if sep {
+            cmd.args(["--doc-sep-token", "<|endoftext|>"]);
+        }
+        let status = cmd.status().expect("failed to spawn tokbench");
+        assert!(status.success(), "tokbench --backend {backend} (sep={sep}) failed");
+        assert_eq!(
+            std::fs::read(&out_b).expect("read stream"),
+            *want,
+            "--backend {backend} (sep={sep}) diverges from the reference stream"
+        );
+    }
+
     // The truncation guard: a tokenizer holding an id above 65535 must be
     // REFUSED before encoding — `as u16` truncates silently, and a sparse
     // vocabulary can carry such an id while its entry count stays small.
@@ -223,31 +255,34 @@ fn tokbench_pretokenize_matches_the_crate_and_guards_the_u16_cast() {
         .insert("<|overflow-model|>".to_string(), serde_json::json!(70000));
     let wide = dir.path().join("wide_tokenizer.json");
     std::fs::write(&wide, serde_json::to_string(&spec).unwrap()).expect("write tokenizer");
-    let out_refused = dir.path().join("refused.bin");
-    let output = Command::new(&tokbench)
-        .args(["pretokenize", "--tokenizer"])
-        .arg(&wide)
-        .arg("--corpus")
-        .arg(&corpus)
-        .arg("--out")
-        .arg(&out_refused)
-        .output()
-        .expect("failed to spawn tokbench");
-    assert!(
-        !output.status.success(),
-        "a tokenizer with id 70000 must be refused, not truncated"
-    );
-    let all = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        all.contains("does not fit the u16 token stream"),
-        "refusal must name the u16 guard; got: {all}"
-    );
-    assert!(
-        !out_refused.exists(),
-        "a refused run must not leave a truncated stream behind"
-    );
+    for backend in ["fast", "hf"] {
+        let out_refused = dir.path().join(format!("refused_{backend}.bin"));
+        let output = Command::new(&tokbench)
+            .args(["pretokenize", "--tokenizer"])
+            .arg(&wide)
+            .arg("--corpus")
+            .arg(&corpus)
+            .arg("--out")
+            .arg(&out_refused)
+            .args(["--backend", backend])
+            .output()
+            .expect("failed to spawn tokbench");
+        assert!(
+            !output.status.success(),
+            "--backend {backend}: a tokenizer with id 70000 must be refused, not truncated"
+        );
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            all.contains("does not fit the u16 token stream"),
+            "--backend {backend}: refusal must name the u16 guard; got: {all}"
+        );
+        assert!(
+            !out_refused.exists(),
+            "--backend {backend}: a refused run must not leave a truncated stream behind"
+        );
+    }
 }

@@ -3,11 +3,12 @@
 
 `tokbench pretokenize` splits its input corpus on U+0000 and encodes each piece
 as one document, so that is the interchange format here. Output is written as
-size-bounded shards because tokbench reads a whole corpus file into memory and
-builds the entire token stream before writing; a single 40 GB corpus file would
-not fit. Sharding is exact rather than approximate: the encoder carries no state
-across documents, so concatenating per-shard token streams gives byte-identical
-output to encoding the whole corpus at once.
+size-bounded shards because tokbench reads a whole corpus file into memory
+(both backends; the legacy `hf` backend additionally holds the entire encoded
+stream); a single 40 GB corpus file would not fit. Sharding also carries the
+resume machinery in pretokenize.py. It is exact rather than approximate: the
+encoder carries no state across documents, so concatenating per-shard token
+streams gives byte-identical output to encoding the whole corpus at once.
 
 Two renderers:
 

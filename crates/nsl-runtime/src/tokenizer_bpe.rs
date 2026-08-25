@@ -518,7 +518,7 @@ where
 /// alone was 4 bytes per character on top of the corpus and the chunks. `\n` and
 /// `\r` are single-byte and cannot occur inside a multi-byte UTF-8 sequence, so
 /// every index below is a character boundary and the slicing cannot panic.
-fn split_relaxed(text: &str) -> Vec<&str> {
+pub(crate) fn split_relaxed(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let is_break = |b: u8| b == b'\n' || b == b'\r';
     let mut out = Vec::new();

@@ -172,6 +172,7 @@ pub mod host_profile;
 pub mod transient_arena;
 pub mod tokenizer;
 pub mod tokenizer_bpe;
+pub mod tokenizer_fast;
 pub mod quantize;
 pub mod fp8;
 pub mod awq;

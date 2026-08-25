@@ -412,6 +412,14 @@ enum Command {
         /// a text splice would let a document forge its own boundary.
         #[arg(long)]
         doc_sep_token: Option<String>,
+        /// Encoding backend. `fast` = nsl-runtime's byte-domain encoder
+        /// (item 16; same-token parity pinned by
+        /// crates/nsl-cli/tests/fast_encoder_parity_gate.rs and the full-
+        /// corpus sha256 evidence in models/benchmarks/). `hf` = the
+        /// `tokenizers` crate, the historical reference the fast backend is
+        /// diffed against.
+        #[arg(long, default_value = "fast")]
+        backend: String,
     },
     /// Report the token-length profile of a trained vocabulary.
     VocabStats {
@@ -437,6 +445,149 @@ enum Command {
 fn read_documents(corpus: &Path) -> Vec<String> {
     let raw = std::fs::read_to_string(corpus).unwrap_or_else(|e| panic!("read corpus: {e}"));
     raw.split(DOC_SEP_CHAR).map(|s| s.to_string()).collect()
+}
+
+/// `pretokenize --backend hf` — the `tokenizers`-crate path, kept verbatim as
+/// the historical reference the fast backend is differentially gated against.
+fn pretokenize_hf(tokenizer: &Path, corpus: &Path, out: &Path, doc_sep_token: Option<&str>) {
+    let tok = Tokenizer::from_file(tokenizer).expect("load tokenizer");
+    // Guard the largest ID, not the number of entries. The ids below are
+    // written with `as u16`, which TRUNCATES silently, and a vocabulary
+    // can be sparse -- fewer than 65536 entries while still holding an
+    // id above 65535. Counting entries would let exactly that case
+    // through and corrupt every token that wrapped.
+    let max_id = tok
+        .get_vocab(true)
+        .values()
+        .copied()
+        .max()
+        .expect("tokenizer has an empty vocabulary");
+    assert!(
+        max_id <= u16::MAX as u32,
+        "token id {max_id} does not fit the u16 token stream format"
+    );
+    // Resolve the separator BEFORE encoding: a missing surface must
+    // fail here, not silently produce a stream with no boundaries.
+    let sep_id: Option<u16> = doc_sep_token.map(|t| {
+        let id = tok.token_to_id(t).unwrap_or_else(|| {
+            panic!(
+                "document separator '{t}' is not in this tokenizer's vocabulary; \
+                 train it with --special-token '{t}'"
+            )
+        });
+        u16::try_from(id).unwrap_or_else(|_| panic!("separator id {id} exceeds u16"))
+    });
+    let docs = read_documents(corpus);
+    let refs: Vec<&str> = docs.iter().map(|d| d.as_str()).collect();
+    let started = std::time::Instant::now();
+    let encs = tok.encode_batch_fast(refs, false).expect("encode");
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut n_tokens = 0usize;
+    for enc in &encs {
+        for id in enc.get_ids() {
+            bytes.extend_from_slice(&(*id as u16).to_le_bytes());
+            n_tokens += 1;
+        }
+        if let Some(sep) = sep_id {
+            bytes.extend_from_slice(&sep.to_le_bytes());
+            n_tokens += 1;
+        }
+    }
+    std::fs::write(out, &bytes).expect("write token stream");
+    let corpus_bytes: usize = docs.iter().map(|d| d.len()).sum();
+    println!(
+        "{} tokens from {:.2} MB ({:.3} B/tok) in {:.1}s -> {} [hf]",
+        n_tokens,
+        corpus_bytes as f64 / 1e6,
+        corpus_bytes as f64 / n_tokens as f64,
+        started.elapsed().as_secs_f64(),
+        out.display()
+    );
+}
+
+/// `pretokenize --backend fast` — nsl-runtime's byte-domain encoder (item 16),
+/// rayon-parallel over document chunks with one line-memo cache per worker
+/// thread. Same-token parity with the hf path is pinned by
+/// `crates/nsl-cli/tests/fast_encoder_parity_gate.rs` (edge cases + generated
+/// corpus, every CI build) and by the full-corpus sha256 re-encode recorded
+/// in models/benchmarks/.
+///
+/// Memory: the shard text once (borrowed doc slices, not owned copies), the
+/// encoded u16 parts, and the per-thread caches — roughly a quarter of the
+/// hf path's peak, which additionally holds every `Encoding` (ids + offsets
+/// + words) for the whole shard at once. The extractor's 1 GB shard bound
+/// still applies; this path just stops being the reason for it.
+fn pretokenize_fast(tokenizer: &Path, corpus: &Path, out: &Path, doc_sep_token: Option<&str>) {
+    use rayon::prelude::*;
+    use nsl_runtime::tokenizer_fast::{EncodeCache, FastBpeEncoder};
+
+    // The fast loader refuses any tokenizer it cannot reproduce
+    // token-for-token, and any id space that does not fit u16.
+    let enc = FastBpeEncoder::from_tokenizer_file(tokenizer).unwrap_or_else(|e| panic!("{e}"));
+    // Resolve the separator BEFORE encoding. Restricted to added tokens by
+    // design (see FastBpeEncoder::special_id): a separator reachable by
+    // ordinary merges would make forged boundaries indistinguishable.
+    let sep_id: Option<u16> = doc_sep_token.map(|t| {
+        enc.special_id(t).unwrap_or_else(|| {
+            panic!(
+                "document separator '{t}' is not an added token of this tokenizer; \
+                 train it with --special-token '{t}'"
+            )
+        })
+    });
+
+    let raw = std::fs::read_to_string(corpus).unwrap_or_else(|e| panic!("read corpus: {e}"));
+    let docs: Vec<&str> = raw.split(DOC_SEP_CHAR).collect();
+    let corpus_bytes: usize = raw.len() - (docs.len() - 1);
+    let started = std::time::Instant::now();
+
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<EncodeCache>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    // Chunks keep rayon's scheduling overhead off individual small documents;
+    // parts come back in order, so concatenation preserves the sequential
+    // stream exactly (no encoder state crosses documents).
+    const DOCS_PER_CHUNK: usize = 64;
+    let parts: Vec<Vec<u8>> = docs
+        .par_chunks(DOCS_PER_CHUNK)
+        .map(|chunk| {
+            CACHE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let cache = slot.get_or_insert_with(|| EncodeCache::with_budget(256 << 20));
+                let mut ids: Vec<u16> = Vec::new();
+                for doc in chunk {
+                    enc.encode_doc_into(doc, cache, &mut ids);
+                    if let Some(sep) = sep_id {
+                        ids.push(sep);
+                    }
+                }
+                let mut bytes = Vec::with_capacity(ids.len() * 2);
+                for &id in &ids {
+                    bytes.extend_from_slice(&id.to_le_bytes());
+                }
+                bytes
+            })
+        })
+        .collect();
+
+    let total_bytes: usize = parts.iter().map(|p| p.len()).sum();
+    let n_tokens = total_bytes / 2;
+    let mut w = std::io::BufWriter::new(File::create(out).expect("create output"));
+    for part in &parts {
+        w.write_all(part).expect("write token stream");
+    }
+    use std::io::Write as _;
+    w.flush().expect("flush token stream");
+
+    println!(
+        "{} tokens from {:.2} MB ({:.3} B/tok) in {:.1}s -> {} [fast]",
+        n_tokens,
+        corpus_bytes as f64 / 1e6,
+        corpus_bytes as f64 / n_tokens as f64,
+        started.elapsed().as_secs_f64(),
+        out.display()
+    );
 }
 
 const DOC_SEP_CHAR: char = '\u{0}';
@@ -592,60 +743,12 @@ fn main() {
             tokenizer.save(&out, false).expect("save tokenizer");
             println!("saved {}", out.display());
         }
-        Command::Pretokenize { tokenizer, corpus, out, doc_sep_token } => {
-            let tok = Tokenizer::from_file(&tokenizer).expect("load tokenizer");
-            // Guard the largest ID, not the number of entries. The ids below are
-            // written with `as u16`, which TRUNCATES silently, and a vocabulary
-            // can be sparse -- fewer than 65536 entries while still holding an
-            // id above 65535. Counting entries would let exactly that case
-            // through and corrupt every token that wrapped.
-            let max_id = tok
-                .get_vocab(true)
-                .values()
-                .copied()
-                .max()
-                .expect("tokenizer has an empty vocabulary");
-            assert!(
-                max_id <= u16::MAX as u32,
-                "token id {max_id} does not fit the u16 token stream format"
-            );
-            // Resolve the separator BEFORE encoding: a missing surface must
-            // fail here, not silently produce a stream with no boundaries.
-            let sep_id: Option<u16> = doc_sep_token.as_ref().map(|t| {
-                let id = tok.token_to_id(t).unwrap_or_else(|| {
-                    panic!(
-                        "document separator '{t}' is not in this tokenizer's vocabulary; \
-                         train it with --special-token '{t}'"
-                    )
-                });
-                u16::try_from(id).unwrap_or_else(|_| panic!("separator id {id} exceeds u16"))
-            });
-            let docs = read_documents(&corpus);
-            let refs: Vec<&str> = docs.iter().map(|d| d.as_str()).collect();
-            let started = std::time::Instant::now();
-            let encs = tok.encode_batch_fast(refs, false).expect("encode");
-            let mut bytes: Vec<u8> = Vec::new();
-            let mut n_tokens = 0usize;
-            for enc in &encs {
-                for id in enc.get_ids() {
-                    bytes.extend_from_slice(&(*id as u16).to_le_bytes());
-                    n_tokens += 1;
-                }
-                if let Some(sep) = sep_id {
-                    bytes.extend_from_slice(&sep.to_le_bytes());
-                    n_tokens += 1;
-                }
+        Command::Pretokenize { tokenizer, corpus, out, doc_sep_token, backend } => {
+            match backend.as_str() {
+                "fast" => pretokenize_fast(&tokenizer, &corpus, &out, doc_sep_token.as_deref()),
+                "hf" => pretokenize_hf(&tokenizer, &corpus, &out, doc_sep_token.as_deref()),
+                other => panic!("unknown --backend '{other}' (expected 'fast' or 'hf')"),
             }
-            std::fs::write(&out, &bytes).expect("write token stream");
-            let corpus_bytes: usize = docs.iter().map(|d| d.len()).sum();
-            println!(
-                "{} tokens from {:.2} MB ({:.3} B/tok) in {:.1}s -> {}",
-                n_tokens,
-                corpus_bytes as f64 / 1e6,
-                corpus_bytes as f64 / n_tokens as f64,
-                started.elapsed().as_secs_f64(),
-                out.display()
-            );
         }
         Command::VocabStats { tokenizer, heldout } => {
             let tok = Tokenizer::from_file(&tokenizer).expect("load tokenizer");
