@@ -41,7 +41,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::wengert::{PrimalOp, VarId, WengertOp};
+use crate::wengert::{PrimalOp, VarId, WengertOp, WengertType};
 
 /// Fused-chain step opcodes. u8-stable: byte values are the descriptor v1
 /// wire format shared with the runtime (`nsl_fused_ew_chain`).
@@ -186,6 +186,14 @@ impl ChainSig {
             if it.next().is_some() {
                 return None;
             }
+            // An immediate LEFT operand is outside the contract: the wire
+            // format's single imm field carries only the RHS (the matcher
+            // hard-barriers const-LEFT for host-f64 semantics), and the
+            // runtime rejects such a record. Refuse it here too so a
+            // malformed name can never lower (review finding N3).
+            if matches!(lhs, Operand::Imm(_)) {
+                return None;
+            }
             match op {
                 EwOpcode::Neg => {
                     if rhs.is_some() {
@@ -233,12 +241,8 @@ impl ChainSig {
     /// Kernel entry name: `nsl_fused_ew_<fnv1a64 of encode_name, 16 hex>`.
     /// Content-derived so identical per-layer chains share one PTX blob.
     pub fn kernel_name(&self) -> String {
-        let name = self.encode_name();
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in name.as_bytes() {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x1000_0000_01b3);
-        }
+        // One FNV-1a definition per crate (review): reuse c_wrapper's.
+        let h = crate::c_wrapper::fnv1a_hash(&self.encode_name());
         format!("nsl_fused_ew_{h:016x}")
     }
 
@@ -262,13 +266,16 @@ impl ChainSig {
         out.push(self.n_inputs);
         out.push(0u8);
         for s in &self.steps {
-            debug_assert!(
+            // Real assert, not debug_assert: CI ships release, and a left-Imm
+            // record silently corrupts the replay's operand resolution (the
+            // step's single imm field is rhs-only). Compile-time cost only.
+            assert!(
                 !matches!(s.lhs, Operand::Imm(_)),
                 "an immediate LEFT operand is a barrier, never encoded"
             );
             let (lk, li, limm) = enc(Some(s.lhs));
             let (rk, ri, rimm) = enc(s.rhs);
-            debug_assert_eq!(limm, 0);
+            assert_eq!(limm, 0);
             out.push(s.op as u8);
             out.push(lk);
             out.push(li);
@@ -348,6 +355,7 @@ impl Chain {
 pub fn run_backward_ew_fusion(
     ops: &mut Vec<WengertOp>,
     needed: &HashSet<VarId>,
+    var_types: &HashMap<VarId, WengertType>,
 ) -> FuseStats {
     if std::env::var("NSL_FUSE_ELEMENTWISE_BWD").ok().as_deref() == Some("0") {
         return FuseStats::default();
@@ -374,6 +382,20 @@ pub fn run_backward_ew_fusion(
         }
         producer.insert(op.result, i);
     }
+    // The baseline binary lowering dispatches on var_types (Integer+Integer
+    // folds to Cranelift ALU, Scalar promotes to a tensor); the fused/scalar
+    // paths pass raw values as tensor handles. Adjoint arithmetic is
+    // Tensor-typed today, but nothing upstream guarantees it — so a
+    // non-Tensor-typed operand or result is a hard barrier (review finding
+    // N2). Missing entries default to Tensor, matching the lowering's own
+    // `unwrap_or(WengertType::Tensor)` convention.
+    let is_tensor = |v: VarId| -> bool {
+        matches!(
+            var_types.get(&v).copied().unwrap_or(WengertType::Tensor),
+            WengertType::Tensor
+        )
+    };
+
     let mut claimed = vec![false; ops.len()];
     let mut chains: Vec<Chain> = Vec::new();
 
@@ -397,6 +419,11 @@ pub fn run_backward_ew_fusion(
 
         let mut idx = start;
         loop {
+            if !is_tensor(ops[idx].result)
+                || !ops[idx].inputs.iter().all(|&v| is_tensor(v))
+            {
+                break;
+            }
             let accepted = try_join(
                 &mut chain, ops, idx, flowing, needed, &reads, &producer, &claimed,
             );
@@ -488,6 +515,9 @@ fn find_unique_consumer(ops: &[WengertOp], from: usize, v: VarId) -> Option<usiz
 /// the chain is rolled back to its entry state, so a partially-resolved op
 /// can never leave phantom externals/imms behind (the fused op's input list
 /// and the encoded signature must correspond exactly).
+// The argument list mirrors the matcher's full context (tape, maps, claim
+// state) — bundling them into a struct would be a struct used by exactly one
+// fn; the lint's advice does not improve this call site.
 #[allow(clippy::too_many_arguments)]
 fn try_join(
     chain: &mut Chain,
@@ -659,6 +689,7 @@ fn register_belt_ok(chain: &Chain) -> bool {
 pub fn rewrite_scalar_immediates(
     ops: &mut Vec<WengertOp>,
     needed: &HashSet<VarId>,
+    var_types: &HashMap<VarId, WengertType>,
 ) -> usize {
     if std::env::var("NSL_FUSE_SCALAR_IMM").ok().as_deref() == Some("0") {
         return 0;
@@ -695,6 +726,16 @@ pub fn rewrite_scalar_immediates(
             continue;
         }
         let (x, c) = (ops[i].inputs[0], ops[i].inputs[1]);
+        // Same Tensor-type guard as the chain fuser (review finding N2).
+        let tensor_typed = |v: VarId| {
+            matches!(
+                var_types.get(&v).copied().unwrap_or(WengertType::Tensor),
+                WengertType::Tensor
+            )
+        };
+        if !tensor_typed(x) || !tensor_typed(ops[i].result) {
+            continue;
+        }
         let Some(&j) = producer.get(&c) else { continue };
         let PrimalOp::Constant(v) = ops[j].op else {
             continue;
@@ -805,6 +846,11 @@ mod tests {
         ops
     }
 
+    /// Empty map = every var defaults to Tensor (the lowering's convention).
+    fn no_types() -> HashMap<VarId, WengertType> {
+        HashMap::new()
+    }
+
     #[test]
     fn chain_sig_name_roundtrip() {
         let sig = ChainSig {
@@ -894,7 +940,7 @@ mod tests {
             op(11, PrimalOp::Add, vec![10, 2]),
         ]);
         let needed: HashSet<VarId> = [11].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert_eq!(stats.chains, 1);
         assert_eq!(stats.device_ops_elided, 1);
         assert_eq!(ops.len(), 1);
@@ -916,7 +962,7 @@ mod tests {
             op(12, PrimalOp::Add, vec![10, 3]),
         ]);
         let needed: HashSet<VarId> = [11, 12].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert_eq!(stats.chains, 0);
         assert_eq!(ops.len(), 3);
     }
@@ -930,7 +976,7 @@ mod tests {
             op(11, PrimalOp::Add, vec![10, 2]),
         ]);
         let needed: HashSet<VarId> = [10, 11].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert_eq!(stats.chains, 0);
     }
 
@@ -943,7 +989,7 @@ mod tests {
             op(11, PrimalOp::Neg, vec![10]),
         ]);
         let needed: HashSet<VarId> = [11].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert_eq!(stats.chains, 1);
         assert_eq!(ops[0].result, 11);
     }
@@ -957,7 +1003,7 @@ mod tests {
             op(11, PrimalOp::Add, vec![10, 1]),
         ]);
         let needed: HashSet<VarId> = [11].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert_eq!(stats.chains, 1);
         assert_eq!(stats.imms_baked, 1);
         assert_eq!(ops.len(), 1);
@@ -982,7 +1028,7 @@ mod tests {
             op(12, PrimalOp::Add, vec![11, 2]),
         ]);
         let needed: HashSet<VarId> = [12].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         // The Div can't join; Mul->Add still fuses.
         assert_eq!(stats.chains, 1);
         assert!(ops.iter().any(|o| matches!(o.op, PrimalOp::Div)));
@@ -1003,7 +1049,7 @@ mod tests {
             op(12, PrimalOp::Add, vec![11, 3]),
         ]);
         let needed: HashSet<VarId> = [12].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert_eq!(stats.chains, 1);
         assert_eq!(stats.reduces_absorbed, 1);
         assert_eq!(ops.len(), 1);
@@ -1034,7 +1080,7 @@ mod tests {
             ),
         ]);
         let needed: HashSet<VarId> = [12].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert_eq!(stats.chains, 0);
         assert_eq!(ops.len(), 3);
     }
@@ -1052,7 +1098,7 @@ mod tests {
         }
         let mut ops = adjoint(ops_v);
         let needed: HashSet<VarId> = [v].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert!(stats.chains >= 1);
         for o in &ops {
             if let PrimalOp::Passthrough(name) = &o.op {
@@ -1080,7 +1126,7 @@ mod tests {
         ]);
         let mut ops = ops_before.clone();
         let needed: HashSet<VarId> = [11, 12].into_iter().collect();
-        run_backward_ew_fusion(&mut ops, &needed);
+        run_backward_ew_fusion(&mut ops, &needed, &no_types());
         assert!(ops.len() < ops_before.len());
         // Every surviving result VarId existed before.
         let before: HashSet<VarId> = ops_before.iter().map(|o| o.result).collect();
@@ -1096,7 +1142,7 @@ mod tests {
             op(11, PrimalOp::Add, vec![10, 2]),
         ]);
         let needed: HashSet<VarId> = [11].into_iter().collect();
-        let stats = run_backward_ew_fusion(&mut ops, &needed);
+        let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
         std::env::remove_var("NSL_FUSE_ELEMENTWISE_BWD");
         assert_eq!(stats.chains, 0);
         assert_eq!(ops.len(), 2);
@@ -1110,7 +1156,7 @@ mod tests {
             op(10, PrimalOp::Mul, vec![0, 9]),
         ]);
         let needed: HashSet<VarId> = [10].into_iter().collect();
-        let n = rewrite_scalar_immediates(&mut ops, &needed);
+        let n = rewrite_scalar_immediates(&mut ops, &needed, &no_types());
         assert_eq!(n, 1);
         assert_eq!(ops.len(), 1);
         let PrimalOp::Passthrough(name) = &ops[0].op else {
@@ -1132,7 +1178,7 @@ mod tests {
             op(12, PrimalOp::Mul, vec![2, 8]), // 8 read twice: skip both
         ]);
         let needed: HashSet<VarId> = [10, 11, 12].into_iter().collect();
-        let n = rewrite_scalar_immediates(&mut ops, &needed);
+        let n = rewrite_scalar_immediates(&mut ops, &needed, &no_types());
         assert_eq!(n, 0);
         assert_eq!(ops.len(), 5);
     }

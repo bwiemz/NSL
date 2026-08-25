@@ -10716,6 +10716,7 @@ sched={sched_s}",
                     let ew_stats = crate::ew_chain_fusion::run_backward_ew_fusion(
                         &mut adjoint.ops,
                         &adjoint_needed,
+                        &adjoint.var_types,
                     );
                     if ew_stats.chains > 0 {
                         eprintln!(
@@ -10730,6 +10731,7 @@ sched={sched_s}",
                     let scalar_imms = crate::ew_chain_fusion::rewrite_scalar_immediates(
                         &mut adjoint.ops,
                         &adjoint_needed,
+                        &adjoint.var_types,
                     );
                     if scalar_imms > 0 {
                         eprintln!("[fuse] scalar immediates: {scalar_imms}");

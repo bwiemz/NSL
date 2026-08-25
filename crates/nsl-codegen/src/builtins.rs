@@ -402,6 +402,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
+    // Dispatching scalar-immediate entry (review fix): f32 -> the dedicated
+    // scalar kernel; any other dtype -> the literal decomposed baseline
+    // (preserves the mixed-dtype "f32 wins" narrowing AND output dtype).
+    // (tensor, f64 scalar, descriptor-v1 opcode) -> result handle.
+    (
+        "nsl_tensor_scalar_rhs",
+        &[types::I64, types::F64, types::I64],
+        Some(types::I64),
+    ),
     // Fused elementwise-chain launcher (MFU campaign C3):
     // (ptx, kname, descriptor, desc_len, in0..in5, n_inputs) -> result handle.
     (

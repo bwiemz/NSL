@@ -19,255 +19,6 @@ pub(crate) mod caching_allocator;
 
 pub(crate) mod graph_capture;
 
-/// Pointer-keyed cache for the per-launch PTX content hash (mfu-fusion C4).
-///
-/// `kernel_launch` keys its module cache by an FNV-1a hash of the FULL PTX
-/// string, and used to recompute that hash (a scan to the NUL terminator over
-/// kilobytes of PTX) on EVERY launch — ~19k times per training update. This
-/// cache maps the PTX *pointer* to its previously computed content hash, with
-/// a belt against heap-address reuse (the exact failure that forced the
-/// module cache off pointer keys in the first place): an entry revalidates by
-/// re-reading the string's first 8 bytes, last 8 bytes, and the NUL at the
-/// remembered length. Content that changed under the same pointer in any of
-/// those bytes forces a full rescan; a middle-only change with identical
-/// head/tail/length is not caught — accepted, because every PTX string that
-/// reaches `kernel_launch` on the hot path is a `'static` const or a
-/// `.rodata` embed whose bytes never change, and the belt exists only for
-/// transiently heap-allocated PTX (which also gets a fresh pointer or a
-/// different tail in practice).
-///
-/// Kill switch: `NSL_PTX_PTR_CACHE=0` bypasses the cache entirely (read once
-/// per process, like the file's other env toggles).
-///
-/// Compiled unconditionally (only the cuda launch path consults it) so the
-/// default-features test suite exercises the cache logic — CI clippy runs
-/// without `--features cuda` and would otherwise never see this code.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) mod ptx_ptr_cache {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, OnceLock};
-
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    /// Distinct PTX pointers in a process number in the dozens ('static
-    /// consts + per-signature .rodata embeds). The bound only matters if
-    /// something starts launching from churning heap buffers; clearing on
-    /// overflow keeps that pathological case merely slow, never unbounded.
-    const MAX_ENTRIES: usize = 256;
-
-    #[derive(Clone, Copy)]
-    struct Entry {
-        len: usize,
-        head: [u8; 8],
-        tail: [u8; 8],
-        hash: u64,
-    }
-
-    static CACHE: OnceLock<Mutex<HashMap<usize, Entry>>> = OnceLock::new();
-    /// Full scan-to-NUL FNV passes performed (misses, belt rejections, and
-    /// kill-switch bypasses). Test-observable: a cache hit does not move it.
-    static FULL_SCANS: AtomicU64 = AtomicU64::new(0);
-
-    #[cfg(test)]
-    pub(crate) fn full_scan_count() -> u64 {
-        FULL_SCANS.load(Ordering::Relaxed)
-    }
-
-    /// `NSL_PTX_PTR_CACHE=0` disables; anything else (including unset)
-    /// enables. Split out for direct testing — the process-global read
-    /// below goes through a `OnceLock` and cannot be re-driven by tests.
-    fn parse_enabled(v: Option<&str>) -> bool {
-        v != Some("0")
-    }
-
-    fn enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| parse_enabled(std::env::var("NSL_PTX_PTR_CACHE").ok().as_deref()))
-    }
-
-    /// Full FNV-1a over the string at `ptx_ptr`, scanning to the NUL.
-    /// Byte-identical to the hash `kernel_launch` computed inline before this
-    /// cache existed (same offset basis/prime, NUL excluded) — module-cache
-    /// keys produced with and without the cache MUST collide.
-    ///
-    /// Caller contract (same as `kernel_launch`'s): `ptx_ptr` points to a
-    /// NUL-terminated C string.
-    fn full_scan(ptx_ptr: *const u8) -> (u64, usize) {
-        FULL_SCANS.fetch_add(1, Ordering::Relaxed);
-        let mut len = 0usize;
-        while unsafe { *ptx_ptr.add(len) } != 0 {
-            len += 1;
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
-        let mut h: u64 = FNV_OFFSET;
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        (h, len)
-    }
-
-    fn make_entry(ptx_ptr: *const u8, hash: u64, len: usize) -> Entry {
-        let mut head = [0u8; 8];
-        let mut tail = [0u8; 8];
-        for (i, slot) in head.iter_mut().enumerate().take(len.min(8)) {
-            *slot = unsafe { *ptx_ptr.add(i) };
-        }
-        if len >= 8 {
-            for (i, slot) in tail.iter_mut().enumerate() {
-                *slot = unsafe { *ptx_ptr.add(len - 8 + i) };
-            }
-        }
-        Entry { len, head, tail, hash }
-    }
-
-    /// The belt: does the string at `ptx_ptr` still look like the one the
-    /// entry was built from? Head bytes are compared first and stop at any
-    /// NUL, so a shorter replacement string is rejected without reading past
-    /// its terminator; only once the head matches are the remembered tail
-    /// offsets probed (for a C string that genuinely still has this length
-    /// those reads are in-bounds; for one that shrank they read stale heap —
-    /// the same exposure `kernel_launch`'s scan-to-NUL contract already has
-    /// when handed a dangling pointer, and a mismatch merely forces a
-    /// rescan).
-    fn entry_matches(ptx_ptr: *const u8, e: &Entry) -> bool {
-        for i in 0..e.len.min(8) {
-            let b = unsafe { *ptx_ptr.add(i) };
-            if b == 0 || b != e.head[i] {
-                return false;
-            }
-        }
-        if e.len < 8 {
-            return unsafe { *ptx_ptr.add(e.len) } == 0;
-        }
-        for i in 0..8 {
-            if unsafe { *ptx_ptr.add(e.len - 8 + i) } != e.tail[i] {
-                return false;
-            }
-        }
-        (unsafe { *ptx_ptr.add(e.len) }) == 0
-    }
-
-    /// Content hash for the NUL-terminated PTX at `ptx_ptr`, consulting the
-    /// pointer cache first. This is the ONLY entry `kernel_launch` uses.
-    pub(crate) fn content_hash(ptx_ptr: *const u8) -> u64 {
-        content_hash_with(ptx_ptr, enabled())
-    }
-
-    /// Same, with the enable decision injected (tests drive the kill-switch
-    /// path through this without touching the process-global env read).
-    pub(crate) fn content_hash_with(ptx_ptr: *const u8, cache_on: bool) -> u64 {
-        if !cache_on {
-            return full_scan(ptx_ptr).0;
-        }
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let key = ptx_ptr as usize;
-        let mut guard = cache.lock().unwrap();
-        if let Some(e) = guard.get(&key) {
-            if entry_matches(ptx_ptr, e) {
-                return e.hash;
-            }
-        }
-        let (hash, len) = full_scan(ptx_ptr);
-        if guard.len() >= MAX_ENTRIES && !guard.contains_key(&key) {
-            guard.clear();
-        }
-        guard.insert(key, make_entry(ptx_ptr, hash, len));
-        hash
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        /// `FULL_SCANS` is process-global and the test harness runs tests
-        /// concurrently — every test that asserts on scan-count deltas must
-        /// hold this lock so a neighbor's scans don't land inside its window.
-        static SCAN_COUNT_LOCK: Mutex<()> = Mutex::new(());
-
-        fn nul_terminated(s: &str) -> Vec<u8> {
-            let mut v = s.as_bytes().to_vec();
-            v.push(0);
-            v
-        }
-
-        /// Reference FNV-1a, written independently of `full_scan`.
-        fn fnv(s: &str) -> u64 {
-            let mut h: u64 = FNV_OFFSET;
-            for &b in s.as_bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(FNV_PRIME);
-            }
-            h
-        }
-
-        #[test]
-        fn same_pointer_second_call_skips_the_full_scan() {
-            let _g = SCAN_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let buf = nul_terminated(".version 7.0 same-ptr-no-rehash kernel body text");
-            let p = buf.as_ptr();
-            let h1 = content_hash_with(p, true);
-            let scans_after_first = full_scan_count();
-            let h2 = content_hash_with(p, true);
-            assert_eq!(h1, h2);
-            assert_eq!(h1, fnv(".version 7.0 same-ptr-no-rehash kernel body text"));
-            assert_eq!(
-                full_scan_count(),
-                scans_after_first,
-                "second call at the same pointer must be a cache hit (no rescan)"
-            );
-        }
-
-        #[test]
-        fn changed_content_at_same_ptr_and_len_is_caught_by_the_belt() {
-            // Holds the lock even though it asserts no counts: its own full
-            // scans must not land inside a counter-asserting test's window.
-            let _g = SCAN_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let mut buf = nul_terminated(".version 7.0 belt-test kernel body AAAAAAAA");
-            let p = buf.as_ptr();
-            let h1 = content_hash_with(p, true);
-            // Mutate inside the last 8 bytes, same pointer, same length.
-            let n = buf.len();
-            buf[n - 2] = b'B';
-            let expected = String::from_utf8(buf[..n - 1].to_vec()).unwrap();
-            let h2 = content_hash_with(buf.as_ptr(), true);
-            assert_ne!(h1, h2, "tail belt failed: stale hash served for changed content");
-            assert_eq!(h2, fnv(&expected));
-            // And a head mutation, same pointer/len again.
-            buf[0] = b'X';
-            let expected2 = String::from_utf8(buf[..n - 1].to_vec()).unwrap();
-            let h3 = content_hash_with(buf.as_ptr(), true);
-            assert_ne!(h2, h3, "head belt failed: stale hash served for changed content");
-            assert_eq!(h3, fnv(&expected2));
-        }
-
-        #[test]
-        fn kill_switch_bypasses_the_cache() {
-            let _g = SCAN_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let buf = nul_terminated(".version 7.0 kill-switch bypass body");
-            let p = buf.as_ptr();
-            let before = full_scan_count();
-            let h1 = content_hash_with(p, false);
-            let h2 = content_hash_with(p, false);
-            assert_eq!(h1, h2);
-            assert_eq!(h1, fnv(".version 7.0 kill-switch bypass body"));
-            assert_eq!(
-                full_scan_count(),
-                before + 2,
-                "bypassed calls must full-scan every time"
-            );
-        }
-
-        #[test]
-        fn env_parse_default_on_zero_off() {
-            assert!(parse_enabled(None), "unset must enable the cache");
-            assert!(parse_enabled(Some("1")));
-            assert!(parse_enabled(Some("")), "junk values fall back to enabled");
-            assert!(!parse_enabled(Some("0")), "NSL_PTX_PTR_CACHE=0 must disable");
-        }
-    }
-}
 
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
@@ -2029,12 +1780,26 @@ pub(crate) mod inner {
             // at the same heap address as a previously-freed one — the cache
             // returned the stale old module and the new kernel name was not found.
             //
-            // mfu-fusion C4: the hash itself now comes through the pointer-
-            // keyed `ptx_ptr_cache` (head/tail/NUL-position belt against that
-            // same heap-reuse hazard; `NSL_PTX_PTR_CACHE=0` restores the
-            // per-launch full scan), so the steady state pays a HashMap probe
-            // instead of a scan over the whole PTX string on every launch.
-            let cache_key = super::ptx_ptr_cache::content_hash(ptx_ptr);
+            // mfu-fusion review: a pointer-keyed hash cache with a
+            // head/tail/length revalidation belt was tried here and REVERTED —
+            // the WRGA fused_adapter clones its PTX String per launch, and two
+            // same-length synthesized kernels share every belt byte (all PTX
+            // starts ".version" and ends "ret;\n}\n"), so heap reuse could
+            // serve a stale module again (plus the belt read past a shorter
+            // replacement string's terminator). A sound skip of this rescan
+            // needs a caller-declared-stable pointer contract (the CFIE
+            // load_module_once pattern); until then the full scan stays.
+            let cache_key = {
+                let mut len = 0usize;
+                while unsafe { *ptx_ptr.add(len) } != 0 { len += 1; }
+                let ptx_bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
+                let mut h: u64 = 14695981039346656037u64;
+                for &b in ptx_bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211u64);
+                }
+                h
+            };
             let module = if let Some(m) = guard.module_cache.get(&cache_key) {
                 *m
             } else {
@@ -5735,11 +5500,25 @@ pub(crate) fn gpu_fused_ew_launch(
         );
     }
 
+    // Degrade diagnostics are warn-once: under sustained OOM / persistent
+    // launch failure every chain call takes these arms (hundreds per
+    // micro-batch), and an unbuffered stderr line per call would flood
+    // exactly when the run is slowest. The FUSED_EW_FALLBACKS counter
+    // records every occurrence regardless.
+    static OOM_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static LAUNCH_FAIL_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     let n = first.len as usize;
     let out_data = match inner::try_alloc_managed(n * 4) {
         Some(ptr) => ptr,
         None => {
-            eprintln!("[nsl] GPU OOM in nsl_fused_ew_chain — degrading to decomposed replay");
+            if !OOM_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nsl] GPU OOM in nsl_fused_ew_chain — degrading to decomposed replay \
+                     (warn-once; see fused_ew_counters for totals)"
+                );
+            }
             return 0;
         }
     };
@@ -5786,16 +5565,19 @@ pub(crate) fn gpu_fused_ew_launch(
         0,
     );
     if result as u32 != 0 {
-        // Free the allocated tensor+data (no leak), report, and let the
+        // Tear down through nsl_tensor_free — the ONLY teardown that also
+        // releases the checked_alloc'd shape/strides arrays and clears the
+        // struct (a Box::from_raw + free_managed pair leaks both arrays and
+        // leaves TENSOR_MAGIC in freed memory; review finding). Then let the
         // caller replay — same degrade contract as the OOM arm above.
-        eprintln!(
-            "[nsl] fused-ew GPU kernel launch failed ({}) — degrading to decomposed replay",
-            result as u32
-        );
-        unsafe {
-            let _ = Box::from_raw(out_ptr);
+        if !LAUNCH_FAIL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[nsl] fused-ew GPU kernel launch failed ({}) — degrading to decomposed \
+                 replay (warn-once; see fused_ew_counters for totals)",
+                result as u32
+            );
         }
-        inner::free_managed(out_data);
+        crate::tensor::nsl_tensor_free(out_ptr as i64);
         return 0;
     }
     inner::sync_after_kernel();

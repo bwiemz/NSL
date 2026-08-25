@@ -3655,17 +3655,22 @@ fn lower_single_op(
                     || name.starts_with("sub_scalar_rhs:") =>
                 {
                     // Scalar-immediate rewrite (bit-exact const-RIGHT fold):
-                    // the original f64 bits ride in the name; the FFI performs
-                    // the same f64->f32 narrowing the baseline's
-                    // nsl_tensor_scalar(v, 1) did. flags = 0 (no relinquish).
-                    let (fn_name, prefix) = if name.starts_with("mul_scalar_rhs:") {
-                        ("nsl_tensor_mul_scalar", "mul_scalar_rhs:")
+                    // the original f64 bits ride in the name. One dispatching
+                    // FFI (`nsl_tensor_scalar_rhs`) owns the numerics: f32
+                    // tensors take the dedicated scalar kernels (same single
+                    // f64->f32 narrowing as the baseline's
+                    // nsl_tensor_scalar(v, 1)); any other dtype replays the
+                    // literal baseline ops — the mixed-dtype "f32 wins" rule
+                    // is NOT what the dedicated f64 arms compute (review
+                    // finding F1). Opcodes are descriptor-v1 byte values.
+                    let (opcode, prefix) = if name.starts_with("mul_scalar_rhs:") {
+                        (crate::ew_chain_fusion::EwOpcode::Mul as i64, "mul_scalar_rhs:")
                     } else if name.starts_with("add_scalar_rhs:") {
-                        ("nsl_tensor_add_scalar", "add_scalar_rhs:")
+                        (crate::ew_chain_fusion::EwOpcode::Add as i64, "add_scalar_rhs:")
                     } else if name.starts_with("div_scalar_rhs:") {
-                        ("nsl_tensor_div_scalar", "div_scalar_rhs:")
+                        (crate::ew_chain_fusion::EwOpcode::Div as i64, "div_scalar_rhs:")
                     } else {
-                        ("nsl_tensor_sub_scalar", "sub_scalar_rhs:")
+                        (crate::ew_chain_fusion::EwOpcode::Sub as i64, "sub_scalar_rhs:")
                     };
                     let bits: u64 = name[prefix.len()..].parse().map_err(|_| {
                         CodegenError::new(format!(
@@ -3673,8 +3678,13 @@ fn lower_single_op(
                         ))
                     })?;
                     let s = builder.ins().f64const(f64::from_bits(bits));
-                    let flags = builder.ins().iconst(cl_types::I8, 0);
-                    call(compiler, builder, fn_name, &[inputs[0], s, flags])
+                    let op_val = builder.ins().iconst(cl_types::I64, opcode);
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_scalar_rhs",
+                        &[inputs[0], s, op_val],
+                    )
                 }
                 _ if name.starts_with("rmsnorm_dgamma_backward:") => {
                     // P5 item 20 slice A: fused RMSNorm gamma gradient.
@@ -4187,12 +4197,16 @@ fn embed_fused_ew_data(
     use cranelift_module::Linkage;
 
     let sig_name = sig.encode_name();
-    let desc_bytes = sig.descriptor_bytes();
-    let desc_len = desc_bytes.len();
+    // The pinned v1 wire formula (4-byte header + 9 bytes/step) — computing
+    // it arithmetically keeps the memo-hit path allocation-free (the bytes
+    // themselves are built only in the miss arm).
+    let desc_len = 4 + 9 * sig.steps.len();
 
     let ids = match compiler.kernels.fused_ew_data.get(&sig_name) {
         Some(&ids) => ids,
         None => {
+            let desc_bytes = sig.descriptor_bytes();
+            debug_assert_eq!(desc_bytes.len(), desc_len);
             let kname = sig.kernel_name();
             // Tag symbols by the kernel-name hash: unique per signature,
             // stable across functions, and short.
@@ -4220,7 +4234,7 @@ fn embed_fused_ew_data(
             let mut kname_nul = kname.clone().into_bytes();
             kname_nul.push(0);
             let name_id = define("name", kname_nul)?;
-            let desc_id = define("desc", desc_bytes.clone())?;
+            let desc_id = define("desc", desc_bytes)?;
             compiler
                 .kernels
                 .fused_ew_data

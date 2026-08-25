@@ -144,7 +144,11 @@ fn desc_abort(msg: &str) -> ! {
 /// Parse + validate a v1 descriptor. Returns the steps and `n_inputs`.
 /// Every malformation aborts loudly — the descriptor is compiler-emitted,
 /// so degrading here would hide a codegen bug behind wrong numerics.
-fn parse_descriptor(desc: *const u8, desc_len: u64) -> (Vec<ChainStep>, usize) {
+/// Header-only validation (version, flags, counts, exact length arithmetic).
+/// Returns `n_inputs`. The fast path needs nothing else from the descriptor,
+/// so the per-step walk lives in [`parse_descriptor`] and runs only on the
+/// replay path.
+fn parse_descriptor_header(desc: *const u8, desc_len: u64) -> usize {
     if desc.is_null() {
         desc_abort("null descriptor pointer");
     }
@@ -159,13 +163,13 @@ fn parse_descriptor(desc: *const u8, desc_len: u64) -> (Vec<ChainStep>, usize) {
     if desc_len > DESC_HEADER_LEN + 255 * DESC_STEP_LEN {
         desc_abort("desc_len exceeds the v1 maximum (4 + 9*255)");
     }
-    let bytes = unsafe { std::slice::from_raw_parts(desc, desc_len) };
-    if bytes[0] != DESC_VERSION {
+    let header = unsafe { std::slice::from_raw_parts(desc, DESC_HEADER_LEN) };
+    if header[0] != DESC_VERSION {
         desc_abort("unknown version (expected 1)");
     }
-    let n_steps = bytes[1] as usize;
-    let n_inputs = bytes[2] as usize;
-    if bytes[3] != 0 {
+    let n_steps = header[1] as usize;
+    let n_inputs = header[2] as usize;
+    if header[3] != 0 {
         desc_abort("nonzero flags byte (v1 defines none)");
     }
     if n_steps == 0 {
@@ -177,6 +181,14 @@ fn parse_descriptor(desc: *const u8, desc_len: u64) -> (Vec<ChainStep>, usize) {
     if desc_len != DESC_HEADER_LEN + n_steps * DESC_STEP_LEN {
         desc_abort("desc_len does not match 4 + 9*n_steps");
     }
+    n_inputs
+}
+
+fn parse_descriptor(desc: *const u8, desc_len: u64) -> (Vec<ChainStep>, usize) {
+    let n_inputs = parse_descriptor_header(desc, desc_len);
+    let desc_len = desc_len as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(desc, desc_len) };
+    let n_steps = bytes[1] as usize;
 
     let validate_operand = |kind: u8, idx: u8, step: usize, role: &str| match kind {
         KIND_INPUT => {
@@ -216,10 +228,15 @@ fn parse_descriptor(desc: *const u8, desc_len: u64) -> (Vec<ChainStep>, usize) {
                     desc_abort(&format!("step {i}: binary op with absent rhs"));
                 }
                 validate_operand(st.rhs_kind, st.rhs_idx, i, "rhs");
-                if st.lhs_kind == KIND_IMM && st.rhs_kind == KIND_IMM {
-                    // One imm_bits field per step — two Imm operands cannot
-                    // be encoded, so seeing both is a corrupt record.
-                    desc_abort(&format!("step {i}: both operands Imm"));
+                if st.lhs_kind == KIND_IMM {
+                    // The single imm_bits field per step carries ONLY a
+                    // right-operand immediate: the compile side hard-barriers
+                    // constant LEFT operands (host-f64 baseline semantics),
+                    // and a left-Imm record would make the replay read the
+                    // WRONG bits while the PTX renders the right ones — a
+                    // silent fast-path/replay divergence. Reject the record
+                    // outright (review finding N3).
+                    desc_abort(&format!("step {i}: left operand Imm (rhs-only contract)"));
                 }
             }
             OP_NEG => {
@@ -414,7 +431,12 @@ pub extern "C" fn nsl_fused_ew_chain(
          this op is emitted only in the source-AD adjoint and has no tape rule"
     );
 
-    let (steps, desc_n_inputs) = parse_descriptor(desc, desc_len);
+    // Header-only validation up front: the fast path needs just n_inputs,
+    // and the full per-step parse (a heap Vec + branchy walk) would be
+    // discarded on every fused launch — the common case this FFI exists to
+    // make fast (review finding R4). The full parse runs lazily in the
+    // replay tail, where its output is actually consumed.
+    let desc_n_inputs = parse_descriptor_header(desc, desc_len);
     if n_inputs < 1 || n_inputs as usize > MAX_INPUTS {
         desc_abort("n_inputs argument outside 1..=6");
     }
@@ -458,7 +480,55 @@ pub extern "C" fn nsl_fused_ew_chain(
     }
 
     FUSED_EW_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    let (steps, _) = parse_descriptor(desc, desc_len);
     replay_decomposed(&steps, inputs)
+}
+
+/// Scalar-immediate binary with the DECOMPOSED BASELINE's exact numerics on
+/// every dtype (mfu-fusion review fix).
+///
+/// The compiler's `rewrite_scalar_immediates` replaces `x OP Constant` with
+/// one call here. For an f32 tensor the dedicated scalar FFIs are bit-exact
+/// against the broadcast baseline (the constant was narrowed to f32 once at
+/// `nsl_tensor_scalar(v, 1)` creation, and the single-op kernels use the
+/// identical arithmetic instruction). For ANY other dtype the dedicated FFIs
+/// would diverge: the baseline's mixed-dtype CPU rule is "either input f32
+/// -> f32 path" (x narrowed per element, f32 OUTPUT), while e.g.
+/// `nsl_tensor_div_scalar`'s f64 arm computes full-precision f64 with an f64
+/// output — different bits AND a flipped result dtype. So the non-f32 arm
+/// REPLAYS the literal baseline ops instead: an f32 scalar tensor fed to the
+/// ordinary binary FFI, bit-exact by construction.
+///
+/// `opcode` uses the descriptor v1 byte values (Add=0, Sub=1, Mul=2, Div=3).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_scalar_rhs(x: i64, s: f64, opcode: i64) -> i64 {
+    assert!(
+        !autodiff::is_recording(),
+        "nsl_tensor_scalar_rhs: called while the autodiff tape is recording; \
+         this op is emitted only in the source-AD adjoint and has no tape rule"
+    );
+    assert!(x != 0, "nsl_tensor_scalar_rhs: null tensor handle");
+    let t = unsafe { &*(x as *const crate::tensor::NslTensor) };
+    if t.dtype == crate::tensor::DTYPE_F32 {
+        return match opcode as u8 {
+            OP_ADD => super::arithmetic::nsl_tensor_add_scalar(x, s, 0),
+            OP_SUB => super::arithmetic::nsl_tensor_sub_scalar(x, s, 0),
+            OP_MUL => super::arithmetic::nsl_tensor_mul_scalar(x, s, 0),
+            OP_DIV => super::arithmetic::nsl_tensor_div_scalar(x, s, 0),
+            _ => desc_abort("nsl_tensor_scalar_rhs: unknown opcode"),
+        };
+    }
+    // Non-f32 (CPU f64, fp16/bf16, ...): the literal baseline ops.
+    let c = nsl_tensor_scalar(s, 1);
+    let out = match opcode as u8 {
+        OP_ADD => nsl_tensor_add(x, c, 0),
+        OP_SUB => nsl_tensor_sub(x, c, 0),
+        OP_MUL => nsl_tensor_mul(x, c, 0),
+        OP_DIV => nsl_tensor_div(x, c, 0),
+        _ => desc_abort("nsl_tensor_scalar_rhs: unknown opcode"),
+    };
+    nsl_tensor_free(c);
+    out
 }
 
 #[cfg(test)]
