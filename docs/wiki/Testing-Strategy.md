@@ -79,6 +79,28 @@ Typical tolerance: tight bounds like `1e-5` or `1e-6` (relative error on f64 std
 
 Skipped by default when no GPU is available (see GPU-gated tests below).
 
+### Exact differentials — the tokenizer encode path
+
+Numerical tolerance is the wrong shape for tokenization: either every
+document encodes to identical ids or the backend is unusable, because the
+corpus fingerprints in `models/datasets/CORPUS_MANIFEST_v2.json` are
+downstream of the exact stream. Two gates hold this line:
+
+- [`fast_encoder_parity_gate.rs`](../../crates/nsl-cli/tests/fast_encoder_parity_gate.rs)
+  — `nsl_runtime::tokenizer_fast` vs the `tokenizers` crate on the committed
+  tokenizer of record: an edge-case battery plus a seeded ~2 MB generated
+  corpus, id-for-id, every CI build. The encoder's loader REFUSES any
+  tokenizer configuration it does not reproduce, so "passes on the shipped
+  tokenizer" is the whole supported surface.
+- [`tokbench_reference_encoder_gate.rs`](../../crates/nsl-cli/tests/tokbench_reference_encoder_gate.rs)
+  — always-run: the committed tokenizer's added-token surface extraction
+  (the corpus depends on it); cert-lane multiproc: builds `tools/tokbench`
+  with `--locked` and requires both `--backend` values × both separator
+  modes to emit byte-identical u16 streams, plus the max-id refusal.
+
+The full-corpus proof (every set re-encoded to its manifest sha256) is a
+local evidence run, not CI — see `models/benchmarks/ITEM16_FAST_ENCODER_2026_08_24.md`.
+
 ## GPU-gated tests
 
 Run only when a CUDA device is present. The codebase uses two complementary mechanisms:

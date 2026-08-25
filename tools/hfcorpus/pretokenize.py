@@ -8,8 +8,11 @@ plus 7 reserved specials stays inside the u16 id space.
 Each shard is encoded independently and the results are concatenated. That is
 exact, not approximate: `tokbench pretokenize` carries no encoder state across
 documents, so shard-then-concatenate is byte-identical to encoding one giant
-corpus file -- which is just as well, because tokbench builds the whole token
-stream in memory and a 40 GB corpus file would not fit.
+corpus file. (The per-worker line caches of the `fast` backend do not change
+this: a cache hit replays exactly what the merge loop produced for identical
+line bytes.) Sharding stays: both backends still read a whole shard into
+memory, and the roster/cache machinery below is what makes a 91-shard run
+resumable.
 
 `--doc-sep-token` puts one end-of-document id between documents. v1 emitted no
 boundary at all, so a window straddling two documents gave the model the end of
@@ -47,9 +50,10 @@ def rel(path: Path) -> str:
         return str(path.relative_to(REPO))
     except ValueError:
         return str(path)
-def encode_shard(tokenizer: Path, shard: Path, out: Path, doc_sep: str | None) -> int:
+def encode_shard(tokenizer: Path, shard: Path, out: Path, doc_sep: str | None,
+                 backend: str) -> int:
     cmd = [str(TOKBENCH), "pretokenize", "--tokenizer", str(tokenizer),
-           "--corpus", str(shard), "--out", str(out)]
+           "--corpus", str(shard), "--out", str(out), "--backend", backend]
     if doc_sep:
         cmd += ["--doc-sep-token", doc_sep]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -67,6 +71,12 @@ def main() -> int:
     ap.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
     ap.add_argument("--doc-sep-token", default="<|endoftext|>",
                     help="pass an empty string to emit no boundary")
+    ap.add_argument("--backend", default="fast", choices=["fast", "hf"],
+                    help="tokbench encoding backend. Same-token parity between "
+                    "the two is pinned by fast_encoder_parity_gate.rs and the "
+                    "full-corpus sha256 evidence; the cache key still includes "
+                    "the backend so switching one discards cached parts rather "
+                    "than trusting that proof transitively")
     ap.add_argument("--reap", action="store_true",
                     help="delete each text shard once encoded, to bound peak disk")
     ap.add_argument("--clean-parts", action="store_true",
@@ -96,12 +106,13 @@ def main() -> int:
     key = {
         "tokenizer_sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
         "doc_sep_token": args.doc_sep_token or None,
+        "backend": args.backend,
     }
     keyfile = scratch / "cache_key.json"
     stale_reason = None
     if keyfile.exists():
         if json.loads(keyfile.read_text()) != key:
-            stale_reason = "tokenizer or separator changed"
+            stale_reason = "tokenizer, separator, or backend changed"
     elif any(scratch.glob("*.bin")):
         # Parts with NO key were written before this check existed, or by a run
         # whose key was lost. Their provenance is unknown, which is exactly the
@@ -192,7 +203,8 @@ def main() -> int:
         if not part.exists():
             if not shard.exists():
                 raise SystemExit(f"shard {shard} is missing and has no encoded part")
-            n = encode_shard(tokenizer, shard, part, args.doc_sep_token or None)
+            n = encode_shard(tokenizer, shard, part, args.doc_sep_token or None,
+                             args.backend)
         else:
             n = part.stat().st_size // 2
             print(f"[encode] {entry['shard']}: cached ({n:,} tokens)", flush=True)
