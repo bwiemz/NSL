@@ -31,6 +31,7 @@ Usage (from the repo root):
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -115,13 +116,21 @@ def main() -> int:
         # into the TRAIN source's file list, so a val shard dropped there
         # would silently join the training provenance.
         idx = args.stack_val_shard
-        stride = STACK_SHARDS // 20
-        if idx % stride == 0:
-            print(f"refusing --stack-val-shard {idx}: multiples of {stride} "
-                  f"are the training stride — the val shard must be "
-                  f"repo-disjoint from every train shard", file=sys.stderr)
-            return 1
         pat = f"data/part-{idx:05d}-{STACK_SUFFIX}"
+        # Refuse against what was ACTUALLY fetched for training (the
+        # committed manifest's file list), not a stride formula that goes
+        # stale the moment --stack-shards changes (review finding).
+        manifest_path = REPO / "models/datasets/CORPUS_MANIFEST_v2.json"
+        if manifest_path.exists():
+            recorded = json.loads(manifest_path.read_text())
+            train_files = set(
+                recorded.get("sources", {}).get("stack", {}).get("files", []))
+            if pat in train_files:
+                print(f"refusing --stack-val-shard {idx}: {pat} is in the "
+                      f"manifest's stack TRAIN file list — the val shard "
+                      f"must be repo-disjoint from every train shard",
+                      file=sys.stderr)
+                return 1
         print(f"[fetch] stack-val: shard {idx} ({pat})", flush=True)
         fetch(STACK_REPO, [pat], DEST / "stack-val", args.workers)
     if args.only == "benchmarks":

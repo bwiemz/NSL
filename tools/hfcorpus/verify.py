@@ -139,6 +139,10 @@ def main() -> int:
         train_ids = ids(train_dir)
         val_ids = ids(val_dir)
         overlap = train_ids & val_ids
+        # BOTH sides must be non-empty or the intersection proves nothing —
+        # a cleared train dir would otherwise pass '0 repos ∩ val = 0'.
+        check(len(train_ids) > 0, "stack train carries repositories",
+              f"{len(train_ids)} repos")
         check(len(val_ids) > 0, "stack-val carries repositories",
               f"{len(val_ids)} repos")
         check(not overlap,

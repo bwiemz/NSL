@@ -295,6 +295,7 @@ def main() -> int:
                     "documents": writer.total_docs,
                     "bytes": writer.total_bytes,
                     "contaminated_dropped": writer.contaminated_dropped,
+                    "drop_contaminated_armed": args.drop_contaminated,
                     "specials_neutralized": SPECIALS,
                     "shards": writer.shards,
                 },
@@ -369,6 +370,7 @@ def main() -> int:
             "rows_seen": seen, "documents": writer.total_docs, "skipped": skipped,
             "bytes": writer.total_bytes,
             "contaminated_dropped": writer.contaminated_dropped,
+            "drop_contaminated_armed": args.drop_contaminated,
             "specials_neutralized": SPECIALS,
             "shards": writer.shards,
         }, indent=2))
@@ -459,6 +461,7 @@ def main() -> int:
         "skipped": skipped,
         "bytes": writer.total_bytes,
         "contaminated_dropped": writer.contaminated_dropped,
+        "drop_contaminated_armed": args.drop_contaminated,
         "specials_neutralized": SPECIALS,
         "shards": writer.shards,
     }

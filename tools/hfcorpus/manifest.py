@@ -196,6 +196,20 @@ def build() -> int:
               file=sys.stderr)
         return 1
     decon_raw = json.loads(decon_path.read_text())
+    # Freshness: the report's per-set document counts must match the
+    # CURRENT extractions, or a set re-cut after the scan would commit a
+    # stale-but-passing record (review finding).
+    for set_name, entry in decon_raw["sets"].items():
+        em = REPO / "data/text" / set_name / "manifest.json"
+        if not em.exists():
+            continue
+        extracted = json.loads(em.read_text()).get("documents")
+        if extracted is not None and extracted != entry["documents"]:
+            print(f"build: decontamination report scanned {entry['documents']} "
+                  f"documents of {set_name} but the extraction now has "
+                  f"{extracted} — re-run decontaminate.py",
+                  file=sys.stderr)
+            return 1
     decontamination = {
         "method": decon_raw["method"],
         "benchmarks": decon_raw["benchmarks"],

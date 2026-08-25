@@ -71,7 +71,10 @@ def benchmark_lines() -> tuple[dict[str, int], set[str]]:
     counts: dict[str, int] = {}
 
     def add(name: str, texts: list[str]) -> None:
-        n = 0
+        # DISTINCT lines per benchmark, so the per-benchmark counts sum to
+        # benchmark_line_count (occurrence counts read as an inconsistency
+        # next to it — review finding).
+        fresh: set[str] = set()
         for t in texts:
             for raw in t.splitlines():
                 norm = normalize(raw)
@@ -79,9 +82,10 @@ def benchmark_lines() -> tuple[dict[str, int], set[str]]:
                     continue
                 if norm.startswith(("import ", "from ")):
                     continue
-                lines.add(norm)
-                n += 1
-        counts[name] = counts.get(name, 0) + n
+                if norm not in lines:
+                    fresh.add(norm)
+        lines.update(fresh)
+        counts[name] = counts.get(name, 0) + len(fresh)
 
     he = REPO / "data/hf/humaneval/openai_humaneval"
     he_files = sorted(he.glob("*.parquet"))
@@ -99,7 +103,9 @@ def benchmark_lines() -> tuple[dict[str, int], set[str]]:
     for f in mbpp_files:
         t = pq.read_table(f)
         for col in t.column_names:
-            if col not in ("text", "prompt", "code", "test_list", "test_imports"):
+            if col not in ("text", "prompt", "code", "test_list",
+                           "test_imports", "challenge_test_list",
+                           "test_setup_code"):
                 continue
             vals = []
             for v in t[col]:
@@ -134,14 +140,17 @@ def scan_set(text_dir: Path, lines: set[str]) -> dict:
     for shard in sorted(text_dir.glob("*.txt")):
         raw = shard.read_text()
         scanned_bytes += len(raw)
-        for doc in raw.split(DOC_SEP):
+        for local_index, doc in enumerate(raw.split(DOC_SEP)):
             docs += 1
             bad, hits = doc_is_contaminated(doc, lines)
             if bad:
                 contaminated += 1
                 if len(examples) < 5:
+                    # Shard-LOCAL index, so the example reproduces by
+                    # indexing into the named shard (review finding: the
+                    # global counter paired with one shard's name did not).
                     examples.append(
-                        {"shard": shard.name, "doc_index": docs - 1,
+                        {"shard": shard.name, "doc_index": local_index,
                          "matched_lines": len(hits),
                          "sample": sorted(hits)[0][:120]}
                     )
@@ -164,6 +173,10 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=REPO / "data/text/decontamination.json")
     args = ap.parse_args()
     fail_on = set(args.fail_on if args.fail_on is not None else args.scan)
+    unknown = fail_on - set(args.scan)
+    if unknown:
+        sys.exit(f"--fail-on names sets not in --scan: {sorted(unknown)} — "
+                 f"a typo here silently disarms the gate")
 
     t0 = time.time()
     counts, lines = benchmark_lines()

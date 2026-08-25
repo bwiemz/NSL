@@ -205,7 +205,8 @@ recipe that pointed at the wrong one would still run.
 Every validation set is scanned against HumanEval and MBPP
 (`decontaminate.py`; exact normalized-line matching, method string recorded
 verbatim in the manifest) and must be CLEAN — the first scan found 14
-genuine MBPP problems inside the distillation validation split, which is
+genuine benchmark problems (7 HumanEval, 7 MBPP) inside the distillation
+validation split, which is
 why `extract.py --drop-contaminated` exists (it applies the SAME rule the
 verifying scan does, imported from one place). Training sets are scanned
 and REPORTED, not filtered: the corpus is shipped, and the committed

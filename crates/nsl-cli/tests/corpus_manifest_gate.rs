@@ -354,3 +354,30 @@ fn the_decontamination_record_is_complete_and_val_sets_are_clean() {
         );
     }
 }
+
+
+/// Item 5: the stack train and val sources must not share a parquet file.
+/// fetch.py refuses a val shard from the recorded train list, but that
+/// guard reads the manifest at fetch time — this pins the committed state
+/// itself, closing the loop end-to-end (review finding: nothing asserted
+/// the two file lists are disjoint).
+#[test]
+fn stack_train_and_val_sources_share_no_files() {
+    let man = manifest();
+    let files = |key: &str| -> std::collections::HashSet<String> {
+        man["sources"][key]["files"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sources.{key}.files missing"))
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    };
+    let train = files("stack");
+    let val = files("stack-val");
+    assert!(!train.is_empty() && !val.is_empty(), "both lists must be non-empty");
+    let shared: Vec<_> = train.intersection(&val).collect();
+    assert!(
+        shared.is_empty(),
+        "stack train and val share parquet files — the val set is not          repository-disjoint: {shared:?}"
+    );
+}

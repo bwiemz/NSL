@@ -210,10 +210,10 @@
   "decontamination": {
     "method": "exact normalized-line matching (lowercase, whitespace-collapsed); benchmark lines >= 30 chars, import/from lines excluded (boilerplate, not benchmark identity — 'from collections import counter' flagged an innocent repo on first contact); a document is contaminated at >= 2 distinct matched lines or one matched line >= 60 chars; catches verbatim inclusion only, not paraphrase",
     "benchmarks": {
-      "humaneval": 2129,
-      "mbpp": 6904
+      "humaneval": 1981,
+      "mbpp": 5288
     },
-    "benchmark_line_count": 7247,
+    "benchmark_line_count": 7269,
     "sets": {
       "val-stack": {
         "documents": 1774,
