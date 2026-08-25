@@ -209,16 +209,32 @@ def build_arm(arm: Arm, workdir: Path, tokens_path: Path, opt_steps: int,
     (d / "build_stderr.txt").write_text(r.stderr)
     if r.returncode != 0:
         raise RuntimeError(f"{arm.key}: build failed:\n{r.stderr[-2000:]}")
+    # The fused-CE route is decided by CODEGEN and lands in the BUILD stderr
+    # (review finding: the old runtime-stderr check could never be true). A
+    # silent fallback ("will NOT run") would benchmark an unfused binary at a
+    # 768 MiB/step handicap — refuse the arm instead of timing it.
+    if "[fused-lce] forward route=" not in r.stderr or "will NOT run" in r.stderr:
+        raise RuntimeError(
+            f"{arm.key}: fused LM-CE did not engage at build time — refusing "
+            f"to benchmark an unfused binary:\n{r.stderr[-2000:]}"
+        )
     return binary
 
 
-OOM_MARKERS = ("CUDA_ERROR_OUT_OF_MEMORY", "VRAM free", "Requested ", "out of memory")
+OOM_MARKERS = ("CUDA_ERROR_OUT_OF_MEMORY", "VRAM free", "Requested:", "out of memory")
 
 
 def run_binary(binary: Path, env: dict[str, str], timeout: int,
                log: Path) -> tuple[int, list[tuple[float, str]]]:
-    """Run, stamping each stdout line's arrival time (the tok/s clock)."""
+    """Run, stamping each stdout line's arrival time (the tok/s clock).
+
+    The stamped lines are PERSISTED beside the stderr log (review finding:
+    the arrival stamps are the entire basis of the headline number and were
+    being discarded). The watchdog is a timer, not an in-loop check — a
+    binary that stops printing would otherwise block the read forever.
+    """
     import os
+    import threading
     full = dict(os.environ)
     full.setdefault("NSL_STDLIB_PATH", str(REPO / "stdlib"))
     full.update(env)
@@ -229,15 +245,16 @@ def run_binary(binary: Path, env: dict[str, str], timeout: int,
             stdout=subprocess.PIPE, stderr=lf, text=True,
         )
         assert p.stdout is not None
-        start = time.monotonic()
+        watchdog = threading.Timer(timeout, p.kill)
+        watchdog.start()
         try:
             for line in p.stdout:
                 lines.append((time.monotonic(), line.rstrip("\n")))
-                if time.monotonic() - start > timeout:
-                    p.kill()
-                    break
         finally:
+            watchdog.cancel()
             p.wait()
+    stamped = log.with_suffix(".stdout")
+    stamped.write_text("".join(f"{t:.6f}\t{s}\n" for t, s in lines))
     return p.returncode, lines
 
 
@@ -290,7 +307,9 @@ def parse_events(events_file: Path, res: ArmResult) -> None:
             continue
         step, v = ev.get("step"), ev.get("fields", {}).get("allocated_bytes")
         if isinstance(step, int) and isinstance(v, int):
-            series.setdefault(step, v)  # first event per step = pre-cleanup
+            # First event carrying step k is the post-cleanup END event of
+            # micro k-1 (steps 0 and last emit once; interior steps twice).
+            series.setdefault(step, v)
     res.alloc_series = [series[k] for k in sorted(series)]
 
 
@@ -394,7 +413,7 @@ def main() -> int:
             )
             if rc != 0:
                 stderr_text = (d / f"run_r{rnd}.stderr").read_text()
-                parse_events(events, res)  # peak-at-failure from the tail
+                parse_events(events, res)  # last step-boundary sample (NOT peak-at-failure)
                 if any(m in stderr_text for m in OOM_MARKERS):
                     res.oom = True
                     print(f"[round {rnd}] {a.key}: OOM (a result, not a failure)", flush=True)
@@ -456,8 +475,20 @@ def main() -> int:
             print(f"[kernels] {key}: rc={rc}, {len(kernels[key])} kernels ranked", flush=True)
 
     # ── report ───────────────────────────────────────────────────────────
+    git_rev = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
     out = {"device": device, "flops_per_token": flops_per_token,
-           "roofline_tf32": roofline, "arms": {}}
+           "roofline_tf32": roofline, "nsl_binary": str(args.nsl),
+           "worktree_commit": git_rev, "arms": {}}
+    # A partial --arms rerun must not clobber prior arms' results.
+    prior = work / "results.json"
+    if prior.exists():
+        try:
+            out["arms"] = json.loads(prior.read_text()).get("arms", {})
+        except json.JSONDecodeError:
+            pass
     print("\n| arm | tok/s (best) | MFU | peak GiB | activations GiB | "
           "optim on dev | pcie h2d/d2h MiB | fwd/bwd/opt s | alloc slope |")
     print("|---|---|---|---|---|---|---|---|---|")
@@ -465,7 +496,12 @@ def main() -> int:
         res = results[a.key]
         row: dict = {"oom": res.oom, "error": res.error}
         if res.oom:
-            tail = f"{res.alloc_series[-1]/2**30:.2f} GiB at failure" if res.alloc_series else "?"
+            # The events tail is the last STEP-BOUNDARY sample, where
+            # activations are ~0 by construction — it is NOT the allocated
+            # bytes at failure (the abort's own NSL_MEMSTATS dump is; read
+            # the run stderr). Label it as what it is.
+            tail = (f"last step-boundary sample {res.alloc_series[-1]/2**30:.2f} GiB"
+                    if res.alloc_series else "?")
             print(f"| {a.key} | OOM | — | {tail} | — | — | — | — | — |")
         elif res.best:
             b = res.best
