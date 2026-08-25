@@ -1,0 +1,134 @@
+# models/coder1b/pretrain_pilot.nsl
+# ============================================================================
+# NSL-Coder-1B — the corpus-v2 PILOT (next-roadmap item 6)
+# ============================================================================
+#
+# THE PILOT, NOT THE RUN. pretrain_prod.nsl's full epoch over the 22.6B v2
+# corpus is ~89 days of resident single-GPU wall clock; this file is the
+# ~9.5-hour rehearsal the roadmap requires BEFORE that commitment: it
+# validates the u16 corpus-v2 data path end to end, a genuinely working
+# scheduler (post-#520) over a real warmup+cosine horizon, checkpoint/resume
+# under the resident posture, throughput at production geometry, and
+# held-out curves on both v2 validation sets. A 1-2B-token intermediate run
+# sits between this pilot and the full epoch.
+#
+# DERIVATION — everything is the production recipe scaled to a
+# 98,304,000-token prefix of the SAME corpus (a prefix carries the mixture's
+# intended proportions: <|file_sep|> density varies 1.08x across deciles,
+# by the mixture's design):
+#   pilot tokens      = 24,000 micro-steps * 4096      = 98,304,000
+#   slice bytes       = (24,000*4096 + 8*2048) * 2     = 196,640,768
+#                       (one update of drop_last slack)
+#   total micro-steps = 24,000     optimizer steps      = 6,000
+#   warmup            = 2,400 micro (10% — the 500M-measured fraction; the
+#                       production 0.15% only makes sense at 22.6B scale)
+#   checkpoint_every  = 500 optimizer steps             (~47 min resident)
+#   wall estimate     = 6,000 * ~5.6 s                  = ~9.4 h
+#   lr / min_lr / betas / wd / clip / geometry: pretrain_prod.nsl's exactly.
+#
+# Held-out: 2M-token prefixes of stack_val and web_val (the full sets are a
+# ~30-minute validation pass — the production recipe pays it, a pilot that
+# exists to be cheap does not). Both parent sets are decontaminated and
+# disjoint by construction; a prefix of either inherits that.
+#
+# Slices (from the repo root; the parents are the manifest-pinned bins):
+#   head -c 196640768 data/tokens/mix/pretrain_train.bin > data/tokens/pilot_train_98m.bin
+#   head -c 4000000   data/tokens/mix/stack_val.bin      > data/tokens/pilot_val_stack_2m.bin
+#   head -c 4000000   data/tokens/mix/web_val.bin        > data/tokens/pilot_val_web_2m.bin
+#
+# NOT covered by pretrain_prod_agreement_gate.rs, deliberately: that gate
+# pins PRODUCTION recipes against config.nsl; this is an experiment artifact
+# whose numbers derive from the block above and whose life ends when the
+# intermediate run supersedes it. It shares model.nsl/config.nsl with the
+# production recipe, so the architecture cannot drift between them.
+#
+# RUN (resident posture — the item-1 measurement):
+#   cd models/coder1b
+#   nsl run --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
+#           pretrain_pilot.nsl
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+print("================================================================")
+print("  NSL-Coder-1B corpus-v2 PILOT: 98.3M tokens, 6000 opt steps")
+print("================================================================")
+
+let tokens = load_mmap("../../data/tokens/pilot_train_98m.bin", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=2048, shuffle=true, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+@fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_pilot_state.nslm", checkpoint_every=500):
+    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=2400, total_steps=24000, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let flat_logits = logits.reshape([4096, 49152])
+        let flat_labels = batch.labels.reshape([4096])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 80 == 0:
+                print(step)
+                print(loss)
+
+print("LOSS_STREAM_END")
+
+print("PEAK_BYTES")
+print(gpu_peak_bytes())
+print("PEAK_WEIGHTS")
+print(gpu_surface_at_peak_bytes(1))
+print("PEAK_OPTIM_M")
+print(gpu_surface_at_peak_bytes(2))
+print("PEAK_OPTIM_V")
+print(gpu_surface_at_peak_bytes(3))
+print("PEAK_M_PARTIAL")
+print(gpu_surface_at_peak_bytes(4))
+print("PEAK_ACTIVATIONS")
+print(gpu_surface_at_peak_bytes(6))
+
+let sval_tokens = load_mmap("../../data/tokens/pilot_val_stack_2m.bin", 3)
+let sval_loader = DataLoader(sval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let sval_total = 0.0
+let sval_count = 0.0
+for batch in sval_loader:
+    let vlogits = m.forward_train(batch.input_ids, false)
+    let vs = vlogits.shape
+    let vflat_logits = vlogits.reshape([vs[0] * vs[1], vs[2]])
+    let vflat_labels = batch.labels.reshape([vs[0] * vs[1]])
+    let vloss = cross_entropy(vflat_logits, vflat_labels)
+    sval_total = sval_total + vloss.item()
+    sval_count = sval_count + 1.0
+
+print("VAL_LOSS_STACK")
+print(sval_total / sval_count)
+print("VAL_BATCHES_STACK")
+print(sval_count)
+
+let wval_tokens = load_mmap("../../data/tokens/pilot_val_web_2m.bin", 3)
+let wval_loader = DataLoader(wval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let wval_total = 0.0
+let wval_count = 0.0
+for batch in wval_loader:
+    let wlogits = m.forward_train(batch.input_ids, false)
+    let ws = wlogits.shape
+    let wflat_logits = wlogits.reshape([ws[0] * ws[1], ws[2]])
+    let wflat_labels = batch.labels.reshape([ws[0] * ws[1]])
+    let wloss = cross_entropy(wflat_logits, wflat_labels)
+    wval_total = wval_total + wloss.item()
+    wval_count = wval_count + 1.0
+
+print("VAL_LOSS_WEB")
+print(wval_total / wval_count)
+print("VAL_BATCHES_WEB")
+print(wval_count)
+
+model_save(m, "checkpoints/pretrain_pilot_final.nslm")
+print("PRETRAIN_PILOT_COMPLETE")

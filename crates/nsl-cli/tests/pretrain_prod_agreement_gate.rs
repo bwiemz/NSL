@@ -146,6 +146,12 @@ struct ProdPair {
     /// validation record. Checked per size rather than repo-wide: a global
     /// count is satisfied by whichever size already cites one.
     cites_validation_record: bool,
+    /// Whether train and val are a prefix/tail cut of ONE stream (the
+    /// make_prod_split model). The overlap-arithmetic check only applies
+    /// then; the 1B pair scores on SEPARATE source bins whose disjointness
+    /// is owned by the corpus machinery (repo_id intersection in verify.py,
+    /// file-list disjointness in corpus_manifest_gate).
+    same_stream_split: bool,
     /// Whether the FASE planner must report `two_phase_clip: true`.
     ///
     /// SCOPE, stated because it is narrower than it looks: `nsl check
@@ -172,6 +178,7 @@ const PAIRS: &[ProdPair] = &[
         shuffle: None,
         run_line_flags: &[],
         cites_validation_record: false,
+        same_stream_split: false,
         two_phase_clip: true,
     },
     ProdPair {
@@ -194,37 +201,42 @@ const PAIRS: &[ProdPair] = &[
         shuffle: Some(true),
         run_line_flags: &["--checkpoint-blocks"],
         cites_validation_record: true,
+        same_stream_split: true,
         two_phase_clip: true,
     },
-    // Item 10. Reads the SAME two slices as 500M — deliberately, so the two
-    // production runs are scored on identical held-out text and their VAL_LOSS
-    // numbers are comparable to each other. The `load_sites` surjectivity check
-    // below is what keeps that from becoming "both loaders read the train
-    // slice".
+    // Item 6: the 1B recipe trains on the v2 corpus and scores on its TWO
+    // held-out sets (stack_val repository-disjoint, web_val file-disjoint) —
+    // separate SOURCE bins, not a prefix/tail cut of one stream, so the
+    // same-stream overlap check below does not apply to this pair (see
+    // `same_stream_split`). Resident posture per the item-1 measurement:
+    // --optim-state-offload left the run line (+30% throughput; offload
+    // stays the smaller-card escape hatch, documented in the header).
     ProdPair {
         dir: "coder1b",
         train_tokens_const: "TRAIN_TOKENS",
         load_sites: &[
             (
-                "../../data/tokens/prod_train_slice.bin",
-                "data/tokens/prod_train_slice.bin",
+                "../../data/tokens/mix/pretrain_train.bin",
+                "data/tokens/mix/pretrain_train.bin",
             ),
             (
-                "../../data/tokens/prod_val_slice.bin",
-                "data/tokens/prod_val_slice.bin",
+                "../../data/tokens/mix/stack_val.bin",
+                "data/tokens/mix/stack_val.bin",
+            ),
+            (
+                "../../data/tokens/mix/web_val.bin",
+                "data/tokens/mix/web_val.bin",
             ),
         ],
         token_counts: &[
-            ("TRAIN_TOKENS", "data/tokens/prod_train_slice.bin"),
-            ("VAL_TOKENS", "data/tokens/prod_val_slice.bin"),
+            ("TRAIN_TOKENS", "data/tokens/mix/pretrain_train.bin"),
+            ("STACK_VAL_TOKENS", "data/tokens/mix/stack_val.bin"),
+            ("WEB_VAL_TOKENS", "data/tokens/mix/web_val.bin"),
         ],
         shuffle: Some(true),
-        run_line_flags: &[
-            "--checkpoint-blocks",
-            "--fuse-rmsnorm-backward",
-            "--optim-state-offload",
-        ],
+        run_line_flags: &["--checkpoint-blocks", "--fuse-rmsnorm-backward"],
         cites_validation_record: true,
+        same_stream_split: false,
         two_phase_clip: true,
     },
 ];
@@ -393,10 +405,16 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
             "{dir}: config.nsl PRETRAIN_DATA disagrees with the corpus \
              pretrain_prod.nsl loads ({documented})"
         );
-        if let Some((val_path, _)) = pair.load_sites.get(1) {
+        for (val_path, _) in &pair.load_sites[1..] {
+            // One PRETRAIN_VAL_DATA* const per held-out site (a size may
+            // have several — item 6's 1B documents _STACK and _WEB).
+            let documented_val = config.lines().any(|l| {
+                l.trim_start().starts_with("const PRETRAIN_VAL_DATA")
+                    && l.contains(&format!("\"{val_path}\""))
+            });
             assert!(
-                config.contains(&format!("const PRETRAIN_VAL_DATA = \"{val_path}\"")),
-                "{dir}: config.nsl PRETRAIN_VAL_DATA disagrees with the \
+                documented_val,
+                "{dir}: no PRETRAIN_VAL_DATA* const in config.nsl names the \
                  held-out slice pretrain_prod.nsl loads ({val_path})"
             );
         }
@@ -543,8 +561,11 @@ fn the_held_out_split_does_not_overlap_the_training_slice() {
 
     let mut checked = 0usize;
     for pair in PAIRS {
-        // Only the sizes that train on a prefix and score on a tail.
-        if pair.load_sites.len() < 2 {
+        // Only the sizes that train on a prefix and score on a tail of ONE
+        // stream. The 1B pair (item 6) scores on separate source bins; its
+        // disjointness is owned by verify.py's repo_id intersection and the
+        // corpus gate's file-list check.
+        if !pair.same_stream_split || pair.load_sites.len() < 2 {
             continue;
         }
         checked += 1;
@@ -685,9 +706,11 @@ fn the_held_out_split_does_not_overlap_the_training_slice() {
     }
     // A loop that silently iterated over nothing would pass this test while
     // checking no split at all.
+    // Item 6 moved the 1B to SEPARATE held-out source bins, so only 500M
+    // remains on the same-stream split this check models.
     assert!(
-        checked >= 2,
-        "expected at least two sizes with a held-out split, checked {checked}"
+        checked >= 1,
+        "expected at least one same-stream held-out split, checked {checked}"
     );
 }
 
@@ -965,37 +988,45 @@ fn loader_bindings_name_the_right_slice() {
             pair.load_sites[0].0
         );
 
-        if let Some((val_path_want, _)) = pair.load_sites.get(1) {
+        // Every held-out site (item 6: a size may have SEVERAL — the 1B
+        // scores stack_val and web_val separately). Each must be iterated by
+        // exactly one post-train loop, in load_sites ORDER (the printed
+        // VAL_LOSS_* labels follow that order), and no post-train loop may
+        // read anything else.
+        let val_sites = &pair.load_sites[1..];
+        if !val_sites.is_empty() {
             checked_val += 1;
-            // THE VALIDATION LOADER = the one the held-out `for` loop iterates.
             let val_iters: Vec<&(usize, String)> =
                 iterated.iter().filter(|(i, _)| *i > train_line).collect();
             assert_eq!(
                 val_iters.len(),
-                1,
-                "{dir}: expected exactly one `for ... in <loader>:` after the \
-                 train block (the held-out pass), found {val_iters:?}"
+                val_sites.len(),
+                "{dir}: expected {} held-out `for ... in <loader>:` loop(s) \
+                 after the train block, found {val_iters:?}",
+                val_sites.len()
             );
-            let val_name = &val_iters[0].1;
-            let (_, _, val_arg) = loaders
-                .iter()
-                .find(|(_, n, _)| n == val_name)
-                .unwrap_or_else(|| {
-                    panic!("{dir}: the held-out loop iterates `{val_name}`, which is not a DataLoader")
-                });
-            let val_path = resolve(val_arg);
-            assert_eq!(
-                val_path, *val_path_want,
-                "{dir}: the held-out loop iterates `{val_name}`, fed {val_path}, \
-                 but this size's HELD-OUT slice is {val_path_want}. A validation \
-                 loop reading the training prefix reports a loss measured on data \
-                 the model trained on"
-            );
-            assert_ne!(
-                val_name, train_name,
-                "{dir}: the held-out loop and the train block consume the SAME \
-                 loader `{val_name}`"
-            );
+            for (k, (val_path_want, _)) in val_sites.iter().enumerate() {
+                let val_name = &val_iters[k].1;
+                let (_, _, val_arg) = loaders
+                    .iter()
+                    .find(|(_, n, _)| n == val_name)
+                    .unwrap_or_else(|| {
+                        panic!("{dir}: the held-out loop iterates `{val_name}`, which is not a DataLoader")
+                    });
+                let val_path = resolve(val_arg);
+                assert_eq!(
+                    val_path, *val_path_want,
+                    "{dir}: held-out loop #{k} iterates `{val_name}`, fed \
+                     {val_path}, but this size's held-out site #{k} is \
+                     {val_path_want}. A validation loop reading the training \
+                     corpus reports a loss measured on data the model trained on"
+                );
+                assert_ne!(
+                    val_name, train_name,
+                    "{dir}: a held-out loop and the train block consume the \
+                     SAME loader `{val_name}`"
+                );
+            }
         }
     }
     assert!(
