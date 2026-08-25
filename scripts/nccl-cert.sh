@@ -56,6 +56,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
+# Refuse-to-start GPU guard (scripts/gpu-guard.sh): flock against other
+# guarded runs + busy-device refusal + own process group. A hard exit, not a
+# warning — see the guard's header for the incident that made this policy.
+if [[ "${NSL_GPU_GUARD:-1}" != "0" ]] && ! "${ROOT}/scripts/gpu-guard.sh" held; then
+    exec "${ROOT}/scripts/gpu-guard.sh" run -- "${ROOT}/scripts/nccl-cert.sh" "$@"
+fi
+
 # DEDICATED, and deliberately NOT `${CARGO_TARGET_DIR:-...}`. This build sets
 # RUSTFLAGS, so sharing a target dir thrashes fingerprints — and worse, any
 # concurrent `cargo test --workspace` (which builds WITHOUT --features cuda)

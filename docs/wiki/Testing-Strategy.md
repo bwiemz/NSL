@@ -109,7 +109,38 @@ cargo test -p nsl-codegen --features cuda --test csha_cuda_launch_fused -- --ign
 NSL_SKIP_CUDA_TESTS=1 cargo test --workspace
 ```
 
-### The certification lane
+### The certification tiers
+
+`scripts/gpu-tier.sh` is the front door for running GPU certification at a
+chosen depth. Each tier answers a different question:
+
+```bash
+scripts/gpu-tier.sh smoke       # "is the GPU + harness sane right now?"
+scripts/gpu-tier.sh certify     # "does everything the tree certifies hold?"
+scripts/gpu-tier.sh endurance   # "does production-scale 1B training complete?"
+```
+
+`smoke` runs the curated canary (`tools/gpu-canary.txt` via `tools/gpu-test.sh`,
+one process per test, every entry a real numerical claim against a CPU
+reference). `certify` runs the full certification lane below. `endurance` runs
+`models/benchmarks/endurance_1b.py` — 1B parameters at sequence length 2048:
+the SR-BF16 endurance arm, the f32 reference arm, and checkpoint-resume in a
+fresh process. Measured budgets live in the script header and in
+`models/benchmarks/GPU_TIERS_2026_08_24.md`.
+
+Every tier **refuses to start when the device is busy** or when another
+guarded run holds the machine-wide lock — `scripts/gpu-guard.sh`, which also
+runs the workload in its own process group so killing a tier cannot orphan a
+child still holding VRAM. The refusal is a hard exit, not a warning: a sweep
+that warned and proceeded on a busy device lost two arms of an LR sweep to an
+orphaned run's resident 22 GB (2026-08-19). The same guard is called by every
+campaign driver under `models/benchmarks/`.
+
+Note the axis distinction: `gpu-tier.sh` selects depth/duration, while
+`gpu-cert.sh --tier` (below) selects gate *capability classes* within the
+certify tier. `gpu-tier.sh certify --tier all` composes the two.
+
+### The certification lane (the `certify` tier)
 
 `scripts/gpu-cert.sh` is the full sweep: it discovers every `#[ignore]` test in
 the tree, classifies each one, and runs the classes that need a device.
@@ -141,9 +172,9 @@ under those conditions would report green having executed nothing — worse than
 not running at all.
 
 `--tier gpu` is the default and covers the `gpu` and `gpu-inferred` classes —
-360 gates as of this writing. It does **not** include the `toolchain` (13),
-`multiproc` (6), or `isolate` (1) tiers; run those separately. These counts are
-not mechanically gated, so treat them as indicative; `scripts/gpu-cert.sh
+397 gates as of this writing. It does **not** include the `toolchain` (13),
+`multiproc` (6), or `isolate` (1) classes; run those separately. These counts
+are not mechanically gated, so treat them as indicative; `scripts/gpu-cert.sh
 --list | cut -f3 | sort | uniq -c` is the authority.
 
 Every gate gets `NSL_CERT_TIMEOUT` seconds (default 1200), and a target's batched run gets that times its gate count, clamped to `NSL_CERT_BATCH_TIMEOUT` (default 3600). The
@@ -175,18 +206,20 @@ each of its gates in a separate process, because a faulting kernel poisons the
 CUDA context for every later test sharing that process — without this, one
 real bug reports as a cluster.
 
-### Canary (fast sanity check)
+### Canary (the `smoke` tier)
 
-For a quick "is the GPU path working at all" check there is a curated
-3-test canary with toolchain preflight and provenance stamping:
+For a quick "is the GPU path working at all" check there is a curated canary
+(`tools/gpu-canary.txt`) — every entry makes a real numerical claim against a
+CPU reference and has been observed green on the reference GPU:
 
-```powershell
-pwsh tools/gpu-test.ps1 -Canary        # acceptance gate: the known-green canary
-pwsh tools/gpu-test.ps1 -ListCanary    # show the manifest
+```bash
+tools/gpu-test.sh                # run the canary, one process per test
+tools/gpu-test.sh --list         # show the manifest
+tools/gpu-test.sh --filter csha  # only matching entries
 ```
 
-This is an acceptance check for the harness itself, not coverage — and it
-needs `pwsh`, which is absent from the Linux dev environment. Use
+(`tools/gpu-test.ps1 -Canary` is the PowerShell equivalent for Windows.)
+This is an acceptance check for the harness itself, not coverage — use
 `scripts/gpu-cert.sh` for coverage.
 
 See [GPU-Test-Harness](GPU-Test-Harness.md) for the full reference, the canary

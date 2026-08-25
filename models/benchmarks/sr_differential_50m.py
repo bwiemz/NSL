@@ -39,6 +39,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import gpu_guard
+
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = REPO / "models/coder50m/sr_differential.nsl"
 CORPUS = REPO / "data/tokens/train_new.bin"
@@ -174,6 +176,9 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--replicates", type=int, default=2)
     args = ap.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("sr_differential_50m")
 
     materialize_slices()
     by_seed: dict[int, dict[str, list[Run]]] = {}

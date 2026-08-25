@@ -30,6 +30,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import gpu_guard
+
 # Dense TFLOPS per device. Keys must match `nvidia-smi --query-gpu=name` output.
 # 5070 Ti: RTX Blackwell whitepaper App. B. RTX PRO 4500: measured 2026-07-30
 # with a cuBLAS GemmEx probe at N=8192 (fp32/tf32/bf16/fp16 sustained at the
@@ -260,6 +262,9 @@ def main() -> None:
                              "[rows, vocab] logits are then never materialized (GEMM-chunked\n"
                              "fused loss)")
     args = parser.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("mfu_bench")
 
     if not args.nsl.exists():
         sys.exit(f"compiler not found at {args.nsl} — build with: cargo build --release --features cuda --bin nsl")

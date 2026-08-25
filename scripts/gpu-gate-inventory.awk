@@ -23,6 +23,8 @@
 #   cpu-stub      `#[cfg(not(feature = "cuda"))]` -> NEVER in the lane: the
 #                 placeholder for non-cuda builds    cuda-featured build the
 #                                                    lane uses compiles it OUT
+#   helper        a child process driven by       -> NEVER auto-run: standalone
+#                 another test via re-exec           invocation is meaningless
 #   unclassified  bare #[ignore], no reason, no   -> NOT run, but REPORTED
 #                 cuda gating
 #
@@ -79,7 +81,13 @@ function classify(r, fname, path,    lower) {
     if (lower ~ /not a correctness gate/)              return "diagnostic"
     if (lower ~ /^diagnostic:/)                        return "diagnostic"
     if (lower ~ /debug helper/)                        return "diagnostic"
+    # Child halves of re-exec tests. The PARENT is the gate (its reason says
+    # "spawns", landing it in multiproc); the child asserts nothing on its own
+    # and exists only to be driven. Deny-side so no GPU wording in the rest of
+    # the reason can promote it into a run class.
+    if (lower ~ /child process|spawned by/)            return "helper"
     # Documented-broken or blocked on unlanded work.
+    if (lower ~ /^blocked:/)                           return "broken"
     if (lower ~ /not yet wired/)                       return "broken"
     if (lower ~ /pre-existing/)                        return "broken"
     if (lower ~ /prerequisite/)                        return "broken"
@@ -95,6 +103,11 @@ function classify(r, fname, path,    lower) {
     if (lower ~ /spawns/)                              return "multiproc"
     if (lower ~ /cuda gpu|cuda device|cuda-capable gpu|cuda toolchain \+ gpu/)
         return "gpu"
+    # A bare "requires GPU" fell through every ALLOW pattern above and landed
+    # in `unclassified` — a gate that silently never ran (found 2026-08-24 on
+    # srbf16_parameter_surface_is_accounted_as_weights_gpu). Deny rules have
+    # already run, so a known-broken reason mentioning a GPU cannot get here.
+    if (lower ~ /requires gpu/)                        return "gpu"
     if (lower ~ /sm_89/)                               return "gpu"
     # Needs nvcc/ptxas/cuobjdump or the CUDA link step, but no device.
     if (lower ~ /ptxas|cuobjdump|cuda toolchain/)      return "toolchain"

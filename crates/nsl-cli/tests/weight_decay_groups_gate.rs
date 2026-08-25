@@ -39,22 +39,32 @@ fn repo_root() -> PathBuf {
 }
 
 fn nsl_binary() -> PathBuf {
-    let root = repo_root();
-    for profile in ["release", "debug"] {
-        let mut p = root.join("target").join(profile).join("nsl");
-        // Windows names it `nsl.exe`; without this the probe never finds the
-        // binary and every test in this file panics with
-        // "no nsl binary in target/{release,debug} — build it first".
-        // This helper was copied from rope_cache_gate.rs, which HAS the branch —
-        // it was dropped in the copy, which is why only this gate failed.
-        if cfg!(windows) {
-            p.set_extension("exe");
-        }
-        if p.exists() {
-            return p;
+    // $CARGO_TARGET_DIR first, repo-local target/ second. The certification
+    // lane (and the CI workflow) redirect the target dir to disk, so a probe
+    // that only knows repo-local target/ panics there with "build it first"
+    // while the freshly built binary sits in the redirected dir — the exact
+    // FAIL the 2026-08-24 lane run reported for this gate.
+    let mut roots = Vec::new();
+    if let Ok(t) = std::env::var("CARGO_TARGET_DIR") {
+        roots.push(PathBuf::from(t));
+    }
+    roots.push(repo_root().join("target"));
+    for root in &roots {
+        for profile in ["release", "debug"] {
+            let mut p = root.join(profile).join("nsl");
+            // Windows names it `nsl.exe`; without this the probe never finds
+            // the binary and every test in this file panics below. This
+            // helper was copied from rope_cache_gate.rs, which HAS the branch —
+            // it was dropped in the copy, which is why only this gate failed.
+            if cfg!(windows) {
+                p.set_extension("exe");
+            }
+            if p.exists() {
+                return p;
+            }
         }
     }
-    panic!("no nsl binary in target/{{release,debug}} — build it first");
+    panic!("no nsl binary under $CARGO_TARGET_DIR or target/ ({{release,debug}}) — build it first");
 }
 
 struct Run {

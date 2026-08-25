@@ -59,6 +59,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from matrix_bench import ARMS, REPO, SCALES, build_binary  # noqa: E402
 
+import gpu_guard
+
 CANONICAL = REPO / "models" / "coder1b" / "pretrain_1b2048.nsl"
 LOSS_RE = re.compile(r"^tensor\(\[([0-9.eE+-]+)\]\)\s*$")
 PCIE_RE = re.compile(r"pcie\s+h2d=([0-9.]+) MiB\s+d2h=([0-9.]+) MiB")
@@ -398,6 +400,9 @@ def main() -> None:
     ap.add_argument("--skip-resume", action="store_true")
     ap.add_argument("--timeout", type=int, default=5400)
     args = ap.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("endurance_1b")
 
     args.nsl = args.nsl.resolve()
     if not args.nsl.exists():

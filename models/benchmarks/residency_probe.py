@@ -52,6 +52,8 @@ from matrix_bench import (  # noqa: E402
     build_program,
 )
 
+import gpu_guard  # noqa: E402
+
 WS_RE = re.compile(r"^\[weight-stream\] .*$", re.M)
 SR_RE = re.compile(r"^\[sr-bf16\] .*$", re.M)
 GPU_MEM_RE = re.compile(
@@ -160,6 +162,9 @@ def main() -> None:
     ap.add_argument("--token-count", type=int, default=120_000)
     ap.add_argument("--timeout", type=int, default=1800)
     args = ap.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("residency_probe")
 
     args.out = args.out.resolve()
     args.nsl = args.nsl.resolve()

@@ -25,6 +25,8 @@ import threading
 import time
 from pathlib import Path
 
+import gpu_guard
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 NSL = REPO / "target" / "release" / "nsl"
@@ -464,6 +466,9 @@ def main() -> None:
     c.set_defaults(fn=cmd_confirm500m)
 
     args = ap.parse_args()
+    # Refuse-to-start GPU guard — a busy device or a concurrent guarded run
+    # aborts here instead of corrupting the measurement (see gpu_guard.py).
+    gpu_guard.acquire_or_refuse("muon_campaign")
     assert NSL.exists(), f"release binary missing: {NSL}"
     assert (DATA / "train_tokens.bin").exists(), "run muon_data.py first"
     args.fn(args)

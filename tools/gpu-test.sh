@@ -31,6 +31,9 @@ logdir="${CARGO_TARGET_DIR:-target}/gpu-test-logs"
 filter=""
 list_only=0
 
+# Kept for the guard re-exec below — the parse loop consumes "$@".
+orig_args=("$@")
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --list) list_only=1; shift ;;
@@ -41,6 +44,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "${manifest}" ]] || { echo "missing ${manifest}" >&2; exit 1; }
+
+# Self-wrap under the concurrency guard (scripts/gpu-guard.sh): flock against
+# other guarded GPU runs, busy-device refusal against everything else (the
+# usual offender is an orphaned `nsl run` child still holding VRAM), and the
+# whole sweep in its own process group so killing it cannot orphan a child on
+# the device. --list runs nothing on the device, so it stays unguarded.
+if [[ "${list_only}" -eq 0 && "${NSL_GPU_GUARD:-1}" != "0" ]] \
+   && ! "${repo_root}/scripts/gpu-guard.sh" held; then
+    exec "${repo_root}/scripts/gpu-guard.sh" run -- "${repo_root}/tools/gpu-test.sh" "${orig_args[@]}"
+fi
 
 # ---------------------------------------------------------------------------
 # Device preflight. REFUSE to start rather than report green having run
