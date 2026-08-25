@@ -54,7 +54,10 @@ CONTINUES the data stream and dropout masks, and REFUSES when the corpus,
 geometry, shuffle seed or loader presence drifted. `epochs` is the TOTAL for
 the run under resume, not "how many more". A checkpoint also records an
 execution fingerprint: resuming under a build whose arithmetic differs
-ABORTS; placement differences warn. (The full contract, including the
+ABORTS; placement differences warn. The RESOLVED optimizer/scheduler/train
+config is identity too (item 4): drift in betas/weight-decay/accumulation
+refuses outright; lr/schedule/clip drift refuses unless
+`NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1` converts it to a loud acknowledgment. (The full contract, including the
 `model_load(...)` weights-only escape hatch, is restated in the distill
 section below.)
 
