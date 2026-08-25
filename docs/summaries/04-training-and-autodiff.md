@@ -261,6 +261,8 @@ holding everything else that determines what the next step computes:
 | Corpus + geometry fingerprint | A resume onto different data **refuses** rather than reordering silently |
 | RNG state (CPU sampling stream, GPU dropout counter) | Dropout masks continue instead of restarting |
 | The `--seed` scalar | Keys the SR-BF16 and ZeRO dither directly; a resume under a different seed **refuses** |
+| Execution fingerprint (#519) | Compile flags that decide the arithmetic: drift **refuses**; placement changes warn and continue |
+| Resolved train/optimizer/scheduler config (item 4) | Optimizer drift (betas/wd/accum) **refuses** outright; lr/schedule/clip drift refuses unless `NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1` acknowledges it |
 
 Both files are written to `.tmp` and renamed, so a crash mid-save leaves the
 previous checkpoint intact; the sidecar echoes a signature of the `.nslm` it

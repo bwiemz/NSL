@@ -316,6 +316,10 @@ fn sidecar_v2_header_carries_the_whole_resume_block() {
         // it keys the SR-BF16 and ZeRO dither directly.
         "\"global_seed\":",
         "\"global_seed_set\":",
+        // #519's compile-flag record (this pin lagged it) and item 4's
+        // resolved train/optimizer/scheduler record.
+        "\"exec\":\"",
+        "\"train_cfg\":\"",
     ] {
         assert!(header.contains(key), "sidecar header lacks {key}:\n{header}");
     }

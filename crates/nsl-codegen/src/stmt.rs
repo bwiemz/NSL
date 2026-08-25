@@ -7913,6 +7913,88 @@ impl Compiler<'_> {
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
+        // Item 4 (2026-08-25): render + install the resolved
+        // train/optimizer/scheduler record for checkpoint identity. At
+        // train-block ENTRY, per block (a module can hold several), before
+        // the resume load below reads it as the LIVE side and before any
+        // save writes it into the sidecar. Values are the RESOLVED config —
+        // compile-time constants the runtime cannot recover. Floats render
+        // via Display (shortest round-trip, digits/dot only for validated
+        // positive config values); the one user-text field (no_decay roles)
+        // is allowlisted to [a-z0-9_-] — the #519 lesson: allowlist user
+        // text inside structured containers.
+        {
+            let clip_s = if grad_clip == f64::MAX {
+                "none".to_string()
+            } else {
+                grad_clip.to_string()
+            };
+            let adamw_lr_s = adamw_lr_value
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let mut nd: Vec<String> = no_decay_scope
+                .static_roles
+                .iter()
+                .map(|r| {
+                    r.chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                                c.to_ascii_lowercase()
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            if no_decay_scope.exempt_non_rank2 {
+                nd.push("vector".to_string());
+            }
+            nd.sort();
+            let nd_s = if nd.is_empty() { "none".to_string() } else { nd.join("+") };
+            let (sched_s, sched_params): (&str, Vec<f64>) = match &scheduler {
+                None => ("none", Vec::new()),
+                Some(sch) => {
+                    use nsl_semantic::optim_config::ResolvedScheduler as RS;
+                    let ps = match sch {
+                        RS::ConstantLr => Vec::new(),
+                        RS::StepLr { step_size, gamma } => vec![*step_size, *gamma],
+                        RS::ExponentialLr { gamma } => vec![*gamma],
+                        RS::LinearDecay { total_steps, end_factor } => {
+                            vec![*total_steps, *end_factor]
+                        }
+                        RS::CosineAnneal { t_max, eta_min } => vec![*t_max, *eta_min],
+                        RS::WarmupCosine { warmup_steps, total_steps, min_lr } => {
+                            vec![*warmup_steps, *total_steps, *min_lr]
+                        }
+                        RS::OneCycle { max_lr, total_steps, pct_start } => {
+                            vec![*max_lr, *total_steps, *pct_start]
+                        }
+                    };
+                    (sch.fn_name(), ps)
+                }
+            };
+            let mut rec = format!(
+                "opt={optimizer_name},lr={lr_value},accum={grad_accumulation_steps},\
+clip={clip_s},wd={weight_decay_value},beta1={beta1_value},beta2={beta2_value},\
+eps={eps_value},momentum={momentum_value},dampening={dampening_value},\
+nesterov={},ns_steps={ns_steps_value},adamw_lr={adamw_lr_s},no_decay={nd_s},\
+sched={sched_s}",
+                nesterov_value as u8,
+            );
+            for (i, v) in sched_params.iter().enumerate() {
+                rec.push_str(&format!(",sp{}={v}", i + 1));
+            }
+            self.intern_string(&rec)?;
+            let rec_ptr = self.compile_string_literal(builder, &rec)?;
+            let rec_len = builder.ins().iconst(cl_types::I64, rec.len() as i64);
+            self.compile_call_by_name(
+                builder,
+                "nsl_set_train_config_record",
+                &[rec_ptr, rec_len],
+            )?;
+        }
+
         // Milestone B: full-state resume. Emitted AFTER moment allocation and
         // BEFORE the first register belt: θ and m/v are all still plain f32
         // device tensors here, so the loader's H2D path covers every arm —

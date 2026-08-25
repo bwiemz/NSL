@@ -95,11 +95,13 @@
 # restored, and a corpus or `--seed` mismatch refuses rather than silently
 # training a different stream.
 #
-# USE THE SAME FLAG SET on the resume, because nothing enforces that one: the
-# guard validates the `--seed` scalar and a corpus+geometry loader_id, NOT the
-# codegen flags. Resuming without --fuse-rmsnorm-backward silently changes the
-# backward arithmetic mid-run (the fused path is deterministic but not bit-equal
-# to the decomposition), and resuming without --optim-state-offload simply OOMs.
+# USE THE SAME FLAG SET AND CONFIG on the resume — and this IS now enforced:
+# #519's execution fingerprint refuses arithmetic compile-flag drift (dropping
+# --fuse-rmsnorm-backward aborts instead of silently changing the backward),
+# placement changes like --optim-state-offload warn and continue, and item 4's
+# config record refuses optimizer drift (betas/wd/accum) outright and
+# lr/schedule/clip drift unless NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1
+# acknowledges it.
 # Measured: a 41% mid-epoch resume reproduced the held-out loss to 0.0055 nats
 # on one arm — see PROD1B_VALIDATION_2026_08_19.md EC4, which is also explicit
 # about what that single agreement does NOT establish.

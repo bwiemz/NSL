@@ -694,12 +694,16 @@ pub extern "C" fn nsl_train_checkpoint_save(
         }
     }
     let resume = format!(
-        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}"}}"#,
+        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}","train_cfg":"{train_cfg}"}}"#,
         hl = (dl_ptr != 0) as u64,
         // The compile-flag record installed by main(). Empty for a program
         // built before the fingerprint existed; the loader treats empty as
         // "unknown" and skips the comparison rather than refusing.
         exec_fp = crate::exec_fingerprint::exec_fingerprint(),
+        // The resolved train/optimizer/scheduler record installed at
+        // train-block entry (item 4). Same tolerance as `exec`: empty for
+        // a build predating it; the loader says the check is skipped.
+        train_cfg = crate::train_config_record::train_config_record(),
         seed_hex = rng.seed_hex(),
         hi = (rng.sampling_pos >> 64) as u64,
         lo = rng.sampling_pos as u64,
@@ -1008,6 +1012,18 @@ pub extern "C" fn nsl_train_checkpoint_load(
                     std::process::abort();
                 }),
             },
+            train_cfg: match scan_header_string(header_bytes, b"\"train_cfg\":") {
+                None => String::new(),
+                Some(raw) => String::from_utf8(raw).unwrap_or_else(|_| {
+                    eprintln!(
+                        "nsl: train_checkpoint_load: the sidecar's \
+                         'train_cfg' record is not valid UTF-8. Treating it \
+                         as absent would silently disable the config check, \
+                         so this refuses instead — the checkpoint is corrupt."
+                    );
+                    std::process::abort();
+                }),
+            },
             rng: crate::rng_state::RngSnapshot {
                 sampling_seed,
                 sampling_pos: ((hi as u128) << 64) | (lo as u128),
@@ -1098,6 +1114,12 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 );
             }
         }
+
+        // The resolved train/optimizer/scheduler configuration (item 4).
+        // Moment-meaning drift aborts with no escape; trajectory drift
+        // (lr/schedule/clip) aborts naming the acknowledgment env. Policy
+        // and messages live in `train_config_record::check_on_resume`.
+        crate::train_config_record::check_on_resume(&r.train_cfg);
 
         // `epochs` is the run TOTAL (see this function's doc). A checkpoint
         // at or past it leaves the epoch loop with nothing to do: zero steps,
@@ -1354,6 +1376,10 @@ struct ResumeState {
     /// checkpoint written before this feature would otherwise become
     /// unresumable.
     exec: String,
+    /// The resolved train/optimizer/scheduler record (`k=v,k=v`) installed
+    /// at the SAVING run's train-block entry (item 4). Same empty-means-
+    /// predates-the-feature tolerance as `exec`.
+    train_cfg: String,
     /// Whether the SAVING run had a DataLoader. Distinguishes "loader at
     /// epoch 0 slot 0" from "no loader at all" — without it, a loader-less
     /// checkpoint and a loader checkpoint saved before its first batch are

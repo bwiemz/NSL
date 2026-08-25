@@ -280,6 +280,7 @@ pub mod tensor_trace;
 pub mod trace_diff;
 pub mod deterministic_ops;
 pub mod exec_fingerprint;
+pub mod train_config_record;
 pub mod multimodal;
 pub mod cfie;
 pub mod cpdt;

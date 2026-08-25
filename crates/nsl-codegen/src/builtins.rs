@@ -2895,6 +2895,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64],
         Some(types::I64),
     ),
+    // Item 4 (2026-08-25): the resolved train/optimizer/scheduler record,
+    // installed at TRAIN-BLOCK entry (per block, not per program — a module
+    // can hold several train blocks). Joins the .optim sidecar as checkpoint
+    // identity; see nsl-runtime/src/train_config_record.rs for the policy.
+    (
+        "nsl_set_train_config_record",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     // --- M48: Multimodal primitives ---
     (
         "nsl_patch_embed",
