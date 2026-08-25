@@ -1,5 +1,17 @@
 # Section 12 — Tooling & Ecosystem
 
+> **Status (v0.9, reconciled 2026-08-25 — item 19).** This section is a
+> DESIGN SKETCH, not a description of the shipped toolchain. Shipped
+> subcommands are what `nsl --help` prints (`crates/nsl-cli/src/args.rs`):
+> `check, run, build, test, export, convert, init, fmt, debug, zk, profile,
+> autotune, tokenize, fpga-compile, ptx-metadata` (proof tooling lives under
+> `nsl zk <prove|verify|...>`).
+> **`nsl lint`, `nsl bench`, `nsl repl`, `nsl lsp`, the `nsl pkg` family,
+> and the `nsl-vscode` extension below do not exist.** Where this sketch
+> and the shipped CLI disagree, the CLI is the specification. Also: NSL
+> compiles via **Cranelift**, not LLVM — banners below predate that
+> decision.
+
 ## Design Rationale
 
 A language is only as good as its tooling. NSL ships with a complete developer experience
@@ -57,7 +69,7 @@ $ nsl init my-project --template=transformer
 
 # Run a program
 $ nsl run src/main.nsl --device cuda
-# Compiles to native code via LLVM, then executes
+# Compiles to native code via Cranelift, then executes
 
 # Type-check only (fast — no code generation)
 $ nsl check src/main.nsl
@@ -214,7 +226,7 @@ integrated into the language runtime.
 ```
 $ nsl repl --device cuda
 
-NeuralScript 0.1.0 | LLVM 18.0 | CUDA 12.4 | A100 80GB
+NeuralScript 0.9.0 | Cranelift | CUDA 13.x   (illustrative banner — no REPL is shipped)
 Type :help for help, :quit to exit
 
 nsl> let x = rand([3, 4], dtype=fp32, device=cuda)

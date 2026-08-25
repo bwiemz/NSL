@@ -14,7 +14,13 @@ data loading with computation).
 ```ebnf
 train_block     ::= 'train' '(' train_config ')' ':' INDENT train_body DEDENT
 train_config    ::= config_entry (',' config_entry)*
-config_entry    ::= IDENT '=' expression
+config_entry    ::= train_key '=' expression
+train_key       ::= 'model' | 'epochs' | 'grad_accumulation' | 'grad_clip'
+                  | 'checkpoint_save' | 'checkpoint_every' | 'checkpoint_load'
+(* Values are constrained beyond this grammar: epochs, grad_accumulation and
+   checkpoint_every must be positive integer LITERALS (a variable or config
+   reference is a compile error), grad_clip a positive number, and
+   checkpoint_save/checkpoint_every must appear together. *)
 train_body      ::= (train_stmt NEWLINE)*
 train_stmt      ::= 'data' ':' data_config
                    | 'optimizer' ':' optim_config
@@ -37,6 +43,20 @@ distribute_ann  ::= 'distribute' '(' dist_config ')'
 dist_config     ::= 'strategy' '=' dist_strategy (',' dist_params)*
 dist_strategy   ::= 'ddp' | 'fsdp' | 'pipeline' | 'tensor_parallel' | 'zero3'
 ```
+
+## Checkpointing and resume (shipped, item 8 — 2026-08-19)
+
+`checkpoint_save=` / `checkpoint_every=` / `checkpoint_load=` are first-class
+config keys. The `.optim` sidecar (v2) carries the optimizer moments, the
+step counter, the training epoch, the DataLoader's epoch and delivery slot, a
+corpus/geometry fingerprint, and every RNG stream's state — a resumed run
+CONTINUES the data stream and dropout masks, and REFUSES when the corpus,
+geometry, shuffle seed or loader presence drifted. `epochs` is the TOTAL for
+the run under resume, not "how many more". A checkpoint also records an
+execution fingerprint: resuming under a build whose arithmetic differs
+ABORTS; placement differences warn. (The full contract, including the
+`model_load(...)` weights-only escape hatch, is restated in the distill
+section below.)
 
 ## Built-in Optimizers
 
@@ -354,7 +374,7 @@ The compiler can optimize the `train` block holistically:
 2. **Fused optimizer**: Gradient clipping + optimizer step are fused into one kernel
 3. **Communication overlap**: In distributed training, gradient all-reduce overlaps with backward computation
 4. **Memory planning**: The compiler knows the entire training loop and can plan memory allocation to avoid fragmentation
-5. **Automatic mixed precision**: The compiler inserts cast operations and handles loss scaling automatically when `precision=bf16`
+5. **Mixed precision**: parameter storage precision is a CLI concern (`--param-dtype bf16-sr`, stochastic-rounding BF16), not a train-config key — the `precision=` key from earlier drafts of this spec was never shipped and is refused by the closed config namespace
 
 ## Design Tensions & Tradeoffs
 

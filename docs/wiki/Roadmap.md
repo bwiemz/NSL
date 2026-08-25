@@ -4,7 +4,7 @@
 
 NSL's development is organized into milestones (M9-M62) grouped into phases (1-13) shipping as versions (v0.1-v1.2). The roadmap is living -- phases beyond the next version boundary are subject to re-ordering.
 
-**Current version:** `0.9.1` (2026-03-26)
+**Current version:** `0.9.0` (tagged 2026-03-19; everything since is unreleased work on the 0.9 line — no v0.9.1 was ever tagged)
 
 ## Phase table
 
@@ -19,7 +19,7 @@ NSL's development is organized into milestones (M9-M62) grouped into phases (1-1
 | 7 | v0.6-v0.7 | M38b (linear types codegen), M40b (source AD extraction), M43 (pipeline parallel) | Shipped 2026-03-18 |
 | 8 | v0.8 | M45 (tensor debugger), M46 (reproducibility), M48 (multimodal) | Shipped 2026-03-18 |
 | 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18 |
-| 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | In flight as of 2026-04-21 |
+| 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 partial (M54b: boot stub + unikernel runtime + GPU-init framework) |
 | 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | Planned |
 | 12 | v1.1 | M58 (elastic FT), M59 (topology routing), M61 (cluster debug) | Planned |
 | 13 | v1.2 | M57 (FPGA/neuromorphic), M60 (exabyte streaming) | Planned |
@@ -97,8 +97,8 @@ Symbolic dimension tracking; bounded syntax (`SeqLen < 4096`); runtime dimension
 ### M34 -- Ring Attention (Shipped v0.3, 2026-03-17)
 `@context_parallel` for cross-GPU sequence parallelism over arbitrarily long sequences.
 
-### M35 -- FP8/AWQ/GPTQ quantization (Shipped v0.3, 2026-03-17; extended v0.9.1)
-FP8 MMA paths; AWQ calibration pipeline; GPTQ full OBQ algorithm with Hessian-based error compensation (v0.9.1). Design: [`2026-04-15-m35-fp8-mma-correctness-design.md`](../superpowers/specs/2026-04-15-m35-fp8-mma-correctness-design.md).
+### M35 -- FP8/AWQ/GPTQ quantization (Shipped v0.3, 2026-03-17; extended 2026-03-26, 0.9 line unreleased)
+FP8 MMA paths; AWQ calibration pipeline; GPTQ full OBQ algorithm with Hessian-based error compensation (2026-03-26, unreleased). Design: [`2026-04-15-m35-fp8-mma-correctness-design.md`](../superpowers/specs/2026-04-15-m35-fp8-mma-correctness-design.md).
 
 ### M36 -- Memory planning (Shipped v0.3, 2026-03-17)
 Compile-time tensor liveness analysis; slab allocator for static memory budgets.
@@ -119,7 +119,7 @@ Batch dimension tracking and shape rewriting (M39a); `VmapTransformer` FnDef->Fn
 Wengert list construction and adjoint rules (M40a); source extraction and backward context wiring (M40b).
 
 ### M41 -- Disaggregated inference (Shipped v0.4-v0.6, 2026-03-18)
-Prefill/decode worker separation; KV transfer abstraction; NVLink, RDMA, and TCP backends (M41b, v0.9.1).
+Prefill/decode worker separation; KV transfer abstraction; NVLink, RDMA, and TCP backends (M41b, 2026-03-26, unreleased).
 
 ### M42 -- KV-cache compression (Shipped v0.5, 2026-03-18)
 INT8/INT4/FP8 KV compression; sliding-window eviction; H2O token-importance eviction policy.
@@ -158,7 +158,7 @@ Compiles model weights into the binary as compile-time constants; constant foldi
 Worst-case execution time analysis for robotics/safety-critical deployments; requires M52 weight constants. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
 ### M54 -- Bare-metal unikernels (In flight, Phase 10)
-x86_64 boot stub + unikernel runtime + GPU init (M54b shipped v0.9.1); single-binary AI inference with no OS. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
+x86_64 boot stub + unikernel runtime + GPU init (M54b, 2026-03-26, unreleased); single-binary AI inference with no OS. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
 ### M55 -- ZK inference circuits (v1 shipped: folding backend)
 Zero-knowledge proofs over model inference; verifiable computation for privacy-sensitive deployments. The folding backend is shipped and wired end-to-end (`nsl build --zk-backend folding` proves + `nsl zk verify`); the `halo2` and `plonky3` backends are refused at compile time (halo2 deprecated/removed, plonky3 prover not yet wired) rather than silently falling back to folding. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
@@ -182,7 +182,7 @@ Distributed data pipeline for exabyte-scale corpora; streaming without full data
 Cross-node trace correlation; per-rank NaN/divergence detection; cluster-level Chrome trace export. Design: [`2026-03-19-m61-cluster-debugging-design.md`](../superpowers/specs/2026-03-19-m61-cluster-debugging-design.md).
 
 ### M62 -- Legacy interop / PyTorch FFI (Shipped; ownership models added 2026-08-18)
-`from_torch()`/`to_torch()` round-trips; `@export` decorator shipped 2026-04-15; grad-context bridge shipped 2026-04-16; per-function C wrappers + Python E2E shipped 2026-04-21 (PR #48/#96). Item 7 (2026-08-18) added the DLPack **output** ownership models: `nsl_model_call_into` (caller-alloc, capacity contract), `nsl_model_call_alloc` (DLManagedTensor transfer, deleter releases exactly once), `nsl_model_get_export_signature` introspection — `NslModel.forward` now returns owned torch tensors. Designs: [`2026-03-19-m62-legacy-interop-design.md`](../superpowers/specs/2026-03-19-m62-legacy-interop-design.md), [`2026-08-18-item7-dlpack-output-ownership.md`](../superpowers/specs/2026-08-18-item7-dlpack-output-ownership.md).
+`from_torch()`/`to_torch()` round-trips; `@export` decorator shipped 2026-04-15; grad-context bridge shipped 2026-04-16; per-function C wrappers + Python E2E shipped 2026-04-21 (PR #48). Item 7 (2026-08-18) added the DLPack **output** ownership models: `nsl_model_call_into` (caller-alloc, capacity contract), `nsl_model_call_alloc` (DLManagedTensor transfer, deleter releases exactly once), `nsl_model_get_export_signature` introspection — `NslModel.forward` now returns owned torch tensors. Designs: [`2026-03-19-m62-legacy-interop-design.md`](../superpowers/specs/2026-03-19-m62-legacy-interop-design.md), [`2026-08-18-item7-dlpack-output-ownership.md`](../superpowers/specs/2026-08-18-item7-dlpack-output-ownership.md).
 
 ### Resumable training state (Shipped 2026-08-19, item 8)
 
@@ -279,20 +279,61 @@ did not survive recomputation over the finished epochs (r = +0.217), and the
 reading built on it was never supported. No derived statistic gets banked until
 the run feeding it has exited.
 
+### Per-segment forward early-free + 1B re-profile (Shipped 2026-08-23, items 11+12, PR #524)
+
+CCR had never reduced the FORWARD peak — recomputation bounds the backward,
+but the forward's activation high-water was untouched. Per-segment early-free
+took 1B@2048 forward activations from 16.54 GiB to 3.42 GiB, and a fully
+resident 1B run COMPLETES. Item 12 closed in the same PR by measurement: the
+re-profiled peak is 82% persistent state, so no further fusion is justified —
+the roadmap row's premise dissolved. Evidence:
+[`ITEM12_REPROFILE_2026_08_24.md`](../../models/benchmarks/ITEM12_REPROFILE_2026_08_24.md).
+
+### Pretraining corpus of record (Shipped 2026-08-19, PR #523)
+
+22.6B-token v2 mixture (60% Stack / 39.8% FineWeb / 0.2% NSL) with a
+committed, checkable identity: `models/datasets/CORPUS_MANIFEST_v2.json`
+pins bin sha256s, token counts, tokenizer hashes, reserved-id tables and HF
+source revisions, gated by `corpus_manifest_gate.rs`.
+
+### Single-GPU certification tiers (Shipped 2026-08-24, item 14, PR #525)
+
+`scripts/gpu-tier.sh smoke|certify|endurance` (measured: 36s / 63m32s /
+~4.5h budget) over one GPU guard (`scripts/gpu-guard.sh`): flock on
+`/tmp/nsl-gpu.lock`, refuse-don't-warn on busy-GPU (names the offender),
+setsid + group-kill so an interrupted lane cannot orphan VRAM holders.
+Evidence: [`GPU_TIERS_2026_08_24.md`](../../models/benchmarks/GPU_TIERS_2026_08_24.md).
+
+### Structured runtime event stream (Shipped 2026-08-24, item 17, PR #526)
+
+`NSL_EVENTS=<path>` appends JSONL twins of every registered counter marker
+plus per-step `[gpu-mem]` with exact bytes; stderr stays byte-identical, both
+renderings from one snapshot; `EVENT_SCHEMAS` registry + consistency gate
+(whose first catch: `[grad-integrity]` was never in the marker registry).
+See [Testing-Strategy](Testing-Strategy.md).
+
+### Tokenizer pipeline closure + fast encoder (items 15+16, PRs #527/#528 — in review at this reconciliation, 2026-08-25)
+
+Item 15: the corpus of record was UNREBUILDABLE — the tokbench flags that
+built it existed only in an uncommitted worktree patch; recovered, committed,
+re-proven sha256-identical; packed batches stop carrying token ids as f32.
+Item 16: a GigaToken-adapted byte-domain encoder
+(`nsl_runtime::tokenizer_fast`) re-encodes all 74 GB of the corpus
+sha256-identical in under 8 minutes (~3.7x less CPU); refusal-perimeter
+loader, differential gates against the `tokenizers` crate every CI build.
+Evidence: `models/benchmarks/ITEM16_FAST_ENCODER_2026_08_24.md` (arrives with PR #528).
+
 ## Currently in flight
 
-Cross-verified against `git log` as of commit `9a1b512e` (2026-04-21):
+Re-verified 2026-08-25 (item 19). The 2026-08 roadmap campaign (items 1-17 above) is shipped through PR #526, with items 15/16 in PRs #527/#528 and this reconciliation as item 19; item 13 (capacity-based residency plan) was never started, and its motivation is re-scoped by item 12's finding that the peak is 82% persistent state. Distributed, TrainIR, BitNet and new quant formats remain frozen. Older in-flight entries, cross-verified against `git log`:
 
 - **M52 CPDT Phase 2** -- weight-aware spectral factor; fires when committed-fixture disagreement exceeds 20% (currently 15.6%); measurement-triggered, not yet scheduled. Design: `docs/superpowers/specs/2026-04-18-cpdt-weight-aware-phase2-stub.md`.
-- **M62 PyTorch FFI -- per-function C wrappers** -- `@export` decorator and grad-context bridge shipped; per-function C wrappers and Python E2E tests remain. Design: `docs/superpowers/specs/2026-04-15-m62-c-wrappers-design.md`.
-- **AWQ retention -- subprocess gaps** -- *shipped*. Original arena-ordering fix in PR #98; subprocess model-forward linkage and the model-library calibration link landed across PRs #134 + #145. The `awq_full_pipeline::end_to_end_real_subprocess_matches_analytical_reference` and `snapshot_awq_sidecar_baseline` tests both pass on `main`. No longer blocking WGGO Phase 2.
-- **WGGO Phase 2 gradient scoring** -- *shipped*. Trait, scorers, sidecar schema, and hook were always in place; real backward-pass execution unblocked by the AWQ retention subprocess fix above and a six-hop calibration runtime chain (PRs #144 / #146 / #148 / #149). The merge-gate test `wggo_backward_pipeline::end_to_end_backward_subprocess_matches_analytical_reference` runs the full calibration subprocess, reads back populated `wggo_head_gradients` from the sidecar, and matches the analytical reference within 5×10⁻³ relative tolerance. `CalibratedGradientScorer` now consumes those real per-head scores via the `Task 30` integration tests.
 - **CSHA Tier B** -- Section 9.2 Level 2 pipelining PTX (double-buffered async loads); not yet started; Tier A and C both shipped.
 - **CSHA Tier D** -- Section 3.3 per-head mixed precision; not yet started; planned after Tier B.
 - **WRGA B.3.2 fused backward** -- *deferred indefinitely (resolved 2026-05-23)*. The per-op profiling bench (`wrga_b32_per_op_breakdown.rs`) ran on current `main`: wall 6.6s/iter, GPU 86.3% of wall (NOT host/allocator-dominated), and **backward is 0.37x the forward, not >2.5x** -- the STUB's trigger condition fails on a clean baseline. The original 106x trigger was measured on a broken substrate (pre-cuBLAS / CPU-fallback / zero-duration profiler). A fused backward kernel would target at most 15% of GPU time. Decision tree resolved in `docs/plans/2026-04-18-wrga-b32-fused-backward-STUB.md`.
 - **WRGA B.4 fused-forward staging** -- *resolved 2026-05-23: NOT pursued; fused stays opt-in, unfused cuBLAS is the default everywhere*. The fused GatedLoRA forward kernel is 73.4% of GPU time, but an m-sweep shows it **loses to cuBLAS at every m** (15x slower at m=1, widening to 68x at m=1024) -- there is no regime where it wins, so there is no niche to optimize the staging for. The assumed small-m niche (fusion's launch/round-trip savings dominate) was falsified: the lane-0 staging tax scales with n-block count (stays large at small-m), so the kernel's own cost dwarfs the savings ~10x. The staging rewrite is a speculative bet, gated on a concrete deployment need + a re-measured prototype that beats unfused. Beating cuBLAS at scale would need a multi-warp + tensor-core rewrite (a different, larger project). A separate robustness bug -- forward-only `@adapter` on sm>=80 segfaults because the side-table is materialized train-block-only -- is fixed independently. Full record: `docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md`.
 
-Items removed from in-flight because git shows shipped: CSHA Gap J NaN (PR #103), CSHA block_q asymmetry (PR #101), CPDT Phase 1 + Tier A follow-ups (PRs #88-#94), PCA Tier A (PRs #78+#105+#109), WRGA B.3.2 Option 3 (PR #93), CSHA Tier A e2e (2026-04-15), CSHA Tier C close-out (2026-04-16), CSHA dead-head elim backward (PR #110), MSE backward /N fix (commit `c215194b`).
+Items removed from in-flight because git shows shipped: M62 per-function C wrappers + Python E2E (2026-04-21, PR #48 — the old #96 half of that attribution does not check out; #96 touched no python files), AWQ retention subprocess gaps (PRs #98/#134/#145), WGGO Phase 2 gradient scoring (PRs #144/#146/#148/#149), CSHA Gap J NaN (PR #103), CSHA block_q asymmetry (PR #101), CPDT Phase 1 + Tier A follow-ups (PRs #88-#94), PCA Tier A (PRs #78+#105+#109), WRGA B.3.2 Option 3 (PR #93), CSHA Tier A e2e (2026-04-15), CSHA Tier C close-out (2026-04-16), CSHA dead-head elim backward (PR #110), MSE backward /N fix (commit `c215194b`).
 
 ## How to pick up a milestone
 
@@ -325,4 +366,4 @@ What is load-bearing and won't move:
 
 ---
 
-*Last structurally verified against commit `9a1b512e` on 2026-04-21.*
+*Version surfaces, phase table, and the in-flight section verified against the tree on 2026-08-25 (item 19). Individual milestone entries carry their own dates.*

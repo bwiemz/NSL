@@ -303,7 +303,7 @@ block_kv with fused projections) are rejected at compile time.
 ### ZK Inference (M55)
 - `@zk_proof(mode="weight_private")` decorator
 - 4 privacy modes: weight_private, input_private, full_private, architecture_attestation
-- Circuit IR, witness generation, Halo2 + Plonky3 backends
+- Circuit IR, witness generation; the **folding backend** is the shipped end-to-end path (`nsl build --zk-backend folding` + `nsl zk verify`) — halo2 and plonky3 are refused at compile time
 - Lookup-native arithmetization (Jolt-style)
 - Mersenne-31 field support
 
@@ -324,7 +324,8 @@ nsl check --wcet file.nsl                                # Worst-case execution 
 nsl check --weight-analysis file.nsl --weights model.st  # Weight sparsity analysis
 nsl run file.nsl --disable-fusion                        # Differential testing
 nsl run file.nsl --trace-ops                             # Tensor operation tracing
-nsl run file.nsl --deterministic                         # Deterministic mode
+nsl run file.nsl --deterministic                         # Deterministic mode (with --seed; flash backward falls back to the CPU reference — no deterministic GPU variant exists, ~36x per step)
+NSL_EVENTS=out.jsonl nsl run file.nsl                    # Structured runtime event stream (JSONL twins of the counter markers + per-step GPU memory, exact bytes)
 ```
 
 ---

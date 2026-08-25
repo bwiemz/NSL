@@ -120,7 +120,7 @@ let qat_model = quant(scheme=int8, mode=aware, granularity=per_channel):
     #   x_fq = dequantize(quantize(x, scale, zp), scale, zp)
     # This simulates quantization error while keeping gradients flowing.
 
-train(model=qat_model, epochs=5, precision=fp32):
+train(model=qat_model, epochs=5):
     data:
         source = train_dataset
         batch_size = 32

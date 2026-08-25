@@ -14,7 +14,7 @@ Usage:
     output.backward()  # gradients flow through NSL and torch
 """
 
-__version__ = "0.2.0"
+__version__ = "0.9.0"
 
 from nslpy._core import NslModel, NslError, GradContext, find_library
 from nslpy._bridge import to_nsl_tensor, from_nsl_tensor, release_nsl_tensor
