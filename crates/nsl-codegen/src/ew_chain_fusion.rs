@@ -33,7 +33,11 @@
 //! v1 scope notes: skipped entirely under `--layerwise-accum` (the CSLA range
 //! partition is positional over this tape; a follow-up can enable it with a
 //! range-boundary-aware differential gate) and not applied to the `@backward`
-//! grad-block window. A `Constant` feeding a LEFT operand slot is a chain
+//! grad-block window. `reduce_to_shape` is a chain BARRIER (measured: on the
+//! prod tape every chain-reachable rts was a real GQA reduce that refused
+//! the uniform-shape gate and replayed — see the barrier comment in
+//! `try_join`; the RtsCheck wire machinery is retained for the
+//! shape-filtered revival). A `Constant` feeding a LEFT operand slot is a chain
 //! BARRIER and excluded from the sweep: the baseline reconciles the right
 //! operand onto the (CPU-resident) constant's device and computes the chain
 //! in host f64, which a device-f32 kernel does not reproduce bit-for-bit once
@@ -589,41 +593,18 @@ fn try_join(
     };
 
     if is_rts(op) {
-        // reduce_to_shape joins only mid-chain, consuming the flowing value
-        // as its grad operand. Its producer is a run member by construction
-        // (we only reach it by following the flow) — i.e. elementwise, never
-        // a Matmul (the wgrad triple stays intact). Belt below.
-        let (Some(f), Some(fo)) = (flowing, flowing_operand) else {
-            return false;
-        };
-        if op.inputs[0] != f {
-            return false;
-        }
-        debug_assert!(
-            chain.members.last().is_some_and(|&m| ops[m].result == f),
-            "RtsCheck must consume the last run member's result"
-        );
-        debug_assert!(
-            !chain
-                .members
-                .last()
-                .is_some_and(|&m| matches!(ops[m].op, PrimalOp::Matmul)),
-            "a Matmul-fed reduce must never join a chain"
-        );
-        let like = op.inputs[1];
-        if chain.members.iter().any(|&m| ops[m].result == like) {
-            // The like-ref would be deleted with the chain — refuse.
-            return rollback(chain);
-        }
-        let Some(like_slot) = chain.input_slot(like).map(Operand::Input) else {
-            return rollback(chain);
-        };
-        chain.steps.push(ChainStep {
-            op: EwOpcode::RtsCheck,
-            lhs: fo,
-            rhs: Some(like_slot),
-        });
-        return true;
+        // reduce_to_shape is a BARRIER (measured decision, 2026-08-25): rts
+        // chain membership was tried — same-shape like-refs would ride free
+        // as identities — but on the 500M prod tape EVERY absorbed rts was a
+        // REAL reduce (48/micro-batch, the GQA K/V expand backward), so all
+        // 48 chains refused the uniform-shape gate and replayed every step:
+        // 11,712 fallbacks per 30-update round, pure overhead, zero fused
+        // launches. Until a compile-time shape filter exists (the
+        // transient-arena size-info follow-up recorded in the campaign
+        // notes), an rts ends the chain before it. The RtsCheck descriptor/
+        // kernel/replay machinery stays — the wire contract is unchanged and
+        // the shape-filtered revival will reuse it.
+        return false;
     }
 
     if !is_fusable_arith(&op.op) || chain.arith_steps >= MAX_ARITH_STEPS {
@@ -1036,9 +1017,13 @@ mod tests {
     }
 
     #[test]
-    fn rts_joins_mid_chain_from_member_producer() {
+    fn rts_is_a_barrier_and_never_joins() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Mul -> reduce_to_shape -> Add : the highest-frequency tape pattern.
+        // Mul -> reduce_to_shape -> Add: on the 500M prod tape every rts
+        // reachable from a chain was a REAL reduce (GQA expand backward), so
+        // absorbing them produced fallback-only chains (11,712 replays per
+        // 30-update round). Measured decision: rts ends the chain, and a
+        // 1-arith remnant dissolves — the tape lowers exactly as baseline.
         let mut ops = adjoint(vec![
             op(10, PrimalOp::Mul, vec![0, 1]),
             op(
@@ -1050,14 +1035,9 @@ mod tests {
         ]);
         let needed: HashSet<VarId> = [12].into_iter().collect();
         let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
-        assert_eq!(stats.chains, 1);
-        assert_eq!(stats.reduces_absorbed, 1);
-        assert_eq!(ops.len(), 1);
-        let PrimalOp::Passthrough(name) = &ops[0].op else {
-            panic!()
-        };
-        assert_eq!(name, "fused_ew:v1:mul(i0,i1);rts(p0,i2);add(p1,i3)");
-        assert_eq!(ops[0].inputs, vec![0, 1, 2, 3]);
+        assert_eq!(stats.chains, 0);
+        assert_eq!(stats.reduces_absorbed, 0);
+        assert_eq!(ops.len(), 3, "the tape must be untouched");
     }
 
     #[test]

@@ -5,9 +5,10 @@
 //!
 //! Floors are 0.8x the counts observed on models/coder500m/pretrain_prod.nsl
 //! at implementation time (2026-08-25, prod posture `--source-ad
-//! --checkpoint-blocks --fuse-rmsnorm-backward`): 120 chains (48x
-//! mul+scale-imm, 48x mul+reduce_to_shape+add, 24x add+add residual joins)
-//! and 48 rope folds. Drift below the floor means a matcher regression or a
+//! --checkpoint-blocks --fuse-rmsnorm-backward`): 72 chains (48x
+//! mul+scale-imm, 24x add+add residual joins — reduce_to_shape is a chain
+//! BARRIER after measurement showed every absorbed rts was a real GQA
+//! reduce that replayed) and 48 rope folds. Drift below the floor means a matcher regression or a
 //! recipe/stdlib change that silently starved the fuser — either way the
 //! perf the campaign measured is gone and this gate is the tell.
 
@@ -63,9 +64,10 @@ fn prod_500m_recipe_fuses_above_the_observed_floor() {
             )
         });
     assert!(
-        chains >= 96,
-        "chain count {chains} fell below the floor (96 = 0.8 x 120 observed \
-         2026-08-25) — matcher regression or recipe drift starved the fuser:\n{stderr}"
+        chains >= 57,
+        "chain count {chains} fell below the floor (57 = 0.8 x 72 observed \
+         2026-08-25, post rts-barrier) — matcher regression or recipe drift \
+         starved the fuser:\n{stderr}"
     );
 
     let rope = marker_count(&stderr, "[fuse] rope backward folds:").unwrap_or_else(|| {
