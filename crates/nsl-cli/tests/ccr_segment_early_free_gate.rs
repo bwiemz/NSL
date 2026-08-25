@@ -299,10 +299,18 @@ fn gpu_forward_activation_peak_drops_with_per_segment_free() {
         peak_value(&on.stdout, "PEAK_ACTIVATIONS"),
         peak_value(&off.stdout, "PEAK_ACTIVATIONS"),
     );
-    // 32 MiB margin: interiors on this fixture total >100 MB, allocator
-    // quanta are 2 MiB blocks / 20 MiB segments — a real effect clears this
-    // by 3x, a granularity artifact cannot reach it.
+    // 32 MiB margin. Measured on hardware (2026-08-25): the drop is 44 MiB
+    // (on=127,142,400 off=174,098,432) — allocator reuse eats part of the
+    // theoretical ~96 MiB, so the cushion is 1.4x, not 3x. Still an order
+    // of magnitude above the 2 MiB block / 20 MiB segment quanta, and a
+    // broken feature drops the delta to ~0.
     const MARGIN: u64 = 32 << 20;
+    // Print the measurement so a passing run leaves auditable evidence
+    // (review: the actual headroom was previously inferred, not recorded).
+    println!(
+        "PEAK_ACTIVATIONS on={on_act} off={off_act} drop={} MiB",
+        (off_act.saturating_sub(on_act)) >> 20
+    );
     assert!(
         on_act + MARGIN <= off_act,
         "per-segment freeing did not move the forward activation peak: \
