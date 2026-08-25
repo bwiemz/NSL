@@ -159,12 +159,19 @@ fn chain_fusion_skipped_under_csla() {
     );
 }
 
-/// GPU: prod-like posture (--fuse-rmsnorm-backward), fusion on vs off under
-/// one binary, bit-identical, plus run-to-run determinism of the fused path.
+/// GPU: fused chains launch on hardware bit-identically, composed with the
+/// CCR recompute splice, plus run-to-run determinism of the fused path.
+///
+/// Deliberately WITHOUT --fuse-rmsnorm-backward: this fixture's chain
+/// population IS the decomposed rmsnorm backward (it has no attention/scale
+/// chains like the prod recipes), so the prod flag would starve the fuser
+/// and vacuously pass. Kernel-vs-decomposed byte parity under the prod
+/// posture is covered by the runtime gpu_fast_path test and the prod-recipe
+/// compile floor gate.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn chain_fusion_bit_exact_gpu() {
-    let args = &["--checkpoint-blocks", "--fuse-rmsnorm-backward"][..];
+    let args = &["--checkpoint-blocks"][..];
     let on = run_fixture("ew_chain_fusion.nsl", "gpu_on", true, args, false);
     assert!(on.success, "fusion-on run failed:\n{}", on.stderr);
     assert!(
