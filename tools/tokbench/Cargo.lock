@@ -468,6 +468,7 @@ dependencies = [
  "memmap2",
  "once_cell",
  "rand",
+ "rand_chacha",
  "rustc-hash",
  "safetensors",
  "serde",
