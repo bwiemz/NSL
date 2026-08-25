@@ -78,8 +78,10 @@ fi
 # tagged in the changelog than the one Cargo declares — exactly what happened
 # with a phantom [0.9.1] recorded 2026-03-26 for a release that was never
 # tagged (item 19). sort -V puts the larger version last.
+# Max over ALL numbered headings, not the first in file order: an
+# out-of-order section appended below older releases would escape a head -1.
 newest_numbered="$(grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md \
-  | head -1 | tr -d '#[] ' || true)"
+  | tr -d '#[] ' | sort -V | tail -1 || true)"
 if [[ -z "${newest_numbered}" ]]; then
   ok "CHANGELOG.md has no numbered release sections (nothing to order-check)"
 elif [[ "$(printf '%s\n%s\n' "${newest_numbered}" "${version}" | sort -V | tail -1)" == "${version}" ]]; then

@@ -19,7 +19,7 @@ NSL's development is organized into milestones (M9-M62) grouped into phases (1-1
 | 7 | v0.6-v0.7 | M38b (linear types codegen), M40b (source AD extraction), M43 (pipeline parallel) | Shipped 2026-03-18 |
 | 8 | v0.8 | M45 (tensor debugger), M46 (reproducibility), M48 (multimodal) | Shipped 2026-03-18 |
 | 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18 |
-| 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 partial (boot stub only) |
+| 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 partial (M54b: boot stub + unikernel runtime + GPU-init framework) |
 | 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | Planned |
 | 12 | v1.1 | M58 (elastic FT), M59 (topology routing), M61 (cluster debug) | Planned |
 | 13 | v1.2 | M57 (FPGA/neuromorphic), M60 (exabyte streaming) | Planned |
@@ -182,7 +182,7 @@ Distributed data pipeline for exabyte-scale corpora; streaming without full data
 Cross-node trace correlation; per-rank NaN/divergence detection; cluster-level Chrome trace export. Design: [`2026-03-19-m61-cluster-debugging-design.md`](../superpowers/specs/2026-03-19-m61-cluster-debugging-design.md).
 
 ### M62 -- Legacy interop / PyTorch FFI (Shipped; ownership models added 2026-08-18)
-`from_torch()`/`to_torch()` round-trips; `@export` decorator shipped 2026-04-15; grad-context bridge shipped 2026-04-16; per-function C wrappers + Python E2E shipped 2026-04-21 (PR #48/#96). Item 7 (2026-08-18) added the DLPack **output** ownership models: `nsl_model_call_into` (caller-alloc, capacity contract), `nsl_model_call_alloc` (DLManagedTensor transfer, deleter releases exactly once), `nsl_model_get_export_signature` introspection — `NslModel.forward` now returns owned torch tensors. Designs: [`2026-03-19-m62-legacy-interop-design.md`](../superpowers/specs/2026-03-19-m62-legacy-interop-design.md), [`2026-08-18-item7-dlpack-output-ownership.md`](../superpowers/specs/2026-08-18-item7-dlpack-output-ownership.md).
+`from_torch()`/`to_torch()` round-trips; `@export` decorator shipped 2026-04-15; grad-context bridge shipped 2026-04-16; per-function C wrappers + Python E2E shipped 2026-04-21 (PR #48). Item 7 (2026-08-18) added the DLPack **output** ownership models: `nsl_model_call_into` (caller-alloc, capacity contract), `nsl_model_call_alloc` (DLManagedTensor transfer, deleter releases exactly once), `nsl_model_get_export_signature` introspection — `NslModel.forward` now returns owned torch tensors. Designs: [`2026-03-19-m62-legacy-interop-design.md`](../superpowers/specs/2026-03-19-m62-legacy-interop-design.md), [`2026-08-18-item7-dlpack-output-ownership.md`](../superpowers/specs/2026-08-18-item7-dlpack-output-ownership.md).
 
 ### Resumable training state (Shipped 2026-08-19, item 8)
 
@@ -312,7 +312,7 @@ renderings from one snapshot; `EVENT_SCHEMAS` registry + consistency gate
 (whose first catch: `[grad-integrity]` was never in the marker registry).
 See [Testing-Strategy](Testing-Strategy.md).
 
-### Tokenizer pipeline closure + fast encoder (items 15+16, PRs #527/#528, 2026-08-24)
+### Tokenizer pipeline closure + fast encoder (items 15+16, PRs #527/#528 — in review at this reconciliation, 2026-08-25)
 
 Item 15: the corpus of record was UNREBUILDABLE — the tokbench flags that
 built it existed only in an uncommitted worktree patch; recovered, committed,
@@ -333,7 +333,7 @@ Re-verified 2026-08-25 (item 19). The 2026-08 roadmap campaign (items 1-17 above
 - **WRGA B.3.2 fused backward** -- *deferred indefinitely (resolved 2026-05-23)*. The per-op profiling bench (`wrga_b32_per_op_breakdown.rs`) ran on current `main`: wall 6.6s/iter, GPU 86.3% of wall (NOT host/allocator-dominated), and **backward is 0.37x the forward, not >2.5x** -- the STUB's trigger condition fails on a clean baseline. The original 106x trigger was measured on a broken substrate (pre-cuBLAS / CPU-fallback / zero-duration profiler). A fused backward kernel would target at most 15% of GPU time. Decision tree resolved in `docs/plans/2026-04-18-wrga-b32-fused-backward-STUB.md`.
 - **WRGA B.4 fused-forward staging** -- *resolved 2026-05-23: NOT pursued; fused stays opt-in, unfused cuBLAS is the default everywhere*. The fused GatedLoRA forward kernel is 73.4% of GPU time, but an m-sweep shows it **loses to cuBLAS at every m** (15x slower at m=1, widening to 68x at m=1024) -- there is no regime where it wins, so there is no niche to optimize the staging for. The assumed small-m niche (fusion's launch/round-trip savings dominate) was falsified: the lane-0 staging tax scales with n-block count (stays large at small-m), so the kernel's own cost dwarfs the savings ~10x. The staging rewrite is a speculative bet, gated on a concrete deployment need + a re-measured prototype that beats unfused. Beating cuBLAS at scale would need a multi-warp + tensor-core rewrite (a different, larger project). A separate robustness bug -- forward-only `@adapter` on sm>=80 segfaults because the side-table is materialized train-block-only -- is fixed independently. Full record: `docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md`.
 
-Items removed from in-flight because git shows shipped: M62 per-function C wrappers + Python E2E (2026-04-21, PR #48/#96 — see the M62 milestone entry above), AWQ retention subprocess gaps (PRs #98/#134/#145), WGGO Phase 2 gradient scoring (PRs #144/#146/#148/#149), CSHA Gap J NaN (PR #103), CSHA block_q asymmetry (PR #101), CPDT Phase 1 + Tier A follow-ups (PRs #88-#94), PCA Tier A (PRs #78+#105+#109), WRGA B.3.2 Option 3 (PR #93), CSHA Tier A e2e (2026-04-15), CSHA Tier C close-out (2026-04-16), CSHA dead-head elim backward (PR #110), MSE backward /N fix (commit `c215194b`).
+Items removed from in-flight because git shows shipped: M62 per-function C wrappers + Python E2E (2026-04-21, PR #48 — the old #96 half of that attribution does not check out; #96 touched no python files), AWQ retention subprocess gaps (PRs #98/#134/#145), WGGO Phase 2 gradient scoring (PRs #144/#146/#148/#149), CSHA Gap J NaN (PR #103), CSHA block_q asymmetry (PR #101), CPDT Phase 1 + Tier A follow-ups (PRs #88-#94), PCA Tier A (PRs #78+#105+#109), WRGA B.3.2 Option 3 (PR #93), CSHA Tier A e2e (2026-04-15), CSHA Tier C close-out (2026-04-16), CSHA dead-head elim backward (PR #110), MSE backward /N fix (commit `c215194b`).
 
 ## How to pick up a milestone
 

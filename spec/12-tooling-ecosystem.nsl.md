@@ -3,8 +3,9 @@
 > **Status (v0.9, reconciled 2026-08-25 — item 19).** This section is a
 > DESIGN SKETCH, not a description of the shipped toolchain. Shipped
 > subcommands are what `nsl --help` prints (`crates/nsl-cli/src/args.rs`):
-> `check, run, build, fmt, test, export, convert, init, debug, zk, profile,
-> autotune, tokenize, fpga-compile, ptx-metadata, stats, prove, verify`.
+> `check, run, build, test, export, convert, init, fmt, debug, zk, profile,
+> autotune, tokenize, fpga-compile, ptx-metadata` (proof tooling lives under
+> `nsl zk <prove|verify|...>`).
 > **`nsl lint`, `nsl bench`, `nsl repl`, `nsl lsp`, the `nsl pkg` family,
 > and the `nsl-vscode` extension below do not exist.** Where this sketch
 > and the shipped CLI disagree, the CLI is the specification. Also: NSL

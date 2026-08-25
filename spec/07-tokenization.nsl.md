@@ -250,7 +250,7 @@ print(f"output size: {stats.output_size_gb:.1f} GB")
 
 # The output file can be directly used as a memory-mapped dataset
 let train_data = dataset("corpus"):
-    source = nsl.data.MemoryMapped("data/tokenized/corpus.bin", dtype=u16)  # shipped on-disk format: headerless little-endian u16 ids (load_mmap mode 3); the loader widens to i32 batches in memory
+    source = nsl.data.MemoryMapped("data/tokenized/corpus.bin", dtype=u16)  # shipped on-disk format: headerless little-endian u16 ids (load_mmap mode 3)
     sequence_length = 2048
     packing = true    # pack multiple documents into fixed-length sequences
 ```

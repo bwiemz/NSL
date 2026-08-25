@@ -2351,7 +2351,8 @@ accumulation).
 
 ### 2026-03-26 tranche — M41b / M35b / M54b
 
-> Everything below to the end of this subsection was previously headed
+> The tranche headings from here down to the `[0.9.0]` release section were
+> previously headed
 > `## [0.9.1] - 2026-03-26`. No v0.9.1 was ever tagged and the workspace
 > version never left 0.9.0, so that heading recorded a release that did not
 > happen — and, being *ahead* of Cargo, it inverted the changelog/version
@@ -2384,6 +2385,16 @@ accumulation).
 - Updated README.md with new CLI commands (unikernel, ZK), test count (1,558)
 - Updated implementation status: 34 production milestones (was 30), 131,800 LOC across 282 files
 - Updated CHANGELOG and SPECIFICATION
+
+## [0.9.0] - 2026-03-19
+
+Tagged release (`v0.9.0`): M52 weight-aware compilation (safetensors loader,
+sparsity analysis, constant folding), M62 legacy interop (DLPack zero-copy
+bridge + C API), M54 unikernel infrastructure, plus memory-safety, numerical
+and ZeRO ABI fixes. This marker section was added retroactively by the
+item-19 reconciliation (2026-08-25): the release was tagged without a
+changelog cut, so its bullets were drafted in the then-current section and
+never moved under a `[0.9.0]` heading.
 
 ## [0.8.0] - 2026-03-18
 

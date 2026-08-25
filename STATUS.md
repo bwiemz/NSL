@@ -50,8 +50,9 @@ The boring, must-always-work core.
 - **DataLoader** — zero-copy mmap tokenized-data loading (M19).
 - **CLI** — `nsl check`, `nsl run`, `nsl build`, `nsl fmt`, `nsl test` carry
   the stability promise. The full shipped surface is larger (`export, convert,
-  init, debug, zk, profile, autotune, tokenize, fpga-compile, ptx-metadata,
-  stats, prove, verify`) — those ride their subsystem's tier, not this one.
+  init, debug, zk, profile, autotune, tokenize, fpga-compile, ptx-metadata`;
+  proof tooling under `nsl zk`) — those ride their subsystem's tier, not this
+  one.
 
 **Compatibility contract:** only the Stable tier above carries a cross-version
 "won't break" promise. That promise is *narrower* than the **CI merge gate** —
@@ -98,8 +99,10 @@ edges and occasional API churn.
   the counter markers + per-step GPU memory with exact bytes (item 17);
   stderr stays byte-identical.
 - **Pretokenization pipeline** — two-stage BPE tokenizers of record
-  (`models/tokenizers/`), u16 corpus format, and the fast byte-domain encoder
-  (`tokbench --backend fast`, same-token parity gated; items 15/16).
+  (`models/tokenizers/`) and the headerless u16 corpus format
+  (`load_mmap(path, 3)`). The fast byte-domain encoder (`tokbench --backend
+  fast`, same-token parity gated; items 15/16) is in review in PRs #527/#528
+  and joins this row when they merge.
 
 ---
 
@@ -170,11 +173,11 @@ analysis. Group them only alongside that analysis.
 |--------------|------------------------------------------------------|-------------------------------------------|
 | Stable       | build, clippy, workspace unit tests (`--skip e2e_`)  | —                                         |
 | Beta         | CLI e2e (Linux/Windows), ONNX-RT integration job     | real-CUDA-device tests, perf baselines    |
-| Experimental | `fpga` job (build/lint gate)                         | FPGA Verilator/Yosys **nightly** workflow, `#[ignore]`'d research tests, macOS e2e |
+| Experimental | `fpga` job (build + Yosys gate)                      | full Verilator/Yosys diagnostic (**nightly** workflow), `#[ignore]`'d research tests, macOS e2e |
 
 CI jobs are cumulative — the Beta/Experimental rows run *in addition to* the
 Stable row on every PR (they are separate, blocking CI jobs, not nightly).
-Four drift gates also block every PR outside the tier table: `version-agreement`
+Five drift gates also block every PR outside the tier table: `version-agreement`
 (Cargo == spec/README/CLI/C API/python), `doc-agreement` (docs == tree),
 `gpu-gate-inventory` (cert-lane manifest == tree), and `python-interop` +
 `cuda-feature` (compile + GPU-free tests). GPU execution itself is certified by

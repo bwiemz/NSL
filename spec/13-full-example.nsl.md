@@ -196,7 +196,8 @@ print(f"Training data: {train_data.total_tokens():,} tokens")
 train(
     model             = model,
     epochs            = 1,
-    grad_accumulation = CONFIG.accumulate,
+    grad_accumulation = 4,   # compile-time keys take integer LITERALS — a
+                             # config reference here is refused by the resolver
     grad_clip         = 1.0
 ):
     data:

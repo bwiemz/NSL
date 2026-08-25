@@ -324,7 +324,7 @@ nsl check --wcet file.nsl                                # Worst-case execution 
 nsl check --weight-analysis file.nsl --weights model.st  # Weight sparsity analysis
 nsl run file.nsl --disable-fusion                        # Differential testing
 nsl run file.nsl --trace-ops                             # Tensor operation tracing
-nsl run file.nsl --deterministic                         # Deterministic mode (with --seed; flash backward routed to a deterministic variant)
+nsl run file.nsl --deterministic                         # Deterministic mode (with --seed; flash backward falls back to the CPU reference — no deterministic GPU variant exists, ~36x per step)
 NSL_EVENTS=out.jsonl nsl run file.nsl                    # Structured runtime event stream (JSONL twins of the counter markers + per-step GPU memory, exact bytes)
 ```
 

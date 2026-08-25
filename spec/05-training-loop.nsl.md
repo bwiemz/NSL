@@ -17,6 +17,10 @@ train_config    ::= config_entry (',' config_entry)*
 config_entry    ::= train_key '=' expression
 train_key       ::= 'model' | 'epochs' | 'grad_accumulation' | 'grad_clip'
                   | 'checkpoint_save' | 'checkpoint_every' | 'checkpoint_load'
+(* Values are constrained beyond this grammar: epochs, grad_accumulation and
+   checkpoint_every must be positive integer LITERALS (a variable or config
+   reference is a compile error), grad_clip a positive number, and
+   checkpoint_save/checkpoint_every must appear together. *)
 train_body      ::= (train_stmt NEWLINE)*
 train_stmt      ::= 'data' ':' data_config
                    | 'optimizer' ':' optim_config
