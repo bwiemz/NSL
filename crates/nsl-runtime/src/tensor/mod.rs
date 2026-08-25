@@ -6271,7 +6271,7 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
     let events_only_ok = crate::cuda::inner::context_initialized();
     #[cfg(not(feature = "cuda"))]
     let events_only_ok = false;
-    if !stderr_on && !(events_on && events_only_ok) { return; }
+    if !(stderr_on || (events_on && events_only_ok)) { return; }
     #[cfg(feature = "cuda")]
     {
         unsafe {

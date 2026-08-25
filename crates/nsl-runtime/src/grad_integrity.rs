@@ -531,7 +531,7 @@ extern "C" fn grad_integrity_atexit() {
             ("notes_observed_max", crate::events::u(notes.max as u64)),
             ("under_noted", crate::events::ulist(&notes.under)),
             ("over_noted", crate::events::ulist(&notes.over)),
-            ("unjudged_checks", crate::events::u(notes.unjudged as u64)),
+            ("unjudged_checks", crate::events::u(notes.unjudged)),
         ],
     );
     let list = |v: &[usize]| {

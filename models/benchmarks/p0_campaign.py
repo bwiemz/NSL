@@ -341,8 +341,16 @@ def run_arm(
             except json.JSONDecodeError:
                 continue
             if ev.get("kind") == "weight_stream_counters":
+                # Ints only, tolerantly: the schema contract says kinds may
+                # GROW fields, and a future string/list field must not raise
+                # ValueError here — that would lose the whole arm's evidence
+                # AFTER the training run finished (review finding: int(v)
+                # on every field re-created the brittleness class the event
+                # stream exists to kill).
                 res.ws_counters = {
-                    k: int(v) for k, v in ev.get("fields", {}).items()
+                    k: v
+                    for k, v in ev.get("fields", {}).items()
+                    if isinstance(v, int) and not isinstance(v, bool)
                 }
     # Health snapshots: polled from the per-flush overwritten file, plus a
     # final read after exit.

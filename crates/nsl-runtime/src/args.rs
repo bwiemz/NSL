@@ -199,8 +199,8 @@ extern "C" fn nsl_zero_count_atexit() {
         "zero_counters",
         None,
         &[
-            ("ws", crate::events::i(ws as i64)),
-            ("rank", crate::events::i(rank as i64)),
+            ("ws", crate::events::i(ws)),
+            ("rank", crate::events::i(rank)),
             ("all_reduce", crate::events::u(all_reduce)),
             ("broadcast", crate::events::u(broadcast)),
             ("optim_elems", crate::events::u(optim_elems)),
@@ -370,7 +370,7 @@ extern "C" fn nsl_csla_window_count_atexit() {
     crate::events::emit(
         "csla_counters",
         None,
-        &[("window_backward_phases", crate::events::i(phases as i64))],
+        &[("window_backward_phases", crate::events::i(phases))],
     );
     if std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
         eprintln!("[csla] window backward phases: {phases}");
@@ -402,11 +402,11 @@ extern "C" fn nsl_fase_fused_step_count_atexit() {
         "fase_fused_counters",
         None,
         &[
-            ("rank", crate::events::i(rank as i64)),
-            ("fused_step_launches", crate::events::i(launches as i64)),
-            ("block_table_builds", crate::events::i(table_builds as i64)),
-            ("multi_batched", crate::events::i(batched as i64)),
-            ("multi_fallback", crate::events::i(fallback as i64)),
+            ("rank", crate::events::i(rank)),
+            ("fused_step_launches", crate::events::i(launches)),
+            ("block_table_builds", crate::events::i(table_builds)),
+            ("multi_batched", crate::events::i(batched)),
+            ("multi_fallback", crate::events::i(fallback)),
         ],
     );
     if std::env::var("NSL_FASE_FUSED_COUNTER").ok().as_deref() != Some("1") {
@@ -428,8 +428,8 @@ extern "C" fn nsl_wgrad_count_atexit() {
         "wgrad_counters",
         None,
         &[
-            ("fused_gemm", crate::events::i(fused as i64)),
-            ("decomposed_fallback", crate::events::i(fallback as i64)),
+            ("fused_gemm", crate::events::i(fused)),
+            ("decomposed_fallback", crate::events::i(fallback)),
         ],
     );
     if std::env::var("NSL_WGRAD_COUNTER").ok().as_deref() == Some("1") {

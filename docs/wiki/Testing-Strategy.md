@@ -228,7 +228,8 @@ set, and the "structural pass ≠ numerical pass" known-blocked list.
 ### Structured runtime events (`NSL_EVENTS`)
 
 Setting `NSL_EVENTS=<path>` makes the runtime append one JSON object per
-line — `{"v":1,"seq":N,"kind":"...","step":S|null,"fields":{...}}` — for
+line — `{"v":1,"seq":N,"rank":R,"kind":"...","step":S|null,"fields":{...}}`
+(`seq` is per-process: multi-rank consumers key on `(rank, seq)`) — for
 every counter reporter (`[zero]`, `[weight-stream]`, `[csla]`,
 `[fase-fused]`, `[wgrad-accum]`, the launch counters, `[grad-integrity]`
 when armed) and for `[gpu-mem]` at every step boundary with **exact bytes**

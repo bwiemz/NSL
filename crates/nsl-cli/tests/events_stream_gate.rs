@@ -135,12 +135,15 @@ fn events_file_is_valid_jsonl_with_the_envelope_and_all_cpu_kinds() {
     let r = run_cpu("envelope", &[("NSL_GRAD_INTEGRITY", "1")], Some(&path));
     assert!(r.ok, "fixture run failed:\n{}", r.stderr);
     assert!(!r.events.is_empty(), "NSL_EVENTS produced an empty file");
+    // Strictly-increasing seq is a SINGLE-RANK property (each rank is its
+    // own process with its own counter); this fixture is single-rank.
     let mut last_seq = -1i64;
     for ev in &r.events {
         assert_eq!(ev["v"], 1, "envelope version: {ev}");
         let seq = ev["seq"].as_i64().expect("seq is an integer");
         assert!(seq > last_seq, "seq must be strictly increasing: {ev}");
         last_seq = seq;
+        assert_eq!(ev["rank"], 0, "single-rank run must carry rank 0: {ev}");
         assert!(ev["kind"].as_str().is_some_and(|k| !k.is_empty()), "kind: {ev}");
         assert!(ev.get("step").is_some(), "step present (may be null): {ev}");
         assert!(ev["fields"].is_object(), "fields is an object: {ev}");
@@ -180,6 +183,31 @@ fn every_event_carries_its_registered_schema_fields() {
     // reach is a schema this gate silently stops guarding).
     assert!(checked >= CPU_KINDS.len(), "only {checked} events validated");
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_schema_registry_is_internally_consistent() {
+    // Every kind unique; every schema's marker actually registered in
+    // EXEC_MARKERS. The registry documents both properties (review finding:
+    // documented-but-unvalidated is how the marker registry's own gaps
+    // started).
+    let mut kinds = std::collections::HashSet::new();
+    for s in EVENT_SCHEMAS {
+        assert!(kinds.insert(s.kind), "duplicate event kind '{}'", s.kind);
+        assert!(
+            nsl_cli::exec_markers::EXEC_MARKERS
+                .iter()
+                .any(|m| m.token == s.marker),
+            "schema '{}' names marker '{}' which is not in EXEC_MARKERS",
+            s.kind,
+            s.marker
+        );
+        assert!(!s.fields.is_empty(), "schema '{}' has no fields", s.kind);
+        let mut f = std::collections::HashSet::new();
+        for field in s.fields {
+            assert!(f.insert(field), "schema '{}' repeats field '{field}'", s.kind);
+        }
+    }
 }
 
 #[test]
@@ -321,14 +349,22 @@ fn gpu_mem_events_agree_with_stderr_and_outlive_the_throttle() {
     let events_path = tmp.join("events.jsonl");
     let _ = std::fs::remove_file(&events_path);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
-        .args(["run", "--source-ad"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
+    cmd.args(["run", "--source-ad"])
         .arg(&prog)
         .current_dir(&tmp)
-        .env("NSL_STDLIB_PATH", root.join("stdlib"))
-        .env("NSL_EVENTS", &events_path)
-        .output()
-        .expect("spawn nsl run");
+        .env("NSL_STDLIB_PATH", root.join("stdlib"));
+    // Scrub the ambient environment like run_cpu does — an exported
+    // NSL_DEBUG_MEM_ALL (routine during memory debugging on this box) would
+    // print [gpu-mem] past step 5 and fail the throttle assertion below for
+    // a reason unrelated to the code (review finding).
+    cmd.env_remove("NSL_DEBUG_MEM_ALL");
+    cmd.env_remove("NSL_GRAD_INTEGRITY");
+    for e in COUNTER_ENVS {
+        cmd.env_remove(e);
+    }
+    cmd.env("NSL_EVENTS", &events_path);
+    let out = cmd.output().expect("spawn nsl run");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "GPU fixture failed:\n{stderr}");
 

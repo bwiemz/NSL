@@ -77,6 +77,18 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the CSLA window-buffered schedule was lowered or executed",
     ),
     m(
+        "[grad-integrity]",
+        &[
+            "crates/nsl-runtime/src/grad_integrity.rs",
+        ],
+        "the P0.3 gradient-integrity atexit block (armed by --grad-integrity \
+         or NSL_GRAD_INTEGRITY=1): worst-case-over-steps counts proving every \
+         trainable parameter received a finite, mostly-nonzero gradient. \
+         Registered 2026-08-24 — it had test consumers (csla_layerwise_gate, \
+         grad_integrity_gate) but sat OUTSIDE this registry until the \
+         events-schema consistency gate required its marker to exist here",
+    ),
+    m(
         "[zero]",
         &[
             "crates/nsl-runtime/src/zero.rs",
@@ -435,6 +447,7 @@ pub fn marker(token: &str) -> &'static ExecMarker {
 pub mod tokens {
     pub const WGGO: &str = "[wggo]";
     pub const CSLA: &str = "[csla]";
+    pub const GRAD_INTEGRITY: &str = "[grad-integrity]";
     pub const ZERO: &str = "[zero]";
     pub const ZERO3: &str = "[zero3]";
     pub const MUON: &str = "[muon]";
@@ -717,6 +730,12 @@ pub const EVENT_SCHEMAS: &[EventSchema] = &[
     },
     EventSchema {
         kind: "weight_stream_residency",
+        // KNOWN GAP: the one kind no gate can exercise — it needs cuda AND
+        // registered > 0 (weight streaming engaged), which neither the CPU
+        // gate nor the GPU cross-validation fixture reaches. Its value
+        // agreement rests on the shared-snapshot construction in
+        // nsl_weight_stream_count_atexit; if a streaming gate ever gains an
+        // events file, cross-validate this kind there.
         marker: "[weight-stream]",
         fields: &["pinned", "registered", "pinned_bytes", "streamed_bytes", "summary"],
     },

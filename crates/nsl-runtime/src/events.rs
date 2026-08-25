@@ -10,12 +10,19 @@
 //! new fields at the END".
 //!
 //! Contract:
-//! - One event per line: `{"v":1,"seq":N,"kind":"...","step":S|null,"fields":{...}}`.
+//! - One event per line:
+//!   `{"v":1,"seq":N,"rank":R,"kind":"...","step":S|null,"fields":{...}}`.
 //! - `v` is the stream-format version; bump on any change to the ENVELOPE
 //!   (per-kind field sets may grow — consumers must ignore unknown fields).
-//! - `seq` is a process-wide monotonic counter, so consumers can order and
-//!   de-duplicate (a step boundary emits `gpu_mem_step` twice: at step start
-//!   and after cleanup).
+//! - `seq` is a PER-PROCESS monotonic counter, so consumers can order and
+//!   de-duplicate within one rank (a step boundary emits `gpu_mem_step`
+//!   twice: at step start and after cleanup). Under `--devices N` every
+//!   rank is a separate process appending to the same file, each with its
+//!   own seq starting at 0 — multi-rank consumers MUST key on (rank, seq),
+//!   and a strictly-increasing-seq assertion is only valid single-rank.
+//! - `rank` is the envelope's process identity (`NSL_LOCAL_RANK`, 0 when
+//!   unset), so interleaved multi-rank series are attributable without
+//!   every kind carrying its own rank field.
 //! - Emission is best-effort and NEVER aborts or panics: a training run must
 //!   not die because an events path is unwritable. The first failure prints
 //!   one `[nsl] warning:` line and further emission is disabled.
@@ -66,6 +73,18 @@ pub fn enabled() -> bool {
     sink().is_some() && !FAILED.load(Ordering::Relaxed)
 }
 
+/// This process's rank for the event envelope: `NSL_LOCAL_RANK`, 0 when
+/// unset — the same variable the multi-rank launcher exports per child.
+fn rank() -> i64 {
+    static RANK: OnceLock<i64> = OnceLock::new();
+    *RANK.get_or_init(|| {
+        std::env::var("NSL_LOCAL_RANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Append one event. `fields` are key/value pairs; values use
 /// `serde_json::Value` so counters, strings and lists all fit.
 /// Best-effort: errors disable the stream with one warning, never panic —
@@ -79,18 +98,26 @@ pub fn emit(kind: &str, step: Option<i64>, fields: &[(&str, serde_json::Value)])
     for (k, v) in fields {
         map.insert((*k).to_string(), v.clone());
     }
-    let line = serde_json::json!({
-        "v": EVENTS_VERSION,
-        "seq": SEQ.fetch_add(1, Ordering::Relaxed),
-        "kind": kind,
-        "step": step,
-        "fields": serde_json::Value::Object(map),
-    });
     // ONE write call per line (see O_APPEND note in the header). `to_string`
     // on a json! value cannot fail; the newline rides in the same buffer.
-    let buf = format!("{line}\n");
+    // The seq is taken INSIDE the file mutex: allocated outside, two
+    // concurrent emitters could commit their lines out of seq order and the
+    // monotonicity consumers pin would be coincidental rather than
+    // guaranteed (every call site is single-threaded today; the first
+    // threaded emitter must not turn that accident into a flake).
     let write_failed = match file.lock() {
-        Ok(mut f) => f.write_all(buf.as_bytes()).is_err(),
+        Ok(mut f) => {
+            let line = serde_json::json!({
+                "v": EVENTS_VERSION,
+                "seq": SEQ.fetch_add(1, Ordering::Relaxed),
+                "rank": rank(),
+                "kind": kind,
+                "step": step,
+                "fields": serde_json::Value::Object(map),
+            });
+            let buf = format!("{line}\n");
+            f.write_all(buf.as_bytes()).is_err()
+        }
         Err(_) => true,
     };
     if write_failed && !FAILED.swap(true, Ordering::Relaxed) {
