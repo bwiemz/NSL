@@ -225,6 +225,28 @@ This is an acceptance check for the harness itself, not coverage — use
 See [GPU-Test-Harness](GPU-Test-Harness.md) for the full reference, the canary
 set, and the "structural pass ≠ numerical pass" known-blocked list.
 
+### Structured runtime events (`NSL_EVENTS`)
+
+Setting `NSL_EVENTS=<path>` makes the runtime append one JSON object per
+line — `{"v":1,"seq":N,"kind":"...","step":S|null,"fields":{...}}` — for
+every counter reporter (`[zero]`, `[weight-stream]`, `[csla]`,
+`[fase-fused]`, `[wgrad-accum]`, the launch counters, `[grad-integrity]`
+when armed) and for `[gpu-mem]` at every step boundary with **exact bytes**
+(the stderr line rounds to MB and throttles after step 5; events do
+neither). Prefer reading events by field name over regexing stderr: the
+stderr lines are unchanged and stay gated by their own env vars, but they
+carry append-only/positional hazards the events don't have.
+
+The schema registry is `exec_markers::EVENT_SCHEMAS` (same file as the
+marker registry); `events_stream_gate.rs` pins the envelope, required
+fields, stderr/event value agreement, byte-identical marker lines with
+events on or off, and that an unwritable path warns once without failing
+the run. The compiler-side decision prose (`[ccr]`, `[muon]`,
+`[lm-head-fusion]` etc. from `stmt.rs`) is deliberately NOT in the event
+stream — it is free-text rationale from lowering code with no shared
+structure to hoist, and wants a `pass_trace`-style compile-report collector
+instead; that is recorded as follow-on work, not silently skipped.
+
 ### CI
 
 The CI workflow (`.github/workflows/ci.yml`) runs on a matrix of `ubuntu-latest`, `windows-latest`, `macos-14`, and `macos-latest`. It does **not** provision a CUDA device, so GPU-gated (`#[ignore]`) tests are never triggered in CI. What CI does run:

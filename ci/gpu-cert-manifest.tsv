@@ -45,6 +45,7 @@ crates/nsl-cli/tests/dict_local_lifetime_gate.rs	loop_local_dicts_are_cleared_pe
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	unallowlisted_dispatch_results_do_not_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	identity_shaped_dispatch_does_not_steal_bindings	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dropout_backward_parity_gate.rs	gpu_source_backward_matches_tape_mask_backward	broken	requires CUDA GPU; blocked on a pre-existing source-AD GPU relu-backward dtype abort (nsl_tensor_compare data_f64 on f32) — reproduces with dropout elided
+crates/nsl-cli/tests/events_stream_gate.rs	gpu_mem_events_agree_with_stderr_and_outlive_the_throttle	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	csla_block_tables_build_once_per_shape_list_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/feature_composition_gate.rs	registered_refusals_actually_fire_on_gpu_only_configurations	gpu	requires a CUDA GPU (--weight-stream needs device-resident params)

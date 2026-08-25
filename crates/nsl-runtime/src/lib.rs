@@ -85,6 +85,7 @@ pub mod math;
 pub mod assert;
 pub mod file_io;
 pub mod args;
+pub mod events;
 pub mod tensor;
 pub(crate) mod cpu;
 pub(crate) mod cuda;

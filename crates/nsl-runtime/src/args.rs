@@ -39,10 +39,19 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
+    // Item 17: when NSL_EVENTS=<path> is set, every counter reporter below
+    // ALSO registers, emitting its machine-readable twin to the events file
+    // (crate::events). Each hook re-reads its own env var to decide whether
+    // the human stderr line prints, so setting NSL_EVENTS alone produces a
+    // silent run with a complete events file — machine output is decoupled
+    // from human verbosity flags. NSL_EVENTS does NOT arm [grad-integrity]:
+    // arming buys per-step measurement cost, which stays an explicit opt-in.
+    let events_on = std::env::var("NSL_EVENTS").map(|v| !v.is_empty()).unwrap_or(false);
+
     // B.3 Task 5: print fused-adapter kernel-launch count at exit when
     // NSL_KERNEL_LAUNCH_COUNTER=1.  The counter is always live (cheap
     // atomic increment); the env var only gates the report.
-    if std::env::var("NSL_KERNEL_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
+    if events_on || std::env::var("NSL_KERNEL_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
@@ -55,7 +64,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // NSL_WRGA_GPU_LAUNCH_COUNTER=1.  Distinguishes real-GPU execution
     // from CPU fallback so tests can assert the fused CUDA path actually
     // fired (not just the math came out right).
-    if std::env::var("NSL_WRGA_GPU_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
+    if events_on || std::env::var("NSL_WRGA_GPU_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
@@ -68,7 +77,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // NSL_FASE_FUSED_COUNTER=1. Lets the differential gate assert the fused
     // path actually fired (anti-vacuity), mirroring the WRGA counter pattern.
     // The counter is always live; the env var only gates the report.
-    if std::env::var("NSL_FASE_FUSED_COUNTER").ok().as_deref() == Some("1") {
+    if events_on || std::env::var("NSL_FASE_FUSED_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
@@ -82,7 +91,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // `nsl_tensor_wgrad_accum` is SILENT by design (a shape the compiler's
     // pre-pass misjudged must degrade to correct-but-slow, not abort), which
     // is exactly why the parity gate needs to see which path actually ran.
-    if std::env::var("NSL_WGRAD_COUNTER").ok().as_deref() == Some("1") {
+    if events_on || std::env::var("NSL_WGRAD_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
@@ -95,7 +104,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // NSL_CSLA_COUNTER=1. Lets the differential gate assert the buffered
     // backward phase actually fired (anti-vacuity), same pattern as above.
     // D2b: weight-stream upload/evict counts, enabled when NSL_WS_COUNTER=1.
-    if std::env::var("NSL_WS_COUNTER").ok().as_deref() == Some("1") {
+    if events_on || std::env::var("NSL_WS_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
@@ -104,7 +113,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
-    if std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
+    if events_on || std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
@@ -133,7 +142,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // parity gate asserts EXACT all_reduce/broadcast totals — with
     // replicated data a no-op reduce is otherwise invisible (identical
     // grads make sum/ws == g either way).
-    if std::env::var("NSL_ZERO_COUNTER").ok().as_deref() == Some("1") {
+    if events_on || std::env::var("NSL_ZERO_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
@@ -182,6 +191,28 @@ extern "C" fn nsl_zero_count_atexit() {
     // Keep new fields at the end regardless — the historical
     // `ends_with("reduce_scatter=6")` parser broke the day item 11 appended
     // `all_gather=`, and terminal anchoring is never safe on this line.
+    // Item 17: the structured twin is built from the SAME snapshot as the
+    // stderr line, so the two renderings cannot disagree about values. The
+    // stderr line stays gated by NSL_ZERO_COUNTER (this hook also registers
+    // under NSL_EVENTS alone).
+    crate::events::emit(
+        "zero_counters",
+        None,
+        &[
+            ("ws", crate::events::i(ws as i64)),
+            ("rank", crate::events::i(rank as i64)),
+            ("all_reduce", crate::events::u(all_reduce)),
+            ("broadcast", crate::events::u(broadcast)),
+            ("optim_elems", crate::events::u(optim_elems)),
+            ("bucket_members", crate::events::u(bucket_members)),
+            ("reduce_scatter", crate::events::u(rs)),
+            ("all_gather", crate::events::u(ag)),
+            ("repl_optim_elems", crate::events::u(repl_optim_elems)),
+        ],
+    );
+    if std::env::var("NSL_ZERO_COUNTER").ok().as_deref() != Some("1") {
+        return;
+    }
     let line = format!(
         "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems} bucket_members={bucket_members} reduce_scatter={rs} all_gather={ag} repl_optim_elems={repl_optim_elems}\n"
     );
@@ -242,63 +273,108 @@ extern "C" fn nsl_weight_stream_count_atexit() {
     // h2d_bytes/d2h_bytes are APPENDED (Milestone B traffic counters, exact
     // bytes) — the zero-line lore above applies here too: existing gates
     // strip_prefix-then-parse leading fields, so new fields go at the END.
-    eprintln!(
-        "[weight-stream] uploads: {} evicts: {} writeback: {} registered: {} ptr_moves: {} \
-         pack_uploads: {} pack_evicts: {} prefetches: {} async_wb: {} h2d_bytes: {} d2h_bytes: {}",
-        crate::weight_stream::WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_EVICTS_WB.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_PTR_MOVES.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_PACK_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_PACK_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_PREFETCHES.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_ASYNC_WB.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_H2D_TRAFFIC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
-        crate::weight_stream::WS_D2H_TRAFFIC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+    //
+    // Item 17: ONE snapshot feeds both the stderr line and the structured
+    // event, so the two renderings cannot disagree about values. The stderr
+    // line stays gated by NSL_WS_COUNTER (this hook also registers under
+    // NSL_EVENTS alone). This event retires the most brittle consumer in the
+    // repo: a nine-capture-group python regex that pinned this line's every
+    // field, order, and colon punctuation.
+    let ld = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    let uploads = ld(&crate::weight_stream::WS_UPLOADS);
+    let evicts = ld(&crate::weight_stream::WS_EVICTS);
+    let writeback = ld(&crate::weight_stream::WS_EVICTS_WB);
+    let registered = ld(&crate::weight_stream::WS_REGISTERED);
+    let ptr_moves = ld(&crate::weight_stream::WS_PTR_MOVES);
+    let pack_uploads = ld(&crate::weight_stream::WS_PACK_UPLOADS);
+    let pack_evicts = ld(&crate::weight_stream::WS_PACK_EVICTS);
+    let prefetches = ld(&crate::weight_stream::WS_PREFETCHES);
+    let async_wb = ld(&crate::weight_stream::WS_ASYNC_WB);
+    let h2d_bytes = ld(&crate::weight_stream::WS_H2D_TRAFFIC_BYTES);
+    let d2h_bytes = ld(&crate::weight_stream::WS_D2H_TRAFFIC_BYTES);
+    crate::events::emit(
+        "weight_stream_counters",
+        None,
+        &[
+            ("uploads", crate::events::u(uploads)),
+            ("evicts", crate::events::u(evicts)),
+            ("writeback", crate::events::u(writeback)),
+            ("registered", crate::events::u(registered)),
+            ("ptr_moves", crate::events::u(ptr_moves)),
+            ("pack_uploads", crate::events::u(pack_uploads)),
+            ("pack_evicts", crate::events::u(pack_evicts)),
+            ("prefetches", crate::events::u(prefetches)),
+            ("async_wb", crate::events::u(async_wb)),
+            ("h2d_bytes", crate::events::u(h2d_bytes)),
+            ("d2h_bytes", crate::events::u(d2h_bytes)),
+        ],
     );
+    let stderr_on = std::env::var("NSL_WS_COUNTER").ok().as_deref() == Some("1");
+    if stderr_on {
+        eprintln!(
+            "[weight-stream] uploads: {uploads} evicts: {evicts} writeback: {writeback} \
+             registered: {registered} ptr_moves: {ptr_moves} pack_uploads: {pack_uploads} \
+             pack_evicts: {pack_evicts} prefetches: {prefetches} async_wb: {async_wb} \
+             h2d_bytes: {h2d_bytes} d2h_bytes: {d2h_bytes}"
+        );
+    }
     // Capacity-aware residency posture. Its OWN line, never appended fields:
     // the counters line above is consumed by strip_prefix-then-parse gates.
     // `pinned == registered` means no parameter bytes crossed PCIe at all.
     #[cfg(feature = "cuda")]
     {
-        let pinned = crate::weight_stream::WS_PINNED.load(std::sync::atomic::Ordering::Relaxed);
-        let registered =
-            crate::weight_stream::WS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed);
+        let pinned = ld(&crate::weight_stream::WS_PINNED);
         if registered > 0 {
             // EXACT bytes, not just MiB: a small model's whole parameter set
             // is a few hundred KiB, and `{:.0}` MiB rounds that to "0" — a
             // counter that reads zero on exactly the fixtures the gates use
             // is worse than no counter (caught by the residency gate).
             // MiB is kept alongside for humans reading a 1B run.
-            let pinned_b = crate::weight_stream::WS_PINNED_BYTES
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let streamed_b = crate::weight_stream::WS_STREAMED_BYTES
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let mib = |b: u64| b as f64 / 1048576.0;
-            let line = format!(
-                "[weight-stream] residency: pinned={} of {} param(s) \
-                 pinned_bytes={} streamed_bytes={} \
-                 pinned_mib={:.1} streamed_mib={:.1} {}\n",
-                pinned,
-                registered,
-                pinned_b,
-                streamed_b,
-                mib(pinned_b),
-                mib(streamed_b),
-                crate::weight_stream::residency_summary().unwrap_or_default(),
+            let pinned_b = ld(&crate::weight_stream::WS_PINNED_BYTES);
+            let streamed_b = ld(&crate::weight_stream::WS_STREAMED_BYTES);
+            let summary = crate::weight_stream::residency_summary().unwrap_or_default();
+            crate::events::emit(
+                "weight_stream_residency",
+                None,
+                &[
+                    ("pinned", crate::events::u(pinned)),
+                    ("registered", crate::events::u(registered)),
+                    ("pinned_bytes", crate::events::u(pinned_b)),
+                    ("streamed_bytes", crate::events::u(streamed_b)),
+                    ("summary", serde_json::Value::from(summary.clone())),
+                ],
             );
-            use std::io::Write;
-            let _ = std::io::stderr().lock().write_all(line.as_bytes());
+            if stderr_on {
+                let mib = |b: u64| b as f64 / 1048576.0;
+                let line = format!(
+                    "[weight-stream] residency: pinned={} of {} param(s) \
+                     pinned_bytes={} streamed_bytes={} \
+                     pinned_mib={:.1} streamed_mib={:.1} {}\n",
+                    pinned,
+                    registered,
+                    pinned_b,
+                    streamed_b,
+                    mib(pinned_b),
+                    mib(streamed_b),
+                    summary,
+                );
+                use std::io::Write;
+                let _ = std::io::stderr().lock().write_all(line.as_bytes());
+            }
         }
     }
 }
 
 extern "C" fn nsl_csla_window_count_atexit() {
-    eprintln!(
-        "[csla] window backward phases: {}",
-        crate::csla_stat::nsl_csla_window_count()
+    let phases = crate::csla_stat::nsl_csla_window_count();
+    crate::events::emit(
+        "csla_counters",
+        None,
+        &[("window_backward_phases", crate::events::i(phases as i64))],
     );
+    if std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
+        eprintln!("[csla] window backward phases: {phases}");
+    }
 }
 
 extern "C" fn nsl_fase_fused_step_count_atexit() {
@@ -318,25 +394,47 @@ extern "C" fn nsl_fase_fused_step_count_atexit() {
     // facts (which parameters that rank owns) would silently cross them
     // whenever the ranks happen to exit in the other order.
     let (rank, _ws, _ar, _bc, _oe, _bm, _repl) = crate::zero::zero_counter_snapshot();
+    let launches = crate::fase_step::nsl_fase_fused_step_count();
+    let table_builds = crate::fase_step::nsl_fase_blk_table_builds();
+    let batched = crate::fase_step::nsl_fase_multi_batched_params();
+    let fallback = crate::fase_step::nsl_fase_multi_fallback_params();
+    crate::events::emit(
+        "fase_fused_counters",
+        None,
+        &[
+            ("rank", crate::events::i(rank as i64)),
+            ("fused_step_launches", crate::events::i(launches as i64)),
+            ("block_table_builds", crate::events::i(table_builds as i64)),
+            ("multi_batched", crate::events::i(batched as i64)),
+            ("multi_fallback", crate::events::i(fallback as i64)),
+        ],
+    );
+    if std::env::var("NSL_FASE_FUSED_COUNTER").ok().as_deref() != Some("1") {
+        return;
+    }
     let report = format!(
-        "[fase-fused] optimizer fused-step launches: {}\n\
-         [fase-fused] block-table builds: {}\n\
-         [fase-fused] multi params: rank={rank} batched={} fallback={}\n",
-        crate::fase_step::nsl_fase_fused_step_count(),
-        crate::fase_step::nsl_fase_blk_table_builds(),
-        crate::fase_step::nsl_fase_multi_batched_params(),
-        crate::fase_step::nsl_fase_multi_fallback_params(),
+        "[fase-fused] optimizer fused-step launches: {launches}\n\
+         [fase-fused] block-table builds: {table_builds}\n\
+         [fase-fused] multi params: rank={rank} batched={batched} fallback={fallback}\n",
     );
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(report.as_bytes());
 }
 
 extern "C" fn nsl_wgrad_count_atexit() {
-    eprintln!(
-        "[wgrad-accum] fused GEMM: {}, decomposed fallback: {}",
-        crate::tensor::arithmetic::nsl_wgrad_fused_count(),
-        crate::tensor::arithmetic::nsl_wgrad_fallback_count()
+    let fused = crate::tensor::arithmetic::nsl_wgrad_fused_count();
+    let fallback = crate::tensor::arithmetic::nsl_wgrad_fallback_count();
+    crate::events::emit(
+        "wgrad_counters",
+        None,
+        &[
+            ("fused_gemm", crate::events::i(fused as i64)),
+            ("decomposed_fallback", crate::events::i(fallback as i64)),
+        ],
     );
+    if std::env::var("NSL_WGRAD_COUNTER").ok().as_deref() == Some("1") {
+        eprintln!("[wgrad-accum] fused GEMM: {fused}, decomposed fallback: {fallback}");
+    }
 }
 
 extern "C" fn nsl_gpu_mem_report_atexit() {

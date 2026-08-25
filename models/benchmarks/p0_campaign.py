@@ -144,7 +144,11 @@ class RunResult:
 
 LOSS_RE = re.compile(r"^-?\d+(\.\d+)?(e-?\d+)?$")
 PHASE_RE = re.compile(r"\[phase\] (?:fwd=(\S+) bwd=(\S+)|opt=(\S+))")
-WS_RE = re.compile(r"\[weight-stream\] uploads: (\d+) evicts: (\d+) writeback: (\d+) registered: (\d+) ptr_moves: (\d+) pack_uploads: (\d+) pack_evicts: (\d+) prefetches: (\d+) async_wb: (\d+)")
+# Weight-stream counters come from the structured event stream (NSL_EVENTS
+# JSONL) since item 17. The regex this replaces pinned NINE fields, their
+# order, and their punctuation of one stderr line — the most brittle marker
+# consumer in the repo, and the reason the emitter carried an "append-only,
+# new fields at the END" prose warning.
 # Every line of the [grad-integrity] atexit block is `key=value`. Matching the
 # SHAPE rather than counting lines is what keeps appended fields (the report
 # grew from 6 to 11 lines when the contribution counters landed) inside the
@@ -185,6 +189,11 @@ def run_arm(
     full_env = dict(os.environ)
     full_env.update(env)
     full_env["NSL_STDLIB_PATH"] = str(REPO / "stdlib")
+    # Structured event stream (item 17): counters are read from this JSONL
+    # by name instead of regexing stderr lines.
+    events_file = workdir / "events.jsonl"
+    events_file.unlink(missing_ok=True)
+    full_env["NSL_EVENTS"] = str(events_file)
 
     sampler = GpuSampler()
     sampler.start()
@@ -322,15 +331,19 @@ def run_arm(
                 res.peak_alloc_bytes = int(float(out_lines[i + 1][1].strip()))
             except ValueError:
                 pass
-    # Weight-stream counters (stderr atexit line).
-    for _, s in err_lines:
-        m = WS_RE.search(s)
-        if m:
-            keys = [
-                "uploads", "evicts", "writeback", "registered", "ptr_moves",
-                "pack_uploads", "pack_evicts", "prefetches", "async_wb",
-            ]
-            res.ws_counters = {k: int(v) for k, v in zip(keys, m.groups())}
+    # Weight-stream counters: read the structured event by NAME from the
+    # arm's events file (fields may grow; unknown keys are ignored by
+    # construction here, unlike the positional regex this replaced).
+    if events_file.exists():
+        for line in events_file.read_text().splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("kind") == "weight_stream_counters":
+                res.ws_counters = {
+                    k: int(v) for k, v in ev.get("fields", {}).items()
+                }
     # Health snapshots: polled from the per-flush overwritten file, plus a
     # final read after exit.
     if health_file.exists():
