@@ -134,8 +134,15 @@ fn tokbench_pretokenize_matches_the_crate_and_guards_the_u16_cast() {
     // Build the reference encoder from the tree. CARGO_TARGET_DIR is pinned
     // to tokbench's own default so the binary lands where the hfcorpus
     // pipeline expects it, regardless of ambient target-dir overrides.
+    // --locked: without it, a drift between tokbench's committed Cargo.lock
+    // and its path-dep on nsl-runtime would be silently REPAIRED here — the
+    // gate would rewrite the tracked lock mid-lane and test a dependency
+    // graph that is not the committed one, which is the exact
+    // "rebuildable from the tree" property this gate pins. That drift has
+    // already happened once (nsl-runtime gained rand_chacha; the lock
+    // lagged until 30df30fd). --locked makes it a loud red instead.
     let status = Command::new("cargo")
-        .args(["build", "--release", "--manifest-path"])
+        .args(["build", "--locked", "--release", "--manifest-path"])
         .arg(&manifest)
         .env("CARGO_TARGET_DIR", &target)
         .status()

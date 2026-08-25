@@ -54,7 +54,12 @@ what deliberately did not.
 - **`load_mmap(path, 2)`** still expands i32→f64 at load (4x). Sole user:
   coder-rl's `sft_labels.bin`. Accepting i32 sources natively means
   widening the DataLoader's accepted-dtype list; not worth the churn for a
-  small legacy path — noted here instead.
+  small legacy path — noted here instead. **Trap for whoever lands it**
+  (review finding, 2026-08-24): `identity_sig`'s `elem_size` closure
+  (dataloader.rs) defaults unknown dtypes to 8 bytes — a native i32 source
+  would make the fingerprint read `len*8` from a `len*4` buffer (OOB), and
+  both `read_flat_value` copies (dataloader.rs, packing.rs) lack an i32 arm
+  (loud panic today). All three need arms in the same change.
 - **muon f32 validation bins** (`muon_data.py` writes `<f` val slices).
   Legacy benchmark inputs, exact for ids < 2^24, loaded via
   `load_mmap(..,1)`. Regenerating them would invalidate banked results for
