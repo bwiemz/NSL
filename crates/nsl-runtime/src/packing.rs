@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use crate::cpu::{create_tensor_with_shape_rs_dtype};
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::{DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN, NslTensor};
+use crate::tensor::{DTYPE_I32, DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN, NslTensor};
 
 /// Maximum number of documents per packed batch.
 ///
@@ -295,20 +295,26 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     let b = batch.batch_size as i64;
     let s = batch.seq_len as i64;
 
-    // input_ids [B, S]
-    let ids_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
+    // input_ids [B, S] — DTYPE_I32, matching the non-packed
+    // `build_simple_batch`: token ids are integers, the cast to float is
+    // deferred to the embedding-lookup boundary (`read_index` has an i32
+    // arm), and the fused-CE label path converts i32 directly. The packed
+    // path shipped f32 ids until item 15 closed the last float token-ID
+    // surface in the training path (f32 was lossless — ids < 2^24 — but a
+    // float carrier for ids is exactly what that item retires).
+    let ids_ptr = create_tensor_with_shape_rs_dtype(&[b, s], DTYPE_I32);
     let ids_tensor = NslTensor::from_ptr(ids_ptr);
-    let ids_data = ids_tensor.data_f32();
+    let ids_data = ids_tensor.data as *mut i32;
     for (i, &v) in batch.input_ids.iter().enumerate() {
-        unsafe { *ids_data.add(i) = v as f32 };
+        unsafe { *ids_data.add(i) = v as i32 };
     }
 
-    // labels [B, S]
-    let lbl_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
+    // labels [B, S] — DTYPE_I32 like input_ids; -100 sentinels included.
+    let lbl_ptr = create_tensor_with_shape_rs_dtype(&[b, s], DTYPE_I32);
     let lbl_tensor = NslTensor::from_ptr(lbl_ptr);
-    let lbl_data = lbl_tensor.data_f32();
+    let lbl_data = lbl_tensor.data as *mut i32;
     for (i, &v) in batch.labels.iter().enumerate() {
-        unsafe { *lbl_data.add(i) = v as f32 };
+        unsafe { *lbl_data.add(i) = v as i32 };
     }
 
     // attention_mask [B, S, S] — opt-in (empty mask vec = not requested)
@@ -400,8 +406,9 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
 /// PCA Stage C: move packed-batch mask tensors to the training device.
 ///
 /// `dict_ptr` — the batch dict produced by `packed_batch_to_dict`
-/// (`input_ids` / `labels` / `attention_mask` / `segment_ids` /
-/// `doc_starts`, all host f32 at creation). `param_list_ptr` — the model
+/// (`input_ids` / `labels` host DTYPE_I32; `attention_mask` /
+/// `segment_ids` / `doc_starts` / `position_ids` host f32 at creation).
+/// `param_list_ptr` — the model
 /// parameter `NslList`; the FIRST parameter tensor's residency decides
 /// the training device.
 ///
@@ -1127,7 +1134,9 @@ mod tests {
         // (attention_mask is opt-in and OFF here)
         assert_eq!(nsl_dict_len(dict), 5);
 
-        // Verify input_ids tensor shape
+        // Verify input_ids tensor shape and dtype. DTYPE_I32 matches the
+        // non-packed `build_simple_batch` contract (item 15: token ids never
+        // ride a float carrier in the training path).
         let k = nsl_str_from_rust("input_ids");
         let tensor_ptr = crate::dict::nsl_dict_get_str(dict, k);
         let tensor = NslTensor::from_ptr(tensor_ptr);
@@ -1136,6 +1145,24 @@ mod tests {
             assert_eq!(*tensor.shape.add(0), 1); // batch_size
             assert_eq!(*tensor.shape.add(1), 4); // seq_len
         }
+        assert_eq!(tensor.dtype, DTYPE_I32, "packed input_ids must be i32");
+        let ids = tensor.data as *const i32;
+        unsafe {
+            assert_eq!(*ids.add(0), 1);
+            assert_eq!(*ids.add(3), 4);
+        }
+        crate::string::nsl_string_free(k);
+
+        let k_lbl = nsl_str_from_rust("labels");
+        let lbl_ptr = crate::dict::nsl_dict_get_str(dict, k_lbl);
+        let lbl = NslTensor::from_ptr(lbl_ptr);
+        assert_eq!(lbl.dtype, DTYPE_I32, "packed labels must be i32");
+        let lbl_data = lbl.data as *const i32;
+        unsafe {
+            assert_eq!(*lbl_data.add(0), 2, "labels are shifted ids");
+            assert_eq!(*lbl_data.add(3), -100, "the -100 sentinel survives i32");
+        }
+        crate::string::nsl_string_free(k_lbl);
     }
 
     #[test]
