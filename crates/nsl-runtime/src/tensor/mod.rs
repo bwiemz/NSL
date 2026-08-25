@@ -4166,6 +4166,44 @@ pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
     nsl_tensor_to_device(src_ptr, r.device as i64)
 }
 
+/// Refuse a host-resident dense-float step input on a GPU-parameter train.
+///
+/// Item 2 (2026-08-25). Binary ops reconcile devices by moving the RIGHT
+/// operand to the LEFT operand's device, so a host-resident `full(...)`
+/// input as the left operand of the first op DOWNLOADS every GPU weight
+/// (f32→f64 by ABI) on every op of every step and runs the whole graph
+/// single-threaded on the host — observed as `reduce_to_shape: migrating a
+/// host-resident gradient`, a silent ~1000x slowdown at wrong precision.
+/// A warning that does not gate is not a guard: refuse with the fix named.
+/// Scalars and int-typed index tensors (the batch-dict path hands the
+/// embedding host ids by design) are exempt; CPU-parameter models no-op.
+#[no_mangle]
+pub extern "C" fn nsl_train_input_device_guard(input_ptr: i64, param_list_ptr: i64) {
+    if input_ptr == 0 || param_list_ptr == 0 {
+        return;
+    }
+    let params = crate::list::NslList::from_ptr(param_list_ptr);
+    if params.len == 0 {
+        return;
+    }
+    let first_param = unsafe { *params.data.add(0) };
+    if first_param == 0 || NslTensor::from_ptr(first_param).device == 0 {
+        return;
+    }
+    let input = NslTensor::from_ptr(input_ptr);
+    let dense_float = matches!(input.dtype, 0 | 1) && input.len > 1;
+    if input.device == 0 && dense_float {
+        eprintln!(
+            "nsl: a train-step input tensor ({} elements, dtype {}) is \
+             host-resident while the model's parameters are on the GPU. \
+             Every op would silently reconcile the WEIGHTS down to the host \
+             (f64, single-threaded). Move the input first: `x.to(cuda)`.",
+            input.len, input.dtype
+        );
+        std::process::abort();
+    }
+}
+
 /// Prefetch a unified-memory tensor to a GPU device asynchronously.
 /// This starts the page migration before the GPU actually accesses the data,
 /// reducing first-access latency from page faults. No-op on CPU tensors.

@@ -75,7 +75,7 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
     let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let data: *mut c_void = if dtype == 1 {
+    let data: *mut c_void = if dtype == 1 && b.dtype == 1 {
         let buf = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
         for i in 0..len {
             let av = unsafe { *a.data_f32().add(i) };
@@ -84,7 +84,7 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
             unsafe { *buf.add(i) = if result { 1.0_f32 } else { 0.0_f32 } };
         }
         buf as *mut c_void
-    } else {
+    } else if dtype == 0 && b.dtype == 0 {
         let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
         for i in 0..len {
             let av = unsafe { *a.data_f64().add(i) };
@@ -93,6 +93,46 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
             unsafe { *buf.add(i) = if result { 1.0_f64 } else { 0.0_f64 } };
         }
         buf as *mut c_void
+    } else {
+        // Mixed-dtype arm (item 2, 2026-08-25). The old code branched on
+        // `a.dtype` ALONE and read `b` with `a`'s accessor, so a GPU
+        // source-AD run whose relu-backward Condition compares the
+        // f64-upcast download of a GPU f32 tensor against the f32 constant
+        // scalar ABORTED in data_f64() — the defect that blocked PR #524's
+        // memory-gate fixture (misattributed to mse targets and 2D-logits
+        // cross_entropy; both were this). Each side reads via ITS OWN
+        // dtype; the comparison runs in f64 with the F32 epsilon, because
+        // tolerance below the lower-precision operand's resolution is an
+        // exact-match test wearing a tolerance's name. Output dtype stays
+        // `a.dtype` (the existing contract). The homogeneous arms above
+        // are byte-identical to the old code — their differing epsilons
+        // are pinned by parity gates.
+        let read = |t: &NslTensor, i: usize| -> f64 {
+            match t.dtype {
+                1 => unsafe { *t.data_f32().add(i) as f64 },
+                0 => unsafe { *t.data_f64().add(i) },
+                other => panic!("nsl_tensor_compare: unsupported dtype {other}"),
+            }
+        };
+        if dtype == 1 {
+            let buf = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+            for i in 0..len {
+                let av = read(a, i);
+                let bv = read(b, if b_is_scalar { 0 } else { i });
+                let result = compare_mixed(av, bv, cmp_kind);
+                unsafe { *buf.add(i) = if result { 1.0_f32 } else { 0.0_f32 } };
+            }
+            buf as *mut c_void
+        } else {
+            let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+            for i in 0..len {
+                let av = read(a, i);
+                let bv = read(b, if b_is_scalar { 0 } else { i });
+                let result = compare_mixed(av, bv, cmp_kind);
+                unsafe { *buf.add(i) = if result { 1.0_f64 } else { 0.0_f64 } };
+            }
+            buf as *mut c_void
+        }
     };
 
     let result = Box::new(NslTensor::new(data, shape, strides, ndim, a.len, 0, dtype, 1, 0));
@@ -127,6 +167,21 @@ fn compare_f64(av: f64, bv: f64, cmp_kind: i64) -> bool {
     }
 }
 
+/// Mixed f32/f64 comparison: f64 arithmetic, F32 epsilon — one operand only
+/// carries f32 precision, so a 1e-12 tolerance would be exact-match.
+#[inline(always)]
+fn compare_mixed(av: f64, bv: f64, cmp_kind: i64) -> bool {
+    match cmp_kind {
+        0 => av > bv,
+        1 => av >= bv,
+        2 => av < bv,
+        3 => av <= bv,
+        4 => (av - bv).abs() < 1e-7_f64,
+        5 => (av - bv).abs() >= 1e-7_f64,
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. nsl_tensor_where — ternary elementwise select
 // ---------------------------------------------------------------------------
@@ -157,36 +212,40 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
     let shape = NslTensor::copy_shape(tv.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
+    // Value reads dispatch on EACH tensor's own dtype (item 2, 2026-08-25).
+    // The old code read `tv`/`fv` with the OUTPUT dtype's accessor, so a
+    // mixed Select — e.g. `Select(cond_f32, y_bar_f64, zero_f32)`, the very
+    // next abort after nsl_tensor_compare's once that was fixed — died in
+    // data_f64()/data_f32(). The condition read was already dispatching.
+    let read = |t: &NslTensor, i: usize| -> f64 {
+        match t.dtype {
+            1 => unsafe { *t.data_f32().add(i) as f64 },
+            0 => unsafe { *t.data_f64().add(i) },
+            other => panic!("nsl_tensor_where: unsupported dtype {other}"),
+        }
+    };
     let data: *mut c_void = if dtype == 1 {
         let buf = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
         for i in 0..len {
             let ci = if cond_scalar { 0 } else { i };
-            let c_val = if cond.dtype == 1 {
-                unsafe { *cond.data_f32().add(ci) != 0.0_f32 }
-            } else {
-                unsafe { *cond.data_f64().add(ci) != 0.0_f64 }
-            };
+            let c_val = read(cond, ci) != 0.0_f64;
             let val = if c_val {
-                unsafe { *tv.data_f32().add(if tv_scalar { 0 } else { i }) }
+                read(tv, if tv_scalar { 0 } else { i })
             } else {
-                unsafe { *fv.data_f32().add(if fv_scalar { 0 } else { i }) }
+                read(fv, if fv_scalar { 0 } else { i })
             };
-            unsafe { *buf.add(i) = val };
+            unsafe { *buf.add(i) = val as f32 };
         }
         buf as *mut c_void
     } else {
         let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
         for i in 0..len {
             let ci = if cond_scalar { 0 } else { i };
-            let c_val = if cond.dtype == 1 {
-                unsafe { *cond.data_f32().add(ci) != 0.0_f32 }
-            } else {
-                unsafe { *cond.data_f64().add(ci) != 0.0_f64 }
-            };
+            let c_val = read(cond, ci) != 0.0_f64;
             let val = if c_val {
-                unsafe { *tv.data_f64().add(if tv_scalar { 0 } else { i }) }
+                read(tv, if tv_scalar { 0 } else { i })
             } else {
-                unsafe { *fv.data_f64().add(if fv_scalar { 0 } else { i }) }
+                read(fv, if fv_scalar { 0 } else { i })
             };
             unsafe { *buf.add(i) = val };
         }
@@ -2109,6 +2168,90 @@ mod tests {
         nsl_tensor_free(target);
         nsl_tensor_free(grad_out);
         nsl_tensor_free(grad);
+    }
+
+    // Helper: 1D f64 tensor (dtype 0) from values.
+    fn make_1d_f64(vals: &[f64]) -> i64 {
+        let ptr = create_tensor_with_shape_rs_dtype(&[vals.len() as i64], 0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, &v) in vals.iter().enumerate() {
+            unsafe { *t.data_f64().add(i) = v };
+        }
+        ptr
+    }
+
+    /// Item 2 (2026-08-25): mixed f64/f32 comparison must dispatch each
+    /// operand on ITS OWN dtype. The old code read `b` with `a`'s accessor
+    /// and ABORTED (`data_f64() called on non-f64 tensor`) — the defect
+    /// that killed every GPU relu-backward whose Condition compared the
+    /// f64-upcast download of a GPU f32 tensor against the f32 constant
+    /// scalar, and blocked PR #524's memory-gate fixture (misattributed
+    /// to mse targets and 2D-logits cross_entropy at the time).
+    #[test]
+    fn compare_mixed_dtypes_dispatches_per_operand() {
+        // a: f64 (as produced by a GPU->CPU download), b: f32 scalar 0.0
+        // (as produced by the relu-backward Condition constant).
+        let a = make_1d_f64(&[-1.0, 0.0, 2.5]);
+        let b = make_1d_f32(&[0.0]);
+        let gt = nsl_tensor_compare(a, b, 0); // Gt — the relu-backward kind
+        let t = NslTensor::from_ptr(gt);
+        assert_eq!(t.dtype, 0, "output keeps a's dtype (existing contract)");
+        let vals: Vec<f64> =
+            (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![0.0, 0.0, 1.0]);
+
+        // The mirrored orientation (a f32, b f64) must also survive.
+        let a32 = make_1d_f32(&[3.0, -0.5]);
+        let b64 = make_1d_f64(&[0.0]);
+        let ge = nsl_tensor_compare(a32, b64, 1);
+        let t2 = NslTensor::from_ptr(ge);
+        assert_eq!(t2.dtype, 1);
+        assert_eq!(read_1d_f32(ge), vec![1.0, 0.0]);
+
+        for p in [a, b, gt, a32, b64, ge] {
+            nsl_tensor_free(p);
+        }
+    }
+
+    /// Homogeneous compare arms must be untouched by the mixed-arm fix:
+    /// the f32 and f64 Eq epsilons DIFFER (1e-7 vs 1e-12) and parity gates
+    /// pin the old behavior.
+    #[test]
+    fn compare_homogeneous_epsilons_are_preserved() {
+        let a32 = make_1d_f32(&[1.0]);
+        let b32 = make_1d_f32(&[1.0 + 5e-8]);
+        let eq32 = nsl_tensor_compare(a32, b32, 4);
+        assert_eq!(read_1d_f32(eq32), vec![1.0], "5e-8 < f32 eps 1e-7");
+
+        let a64 = make_1d_f64(&[1.0]);
+        let b64 = make_1d_f64(&[1.0 + 5e-8]);
+        let eq64 = nsl_tensor_compare(a64, b64, 4);
+        let t = NslTensor::from_ptr(eq64);
+        let v = unsafe { *t.data_f64() };
+        assert_eq!(v, 0.0, "5e-8 >= f64 eps 1e-12");
+
+        for p in [a32, b32, eq32, a64, b64, eq64] {
+            nsl_tensor_free(p);
+        }
+    }
+
+    /// Item 2 (2026-08-25): `nsl_tensor_where` with mixed-dtype value
+    /// tensors — `Select(cond_f32, y_bar_f64, zero_f32)` is the exact shape
+    /// the relu backward produces once compare no longer aborts.
+    #[test]
+    fn where_mixed_dtypes_dispatches_per_operand() {
+        let cond = make_1d_f32(&[1.0, 0.0, 1.0]);
+        let tval = make_1d_f64(&[10.0, 20.0, 30.0]);
+        let fval = make_1d_f32(&[0.0]);
+        let out = nsl_tensor_where(cond, tval, fval);
+        let t = NslTensor::from_ptr(out);
+        assert_eq!(t.dtype, 0, "output keeps the true-branch dtype");
+        let vals: Vec<f64> =
+            (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![10.0, 0.0, 30.0]);
+        for p in [cond, tval, fval, out] {
+            nsl_tensor_free(p);
+        }
     }
 }
 

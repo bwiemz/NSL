@@ -8771,6 +8771,73 @@ impl Compiler<'_> {
                     }
                 }
 
+                // Item 2 (2026-08-25): every SEMANTICALLY-TENSOR Input leaf
+                // gets a device guard call — a host-resident dense-float
+                // input on a GPU-parameter model REFUSES at runtime instead
+                // of silently reconciling every weight down to the host
+                // (f64, single-threaded; the defect that made #524's first
+                // gate fixture look like a hang). The type filter is
+                // load-bearing: EVERY outer variable registers as an Input
+                // leaf (DataLoader handles, strings, ints included), and
+                // handing a non-tensor i64 to the runtime guard is a wild
+                // pointer read — `NslTensor::from_ptr` checks its magic
+                // only under debug_assert. A variable whose semantic type
+                // is unknown is skipped (best-effort guard; unsound
+                // guarding is worse than a miss). The runtime additionally
+                // no-ops for CPU models, scalars, and index-dtype tensors.
+                let tensor_input_names: std::collections::HashSet<String> = state
+                    .variables
+                    .keys()
+                    .filter(|sym| {
+                        state.variable_types.get(sym).is_some_and(|ty| {
+                            let inner = match ty {
+                                Type::Borrow(inner) => inner.as_ref(),
+                                other => other,
+                            };
+                            // NOT Sparse: NslSparseTensor is a different
+                            // repr(C) with no magic field — handing it to
+                            // the guard is the wild-read class this filter
+                            // exists to kill (review S1). Unreachable today
+                            // (source AD has no sparse handlers); a skip is
+                            // the safe direction if that changes.
+                            matches!(
+                                inner,
+                                Type::Tensor { .. }
+                                    | Type::Param { .. }
+                                    | Type::Buffer { .. }
+                            )
+                        })
+                    })
+                    .map(|sym| self.resolve_sym(*sym).to_string())
+                    .collect();
+                // Only CONSUMED inputs: registration is eager over every
+                // outer variable, so a tensor the step body never reads
+                // (e.g. one used only to build the token stream before the
+                // train block) still carries an Input leaf — guarding it
+                // would refuse programs the defect cannot touch.
+                let consumed_vars: std::collections::HashSet<crate::wengert::VarId> = extractor
+                    .wengert_list()
+                    .ops
+                    .iter()
+                    .flat_map(|op| op.inputs.iter().copied())
+                    .collect();
+                for op in &extractor.wengert_list().ops {
+                    if let crate::wengert::PrimalOp::Input(name) = &op.op {
+                        if !tensor_input_names.contains(name)
+                            || !consumed_vars.contains(&op.result)
+                        {
+                            continue;
+                        }
+                        if let Some(&val) = primal_vars.get(&op.result) {
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_train_input_device_guard",
+                                &[val, param_list],
+                            )?;
+                        }
+                    }
+                }
+
                 // Also populate model parameter VarIds from param_list.
                 // MemberAccess expressions (e.g., m.w) are registered in the extractor
                 // under the member symbol, but those aren't in state.variables — they're
