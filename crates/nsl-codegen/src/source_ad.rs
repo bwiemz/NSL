@@ -1485,14 +1485,23 @@ impl AdjointGenerator {
             // --- rotate_half backward: -rotate_half(grad) ---
             // forward: y[..h] = -x[h..], y[h..] = x[..h]
             // backward: dx[..h] = dy[h..], dx[h..] = -dy[..h]
-            // which equals -rotate_half(dy). Lower as a Passthrough rotate_half
-            // followed by Neg.
+            // which equals -rotate_half(dy). Fused as one rotate_half_neg op
+            // (a permutation with a sign flip — rounding-free, so bit-exact
+            // against the decomposed pair). NSL_FUSE_ROPE_NEG=0 (compile-time
+            // env) restores the rotate_half + Neg pair for differential gating.
             AdjointExpr::RotateHalfBackward(y_bar) => {
-                let rotated = self.emit_op(
-                    PrimalOp::Passthrough("rotate_half".into()),
-                    vec![y_bar],
-                );
-                self.emit_op(PrimalOp::Neg, vec![rotated])
+                if std::env::var("NSL_FUSE_ROPE_NEG").ok().as_deref() == Some("0") {
+                    let rotated = self.emit_op(
+                        PrimalOp::Passthrough("rotate_half".into()),
+                        vec![y_bar],
+                    );
+                    self.emit_op(PrimalOp::Neg, vec![rotated])
+                } else {
+                    self.emit_op(
+                        PrimalOp::Passthrough("rotate_half_neg".into()),
+                        vec![y_bar],
+                    )
+                }
             }
         }
     }

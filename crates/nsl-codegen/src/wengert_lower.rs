@@ -3544,6 +3544,11 @@ fn lower_single_op(
                 "cos" => call(compiler, builder, "nsl_tensor_cos", &[inputs[0]]),
                 "sin" => call(compiler, builder, "nsl_tensor_sin", &[inputs[0]]),
                 "rotate_half" => call(compiler, builder, "nsl_tensor_rotate_half", &[inputs[0]]),
+                // Fused RoPE backward: -rotate_half(dy) as one kernel (bit-exact —
+                // a permutation with a sign flip has no rounding).
+                "rotate_half_neg" => {
+                    call(compiler, builder, "nsl_tensor_rotate_half_neg", &[inputs[0]])
+                }
                 // Tensor construction (non-differentiable, used for shape/position computation)
                 "arange" => {
                     // arange(start, stop) or arange(stop) — extract f64 from inputs
@@ -3637,6 +3642,39 @@ fn lower_single_op(
                     let field = &name["dict_get:".len()..];
                     let key = compiler.compile_string_literal(builder, field)?;
                     call(compiler, builder, "nsl_dict_get_str", &[inputs[0], key])
+                }
+                _ if name.starts_with(crate::ew_chain_fusion::FUSED_EW_PREFIX) => {
+                    // MFU campaign C3: one fused kernel replacing a
+                    // single-reader elementwise run. The FFI owns the
+                    // uniformity gate + bit-exact decomposed replay.
+                    lower_fused_ew_chain(compiler, builder, name, &inputs)
+                }
+                _ if name.starts_with("mul_scalar_rhs:")
+                    || name.starts_with("add_scalar_rhs:")
+                    || name.starts_with("div_scalar_rhs:")
+                    || name.starts_with("sub_scalar_rhs:") =>
+                {
+                    // Scalar-immediate rewrite (bit-exact const-RIGHT fold):
+                    // the original f64 bits ride in the name; the FFI performs
+                    // the same f64->f32 narrowing the baseline's
+                    // nsl_tensor_scalar(v, 1) did. flags = 0 (no relinquish).
+                    let (fn_name, prefix) = if name.starts_with("mul_scalar_rhs:") {
+                        ("nsl_tensor_mul_scalar", "mul_scalar_rhs:")
+                    } else if name.starts_with("add_scalar_rhs:") {
+                        ("nsl_tensor_add_scalar", "add_scalar_rhs:")
+                    } else if name.starts_with("div_scalar_rhs:") {
+                        ("nsl_tensor_div_scalar", "div_scalar_rhs:")
+                    } else {
+                        ("nsl_tensor_sub_scalar", "sub_scalar_rhs:")
+                    };
+                    let bits: u64 = name[prefix.len()..].parse().map_err(|_| {
+                        CodegenError::new(format!(
+                            "malformed scalar-immediate bits in tape op name: {name}"
+                        ))
+                    })?;
+                    let s = builder.ins().f64const(f64::from_bits(bits));
+                    let flags = builder.ins().iconst(cl_types::I8, 0);
+                    call(compiler, builder, fn_name, &[inputs[0], s, flags])
                 }
                 _ if name.starts_with("rmsnorm_dgamma_backward:") => {
                     // P5 item 20 slice A: fused RMSNorm gamma gradient.
@@ -4131,6 +4169,110 @@ fn embed_fused_ce_data(
     let ptx_val = builder.ins().symbol_value(cl_types::I64, ptx_gv);
     let name_val = builder.ins().symbol_value(cl_types::I64, name_gv);
     Ok((ptx_val, name_val))
+}
+
+/// Embed one fused elementwise chain's {PTX, kernel name, descriptor} into
+/// `.rodata`, memoized per unique signature in `compiler.kernels.fused_ew_data`
+/// (a 24-block model's identical per-layer chains share one blob). Returns
+/// the three pointer Values plus the descriptor length.
+///
+/// Declaration is per-module (memoized); `declare_data_in_func` +
+/// `symbol_value` are per-function and run on every call.
+fn embed_fused_ew_data(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    sig: &crate::ew_chain_fusion::ChainSig,
+) -> Result<(Value, Value, Value, usize), CodegenError> {
+    use cranelift_module::DataDescription;
+    use cranelift_module::Linkage;
+
+    let sig_name = sig.encode_name();
+    let desc_bytes = sig.descriptor_bytes();
+    let desc_len = desc_bytes.len();
+
+    let ids = match compiler.kernels.fused_ew_data.get(&sig_name) {
+        Some(&ids) => ids,
+        None => {
+            let kname = sig.kernel_name();
+            // Tag symbols by the kernel-name hash: unique per signature,
+            // stable across functions, and short.
+            let tag = &kname["nsl_fused_ew_".len()..];
+            let mut define = |suffix: &str, bytes: Vec<u8>| -> Result<_, CodegenError> {
+                let sym = format!("__nsl_fused_ew_{suffix}_{tag}");
+                let id = compiler
+                    .module
+                    .declare_data(&sym, Linkage::Local, false, false)
+                    .map_err(|e| {
+                        CodegenError::new(format!("declare fused-ew data '{sym}': {e}"))
+                    })?;
+                let mut desc = DataDescription::new();
+                desc.define(bytes.into_boxed_slice());
+                compiler.module.define_data(id, &desc).map_err(|e| {
+                    CodegenError::new(format!("define fused-ew data '{sym}': {e}"))
+                })?;
+                Ok(id)
+            };
+            // The emitter already NUL-terminates the PTX. gpu_sm = 80
+            // follows the fused-CE precedent (the emitter clamps to the
+            // sm_80 floor regardless; the driver JIT forward-compiles).
+            let ptx_bytes = crate::fusion::synthesize_fused_chain_ptx(sig, &kname, 80);
+            let ptx_id = define("ptx", ptx_bytes)?;
+            let mut kname_nul = kname.clone().into_bytes();
+            kname_nul.push(0);
+            let name_id = define("name", kname_nul)?;
+            let desc_id = define("desc", desc_bytes.clone())?;
+            compiler
+                .kernels
+                .fused_ew_data
+                .insert(sig_name.clone(), (ptx_id, name_id, desc_id));
+            (ptx_id, name_id, desc_id)
+        }
+    };
+
+    let ptx_gv = compiler.module.declare_data_in_func(ids.0, builder.func);
+    let name_gv = compiler.module.declare_data_in_func(ids.1, builder.func);
+    let desc_gv = compiler.module.declare_data_in_func(ids.2, builder.func);
+    Ok((
+        builder.ins().symbol_value(cl_types::I64, ptx_gv),
+        builder.ins().symbol_value(cl_types::I64, name_gv),
+        builder.ins().symbol_value(cl_types::I64, desc_gv),
+        desc_len,
+    ))
+}
+
+/// Lower one `fused_ew:v1:...` Passthrough to its runtime FFI call.
+///
+/// The FFI (`nsl_fused_ew_chain`) owns the fast-path uniformity gate and the
+/// bit-exact decomposed replay; lowering only marshals pointers: fixed-arity
+/// six i64 handle slots, zero-padded, plus the input count. The result enters
+/// `owned_values` through the ordinary `should_cleanup_result` path.
+fn lower_fused_ew_chain(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    name: &str,
+    inputs: &[Value],
+) -> Result<Value, CodegenError> {
+    let sig = crate::ew_chain_fusion::ChainSig::parse(name).ok_or_else(|| {
+        CodegenError::new(format!("malformed fused_ew signature in tape op: {name}"))
+    })?;
+    if inputs.len() != sig.n_inputs as usize {
+        return Err(CodegenError::new(format!(
+            "fused_ew arity mismatch: signature wants {} inputs, tape op has {}",
+            sig.n_inputs,
+            inputs.len()
+        )));
+    }
+    let (ptx_val, name_val, desc_val, desc_len) =
+        embed_fused_ew_data(compiler, builder, &sig)?;
+    let desc_len_val = builder.ins().iconst(cl_types::I64, desc_len as i64);
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    let mut args = vec![ptx_val, name_val, desc_val, desc_len_val];
+    for i in 0..crate::ew_chain_fusion::MAX_INPUTS {
+        args.push(inputs.get(i).copied().unwrap_or(zero));
+    }
+    let n_inputs_val = builder.ins().iconst(cl_types::I64, sig.n_inputs as i64);
+    args.push(n_inputs_val);
+    call(compiler, builder, "nsl_fused_ew_chain", &args)
 }
 
 /// Allocate a zeroed f32 NslTensor of `shape` directly on device=1 (CUDA).

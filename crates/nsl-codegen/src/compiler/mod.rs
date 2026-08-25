@@ -371,6 +371,11 @@ impl MemoryPlanState {
 /// Sub-struct grouping GPU kernel compilation state out of the `Compiler` god-object.
 pub struct GpuKernelState {
     pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
+    /// Fused elementwise-chain blobs (MFU campaign C3), keyed by the encoded
+    /// `fused_ew:v1:...` signature: (PTX, kernel-name, descriptor) .rodata
+    /// ids. Memoized so the 24 per-layer copies of one chain structure share
+    /// one embedded blob.
+    pub fused_ew_data: HashMap<String, (DataId, DataId, DataId)>,
     pub flash_attention_context: Option<FlashAttentionCompileContext>,
     /// Decorator-free SDPA backward variant table, keyed by the op's static
     /// `(causal, segment_masked)` pair. Populated lazily by
@@ -430,6 +435,7 @@ impl GpuKernelState {
     fn new() -> Self {
         Self {
             kernel_ptx_data: HashMap::new(),
+            fused_ew_data: HashMap::new(),
             flash_attention_context: None,
             sdpa_bwd_variants: HashMap::new(),
             sdpa_fwd_variants: HashMap::new(),

@@ -1139,9 +1139,11 @@ impl<'a> SizeProp<'a> {
 
             PrimalOp::Passthrough(name) => match name.as_str() {
                 // Shape-preserving passthroughs.
-                "contiguous" | "cos" | "sin" | "rotate_half" | "zeros_like"
-                | "ones_like" | "silu_backward" | "gelu_backward" | "sigmoid_backward"
-                | "tanh_backward" | "swiglu_gate_backward" => self.input_info(op, 0),
+                "contiguous" | "cos" | "sin" | "rotate_half" | "rotate_half_neg"
+                | "zeros_like" | "ones_like" | "silu_backward" | "gelu_backward"
+                | "sigmoid_backward" | "tanh_backward" | "swiglu_gate_backward" => {
+                    self.input_info(op, 0)
+                }
                 n if n.starts_with("ccr_cast_") => self.input_info(op, 0),
                 // Backward FFIs whose result is a NON-FIRST input's shape.
                 n if n.starts_with("rmsnorm_dx_backward") => self.input_info(op, 1),
@@ -1212,6 +1214,20 @@ impl<'a> SizeProp<'a> {
                     let dims = self.static_list_dims(*op.inputs.first()?)?;
                     Some(Shape(dims))
                 }
+                // Scalar-immediate rewrites preserve their tensor operand's
+                // shape (MFU campaign C3).
+                n if n.starts_with("mul_scalar_rhs:")
+                    || n.starts_with("add_scalar_rhs:")
+                    || n.starts_with("div_scalar_rhs:")
+                    || n.starts_with("sub_scalar_rhs:") =>
+                {
+                    self.input_info(op, 0)
+                }
+                // Fused elementwise chains are DELIBERATELY unsized: a
+                // replay-fallback result may not match input 0's shape (a
+                // genuinely-reducing rts tail), and an unsized transient is
+                // refused arena admission (loud-benign) — never mis-placed.
+                n if n.starts_with("fused_ew:") => None,
                 // dict_get is seeded from DataLoader facts by the caller,
                 // never derived; everything else ("arange", "list",
                 // "shape", ...) has a data-dependent or non-tensor result.

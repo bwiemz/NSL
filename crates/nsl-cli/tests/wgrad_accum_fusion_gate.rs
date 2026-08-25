@@ -1239,3 +1239,59 @@ fn gpu_fused_wgrad_matches_the_unfused_chain_within_f32_tolerance() {
         }
     }
 }
+
+/// MFU campaign C3 belt: the elementwise chain fuser is DELETION-ONLY and
+/// rewrites in place at the chain tail, so it can never break the wgrad
+/// triple's Transpose -> Matmul -> reduce_to_shape adjacency (an rts joins a
+/// chain only by consuming a fusable member's result, and Matmul is not a
+/// member). Pin that: the wgrad chain count with the fuser ON (its default)
+/// equals the count with it forced OFF, and both are non-vacuous.
+#[test]
+fn elementwise_fusion_does_not_break_wgrad_adjacency() {
+    fn run_env(fixture: &Path, extra: &[&str], ew_off: bool) -> Run {
+        let root = repo_root();
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.args(["run", "-q", "-p", "nsl-cli", "--manifest-path"])
+            .arg(root.join("Cargo.toml"))
+            .args(["--", "run", "--source-ad"])
+            .args(extra)
+            .arg(fixture)
+            .current_dir(&root)
+            .env("NSL_STDLIB_PATH", root.join("stdlib"));
+        if ew_off {
+            cmd.env("NSL_FUSE_ELEMENTWISE_BWD", "0")
+                .env("NSL_FUSE_SCALAR_IMM", "0");
+        }
+        let out = cmd.output().expect("spawn nsl run");
+        Run {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            ok: out.status.success(),
+        }
+    }
+
+    let p = std::env::temp_dir().join("nsl_wgrad_ewfuse_belt.nsl");
+    std::fs::write(&p, ccr_fixture_src()).expect("write fixture");
+    let flags = &["--fuse-wgrad-accum", "--checkpoint-blocks"][..];
+
+    let ew_on = run_env(&p, flags, false);
+    assert!(ew_on.ok, "fuser-on run failed:\n{}", ew_on.stderr);
+    let ew_off = run_env(&p, flags, true);
+    assert!(ew_off.ok, "fuser-off run failed:\n{}", ew_off.stderr);
+
+    let on_count = fused_chains(&ew_on.stderr).unwrap_or(0);
+    let off_count = fused_chains(&ew_off.stderr).unwrap_or(0);
+    assert!(
+        off_count >= 3,
+        "baseline wgrad count vacuous (got {off_count}) — fixture or plan \
+         changed:\n{}",
+        ew_off.stderr
+    );
+    assert!(
+        on_count >= off_count,
+        "elementwise fusion REDUCED the wgrad chain count ({off_count} -> \
+         {on_count}) — the deletion-only adjacency claim is broken.\n\
+         on stderr:\n{}",
+        ew_on.stderr
+    );
+}
