@@ -511,6 +511,29 @@ pub extern "C" fn nsl_grad_integrity_arm() {
 extern "C" fn grad_integrity_atexit() {
     let (checks, expected, gradient, finite, nonzero, missing) = grad_integrity_snapshot();
     let notes = grad_integrity_notes_snapshot();
+    // Item 17: structured twin, from the SAME snapshot as the stderr block.
+    // The block's append-only-by-position constraint (documented below) is a
+    // stderr-format hazard only — event consumers address fields by name.
+    crate::events::emit(
+        "grad_integrity",
+        None,
+        &[
+            ("checks", crate::events::u(checks)),
+            ("expected_params", crate::events::u(expected as u64)),
+            ("gradient_params", crate::events::u(gradient as u64)),
+            ("finite", crate::events::u(finite as u64)),
+            ("nonzero", crate::events::u(nonzero as u64)),
+            ("missing", crate::events::ulist(&missing)),
+            // Deliberately a STRING, matching the stderr rendering ("N" or
+            // "lo..hi") — the struct keeps one definition of that spelling.
+            ("notes_expected", serde_json::Value::from(notes.expected.clone())),
+            ("notes_observed_min", crate::events::u(notes.min as u64)),
+            ("notes_observed_max", crate::events::u(notes.max as u64)),
+            ("under_noted", crate::events::ulist(&notes.under)),
+            ("over_noted", crate::events::ulist(&notes.over)),
+            ("unjudged_checks", crate::events::u(notes.unjudged)),
+        ],
+    );
     let list = |v: &[usize]| {
         v.iter()
             .map(|i| i.to_string())

@@ -100,19 +100,35 @@ pub(crate) fn record_fused_gpu_launch() {
     FUSED_ADAPTER_GPU_LAUNCH_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Atexit hook: print `[nsl-kernel-count] <N>` to stderr.  Registered
-/// from `args.rs::nsl_args_init` only when `NSL_KERNEL_LAUNCH_COUNTER=1`.
+/// Atexit hook: print `[nsl-kernel-count] <N>` to stderr.  Registered from
+/// `args.rs::nsl_args_init` when `NSL_KERNEL_LAUNCH_COUNTER=1` (stderr) or
+/// `NSL_EVENTS` is set (structured twin only).
 pub extern "C" fn nsl_fused_adapter_launch_count_atexit() {
     let n = FUSED_ADAPTER_LAUNCH_COUNT.load(Ordering::Relaxed);
-    eprintln!("[nsl-kernel-count] {n}");
+    crate::events::emit(
+        "kernel_launch_count",
+        None,
+        &[("count", crate::events::u(n))],
+    );
+    if std::env::var("NSL_KERNEL_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
+        eprintln!("[nsl-kernel-count] {n}");
+    }
 }
 
 /// Atexit hook: print `[nsl-gpu-launch-count] <N>` to stderr.  Registered
-/// from `args.rs::nsl_args_init` only when `NSL_WRGA_GPU_LAUNCH_COUNTER=1`.
+/// from `args.rs::nsl_args_init` when `NSL_WRGA_GPU_LAUNCH_COUNTER=1`
+/// (stderr) or `NSL_EVENTS` is set (structured twin only).
 /// Zero means all fused calls fell back to CPU math.
 pub extern "C" fn nsl_fused_adapter_gpu_launch_count_atexit() {
     let n = FUSED_ADAPTER_GPU_LAUNCH_COUNT.load(Ordering::Relaxed);
-    eprintln!("[nsl-gpu-launch-count] {n}");
+    crate::events::emit(
+        "gpu_launch_count",
+        None,
+        &[("count", crate::events::u(n))],
+    );
+    if std::env::var("NSL_WRGA_GPU_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
+        eprintln!("[nsl-gpu-launch-count] {n}");
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────

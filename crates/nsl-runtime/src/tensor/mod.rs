@@ -6248,10 +6248,30 @@ pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
 }
 
 /// Debug: print GPU memory usage + caching allocator stats.
+///
+/// Item 17: when `NSL_EVENTS` is set, every call also appends a
+/// `gpu_mem_step` event — for EVERY step, not just the stderr-throttled
+/// first five — with EXACT bytes (the stderr line rounds to MB, which is
+/// useless for byte-level regression pins). Both renderings come from one
+/// snapshot taken under one allocator-lock window, so they cannot disagree.
+/// The generated step code calls this twice per step (start of step, after
+/// cleanup); the event stream's `seq` field keeps the two ordered.
 #[no_mangle]
 pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
     let all = std::env::var("NSL_DEBUG_MEM_ALL").ok().as_deref() == Some("1");
-    if !all && step > 5 { return; }
+    let stderr_on = all || step <= 5;
+    let events_on = crate::events::enabled();
+    // The events-ONLY path (step > 5, no NSL_DEBUG_MEM_ALL) is new code and
+    // must not force-initialize CUDA: `state()`'s lazy init asserts on cuInit
+    // failure, which would abort a pure-CPU run of a cuda-featured binary on
+    // a GPU-less machine from inside an instrumentation path (the exact
+    // hazard `context_initialized`'s doc comment names). The stderr path
+    // keeps its historical behaviour untouched.
+    #[cfg(feature = "cuda")]
+    let events_only_ok = crate::cuda::inner::context_initialized();
+    #[cfg(not(feature = "cuda"))]
+    let events_only_ok = false;
+    if !(stderr_on || (events_on && events_only_ok)) { return; }
     #[cfg(feature = "cuda")]
     {
         unsafe {
@@ -6260,8 +6280,60 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             let mut total: usize = 0;
             cudarc::driver::sys::cuMemGetInfo_v2(&mut free, &mut total);
             let used_mb = (total - free) / (1024 * 1024);
+            // ONE snapshot window: everything both renderings need is copied
+            // out under a single lock hold, then the lock drops before any IO.
             let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
             let stats = alloc.stats();
+            let (p_b, p_s, t_b, t_s) = alloc.pool_breakdown();
+            let surfaces = alloc.surface_breakdown();
+            let ext = alloc.external_summary();
+            drop(alloc);
+            let pending = crate::cuda::inner::deferred_free_pending();
+
+            if events_on {
+                let mut surf = serde_json::Map::new();
+                for (name, cur, peak) in &surfaces {
+                    surf.insert(
+                        name.to_string(),
+                        serde_json::json!({ "current": cur, "peak": peak }),
+                    );
+                }
+                crate::events::emit(
+                    "gpu_mem_step",
+                    Some(step),
+                    &[
+                        ("driver_used_bytes", crate::events::u((total - free) as u64)),
+                        ("driver_free_bytes", crate::events::u(free as u64)),
+                        ("driver_total_bytes", crate::events::u(total as u64)),
+                        ("allocated_bytes", crate::events::u(stats.allocated_bytes as u64)),
+                        ("reserved_bytes", crate::events::u(stats.reserved_bytes as u64)),
+                        ("live_blocks", crate::events::u(stats.num_allocs as u64)),
+                        ("persistent_blocks", crate::events::u(stats.num_allocs_persistent as u64)),
+                        ("drv_allocs", crate::events::u(stats.num_driver_allocs as u64)),
+                        ("drv_frees", crate::events::u(stats.num_driver_frees as u64)),
+                        ("persistent_pool_bytes", crate::events::u(p_b as u64)),
+                        ("persistent_pool_segs", crate::events::u(p_s as u64)),
+                        ("transient_pool_bytes", crate::events::u(t_b as u64)),
+                        ("transient_pool_segs", crate::events::u(t_s as u64)),
+                        ("free_blocks", crate::events::u(stats.num_free_blocks as u64)),
+                        ("cache_hits", crate::events::u(stats.num_cache_hits as u64)),
+                        ("cache_misses", crate::events::u(stats.num_cache_misses as u64)),
+                        ("splits", crate::events::u(stats.num_splits as u64)),
+                        ("coalesces", crate::events::u(stats.num_coalesces as u64)),
+                        ("surfaces", serde_json::Value::Object(surf)),
+                        ("external_async_bytes", crate::events::u(ext.async_bytes as u64)),
+                        ("external_direct_bytes", crate::events::u(ext.direct_bytes as u64)),
+                        ("external_persistent_bytes", crate::events::u(ext.persistent_bytes as u64)),
+                        ("external_count", crate::events::u(ext.total_count as u64)),
+                        ("external_identified", crate::events::u(ext.identified_count as u64)),
+                        ("deferred_free_pending", crate::events::u(pending as u64)),
+                    ],
+                );
+            }
+
+            if !stderr_on {
+                return;
+            }
             let mb = |b: usize| b / (1024 * 1024);
             eprintln!(
                 "[gpu-mem] step={} driver={}MB alloc={}MB reserved={}MB live_blocks={} persistent_blocks={} drv_allocs={} drv_frees={}",
@@ -6271,7 +6343,6 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                 stats.num_allocs, stats.num_allocs_persistent,
                 stats.num_driver_allocs, stats.num_driver_frees,
             );
-            let (p_b, p_s, t_b, t_s) = alloc.pool_breakdown();
             eprintln!(
                 "[gpu-mem]    persistent={}MB ({} segs)  transient={}MB ({} segs)  free_blocks={} hits={} misses={} splits={} coalesces={}",
                 mb(p_b), p_s, mb(t_b), t_s,
@@ -6282,8 +6353,8 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             // P0.1: per-surface attribution (current/peak). Zero-only
             // surfaces are elided to keep the line readable.
             let mut surface_line = String::from("[gpu-mem]    surfaces:");
-            for (name, cur, peak) in alloc.surface_breakdown() {
-                if cur > 0 || peak > 0 {
+            for (name, cur, peak) in &surfaces {
+                if *cur > 0 || *peak > 0 {
                     surface_line.push_str(&format!(
                         " {}={}MB(peak {}MB)",
                         name,
@@ -6295,7 +6366,6 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             eprintln!("{}", surface_line);
             // A1: external (non-pooled) allocation breakdown — async /
             // direct-device / identity coverage. Only when any exist.
-            let ext = alloc.external_summary();
             if ext.total_count > 0 {
                 eprintln!(
                     "[gpu-mem]    external: async={}MB direct={}MB persistent={}MB \
@@ -6307,13 +6377,11 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                     ext.identified_count,
                 );
             }
-            drop(alloc);
             // p3-remainder: raw `alloc_device` buffers (CSHA backward saves,
             // Tier B.1 x-scratch) freed via the stream-ordered deferred path
             // are physically resident until their completion event fires and a
             // drain runs. Surface the count so the report distinguishes this
             // transient hold-over from a genuine leak.
-            let pending = crate::cuda::inner::deferred_free_pending();
             if pending > 0 {
                 eprintln!("[gpu-mem]    deferred-free pending: {} buffer(s)", pending);
             }

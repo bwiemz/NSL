@@ -77,6 +77,18 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the CSLA window-buffered schedule was lowered or executed",
     ),
     m(
+        "[grad-integrity]",
+        &[
+            "crates/nsl-runtime/src/grad_integrity.rs",
+        ],
+        "the P0.3 gradient-integrity atexit block (armed by --grad-integrity \
+         or NSL_GRAD_INTEGRITY=1): worst-case-over-steps counts proving every \
+         trainable parameter received a finite, mostly-nonzero gradient. \
+         Registered 2026-08-24 — it had test consumers (csla_layerwise_gate, \
+         grad_integrity_gate) but sat OUTSIDE this registry until the \
+         events-schema consistency gate required its marker to exist here",
+    ),
+    m(
         "[zero]",
         &[
             "crates/nsl-runtime/src/zero.rs",
@@ -435,6 +447,7 @@ pub fn marker(token: &str) -> &'static ExecMarker {
 pub mod tokens {
     pub const WGGO: &str = "[wggo]";
     pub const CSLA: &str = "[csla]";
+    pub const GRAD_INTEGRITY: &str = "[grad-integrity]";
     pub const ZERO: &str = "[zero]";
     pub const ZERO3: &str = "[zero3]";
     pub const MUON: &str = "[muon]";
@@ -666,5 +679,116 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
             "[cuda-graph] regions=",
             "crates/nsl-runtime/src/cuda/graph_capture.rs",
         )],
+    },
+];
+
+// ───────────────────────────────────────────────────────────────────────────
+// Item 17: structured-event schemas (`NSL_EVENTS=<path>` JSONL twins)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Schema of one structured event kind emitted by `nsl_runtime::events`.
+///
+/// Every kind twins a stderr marker above: the runtime builds both renderings
+/// from ONE counter snapshot, so values cannot disagree — but field NAMES can
+/// rot independently of the emitting call site, which is exactly the gap the
+/// marker registry's gates leave open (they pin that the emit exists, not
+/// what it says). `events_stream_gate.rs` runs a fixture with `NSL_EVENTS`
+/// set and checks every event of a registered kind carries at least these
+/// fields, so renaming or dropping a field fails a GPU-free gate instead of
+/// silently breaking whichever consumer read it.
+///
+/// `fields` is the REQUIRED set — kinds may grow fields (consumers must
+/// ignore unknown keys; the envelope version `v` only bumps for envelope
+/// changes). Removing or renaming a listed field is a breaking change and
+/// must update this table and every consumer in the same commit.
+pub struct EventSchema {
+    /// `kind` value in the event envelope.
+    pub kind: &'static str,
+    /// The stderr marker this event twins (must appear in `EXEC_MARKERS`).
+    pub marker: &'static str,
+    /// Field names REQUIRED in `fields` of every event of this kind.
+    pub fields: &'static [&'static str],
+}
+
+pub const EVENT_SCHEMAS: &[EventSchema] = &[
+    EventSchema {
+        kind: "zero_counters",
+        marker: "[zero]",
+        fields: &[
+            "ws", "rank", "all_reduce", "broadcast", "optim_elems",
+            "bucket_members", "reduce_scatter", "all_gather", "repl_optim_elems",
+        ],
+    },
+    EventSchema {
+        kind: "weight_stream_counters",
+        marker: "[weight-stream]",
+        fields: &[
+            "uploads", "evicts", "writeback", "registered", "ptr_moves",
+            "pack_uploads", "pack_evicts", "prefetches", "async_wb",
+            "h2d_bytes", "d2h_bytes",
+        ],
+    },
+    EventSchema {
+        kind: "weight_stream_residency",
+        // KNOWN GAP: the one kind no gate can exercise — it needs cuda AND
+        // registered > 0 (weight streaming engaged), which neither the CPU
+        // gate nor the GPU cross-validation fixture reaches. Its value
+        // agreement rests on the shared-snapshot construction in
+        // nsl_weight_stream_count_atexit; if a streaming gate ever gains an
+        // events file, cross-validate this kind there.
+        marker: "[weight-stream]",
+        fields: &["pinned", "registered", "pinned_bytes", "streamed_bytes", "summary"],
+    },
+    EventSchema {
+        kind: "csla_counters",
+        marker: "[csla]",
+        fields: &["window_backward_phases"],
+    },
+    EventSchema {
+        kind: "fase_fused_counters",
+        marker: "[fase-fused]",
+        fields: &[
+            "rank", "fused_step_launches", "block_table_builds",
+            "multi_batched", "multi_fallback",
+        ],
+    },
+    EventSchema {
+        kind: "wgrad_counters",
+        marker: "[wgrad-accum]",
+        fields: &["fused_gemm", "decomposed_fallback"],
+    },
+    EventSchema {
+        kind: "kernel_launch_count",
+        marker: "[nsl-kernel-count]",
+        fields: &["count"],
+    },
+    EventSchema {
+        kind: "gpu_launch_count",
+        marker: "[nsl-gpu-launch-count]",
+        fields: &["count"],
+    },
+    EventSchema {
+        kind: "grad_integrity",
+        marker: "[grad-integrity]",
+        fields: &[
+            "checks", "expected_params", "gradient_params", "finite", "nonzero",
+            "missing", "notes_expected", "notes_observed_min",
+            "notes_observed_max", "under_noted", "over_noted", "unjudged_checks",
+        ],
+    },
+    EventSchema {
+        kind: "gpu_mem_step",
+        marker: "[gpu-mem]",
+        fields: &[
+            "driver_used_bytes", "driver_free_bytes", "driver_total_bytes",
+            "allocated_bytes", "reserved_bytes", "live_blocks",
+            "persistent_blocks", "drv_allocs", "drv_frees",
+            "persistent_pool_bytes", "persistent_pool_segs",
+            "transient_pool_bytes", "transient_pool_segs", "free_blocks",
+            "cache_hits", "cache_misses", "splits", "coalesces", "surfaces",
+            "external_async_bytes", "external_direct_bytes",
+            "external_persistent_bytes", "external_count",
+            "external_identified", "deferred_free_pending",
+        ],
     },
 ];
