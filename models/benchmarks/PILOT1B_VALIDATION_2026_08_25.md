@@ -76,7 +76,7 @@ zero, so yes. The next 10-hour units of GPU time buy the most as a
 lr varied — each arm of which produces its own held-out numbers. The config
 prose (rewritten this campaign) already frames exactly this follow-up.
 
-## Finding 1 — runtime: plain-loop inference dies on the display watchdog at 1B
+## Finding 1 — the val pass died on the display watchdog; the mechanism is CONTENTION
 
 After the train block, the first held-out forward aborted:
 
@@ -84,23 +84,35 @@ After the train block, the first held-out forward aborted:
     [context: nsl_mul_scalar_f32]
     ... nsl_tensor_to_device <- nsl_tensor_add <- __nsl_model_GroupedQueryAttention_forward
 
-A plain `for batch in loader:` loop never stages the batch to the model's
-device. Each op reconciles ad hoc — host operands flowing into GPU ops,
-per-op transfers, f64 fallback kernels (GPU→CPU migration converts to f64
-by ABI) — and at 1B dims one such kernel exceeded the ~2 s display watchdog
-on this desktop-attached card; the sticky context error then surfaced on
-the next H2D copy. **The 500M recipe's val loop is the same shape** and its
-recorded VAL numbers were produced by this same mixed path, evidently under
-the watchdog at those dims. The 89-day production run would have lost its
-val pass to this after the full epoch.
+The initial reading — that the plain-loop val path's mixed host/device
+graph is INTRINSICALLY watchdog-crossing at 1B dims — was tested and is
+WRONG: the identical unstaged loop, rerun on an idle card (probe below),
+completed all 488 batches cleanly. What the abort actually was: a
+concurrent session's fusion-benchmark campaign was launching GPU work in
+the same window (its suite logs stamp 12:26-13:40, overlapping our
+training; our guard flock does not bind another session's unguarded
+launches), and on a desktop-attached card, time-slicing can push ANY
+kernel's wall time past the ~2 s display watchdog. The plain-loop val
+path's reconciliation kernels have the longest wall times in the program —
+host operands flowing into GPU ops, per-op transfers, f64 fallback kernels
+(GPU→CPU migration converts to f64 by ABI; measured ~3x slower per batch
+than the trained forward) — which made them the first casualties.
 
-Follow-up (runtime): plain-loop inference against a GPU model must either
-stage loader batches to the model's device or refuse the mixed graph — the
-same doctrine item 2 (#531) applies to train-block Input leaves, extended
-to the inference path. Recipe-side idiom until then: `batch.input_ids.to(cuda)`
-before the forward (committed in pilot_finish.nsl's val loops; the probe
-scripts named below are local artifacts — `models/*/*_probe.nsl` is
-gitignored by policy).
+What stands, verified along the way:
+- Loader batches are i32 (dtype 9; the float cast is deferred to the
+  embedding boundary), and `embedding_lookup` accepts host i32 ids against
+  a GPU table BY DESIGN — ids never needed staging. Attempts to stage them
+  (`.to(cuda)`, `.to(f32).to(cuda)`) were REFUSED by clamp_f32's
+  narrow-dtype check — the refusal working exactly as written.
+- The mixed val path is ~3x slower per batch than a pure-GPU forward and
+  is the program's most watchdog-fragile region; tightening it (device
+  reconciliation as in #531, or staged integer uploads) remains a
+  worthwhile follow-up for robustness and speed, but it is not the bug it
+  first appeared to be.
+- The operational rule is co-tenancy discipline: EVERY GPU launch from any
+  session goes through gpu-guard.sh. The guard refused this session's own
+  probes while the fusion campaign held the lock — both directions of the
+  contract demonstrated in one afternoon.
 
 ## Finding 2 — operator error: the trained θ was lost to a save-armed "resume"
 
@@ -130,16 +142,24 @@ guard, used correctly, refuses exactly this. Both directions of the lesson
 were then demonstrated within the hour: the guard later refused THIS
 session's probe while the other campaign held the lock.
 
-## Probes (post-incident)
+## Probes (post-incident) — results
 
-- `pilot_resume_probe.nsl` — WRITE-FREE resume-mechanics probe at 1B
-  resident: `checkpoint_load=` from a backup copy of the (post-overwrite,
-  from-scratch step-2000) checkpoint, no checkpoint_save. PASS = counter
-  continues at 2,080 and losses resume in the trained band. RESULT: see
-  addendum below.
-- `pilot_val_staged_probe.nsl` — the staged-input val loop on a fresh
-  model: doubles as a null control (expected loss ≈ ln(49152) = 10.803)
-  and as the watchdog-crash counter-evidence. RESULT: see addendum below.
+- **Resume at 1B resident: VALIDATED.** `pilot_resume_probe.nsl`
+  (write-free; `checkpoint_load=` from a backup of the step-2000 pair, no
+  checkpoint_save): the first on_step print was **2080 with loss 8.653** —
+  the counter CONTINUED and the loss resumed in that run's trained band
+  (from-scratch prints ~10.8 at step 80). θ, both moments, the loader
+  slot, and the step counter all restored; the resumed training forward
+  ran cleanly. This closes the resume half of the checkpointing target.
+- **Val machinery null control: VALIDATED, and the watchdog A/B decided.**
+  The unstaged val loop on a FRESH model, idle card: completed 488/488
+  batches, **VAL_LOSS_STACK 11.204** — the expected neighborhood of the
+  ln(49152)=10.803 uniform bound (a random-init model is slightly worse
+  than uniform; its logits are not flat). Loader → forward → CE → labels
+  plumbing all correct. Completion of the exact loop that aborted at 14:53
+  is what reframed finding 1 to contention.
+- Probe scripts are local artifacts (`models/*/*_probe.nsl` is gitignored
+  by policy); their content is reproduced by the descriptions above.
 
 ## Artifacts
 

@@ -21,11 +21,12 @@
 # 11.081) and its first cadence save at micro 2,000 OVERWROTE the pilot's
 # opt-6000 checkpoint — the only copy of the trained state. The file below
 # is corrected to what it should have been: checkpoint_load= names the
-# state to resume, checkpoint_save= the rolling target, and the val loops
-# stage each batch via .to(cuda) BEFORE the forward (the plain-loop val
-# path died on the display watchdog at 1B — finding 1). Token ids survive
-# the ABI's f64->f32 conversion exactly (49151 < 2^24). Kept as the honest
-# record; the trained θ it was written to finish is unrecoverable.
+# state to resume, checkpoint_save= the rolling target. The val loops are
+# UNSTAGED — probes showed the plain loop is correct (loader ids are i32,
+# embedding_lookup takes host ids by design; staging attempts are refused
+# by clamp_f32's dtype check) and the 14:53 watchdog abort was GPU
+# contention, not this path (finding 1, as corrected). Kept as the honest
+# record; the trained θ this file was written to finish is unrecoverable.
 #
 # RUN (from models/coder1b):
 #   nsl run --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
@@ -69,12 +70,10 @@ let sval_loader = DataLoader(sval_tokens, batch_size=2, seq_len=2048, shuffle=fa
 let sval_total = 0.0
 let sval_count = 0.0
 for batch in sval_loader:
-    let vids = batch.input_ids.to(cuda)
-    let vlabels = batch.labels.to(cuda)
-    let vlogits = m.forward_train(vids, false)
+    let vlogits = m.forward_train(batch.input_ids, false)
     let vs = vlogits.shape
     let vflat_logits = vlogits.reshape([vs[0] * vs[1], vs[2]])
-    let vflat_labels = vlabels.reshape([vs[0] * vs[1]])
+    let vflat_labels = batch.labels.reshape([vs[0] * vs[1]])
     let vloss = cross_entropy(vflat_logits, vflat_labels)
     sval_total = sval_total + vloss.item()
     sval_count = sval_count + 1.0
@@ -90,12 +89,10 @@ let wval_loader = DataLoader(wval_tokens, batch_size=2, seq_len=2048, shuffle=fa
 let wval_total = 0.0
 let wval_count = 0.0
 for batch in wval_loader:
-    let wids = batch.input_ids.to(cuda)
-    let wlabels = batch.labels.to(cuda)
-    let wlogits = m.forward_train(wids, false)
+    let wlogits = m.forward_train(batch.input_ids, false)
     let ws = wlogits.shape
     let wflat_logits = wlogits.reshape([ws[0] * ws[1], ws[2]])
-    let wflat_labels = wlabels.reshape([ws[0] * ws[1]])
+    let wflat_labels = batch.labels.reshape([ws[0] * ws[1]])
     let wloss = cross_entropy(wflat_logits, wflat_labels)
     wval_total = wval_total + wloss.item()
     wval_count = wval_count + 1.0
