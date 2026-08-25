@@ -115,6 +115,7 @@ crates/nsl-cli/tests/stage_c_packed_parity.rs	wggo_reports_fused_consumption_on_
 crates/nsl-cli/tests/stream_migration_gpu_gate.rs	compute_stream_matches_legacy_null_stream_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
 crates/nsl-cli/tests/stream_ordering_gpu_gate.rs	stream_ordered_matches_eager_bit_exact	gpu	requires CUDA GPU (2 training runs)
 crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fused_backward_gpu_deterministic_and_matches_reference	gpu	requires CUDA GPU
+crates/nsl-cli/tests/tokbench_reference_encoder_gate.rs	tokbench_pretokenize_matches_the_crate_and_guards_the_u16_cast	multiproc	spawns cargo to build tools/tokbench, then runs the reference-encoder differential
 crates/nsl-cli/tests/transient_arena_gpu_gate.rs	arena_report_is_consistent_and_loss_neutral	gpu	requires CUDA GPU (~2 runs of the packed-GQA fixture)
 crates/nsl-cli/tests/transient_arena_gpu_gate.rs	arena_parity_script_passes	gpu	requires CUDA GPU (~5 runs of a 40-step coder50m program)
 crates/nsl-cli/tests/view_chain_leak_gate.rs	anonymous_view_chain_links_do_not_strand_per_call	gpu	requires CUDA GPU

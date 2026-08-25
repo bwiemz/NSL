@@ -392,6 +392,11 @@ enum Command {
         /// Longest token surface allowed, in bytes. 0 disables the cap.
         #[arg(long, default_value_t = 0)]
         max_token_bytes: usize,
+        /// Reserve a special token, repeatable. Each one costs a slot out of
+        /// `vocab_size` (the trainer learns `vocab_size - specials` merges),
+        /// so the id space still fits the u16 token stream.
+        #[arg(long = "special-token")]
+        special_tokens: Vec<String>,
     },
     /// Encode a corpus into a flat u16 token stream for pretraining.
     Pretokenize {
@@ -401,6 +406,12 @@ enum Command {
         corpus: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// Emit this token's id after every document. Looked up in the
+        /// vocabulary by surface and injected structurally, NOT spliced into
+        /// the text as a literal: web corpora contain the surface itself, and
+        /// a text splice would let a document forge its own boundary.
+        #[arg(long)]
+        doc_sep_token: Option<String>,
     },
     /// Report the token-length profile of a trained vocabulary.
     VocabStats {
@@ -532,6 +543,7 @@ fn main() {
             transition,
             min_freq,
             max_token_bytes,
+            special_tokens,
         } => {
             // Delegates to nsl-runtime's trainer so this benchmark measures the
             // shipped code path. The runtime relaxes to whole lines, so the
@@ -551,7 +563,7 @@ fn main() {
                 transition,
                 max_token_bytes,
                 stage1: stage1_kind,
-                special_tokens: Vec::new(),
+                special_tokens: special_tokens.clone(),
             };
 
             let started = std::time::Instant::now();
@@ -565,16 +577,49 @@ fn main() {
                 started.elapsed().as_secs_f64()
             );
             let tokenizer = bpe::assemble(&trained, &spec).expect("assemble");
+            for t in &special_tokens {
+                let id = tokenizer.token_to_id(t).unwrap_or_else(|| {
+                    panic!("special token '{t}' is absent from the assembled vocabulary")
+                });
+                println!("special {t} = {id}");
+            }
+            let total = tokenizer.get_vocab_size(true);
+            assert!(
+                total <= u16::MAX as usize + 1,
+                "vocab {total} (including {} specials) does not fit the u16 token stream",
+                special_tokens.len()
+            );
             tokenizer.save(&out, false).expect("save tokenizer");
             println!("saved {}", out.display());
         }
-        Command::Pretokenize { tokenizer, corpus, out } => {
+        Command::Pretokenize { tokenizer, corpus, out, doc_sep_token } => {
             let tok = Tokenizer::from_file(&tokenizer).expect("load tokenizer");
-            let vocab = tok.get_vocab_size(true);
+            // Guard the largest ID, not the number of entries. The ids below are
+            // written with `as u16`, which TRUNCATES silently, and a vocabulary
+            // can be sparse -- fewer than 65536 entries while still holding an
+            // id above 65535. Counting entries would let exactly that case
+            // through and corrupt every token that wrapped.
+            let max_id = tok
+                .get_vocab(true)
+                .values()
+                .copied()
+                .max()
+                .expect("tokenizer has an empty vocabulary");
             assert!(
-                vocab <= u16::MAX as usize + 1,
-                "vocab {vocab} does not fit the u16 token stream format"
+                max_id <= u16::MAX as u32,
+                "token id {max_id} does not fit the u16 token stream format"
             );
+            // Resolve the separator BEFORE encoding: a missing surface must
+            // fail here, not silently produce a stream with no boundaries.
+            let sep_id: Option<u16> = doc_sep_token.as_ref().map(|t| {
+                let id = tok.token_to_id(t).unwrap_or_else(|| {
+                    panic!(
+                        "document separator '{t}' is not in this tokenizer's vocabulary; \
+                         train it with --special-token '{t}'"
+                    )
+                });
+                u16::try_from(id).unwrap_or_else(|_| panic!("separator id {id} exceeds u16"))
+            });
             let docs = read_documents(&corpus);
             let refs: Vec<&str> = docs.iter().map(|d| d.as_str()).collect();
             let started = std::time::Instant::now();
@@ -584,6 +629,10 @@ fn main() {
             for enc in &encs {
                 for id in enc.get_ids() {
                     bytes.extend_from_slice(&(*id as u16).to_le_bytes());
+                    n_tokens += 1;
+                }
+                if let Some(sep) = sep_id {
+                    bytes.extend_from_slice(&sep.to_le_bytes());
                     n_tokens += 1;
                 }
             }

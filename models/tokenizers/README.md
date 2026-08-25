@@ -40,6 +40,37 @@ pinned against them — `crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs`,
 fingerprint in `models/benchmarks/TOKENIZER_AND_MFU_2026_07_29.md`. `v2` writes
 to new paths and changes none of them.
 
+## The reference encoder is committed, and that is verified (item 15, 2026-08-24)
+
+The binary that encoded the v2 corpus was a locally patched tokbench: the
+`pretokenize --doc-sep-token` and `train2 --special-token` flags the
+`tools/hfcorpus` pipeline invokes existed in no committed version of
+`tools/tokbench/src/main.rs` for five days after the corpus was built. The
+patch was recovered from the build worktree and committed; the rebuilt binary
+was then proven against the corpus of record by re-encoding two full sets
+from their text shards with the committed tokenizer:
+
+| set | tokens | manifest sha256 | re-encode |
+|---|---|---|---|
+| `nsl_train.bin` | 11,413,038 | `0d961570…79a8f8` | **identical** |
+| `sft_train.bin` | 41,020,908 | `2c8cfa87…8e8ecb` | **identical** |
+
+`sft_train` also pins the added-token surface path: the re-encoded stream
+carries 212,849 `<|im_start|>` and 24,129 `<|tool_call|>` extractions.
+Reproduce with:
+
+    tools/tokbench/target/release/tokbench pretokenize \
+      --tokenizer models/tokenizers/nsl_mix_v2_t40960_v49152.json \
+      --corpus data/text/code-train/code-00000.txt \
+      --out /tmp/nsl_train_reencode.bin --doc-sep-token '<|endoftext|>'
+    sha256sum /tmp/nsl_train_reencode.bin   # must match the manifest
+
+The CI-side pin is `crates/nsl-cli/tests/tokbench_reference_encoder_gate.rs`:
+the committed tokenizer's extraction semantics run in every CI build, and the
+cert lane's multiproc tier builds tokbench from the tree and checks its u16
+stream (with and without structural separators, plus the max-id refusal)
+against ids computed independently with the workspace's `tokenizers` crate.
+
 ## Reserved ids are data, not a convention
 
 `v2`'s special-token surfaces and ids live in `special_tokens.json` in THIS
