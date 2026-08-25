@@ -85,11 +85,18 @@ def fetch(repo_id: str, patterns: list[str], out: Path, workers: int) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["fineweb", "distill", "stack"], default=None)
+    ap.add_argument("--only",
+                    choices=["fineweb", "distill", "stack", "stack-val", "benchmarks"],
+                    default=None)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--stack-shards", type=int, default=20,
                     help="how many of the 8192 Stack v3 shards to take "
-                    "(~0.55B tokens each); sampled with a stride, not a prefix")
+                    "(measured yield: ~387M tokens each under the v2 "
+                    "tokenizer); sampled with a stride, not a prefix")
+    ap.add_argument("--stack-val-shard", type=int, default=204,
+                    help="shard index for the repo-disjoint validation shard "
+                    "(--only stack-val). Refused if it collides with the "
+                    "train stride (multiples of 409)")
     args = ap.parse_args()
 
     DEST.mkdir(parents=True, exist_ok=True)
@@ -103,6 +110,29 @@ def main() -> int:
         print(f"[fetch] stack: {len(pats)} of {STACK_SHARDS} shards, "
               f"stride {STACK_SHARDS // args.stack_shards}", flush=True)
         fetch(STACK_REPO, pats, DEST / "stack", args.workers)
+    if args.only == "stack-val":
+        # A SEPARATE dir, deliberately: manifest.py rglobs data/hf/stack/**
+        # into the TRAIN source's file list, so a val shard dropped there
+        # would silently join the training provenance.
+        idx = args.stack_val_shard
+        stride = STACK_SHARDS // 20
+        if idx % stride == 0:
+            print(f"refusing --stack-val-shard {idx}: multiples of {stride} "
+                  f"are the training stride — the val shard must be "
+                  f"repo-disjoint from every train shard", file=sys.stderr)
+            return 1
+        pat = f"data/part-{idx:05d}-{STACK_SUFFIX}"
+        print(f"[fetch] stack-val: shard {idx} ({pat})", flush=True)
+        fetch(STACK_REPO, [pat], DEST / "stack-val", args.workers)
+    if args.only == "benchmarks":
+        # Evaluation benchmarks for decontamination (item 5). Tiny single
+        # parquets; pinned by revision in the corpus manifest like every
+        # other source.
+        fetch("openai/openai_humaneval", ["openai_humaneval/*.parquet"],
+              DEST / "humaneval", args.workers)
+        fetch("google-research-datasets/mbpp",
+              ["full/*.parquet", "sanitized/*.parquet"],
+              DEST / "mbpp", args.workers)
 
     print("[fetch] done", flush=True)
     return 0

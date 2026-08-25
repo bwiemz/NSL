@@ -225,9 +225,10 @@ fn bin_records_are_complete_and_composition_is_coherent() {
     let bins = man["bins"].as_object().expect("bins object");
     assert_eq!(
         bins.len(),
-        7,
-        "the v2 corpus is exactly 7 bins; a new bin needs a deliberate \
-         manifest rebuild, and a missing one means the record is stale"
+        8,
+        "the v2 corpus is exactly 8 bins (item 5 added stack_val); a new \
+         bin needs a deliberate manifest rebuild, and a missing one means \
+         the record is stale"
     );
     for (name, entry) in bins {
         let sha = entry["sha256"].as_str().unwrap_or("");
@@ -291,6 +292,65 @@ fn every_hf_source_records_the_downloaded_revision() {
         assert!(
             src["dedup"].as_str().is_some_and(|d| !d.is_empty()),
             "{name}: dedup status must be stated, not implied"
+        );
+    }
+}
+
+/// Item 5: the corpus is manifested for EVALUATION, so the manifest must
+/// carry the decontamination record — method stated (not implied, the
+/// `dedup` doctrine), benchmarks pinned as revisioned sources like every
+/// other input, and every validation set scanned CLEAN. The gate reads
+/// committed JSON only; the scan itself is local (decontaminate.py), which
+/// is exactly why its RESULTS must live here — a claim with no committed
+/// record is a claim the tree cannot check.
+#[test]
+fn the_decontamination_record_is_complete_and_val_sets_are_clean() {
+    let man = manifest();
+    let decon = man["decontamination"]
+        .as_object()
+        .expect("manifest carries no decontamination record — run \
+                 tools/hfcorpus/decontaminate.py then manifest.py build");
+    let method = decon["method"].as_str().unwrap_or("");
+    assert!(
+        method.len() > 40 && method.contains("normalized-line"),
+        "the decontamination method must be STATED precisely, not implied: {method:?}"
+    );
+
+    // The benchmarks it scanned against must be pinned sources with
+    // revisions (they ride the every_hf_source test's loop too; this
+    // asserts the linkage in the other direction).
+    let sources = man["sources"].as_object().expect("sources");
+    for bench in decon["benchmarks"].as_object().expect("benchmarks").keys() {
+        assert!(
+            sources.contains_key(bench),
+            "decontamination names benchmark '{bench}' but sources does not pin it"
+        );
+    }
+
+    // Every validation set: present in the record and CLEAN. A val set that
+    // contains benchmark text scores memorization, not generalization.
+    let sets = decon["sets"].as_object().expect("sets");
+    for val in ["val-stack", "val-web", "val-sft"] {
+        let e = sets
+            .get(val)
+            .unwrap_or_else(|| panic!("decontamination record does not cover {val}"));
+        let docs = e["documents"].as_u64().unwrap_or(0);
+        assert!(docs > 100, "{val}: implausibly few documents scanned ({docs})");
+        assert_eq!(
+            e["contaminated_documents"].as_u64(),
+            Some(0),
+            "{val} is recorded as CONTAMINATED — re-cut it with \
+             extract.py --drop-contaminated"
+        );
+    }
+
+    // Train sets are REPORTED, not required clean (the corpus is shipped;
+    // the record is what makes its evaluation honest) — but they must be
+    // present, or the record is a val-only claim wearing a corpus name.
+    for train in ["stack-train", "web-train", "sft-train"] {
+        assert!(
+            sets.contains_key(train),
+            "decontamination record does not report {train}"
         );
     }
 }

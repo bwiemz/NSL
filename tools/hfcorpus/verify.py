@@ -93,28 +93,75 @@ def main() -> int:
                   f"{binp.name}: end-of-document id is actually present")
 
     print("\n== train/val disjointness ==")
-    train = mix / "web_train.bin"
-    val = mix / "web_val.bin"
-    if not (train.exists() and val.exists()):
-        # Say so. A section that prints nothing when its inputs are absent reads
-        # exactly like a section whose checks all passed.
-        absent = [p.name for p in (train, val) if not p.exists()]
-        check(False, "web train/val disjointness could not be checked",
-              f"missing {', '.join(absent)}")
-    else:
+    # Every (train, val) pair, not a hardcoded web-only check (item 5): the
+    # sft pair silently had NO disjointness coverage before.
+    for stem in ("web", "sft", "stack"):
+        train = mix / f"{stem}_train.bin"
+        val = mix / f"{stem}_val.bin"
+        if not (train.exists() and val.exists()):
+            # Say so. A section that prints nothing when its inputs are
+            # absent reads exactly like a section whose checks all passed.
+            absent = [p.name for p in (train, val) if not p.exists()]
+            check(False, f"{stem} train/val disjointness could not be checked",
+                  f"missing {', '.join(absent)}")
+            continue
         a = np.memmap(train, dtype="<u2", mode="r")
         b = np.memmap(val, dtype="<u2", mode="r")
         n = min(1 << 20, a.size, b.size)
-        # The split is cut at parquet-file granularity, so no window of the val
+        # The split is cut at file/shard granularity, so no window of the val
         # stream should appear at the head or tail of the train stream.
         check(not np.array_equal(np.asarray(a[:n]), np.asarray(b[:n])),
-              "web train and val heads differ")
+              f"{stem} train and val heads differ")
         # Compare TAIL to TAIL. The failure this guards against is val having
         # been cut as a suffix of the same stream, i.e. a[-val.size:] == b; that
         # leaves a[-n:] equal to b[-n:], while a[-n:] vs b[:n] differs and the
         # check would pass on real contamination.
         check(not np.array_equal(np.asarray(a[-n:]), np.asarray(b[-n:])),
-              "web val is not a suffix of the train stream")
+              f"{stem} val is not a suffix of the train stream")
+
+    print("\n== stack repo-id disjointness ==")
+    # The val shard sits off the training stride, but partitioning is an
+    # ARGUMENT — the repo_id columns are EVIDENCE. Empty intersection or fail.
+    train_dir = REPO / "data/hf/stack/data"
+    val_dir = REPO / "data/hf/stack-val/data"
+    if not (train_dir.is_dir() and any(val_dir.glob("*.parquet")) if val_dir.is_dir() else False):
+        check(False, "stack repo-id disjointness could not be checked",
+              "stack or stack-val parquet missing")
+    else:
+        import pyarrow.parquet as pq
+
+        def ids(d):
+            out = set()
+            for f in sorted(d.glob("*.parquet")):
+                out.update(pq.read_table(f, columns=["repo_id"])["repo_id"].to_pylist())
+            return out
+
+        train_ids = ids(train_dir)
+        val_ids = ids(val_dir)
+        overlap = train_ids & val_ids
+        check(len(val_ids) > 0, "stack-val carries repositories",
+              f"{len(val_ids)} repos")
+        check(not overlap,
+              f"stack train ({len(train_ids)} repos) and val "
+              f"({len(val_ids)} repos) share no repo_id",
+              f"{len(overlap)} shared")
+
+    print("\n== benchmark decontamination record ==")
+    decon = REPO / "data/text/decontamination.json"
+    if not decon.exists():
+        check(False, "decontamination report exists",
+              "run tools/hfcorpus/decontaminate.py")
+    else:
+        rep = json.loads(decon.read_text())
+        check(bool(rep.get("method")), "decontamination method is stated")
+        for name in ("val-stack", "val-web", "val-sft"):
+            entry = rep.get("sets", {}).get(name)
+            if entry is None:
+                check(False, f"decontamination covers {name}", "not scanned")
+            else:
+                check(entry.get("contaminated_documents") == 0,
+                      f"{name} is clean of benchmark text",
+                      f"{entry.get('contaminated_documents')} contaminated")
 
     print(f"\n{checks - len(failures)}/{checks} checks passed")
     if failures:
