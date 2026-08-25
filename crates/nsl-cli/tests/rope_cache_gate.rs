@@ -36,17 +36,28 @@ fn repo_root() -> PathBuf {
 }
 
 fn nsl_binary() -> PathBuf {
-    let root = repo_root();
-    for profile in ["release", "debug"] {
-        let mut p = root.join("target").join(profile).join("nsl");
-        if cfg!(windows) {
-            p.set_extension("exe");
-        }
-        if p.exists() {
-            return p;
+    // $CARGO_TARGET_DIR first, repo-local target/ second — the certification
+    // lane and CI redirect the target dir, and a probe that only knows
+    // repo-local target/ panics there while the built binary sits in the
+    // redirected dir (weight_decay_groups_gate hit exactly that in the
+    // 2026-08-24 lane run; this file carried the same latent probe).
+    let mut roots = Vec::new();
+    if let Ok(t) = std::env::var("CARGO_TARGET_DIR") {
+        roots.push(PathBuf::from(t));
+    }
+    roots.push(repo_root().join("target"));
+    for root in &roots {
+        for profile in ["release", "debug"] {
+            let mut p = root.join(profile).join("nsl");
+            if cfg!(windows) {
+                p.set_extension("exe");
+            }
+            if p.exists() {
+                return p;
+            }
         }
     }
-    panic!("no nsl binary in target/{{release,debug}} — build it first");
+    panic!("no nsl binary under $CARGO_TARGET_DIR or target/ ({{release,debug}}) — build it first");
 }
 
 /// Run an NSL source string through `nsl run`, returning (stdout, stderr, ok).
