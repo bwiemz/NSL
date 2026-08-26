@@ -58,7 +58,15 @@ weight surface look like two different numbers:
 The allocator peak is the *stable* number — two full epochs of the same
 program reported it byte-identically (22,073,520,640 B) while their
 driver-level peaks differed by 1548 MiB. **Size a card against the driver
-maximum (~26.1 GiB), not the allocator figure.** Per-flag necessity — which of
+maximum, not the allocator figure.**
+
+**The table above is PRE-ITEM-11 history.** Per-segment early-free (PR
+#524) cut the forward activation surface to 3.45 GiB, and the RESIDENT
+column's outcome flipped: it now COMPLETES at 19.47 GiB allocator /
+22.4 GiB driver peak — at +30% throughput over the offloaded posture
+(2,914 vs 2,234 tok/s; the whole delta is optimizer staging —
+`RESIDENT_1B_THROUGHPUT_2026_08_25.md`). Item 6 made resident the
+production run line; offload remains the smaller-card escape hatch. Per-flag necessity — which of
 the four flags above is actually load-bearing, measured rather than asserted —
 is `PROD1B_VALIDATION_2026_08_19.md` §EC6; the short version is that
 `--checkpoint-blocks` and `--optim-state-offload` are both load-bearing (each
@@ -66,12 +74,13 @@ OOMs when dropped), while `--fuse-rmsnorm-backward` shows no memory effect the
 measurement can resolve — the probes differ by less than 20 MiB in *opposite*
 directions, against a ~1548 MiB run-to-run spread on that same quantity.
 
-**`--optim-state-offload` is what makes 1B@2048 fit here**, and it is not
-interchangeable with the endurance benchmark's `--layerwise-accum`: that
-flag refuses `grad_clip` outright. The recipe prints `PEAK_OPTIM_M` /
-`PEAK_OPTIM_V` / `PEAK_M_PARTIAL` at the end of every run so a regression
-to device-resident moments shows up as a number rather than as someone
-else's OOM.
+**`--optim-state-offload` WAS what made 1B@2048 fit here** before item 11;
+the resident posture now fits and is faster, and neither flag is
+interchangeable with the endurance benchmark's `--layerwise-accum` (which
+refuses `grad_clip` outright). The recipe prints `PEAK_OPTIM_M` /
+`PEAK_OPTIM_V` / `PEAK_M_PARTIAL` at the end of every run: resident, each
+must read ~4.0 GiB — zeros would mean the offload escape hatch silently
+engaged.
 
 ## Files
 
@@ -100,11 +109,13 @@ is inside a subshell, and everything after it stays repo-root-relative:
 
 ```bash
 cargo build --release --bin nsl --features cuda
-python models/benchmarks/make_prod_split.py      # materializes the corpus split, once
+# Corpus: the v2 mixture bins (tools/hfcorpus pipeline; identity in
+# models/datasets/CORPUS_MANIFEST_v2.json). No make_prod_split step — that
+# materializes the v1 slices the 50M/500M recipes still read.
 
 ( cd models/coder1b && ../../target/release/nsl run \
     --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
-    --optim-state-offload pretrain_prod.nsl )
+    pretrain_prod.nsl )
 ```
 
 The demos below are a different thing — a memory demo at seq 512, not a

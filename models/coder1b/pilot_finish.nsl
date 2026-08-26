@@ -1,0 +1,106 @@
+# models/coder1b/pilot_finish.nsl
+# ============================================================================
+# Corpus-v2 pilot: RESUME the last update, then held-out validation
+# ============================================================================
+#
+# pretrain_pilot.nsl trained all 24,004 micro-steps and saved its opt-6000
+# checkpoint cleanly, then ABORTED on the first held-out forward — the plain
+# `for batch in loader:` path never stages the batch to the model's device,
+# and at 1B dims one of the ad-hoc host/f64 reconciliation kernels crossed
+# the ~2 s display watchdog (CUDA_ERROR_LAUNCH_TIMEOUT in nsl_mul_scalar_f32,
+# via nsl_tensor_to_device <- nsl_tensor_add <- GQA forward). model_load
+# cannot read the checkpoint (146 trained params vs 338 model tensors), so
+# the correct loader is the RESUME path — which is also the resume-at-1B
+# test the pilot owed the roadmap anyway.
+#
+# INCIDENT RECORD (2026-08-25, PILOT1B_VALIDATION_2026_08_25.md finding 2):
+# the version of this file that RAN passed only checkpoint_save= on the
+# belief that an existing checkpoint auto-resumes. IT DOES NOT —
+# checkpoint_save is write-only, and resume is armed by the separate
+# checkpoint_load= kwarg. That run trained from scratch (first loss print
+# 11.081) and its first cadence save at micro 2,000 OVERWROTE the pilot's
+# opt-6000 checkpoint — the only copy of the trained state. The file below
+# is corrected to what it should have been: checkpoint_load= names the
+# state to resume, checkpoint_save= the rolling target. The val loops are
+# UNSTAGED — probes showed the plain loop is correct (loader ids are i32,
+# embedding_lookup takes host ids by design; staging attempts are refused
+# by clamp_f32's dtype check) and the 14:53 watchdog abort was GPU
+# contention, not this path (finding 1, as corrected). Kept as the honest
+# record; the trained θ this file was written to finish is unrecoverable.
+#
+# RUN (from models/coder1b):
+#   nsl run --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
+#           pilot_finish.nsl
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+print("================================================================")
+print("  NSL-Coder-1B corpus-v2 PILOT: resume final update + validation")
+print("================================================================")
+
+let tokens = load_mmap("../../data/tokens/pilot_train_98m.bin", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=2048, shuffle=true, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+@fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints/pretrain_pilot_state.nslm", checkpoint_save="checkpoints/pretrain_pilot_state.nslm", checkpoint_every=500):
+    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=2400, total_steps=24000, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let flat_logits = logits.reshape([4096, 49152])
+        let flat_labels = batch.labels.reshape([4096])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 80 == 0:
+                print(step)
+                print(loss)
+
+print("LOSS_STREAM_END")
+
+let sval_tokens = load_mmap("../../data/tokens/pilot_val_stack_2m.bin", 3)
+let sval_loader = DataLoader(sval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let sval_total = 0.0
+let sval_count = 0.0
+for batch in sval_loader:
+    let vlogits = m.forward_train(batch.input_ids, false)
+    let vs = vlogits.shape
+    let vflat_logits = vlogits.reshape([vs[0] * vs[1], vs[2]])
+    let vflat_labels = batch.labels.reshape([vs[0] * vs[1]])
+    let vloss = cross_entropy(vflat_logits, vflat_labels)
+    sval_total = sval_total + vloss.item()
+    sval_count = sval_count + 1.0
+
+print("VAL_LOSS_STACK")
+print(sval_total / sval_count)
+print("VAL_BATCHES_STACK")
+print(sval_count)
+
+let wval_tokens = load_mmap("../../data/tokens/pilot_val_web_2m.bin", 3)
+let wval_loader = DataLoader(wval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let wval_total = 0.0
+let wval_count = 0.0
+for batch in wval_loader:
+    let wlogits = m.forward_train(batch.input_ids, false)
+    let ws = wlogits.shape
+    let wflat_logits = wlogits.reshape([ws[0] * ws[1], ws[2]])
+    let wflat_labels = batch.labels.reshape([ws[0] * ws[1]])
+    let wloss = cross_entropy(wflat_logits, wflat_labels)
+    wval_total = wval_total + wloss.item()
+    wval_count = wval_count + 1.0
+
+print("VAL_LOSS_WEB")
+print(wval_total / wval_count)
+print("VAL_BATCHES_WEB")
+print(wval_count)
+
+model_save(m, "checkpoints/pretrain_pilot_final.nslm")
+print("PILOT_FINISH_COMPLETE")
