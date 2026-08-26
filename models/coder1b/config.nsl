@@ -52,7 +52,7 @@ const DROPOUT = 0.0
 const TRAIN_TOKENS = 22595922912
 const STACK_VAL_TOKENS = 15377827
 const WEB_VAL_TOKENS = 11942304
-# LR AND WARMUP — THIS VALUE IS NOT MEASURED AT 1B. Read the provenance.
+# LR AND WARMUP — MEASURED AT 1B by a matched-pair comparison (item 6).
 #
 # This config carried lr = 3e-4, the same constant coder50m / coder500m /
 # coder7b all carry across d_model 512 / 1280 / 2048 / 4096. That uniformity IS
@@ -74,30 +74,33 @@ const WEB_VAL_TOKENS = 11942304
 # So the sign of "which LR is better at 1B" is not established, and this file
 # must not launder either arm into a measured constant.
 #
-# The value below is therefore the WIDTH SCALING of the one LR result this repo
-# does own — item 9's 1.5e-4 at d_model 1280 — carried to d_model 2048:
-#   1.5e-4 * 1280/2048 = 9.4e-5, rounded to 1e-4.
-# It is a principled default, not a measurement. Item 15's corpus now
-# EXISTS and this config trains on it (~21 tokens/param), so the old excuse
-# — 0.008 tokens/param cannot resolve a learning rate — no longer holds.
-# What stands between this default and a measured value is the item-6
-# pilot's descent shape and, if warranted, a properly controlled LR pair at
-# a budget that can rank arms. Until then this value is a width-scaled
-# default and says so.
-#
-# The arms, the corrected statistics, and what the earlier partial-window
-# numbers got wrong are in models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
-const PRETRAIN_LR = 0.0001
+# The item-6 pilot ran the width-scaled default (1e-4) over 98.3M corpus-v2
+# tokens and got warmup descent followed by 21,600 micro-steps of ZERO
+# slope. The matched-pair arm — identical data, seed, batches and cosine
+# shape, peak lr 3e-5 — descended CONTINUOUSLY (post-warmup halves 7.50 ->
+# 6.88), finishing 1.6-1.9 nats better on identical batches, with held-out
+# VAL_LOSS_STACK 7.392 / VAL_LOSS_WEB 8.009 against the ln(49152)=10.803
+# uniform bound. So 1e-4 is measured TOO HIGH at 1B and 3e-5 is the
+# measured-better value this config now carries. Honest scope: a two-arm
+# comparison at 0.09 tokens/param — 3e-5 beats 1e-4; it is not a swept
+# optimum, and transfer to the 5.5M-micro full schedule is an assumption
+# the intermediate run exists to check.
+# Records: models/benchmarks/PILOT1B_VALIDATION_2026_08_25.md (this
+# comparison) and PROD1B_VALIDATION_2026_08_19.md (the earlier arms whose
+# budget could not rank anything).
+const PRETRAIN_LR = 0.00003
 # Warmup 8192 micro-steps = 2,048 optimizer steps = ~33.5M tokens (~0.15% of
 # the schedule). A CHOSEN default in the large-corpus convention, not a
-# measurement — the item-6 pilot (pretrain_pilot.nsl) is what validates the
-# warmup/lr shape before the full run commits GPU-months. The old 200 was
+# measurement — the item-6 pilot validated the shape (descent through
+# warmup in both arms; the ramp is not the problem). The old 200 was
 # ~9.8% of a 2048-micro toy schedule; carrying that fraction to 22.6B would
 # warm up for 2.2B tokens.
 const PRETRAIN_WARMUP = 8192
 # floor(22,595,922,912 / (2048 * 2)) = 5,516,582 micro-steps (1 epoch).
 const PRETRAIN_TOTAL_STEPS = 5516582
-const PRETRAIN_MIN_LR = 0.00003
+# min_lr keeps the pilot arms' 0.3 peak ratio (3e-5 * 0.3 = 9e-6) so the
+# cosine SHAPE matches the measured configuration.
+const PRETRAIN_MIN_LR = 0.000009
 const PRETRAIN_BATCH_SIZE = 2
 const PRETRAIN_GRAD_ACCUMULATION = 4
 const PRETRAIN_WEIGHT_DECAY = 0.1

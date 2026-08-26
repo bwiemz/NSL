@@ -66,15 +66,53 @@ committing GPU-months to the 22.6B corpus.
   **lr=1e-4 (width-scaled, never measured at 1B) does not descend past the
   token-statistics floor at 0.09 tokens/param.**
 
+## The LR arm (2026-08-25/26): the matched pair ANSWERED the question
+
+`pilot_lr3e5.nsl` — pretrain_pilot.nsl with exactly two numbers changed
+(peak lr 1e-4 → 3e-5; min_lr scaled by the same 0.3 ratio to 9e-6), same
+data file, same seeded shuffle → the two arms saw IDENTICAL batches in
+identical order, so per-print paired deltas cancel batch-composition noise.
+Ran overnight under gpu-guard on an idle card; completed fully, INCLUDING
+the unstaged val passes and final save (which also seals finding 1's
+contention story — the loop that "crashed" ran 976 val batches cleanly).
+
+| window (micro-steps) | 1e-4 | 3e-5 | paired Δ |
+|---|---|---|---|
+| 80–1,600 (warmup) | 9.130 | 9.507 | +0.377 |
+| 1,680–3,200 | 8.563 | 8.324 | −0.238 |
+| 4,880–6,400 | 8.758 | 7.404 | −1.354 |
+| 8,080–9,600 | 8.648 | 7.462 | −1.186 |
+| 11,280–12,800 | 8.673 | 6.271 | −2.402 |
+| 16,080–17,600 | 8.813 | 6.793 | −2.020 |
+| 22,480–24,000 | 8.767 | 6.782 | −1.985 |
+
+- The 3e-5 arm starts SLOWER (smaller lr through the ramp), is even by
+  warmup end, and then descends continuously exactly where 1e-4 went flat:
+  post-warmup halves **7.496 → 6.880** (vs 1e-4's 8.759 → 8.790).
+  Post-warmup paired mean **−1.60**; final quarter **−1.89**.
+- **Held-out: VAL_LOSS_STACK 7.392, VAL_LOSS_WEB 8.009** (488 batches
+  each) — 3.4 / 2.8 nats below the ln(49152)=10.803 uniform bound, code
+  learning faster than prose as the 60/40 mixture intends.
+- Peaks byte-identical to the pilot; same throughput; final model
+  (`pilot_lr3e5_final.nslm`) saved and the rolling checkpoint pair backed
+  up to `checkpoints_backup/` the moment the run ended, per the rule
+  finding 2 earned.
+
+**Verdict: lr=1e-4 was measured TOO HIGH at 1B; 3e-5 is measured better by
+1.6–1.9 nats on identical batches, with a healthy held-out pair.** The
+production recipe now carries lr=3e-5 / min_lr=9e-6 with this record as
+provenance. Honest scope: a two-arm comparison at 0.09 tokens/param — not
+a swept optimum, and transfer to the 5.5M-micro full schedule is an
+assumption.
+
 ## What the pilot answers for the roadmap
 
-**Do not start the 1–2B intermediate run on this recipe.** The pilot's
-whole purpose was to answer "would GPU-months on this configuration be
-wasted?" and the answer for lr=1e-4 as-shipped is: the post-warmup slope is
-zero, so yes. The next 10-hour units of GPU time buy the most as a
-**controlled LR pair (or 2×2) at pilot budget** — same program, same data,
-lr varied — each arm of which produces its own held-out numbers. The config
-prose (rewritten this campaign) already frames exactly this follow-up.
+All five targets are now closed, and the gate to the next stage is OPEN:
+the roadmap's **1–2B-token intermediate run** is warranted on the updated
+recipe (lr 3e-5), and is also the check on LR transfer to longer
+schedules. At the measured 2,878 tok/s, 1.5B tokens ≈ 6 days of resident
+single-GPU wall clock — a scheduling decision for the card's owner, not
+one a session should take unilaterally against a shared device.
 
 ## Finding 1 — the val pass died on the display watchdog; the mechanism is CONTENTION
 
