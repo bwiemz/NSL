@@ -274,6 +274,12 @@ pub fn backward_main_warps(config: &FlashAttentionBackwardConfig) -> i64 {
     {
         return 1;
     }
+    // The persistent dK/dV register accumulators need each warp to own
+    // exactly ONE dV/dK m-tile (register names carry no m index): true iff
+    // m_tiles_kv <= warps, which every selector shape satisfies (1/2/4).
+    if m_tiles_kv > WARPS {
+        return 1;
+    }
     WARPS as i64
 }
 
@@ -3577,8 +3583,18 @@ pub fn backward_shared_mem_bytes(config: &FlashAttentionBackwardConfig) -> u32 {
     let k_tile = tile_bytes(config.block_kv, hd_padded);
     let v_tile = tile_bytes(config.block_kv, hd_padded);
     let do_tile = tile_bytes(config.block_q, hd_padded);
-    let dk_local = tile_bytes(config.block_kv, hd_padded);
-    let dv_local = tile_bytes(config.block_kv, hd_padded);
+    // Multi-warp: dK/dV accumulate in persistent per-warp registers — no
+    // SMEM tiles (17.4 KB back at 32/32/hd64 => 2 CTAs/SM). The runtime's
+    // launch-time twin keys the same branch off the `_w<N>` kernel-name
+    // suffix it already parses for the thread count.
+    let (dk_local, dv_local) = if backward_main_warps(config) > 1 {
+        (0, 0)
+    } else {
+        (
+            tile_bytes(config.block_kv, hd_padded),
+            tile_bytes(config.block_kv, hd_padded),
+        )
+    };
     let s_tile = tile_bytes(config.block_q, config.block_kv);
     // dP tile: workspace for MMA dP = dO@V^T results (needed alongside P in S_tile for dS computation)
     let dp_tile = if backward_uses_mma(config) {
@@ -3811,12 +3827,6 @@ fn emit_flash_attention_bwd_main(
     ptx.push_str(")\n");
     ptx.push_str("{\n");
 
-    emit_bwd_main_registers(ptx, config, gqa);
-    if backward_uses_mma(config) {
-        emit_bwd_mma_registers(ptx, config);
-    }
-    emit_bwd_main_param_loads(ptx, config, gqa);
-    emit_bwd_main_index_computation(ptx, config, gqa);
     // Launch thread count: 32*warps on the multi-warp MMA path, block_q
     // otherwise (the historical contract). Must match the runtime's parse of
     // the `_w<N>` kernel-name suffix.
@@ -3826,8 +3836,35 @@ fn emit_flash_attention_bwd_main(
     } else {
         config.block_q
     };
+    emit_bwd_main_registers(ptx, config, gqa);
+    if backward_uses_mma(config) {
+        emit_bwd_mma_registers(ptx, config, warps);
+    }
+    emit_bwd_main_param_loads(ptx, config, gqa);
+    emit_bwd_main_index_computation(ptx, config, gqa);
     emit_bwd_main_load_kv_tiles(ptx, config, gqa, nthreads);
-    emit_bwd_main_init_dk_dv(ptx, config, nthreads);
+    if warps > 1 {
+        // Multi-warp: dK/dV accumulate in persistent per-warp registers, so
+        // there are no SMEM tiles to zero (and no barrier needed — registers
+        // are thread-private). Zeroing ALL nt slices on every thread is
+        // harmless; each warp only ever accumulates and stores its own.
+        ptx.push_str("    // === Zero persistent dK/dV register accumulators ===\n");
+        let n_tiles_hd = (config.head_dim as usize) / MMA_N;
+        for nt in 0..n_tiles_hd {
+            for r in 0..4 {
+                ptx.push_str(&format!(
+                    "    mov.f32 %bwd_dvp_{nt}_{r}, {};\n",
+                    f32_bits(F32_ZERO)
+                ));
+                ptx.push_str(&format!(
+                    "    mov.f32 %bwd_dkp_{nt}_{r}, {};\n",
+                    f32_bits(F32_ZERO)
+                ));
+            }
+        }
+    } else {
+        emit_bwd_main_init_dk_dv(ptx, config, nthreads);
+    }
     if gqa {
         // Group loop head: iterate the q-heads sharing this CTA's kv-head.
         // The trip count (%rd_gqa_g) is CTA-uniform, so the loop branches are
@@ -3856,7 +3893,11 @@ fn emit_flash_attention_bwd_main(
         ptx.push_str("    bra BWD_MAIN_GQA_GROUP;\n");
         ptx.push_str("BWD_MAIN_GQA_GROUP_DONE:\n\n");
     }
-    emit_bwd_main_store_dk_dv(ptx, config, gqa, nthreads);
+    if warps > 1 {
+        emit_bwd_main_store_dk_dv_regs(ptx, config, gqa, warps);
+    } else {
+        emit_bwd_main_store_dk_dv(ptx, config, gqa, nthreads);
+    }
 
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
@@ -4678,12 +4719,32 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
 /// MMA register declarations for the backward kernel (sm_80+).
 /// Declares accumulators and fragment registers for all 5 backward matmuls:
 ///   S = Q@K^T, dP = dO@V^T, dV += P^T@dO, dQ += dS@K, dK += dS^T@Q
-fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_mma_registers(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    warps: i64,
+) {
     let n_tiles_s = config.block_kv as usize / MMA_N; // S/dP: [block_q, block_kv]
     let n_tiles_hd = config.head_dim as usize / MMA_N; // dV/dQ/dK: [*, head_dim]
     let k_iters_qk = config.head_dim as usize / MMA_K;
 
     ptx.push_str("    // === MMA registers for backward (all 5 matmuls) ===\n");
+
+    if warps > 1 {
+        // Persistent per-warp dV/dK accumulators (multi-warp only): each warp
+        // owns exactly one dV/dK m-tile and a fixed nt slice, accumulating
+        // across the whole q-loop (and the GQA group loop) in registers — the
+        // dK/dV SMEM tiles and their per-iteration atom.shared.add are gone.
+        // Declared for every nt; each warp's arm touches only its slice.
+        for nt in 0..n_tiles_hd {
+            ptx.push_str(&format!(
+                "    .reg .f32 %bwd_dvp_{nt}_0, %bwd_dvp_{nt}_1, %bwd_dvp_{nt}_2, %bwd_dvp_{nt}_3;\n"
+            ));
+            ptx.push_str(&format!(
+                "    .reg .f32 %bwd_dkp_{nt}_0, %bwd_dkp_{nt}_1, %bwd_dkp_{nt}_2, %bwd_dkp_{nt}_3;\n"
+            ));
+        }
+    }
 
     // S accumulators: one m-tile at a time, n_tiles_s n-tiles
     for nt in 0..n_tiles_s {
@@ -4802,9 +4863,18 @@ fn emit_bwd_main_q_tile_loop_mma(
     let v_tile_bytes = config.block_kv * hd_padded * 4;
     let q_shmem_offset = k_tile_bytes + v_tile_bytes;
     let do_shmem_offset = q_shmem_offset + config.block_q * hd_padded * 4;
+    // Multi-warp: dK/dV live in persistent per-warp REGISTERS, so their SMEM
+    // tiles are gone and S/dP/D/L shift down by 2 kv-tiles (the 2-CTAs/SM
+    // occupancy win). Single-warp keeps the historical layout; the dk/dv
+    // offsets below are only meaningful (and only used) when warps == 1.
+    let dkdv_tiles = if warps > 1 {
+        0
+    } else {
+        2 * config.block_kv * hd_padded * 4
+    };
     let dk_shmem_offset = do_shmem_offset + config.block_q * hd_padded * 4;
     let dv_shmem_offset = dk_shmem_offset + config.block_kv * hd_padded * 4;
-    let s_shmem_offset = dv_shmem_offset + config.block_kv * hd_padded * 4;
+    let s_shmem_offset = do_shmem_offset + config.block_q * hd_padded * 4 + dkdv_tiles;
     let dp_shmem_offset = s_shmem_offset + config.block_q * config.block_kv * 4;
     let d_shmem_offset = dp_shmem_offset + config.block_q * config.block_kv * 4;
     let l_shmem_offset = d_shmem_offset + config.block_q * 4;
@@ -5317,18 +5387,32 @@ fn emit_bwd_main_q_tile_loop_mma(
     ));
     ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DV_K_LOOP;\n\n");
 
-    // Accumulate dV results to dV_local shmem via atom.shared.add.f32.
-    // Each (m-tile, n-tile) unit is owned by exactly one warp partition, so
-    // ownership replaces the historical warp-0 redundancy gate: every unit is
-    // accumulated once, in the same per-element q-iteration order.
+    // Accumulate dV. Each (m-tile, n-tile) unit is owned by exactly one warp
+    // partition, so ownership replaces the historical warp-0 redundancy gate:
+    // every unit is accumulated once, in the same per-element q-iteration
+    // order. Multi-warp accumulates into persistent per-warp REGISTERS
+    // (each warp runs exactly ONE dV m-tile — backward_main_warps guarantees
+    // m_tiles_kv == g_mw — so the register names need no m index); the
+    // plain add per q-iteration keeps the summation order bit-identical to
+    // the historical atom.shared.add flow. Single-warp keeps the SMEM tile.
     emit_bwd_nt_arms(ptx, "BWD_MMA_DV_ACC", n_tiles_hd, g_wnt, &mut |ptx, nts| {
-        emit_accumulate_mma_to_shmem(
-            ptx,
-            "%bwd_acc_g",
-            nts,
-            dv_shmem_offset as usize,
-            hd_padded_u,
-        );
+        if warps > 1 {
+            for nt in nts {
+                for r in 0..4 {
+                    ptx.push_str(&format!(
+                        "    add.f32 %bwd_dvp_{nt}_{r}, %bwd_dvp_{nt}_{r}, %bwd_acc_g_{nt}_{r};\n"
+                    ));
+                }
+            }
+        } else {
+            emit_accumulate_mma_to_shmem(
+                ptx,
+                "%bwd_acc_g",
+                nts,
+                dv_shmem_offset as usize,
+                hd_padded_u,
+            );
+        }
     });
 
     // Advance m-tile (stride = warp m-groups; row stride for dV_local is hd_padded)
@@ -5619,16 +5703,32 @@ fn emit_bwd_main_q_tile_loop_mma(
     ));
     ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DK_K_LOOP;\n\n");
 
-    // Scale and accumulate dK results to dK_local shmem via atom.shared.add.f32.
-    // Unit ownership replaces the warp-0 redundancy gate (see the dV note).
+    // Scale and accumulate dK. Unit ownership replaces the warp-0 redundancy
+    // gate (see the dV note). Multi-warp: mul-then-add into the persistent
+    // registers — the SAME two-rounding shape as the historical
+    // scale-then-atom.shared.add, so dK stays bit-identical (a single fma
+    // here would round differently).
     emit_bwd_nt_arms(ptx, "BWD_MMA_DK_ACC", n_tiles_hd, g_wnt, &mut |ptx, nts| {
-        emit_accumulate_mma_to_shmem_scaled(
-            ptx,
-            "%bwd_acc_g",
-            nts,
-            dk_shmem_offset as usize,
-            hd_padded_u,
-        );
+        if warps > 1 {
+            for nt in nts {
+                for r in 0..4 {
+                    ptx.push_str(&format!(
+                        "    mul.f32 %bwd_mma_f32_lo, %bwd_acc_g_{nt}_{r}, %scale;\n"
+                    ));
+                    ptx.push_str(&format!(
+                        "    add.f32 %bwd_dkp_{nt}_{r}, %bwd_dkp_{nt}_{r}, %bwd_mma_f32_lo;\n"
+                    ));
+                }
+            }
+        } else {
+            emit_accumulate_mma_to_shmem_scaled(
+                ptx,
+                "%bwd_acc_g",
+                nts,
+                dk_shmem_offset as usize,
+                hd_padded_u,
+            );
+        }
     });
 
     // Advance m-tile (stride = warp m-groups)
@@ -6288,6 +6388,104 @@ fn emit_bwd_main_store_dk_dv(
         dv_shmem_offset,
         false,
     );
+}
+
+/// Multi-warp store epilogue: scatter the persistent per-warp dK/dV register
+/// accumulators straight to global memory (the SMEM tiles no longer exist).
+///
+/// Each warp owns exactly one dV/dK m-tile (m_tile = wid / w_nt) and a fixed
+/// nt slice; the per-register C-layout mapping is the same as the accumulate
+/// helpers': reg r -> row = m_tile*16 + g + 8*(r>=2), col = nt*8 + 2t + (r&1).
+/// The kv slice is CTA-exclusive (GQA included — the group reduction already
+/// happened in the registers), so these are plain `st.global.f32`. dK was
+/// scaled during accumulation; no scale here.
+fn emit_bwd_main_store_dk_dv_regs(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    gqa: bool,
+    warps: i64,
+) {
+    let n_tiles_hd = (config.head_dim as usize) / MMA_N;
+    let m_tiles_kv = (config.block_kv as usize) / MMA_M;
+    let (_g_mw, g_wnt) = bwd_step_partition(m_tiles_kv, n_tiles_hd, warps as usize)
+        .expect("dV/dK partition (store)");
+    let kv_base_reg = if gqa { "%rd_gqa_kvoff" } else { "%rd15" };
+    let head_dim = config.head_dim;
+
+    ptx.push_str("    // === Store persistent dK/dV registers to global memory ===\n");
+
+    // dK global base: dk_ptr + (kv_elem_offset + kv_start * head_dim) * 4
+    ptx.push_str("    mul.lo.u64 %rd20, %rd14, %rd10;  // kv_start * head_dim\n");
+    ptx.push_str(&format!("    add.u64 %rd20, {kv_base_reg}, %rd20;\n"));
+    ptx.push_str("    shl.b64 %rd20, %rd20, 2;\n");
+    ptx.push_str("    add.u64 %rd20, %rd5, %rd20;  // dk_global_base\n\n");
+
+    // dV global base
+    ptx.push_str("    mul.lo.u64 %rd21, %rd14, %rd10;\n");
+    ptx.push_str(&format!("    add.u64 %rd21, {kv_base_reg}, %rd21;\n"));
+    ptx.push_str("    shl.b64 %rd21, %rd21, 2;\n");
+    ptx.push_str("    add.u64 %rd21, %rd6, %rd21;  // dv_global_base\n\n");
+
+    // This warp's dV/dK m-tile and nt partition (single m-tile per warp).
+    let shift = g_wnt.trailing_zeros();
+    ptx.push_str(&format!(
+        "    shr.u32 %bwd_mma_m_tile, %bwd_mma_wid, {shift};  // m-tile = wid / {g_wnt}\n"
+    ));
+    ptx.push_str(&format!(
+        "    and.b32 %bwd_mma_wpart, %bwd_mma_wid, {};  // nt-part = wid % {g_wnt}\n",
+        g_wnt - 1
+    ));
+
+    for (which, base_reg) in [("DK", "%rd20"), ("DV", "%rd21")] {
+        let acc = if which == "DK" { "%bwd_dkp" } else { "%bwd_dvp" };
+        emit_bwd_nt_arms(
+            ptx,
+            &format!("BWD_STORE_{which}_REGS"),
+            n_tiles_hd,
+            g_wnt,
+            &mut |ptx, nts| {
+                for nt in nts {
+                    for r in 0..4 {
+                        let row_add: usize = if r >= 2 { 8 } else { 0 };
+                        let col_add: usize = r & 1;
+                        // row = m_tile*16 + g (+8 for r>=2)
+                        ptx.push_str(&format!(
+                            "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
+                            MMA_M
+                        ));
+                        ptx.push_str(
+                            "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_gid;\n",
+                        );
+                        if row_add > 0 {
+                            ptx.push_str(&format!(
+                                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {row_add};\n"
+                            ));
+                        }
+                        // addr = base + (row*head_dim + nt*8 + 2t + (r&1)) * 4
+                        ptx.push_str(
+                            "    cvt.u64.u32 %bwd_mma_gaddr, %bwd_mma_store_row;\n",
+                        );
+                        ptx.push_str(&format!(
+                            "    mul.lo.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, {head_dim};\n"
+                        ));
+                        ptx.push_str("    cvt.u64.u32 %rd35, %bwd_mma_tid2;\n");
+                        ptx.push_str("    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, %rd35;\n");
+                        ptx.push_str(&format!(
+                            "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, {};  // + nt*MMA_N + (r&1)\n",
+                            nt * MMA_N + col_add
+                        ));
+                        ptx.push_str("    shl.b64 %bwd_mma_gaddr, %bwd_mma_gaddr, 2;\n");
+                        ptx.push_str(&format!(
+                            "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, {base_reg};\n"
+                        ));
+                        ptx.push_str(&format!(
+                            "    st.global.f32 [%bwd_mma_gaddr], {acc}_{nt}_{r};\n"
+                        ));
+                    }
+                }
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7161,21 +7359,37 @@ mod tests {
 
     #[test]
     fn test_bwd_main_has_regular_store_dk_dv() {
+        // Multi-warp (default): dK/dV persist in registers and the store is
+        // the per-warp fragment scatter (BWD_STORE_*_REGS); there is no SMEM
+        // tile store and NO shared atomics anywhere in the body.
         let cfg = bwd_config(false);
         let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
         let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        // (The BWD_STORE_*_REGS arm labels only appear when the dV/dK
+        // partition has w_nt > 1; at 64/64 all four warps split by m-tile,
+        // so probe the persistent registers themselves.)
         assert!(
-            ptx.contains("BWD_MAIN_STORE_DK"),
-            "dK store section"
+            ptx.contains("st.global.f32 [%bwd_mma_gaddr], %bwd_dkp_"),
+            "dK register-scatter store"
         );
         assert!(
-            ptx.contains("BWD_MAIN_STORE_DV"),
-            "dV store section"
+            ptx.contains("st.global.f32 [%bwd_mma_gaddr], %bwd_dvp_"),
+            "dV register-scatter store"
         );
         // dK/dV use regular st.global, not atomic
         assert!(
             ptx.contains("st.global.f32"),
             "dK/dV use regular global store"
+        );
+        // Instruction form only — the %f_discard declaration's comment also
+        // says "atom.shared.add.f32".
+        assert!(
+            !ptx.contains("atom.shared.add.f32 %"),
+            "multi-warp body must not use shared atomics (register accumulators)"
+        );
+        assert!(
+            !ptx.contains("BWD_MAIN_ZERO_DK"),
+            "multi-warp body must not zero SMEM dK/dV tiles"
         );
     }
 
