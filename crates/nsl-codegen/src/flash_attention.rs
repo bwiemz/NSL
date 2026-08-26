@@ -3777,6 +3777,13 @@ fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConf
     ptx.push_str("    .reg .f32 %f_l_val;\n");
     ptx.push_str("    .reg .f32 %f_tmp;\n");
     ptx.push_str("    .reg .f32 %f_discard;  // sink for atom.shared.add.f32 return value\n");
+    // Dedicated scratch for the coalesced tile-copy helper
+    // (emit_bwd_coalesced_tile_copy). Named so the copy loops can never
+    // collide with the numbered scratch the surrounding q-loop bodies hold
+    // live across a copy (%rd24 = i_block, %rd25 = q_start, %rd26 = the
+    // tile's global base).
+    ptx.push_str("    .reg .u64 %rd_cp<6>;\n");
+    ptx.push_str("    .reg .f32 %f_cp;\n");
     // SMEM addressing prolog — the emit_smem_store / emit_smem_load / emit_smem_atom
     // helpers (used throughout both the scalar and MMA q-tile loops) address shared
     // memory as `add.s64 %smem_addr, %shmem_base, <offset>` + `st/ld/atom.shared
@@ -3919,6 +3926,124 @@ fn emit_bwd_main_index_computation(
 /// `%rd_gqa_kvoff` instead of the q-side `%rd15` — the only difference from
 /// the plain emission (the tile is loaded once per CTA and reused by every
 /// q-head in the group).
+/// Coalesced global<->shared tile copy for the backward's [rows, head_dim]
+/// tiles (K/V once per CTA, Q/dO every q-iteration, dK/dV at store time).
+///
+/// The historical loops assigned thread = row (outer) and walked head_dim
+/// serially (inner), so at any instant the active lanes touched addresses
+/// `head_dim * 4` bytes apart — every warp-wide access split into 32 separate
+/// transactions. This helper assigns warp w -> rows w, w+nwarps, ... and lane
+/// l -> columns l, l+32, ...: consecutive lanes hit consecutive f32s, one
+/// 128B transaction per warp access. The per-thread element count is
+/// unchanged and each element is read/written exactly once by exactly one
+/// thread, so the copy is numerics-identical to the old loop — only the
+/// access ORDER across lanes changes.
+///
+/// `nthreads` is the launch's thread count (block_q today; the Phase-B
+/// multi-warp launch passes its larger count). The coalesced form needs full
+/// warps; a sub-warp or non-multiple-of-32 count (diag sweeps use bq=16)
+/// falls back to the historical row-per-thread loop, which is correct for
+/// any count.
+///
+/// `global_base_reg` holds the tile's global BYTE base and is only read.
+/// Clobbers: %rd_cp0..%rd_cp5, %f_cp, %p1, %p2 (declared in
+/// emit_bwd_main_registers; the numbered scratch the q-loop keeps live
+/// across copies — %rd24/%rd25/%rd26 — is untouched).
+fn emit_bwd_coalesced_tile_copy(
+    ptx: &mut String,
+    label: &str,
+    rows: i64,
+    head_dim: i64,
+    hd_padded: i64,
+    nthreads: i64,
+    global_base_reg: &str,
+    smem_byte_off: i64,
+    to_smem: bool,
+) {
+    let hd_bytes = head_dim * 4;
+    let hdp_bytes = hd_padded * 4;
+    if nthreads % 32 != 0 {
+        // Historical row-per-thread loop (any thread count).
+        ptx.push_str(&format!("    mov.u64 %rd_cp0, %rd11;  // row = tid\n"));
+        ptx.push_str(&format!("{label}:\n"));
+        ptx.push_str(&format!("    setp.ge.u64 %p1, %rd_cp0, {rows};\n"));
+        ptx.push_str(&format!("    @%p1 bra {label}_DONE;\n"));
+        ptx.push_str("    mov.u64 %rd_cp4, 0;  // col byte = 0\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_cp2, %rd_cp0, {hd_bytes};\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_cp2, {global_base_reg}, %rd_cp2;  // global row base\n"
+        ));
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_cp3, %rd_cp0, {hdp_bytes};\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_cp3, %rd_cp3, {smem_byte_off};  // smem row byte off\n"
+        ));
+        ptx.push_str(&format!("{label}_C:\n"));
+        ptx.push_str(&format!("    setp.ge.u64 %p2, %rd_cp4, {hd_bytes};\n"));
+        ptx.push_str(&format!("    @%p2 bra {label}_C_DONE;\n"));
+        emit_bwd_tile_copy_element(ptx, to_smem);
+        ptx.push_str("    add.u64 %rd_cp4, %rd_cp4, 4;\n");
+        ptx.push_str(&format!("    bra {label}_C;\n"));
+        ptx.push_str(&format!("{label}_C_DONE:\n"));
+        ptx.push_str(&format!("    add.u64 %rd_cp0, %rd_cp0, {nthreads};\n"));
+        ptx.push_str(&format!("    bra {label};\n"));
+        ptx.push_str(&format!("{label}_DONE:\n\n"));
+        return;
+    }
+    let nwarps = nthreads / 32;
+    ptx.push_str(&format!(
+        "    // coalesced copy: warp w -> rows w, w+{nwarps}, ...; lane l -> cols l, l+32, ...\n"
+    ));
+    ptx.push_str("    shr.b64 %rd_cp0, %rd11, 5;   // row = warp id\n");
+    ptx.push_str("    and.b64 %rd_cp1, %rd11, 31;  // lane\n");
+    ptx.push_str("    shl.b64 %rd_cp1, %rd_cp1, 2; // lane byte offset\n");
+    ptx.push_str(&format!("{label}:\n"));
+    ptx.push_str(&format!("    setp.ge.u64 %p1, %rd_cp0, {rows};\n"));
+    ptx.push_str(&format!("    @%p1 bra {label}_DONE;\n"));
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_cp2, %rd_cp0, {hd_bytes};\n"
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %rd_cp2, {global_base_reg}, %rd_cp2;  // global row base\n"
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_cp3, %rd_cp0, {hdp_bytes};\n"
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %rd_cp3, %rd_cp3, {smem_byte_off};  // smem row byte off\n"
+    ));
+    ptx.push_str("    mov.u64 %rd_cp4, %rd_cp1;    // col byte = lane*4\n");
+    ptx.push_str(&format!("{label}_C:\n"));
+    ptx.push_str(&format!("    setp.ge.u64 %p2, %rd_cp4, {hd_bytes};\n"));
+    ptx.push_str(&format!("    @%p2 bra {label}_C_DONE;\n"));
+    emit_bwd_tile_copy_element(ptx, to_smem);
+    ptx.push_str("    add.u64 %rd_cp4, %rd_cp4, 128;  // += 32 lanes * 4B\n");
+    ptx.push_str(&format!("    bra {label}_C;\n"));
+    ptx.push_str(&format!("{label}_C_DONE:\n"));
+    ptx.push_str(&format!("    add.u64 %rd_cp0, %rd_cp0, {nwarps};\n"));
+    ptx.push_str(&format!("    bra {label};\n"));
+    ptx.push_str(&format!("{label}_DONE:\n\n"));
+}
+
+/// One element move for emit_bwd_coalesced_tile_copy: %rd_cp2 = global row
+/// base, %rd_cp3 = smem row byte offset, %rd_cp4 = column byte offset.
+fn emit_bwd_tile_copy_element(ptx: &mut String, to_smem: bool) {
+    if to_smem {
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp2, %rd_cp4;\n");
+        ptx.push_str("    ld.global.f32 %f_cp, [%rd_cp5];\n");
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp3, %rd_cp4;\n");
+        emit_smem_store(ptx, "f32", "%rd_cp5", "%f_cp");
+    } else {
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp3, %rd_cp4;\n");
+        emit_smem_load(ptx, "f32", "%f_cp", "%rd_cp5");
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp2, %rd_cp4;\n");
+        ptx.push_str("    st.global.f32 [%rd_cp5], %f_cp;\n");
+    }
+}
+
 fn emit_bwd_main_load_kv_tiles(
     ptx: &mut String,
     config: &FlashAttentionBackwardConfig,
@@ -3947,89 +4072,36 @@ fn emit_bwd_main_load_kv_tiles(
     ptx.push_str("    shl.b64 %rd19, %rd19, 2;\n");
     ptx.push_str("    add.u64 %rd19, %rd3, %rd19;        // v_global_base\n\n");
 
-    // Cooperative load K tile: thread tid loads rows starting at tid, stride block_q
-    // Each row has head_dim elements in global, stored with hd_padded stride in shmem
+    // Cooperative coalesced load of the K tile (padded rows) into shmem[0..]
     ptx.push_str("    // Load K tile (with padding) into shmem[0..]\n");
-    ptx.push_str("    mov.u64 %rd20, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_K:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd20, {};\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_LOAD_K_DONE;\n");
-
-    // For each row nj: load head_dim elements from global, store to shmem with padded stride
-    ptx.push_str("    mov.u64 %rd21, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_K_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd21, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_K_D_DONE;\n");
-    // global addr: k_global_base + (nj * head_dim + d) * 4
-    ptx.push_str("    mul.lo.u64 %rd22, %rd20, %rd10;\n");
-    ptx.push_str("    add.u64 %rd22, %rd22, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd22, %rd22, 2;\n");
-    ptx.push_str("    add.u64 %rd22, %rd18, %rd22;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd22];\n");
-    // shmem addr: (nj * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd23, %rd20, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd23, %rd23, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd23, %rd23, 2;\n");
-    emit_smem_store(ptx, "f32", "%rd23", "%f0");
-    ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_K_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_K_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd20, %rd20, {};  // nj += block_q (stride by num threads)\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_K;\n");
-    ptx.push_str("BWD_MAIN_LOAD_K_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_K",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd18",
+        0,
+        true,
+    );
 
     // Load V tile: shmem offset = v_offset
     ptx.push_str(&format!(
         "    // Load V tile into shmem[{}..]\n",
         v_offset
     ));
-    ptx.push_str("    mov.u64 %rd20, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_V:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd20, {};\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_LOAD_V_DONE;\n");
-    ptx.push_str("    mov.u64 %rd21, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_V_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd21, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_V_D_DONE;\n");
-    // global addr: v_global_base + (nj * head_dim + d) * 4
-    ptx.push_str("    mul.lo.u64 %rd22, %rd20, %rd10;\n");
-    ptx.push_str("    add.u64 %rd22, %rd22, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd22, %rd22, 2;\n");
-    ptx.push_str("    add.u64 %rd22, %rd19, %rd22;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd22];\n");
-    // shmem addr: v_offset + (nj * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd23, %rd20, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd23, %rd23, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd23, %rd23, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd23, %rd23, {};  // + V tile shmem offset\n",
-        v_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd23", "%f0");
-    ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_V_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_V_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd20, %rd20, {};  // nj += block_q\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_V;\n");
-    ptx.push_str("BWD_MAIN_LOAD_V_DONE:\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_V",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd19",
+        v_offset,
+        true,
+    );
 
     ptx.push_str("    bar.sync 0;  // K and V tiles loaded\n\n");
 }
@@ -4131,44 +4203,18 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd1, %rd26;  // q_global_base\n");
 
-    // Cooperative load Q tile rows
-    ptx.push_str("    mov.u64 %rd27, %rd11;  // mi = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_Q_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_Q_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    // shmem: q_shmem_offset + (mi * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        q_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_DONE:\n\n");
+    // Cooperative coalesced load of the Q tile rows
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_Q",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd26",
+        q_shmem_offset,
+        true,
+    );
 
     // Load dO[i_block] into shmem[do_shmem_offset..]
     ptx.push_str(&format!(
@@ -4180,42 +4226,17 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd0, %rd26;  // dO_global_base\n");
 
-    ptx.push_str("    mov.u64 %rd27, %rd11;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DO_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_DO_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        do_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_DO",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd26",
+        do_shmem_offset,
+        true,
+    );
 
     // Load D[i_block] and L[i_block] vectors into shmem
     ptx.push_str("    // Load D[i_block] and L[i_block] into shmem\n");
@@ -4696,42 +4717,17 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd1, %rd26;  // q_global_base\n");
 
-    ptx.push_str("    mov.u64 %rd27, %rd11;  // mi = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_Q_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_Q_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        q_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_Q",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd26",
+        q_shmem_offset,
+        true,
+    );
 
     // Load dO[i_block] into shmem[do_shmem_offset..]
     ptx.push_str(&format!(
@@ -4743,42 +4739,17 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd0, %rd26;  // dO_global_base\n");
 
-    ptx.push_str("    mov.u64 %rd27, %rd11;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DO_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_DO_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        do_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_DO",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd26",
+        do_shmem_offset,
+        true,
+    );
 
     // Load D[i_block] and L[i_block] vectors into shmem
     ptx.push_str("    // Load D[i_block] and L[i_block] into shmem\n");
@@ -6049,83 +6020,31 @@ fn emit_bwd_main_store_dk_dv(
     ptx.push_str("    shl.b64 %rd21, %rd21, 2;\n");
     ptx.push_str("    add.u64 %rd21, %rd6, %rd21;  // dv_global_base\n\n");
 
-    // Store dK: thread tid stores rows starting at tid, stride block_q
-    ptx.push_str("    mov.u64 %rd22, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_STORE_DK:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd22, {};\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_STORE_DK_DONE;\n");
-    ptx.push_str("    mov.u64 %rd23, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_STORE_DK_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd23, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_STORE_DK_D_DONE;\n");
-    // shmem addr: dk_shmem_offset + (nj * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd24, %rd22, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd24, %rd24, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd24, %rd24, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd24, %rd24, {};\n",
-        dk_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f0", "%rd24");
-    // global addr: dk_global_base + (nj * head_dim + d) * 4
-    ptx.push_str("    mul.lo.u64 %rd25, %rd22, %rd10;\n");
-    ptx.push_str("    add.u64 %rd25, %rd25, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd25, %rd25, 2;\n");
-    ptx.push_str("    add.u64 %rd25, %rd20, %rd25;\n");
-    ptx.push_str("    st.global.f32 [%rd25], %f0;\n");
-    ptx.push_str("    add.u64 %rd23, %rd23, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_STORE_DK_D;\n");
-    ptx.push_str("BWD_MAIN_STORE_DK_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd22, %rd22, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_STORE_DK;\n");
-    ptx.push_str("BWD_MAIN_STORE_DK_DONE:\n\n");
+    // Store dK: coalesced smem -> global copy of the CTA-exclusive kv slice
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_STORE_DK",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd20",
+        dk_shmem_offset,
+        false,
+    );
 
     // Store dV
-    ptx.push_str("    mov.u64 %rd22, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_STORE_DV:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd22, {};\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_STORE_DV_DONE;\n");
-    ptx.push_str("    mov.u64 %rd23, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_STORE_DV_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd23, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_STORE_DV_D_DONE;\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd24, %rd22, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd24, %rd24, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd24, %rd24, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd24, %rd24, {};\n",
-        dv_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f0", "%rd24");
-    ptx.push_str("    mul.lo.u64 %rd25, %rd22, %rd10;\n");
-    ptx.push_str("    add.u64 %rd25, %rd25, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd25, %rd25, 2;\n");
-    ptx.push_str("    add.u64 %rd25, %rd21, %rd25;\n");
-    ptx.push_str("    st.global.f32 [%rd25], %f0;\n");
-    ptx.push_str("    add.u64 %rd23, %rd23, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_STORE_DV_D;\n");
-    ptx.push_str("BWD_MAIN_STORE_DV_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd22, %rd22, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_STORE_DV;\n");
-    ptx.push_str("BWD_MAIN_STORE_DV_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_STORE_DV",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd21",
+        dv_shmem_offset,
+        false,
+    );
 }
 
 #[cfg(test)]
