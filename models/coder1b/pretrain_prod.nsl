@@ -73,10 +73,13 @@
 #
 # So lr = 1e-4 here is the WIDTH SCALING of item 9's measurement, not a repeat
 # of it: 1.5e-4 * 1280/2048 = 9.4e-5. A principled default, chosen because the
-# budget could not resolve a learning rate then. Item 15's corpus is wired
-# in NOW (~21 tokens/param); the item-6 pilot's descent shape is the first
-# evidence on whether this default holds, and a controlled LR pair at a
-# rankable budget is the follow-up if it does not.
+# budget could not resolve a learning rate then. The item-6 pilot DID
+# resolve it: 1e-4 went flat after warmup for 21,600 micro-steps, and the
+# matched-pair 3e-5 arm (identical batches) descended continuously to
+# VAL_LOSS_STACK 7.392 / VAL_LOSS_WEB 8.009. This recipe carries the
+# measured 3e-5 (min_lr scaled by the same 0.3 ratio); the intermediate
+# run checks its transfer to the full schedule.
+# (PILOT1B_VALIDATION_2026_08_25.md.)
 # Arms, corrected statistics, and the per-flag table:
 # models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
 #
@@ -226,8 +229,8 @@ print("LOSS_STREAM_BEGIN")
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
 train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
-    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.00003)
+    optimizer: AdamW(lr=0.00003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.000009)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
         let flat_logits = logits.reshape([4096, 49152])
