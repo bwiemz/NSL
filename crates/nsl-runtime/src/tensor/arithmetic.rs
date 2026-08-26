@@ -877,6 +877,262 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     result
 }
 
+/// Scalar-RHS division (mfu-fusion C3 scalar sweep): `out = a / s`, one
+/// kernel launch replacing the decomposed `Div(x, Constant)` chain (scalar
+/// CPU tensor + synchronous HtoD + full-size broadcast materialize + the
+/// nsl_div_f32 launch). Clone of the [`nsl_tensor_mul_scalar`] template:
+/// host narrows `s as f32` for the f32 path (the identical single narrowing
+/// `nsl_tensor_scalar` performed), GPU arm via the scalar-op launcher with a
+/// kernel whose `div.approx.f32` is copied verbatim from `nsl_div_f32`, CPU
+/// arm the bit-exact loop.
+///
+/// ADJOINT-ONLY: emitted by codegen exclusively inside the source-AD
+/// backward. There is no `TapeOp::DivScalar`, so running this under an armed
+/// tape would silently drop the op from the graph (the #396 silent-drop
+/// class) — it refuses instead.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_div_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
+    use crate::tensor::fbip_flags::relinquish_a;
+    assert!(
+        !autodiff::is_recording(),
+        "nsl_tensor_div_scalar: called while the autodiff tape is recording; \
+         this adjoint-only op has no tape rule (use nsl_tensor_div with a \
+         scalar tensor on taped paths)"
+    );
+    let relinq_a = relinquish_a(flags);
+    {
+        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                if relinq_a {
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::DIV_SCALAR_F32_PTX, "nsl_div_scalar_f32\0");
+                    // Ownership transfer: relinquished A ref becomes the result ref.
+                    super::fbip_record_reuse();
+                    return a_ptr;
+                }
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::DIV_SCALAR_F32_PTX, "nsl_div_scalar_f32\0");
+                if relinq_a { nsl_tensor_free(a_ptr); }
+                return result;
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
+    // FBIP: mutate in-place when the caller relinquished (CPU).
+    // Skip for i32 — the dtype arms below would flat-index it as f64 (8-byte
+    // writes into a 4-byte-element buffer). Same guard as nsl_tensor_mul_scalar.
+    {
+        let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
+        if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
+            let len = t.len as usize;
+            if t.dtype == crate::tensor::DTYPE_FP16 {
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::f16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_f16_bits(v / sf) };
+                }
+            } else if t.dtype == crate::tensor::DTYPE_BF16 {
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::bf16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_bf16_bits(v / sf) };
+                }
+            } else if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                let sf = s as f32;
+                for i in 0..len { unsafe { *d.add(i) /= sf }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) /= s }; }
+            }
+            // Ownership transfer: no refcount bump.
+            super::fbip_record_reuse();
+            return a_ptr;
+        }
+    }
+    super::fbip_record_alloc();
+    let a_c = nsl_tensor_contiguous(a_ptr);
+    let a = NslTensor::from_ptr(a_c);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+
+    let data: *mut c_void = if a.dtype == crate::tensor::DTYPE_FP16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let sf = s as f32;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::f16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_f16_bits(v / sf) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == crate::tensor::DTYPE_BF16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let sf = s as f32;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::bf16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_bf16_bits(v / sf) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f32().add(i) / (s as f32) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f64().add(i) / s };
+        }
+        buf as *mut c_void
+    };
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
+    let result = NslTensor::publish(result);
+    nsl_tensor_free(a_c);
+    if relinq_a { nsl_tensor_free(a_ptr); }
+    result
+}
+
+/// Scalar-RHS subtraction (mfu-fusion C3 scalar sweep): `out = a - s`.
+/// Same template, contract, and adjoint-only refusal as
+/// [`nsl_tensor_div_scalar`] above; the GPU kernel's `sub.f32` is copied
+/// verbatim from `nsl_sub_f32`.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
+    use crate::tensor::fbip_flags::relinquish_a;
+    assert!(
+        !autodiff::is_recording(),
+        "nsl_tensor_sub_scalar: called while the autodiff tape is recording; \
+         this adjoint-only op has no tape rule (use nsl_tensor_sub with a \
+         scalar tensor on taped paths)"
+    );
+    let relinq_a = relinquish_a(flags);
+    {
+        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                if relinq_a {
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::SUB_SCALAR_F32_PTX, "nsl_sub_scalar_f32\0");
+                    // Ownership transfer: relinquished A ref becomes the result ref.
+                    super::fbip_record_reuse();
+                    return a_ptr;
+                }
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::SUB_SCALAR_F32_PTX, "nsl_sub_scalar_f32\0");
+                if relinq_a { nsl_tensor_free(a_ptr); }
+                return result;
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
+    // FBIP: mutate in-place when the caller relinquished (CPU). i32 guard as
+    // in nsl_tensor_mul_scalar.
+    {
+        let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
+        if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
+            let len = t.len as usize;
+            if t.dtype == crate::tensor::DTYPE_FP16 {
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::f16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_f16_bits(v - sf) };
+                }
+            } else if t.dtype == crate::tensor::DTYPE_BF16 {
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::bf16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_bf16_bits(v - sf) };
+                }
+            } else if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                let sf = s as f32;
+                for i in 0..len { unsafe { *d.add(i) -= sf }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) -= s }; }
+            }
+            // Ownership transfer: no refcount bump.
+            super::fbip_record_reuse();
+            return a_ptr;
+        }
+    }
+    super::fbip_record_alloc();
+    let a_c = nsl_tensor_contiguous(a_ptr);
+    let a = NslTensor::from_ptr(a_c);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+
+    let data: *mut c_void = if a.dtype == crate::tensor::DTYPE_FP16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let sf = s as f32;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::f16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_f16_bits(v - sf) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == crate::tensor::DTYPE_BF16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let sf = s as f32;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::bf16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_bf16_bits(v - sf) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f32().add(i) - (s as f32) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f64().add(i) - s };
+        }
+        buf as *mut c_void
+    };
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
+    let result = NslTensor::publish(result);
+    nsl_tensor_free(a_c);
+    if relinq_a { nsl_tensor_free(a_ptr); }
+    result
+}
+
 /// FASE fused scaled-add epilogue (Milestone C · p4): `m += s * g`, in place
 /// into `m`, leaving `g` untouched (the caller still owns and frees it).
 ///
@@ -1807,6 +2063,107 @@ mod fbip_add_tests {
         assert_eq!(read_f64(out, 0), 50.0);
         assert_eq!(read_f64(out, 1), 100.0);
         nsl_tensor_free(out); // == a
+    }
+
+    // mfu-fusion C3: the two new scalar FFIs pin the same flags/refcount
+    // contract as their mul_scalar template.
+
+    #[test]
+    fn div_scalar_flags_zero_leaves_input_alive() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        let out = nsl_tensor_div_scalar(a, 5.0, 0);
+        assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
+        assert_eq!(read_f64(a, 0), 10.0);
+        assert_eq!(read_f64(a, 1), 20.0);
+        assert_eq!(read_f64(out, 0), 2.0);
+        assert_eq!(read_f64(out, 1), 4.0);
+        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(a);
+        nsl_tensor_free(out);
+    }
+
+    #[test]
+    fn div_scalar_flags_relinquish_a_inplace() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        let out = nsl_tensor_div_scalar(a, 5.0, RELINQUISH_A);
+        assert_eq!(out, a, "in-place on A should return A");
+        assert_eq!(read_f64(out, 0), 2.0);
+        assert_eq!(read_f64(out, 1), 4.0);
+        nsl_tensor_free(out); // == a
+    }
+
+    /// The f32 CPU arm must divide with a single `s as f32` narrowing —
+    /// identical to feeding `nsl_tensor_scalar(s, 1)` to `nsl_tensor_div`.
+    #[test]
+    fn div_scalar_f32_matches_decomposed_scalar_tensor_div() {
+        let vals = [1.5f32, -2.25, 3.0, 1e-3, -8.125, 0.0];
+        let s = 0.30000000000000004f64; // no exact f32/f64 form
+        let read_f32 = |ptr: i64, i: usize| -> f32 {
+            let t = unsafe { &*(ptr as *const NslTensor) };
+            unsafe { *(t.data as *const f32).add(i) }
+        };
+        let a1 = make_tensor_f32(&vals);
+        let fused = nsl_tensor_div_scalar(a1, s, 0);
+        let a2 = make_tensor_f32(&vals);
+        let st = crate::tensor::ad_ops::nsl_tensor_scalar(s, 1);
+        let decomposed = nsl_tensor_div(a2, st, 0);
+        for i in 0..vals.len() {
+            assert_eq!(
+                read_f32(fused, i).to_bits(),
+                read_f32(decomposed, i).to_bits(),
+                "f32 div_scalar mismatch at {i}"
+            );
+        }
+        for p in [a1, a2, st, fused, decomposed] { nsl_tensor_free(p); }
+    }
+
+    #[test]
+    fn sub_scalar_flags_zero_leaves_input_alive() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        let out = nsl_tensor_sub_scalar(a, 5.0, 0);
+        assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
+        assert_eq!(read_f64(a, 0), 10.0);
+        assert_eq!(read_f64(a, 1), 20.0);
+        assert_eq!(read_f64(out, 0), 5.0);
+        assert_eq!(read_f64(out, 1), 15.0);
+        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(a);
+        nsl_tensor_free(out);
+    }
+
+    #[test]
+    fn sub_scalar_flags_relinquish_a_inplace() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        let out = nsl_tensor_sub_scalar(a, 5.0, RELINQUISH_A);
+        assert_eq!(out, a, "in-place on A should return A");
+        assert_eq!(read_f64(out, 0), 5.0);
+        assert_eq!(read_f64(out, 1), 15.0);
+        nsl_tensor_free(out); // == a
+    }
+
+    #[test]
+    fn sub_scalar_f32_matches_decomposed_scalar_tensor_sub() {
+        let vals = [1.5f32, -2.25, 3.0, 1e-3, -8.125, 0.0];
+        let s = 0.30000000000000004f64;
+        let read_f32 = |ptr: i64, i: usize| -> f32 {
+            let t = unsafe { &*(ptr as *const NslTensor) };
+            unsafe { *(t.data as *const f32).add(i) }
+        };
+        let a1 = make_tensor_f32(&vals);
+        let fused = nsl_tensor_sub_scalar(a1, s, 0);
+        let a2 = make_tensor_f32(&vals);
+        let st = crate::tensor::ad_ops::nsl_tensor_scalar(s, 1);
+        let decomposed = nsl_tensor_sub(a2, st, 0);
+        for i in 0..vals.len() {
+            assert_eq!(
+                read_f32(fused, i).to_bits(),
+                read_f32(decomposed, i).to_bits(),
+                "f32 sub_scalar mismatch at {i}"
+            );
+        }
+        for p in [a1, a2, st, fused, decomposed] { nsl_tensor_free(p); }
     }
 
     // TODO(eltls): add a regression test for the cross-device RELINQUISH_B path

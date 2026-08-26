@@ -133,6 +133,14 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "a fusion peephole fired",
     ),
     m(
+        "[fused-ew]",
+        &[
+            "crates/nsl-runtime/src/tensor/fused_chain.rs",
+        ],
+        "the fused elementwise-chain runtime: launch/fallback counters and \
+         the decomposed-replay warn-once",
+    ),
+    m(
         "[csha]",
         &[
             "crates/nsl-codegen/src/stmt.rs",
@@ -631,6 +639,33 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         )],
     },
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs",
+        asserts: "the elementwise chain fuser did NOT fire with \
+                  NSL_FUSE_ELEMENTWISE_BWD=0 (and did not run under \
+                  --layerwise-accum)",
+        parts: &[(
+            "[fuse] elementwise backward chains:",
+            "crates/nsl-codegen/src/stmt.rs",
+        )],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/scalar_immediate_fold_gate.rs",
+        asserts: "the scalar-immediate sweep did NOT fire with \
+                  NSL_FUSE_SCALAR_IMM=0",
+        parts: &[(
+            "[fuse] scalar immediates:",
+            "crates/nsl-codegen/src/stmt.rs",
+        )],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/rope_neg_fold_gate.rs",
+        asserts: "the RoPE backward fold did NOT fire with NSL_FUSE_ROPE_NEG=0",
+        parts: &[(
+            "[fuse] rope backward folds:",
+            "crates/nsl-codegen/src/stmt.rs",
+        )],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/fused_lm_ce_decline_gate.rs",
         asserts: "a matching LM head, and a disabled decorator, produced NO \
                   fused linear-CE fallback diagnostic",
@@ -711,6 +746,11 @@ pub struct EventSchema {
 }
 
 pub const EVENT_SCHEMAS: &[EventSchema] = &[
+    EventSchema {
+        kind: "fused_ew_counters",
+        marker: "[fused-ew]",
+        fields: &["launches", "fallbacks"],
+    },
     EventSchema {
         kind: "zero_counters",
         marker: "[zero]",

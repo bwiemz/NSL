@@ -8,6 +8,7 @@ pub mod activation;
 pub mod trig;
 pub mod ad_ops;
 pub mod fbip_flags;
+pub mod fused_chain;
 pub mod precision_cast;
 pub mod int8_blockwise;
 
@@ -19,6 +20,7 @@ pub use shape_ops::*;
 pub use activation::*;
 pub use trig::*;
 pub use ad_ops::*;
+pub use fused_chain::*;
 
 use std::cell::Cell;
 use std::collections::HashMap;

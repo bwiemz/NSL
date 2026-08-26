@@ -19,6 +19,7 @@ pub(crate) mod caching_allocator;
 
 pub(crate) mod graph_capture;
 
+
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
@@ -1778,12 +1779,20 @@ pub(crate) mod inner {
             // CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was allocated
             // at the same heap address as a previously-freed one — the cache
             // returned the stale old module and the new kernel name was not found.
+            //
+            // mfu-fusion review: a pointer-keyed hash cache with a
+            // head/tail/length revalidation belt was tried here and REVERTED —
+            // the WRGA fused_adapter clones its PTX String per launch, and two
+            // same-length synthesized kernels share every belt byte (all PTX
+            // starts ".version" and ends "ret;\n}\n"), so heap reuse could
+            // serve a stale module again (plus the belt read past a shorter
+            // replacement string's terminator). A sound skip of this rescan
+            // needs a caller-declared-stable pointer contract (the CFIE
+            // load_module_once pattern); until then the full scan stays.
             let cache_key = {
-                // Compute length by scanning for the NUL terminator.
                 let mut len = 0usize;
                 while unsafe { *ptx_ptr.add(len) } != 0 { len += 1; }
                 let ptx_bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
-                // FNV-1a 64-bit hash (no external dep, no alloc).
                 let mut h: u64 = 14695981039346656037u64;
                 for &b in ptx_bytes {
                     h ^= b as u64;
@@ -1928,14 +1937,29 @@ pub(crate) mod inner {
         // Launch kernel (no lock held) — on the per-thread compute stream
         // (p8 PR-A; ordering-neutral vs the old NULL-stream launch, see
         // `current_stream`).
-        let mut kernel_args: Vec<*mut c_void> = args.to_vec();
+        //
+        // mfu-fusion C4: the kernelParams array is a fixed stack buffer for
+        // the common case (every launcher in this crate passes <= 8 args),
+        // replacing a per-launch `args.to_vec()` heap allocation. The Vec
+        // fallback keeps behavior identical for wider arg lists; `Vec::new()`
+        // does not allocate, so the fast path pays nothing for it.
+        // cuLaunchKernel only READS through kernelParams.
+        let mut stack_args: [*mut c_void; 16] = [std::ptr::null_mut(); 16];
+        let mut vec_args: Vec<*mut c_void> = Vec::new();
+        let kernel_args_ptr: *mut *mut c_void = if args.len() <= stack_args.len() {
+            stack_args[..args.len()].copy_from_slice(args);
+            stack_args.as_mut_ptr()
+        } else {
+            vec_args.extend_from_slice(args);
+            vec_args.as_mut_ptr()
+        };
         let res = unsafe {
             cuLaunchKernel(
                 func,
                 grid[0] as u32, grid[1] as u32, grid[2] as u32,
                 block[0] as u32, block[1] as u32, block[2] as u32,
                 shared_mem_bytes, current_stream(),
-                kernel_args.as_mut_ptr(), std::ptr::null_mut(),
+                kernel_args_ptr, std::ptr::null_mut(),
             )
         };
 
@@ -3506,6 +3530,129 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::ROTATE_HALF_F32_PTX.as_ptr(),
+        KERNEL_NAME.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU kernel '{}' failed: {}",
+        KERNEL_NAME.trim_end_matches('\0'),
+        result as u32
+    );
+    inner::sync_after_kernel();
+
+    if contiguous_ptr != tensor_ptr {
+        crate::tensor::nsl_tensor_free(contiguous_ptr);
+    }
+    out_ptr as i64
+}
+
+/// Fused RoPE-backward `neg(rotate_half(x))` (mfu-fusion C2): one launch and
+/// one full-size alloc where the decomposed pair paid two of each.
+///
+/// Clone of [`gpu_rotate_half_f32`] with the sign flip MOVED to match the
+/// composition, not a textbook formula: `nsl_rotate_half_f32` negates its
+/// FIRST-half outputs (`out[..h] = -in[h..]`, `out[h..] = in[..h]`), so
+/// negating that result cancels the first-half negation and introduces one
+/// on the second half — `out[..h] = in[h..]`, `out[h..] = -in[..h]`.
+/// f32 negation is a pure sign-bit flip, so the single-negation kernel is
+/// bit-identical to running `nsl_rotate_half_f32` then `nsl_neg_f32`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_rotate_half_neg_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+
+    // Degrade path mirrors gpu_rotate_half_f32's: compute the exact
+    // rotate-half-then-neg composition on CPU, then upload.
+    fn cpu_fallback_rotate_half_neg(ptr: i64, device: i32) -> i64 {
+        let cpu_input = crate::tensor::nsl_tensor_to_device(ptr, 0);
+        let cpu_out = crate::tensor::shape_ops::nsl_tensor_rotate_half_neg(cpu_input);
+        let gpu_out = crate::tensor::nsl_tensor_to_device(cpu_out, device as i64);
+        crate::tensor::nsl_tensor_free(cpu_input);
+        crate::tensor::nsl_tensor_free(cpu_out);
+        gpu_out
+    }
+
+    const KERNEL_NAME: &str = "nsl_rotate_half_neg_f32\0";
+
+    inner::set_oom_context(KERNEL_NAME.trim_end_matches('\0'));
+
+    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    assert!(tensor.device > 0, "gpu_rotate_half_neg_f32 requires a CUDA tensor");
+
+    // Dtype degrade BEFORE materialization, for the reason documented in
+    // gpu_rotate_half_f32: `nsl_tensor_contiguous` refuses non-f32 device
+    // tensors, so checking later would make the degrade stride-dependent.
+    if tensor.dtype != crate::tensor::DTYPE_F32 {
+        return cpu_fallback_rotate_half_neg(tensor_ptr, tensor.device as i32);
+    }
+
+    let contiguous_ptr = if tensor.is_contiguous() {
+        tensor_ptr
+    } else {
+        crate::tensor::nsl_tensor_contiguous(tensor_ptr)
+    };
+    let contiguous = unsafe { &*(contiguous_ptr as *const NslTensor) };
+
+    let ndim = contiguous.ndim as usize;
+    assert!(ndim > 0, "nsl: rotate_half_neg requires at least 1 dimension");
+
+    let last_dim = unsafe { *contiguous.shape.add(ndim - 1) } as usize;
+    assert!(
+        last_dim.is_multiple_of(2),
+        "nsl: rotate_half_neg requires even last dimension, got {}",
+        last_dim
+    );
+
+    debug_assert_eq!(contiguous.dtype, crate::tensor::DTYPE_F32);
+
+    let n = contiguous.len as usize;
+    let out_data = match inner::try_alloc_managed(n * 4) {
+        Some(ptr) => ptr,
+        None => {
+            let result = cpu_fallback_rotate_half_neg(contiguous_ptr, tensor.device as i32);
+            if contiguous_ptr != tensor_ptr {
+                crate::tensor::nsl_tensor_free(contiguous_ptr);
+            }
+            return result;
+        }
+    };
+
+    let shape = NslTensor::copy_shape(contiguous.shape, contiguous.ndim);
+    let strides = NslTensor::compute_strides(shape, contiguous.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        contiguous.ndim,
+        contiguous.len,
+        contiguous.device,
+        1,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = contiguous.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let mut last_dim_val = last_dim as u64;
+    let mut half_val = (last_dim / 2) as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut last_dim_val as *mut _ as *mut std::ffi::c_void,
+        &mut half_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::ROTATE_HALF_NEG_F32_PTX.as_ptr(),
         KERNEL_NAME.as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -5301,6 +5448,138 @@ pub(crate) fn gpu_backward_ternary(
         kernel_name.trim_end_matches('\0'),
         result as u32
     );
+    inner::sync_after_kernel();
+    out_ptr as i64
+}
+
+/// Fused elementwise-chain launch (mfu-fusion C3): `gpu_backward_ternary`'s
+/// pattern generalized to up to 6 inputs, with the compiler-synthesized PTX
+/// and kernel name arriving as raw NUL-terminated pointers (`.rodata` embeds,
+/// the fused-CE delivery precedent) instead of `'static` consts.
+///
+/// The synthesized kernel signature is `(param_out, param_in0..N-1,
+/// param_n: u64)` — output pointer FIRST (the `fusion.rs` emitter
+/// convention), unlike this file's hand-written elementwise kernels which
+/// take it after the inputs. kernelParams are marshaled to match.
+///
+/// Preconditions (the caller `nsl_fused_ew_chain` gates them; asserts here
+/// are belts): 1..=6 inputs, all GPU-resident contiguous f32 of one uniform
+/// length. Returns 0 on output-allocation failure or launch failure so the
+/// caller can degrade to its bit-exact decomposed replay instead of aborting
+/// mid-backward; the launch goes through the HOOKED `inner::kernel_launch`
+/// so cuda-graph capture, the kernel profiler, and launch counters all see
+/// it exactly as they see `nsl_mul_f32`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_fused_ew_launch(
+    inputs: &[&crate::tensor::NslTensor],
+    ptx: *const u8,
+    kname: *const u8,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    const MAX_INPUTS: usize = 6;
+    inner::set_oom_context("nsl_fused_ew_chain");
+    assert!(
+        !inputs.is_empty() && inputs.len() <= MAX_INPUTS,
+        "gpu_fused_ew_launch: {} inputs (contract is 1..=6)",
+        inputs.len()
+    );
+    assert!(
+        !ptx.is_null() && !kname.is_null(),
+        "gpu_fused_ew_launch: null ptx/kname (the caller's gate must reject these)"
+    );
+    let first = inputs[0];
+    for (i, t) in inputs.iter().enumerate() {
+        assert_gpu_f32(t, "nsl_fused_ew_chain", "chain input");
+        assert!(
+            t.len == first.len && t.is_contiguous(),
+            "gpu_fused_ew_launch: input {i} violates the uniform-contiguous gate \
+             (len {} vs {}, contiguous={})",
+            t.len,
+            first.len,
+            t.is_contiguous()
+        );
+    }
+
+    // Degrade diagnostics are warn-once: under sustained OOM / persistent
+    // launch failure every chain call takes these arms (hundreds per
+    // micro-batch), and an unbuffered stderr line per call would flood
+    // exactly when the run is slowest. The FUSED_EW_FALLBACKS counter
+    // records every occurrence regardless.
+    static OOM_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static LAUNCH_FAIL_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    let n = first.len as usize;
+    let out_data = match inner::try_alloc_managed(n * 4) {
+        Some(ptr) => ptr,
+        None => {
+            if !OOM_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nsl] GPU OOM in nsl_fused_ew_chain — degrading to decomposed replay \
+                     (warn-once; see fused_ew_counters for totals)"
+                );
+            }
+            return 0;
+        }
+    };
+    let shape = NslTensor::copy_shape(first.shape, first.ndim);
+    let strides = NslTensor::compute_strides(shape, first.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        first.ndim,
+        first.len,
+        first.device,
+        1,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    // kernelParams = [&out, &in0.., &n] — one u64 local per pointer param,
+    // exactly as the sibling launchers marshal (raw pointers into locals
+    // that live until the launch returns).
+    let mut out_val = out_t.data as u64;
+    let mut in_vals = [0u64; MAX_INPUTS];
+    for (i, t) in inputs.iter().enumerate() {
+        in_vals[i] = t.data as u64;
+    }
+    let mut n_val = n as u64;
+    let mut args: [*mut c_void; MAX_INPUTS + 2] = [std::ptr::null_mut(); MAX_INPUTS + 2];
+    args[0] = &mut out_val as *mut _ as *mut c_void;
+    for (i, v) in in_vals.iter_mut().enumerate().take(inputs.len()) {
+        args[1 + i] = v as *mut _ as *mut c_void;
+    }
+    args[1 + inputs.len()] = &mut n_val as *mut _ as *mut c_void;
+
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx,
+        kname,
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args[..inputs.len() + 2],
+        0,
+    );
+    if result as u32 != 0 {
+        // Tear down through nsl_tensor_free — the ONLY teardown that also
+        // releases the checked_alloc'd shape/strides arrays and clears the
+        // struct (a Box::from_raw + free_managed pair leaks both arrays and
+        // leaves TENSOR_MAGIC in freed memory; review finding). Then let the
+        // caller replay — same degrade contract as the OOM arm above.
+        if !LAUNCH_FAIL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[nsl] fused-ew GPU kernel launch failed ({}) — degrading to decomposed \
+                 replay (warn-once; see fused_ew_counters for totals)",
+                result as u32
+            );
+        }
+        crate::tensor::nsl_tensor_free(out_ptr as i64);
+        return 0;
+    }
     inner::sync_after_kernel();
     out_ptr as i64
 }

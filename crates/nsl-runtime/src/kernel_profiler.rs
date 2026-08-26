@@ -54,7 +54,36 @@ pub fn kernel_profiler_enabled() -> bool {
 }
 
 #[allow(dead_code)] // used in cuda feature gate block
-const EVENT_POOL_SIZE: usize = 4096;
+const EVENT_POOL_SIZE_DEFAULT: usize = 4096;
+
+/// Hard cap on the pool (mfu-fusion C1). Each slot is one cuEvent PAIR plus
+/// a trace entry; 65536 pairs comfortably covers several full micro-batches
+/// of the 1B recipe while bounding driver-object count if someone fat-fingers
+/// the env var.
+#[allow(dead_code)] // used in cuda feature gate block
+const EVENT_POOL_SIZE_CAP: usize = 65536;
+
+/// `NSL_PROFILE_KERNELS_POOL` parse rule: default 4096 (unset, empty, or
+/// unparsable — a bad value must not silently change what a profiling run
+/// measures), capped at 65536. Split from the env read for direct testing.
+#[allow(dead_code)] // consumed by the cuda-gated pool init; kept unconditional so the CPU test suite pins the parse rule
+fn parse_pool_size(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(EVENT_POOL_SIZE_DEFAULT)
+        .min(EVENT_POOL_SIZE_CAP)
+}
+
+/// Pool size for the cuEvent pairs, from `NSL_PROFILE_KERNELS_POOL`.
+/// Read once per process — the pool is allocated once, on the first
+/// profiled launch.
+#[allow(dead_code)] // used in cuda feature gate block
+fn event_pool_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        parse_pool_size(std::env::var("NSL_PROFILE_KERNELS_POOL").ok().as_deref())
+    })
+}
 
 /// Initialize the kernel profiler.
 ///
@@ -130,8 +159,9 @@ pub(crate) fn ensure_event_pool_initialized() {
     // both are populated atomically from the observer's perspective.
     let mut base = KERNEL_PROFILER.gpu_base_event.lock().unwrap();
 
-    pool.reserve(EVENT_POOL_SIZE);
-    for _ in 0..EVENT_POOL_SIZE {
+    let pool_size = event_pool_size();
+    pool.reserve(pool_size);
+    for _ in 0..pool_size {
         let mut start: u64 = 0;
         let mut stop: u64 = 0;
         unsafe {
@@ -427,6 +457,21 @@ mod tests {
 
     // Tests share global KERNEL_PROFILER state and must not run concurrently.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// NSL_PROFILE_KERNELS_POOL parse rule (mfu-fusion C1): default 4096,
+    /// parse-failure = default (never a silent zero-slot pool), cap 65536.
+    #[test]
+    fn pool_size_env_parse_rule() {
+        assert_eq!(parse_pool_size(None), 4096, "unset -> default");
+        assert_eq!(parse_pool_size(Some("16384")), 16384);
+        assert_eq!(parse_pool_size(Some(" 8192 ")), 8192, "whitespace tolerated");
+        assert_eq!(parse_pool_size(Some("banana")), 4096, "unparsable -> default");
+        assert_eq!(parse_pool_size(Some("")), 4096, "empty -> default");
+        assert_eq!(parse_pool_size(Some("0")), 4096, "zero -> default (a 0-slot pool records nothing)");
+        assert_eq!(parse_pool_size(Some("-5")), 4096, "negative -> default");
+        assert_eq!(parse_pool_size(Some("1000000")), 65536, "capped at 65536");
+        assert_eq!(parse_pool_size(Some("65536")), 65536);
+    }
 
     #[test]
     fn test_profiler_enable_disable() {

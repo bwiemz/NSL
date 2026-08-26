@@ -657,6 +657,15 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("fpga_error", "FPGA backend errors"),
     ("func", "function lowering"),
     ("fused_linear_ce", "fused loss kernel emitter"),
+    (
+        "ew_chain_fusion",
+        "elementwise-chain fusion over the adjoint tape — a LOWERING peephole \
+         invoked from the stmt.rs adjoint window like fuse_swiglu_gate_backward, \
+         not a registered pass; same considered line as `wgrad_fusion`, \
+         `fusion`, `fused_linear_ce`, `matmul_mma` and `flash_attention`. It \
+         reports its own effect (`[fuse] elementwise backward chains: N`, \
+         pinned by an exec-marker)",
+    ),
     ("fusion", "elementwise fusion (M31) - graph/report/driver"),
     ("gpu_spec", "GPU capability tables"),
     ("gpu_target", "GPU target selection"),

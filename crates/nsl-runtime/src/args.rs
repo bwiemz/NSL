@@ -100,6 +100,22 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
+    // mfu-fusion C3: fused elementwise-chain launch vs decomposed-replay
+    // counts, enabled when NSL_FUSED_EW_COUNTER=1 (or NSL_EVENTS, which gets
+    // the machine twin regardless). Same anti-vacuity rationale as the wgrad
+    // pair: the replay fallback is warn-once, so a green bit-exactness gate
+    // could otherwise be testing the decomposed chain against itself. The
+    // report fn IS the atexit hook (it re-reads its own env var for the
+    // human line, per the Item-17 pattern above).
+    if events_on || std::env::var("NSL_FUSED_EW_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(crate::tensor::fused_chain::nsl_fused_ew_counters_report);
+        }
+    }
+
     // D1 (CSLA Stage-2): layerwise window-backward count, enabled when
     // NSL_CSLA_COUNTER=1. Lets the differential gate assert the buffered
     // backward phase actually fired (anti-vacuity), same pattern as above.

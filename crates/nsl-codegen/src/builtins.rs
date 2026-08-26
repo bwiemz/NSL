@@ -390,6 +390,46 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
+    // Scalar-immediate siblings (MFU campaign C3): x / s and x - s with the
+    // scalar as an argument instead of a broadcast-materialized tensor.
+    (
+        "nsl_tensor_div_scalar",
+        &[types::I64, types::F64, types::I8],
+        Some(types::I64),
+    ),
+    (
+        "nsl_tensor_sub_scalar",
+        &[types::I64, types::F64, types::I8],
+        Some(types::I64),
+    ),
+    // Dispatching scalar-immediate entry (review fix): f32 -> the dedicated
+    // scalar kernel; any other dtype -> the literal decomposed baseline
+    // (preserves the mixed-dtype "f32 wins" narrowing AND output dtype).
+    // (tensor, f64 scalar, descriptor-v1 opcode) -> result handle.
+    (
+        "nsl_tensor_scalar_rhs",
+        &[types::I64, types::F64, types::I64],
+        Some(types::I64),
+    ),
+    // Fused elementwise-chain launcher (MFU campaign C3):
+    // (ptx, kname, descriptor, desc_len, in0..in5, n_inputs) -> result handle.
+    (
+        "nsl_fused_ew_chain",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     // FASE fused scaled-add epilogue (p4): m += s * g, in place, void.
     (
         "nsl_tensor_scalar_mul_add_inplace",
@@ -820,6 +860,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_cos", &[types::I64], Some(types::I64)),
     // Fused rotate_half (RoPE support)
     ("nsl_tensor_rotate_half", &[types::I64], Some(types::I64)),
+    // Fused RoPE backward: -rotate_half(dy) in one launch (bit-exact)
+    ("nsl_tensor_rotate_half_neg", &[types::I64], Some(types::I64)),
     (
         "nsl_tensor_softmax",
         &[types::I64, types::I64],

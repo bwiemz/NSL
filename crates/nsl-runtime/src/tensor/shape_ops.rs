@@ -1161,6 +1161,109 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
     result
 }
 
+/// Fused RoPE-backward `neg(rotate_half(x))` (mfu-fusion C2): one op where
+/// source-AD's `RotateHalfBackward` used to emit `rotate_half` + `Neg`.
+///
+/// The composition, spelled against [`nsl_tensor_rotate_half`]'s actual
+/// layout (NOT a textbook formula — rotate_half negates the SECOND-half
+/// *source* values into the first-half outputs):
+///
+/// ```text
+///   rotate_half: out[..h] = -in[h..],  out[h..] =  in[..h]
+///   then neg:    out[..h] =  in[h..],  out[h..] = -in[..h]
+/// ```
+///
+/// f32/f64 negation is a pure sign-bit flip, so writing `in[h..]` directly
+/// (the two flips cancel) and `-in[..h]` (one flip) is bit-identical to
+/// running the two ops, element for element — including NaN payloads and
+/// signed zeros.
+///
+/// ADJOINT-ONLY: emitted by codegen exclusively inside the source-AD
+/// backward. There is no tape rule for the fused form, so it refuses under
+/// an armed tape rather than silently dropping an edge (the #396 class).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_rotate_half_neg(tensor_ptr: i64) -> i64 {
+    assert!(
+        !crate::autodiff::is_recording(),
+        "nsl_tensor_rotate_half_neg: called while the autodiff tape is \
+         recording; this adjoint-only op has no tape rule (use \
+         nsl_tensor_rotate_half + nsl_tensor_neg on taped paths)"
+    );
+    let t_check = NslTensor::from_ptr(tensor_ptr);
+    if t_check.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            return crate::cuda::gpu_rotate_half_neg_f32(tensor_ptr);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!("CUDA support not compiled");
+        }
+    }
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_c);
+    let ndim = tensor.ndim as usize;
+
+    if ndim == 0 {
+        eprintln!("nsl: rotate_half_neg requires at least 1 dimension");
+        std::process::abort();
+    }
+
+    let last_dim = unsafe { *tensor.shape.add(ndim - 1) } as usize;
+    if !last_dim.is_multiple_of(2) {
+        eprintln!(
+            "nsl: rotate_half_neg requires even last dimension, got {}",
+            last_dim
+        );
+        std::process::abort();
+    }
+    let half = last_dim / 2;
+    let total = tensor.len as usize;
+    let num_chunks = total / last_dim;
+
+    let shape = NslTensor::copy_shape(tensor.shape, tensor.ndim);
+    let strides = NslTensor::compute_strides(shape, tensor.ndim);
+
+    let data: *mut c_void = if tensor.dtype == 1 {
+        let buf = checked_alloc(total * std::mem::size_of::<f32>()) as *mut f32;
+        let src = tensor.data_f32();
+        for chunk in 0..num_chunks {
+            let base = chunk * last_dim;
+            for i in 0..half {
+                unsafe { *buf.add(base + i) = *src.add(base + half + i) };
+                unsafe { *buf.add(base + half + i) = -(*src.add(base + i)) };
+            }
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc(total * std::mem::size_of::<f64>()) as *mut f64;
+        let src = tensor.data_f64();
+        for chunk in 0..num_chunks {
+            let base = chunk * last_dim;
+            for i in 0..half {
+                unsafe { *buf.add(base + i) = *src.add(base + half + i) };
+                unsafe { *buf.add(base + half + i) = -(*src.add(base + i)) };
+            }
+        }
+        buf as *mut c_void
+    };
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        tensor.ndim,
+        tensor.len,
+        tensor.device,
+        tensor.dtype,
+        1,
+        0,
+    ));
+    let result = NslTensor::publish(result);
+    nsl_tensor_free(t_c);
+    result
+}
+
 /// Materialize a non-contiguous tensor (e.g. from `expand`) into a contiguous copy.
 ///
 /// If the tensor is already contiguous (strides match row-major layout), the same
@@ -1282,4 +1385,91 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
         0,
     ));
     record_relabel(NslTensor::publish(result))
+}
+
+#[cfg(test)]
+mod rotate_half_neg_tests {
+    use super::*;
+
+    fn f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(shape, 1);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in vals.iter().enumerate() {
+            unsafe { *t.data_f32().add(i) = *v };
+        }
+        ptr
+    }
+
+    fn f64_tensor(shape: &[i64], vals: &[f64]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(shape, 0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in vals.iter().enumerate() {
+            unsafe { *t.data_f64().add(i) = *v };
+        }
+        ptr
+    }
+
+    /// CPU `rotate_half_neg(x)` must be byte-equal to `neg(rotate_half(x))`
+    /// on every element — including signed zeros (which value-equality would
+    /// miss), across several shapes with odd leading dims and the minimal
+    /// last_dim=2 case.
+    #[test]
+    fn cpu_rotate_half_neg_matches_neg_of_rotate_half_f32() {
+        let shapes: &[&[i64]] = &[&[3, 4], &[5, 2], &[1, 6], &[2, 3, 4]];
+        for shape in shapes {
+            let n: i64 = shape.iter().product();
+            // Deterministic values incl. 0.0 and -0.0 so a dropped sign flip
+            // on a zero cannot pass a value-compare.
+            let vals: Vec<f32> = (0..n)
+                .map(|i| match i % 5 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    _ => ((i as f32) * 0.37 - 1.5) * if i % 2 == 0 { 1.0 } else { -1.0 },
+                })
+                .collect();
+            let x1 = f32_tensor(shape, &vals);
+            let fused = nsl_tensor_rotate_half_neg(x1);
+            let x2 = f32_tensor(shape, &vals);
+            let rot = nsl_tensor_rotate_half(x2);
+            let composed = crate::tensor::arithmetic::nsl_tensor_neg(rot);
+            let ft = NslTensor::from_ptr(fused);
+            let ct = NslTensor::from_ptr(composed);
+            assert_eq!(ft.len, ct.len);
+            for i in 0..ft.len as usize {
+                let f = unsafe { *ft.data_f32().add(i) };
+                let c = unsafe { *ct.data_f32().add(i) };
+                assert_eq!(
+                    f.to_bits(),
+                    c.to_bits(),
+                    "shape {shape:?} elem {i}: fused {f} vs composed {c}"
+                );
+            }
+            for p in [x1, x2, rot, composed, fused] {
+                nsl_tensor_free(p);
+            }
+        }
+    }
+
+    /// Same parity on the f64 CPU arm (CPU adjoint values are f64 when the
+    /// whole chain runs on host).
+    #[test]
+    fn cpu_rotate_half_neg_matches_neg_of_rotate_half_f64() {
+        let shape: &[i64] = &[3, 6];
+        let vals: Vec<f64> = (0..18).map(|i| (i as f64) * 0.25 - 2.0).collect();
+        let x1 = f64_tensor(shape, &vals);
+        let fused = nsl_tensor_rotate_half_neg(x1);
+        let x2 = f64_tensor(shape, &vals);
+        let rot = nsl_tensor_rotate_half(x2);
+        let composed = crate::tensor::arithmetic::nsl_tensor_neg(rot);
+        let ft = NslTensor::from_ptr(fused);
+        let ct = NslTensor::from_ptr(composed);
+        for i in 0..ft.len as usize {
+            let f = unsafe { *ft.data_f64().add(i) };
+            let c = unsafe { *ct.data_f64().add(i) };
+            assert_eq!(f.to_bits(), c.to_bits(), "elem {i}: fused {f} vs composed {c}");
+        }
+        for p in [x1, x2, rot, composed, fused] {
+            nsl_tensor_free(p);
+        }
+    }
 }

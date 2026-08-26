@@ -10620,30 +10620,21 @@ sched={sched_s}",
                 // targets. Pre-CCR: recompute clones are forward ops, so this is
                 // the true backward-op composition.
                 if std::env::var("NSL_PROFILE_ADJOINT").is_ok() {
-                    use std::collections::BTreeMap;
-                    let mut hist: BTreeMap<String, usize> = BTreeMap::new();
-                    for op in &adjoint.ops {
-                        let key = match &op.op {
-                            crate::wengert::PrimalOp::Passthrough(n) => {
-                                format!("Passthrough({n})")
-                            }
-                            other => format!("{other:?}")
-                                .split(['(', ' ', '{'])
-                                .next()
-                                .unwrap_or("?")
-                                .to_string(),
-                        };
-                        *hist.entry(key).or_default() += 1;
-                    }
                     eprintln!(
                         "[adjoint-profile] {} generated backward ops:",
                         adjoint.ops.len()
                     );
-                    let mut rows: Vec<_> = hist.into_iter().collect();
-                    rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-                    for (k, c) in rows {
+                    for (k, c) in crate::ew_chain_fusion::histogram(&adjoint.ops) {
                         eprintln!("[adjoint-profile]   {c:>5}  {k}");
                     }
+                    // D2b prevalence: binaries whose LEFT operand is a
+                    // Constant run the baseline chain in host f64 (the
+                    // recorded reconcile_device pull-down) — the v1 fuser
+                    // must skip them, so count what that costs.
+                    eprintln!(
+                        "[adjoint-profile] const-left binary sites: {}",
+                        crate::ew_chain_fusion::const_left_binary_sites(&adjoint.ops)
+                    );
                 }
                 // D2b part 2: hand the claims BACK for the forward lowering
                 // below (the fused-SDPA claim dispatch reads them); the
@@ -10697,6 +10688,67 @@ sched={sched_s}",
                     crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &adjoint_needed);
                 if norm_res_folds > 0 {
                     eprintln!("[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
+                }
+                // MFU campaign C2: the RoPE backward fold is generation-time
+                // (rotate_half_neg emitted instead of rotate_half + Neg);
+                // count the ops here so gates have an anti-vacuity witness.
+                let rope_folds = adjoint
+                    .ops
+                    .iter()
+                    .filter(|op| {
+                        matches!(&op.op,
+                            crate::wengert::PrimalOp::Passthrough(n) if n == "rotate_half_neg")
+                    })
+                    .count();
+                if rope_folds > 0 {
+                    eprintln!("[fuse] rope backward folds: {rope_folds}");
+                }
+                // MFU campaign C3: generic elementwise-chain fusion + the
+                // standalone scalar-immediate sweep. Chain fuser first so
+                // chains absorb Constants as immediates; the sweep catches
+                // standalone leftovers (reversed order would turn const
+                // sites into Passthrough barriers and starve chains). Runs
+                // after the specialized folds above so they claim their
+                // better patterns first; skipped under --layerwise-accum
+                // (the CSLA range partition is positional over this tape —
+                // v1 defers, see ew_chain_fusion module docs).
+                if !self.compile_options.layerwise_accum {
+                    let ew_stats = crate::ew_chain_fusion::run_backward_ew_fusion(
+                        &mut adjoint.ops,
+                        &adjoint_needed,
+                        &adjoint.var_types,
+                    );
+                    if ew_stats.chains > 0 {
+                        eprintln!(
+                            "[fuse] elementwise backward chains: {} ({} device ops elided, \
+                             {} reduces absorbed, {} imms baked)",
+                            ew_stats.chains,
+                            ew_stats.device_ops_elided,
+                            ew_stats.reduces_absorbed,
+                            ew_stats.imms_baked
+                        );
+                    }
+                    let scalar_imms = crate::ew_chain_fusion::rewrite_scalar_immediates(
+                        &mut adjoint.ops,
+                        &adjoint_needed,
+                        &adjoint.var_types,
+                    );
+                    if scalar_imms > 0 {
+                        eprintln!("[fuse] scalar immediates: {scalar_imms}");
+                    }
+                    if (ew_stats.chains > 0 || scalar_imms > 0)
+                        && std::env::var("NSL_PROFILE_ADJOINT").is_ok()
+                    {
+                        eprintln!(
+                            "[adjoint-profile] post-fusion: {} backward ops:",
+                            adjoint.ops.len()
+                        );
+                        for (k, c) in crate::ew_chain_fusion::histogram(&adjoint.ops) {
+                            eprintln!("[adjoint-profile]   {c:>5}  {k}");
+                        }
+                    }
+                } else {
+                    eprintln!("[fuse] elementwise backward fusion skipped (--layerwise-accum)");
                 }
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
