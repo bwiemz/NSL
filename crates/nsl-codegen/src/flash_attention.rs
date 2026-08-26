@@ -171,6 +171,118 @@ fn backward_uses_mma(config: &FlashAttentionBackwardConfig) -> bool {
         && config.head_dim % MMA_K as i64 == 0
 }
 
+/// Compile-time kill switch for the multi-warp backward launch
+/// (`NSL_FA_BWD_MULTIWARP=0` -> single-warp emission, DEFAULT ON). Mirrors
+/// the `NSL_FA_FWD_MMA` pattern: bit-for-bit A/B needs per-arm builds.
+fn bwd_multiwarp_enabled() -> bool {
+    std::env::var("NSL_FA_BWD_MULTIWARP")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Per-step warp partition for the multi-warp MMA backward: `m_w` warp
+/// groups stride the m-tiles and `w_nt` warps within a group split the
+/// unrolled n-tiles. Returns None when the step's tile counts do not divide
+/// evenly (exotic diag-sweep shapes) — the caller then stays single-warp.
+fn bwd_step_partition(m_tiles: usize, n_tiles: usize, warps: usize) -> Option<(usize, usize)> {
+    let m_w = m_tiles.min(warps);
+    if !warps.is_multiple_of(m_w) {
+        return None;
+    }
+    let w_nt = warps / m_w;
+    if !w_nt.is_power_of_two() || !n_tiles.is_multiple_of(w_nt) {
+        return None;
+    }
+    Some((m_w, w_nt))
+}
+
+/// Partition-aware head for a backward MMA m-loop: each warp's m-tile starts
+/// at wid / w_nt and strides by m_w; %bwd_mma_wpart is set to wid % w_nt for
+/// the nt arms. With warps=1 this degenerates to the historical
+/// m_tile=0/byte_off=0 init. `m_adv_bytes` is the per-m-tile advance of
+/// %bwd_mma_m_byte_off (the same constant the loop tail adds).
+fn emit_bwd_m_loop_init(ptx: &mut String, w_nt: usize, m_adv_bytes: usize) {
+    let shift = w_nt.trailing_zeros();
+    ptx.push_str(&format!(
+        "    shr.u32 %bwd_mma_m_tile, %bwd_mma_wid, {shift};  // m-group = wid / {w_nt}\n"
+    ));
+    ptx.push_str(&format!(
+        "    and.b32 %bwd_mma_wpart, %bwd_mma_wid, {};  // nt-part = wid % {w_nt}\n",
+        w_nt - 1
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %bwd_mma_m_byte_off, %bwd_mma_m_tile, {m_adv_bytes};\n"
+    ));
+}
+
+/// Per-warp-partition arms over the unrolled n-tiles: for part p, only warps
+/// with (wid % w_nt) == p execute `body(ptx, nt_range_of_p)`. Warp-uniform
+/// branches, so skipping is safe (no bar.sync may appear inside `body`).
+/// w_nt == 1 emits the body unguarded over the whole range.
+fn emit_bwd_nt_arms(
+    ptx: &mut String,
+    label: &str,
+    n_tiles: usize,
+    w_nt: usize,
+    body: &mut dyn FnMut(&mut String, std::ops::Range<usize>),
+) {
+    if w_nt <= 1 {
+        body(ptx, 0..n_tiles);
+        return;
+    }
+    let slice = n_tiles / w_nt;
+    for part in 0..w_nt {
+        ptx.push_str(&format!(
+            "    setp.ne.u32 %bwd_mma_pw, %bwd_mma_wpart, {part};\n"
+        ));
+        ptx.push_str(&format!("    @%bwd_mma_pw bra {label}_ARM{part}_END;\n"));
+        body(ptx, part * slice..(part + 1) * slice);
+        ptx.push_str(&format!("{label}_ARM{part}_END:\n"));
+    }
+}
+
+/// Number of warps the backward MAIN kernel is emitted for (and must be
+/// launched with: the runtime derives the thread count from the `_w<N>`
+/// kernel-name suffix, so name and body can never disagree).
+///
+/// 4 on the MMA path — the five matmul steps partition (m-tile x n-tile)
+/// ownership across warps and the scalar P/dS sections go element-linear.
+/// 1 otherwise: the scalar q-loop is thread-per-row by construction, and the
+/// segment-masked variant keeps the audited single-warp emission (its mask
+/// helpers assume the row-per-thread P/dS flow).
+pub fn backward_main_warps(config: &FlashAttentionBackwardConfig) -> i64 {
+    const WARPS: usize = 4;
+    if !backward_uses_mma(config) || config.segment_masked || !bwd_multiwarp_enabled() {
+        return 1;
+    }
+    let bq = config.block_q as usize;
+    let bkv = config.block_kv as usize;
+    let hd = config.head_dim as usize;
+    // The element-linear P/dS rewrite indexes rows via shr/and.
+    if !bkv.is_power_of_two() {
+        return 1;
+    }
+    let m_tiles_q = bq / MMA_M;
+    let m_tiles_kv = bkv / MMA_M;
+    let n_tiles_s = bkv / MMA_N;
+    let n_tiles_hd = hd / MMA_N;
+    // S/dP: [m_tiles_q x n_tiles_s]; dV/dK: [m_tiles_kv x n_tiles_hd];
+    // dQ: [m_tiles_q x n_tiles_hd]. All three must partition cleanly.
+    if bwd_step_partition(m_tiles_q, n_tiles_s, WARPS).is_none()
+        || bwd_step_partition(m_tiles_kv, n_tiles_hd, WARPS).is_none()
+        || bwd_step_partition(m_tiles_q, n_tiles_hd, WARPS).is_none()
+    {
+        return 1;
+    }
+    // The persistent dK/dV register accumulators need each warp to own
+    // exactly ONE dV/dK m-tile (register names carry no m index): true iff
+    // m_tiles_kv <= warps, which every selector shape satisfies (1/2/4).
+    if m_tiles_kv > WARPS {
+        return 1;
+    }
+    WARPS as i64
+}
+
 /// Budget-aware backward tile-size selector, keyed by `head_dim`.
 ///
 /// The Phase-2 backward keeps six resident SMEM tiles (Q, K, V, dO, dK-local,
@@ -3436,7 +3548,15 @@ pub fn flash_attention_bwd_main_kernel_name(config: &FlashAttentionBackwardConfi
     if config.segment_masked {
         format!("{base}_segmask")
     } else {
-        base
+        // The `_w<N>` suffix is the launch contract: the runtime derives the
+        // thread count (32*N) from the embedded name, so a multi-warp body
+        // can never be launched single-warp or vice versa.
+        let warps = backward_main_warps(config);
+        if warps > 1 {
+            format!("{base}_w{warps}")
+        } else {
+            base
+        }
     }
 }
 
@@ -3463,8 +3583,18 @@ pub fn backward_shared_mem_bytes(config: &FlashAttentionBackwardConfig) -> u32 {
     let k_tile = tile_bytes(config.block_kv, hd_padded);
     let v_tile = tile_bytes(config.block_kv, hd_padded);
     let do_tile = tile_bytes(config.block_q, hd_padded);
-    let dk_local = tile_bytes(config.block_kv, hd_padded);
-    let dv_local = tile_bytes(config.block_kv, hd_padded);
+    // Multi-warp: dK/dV accumulate in persistent per-warp registers — no
+    // SMEM tiles (17.4 KB back at 32/32/hd64 => 2 CTAs/SM). The runtime's
+    // launch-time twin keys the same branch off the `_w<N>` kernel-name
+    // suffix it already parses for the thread count.
+    let (dk_local, dv_local) = if backward_main_warps(config) > 1 {
+        (0, 0)
+    } else {
+        (
+            tile_bytes(config.block_kv, hd_padded),
+            tile_bytes(config.block_kv, hd_padded),
+        )
+    };
     let s_tile = tile_bytes(config.block_q, config.block_kv);
     // dP tile: workspace for MMA dP = dO@V^T results (needed alongside P in S_tile for dS computation)
     let dp_tile = if backward_uses_mma(config) {
@@ -3697,14 +3827,44 @@ fn emit_flash_attention_bwd_main(
     ptx.push_str(")\n");
     ptx.push_str("{\n");
 
+    // Launch thread count: 32*warps on the multi-warp MMA path, block_q
+    // otherwise (the historical contract). Must match the runtime's parse of
+    // the `_w<N>` kernel-name suffix.
+    let warps = backward_main_warps(config);
+    let nthreads = if warps > 1 {
+        32 * warps
+    } else {
+        config.block_q
+    };
     emit_bwd_main_registers(ptx, config, gqa);
     if backward_uses_mma(config) {
-        emit_bwd_mma_registers(ptx, config);
+        emit_bwd_mma_registers(ptx, config, warps);
     }
     emit_bwd_main_param_loads(ptx, config, gqa);
     emit_bwd_main_index_computation(ptx, config, gqa);
-    emit_bwd_main_load_kv_tiles(ptx, config, gqa);
-    emit_bwd_main_init_dk_dv(ptx, config);
+    emit_bwd_main_load_kv_tiles(ptx, config, gqa, nthreads);
+    if warps > 1 {
+        // Multi-warp: dK/dV accumulate in persistent per-warp registers, so
+        // there are no SMEM tiles to zero (and no barrier needed — registers
+        // are thread-private). Zeroing ALL nt slices on every thread is
+        // harmless; each warp only ever accumulates and stores its own.
+        ptx.push_str("    // === Zero persistent dK/dV register accumulators ===\n");
+        let n_tiles_hd = (config.head_dim as usize) / MMA_N;
+        for nt in 0..n_tiles_hd {
+            for r in 0..4 {
+                ptx.push_str(&format!(
+                    "    mov.f32 %bwd_dvp_{nt}_{r}, {};\n",
+                    f32_bits(F32_ZERO)
+                ));
+                ptx.push_str(&format!(
+                    "    mov.f32 %bwd_dkp_{nt}_{r}, {};\n",
+                    f32_bits(F32_ZERO)
+                ));
+            }
+        }
+    } else {
+        emit_bwd_main_init_dk_dv(ptx, config, nthreads);
+    }
     if gqa {
         // Group loop head: iterate the q-heads sharing this CTA's kv-head.
         // The trip count (%rd_gqa_g) is CTA-uniform, so the loop branches are
@@ -3724,7 +3884,7 @@ fn emit_flash_attention_bwd_main(
         ptx.push_str("    mul.lo.u64 %rd15, %rd16, %rd10;  // * head_dim => bh_elem_offset\n\n");
     }
     if backward_uses_mma(config) {
-        emit_bwd_main_q_tile_loop_mma(ptx, config);
+        emit_bwd_main_q_tile_loop_mma(ptx, config, warps);
     } else {
         emit_bwd_main_q_tile_loop_scalar(ptx, config);
     }
@@ -3733,7 +3893,11 @@ fn emit_flash_attention_bwd_main(
         ptx.push_str("    bra BWD_MAIN_GQA_GROUP;\n");
         ptx.push_str("BWD_MAIN_GQA_GROUP_DONE:\n\n");
     }
-    emit_bwd_main_store_dk_dv(ptx, config, gqa);
+    if warps > 1 {
+        emit_bwd_main_store_dk_dv_regs(ptx, config, gqa, warps);
+    } else {
+        emit_bwd_main_store_dk_dv(ptx, config, gqa, nthreads);
+    }
 
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
@@ -3777,6 +3941,13 @@ fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConf
     ptx.push_str("    .reg .f32 %f_l_val;\n");
     ptx.push_str("    .reg .f32 %f_tmp;\n");
     ptx.push_str("    .reg .f32 %f_discard;  // sink for atom.shared.add.f32 return value\n");
+    // Dedicated scratch for the coalesced tile-copy helper
+    // (emit_bwd_coalesced_tile_copy). Named so the copy loops can never
+    // collide with the numbered scratch the surrounding q-loop bodies hold
+    // live across a copy (%rd24 = i_block, %rd25 = q_start, %rd26 = the
+    // tile's global base).
+    ptx.push_str("    .reg .u64 %rd_cp<6>;\n");
+    ptx.push_str("    .reg .f32 %f_cp;\n");
     // SMEM addressing prolog — the emit_smem_store / emit_smem_load / emit_smem_atom
     // helpers (used throughout both the scalar and MMA q-tile loops) address shared
     // memory as `add.s64 %smem_addr, %shmem_base, <offset>` + `st/ld/atom.shared
@@ -3919,10 +4090,129 @@ fn emit_bwd_main_index_computation(
 /// `%rd_gqa_kvoff` instead of the q-side `%rd15` — the only difference from
 /// the plain emission (the tile is loaded once per CTA and reused by every
 /// q-head in the group).
+/// Coalesced global<->shared tile copy for the backward's [rows, head_dim]
+/// tiles (K/V once per CTA, Q/dO every q-iteration, dK/dV at store time).
+///
+/// The historical loops assigned thread = row (outer) and walked head_dim
+/// serially (inner), so at any instant the active lanes touched addresses
+/// `head_dim * 4` bytes apart — every warp-wide access split into 32 separate
+/// transactions. This helper assigns warp w -> rows w, w+nwarps, ... and lane
+/// l -> columns l, l+32, ...: consecutive lanes hit consecutive f32s, one
+/// 128B transaction per warp access. The per-thread element count is
+/// unchanged and each element is read/written exactly once by exactly one
+/// thread, so the copy is numerics-identical to the old loop — only the
+/// access ORDER across lanes changes.
+///
+/// `nthreads` is the launch's thread count (block_q today; the Phase-B
+/// multi-warp launch passes its larger count). The coalesced form needs full
+/// warps; a sub-warp or non-multiple-of-32 count (diag sweeps use bq=16)
+/// falls back to the historical row-per-thread loop, which is correct for
+/// any count.
+///
+/// `global_base_reg` holds the tile's global BYTE base and is only read.
+/// Clobbers: %rd_cp0..%rd_cp5, %f_cp, %p1, %p2 (declared in
+/// emit_bwd_main_registers; the numbered scratch the q-loop keeps live
+/// across copies — %rd24/%rd25/%rd26 — is untouched).
+fn emit_bwd_coalesced_tile_copy(
+    ptx: &mut String,
+    label: &str,
+    rows: i64,
+    head_dim: i64,
+    hd_padded: i64,
+    nthreads: i64,
+    global_base_reg: &str,
+    smem_byte_off: i64,
+    to_smem: bool,
+) {
+    let hd_bytes = head_dim * 4;
+    let hdp_bytes = hd_padded * 4;
+    if nthreads % 32 != 0 {
+        // Historical row-per-thread loop (any thread count).
+        ptx.push_str(&format!("    mov.u64 %rd_cp0, %rd11;  // row = tid\n"));
+        ptx.push_str(&format!("{label}:\n"));
+        ptx.push_str(&format!("    setp.ge.u64 %p1, %rd_cp0, {rows};\n"));
+        ptx.push_str(&format!("    @%p1 bra {label}_DONE;\n"));
+        ptx.push_str("    mov.u64 %rd_cp4, 0;  // col byte = 0\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_cp2, %rd_cp0, {hd_bytes};\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_cp2, {global_base_reg}, %rd_cp2;  // global row base\n"
+        ));
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_cp3, %rd_cp0, {hdp_bytes};\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_cp3, %rd_cp3, {smem_byte_off};  // smem row byte off\n"
+        ));
+        ptx.push_str(&format!("{label}_C:\n"));
+        ptx.push_str(&format!("    setp.ge.u64 %p2, %rd_cp4, {hd_bytes};\n"));
+        ptx.push_str(&format!("    @%p2 bra {label}_C_DONE;\n"));
+        emit_bwd_tile_copy_element(ptx, to_smem);
+        ptx.push_str("    add.u64 %rd_cp4, %rd_cp4, 4;\n");
+        ptx.push_str(&format!("    bra {label}_C;\n"));
+        ptx.push_str(&format!("{label}_C_DONE:\n"));
+        ptx.push_str(&format!("    add.u64 %rd_cp0, %rd_cp0, {nthreads};\n"));
+        ptx.push_str(&format!("    bra {label};\n"));
+        ptx.push_str(&format!("{label}_DONE:\n\n"));
+        return;
+    }
+    let nwarps = nthreads / 32;
+    ptx.push_str(&format!(
+        "    // coalesced copy: warp w -> rows w, w+{nwarps}, ...; lane l -> cols l, l+32, ...\n"
+    ));
+    ptx.push_str("    shr.b64 %rd_cp0, %rd11, 5;   // row = warp id\n");
+    ptx.push_str("    and.b64 %rd_cp1, %rd11, 31;  // lane\n");
+    ptx.push_str("    shl.b64 %rd_cp1, %rd_cp1, 2; // lane byte offset\n");
+    ptx.push_str(&format!("{label}:\n"));
+    ptx.push_str(&format!("    setp.ge.u64 %p1, %rd_cp0, {rows};\n"));
+    ptx.push_str(&format!("    @%p1 bra {label}_DONE;\n"));
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_cp2, %rd_cp0, {hd_bytes};\n"
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %rd_cp2, {global_base_reg}, %rd_cp2;  // global row base\n"
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_cp3, %rd_cp0, {hdp_bytes};\n"
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %rd_cp3, %rd_cp3, {smem_byte_off};  // smem row byte off\n"
+    ));
+    ptx.push_str("    mov.u64 %rd_cp4, %rd_cp1;    // col byte = lane*4\n");
+    ptx.push_str(&format!("{label}_C:\n"));
+    ptx.push_str(&format!("    setp.ge.u64 %p2, %rd_cp4, {hd_bytes};\n"));
+    ptx.push_str(&format!("    @%p2 bra {label}_C_DONE;\n"));
+    emit_bwd_tile_copy_element(ptx, to_smem);
+    ptx.push_str("    add.u64 %rd_cp4, %rd_cp4, 128;  // += 32 lanes * 4B\n");
+    ptx.push_str(&format!("    bra {label}_C;\n"));
+    ptx.push_str(&format!("{label}_C_DONE:\n"));
+    ptx.push_str(&format!("    add.u64 %rd_cp0, %rd_cp0, {nwarps};\n"));
+    ptx.push_str(&format!("    bra {label};\n"));
+    ptx.push_str(&format!("{label}_DONE:\n\n"));
+}
+
+/// One element move for emit_bwd_coalesced_tile_copy: %rd_cp2 = global row
+/// base, %rd_cp3 = smem row byte offset, %rd_cp4 = column byte offset.
+fn emit_bwd_tile_copy_element(ptx: &mut String, to_smem: bool) {
+    if to_smem {
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp2, %rd_cp4;\n");
+        ptx.push_str("    ld.global.f32 %f_cp, [%rd_cp5];\n");
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp3, %rd_cp4;\n");
+        emit_smem_store(ptx, "f32", "%rd_cp5", "%f_cp");
+    } else {
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp3, %rd_cp4;\n");
+        emit_smem_load(ptx, "f32", "%f_cp", "%rd_cp5");
+        ptx.push_str("    add.u64 %rd_cp5, %rd_cp2, %rd_cp4;\n");
+        ptx.push_str("    st.global.f32 [%rd_cp5], %f_cp;\n");
+    }
+}
+
 fn emit_bwd_main_load_kv_tiles(
     ptx: &mut String,
     config: &FlashAttentionBackwardConfig,
     gqa: bool,
+    nthreads: i64,
 ) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_elems = config.block_kv * hd_padded;
@@ -3947,95 +4237,46 @@ fn emit_bwd_main_load_kv_tiles(
     ptx.push_str("    shl.b64 %rd19, %rd19, 2;\n");
     ptx.push_str("    add.u64 %rd19, %rd3, %rd19;        // v_global_base\n\n");
 
-    // Cooperative load K tile: thread tid loads rows starting at tid, stride block_q
-    // Each row has head_dim elements in global, stored with hd_padded stride in shmem
+    // Cooperative coalesced load of the K tile (padded rows) into shmem[0..]
     ptx.push_str("    // Load K tile (with padding) into shmem[0..]\n");
-    ptx.push_str("    mov.u64 %rd20, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_K:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd20, {};\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_LOAD_K_DONE;\n");
-
-    // For each row nj: load head_dim elements from global, store to shmem with padded stride
-    ptx.push_str("    mov.u64 %rd21, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_K_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd21, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_K_D_DONE;\n");
-    // global addr: k_global_base + (nj * head_dim + d) * 4
-    ptx.push_str("    mul.lo.u64 %rd22, %rd20, %rd10;\n");
-    ptx.push_str("    add.u64 %rd22, %rd22, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd22, %rd22, 2;\n");
-    ptx.push_str("    add.u64 %rd22, %rd18, %rd22;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd22];\n");
-    // shmem addr: (nj * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd23, %rd20, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd23, %rd23, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd23, %rd23, 2;\n");
-    emit_smem_store(ptx, "f32", "%rd23", "%f0");
-    ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_K_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_K_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd20, %rd20, {};  // nj += block_q (stride by num threads)\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_K;\n");
-    ptx.push_str("BWD_MAIN_LOAD_K_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_K",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        nthreads,
+        "%rd18",
+        0,
+        true,
+    );
 
     // Load V tile: shmem offset = v_offset
     ptx.push_str(&format!(
         "    // Load V tile into shmem[{}..]\n",
         v_offset
     ));
-    ptx.push_str("    mov.u64 %rd20, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_V:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd20, {};\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_LOAD_V_DONE;\n");
-    ptx.push_str("    mov.u64 %rd21, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_V_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd21, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_V_D_DONE;\n");
-    // global addr: v_global_base + (nj * head_dim + d) * 4
-    ptx.push_str("    mul.lo.u64 %rd22, %rd20, %rd10;\n");
-    ptx.push_str("    add.u64 %rd22, %rd22, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd22, %rd22, 2;\n");
-    ptx.push_str("    add.u64 %rd22, %rd19, %rd22;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd22];\n");
-    // shmem addr: v_offset + (nj * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd23, %rd20, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd23, %rd23, %rd21;\n");
-    ptx.push_str("    shl.b64 %rd23, %rd23, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd23, %rd23, {};  // + V tile shmem offset\n",
-        v_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd23", "%f0");
-    ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_V_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_V_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd20, %rd20, {};  // nj += block_q\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_V;\n");
-    ptx.push_str("BWD_MAIN_LOAD_V_DONE:\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_V",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        nthreads,
+        "%rd19",
+        v_offset,
+        true,
+    );
 
     ptx.push_str("    bar.sync 0;  // K and V tiles loaded\n\n");
 }
 
 /// Zero-initialize dK_local and dV_local in shared memory.
-fn emit_bwd_main_init_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_main_init_dk_dv(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    nthreads: i64,
+) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_bytes = config.block_kv * hd_padded * 4;
     let v_tile_bytes = config.block_kv * hd_padded * 4;
@@ -4061,8 +4302,8 @@ fn emit_bwd_main_init_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardCon
     ));
     emit_smem_store(ptx, "f32", "%rd21", "0f00000000");
     ptx.push_str(&format!(
-        "    add.u64 %rd20, %rd20, {};  // stride by block_q threads\n",
-        config.block_q
+        "    add.u64 %rd20, %rd20, {};  // stride by launch threads\n",
+        nthreads
     ));
     ptx.push_str("    bra BWD_MAIN_ZERO_DK;\n");
     ptx.push_str("BWD_MAIN_ZERO_DK_DONE:\n\n");
@@ -4081,8 +4322,8 @@ fn emit_bwd_main_init_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardCon
     ));
     emit_smem_store(ptx, "f32", "%rd21", "0f00000000");
     ptx.push_str(&format!(
-        "    add.u64 %rd20, %rd20, {};  // stride by block_q threads\n",
-        config.block_q
+        "    add.u64 %rd20, %rd20, {};  // stride by launch threads\n",
+        nthreads
     ));
     ptx.push_str("    bra BWD_MAIN_ZERO_DV;\n");
     ptx.push_str("BWD_MAIN_ZERO_DV_DONE:\n");
@@ -4131,44 +4372,18 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd1, %rd26;  // q_global_base\n");
 
-    // Cooperative load Q tile rows
-    ptx.push_str("    mov.u64 %rd27, %rd11;  // mi = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_Q_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_Q_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    // shmem: q_shmem_offset + (mi * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        q_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_DONE:\n\n");
+    // Cooperative coalesced load of the Q tile rows
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_Q",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd26",
+        q_shmem_offset,
+        true,
+    );
 
     // Load dO[i_block] into shmem[do_shmem_offset..]
     ptx.push_str(&format!(
@@ -4180,42 +4395,17 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd0, %rd26;  // dO_global_base\n");
 
-    ptx.push_str("    mov.u64 %rd27, %rd11;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DO_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_DO_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        do_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_DO",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        config.block_q,
+        "%rd26",
+        do_shmem_offset,
+        true,
+    );
 
     // Load D[i_block] and L[i_block] vectors into shmem
     ptx.push_str("    // Load D[i_block] and L[i_block] into shmem\n");
@@ -4529,12 +4719,32 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
 /// MMA register declarations for the backward kernel (sm_80+).
 /// Declares accumulators and fragment registers for all 5 backward matmuls:
 ///   S = Q@K^T, dP = dO@V^T, dV += P^T@dO, dQ += dS@K, dK += dS^T@Q
-fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_mma_registers(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    warps: i64,
+) {
     let n_tiles_s = config.block_kv as usize / MMA_N; // S/dP: [block_q, block_kv]
     let n_tiles_hd = config.head_dim as usize / MMA_N; // dV/dQ/dK: [*, head_dim]
     let k_iters_qk = config.head_dim as usize / MMA_K;
 
     ptx.push_str("    // === MMA registers for backward (all 5 matmuls) ===\n");
+
+    if warps > 1 {
+        // Persistent per-warp dV/dK accumulators (multi-warp only): each warp
+        // owns exactly one dV/dK m-tile and a fixed nt slice, accumulating
+        // across the whole q-loop (and the GQA group loop) in registers — the
+        // dK/dV SMEM tiles and their per-iteration atom.shared.add are gone.
+        // Declared for every nt; each warp's arm touches only its slice.
+        for nt in 0..n_tiles_hd {
+            ptx.push_str(&format!(
+                "    .reg .f32 %bwd_dvp_{nt}_0, %bwd_dvp_{nt}_1, %bwd_dvp_{nt}_2, %bwd_dvp_{nt}_3;\n"
+            ));
+            ptx.push_str(&format!(
+                "    .reg .f32 %bwd_dkp_{nt}_0, %bwd_dkp_{nt}_1, %bwd_dkp_{nt}_2, %bwd_dkp_{nt}_3;\n"
+            ));
+        }
+    }
 
     // S accumulators: one m-tile at a time, n_tiles_s n-tiles
     for nt in 0..n_tiles_s {
@@ -4594,7 +4804,8 @@ fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfi
     ptx.push_str("    .reg .u32 %bwd_mma_m_byte_off;            // m-tile byte offset\n");
     ptx.push_str("    .reg .u32 %bwd_mma_store_row;             // row for storing MMA results\n");
     ptx.push_str("    .reg .u32 %bwd_mma_wid;                   // warp id = tid.x/32 (accumulate guard)\n");
-    ptx.push_str("    .reg .pred %bwd_mma_pw;                   // warp-0 predicate for atom.add accumulate\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_wpart;                 // wid % w_nt: this warp's n-tile partition\n");
+    ptx.push_str("    .reg .pred %bwd_mma_pw;                   // warp-partition predicate\n");
     ptx.push_str("    .reg .u32 %bwd_mma_store_addr;            // shmem addr for MMA result store\n");
     ptx.push_str("    .reg .u64 %bwd_mma_store_addr_64;         // widened copy of %bwd_mma_store_addr for add.s64\n");
     ptx.push_str("    .reg .u64 %bwd_mma_addr_64;               // widened copy of %bwd_mma_addr for add.s64 (MMA tile loads)\n");
@@ -4642,15 +4853,28 @@ fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfi
 ///   3g: dK += dS^T@Q * scale (atomicAdd to dK_local shmem)
 ///
 /// Steps 3b (softmax) and 3e (dS = P*(dP-D)) remain scalar elementwise.
-fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_main_q_tile_loop_mma(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    warps: i64,
+) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_bytes = config.block_kv * hd_padded * 4;
     let v_tile_bytes = config.block_kv * hd_padded * 4;
     let q_shmem_offset = k_tile_bytes + v_tile_bytes;
     let do_shmem_offset = q_shmem_offset + config.block_q * hd_padded * 4;
+    // Multi-warp: dK/dV live in persistent per-warp REGISTERS, so their SMEM
+    // tiles are gone and S/dP/D/L shift down by 2 kv-tiles (the 2-CTAs/SM
+    // occupancy win). Single-warp keeps the historical layout; the dk/dv
+    // offsets below are only meaningful (and only used) when warps == 1.
+    let dkdv_tiles = if warps > 1 {
+        0
+    } else {
+        2 * config.block_kv * hd_padded * 4
+    };
     let dk_shmem_offset = do_shmem_offset + config.block_q * hd_padded * 4;
     let dv_shmem_offset = dk_shmem_offset + config.block_kv * hd_padded * 4;
-    let s_shmem_offset = dv_shmem_offset + config.block_kv * hd_padded * 4;
+    let s_shmem_offset = do_shmem_offset + config.block_q * hd_padded * 4 + dkdv_tiles;
     let dp_shmem_offset = s_shmem_offset + config.block_q * config.block_kv * 4;
     let d_shmem_offset = dp_shmem_offset + config.block_q * config.block_kv * 4;
     let l_shmem_offset = d_shmem_offset + config.block_q * 4;
@@ -4666,6 +4890,17 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     let m_tiles_q = block_q_u / MMA_M; // m-tiles for S/dP/dQ (rows = block_q)
     let m_tiles_kv = block_kv_u / MMA_M; // m-tiles for dV/dK (rows = block_kv)
     let hd_padded_u = hd_padded as usize;
+
+    // Warp partition per step (backward_main_warps guaranteed divisibility;
+    // warps == 1 degenerates to (1, 1) = the historical single-warp flow).
+    let warps_u = warps as usize;
+    let nthreads = if warps > 1 { 32 * warps } else { config.block_q };
+    let (s_mw, s_wnt) =
+        bwd_step_partition(m_tiles_q, n_tiles_s, warps_u).expect("S/dP partition");
+    let (g_mw, g_wnt) =
+        bwd_step_partition(m_tiles_kv, n_tiles_hd, warps_u).expect("dV/dK partition");
+    let (q_mw, q_wnt) =
+        bwd_step_partition(m_tiles_q, n_tiles_hd, warps_u).expect("dQ partition");
 
     // Helper: V tile starts right after K tile
     let v_shmem_offset = k_tile_bytes;
@@ -4696,42 +4931,17 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd1, %rd26;  // q_global_base\n");
 
-    ptx.push_str("    mov.u64 %rd27, %rd11;  // mi = tid\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_Q_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_Q_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        q_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_Q;\n");
-    ptx.push_str("BWD_MAIN_LOAD_Q_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_Q",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        nthreads,
+        "%rd26",
+        q_shmem_offset,
+        true,
+    );
 
     // Load dO[i_block] into shmem[do_shmem_offset..]
     ptx.push_str(&format!(
@@ -4743,42 +4953,17 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd26, %rd0, %rd26;  // dO_global_base\n");
 
-    ptx.push_str("    mov.u64 %rd27, %rd11;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DO_DONE;\n");
-    ptx.push_str("    mov.u64 %rd28, 0;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_DO_D_DONE;\n");
-    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
-    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
-    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
-    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd27, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {};\n",
-        do_shmem_offset
-    ));
-    emit_smem_store(ptx, "f32", "%rd30", "%f0");
-    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd27, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_LOAD_DO;\n");
-    ptx.push_str("BWD_MAIN_LOAD_DO_DONE:\n\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_LOAD_DO",
+        config.block_q,
+        config.head_dim,
+        hd_padded,
+        nthreads,
+        "%rd26",
+        do_shmem_offset,
+        true,
+    );
 
     // Load D[i_block] and L[i_block] vectors into shmem
     ptx.push_str("    // Load D[i_block] and L[i_block] into shmem\n");
@@ -4819,8 +5004,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         m_tiles_q, n_tiles_s, k_iters_hd
     ));
 
-    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
-    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    emit_bwd_m_loop_init(ptx, s_wnt, MMA_M * hd_padded_u * 4);
     ptx.push_str("BWD_MAIN_MMA_S_M_LOOP:\n");
     ptx.push_str(&format!(
         "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
@@ -4851,23 +5035,24 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "%bwd_mma_m_byte_off",
     );
 
-    // Load B-fragments from K shmem for each n-tile (K stored as [block_kv, hd_padded])
-    for nt in 0..n_tiles_s {
-        emit_load_b_fragment_row_major(ptx, &format!("%bwd_bk_{nt}"), 0, hd_padded_u, nt);
-    }
-
-    // Issue MMA for each n-tile
-    for nt in 0..n_tiles_s {
-        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_s_{nt}_0, %bwd_acc_s_{nt}_1, %bwd_acc_s_{nt}_2, %bwd_acc_s_{nt}_3}},\n"
-        ));
-        ptx.push_str("        {%bwd_aq_0, %bwd_aq_1, %bwd_aq_2, %bwd_aq_3},\n");
-        ptx.push_str(&format!("        {{%bwd_bk_{nt}_0, %bwd_bk_{nt}_1}},\n"));
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_s_{nt}_0, %bwd_acc_s_{nt}_1, %bwd_acc_s_{nt}_2, %bwd_acc_s_{nt}_3}};\n"
-        ));
-    }
+    // Load B-fragments from K shmem and issue MMAs — each warp partition owns
+    // its n-tile slice (K stored as [block_kv, hd_padded])
+    emit_bwd_nt_arms(ptx, "BWD_MMA_S_NT", n_tiles_s, s_wnt, &mut |ptx, nts| {
+        for nt in nts.clone() {
+            emit_load_b_fragment_row_major(ptx, &format!("%bwd_bk_{nt}"), 0, hd_padded_u, nt);
+        }
+        for nt in nts {
+            ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_s_{nt}_0, %bwd_acc_s_{nt}_1, %bwd_acc_s_{nt}_2, %bwd_acc_s_{nt}_3}},\n"
+            ));
+            ptx.push_str("        {%bwd_aq_0, %bwd_aq_1, %bwd_aq_2, %bwd_aq_3},\n");
+            ptx.push_str(&format!("        {{%bwd_bk_{nt}_0, %bwd_bk_{nt}_1}},\n"));
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_s_{nt}_0, %bwd_acc_s_{nt}_1, %bwd_acc_s_{nt}_2, %bwd_acc_s_{nt}_3}};\n"
+            ));
+        }
+    });
 
     ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
     ptx.push_str(&format!(
@@ -4876,22 +5061,26 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ));
     ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_S_K_LOOP;\n\n");
 
-    // Scale and store S to S_tile shmem
-    emit_scale_and_store_mma_tile(
-        ptx,
-        "%bwd_acc_s",
-        n_tiles_s,
-        s_shmem_offset as usize,
-        block_kv_u,
-        true, // apply scale
-    );
+    // Scale and store S to S_tile shmem (each partition stores its slice)
+    emit_bwd_nt_arms(ptx, "BWD_MMA_S_ST", n_tiles_s, s_wnt, &mut |ptx, nts| {
+        emit_scale_and_store_mma_tile(
+            ptx,
+            "%bwd_acc_s",
+            nts,
+            s_shmem_offset as usize,
+            block_kv_u,
+            true, // apply scale
+        );
+    });
 
-    // Advance m-tile
+    // Advance m-tile (stride = warp m-groups)
     ptx.push_str(&format!(
-        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
-        MMA_M * hd_padded_u * 4
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += m_w * MMA_M * hd_padded * 4\n",
+        s_mw * MMA_M * hd_padded_u * 4
     ));
-    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, {s_mw};\n"
+    ));
     ptx.push_str("    bra BWD_MAIN_MMA_S_M_LOOP;\n");
     ptx.push_str("BWD_MAIN_MMA_S_M_DONE:\n");
     ptx.push_str("    bar.sync 0;  // S_tile fully computed via MMA\n\n");
@@ -4900,79 +5089,132 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     // Scalar Step 3b: P = exp(S - L), with causal mask → overwrite S_tile with P
     // Each thread handles one row (mi = tid), iterates over columns
     // ══════════════════════════════════════════════════════════════════
-    ptx.push_str("    // === Scalar Step 3b: P = exp(S - L) ===\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_P_DONE;\n\n");
+    if warps > 1 {
+        // Element-linear P: all launch threads stride the block_q*block_kv
+        // tile (idx = mi*block_kv + nj, so the S address is simply idx*4).
+        // Multi-warp implies !segment_masked, so no segment hooks here.
+        ptx.push_str(
+            "    // === Scalar Step 3b: P = exp(S - L) (element-linear over all warps) ===\n",
+        );
+        let total_elems = block_q_u * block_kv_u;
+        let bkv_shift = block_kv_u.trailing_zeros();
+        ptx.push_str("    mov.u64 %rd32, %rd11;  // idx = tid\n");
+        ptx.push_str("BWD_MAIN_MMA_P_ELEM:\n");
+        ptx.push_str(&format!("    setp.ge.u64 %p1, %rd32, {total_elems};\n"));
+        ptx.push_str("    @%p1 bra BWD_MAIN_MMA_P_DONE;\n");
+        ptx.push_str(&format!(
+            "    shr.b64 %rd27, %rd32, {bkv_shift};  // mi = idx / block_kv\n"
+        ));
+        ptx.push_str(&format!(
+            "    and.b64 %rd28, %rd32, {};  // nj = idx % block_kv\n",
+            block_kv_u - 1
+        ));
+        // L[mi]
+        ptx.push_str("    shl.b64 %rd26, %rd27, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd26, %rd26, {};\n",
+            l_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_l_val", "%rd26");
+        // S[idx]
+        ptx.push_str("    shl.b64 %rd35, %rd32, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd35, %rd35, {};\n",
+            s_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_s", "%rd35");
+        if config.causal {
+            ptx.push_str("    add.u64 %rd31, %rd25, %rd27;  // global_i = q_start + mi\n");
+            ptx.push_str("    add.u64 %rd33, %rd14, %rd28;  // global_j = kv_start + nj\n");
+            ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
+            ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // -inf\n");
+        }
+        ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;\n");
+        ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;\n");
+        ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;\n");
+        if config.causal {
+            ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
+        }
+        emit_smem_store(ptx, "f32", "%rd35", "%f_p");
+        ptx.push_str(&format!("    add.u64 %rd32, %rd32, {nthreads};\n"));
+        ptx.push_str("    bra BWD_MAIN_MMA_P_ELEM;\n");
+        ptx.push_str("BWD_MAIN_MMA_P_DONE:\n");
+        ptx.push_str("    bar.sync 0;  // P stored in S_tile\n\n");
+    } else {
+        ptx.push_str("    // === Scalar Step 3b: P = exp(S - L) ===\n");
+        ptx.push_str(&format!(
+            "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
+            config.block_q
+        ));
+        ptx.push_str("    @%p0 bra BWD_MAIN_MMA_P_DONE;\n\n");
 
-    // Load D[mi] and L[mi]
-    ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd26, {};\n",
-        d_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f_d_val", "%rd27"); // D[mi]
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd26, {};\n",
-        l_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f_l_val", "%rd27"); // L[mi]
-    ptx.push('\n');
+        // Load D[mi] and L[mi]
+        ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd27, %rd26, {};\n",
+            d_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_d_val", "%rd27"); // D[mi]
+        ptx.push_str(&format!(
+            "    add.u64 %rd27, %rd26, {};\n",
+            l_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_l_val", "%rd27"); // L[mi]
+        ptx.push('\n');
 
-    // global_i = q_start + mi
-    ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
-    emit_bwd_segment_load_seg_i(ptx, config);
+        // global_i = q_start + mi
+        ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
+        emit_bwd_segment_load_seg_i(ptx, config);
 
-    ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
-    ptx.push_str("BWD_MAIN_MMA_P_NJ:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_MMA_P_NJ_DONE;\n\n");
+        ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
+        ptx.push_str("BWD_MAIN_MMA_P_NJ:\n");
+        ptx.push_str(&format!(
+            "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
+            config.block_kv
+        ));
+        ptx.push_str("    @%p1 bra BWD_MAIN_MMA_P_NJ_DONE;\n\n");
 
-    // Read S[mi][nj]
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
-        config.block_kv
-    ));
-    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;\n");
-    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd35, %rd35, {};\n",
-        s_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f_s", "%rd35");
+        // Read S[mi][nj]
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
+            config.block_kv
+        ));
+        ptx.push_str("    add.u64 %rd35, %rd35, %rd32;\n");
+        ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd35, %rd35, {};\n",
+            s_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_s", "%rd35");
 
-    // Causal mask
-    if config.causal {
-        ptx.push_str("    add.u64 %rd33, %rd14, %rd32;  // global_j = kv_start + nj\n");
-        ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
-        ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // -inf\n");
+        // Causal mask
+        if config.causal {
+            ptx.push_str("    add.u64 %rd33, %rd14, %rd32;  // global_j = kv_start + nj\n");
+            ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
+            ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // -inf\n");
+        }
+        // Segment mask (recomputes %rd33 — the causal arm above only sets it
+        // when `causal`, and the segment variant must not depend on that).
+        emit_bwd_segment_mask_pre_exp(ptx, config, true, "%rd27");
+
+        // P = exp(S - L)
+        ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;\n");
+        ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;\n");
+        ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;\n");
+        if config.causal {
+            ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
+        }
+        emit_bwd_segment_mask_post_exp(ptx, config);
+
+        // Overwrite S_tile with P
+        emit_smem_store(ptx, "f32", "%rd35", "%f_p");
+        ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
+        ptx.push_str("    bra BWD_MAIN_MMA_P_NJ;\n");
+        ptx.push_str("BWD_MAIN_MMA_P_NJ_DONE:\n\n");
+
+        ptx.push_str("BWD_MAIN_MMA_P_DONE:\n");
+        ptx.push_str("    bar.sync 0;  // P stored in S_tile\n\n");
     }
-    // Segment mask (recomputes %rd33 — the causal arm above only sets it
-    // when `causal`, and the segment variant must not depend on that).
-    emit_bwd_segment_mask_pre_exp(ptx, config, true, "%rd27");
-
-    // P = exp(S - L)
-    ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;\n");
-    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;\n");
-    ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;\n");
-    if config.causal {
-        ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
-    }
-    emit_bwd_segment_mask_post_exp(ptx, config);
-
-    // Overwrite S_tile with P
-    emit_smem_store(ptx, "f32", "%rd35", "%f_p");
-    ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_MMA_P_NJ;\n");
-    ptx.push_str("BWD_MAIN_MMA_P_NJ_DONE:\n\n");
-
-    ptx.push_str("BWD_MAIN_MMA_P_DONE:\n");
-    ptx.push_str("    bar.sync 0;  // P stored in S_tile\n\n");
 
     // ══════════════════════════════════════════════════════════════════
     // MMA Step 3d: dP = dO @ V^T → dP_tile shmem
@@ -4981,8 +5223,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     // ══════════════════════════════════════════════════════════════════
     ptx.push_str("    // === MMA Step 3d: dP = dO @ V^T ===\n");
 
-    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
-    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    emit_bwd_m_loop_init(ptx, s_wnt, MMA_M * hd_padded_u * 4);
     ptx.push_str("BWD_MAIN_MMA_DP_M_LOOP:\n");
     ptx.push_str(&format!(
         "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
@@ -5013,29 +5254,30 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "%bwd_mma_m_byte_off",
     );
 
-    // B-fragments from V shmem (V stored as [block_kv, hd_padded], same layout as K)
-    for nt in 0..n_tiles_s {
-        emit_load_b_fragment_row_major(
-            ptx,
-            &format!("%bwd_bv_{nt}"),
-            v_shmem_offset as usize,
-            hd_padded_u,
-            nt,
-        );
-    }
-
-    // Issue MMA: dP_acc += dO_frag @ V^T_frag
-    for nt in 0..n_tiles_s {
-        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3}},\n"
-        ));
-        ptx.push_str("        {%bwd_ado_0, %bwd_ado_1, %bwd_ado_2, %bwd_ado_3},\n");
-        ptx.push_str(&format!("        {{%bwd_bv_{nt}_0, %bwd_bv_{nt}_1}},\n"));
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3}};\n"
-        ));
-    }
+    // B-fragments from V shmem + MMAs, per warp partition (V stored as
+    // [block_kv, hd_padded], same layout as K)
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DP_NT", n_tiles_s, s_wnt, &mut |ptx, nts| {
+        for nt in nts.clone() {
+            emit_load_b_fragment_row_major(
+                ptx,
+                &format!("%bwd_bv_{nt}"),
+                v_shmem_offset as usize,
+                hd_padded_u,
+                nt,
+            );
+        }
+        for nt in nts {
+            ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3}},\n"
+            ));
+            ptx.push_str("        {%bwd_ado_0, %bwd_ado_1, %bwd_ado_2, %bwd_ado_3},\n");
+            ptx.push_str(&format!("        {{%bwd_bv_{nt}_0, %bwd_bv_{nt}_1}},\n"));
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3}};\n"
+            ));
+        }
+    });
 
     ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
     ptx.push_str(&format!(
@@ -5044,22 +5286,26 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ));
     ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DP_K_LOOP;\n\n");
 
-    // Store dP to dP_tile shmem (no scaling needed)
-    emit_scale_and_store_mma_tile(
-        ptx,
-        "%bwd_acc_dp",
-        n_tiles_s,
-        dp_shmem_offset as usize,
-        block_kv_u,
-        false, // no scale
-    );
+    // Store dP to dP_tile shmem (no scaling; each partition stores its slice)
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DP_ST", n_tiles_s, s_wnt, &mut |ptx, nts| {
+        emit_scale_and_store_mma_tile(
+            ptx,
+            "%bwd_acc_dp",
+            nts,
+            dp_shmem_offset as usize,
+            block_kv_u,
+            false, // no scale
+        );
+    });
 
-    // Advance m-tile
+    // Advance m-tile (stride = warp m-groups)
     ptx.push_str(&format!(
-        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
-        MMA_M * hd_padded_u * 4
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += m_w * MMA_M * hd_padded * 4\n",
+        s_mw * MMA_M * hd_padded_u * 4
     ));
-    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, {s_mw};\n"
+    ));
     ptx.push_str("    bra BWD_MAIN_MMA_DP_M_LOOP;\n");
     ptx.push_str("BWD_MAIN_MMA_DP_M_DONE:\n");
     ptx.push_str("    bar.sync 0;  // dP_tile fully computed via MMA\n\n");
@@ -5076,8 +5322,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         m_tiles_kv, n_tiles_hd, k_iters_q
     ));
 
-    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
-    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    emit_bwd_m_loop_init(ptx, g_wnt, MMA_M * hd_padded_u * 4);
     ptx.push_str("BWD_MAIN_MMA_DV_M_LOOP:\n");
     ptx.push_str(&format!(
         "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
@@ -5110,30 +5355,30 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         block_kv_u, // col stride of source matrix (S_tile row width)
     );
 
-    // B-fragments from dO shmem [block_q, hd_padded]
-    // k_iter indexes rows of dO (Q dimension)
-    for nt in 0..n_tiles_hd {
-        emit_load_b_fragment_row_major_k_is_q(
-            ptx,
-            &format!("%bwd_bg_{nt}"),
-            do_shmem_offset as usize,
-            hd_padded_u,
-            nt,
-        );
-    }
-
-    // Issue MMA: dV_acc += P^T_frag @ dO_frag
-    for nt in 0..n_tiles_hd {
-        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
-        ));
-        ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
-        ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
-        ));
-    }
+    // B-fragments from dO shmem [block_q, hd_padded] + MMAs, per warp
+    // partition (k_iter indexes rows of dO, the Q dimension)
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DV_NT", n_tiles_hd, g_wnt, &mut |ptx, nts| {
+        for nt in nts.clone() {
+            emit_load_b_fragment_row_major_k_is_q(
+                ptx,
+                &format!("%bwd_bg_{nt}"),
+                do_shmem_offset as usize,
+                hd_padded_u,
+                nt,
+            );
+        }
+        for nt in nts {
+            ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
+            ));
+            ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
+            ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
+            ));
+        }
+    });
 
     ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
     ptx.push_str(&format!(
@@ -5142,26 +5387,42 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ));
     ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DV_K_LOOP;\n\n");
 
-    // Accumulate dV results to dV_local shmem via atom.shared.add.f32.
-    // Only warp 0 accumulates — every warp holds the identical tile, so an
-    // unguarded atom.add would over-count by the warp count (2× at block_q=64).
-    ptx.push_str("    setp.ne.u32 %bwd_mma_pw, %bwd_mma_wid, 0;\n");
-    ptx.push_str("    @%bwd_mma_pw bra BWD_MAIN_MMA_DV_ACC_SKIP;\n");
-    emit_accumulate_mma_to_shmem(
-        ptx,
-        "%bwd_acc_g",
-        n_tiles_hd,
-        dv_shmem_offset as usize,
-        hd_padded_u,
-    );
-    ptx.push_str("BWD_MAIN_MMA_DV_ACC_SKIP:\n");
+    // Accumulate dV. Each (m-tile, n-tile) unit is owned by exactly one warp
+    // partition, so ownership replaces the historical warp-0 redundancy gate:
+    // every unit is accumulated once, in the same per-element q-iteration
+    // order. Multi-warp accumulates into persistent per-warp REGISTERS
+    // (each warp runs exactly ONE dV m-tile — backward_main_warps guarantees
+    // m_tiles_kv == g_mw — so the register names need no m index); the
+    // plain add per q-iteration keeps the summation order bit-identical to
+    // the historical atom.shared.add flow. Single-warp keeps the SMEM tile.
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DV_ACC", n_tiles_hd, g_wnt, &mut |ptx, nts| {
+        if warps > 1 {
+            for nt in nts {
+                for r in 0..4 {
+                    ptx.push_str(&format!(
+                        "    add.f32 %bwd_dvp_{nt}_{r}, %bwd_dvp_{nt}_{r}, %bwd_acc_g_{nt}_{r};\n"
+                    ));
+                }
+            }
+        } else {
+            emit_accumulate_mma_to_shmem(
+                ptx,
+                "%bwd_acc_g",
+                nts,
+                dv_shmem_offset as usize,
+                hd_padded_u,
+            );
+        }
+    });
 
-    // Advance m-tile (row stride for dV_local is hd_padded)
+    // Advance m-tile (stride = warp m-groups; row stride for dV_local is hd_padded)
     ptx.push_str(&format!(
-        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
-        MMA_M * hd_padded_u * 4
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += m_w * MMA_M * hd_padded * 4\n",
+        g_mw * MMA_M * hd_padded_u * 4
     ));
-    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, {g_mw};\n"
+    ));
     ptx.push_str("    bra BWD_MAIN_MMA_DV_M_LOOP;\n");
     ptx.push_str("BWD_MAIN_MMA_DV_M_DONE:\n");
     ptx.push_str("    bar.sync 0;  // dV accumulation done\n\n");
@@ -5170,64 +5431,106 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     // Scalar Step 3e: dS = P * (dP - D) → overwrite S_tile with dS
     // Now P is in S_tile and dP is in dP_tile
     // ══════════════════════════════════════════════════════════════════
-    ptx.push_str("    // === Scalar Step 3e: dS = P * (dP - D) ===\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
-        config.block_q
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_DS_DONE;\n\n");
+    if warps > 1 {
+        // Element-linear dS: all launch threads stride the tile; the S/dP
+        // addresses are idx*4 plus each tile's base.
+        ptx.push_str(
+            "    // === Scalar Step 3e: dS = P * (dP - D) (element-linear over all warps) ===\n",
+        );
+        let total_elems = block_q_u * block_kv_u;
+        let bkv_shift = block_kv_u.trailing_zeros();
+        ptx.push_str("    mov.u64 %rd32, %rd11;  // idx = tid\n");
+        ptx.push_str("BWD_MAIN_MMA_DS_ELEM:\n");
+        ptx.push_str(&format!("    setp.ge.u64 %p1, %rd32, {total_elems};\n"));
+        ptx.push_str("    @%p1 bra BWD_MAIN_MMA_DS_DONE;\n");
+        // D[mi]
+        ptx.push_str(&format!(
+            "    shr.b64 %rd27, %rd32, {bkv_shift};  // mi = idx / block_kv\n"
+        ));
+        ptx.push_str("    shl.b64 %rd26, %rd27, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd26, %rd26, {};\n",
+            d_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_d_val", "%rd26");
+        ptx.push_str("    shl.b64 %rd35, %rd32, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd36, %rd35, {};  // S_tile offset\n",
+            s_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_p", "%rd36");
+        ptx.push_str(&format!(
+            "    add.u64 %rd37, %rd35, {};  // dP_tile offset\n",
+            dp_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_dp", "%rd37");
+        ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;\n");
+        ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;\n");
+        emit_smem_store(ptx, "f32", "%rd36", "%f_ds");
+        ptx.push_str(&format!("    add.u64 %rd32, %rd32, {nthreads};\n"));
+        ptx.push_str("    bra BWD_MAIN_MMA_DS_ELEM;\n");
+        ptx.push_str("BWD_MAIN_MMA_DS_DONE:\n");
+        ptx.push_str("    bar.sync 0;  // dS stored in S_tile\n\n");
+    } else {
+        ptx.push_str("    // === Scalar Step 3e: dS = P * (dP - D) ===\n");
+        ptx.push_str(&format!(
+            "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
+            config.block_q
+        ));
+        ptx.push_str("    @%p0 bra BWD_MAIN_MMA_DS_DONE;\n\n");
 
-    // Reload D[mi]
-    ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd27, %rd26, {};\n",
-        d_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f_d_val", "%rd27");
-    ptx.push('\n');
+        // Reload D[mi]
+        ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd27, %rd26, {};\n",
+            d_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_d_val", "%rd27");
+        ptx.push('\n');
 
-    ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
-    ptx.push_str("BWD_MAIN_MMA_DS_NJ:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_MMA_DS_NJ_DONE;\n\n");
+        ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
+        ptx.push_str("BWD_MAIN_MMA_DS_NJ:\n");
+        ptx.push_str(&format!(
+            "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
+            config.block_kv
+        ));
+        ptx.push_str("    @%p1 bra BWD_MAIN_MMA_DS_NJ_DONE;\n\n");
 
-    // S_tile addr for [mi][nj]
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
-        config.block_kv
-    ));
-    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;\n");
-    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+        // S_tile addr for [mi][nj]
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
+            config.block_kv
+        ));
+        ptx.push_str("    add.u64 %rd35, %rd35, %rd32;\n");
+        ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
 
-    // Read P[mi][nj] from S_tile
-    ptx.push_str(&format!(
-        "    add.u64 %rd36, %rd35, {};  // S_tile offset\n",
-        s_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f_p", "%rd36");
+        // Read P[mi][nj] from S_tile
+        ptx.push_str(&format!(
+            "    add.u64 %rd36, %rd35, {};  // S_tile offset\n",
+            s_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_p", "%rd36");
 
-    // Read dP[mi][nj] from dP_tile
-    ptx.push_str(&format!(
-        "    add.u64 %rd37, %rd35, {};  // dP_tile offset\n",
-        dp_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f_dp", "%rd37");
+        // Read dP[mi][nj] from dP_tile
+        ptx.push_str(&format!(
+            "    add.u64 %rd37, %rd35, {};  // dP_tile offset\n",
+            dp_shmem_offset
+        ));
+        emit_smem_load(ptx, "f32", "%f_dp", "%rd37");
 
-    // dS = P * (dP - D)
-    ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;\n");
-    ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;\n");
+        // dS = P * (dP - D)
+        ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;\n");
+        ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;\n");
 
-    // Overwrite S_tile with dS (reuse same location)
-    emit_smem_store(ptx, "f32", "%rd36", "%f_ds");
-    ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_MMA_DS_NJ;\n");
-    ptx.push_str("BWD_MAIN_MMA_DS_NJ_DONE:\n\n");
+        // Overwrite S_tile with dS (reuse same location)
+        emit_smem_store(ptx, "f32", "%rd36", "%f_ds");
+        ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
+        ptx.push_str("    bra BWD_MAIN_MMA_DS_NJ;\n");
+        ptx.push_str("BWD_MAIN_MMA_DS_NJ_DONE:\n\n");
 
-    ptx.push_str("BWD_MAIN_MMA_DS_DONE:\n");
-    ptx.push_str("    bar.sync 0;  // dS stored in S_tile\n\n");
+        ptx.push_str("BWD_MAIN_MMA_DS_DONE:\n");
+        ptx.push_str("    bar.sync 0;  // dS stored in S_tile\n\n");
+    }
 
     // ══════════════════════════════════════════════════════════════════
     // MMA Step 3f: dQ += dS @ K * scale → atomicAdd to global dQ
@@ -5241,8 +5544,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         m_tiles_q, n_tiles_hd, k_iters_kv
     ));
 
-    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
-    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    emit_bwd_m_loop_init(ptx, q_wnt, MMA_M * block_kv_u * 4);
     ptx.push_str("BWD_MAIN_MMA_DQ_M_LOOP:\n");
     ptx.push_str(&format!(
         "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
@@ -5273,30 +5575,30 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         block_kv_u,
     );
 
-    // B-fragments from K shmem [block_kv, hd_padded]
-    // k_iter indexes rows of K (KV dimension = reduction)
-    for nt in 0..n_tiles_hd {
-        emit_load_b_fragment_row_major_k_is_q(
-            ptx,
-            &format!("%bwd_bg_{nt}"),
-            0, // K at shmem[0..]
-            hd_padded_u,
-            nt,
-        );
-    }
-
-    // Issue MMA: dQ_acc += dS_frag @ K_frag
-    for nt in 0..n_tiles_hd {
-        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
-        ));
-        ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
-        ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
-        ));
-    }
+    // B-fragments from K shmem [block_kv, hd_padded] + MMAs, per warp
+    // partition (k_iter indexes rows of K, the KV reduction dimension)
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DQ_NT", n_tiles_hd, q_wnt, &mut |ptx, nts| {
+        for nt in nts.clone() {
+            emit_load_b_fragment_row_major_k_is_q(
+                ptx,
+                &format!("%bwd_bg_{nt}"),
+                0, // K at shmem[0..]
+                hd_padded_u,
+                nt,
+            );
+        }
+        for nt in nts {
+            ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
+            ));
+            ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
+            ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
+            ));
+        }
+    });
 
     ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
     ptx.push_str(&format!(
@@ -5308,26 +5610,21 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     // Scale and atomicAdd dQ results to global dQ
     // dQ[global_q_row, d] += acc * scale
     // global_q_row = q_start + m_tile*16 + thread_row
-    // Only warp 0 accumulates (see the dV note): the global atom.add would otherwise
-    // over-count by the warp count.
-    ptx.push_str("    setp.ne.u32 %bwd_mma_pw, %bwd_mma_wid, 0;\n");
-    ptx.push_str("    @%bwd_mma_pw bra BWD_MAIN_MMA_DQ_ACC_SKIP;\n");
-    emit_atomicadd_mma_to_global_dq(
-        ptx,
-        "%bwd_acc_g",
-        n_tiles_hd,
-        config,
-    );
-    ptx.push_str("BWD_MAIN_MMA_DQ_ACC_SKIP:\n");
+    // Unit ownership replaces the historical warp-0 redundancy gate: each
+    // (m-tile, n-tile) unit is atomically added exactly once, by its owner.
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DQ_ACC", n_tiles_hd, q_wnt, &mut |ptx, nts| {
+        emit_atomicadd_mma_to_global_dq(ptx, "%bwd_acc_g", nts, config);
+    });
 
-    // Advance m-tile (row stride for S_tile A-fragment is block_kv, but m_byte_off
-    // tracks the Q/dO m-tile offset which uses hd_padded stride — we need a separate
-    // offset for S_tile. Use m_tile counter directly in the helper.)
+    // Advance m-tile (stride = warp m-groups; row stride for the S_tile
+    // A-fragment is block_kv, so m_byte_off advances by that stride here)
     ptx.push_str(&format!(
-        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * block_kv * 4 (S_tile row stride)\n",
-        MMA_M * block_kv_u * 4
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += m_w * MMA_M * block_kv * 4 (S_tile row stride)\n",
+        q_mw * MMA_M * block_kv_u * 4
     ));
-    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, {q_mw};\n"
+    ));
     ptx.push_str("    bra BWD_MAIN_MMA_DQ_M_LOOP;\n");
     ptx.push_str("BWD_MAIN_MMA_DQ_M_DONE:\n");
     ptx.push_str("    bar.sync 0;  // dQ accumulation done\n\n");
@@ -5344,8 +5641,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         m_tiles_kv, n_tiles_hd, k_iters_q
     ));
 
-    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
-    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    emit_bwd_m_loop_init(ptx, g_wnt, MMA_M * hd_padded_u * 4);
     ptx.push_str("BWD_MAIN_MMA_DK_M_LOOP:\n");
     ptx.push_str(&format!(
         "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
@@ -5376,29 +5672,29 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         block_kv_u,
     );
 
-    // B-fragments from Q shmem [block_q, hd_padded]
-    for nt in 0..n_tiles_hd {
-        emit_load_b_fragment_row_major_k_is_q(
-            ptx,
-            &format!("%bwd_bg_{nt}"),
-            q_shmem_offset as usize,
-            hd_padded_u,
-            nt,
-        );
-    }
-
-    // Issue MMA: dK_acc += dS^T_frag @ Q_frag
-    for nt in 0..n_tiles_hd {
-        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
-        ));
-        ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
-        ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
-        ptx.push_str(&format!(
-            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
-        ));
-    }
+    // B-fragments from Q shmem [block_q, hd_padded] + MMAs, per warp partition
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DK_NT", n_tiles_hd, g_wnt, &mut |ptx, nts| {
+        for nt in nts.clone() {
+            emit_load_b_fragment_row_major_k_is_q(
+                ptx,
+                &format!("%bwd_bg_{nt}"),
+                q_shmem_offset as usize,
+                hd_padded_u,
+                nt,
+            );
+        }
+        for nt in nts {
+            ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
+            ));
+            ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
+            ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
+            ptx.push_str(&format!(
+                "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
+            ));
+        }
+    });
 
     ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
     ptx.push_str(&format!(
@@ -5407,25 +5703,42 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ));
     ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DK_K_LOOP;\n\n");
 
-    // Scale and accumulate dK results to dK_local shmem via atom.shared.add.f32.
-    // Only warp 0 accumulates (see the dV note).
-    ptx.push_str("    setp.ne.u32 %bwd_mma_pw, %bwd_mma_wid, 0;\n");
-    ptx.push_str("    @%bwd_mma_pw bra BWD_MAIN_MMA_DK_ACC_SKIP;\n");
-    emit_accumulate_mma_to_shmem_scaled(
-        ptx,
-        "%bwd_acc_g",
-        n_tiles_hd,
-        dk_shmem_offset as usize,
-        hd_padded_u,
-    );
-    ptx.push_str("BWD_MAIN_MMA_DK_ACC_SKIP:\n");
+    // Scale and accumulate dK. Unit ownership replaces the warp-0 redundancy
+    // gate (see the dV note). Multi-warp: mul-then-add into the persistent
+    // registers — the SAME two-rounding shape as the historical
+    // scale-then-atom.shared.add, so dK stays bit-identical (a single fma
+    // here would round differently).
+    emit_bwd_nt_arms(ptx, "BWD_MMA_DK_ACC", n_tiles_hd, g_wnt, &mut |ptx, nts| {
+        if warps > 1 {
+            for nt in nts {
+                for r in 0..4 {
+                    ptx.push_str(&format!(
+                        "    mul.f32 %bwd_mma_f32_lo, %bwd_acc_g_{nt}_{r}, %scale;\n"
+                    ));
+                    ptx.push_str(&format!(
+                        "    add.f32 %bwd_dkp_{nt}_{r}, %bwd_dkp_{nt}_{r}, %bwd_mma_f32_lo;\n"
+                    ));
+                }
+            }
+        } else {
+            emit_accumulate_mma_to_shmem_scaled(
+                ptx,
+                "%bwd_acc_g",
+                nts,
+                dk_shmem_offset as usize,
+                hd_padded_u,
+            );
+        }
+    });
 
-    // Advance m-tile
+    // Advance m-tile (stride = warp m-groups)
     ptx.push_str(&format!(
-        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
-        MMA_M * hd_padded_u * 4
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += m_w * MMA_M * hd_padded * 4\n",
+        g_mw * MMA_M * hd_padded_u * 4
     ));
-    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, {g_mw};\n"
+    ));
     ptx.push_str("    bra BWD_MAIN_MMA_DK_M_LOOP;\n");
     ptx.push_str("BWD_MAIN_MMA_DK_M_DONE:\n");
     ptx.push_str("BWD_MAIN_STEPS_DONE:\n");
@@ -5774,14 +6087,14 @@ fn emit_load_b_fragment_row_major_k_is_q(
 fn emit_scale_and_store_mma_tile(
     ptx: &mut String,
     acc_prefix: &str,
-    n_tiles: usize,
+    nts: std::ops::Range<usize>,
     shmem_base: usize,
     row_width: usize, // number of columns in the output tile (e.g. block_kv)
     apply_scale: bool,
 ) {
     ptx.push_str("    // Store MMA accumulator results to shmem\n");
 
-    for nt in 0..n_tiles {
+    for nt in nts {
         for r in 0..4 {
             if apply_scale {
                 ptx.push_str(&format!(
@@ -5832,13 +6145,13 @@ fn emit_scale_and_store_mma_tile(
 fn emit_accumulate_mma_to_shmem(
     ptx: &mut String,
     acc_prefix: &str,
-    n_tiles: usize,
+    nts: std::ops::Range<usize>,
     shmem_base: usize,
     row_stride_elems: usize, // hd_padded
 ) {
     ptx.push_str("    // Accumulate MMA results to shmem via atomicAdd\n");
 
-    for nt in 0..n_tiles {
+    for nt in nts {
         for r in 0..4 {
             // hw C layout: reg r → row = m_tile*16 + g + 8*(r>=2), col = nt*8 + 2t + (r&1)
             let row_add = if r >= 2 { 8 } else { 0 };
@@ -5884,13 +6197,13 @@ fn emit_accumulate_mma_to_shmem(
 fn emit_accumulate_mma_to_shmem_scaled(
     ptx: &mut String,
     acc_prefix: &str,
-    n_tiles: usize,
+    nts: std::ops::Range<usize>,
     shmem_base: usize,
     row_stride_elems: usize,
 ) {
     ptx.push_str("    // Accumulate MMA results to shmem via atomicAdd (with scale)\n");
 
-    for nt in 0..n_tiles {
+    for nt in nts {
         for r in 0..4 {
             // Scale first
             ptx.push_str(&format!(
@@ -5940,12 +6253,12 @@ fn emit_accumulate_mma_to_shmem_scaled(
 fn emit_atomicadd_mma_to_global_dq(
     ptx: &mut String,
     acc_prefix: &str,
-    n_tiles: usize,
+    nts: std::ops::Range<usize>,
     config: &FlashAttentionBackwardConfig,
 ) {
     ptx.push_str("    // AtomicAdd MMA dQ results to global dQ (with scale)\n");
 
-    for nt in 0..n_tiles {
+    for nt in nts {
         for r in 0..4 {
             // Scale
             ptx.push_str(&format!(
@@ -6025,6 +6338,7 @@ fn emit_bwd_main_store_dk_dv(
     ptx: &mut String,
     config: &FlashAttentionBackwardConfig,
     gqa: bool,
+    nthreads: i64,
 ) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_bytes = config.block_kv * hd_padded * 4;
@@ -6049,83 +6363,129 @@ fn emit_bwd_main_store_dk_dv(
     ptx.push_str("    shl.b64 %rd21, %rd21, 2;\n");
     ptx.push_str("    add.u64 %rd21, %rd6, %rd21;  // dv_global_base\n\n");
 
-    // Store dK: thread tid stores rows starting at tid, stride block_q
-    ptx.push_str("    mov.u64 %rd22, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_STORE_DK:\n");
-    ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd22, {};\n",
-        config.block_kv
-    ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_STORE_DK_DONE;\n");
-    ptx.push_str("    mov.u64 %rd23, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_STORE_DK_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd23, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_STORE_DK_D_DONE;\n");
-    // shmem addr: dk_shmem_offset + (nj * hd_padded + d) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd24, %rd22, {};\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd24, %rd24, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd24, %rd24, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd24, %rd24, {};\n",
-        dk_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f0", "%rd24");
-    // global addr: dk_global_base + (nj * head_dim + d) * 4
-    ptx.push_str("    mul.lo.u64 %rd25, %rd22, %rd10;\n");
-    ptx.push_str("    add.u64 %rd25, %rd25, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd25, %rd25, 2;\n");
-    ptx.push_str("    add.u64 %rd25, %rd20, %rd25;\n");
-    ptx.push_str("    st.global.f32 [%rd25], %f0;\n");
-    ptx.push_str("    add.u64 %rd23, %rd23, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_STORE_DK_D;\n");
-    ptx.push_str("BWD_MAIN_STORE_DK_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd22, %rd22, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_STORE_DK;\n");
-    ptx.push_str("BWD_MAIN_STORE_DK_DONE:\n\n");
+    // Store dK: coalesced smem -> global copy of the CTA-exclusive kv slice
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_STORE_DK",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        nthreads,
+        "%rd20",
+        dk_shmem_offset,
+        false,
+    );
 
     // Store dV
-    ptx.push_str("    mov.u64 %rd22, %rd11;  // nj = tid\n");
-    ptx.push_str("BWD_MAIN_STORE_DV:\n");
+    emit_bwd_coalesced_tile_copy(
+        ptx,
+        "BWD_MAIN_STORE_DV",
+        config.block_kv,
+        config.head_dim,
+        hd_padded,
+        nthreads,
+        "%rd21",
+        dv_shmem_offset,
+        false,
+    );
+}
+
+/// Multi-warp store epilogue: scatter the persistent per-warp dK/dV register
+/// accumulators straight to global memory (the SMEM tiles no longer exist).
+///
+/// Each warp owns exactly one dV/dK m-tile (m_tile = wid / w_nt) and a fixed
+/// nt slice; the per-register C-layout mapping is the same as the accumulate
+/// helpers': reg r -> row = m_tile*16 + g + 8*(r>=2), col = nt*8 + 2t + (r&1).
+/// The kv slice is CTA-exclusive (GQA included — the group reduction already
+/// happened in the registers), so these are plain `st.global.f32`. dK was
+/// scaled during accumulation; no scale here.
+fn emit_bwd_main_store_dk_dv_regs(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    gqa: bool,
+    warps: i64,
+) {
+    let n_tiles_hd = (config.head_dim as usize) / MMA_N;
+    let m_tiles_kv = (config.block_kv as usize) / MMA_M;
+    let (_g_mw, g_wnt) = bwd_step_partition(m_tiles_kv, n_tiles_hd, warps as usize)
+        .expect("dV/dK partition (store)");
+    let kv_base_reg = if gqa { "%rd_gqa_kvoff" } else { "%rd15" };
+    let head_dim = config.head_dim;
+
+    ptx.push_str("    // === Store persistent dK/dV registers to global memory ===\n");
+
+    // dK global base: dk_ptr + (kv_elem_offset + kv_start * head_dim) * 4
+    ptx.push_str("    mul.lo.u64 %rd20, %rd14, %rd10;  // kv_start * head_dim\n");
+    ptx.push_str(&format!("    add.u64 %rd20, {kv_base_reg}, %rd20;\n"));
+    ptx.push_str("    shl.b64 %rd20, %rd20, 2;\n");
+    ptx.push_str("    add.u64 %rd20, %rd5, %rd20;  // dk_global_base\n\n");
+
+    // dV global base
+    ptx.push_str("    mul.lo.u64 %rd21, %rd14, %rd10;\n");
+    ptx.push_str(&format!("    add.u64 %rd21, {kv_base_reg}, %rd21;\n"));
+    ptx.push_str("    shl.b64 %rd21, %rd21, 2;\n");
+    ptx.push_str("    add.u64 %rd21, %rd6, %rd21;  // dv_global_base\n\n");
+
+    // This warp's dV/dK m-tile and nt partition (single m-tile per warp).
+    let shift = g_wnt.trailing_zeros();
     ptx.push_str(&format!(
-        "    setp.ge.u64 %p0, %rd22, {};\n",
-        config.block_kv
+        "    shr.u32 %bwd_mma_m_tile, %bwd_mma_wid, {shift};  // m-tile = wid / {g_wnt}\n"
     ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_STORE_DV_DONE;\n");
-    ptx.push_str("    mov.u64 %rd23, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_STORE_DV_D:\n");
-    ptx.push_str("    setp.ge.u64 %p1, %rd23, %rd10;\n");
-    ptx.push_str("    @%p1 bra BWD_MAIN_STORE_DV_D_DONE;\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd24, %rd22, {};\n",
-        hd_padded
+        "    and.b32 %bwd_mma_wpart, %bwd_mma_wid, {};  // nt-part = wid % {g_wnt}\n",
+        g_wnt - 1
     ));
-    ptx.push_str("    add.u64 %rd24, %rd24, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd24, %rd24, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd24, %rd24, {};\n",
-        dv_shmem_offset
-    ));
-    emit_smem_load(ptx, "f32", "%f0", "%rd24");
-    ptx.push_str("    mul.lo.u64 %rd25, %rd22, %rd10;\n");
-    ptx.push_str("    add.u64 %rd25, %rd25, %rd23;\n");
-    ptx.push_str("    shl.b64 %rd25, %rd25, 2;\n");
-    ptx.push_str("    add.u64 %rd25, %rd21, %rd25;\n");
-    ptx.push_str("    st.global.f32 [%rd25], %f0;\n");
-    ptx.push_str("    add.u64 %rd23, %rd23, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_STORE_DV_D;\n");
-    ptx.push_str("BWD_MAIN_STORE_DV_D_DONE:\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd22, %rd22, {};\n",
-        config.block_q
-    ));
-    ptx.push_str("    bra BWD_MAIN_STORE_DV;\n");
-    ptx.push_str("BWD_MAIN_STORE_DV_DONE:\n\n");
+
+    for (which, base_reg) in [("DK", "%rd20"), ("DV", "%rd21")] {
+        let acc = if which == "DK" { "%bwd_dkp" } else { "%bwd_dvp" };
+        emit_bwd_nt_arms(
+            ptx,
+            &format!("BWD_STORE_{which}_REGS"),
+            n_tiles_hd,
+            g_wnt,
+            &mut |ptx, nts| {
+                for nt in nts {
+                    for r in 0..4 {
+                        let row_add: usize = if r >= 2 { 8 } else { 0 };
+                        let col_add: usize = r & 1;
+                        // row = m_tile*16 + g (+8 for r>=2)
+                        ptx.push_str(&format!(
+                            "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
+                            MMA_M
+                        ));
+                        ptx.push_str(
+                            "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_gid;\n",
+                        );
+                        if row_add > 0 {
+                            ptx.push_str(&format!(
+                                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {row_add};\n"
+                            ));
+                        }
+                        // addr = base + (row*head_dim + nt*8 + 2t + (r&1)) * 4
+                        ptx.push_str(
+                            "    cvt.u64.u32 %bwd_mma_gaddr, %bwd_mma_store_row;\n",
+                        );
+                        ptx.push_str(&format!(
+                            "    mul.lo.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, {head_dim};\n"
+                        ));
+                        ptx.push_str("    cvt.u64.u32 %rd35, %bwd_mma_tid2;\n");
+                        ptx.push_str("    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, %rd35;\n");
+                        ptx.push_str(&format!(
+                            "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, {};  // + nt*MMA_N + (r&1)\n",
+                            nt * MMA_N + col_add
+                        ));
+                        ptx.push_str("    shl.b64 %bwd_mma_gaddr, %bwd_mma_gaddr, 2;\n");
+                        ptx.push_str(&format!(
+                            "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, {base_reg};\n"
+                        ));
+                        ptx.push_str(&format!(
+                            "    st.global.f32 [%bwd_mma_gaddr], {acc}_{nt}_{r};\n"
+                        ));
+                    }
+                }
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6942,15 +7302,25 @@ mod tests {
 
     #[test]
     fn test_bwd_main_kernel_name() {
+        // The `_w4` suffix IS the launch contract (32*4 threads) — the
+        // runtime parses it, so the name must carry it whenever the
+        // multi-warp MMA emission is active (default-on for this config).
         let cfg = bwd_config(true);
         assert_eq!(
             flash_attention_bwd_main_kernel_name(&cfg),
-            "flash_attn_bwd_main_c1_q64_kv64"
+            "flash_attn_bwd_main_c1_q64_kv64_w4"
         );
         let cfg2 = bwd_config(false);
         assert_eq!(
             flash_attention_bwd_main_kernel_name(&cfg2),
-            "flash_attn_bwd_main_c0_q64_kv64"
+            "flash_attn_bwd_main_c0_q64_kv64_w4"
+        );
+        // The scalar path (no MMA => single warp) keeps the unsuffixed name.
+        let mut cfg3 = bwd_config(true);
+        cfg3.gpu_sm = 75;
+        assert_eq!(
+            flash_attention_bwd_main_kernel_name(&cfg3),
+            "flash_attn_bwd_main_c1_q64_kv64"
         );
     }
 
@@ -6989,21 +7359,37 @@ mod tests {
 
     #[test]
     fn test_bwd_main_has_regular_store_dk_dv() {
+        // Multi-warp (default): dK/dV persist in registers and the store is
+        // the per-warp fragment scatter (BWD_STORE_*_REGS); there is no SMEM
+        // tile store and NO shared atomics anywhere in the body.
         let cfg = bwd_config(false);
         let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
         let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        // (The BWD_STORE_*_REGS arm labels only appear when the dV/dK
+        // partition has w_nt > 1; at 64/64 all four warps split by m-tile,
+        // so probe the persistent registers themselves.)
         assert!(
-            ptx.contains("BWD_MAIN_STORE_DK"),
-            "dK store section"
+            ptx.contains("st.global.f32 [%bwd_mma_gaddr], %bwd_dkp_"),
+            "dK register-scatter store"
         );
         assert!(
-            ptx.contains("BWD_MAIN_STORE_DV"),
-            "dV store section"
+            ptx.contains("st.global.f32 [%bwd_mma_gaddr], %bwd_dvp_"),
+            "dV register-scatter store"
         );
         // dK/dV use regular st.global, not atomic
         assert!(
             ptx.contains("st.global.f32"),
             "dK/dV use regular global store"
+        );
+        // Instruction form only — the %f_discard declaration's comment also
+        // says "atom.shared.add.f32".
+        assert!(
+            !ptx.contains("atom.shared.add.f32 %"),
+            "multi-warp body must not use shared atomics (register accumulators)"
+        );
+        assert!(
+            !ptx.contains("BWD_MAIN_ZERO_DK"),
+            "multi-warp body must not zero SMEM dK/dV tiles"
         );
     }
 
@@ -7315,10 +7701,12 @@ mod tests {
 
     #[test]
     fn test_bwd_main_gqa_kernel_name() {
+        // `_gqa` appends AFTER the `_w4` launch suffix, matching the
+        // runtime's read-name-then-append-`_gqa` selection.
         let cfg = bwd_config(true);
         assert_eq!(
             flash_attention_bwd_main_gqa_kernel_name(&cfg),
-            "flash_attn_bwd_main_c1_q64_kv64_gqa"
+            "flash_attn_bwd_main_c1_q64_kv64_w4_gqa"
         );
     }
 

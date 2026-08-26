@@ -6301,12 +6301,34 @@ fn flash_attention_backward_gpu(
     // behavior (the kernel would index past its dynamic-shared window at run time
     // with no launch-time error). Keep this in sync with `backward_shared_mem_bytes`.
     {
+        // The `_w<N>` kernel-name suffix is the multi-warp launch contract
+        // (see the block-dims comment below): those bodies keep dK/dV in
+        // persistent per-warp REGISTERS, so their SMEM layout has no dK/dV
+        // tiles. Parsed here (before the launch parse) because the SMEM
+        // request must match the layout the PTX was emitted against —
+        // over-allocating would silently forfeit the 2-CTAs/SM occupancy the
+        // shrink exists for.
+        let phase2_multiwarp = {
+            let plain = unsafe {
+                std::ffi::CStr::from_ptr(phase2_name_ptr as *const std::os::raw::c_char)
+            };
+            let name = plain.to_string_lossy();
+            match name.rfind("_w") {
+                Some(pos) => name[pos + 2..].parse::<i64>().is_ok_and(|w| w > 1),
+                None => false,
+            }
+        };
         let pad: i64 = 4;
         let hd_padded = d as i64 + pad;
         let tile_bytes = |rows: i64, cols: i64| -> i64 { rows * cols * 4 };
+        let dkdv_tiles = if phase2_multiwarp {
+            0 // dK/dV live in registers (multi-warp body)
+        } else {
+            tile_bytes(block_kv, hd_padded) * 2
+        };
         let shmem = (tile_bytes(block_kv, hd_padded) * 2  // K, V tiles
             + tile_bytes(block_q, hd_padded) * 2           // Q, dO tiles
-            + tile_bytes(block_kv, hd_padded) * 2          // dK, dV accumulators
+            + dkdv_tiles                                   // dK, dV accumulators (single-warp only)
             + tile_bytes(block_q, block_kv)                // S tile
             + tile_bytes(block_q, block_kv)                // dP tile (MMA path only; over-allocated for scalar)
             + block_q * 4                                  // D vector
@@ -6477,8 +6499,29 @@ fn flash_attention_backward_gpu(
             ((b * h) as i64, phase2_name_ptr as *const u8)
         };
 
+        // Launch thread count is part of the kernel-name contract: a `_w<N>`
+        // suffix (emitted by codegen's `backward_main_warps`) means the body
+        // partitions its work across N warps and MUST be launched with 32*N
+        // threads. No suffix = the historical block_q-thread single-warp
+        // contract. Parsing the embedded name (rather than recomputing the
+        // codegen policy here) means body and launch can never disagree, even
+        // across env-var or policy changes.
+        let phase2_threads = {
+            let plain = unsafe {
+                std::ffi::CStr::from_ptr(phase2_name_ptr as *const std::os::raw::c_char)
+            };
+            let name = plain.to_string_lossy();
+            match name.rfind("_w") {
+                Some(pos) => match name[pos + 2..].parse::<i64>() {
+                    Ok(w) if w >= 1 && w <= 32 => 32 * w,
+                    _ => block_q,
+                },
+                None => block_q,
+            }
+        };
+
         let grid = [grid_x, (s as i64 + block_kv - 1) / block_kv, 1];
-        let block = [block_q, 1, 1];
+        let block = [phase2_threads, 1, 1];
 
         let res = inner::kernel_launch(
             phase2_ptx_ptr as *const u8,

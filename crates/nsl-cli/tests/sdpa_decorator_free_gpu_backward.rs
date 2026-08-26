@@ -195,10 +195,13 @@ fn contains_bytes(haystack: &[u8], needle: &str) -> bool {
 #[test]
 fn variant_table_embedded_for_decorator_free_train() {
     let obj = build_obj_bytes(DECORATOR_FREE_SRC, "decorator_free_attn");
+    // The `_w4` suffix is the multi-warp launch contract (32*4 threads,
+    // parsed by the runtime from this embedded name) — pinning it here pins
+    // that the shipped variants are the partitioned multi-warp bodies.
     for name in [
-        "flash_attn_bwd_main_c1_q64_kv64", // head_dim 32
-        "flash_attn_bwd_main_c1_q32_kv32", // head_dim 64
-        "flash_attn_bwd_main_c1_q32_kv16", // head_dim 128
+        "flash_attn_bwd_main_c1_q64_kv64_w4", // head_dim 32
+        "flash_attn_bwd_main_c1_q32_kv32_w4", // head_dim 64
+        "flash_attn_bwd_main_c1_q32_kv16_w4", // head_dim 128
     ] {
         assert!(
             contains_bytes(&obj, name),
