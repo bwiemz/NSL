@@ -57,6 +57,29 @@ mod imp {
     const MAX_CAPTURE_ATTEMPTS: u32 = 2;
     /// Regions longer than this never capture (runaway-memory guard).
     const MAX_REGION_OPS: usize = 65536;
+    /// Record passes a region may spend without ever reaching
+    /// `STABLE_STREAK` before it gives up and goes eager.
+    ///
+    /// Recording is NOT free: every launch copies its raw argument bytes out
+    /// via `cuFuncGetParamInfo` into a fresh `Vec<GpuOp>`, and the whole
+    /// vector is hashed at region end. A region whose pointers churn every
+    /// step never stabilizes, so without a bound it pays that cost on every
+    /// step for the life of the process. At the 500M recipe that was 192 of
+    /// 408 (region, phase) slots recording forever — invisible until then,
+    /// because such regions used to taint on their first pass and
+    /// short-circuit straight to `Eager`.
+    ///
+    /// Honest scope: this bound was WRITTEN to explain a 1.5% regression and
+    /// it did not. It fires as intended (`eager` 192 -> 384) and recovers
+    /// nothing measurable; the regression is elsewhere (capturing the
+    /// monolithic adjoint region). Unbounded recording is a real cost and
+    /// bounding it is right, but do not credit it with a speedup.
+    ///
+    /// Above `STABLE_STREAK` with room for the allocator to settle: the
+    /// sgemm output pointer is known to move between the first and second
+    /// window (see the e2e gate's EPOCHS note), so a couple of restarts are
+    /// normal and must not be mistaken for churn.
+    const MAX_RECORD_ROUNDS: u32 = 8;
     /// Sanity cap on a single kernel argument's size in bytes.
     const MAX_PARAM_BYTES: usize = 512;
 
@@ -307,6 +330,8 @@ mod imp {
             prev_digest: Option<u64>,
             streak: u32,
             attempts: u32,
+            /// Record passes spent so far (see `MAX_RECORD_ROUNDS`).
+            rounds: u32,
             /// Retained only under NSL_CUDA_GRAPH_LOG=1, for divergence diffs.
             prev_seq: Option<Vec<GpuOp>>,
         },
@@ -348,6 +373,7 @@ mod imp {
         prev_digest: Option<u64>,
         streak: u32,
         attempts: u32,
+        rounds: u32,
         prev_seq: Option<Vec<GpuOp>>,
         /// Explicit next state set by mid-region transitions (taint/mismatch).
         post: Option<RegionState>,
@@ -697,7 +723,7 @@ mod imp {
             EAGER_REGIONS.fetch_add(1, Ordering::Relaxed);
             RegionState::Eager
         } else {
-            RegionState::Record { prev_digest: None, streak: 0, attempts: attempts + 1, prev_seq: None }
+            RegionState::Record { prev_digest: None, streak: 0, attempts: attempts + 1, rounds: 0, prev_seq: None }
         }
     }
 
@@ -729,14 +755,14 @@ mod imp {
         let state = REGIONS.with(|r| r.borrow_mut().remove(&(id, phase)));
         let state = state.unwrap_or_else(|| {
             REGIONS_SEEN.fetch_add(1, Ordering::Relaxed);
-            RegionState::Record { prev_digest: None, streak: 0, attempts: 0, prev_seq: None }
+            RegionState::Record { prev_digest: None, streak: 0, attempts: 0, rounds: 0, prev_seq: None }
         });
         let active = match state {
             RegionState::Eager => {
                 REGIONS.with(|r| r.borrow_mut().insert((id, phase), RegionState::Eager));
                 return;
             }
-            RegionState::Record { prev_digest, streak, attempts, prev_seq } => {
+            RegionState::Record { prev_digest, streak, attempts, rounds, prev_seq } => {
                 if streak >= STABLE_STREAK {
                     // Stable — capture this pass.
                     let stream = crate::cuda::inner::current_stream();
@@ -763,6 +789,7 @@ mod imp {
                         prev_digest,
                         streak,
                         attempts,
+                        rounds,
                         prev_seq: None,
                         post: None,
                         deferred: Vec::new(),
@@ -778,6 +805,7 @@ mod imp {
                         prev_digest,
                         streak,
                         attempts,
+                        rounds,
                         prev_seq,
                         post: None,
                         deferred: Vec::new(),
@@ -803,6 +831,7 @@ mod imp {
                     prev_digest: None,
                     streak: 0,
                     attempts,
+                    rounds: 0,
                     prev_seq: None,
                     post: None,
                     deferred: Vec::new(),
@@ -885,9 +914,10 @@ mod imp {
                         } else {
                             1
                         };
+                        let rounds = active.rounds + 1;
                         if log_on() {
                             eprintln!(
-                                "[cuda-graph] region {id}.{}: recorded {} ops, digest {d:016x}, streak {streak}",
+                                "[cuda-graph] region {id}.{}: recorded {} ops, digest {d:016x}, streak {streak}, round {rounds}",
                                 active.phase,
                                 active.seq.len()
                             );
@@ -897,15 +927,33 @@ mod imp {
                                 }
                             }
                         }
-                        RegionState::Record {
-                            prev_digest: Some(d),
-                            streak,
-                            attempts: active.attempts,
-                            prev_seq: if log_on() {
-                                Some(std::mem::take(&mut active.seq))
-                            } else {
-                                None
-                            },
+                        if streak < STABLE_STREAK && rounds >= MAX_RECORD_ROUNDS {
+                            // Churning, not warming up. Recording costs a
+                            // param-bytes copy per launch and a hash of the
+                            // whole sequence per pass, every step, forever —
+                            // so a region that has had this many chances and
+                            // still cannot repeat a digest is strictly
+                            // cheaper eager. See `MAX_RECORD_ROUNDS`.
+                            if log_on() {
+                                eprintln!(
+                                    "[cuda-graph] region {id}.{}: no stable digest in {rounds} rounds — going eager",
+                                    active.phase
+                                );
+                            }
+                            EAGER_REGIONS.fetch_add(1, Ordering::Relaxed);
+                            RegionState::Eager
+                        } else {
+                            RegionState::Record {
+                                prev_digest: Some(d),
+                                streak,
+                                attempts: active.attempts,
+                                rounds,
+                                prev_seq: if log_on() {
+                                    Some(std::mem::take(&mut active.seq))
+                                } else {
+                                    None
+                                },
+                            }
                         }
                     }
                 }
@@ -1492,7 +1540,22 @@ mod imp {
     /// Recording: taints the region (never captures). Capturing/Skipping:
     /// aborts and repairs so the primitive proceeds against fully-issued
     /// work. Outside a region: no-op.
+    ///
+    /// `#[track_caller]` so the log names the primitive's own call site. A
+    /// taint is the single most expensive thing that can happen to a region
+    /// (permanently eager), and "sync DtoH readback" alone does not say WHICH
+    /// readback — the reason a whole backward pass stayed eager was invisible
+    /// until the location came with it. Callers that are themselves thin
+    /// wrappers should be `#[track_caller]` too, so the blame lands on the
+    /// site that chose to read the device, not on the transport.
+    #[track_caller]
     pub fn taint(reason: &'static str) {
+        taint_at(reason, std::panic::Location::caller());
+    }
+
+    /// [`taint`] with an explicit blame location — for wrappers that want to
+    /// forward their own caller instead of themselves.
+    pub fn taint_at(reason: &'static str, loc: &'static std::panic::Location<'static>) {
         if !enabled() {
             return;
         }
@@ -1507,8 +1570,10 @@ mod imp {
                         TAINTS.fetch_add(1, Ordering::Relaxed);
                         if log_on() {
                             eprintln!(
-                                "[cuda-graph] region {}: tainted by {reason} — stays eager",
-                                active.id
+                                "[cuda-graph] region {}: tainted by {reason} — stays eager (at {}:{})",
+                                active.id,
+                                loc.file(),
+                                loc.line(),
                             );
                         }
                     }
@@ -1518,8 +1583,10 @@ mod imp {
                     TAINTS.fetch_add(1, Ordering::Relaxed);
                     if log_on() {
                         eprintln!(
-                            "[cuda-graph] region {}: {reason} during capture/replay — repairing",
-                            active.id
+                            "[cuda-graph] region {}: {reason} during capture/replay — repairing (at {}:{})",
+                            active.id,
+                            loc.file(),
+                            loc.line(),
                         );
                     }
                     Some(diverge(active, RegionState::Eager))
@@ -1837,6 +1904,6 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 #[cfg(feature = "cuda")]
 pub(crate) use imp::{
     in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
-    on_sgemm_full, queue_deferred_free, taint,
+    on_sgemm_full, queue_deferred_free, taint, taint_at,
     GemmPrecision, MemsetAction, SgemmKind,
 };

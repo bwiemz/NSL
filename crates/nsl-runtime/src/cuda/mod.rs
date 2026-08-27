@@ -1176,13 +1176,20 @@ pub(crate) mod inner {
     }
 
     /// Copy `size_bytes` bytes from device memory to host memory.
+    ///
+    /// `#[track_caller]` only to blame the right site in the cuda-graph taint
+    /// log: this call is the transport, and every caller of it is a distinct
+    /// decision to stall the pipeline. Forwarding the location costs one
+    /// pointer per call and turns "some readback tainted the region" into a
+    /// file:line.
+    #[track_caller]
     pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
         if size_bytes >= 262144 && crate::host_profile::enabled() {
             eprintln!("[copy] D2H {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
         }
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         crate::host_profile::record_d2h(size_bytes);
-        super::graph_capture::taint("sync DtoH readback");
+        super::graph_capture::taint_at("sync DtoH readback", std::panic::Location::caller());
         ensure_context();
         unsafe {
             let result = cuMemcpyDtoH_v2(dst_host, src_device as CUdeviceptr, size_bytes);
