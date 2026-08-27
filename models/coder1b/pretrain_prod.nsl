@@ -33,8 +33,8 @@
 #   warmup            = 8,192 micro-steps                (~0.15%)
 #   optimizer steps   = floor(5,516,582 / accum(4))      = 1,379,145
 #   tokens/opt step   = 2 * 2048 * 4                     = 16,384
-#   checkpoints       = every 2,000 opt steps            (~3.1 h resident)
-#   wall estimate     = 1,379,145 x ~5.6 s               = ~89 days resident
+#   checkpoints       = every 2,000 opt steps            (~83 min at 6,568 tok/s)
+#   wall estimate     = 22.6B / 6,568 tok/s              = ~40 days resident
 #
 # The effective batch (16,384 tokens/update) is unchanged from the toy-era
 # schedule and from the 500M recipe — deliberately, because it is the
@@ -111,7 +111,7 @@
 # At 1B a checkpoint pair is 4.30 GB of theta
 # plus an 8.59 GB `.optim` sidecar (m and v for 146 parameters) — measured, not
 # estimated — so checkpoint_every=2000 optimizer steps rewrites 12.9 GB about
-# 689 times over the full epoch (~3.1 h cadence). Budget the disk: `checkpoints/` is gitignored except for
+# 689 times over the full epoch (~83 min cadence at the posture-bench rate). Budget the disk: `checkpoints/` is gitignored except for
 # its `.gitkeep`, and the runtime does NOT create the directory (it does
 # File::create and aborts), which is why that placeholder is tracked.
 #
@@ -119,14 +119,34 @@
 # any cwd; the nsl invocation must be from THIS directory (the corpus paths and
 # `from model import ...` are relative to it):
 #   cd models/coder1b
-#   nsl run --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
-#           pretrain_prod.nsl
+#   NSL_MATMUL_BF16=1 nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
+#           --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
 #
 # THE FLAGS ARE NOT ALL THE SAME KIND OF THING, and an earlier draft of this
 # header flattened them into "every flag is required", which is false:
 #
 #   --source-ad             the production path. The fused LCE and SDPA
 #                           kernels exist only there.
+#   --checkpoint-selective  modifier of --checkpoint-blocks (clap requires the
+#                           pair). Keeps cheap activations, recomputes only the
+#                           expensive ones: measured +17.5% over full recompute
+#                           at 1B for +5.8 GiB of peak (19.4 -> 25.2 GiB alloc;
+#                           POSTURE_1B_THROUGHPUT_2026_08_27.md). 73% of the
+#                           no-recompute speedup for 18% of its memory.
+#   --fuse-wgrad-accum      +11.5% at 1B, no memory cost. In the line BEFORE
+#                           the checkpoint chain began on purpose: #519's
+#                           execution fingerprint treats the wgrad choice as
+#                           arithmetic identity, so adding it mid-chain would
+#                           refuse every prior checkpoint.
+#   NSL_MATMUL_BF16=1       RUNTIME env, not a flag: cuBLAS math mode (bf16
+#                           inputs, f32 accumulate) — +30% on top of selective.
+#                           INVISIBLE to the execution fingerprint (it changes
+#                           no compiled code), so the run's provenance file
+#                           must record it; convergence at 1B is validated by
+#                           the intermediate run's own staged inspections, not
+#                           assumed. --cuda-graphs measured +0.8% with clean
+#                           counters (76 captured / 2,052 replays / 0 taints)
+#                           and stays OUT: not worth carrying for <1%.
 #   --optim-state-offload   NOT in the line anymore (item 6). Before item 11
 #                           the resident configuration OOM'd in the forward
 #                           and this flag was load-bearing; per-segment

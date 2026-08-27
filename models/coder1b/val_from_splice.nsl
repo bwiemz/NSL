@@ -1,0 +1,72 @@
+# models/coder1b/val_from_splice.nsl
+# ============================================================================
+# Held-out scorer for a SPLICED checkpoint (tools/nslm_splice.py output)
+# ============================================================================
+#
+# Scores VAL_LOSS_STACK / VAL_LOSS_WEB for a full-model .nslm produced by
+# splicing a mid-chain checkpoint's 146 trained params into an
+# architecture-identical 338-tensor template. This is the inspection-gate
+# tool for the staged intermediate run: checkpoints cannot be model_load'ed
+# directly and the recipe's own val loops only run at epoch end.
+#
+# The loops are UNSTAGED on purpose: loader ids are i32 and
+# embedding_lookup takes host ids against the GPU table by design; staging
+# attempts are refused by clamp_f32's dtype check (pilot findings,
+# PILOT1B_VALIDATION_2026_08_25.md).
+#
+# Known-answer contract: run against run-out/spliced_lr3e5_opt6000.nslm
+# (the 3e-5 arm's opt-6000 state) this must reproduce that arm's recorded
+# VAL_LOSS_STACK 7.392 / VAL_LOSS_WEB 8.009 up to the single min_lr update
+# separating opt-6000 from the template's opt-6001 θ.
+#
+# The MODEL_PATH line is rewritten per inspection by the stage driver.
+# RUN (from models/coder1b): nsl run val_from_splice.nsl
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+model_load(m, "../../run-out/spliced_lr3e5_opt6000.nslm")
+m.to(cuda)
+
+print("SPLICE_VAL_BEGIN")
+
+let sval_tokens = load_mmap("../../data/tokens/pilot_val_stack_2m.bin", 3)
+let sval_loader = DataLoader(sval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let sval_total = 0.0
+let sval_count = 0.0
+for batch in sval_loader:
+    let vlogits = m.forward_train(batch.input_ids, false)
+    let vs = vlogits.shape
+    let vflat_logits = vlogits.reshape([vs[0] * vs[1], vs[2]])
+    let vflat_labels = batch.labels.reshape([vs[0] * vs[1]])
+    let vloss = cross_entropy(vflat_logits, vflat_labels)
+    sval_total = sval_total + vloss.item()
+    sval_count = sval_count + 1.0
+
+print("VAL_LOSS_STACK")
+print(sval_total / sval_count)
+print("VAL_BATCHES_STACK")
+print(sval_count)
+
+let wval_tokens = load_mmap("../../data/tokens/pilot_val_web_2m.bin", 3)
+let wval_loader = DataLoader(wval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
+
+let wval_total = 0.0
+let wval_count = 0.0
+for batch in wval_loader:
+    let wlogits = m.forward_train(batch.input_ids, false)
+    let ws = wlogits.shape
+    let wflat_logits = wlogits.reshape([ws[0] * ws[1], ws[2]])
+    let wflat_labels = batch.labels.reshape([ws[0] * ws[1]])
+    let wloss = cross_entropy(wflat_logits, wflat_labels)
+    wval_total = wval_total + wloss.item()
+    wval_count = wval_count + 1.0
+
+print("VAL_LOSS_WEB")
+print(wval_total / wval_count)
+print("VAL_BATCHES_WEB")
+print(wval_count)
+
+print("SPLICE_VAL_COMPLETE")
