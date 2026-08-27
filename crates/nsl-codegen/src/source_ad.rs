@@ -23,6 +23,42 @@ use nsl_ast::operator::{BinOp, UnaryOp as AstUnaryOp};
 use nsl_ast::stmt::StmtKind;
 use nsl_lexer::Interner;
 
+/// A model field whose constructor-folded value may be baked into emitted
+/// code: one the parameter list excludes, so nothing can have moved it.
+///
+/// A STRICT SUBSET of what `is_trainable_param_leaf_name`
+/// (nsl-codegen/src/stmt.rs) keeps out of the parameter list — not the same
+/// rule. That function excludes `_`-prefixed leaves AND `inv_freq`; this one
+/// claims only the `_` half, because the required property is one-directional:
+/// everything folded here must be non-trainable, but not everything
+/// non-trainable need be folded. `inv_freq` simply keeps its runtime read.
+///
+/// The implication is what matters and is asserted against the real predicate
+/// in `const_config_field_tests`: if a `_`-prefixed leaf ever became
+/// trainable, folding its reads would pin it at its constructor value while
+/// the optimizer moved the real tensor — a wrong weight with no error
+/// anywhere.
+fn is_const_config_field(leaf_name: &str) -> bool {
+    leaf_name.starts_with('_')
+}
+
+/// Kill switch for the config-`.item()` constant fold, read at COMPILE time
+/// (`NSL_SOURCE_AD_ITEM_FOLD=0` restores the runtime readback).
+///
+/// Same shape as `NSL_FA_BWD_MULTIWARP`: the env var decides what gets
+/// EMITTED, so an A/B needs two model builds from one compiler rather than two
+/// compilers — which is what makes the comparison exact, since everything
+/// except the emitted tape is then provably identical. This fold changes both
+/// throughput and cuda-graph capture behaviour in ways that were not obvious
+/// in advance (it made one configuration 1.5% SLOWER), so being able to
+/// re-measure it against any future tape shape is worth one env read.
+fn item_fold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NSL_SOURCE_AD_ITEM_FOLD").ok().as_deref() != Some("0")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Adjoint generation
 // ---------------------------------------------------------------------------
@@ -1845,6 +1881,55 @@ pub fn eliminate_by_backward_live(
 }
 
 #[cfg(test)]
+mod const_config_field_tests {
+    /// The soundness rule for folding a config `.item()` into emitted code:
+    /// anything we are willing to bake in must be something the parameter
+    /// list excludes. If it were trainable, the optimizer would move it and a
+    /// checkpoint would restore whatever it became, while the compiled code
+    /// went on asserting the constructor's value — a wrong weight with no
+    /// error anywhere.
+    ///
+    /// Asserted as an IMPLICATION against the real predicate, not as equality:
+    /// `inv_freq` is non-trainable but is not a `_` config leaf, so the
+    /// converse does not hold and must not be asserted. Written this way, the
+    /// gate survives someone widening the non-trainable set and fails exactly
+    /// when someone narrows it under our feet.
+    #[test]
+    fn folding_is_confined_to_non_trainable_leaves() {
+        let names = [
+            "_n_heads", "_dropout_p", "_head_dim", "_d_model", "_n_rep",
+            "weight", "wq", "w_down", "embed", "scale", "inv_freq",
+            "m.blocks.0.attn._n_heads", "m.blocks.0.attn.wq",
+        ];
+        let mut folded = 0;
+        for n in names {
+            if super::is_const_config_field(n.rsplit('.').next().unwrap()) {
+                assert!(
+                    !crate::stmt::is_trainable_param_leaf_name(n),
+                    "{n} would be constant-folded into emitted code, but the \
+                     parameter list treats it as TRAINABLE — the optimizer can \
+                     move it and a checkpoint can restore a different value"
+                );
+                folded += 1;
+            }
+        }
+        // Anti-vacuity: the implication above is trivially true if nothing
+        // folds. Six of the names are `_` config leaves.
+        assert_eq!(folded, 6, "expected six foldable names in {names:?}");
+    }
+
+    #[test]
+    fn a_trainable_one_element_field_is_not_foldable() {
+        // The case the gate exists for: `scale: Tensor = full([1], 1.0)` is a
+        // 1-element field with a constructor-folded value, so it reaches
+        // `known_scalar_values` exactly like `_dropout_p` does — and must NOT
+        // reach `const_config_vars`.
+        assert!(!super::is_const_config_field("scale"));
+        assert!(crate::stmt::is_trainable_param_leaf_name("scale"));
+    }
+}
+
+#[cfg(test)]
 mod backward_live_tests {
     use super::*;
     use crate::wengert::{PrimalOp, WengertOp};
@@ -2156,6 +2241,20 @@ pub struct WengertExtractor<'a> {
     /// Item 5: per-var VALUES of 1-element config tensors, resolved
     /// through the owning model type like `known_dims`.
     known_scalar_values: HashMap<VarId, f64>,
+    /// The subset of `known_scalar_values` that is safe to BAKE INTO THE
+    /// EMITTED CODE, not merely to reason with.
+    ///
+    /// `known_scalar_values` holds the constructor-folded value of any
+    /// 1-element config tensor. That is enough to decide a shape, but not
+    /// enough to replace a runtime read: a TRAINABLE 1-element field
+    /// (`scale: Tensor = full([1], 1.0)`) is in the parameter list, so the
+    /// optimizer moves it and a checkpoint restores whatever it became —
+    /// folding its `.item()` to 1.0 would silently pin a weight at its
+    /// initial value. Only `_`-prefixed leaves are excluded from the
+    /// parameter list (`is_trainable_param_leaf_name`, nsl-codegen/stmt.rs),
+    /// so only those are provably still equal to what the constructor put
+    /// there. Membership here is that proof.
+    const_config_vars: std::collections::HashSet<VarId>,
     /// Item 4: `None` disables inference entirely (the pre-item-4 behaviour,
     /// and what every non-`--pretrain-optimized` compile gets).
     lm_head_inference: Option<LmHeadInferenceCtx>,
@@ -2571,6 +2670,7 @@ impl<'a> WengertExtractor<'a> {
             known_ranks: HashMap::new(),
             known_dims: HashMap::new(),
             known_scalar_values: HashMap::new(),
+            const_config_vars: std::collections::HashSet::new(),
             lm_head_inference: None,
             inferred_heads: Vec::new(),
             inference_declines: Vec::new(),
@@ -3649,6 +3749,35 @@ impl<'a> WengertExtractor<'a> {
         None
     }
 
+    /// The value of `var` when it is safe to EMIT as a literal — i.e. it
+    /// bottoms out in a non-trainable config field or a literal constant.
+    ///
+    /// Deliberately narrower than [`resolve_scalar_var`] in two ways, both
+    /// because this one changes the generated code rather than informing a
+    /// decision about it:
+    ///   * the terminal must be in `const_config_vars` (see that field), so
+    ///     a trainable 1-element weight is never baked in;
+    ///   * the hop whitelist is only `item` / `float`, the value-preserving
+    ///     pair a config read actually goes through. `reshape` and friends
+    ///     preserve the value too, but a config scalar does not travel that
+    ///     way, and every name admitted here is a name that can be wrong.
+    fn resolve_const_config_scalar(&self, mut var: VarId) -> Option<f64> {
+        for _ in 0..16 {
+            if self.const_config_vars.contains(&var) {
+                return self.known_scalar_values.get(&var).copied();
+            }
+            let op = self.list.ops.iter().find(|op| op.result == var)?;
+            match &op.op {
+                PrimalOp::Constant(c) => return Some(*c),
+                PrimalOp::Passthrough(name) if matches!(name.as_str(), "item" | "float") => {
+                    var = *op.inputs.first()?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Extract statements into the Wengert list.
     /// Returns false if dynamic control flow is detected.
     pub fn extract_stmts(&mut self, stmts: &[nsl_ast::stmt::Stmt]) -> bool {
@@ -3960,6 +4089,9 @@ impl<'a> WengertExtractor<'a> {
                                 .and_then(|fields| fields.get(&field_name))
                             {
                                 self.known_scalar_values.insert(var, sv);
+                                if is_const_config_field(&field_name) {
+                                    self.const_config_vars.insert(var);
+                                }
                             }
                         }
                         if self.is_frozen_compound(&compound) {
@@ -4119,6 +4251,9 @@ impl<'a> WengertExtractor<'a> {
                                             .and_then(|fields| fields.get(&ident_name))
                                         {
                                             self.known_scalar_values.insert(var, sv);
+                                            if is_const_config_field(&ident_name) {
+                                                self.const_config_vars.insert(var);
+                                            }
                                         }
                                     }
                                     if self.is_frozen_compound(&compound) {
@@ -4360,6 +4495,57 @@ impl<'a> WengertExtractor<'a> {
                         }
                         "reshape" | "contiguous" | "item" | "expand" | "squeeze" | "unsqueeze" => {
                             let obj = self.extract_expr(object)?;
+                            // `.item()` on a CONFIG tensor is a compile-time
+                            // constant — emit it as one instead of a readback.
+                            //
+                            // The house idiom stores dims as `full([1],
+                            // float(n))` fields and reads them back on every
+                            // forward. On device that lowers to
+                            // `nsl_tensor_item`, which is a
+                            // `cuCtxSynchronize()` plus a 4-byte DtoH: a full
+                            // pipeline drain to re-learn a number `ctor_fold`
+                            // already proved constant. At 500M/24 blocks
+                            // (2026-08-26) that was 432 reads per MICRO-BATCH
+                            // — 24 blocks x 9 reads x (forward + the CCR
+                            // recompute clone in the adjoint) — at ~500 us
+                            // each.
+                            //
+                            // Read that ~500 us as a STALL, not as removable
+                            // host work: `cuCtxSynchronize` blocks until the
+                            // queue drains, so most of what the timer
+                            // attributes is GPU work the host is waiting on,
+                            // and deleting the read reclaims the lost
+                            // host/device OVERLAP rather than 216 ms of
+                            // compute. The measured, unambiguous win is
+                            // elsewhere: a synchronous readback cannot be
+                            // captured into a cuda graph, and these reads
+                            // tainted 25 of the 51 regions — every per-block
+                            // forward slice plus the monolithic adjoint
+                            // region — into permanent eager mode. Taints go
+                            // 200 -> 0.
+                            //
+                            // This also removes a real inconsistency rather
+                            // than adding one: the dropout backward ALREADY
+                            // bakes the folded constant into its 1/(1-p)
+                            // scale (see the `dropout` arm), while the
+                            // forward was reading the tensor. Folding both
+                            // makes them agree by construction.
+                            if method_name == "item" && item_fold_enabled() {
+                                if let Some(v) = self.resolve_const_config_scalar(obj) {
+                                    let result = self.alloc_var();
+                                    self.known_scalar_values.insert(result, v);
+                                    self.const_config_vars.insert(result);
+                                    self.push_op(WengertOp {
+                                        id: self.list.ops.len() as u32,
+                                        result,
+                                        op: PrimalOp::Constant(v),
+                                        inputs: vec![],
+                                        saved_for_backward: false,
+                                        checkpointed: false,
+                                    });
+                                    return Some(result);
+                                }
+                            }
                             let mut inputs = vec![obj];
                             for arg in args {
                                 inputs.push(self.extract_expr(&arg.value)?);

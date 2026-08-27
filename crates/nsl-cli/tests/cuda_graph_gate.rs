@@ -508,3 +508,92 @@ fn cuda_graph_self_heals_on_host_readbacks_gpu() {
         "self-healed run diverged from the eager path"
     );
 }
+
+/// A `full([1], const)` config field read back with `.item()` inside the
+/// forward — the house idiom for storing dims (`_n_heads`, `_head_dim`,
+/// `_dropout_p` in stdlib/nsl/nn/gqa.nsl) — must not block cuda-graph capture.
+///
+/// On device `.item()` is `nsl_tensor_item`: `cuCtxSynchronize()` plus a
+/// 4-byte DtoH to re-read a number `ctor_fold` already proved constant. A
+/// synchronous readback cannot be captured, so every region holding one went
+/// permanently eager — measured at the 500M recipe (2026-08-26) as 25 of 51
+/// regions, every per-block forward slice plus the whole adjoint. Source AD
+/// now folds the read to that constant.
+///
+/// Stated as a DIFFERENTIAL against the kill switch rather than as
+/// `taints == 0`, for two reasons. It is non-vacuous by construction: the
+/// unfolded arm must fail to capture at all, so the folded arm's `captured`
+/// cannot be explained by anything but the fold. And it is honest about the
+/// fixture, which retains one unrelated device-to-host migration — meaning
+/// the folded arm still taints, and a gate demanding zero would be asserting
+/// something about that migration instead of about the fold.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn cuda_graph_config_item_read_folds_and_captures_gpu() {
+    let folded = run_fixture(
+        "cuda_graph_config_item.nsl",
+        "cfgitem_folded",
+        &[GPU_MLP, XG, YG],
+        &["--seed", "777", "--cuda-graphs"],
+    );
+    assert!(
+        folded.success,
+        "config-item run failed:\nstdout:\n{}\nstderr:\n{}",
+        folded.stdout, folded.stderr
+    );
+    let c = banner_counters(&folded.stderr);
+
+    // Same source, same flags, fold disabled.
+    let unfolded = run_fixture_env(
+        "cuda_graph_config_item.nsl",
+        "cfgitem_unfolded",
+        &[GPU_MLP, XG, YG],
+        &["--seed", "777", "--cuda-graphs"],
+        &[("NSL_SOURCE_AD_ITEM_FOLD", "0")],
+    );
+    assert!(
+        unfolded.success,
+        "kill-switch run failed:\nstdout:\n{}\nstderr:\n{}",
+        unfolded.stdout, unfolded.stderr
+    );
+    let uc = banner_counters(&unfolded.stderr);
+
+    assert!(
+        c["captured"] > 0,
+        "no region captured with the fold on: {c:?}\n{}",
+        folded.stderr
+    );
+    assert_eq!(
+        uc["captured"], 0,
+        "the config `.item()` readback did NOT block capture, so this fixture \
+         no longer exercises the defect and the assertion above proves nothing: \
+         {uc:?}\n{}",
+        unfolded.stderr
+    );
+    assert!(
+        uc["taints"] > c["taints"],
+        "disabling the fold did not restore any taint — the kill switch is \
+         not reaching the fold, or the fold is not what removes the readback: \
+         folded {c:?} vs unfolded {uc:?}\n{}",
+        unfolded.stderr
+    );
+
+    // Folding must not change what the model computes — against the unfolded
+    // run AND against a graphs-free run.
+    assert!(!folded.losses.is_empty(), "no losses parsed:\n{}", folded.stdout);
+    assert_eq!(
+        folded.losses, unfolded.losses,
+        "folding the config read changed the loss stream"
+    );
+    let eager = run_fixture(
+        "cuda_graph_config_item.nsl",
+        "cfgitem_eager",
+        &[GPU_MLP, XG, YG],
+        &["--seed", "777"],
+    );
+    assert!(eager.success, "eager control failed:\n{}", eager.stderr);
+    assert_eq!(
+        folded.losses, eager.losses,
+        "graph capture of the folded program diverged from the eager path"
+    );
+}

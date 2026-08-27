@@ -1,0 +1,58 @@
+# cuda-graph gate fixture — the CONFIG-`.item()` readback.
+#
+# Same readback-free residual MLP as cuda_graph_gate.nsl, plus the one thing
+# that fixture deliberately avoids: a `full([1], const)` config field read
+# back with `.item()` inside the forward. That is the house idiom for storing
+# dims (`_n_heads`, `_head_dim`, `_dropout_p` in stdlib/nsl/nn/gqa.nsl), and
+# on device it lowers to `nsl_tensor_item` = `cuCtxSynchronize()` + a 4-byte
+# DtoH. A synchronous readback cannot be captured, so before the source-AD
+# constant fold every region containing one stayed permanently eager: 25 of
+# the 51 regions in the 500M recipe, including the monolithic adjoint.
+#
+# Rewrite markers (harness convention). NOT spelled out literally here: the
+# harness does a plain string replace over the whole file, so naming a marker
+# inside a comment rewrites the comment too and the result does not parse.
+# They are the GPU-placement line below, and the `.item()` line in Blk.forward
+# (rewritten to a COMPUTED read for the narrowness control).
+
+from nsl.nn.losses import l1_loss
+
+model Blk:
+    # `_`-prefixed: excluded from the parameter list, therefore never moved by
+    # the optimizer and never restored from a checkpoint — which is exactly
+    # what makes folding its value into the emitted code sound.
+    _scale: Tensor = full([1], 0.5)
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let s = self._scale.item()
+        let f = silu(h @ self.w_up) @ self.w_down
+        return h + f * s
+
+model TinyMLP:
+    w_in: Tensor = randn([32, 64]) * 0.2
+    blocks: [Blk; 2] = Blk()
+    w_out: Tensor = randn([64, 32]) * 0.2
+
+    fn forward_train(self, x: Tensor) -> Tensor:
+        let h = x @ self.w_in
+        for block in self.blocks:
+            h = block.forward(h)
+        return h @ self.w_out
+
+let m = TinyMLP()
+let x = randn([8, 32])
+let y = randn([8, 32]) * 0.1
+# GPU_PLACEMENT
+
+print("LOSS_STREAM_BEGIN")
+train(model=m, epochs=20, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let pred = m.forward_train(x)
+        let loss = l1_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+print("LOSS_STREAM_END")
