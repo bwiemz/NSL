@@ -91,7 +91,11 @@ const WS_PCIE_FIXED_LAT_US: f64 = 10.0;
 /// treat a 0-byte pricing as a real transfer estimate).
 const WS_PREFETCH_MIN_OPS_PER_RANGE: usize = 4;
 
-fn is_trainable_param_leaf_name(param_name: &str) -> bool {
+/// `pub(crate)` for the drift gate in `source_ad.rs`: constant-folding a
+/// config field's `.item()` is sound only for leaves this function keeps OUT
+/// of the parameter list, and that implication is asserted against the real
+/// function rather than a restatement of it.
+pub(crate) fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
 }

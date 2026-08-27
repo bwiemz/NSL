@@ -660,4 +660,34 @@ mod tests {
         assert_eq!(f.dims["NSLCoder"]["embed"], vec![49152, 512]);
         assert!(f.conflicted.is_empty());
     }
+
+    // ------------------------------------------------------------------
+    // The VALUE channel — untested until source AD started EMITTING these
+    // constants rather than only reasoning with them.
+    //
+    // `values` is what lets source AD resolve a config read to a
+    // compile-time constant. It had two consumers: the dropout scale
+    // 1/(1-p) (an unresolved p is a hard compile refusal) and, now, the
+    // `.item()` fold that replaces the read itself. The f32 round-trip below
+    // is the load-bearing detail for both — get it wrong and the compiled
+    // constant disagrees with the tensor the program would have read.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_tensor_config_form_still_folds_through_its_f32_storage() {
+        // `full([1], c)` fields remain supported (models outside this repo
+        // use them). The runtime stores f32 and `.item()` widens, so the
+        // folded constant must take the same round-trip or the compile-time
+        // scale disagrees with the value the program actually reads.
+        let f = fold(
+            "model Attn(n_heads: int, dropout_p: float):\n    \
+                 _n_heads: Tensor = full([1], float(n_heads))\n    \
+                 _dropout_p: Tensor = full([1], dropout_p)\n\n\
+             model Root:\n    \
+                 attn: Attn = Attn(20, 0.1)\n",
+        );
+        assert_eq!(f.values["Attn"]["_n_heads"], 20.0);
+        assert_eq!(f.values["Attn"]["_dropout_p"], (0.1f32) as f64);
+        assert_ne!(f.values["Attn"]["_dropout_p"], 0.1f64);
+    }
 }
