@@ -64,9 +64,10 @@ from ~89 to ~40 days; the intermediate run's 1B-token gate from ~6 days to
 
 ## The chain posture
 
-    NSL_MATMUL_BF16=1 nsl run --source-ad --checkpoint-blocks \
-        --checkpoint-selective --fuse-rmsnorm-backward --fuse-wgrad-accum \
-        pretrain_prod.nsl
+    nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
+        --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
+
+(bf16 removed from the line 2026-08-28 — see its conviction above.)
 
 Staged stops (full 5,516,582-micro scheduler preserved throughout; stops
 only at checkpoint-cadence update boundaries): ~2,200 updates (36M tokens,

@@ -119,7 +119,7 @@
 # any cwd; the nsl invocation must be from THIS directory (the corpus paths and
 # `from model import ...` are relative to it):
 #   cd models/coder1b
-#   NSL_MATMUL_BF16=1 nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
+#   nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
 #           --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
 #
 # THE FLAGS ARE NOT ALL THE SAME KIND OF THING, and an earlier draft of this
@@ -138,15 +138,19 @@
 #                           execution fingerprint treats the wgrad choice as
 #                           arithmetic identity, so adding it mid-chain would
 #                           refuse every prior checkpoint.
-#   NSL_MATMUL_BF16=1       RUNTIME env, not a flag: cuBLAS math mode (bf16
-#                           inputs, f32 accumulate) — +30% on top of selective.
-#                           INVISIBLE to the execution fingerprint (it changes
-#                           no compiled code), so the run's provenance file
-#                           must record it; convergence at 1B is validated by
-#                           the intermediate run's own staged inspections, not
-#                           assumed. --cuda-graphs measured +0.8% with clean
-#                           counters (76 captured / 2,052 replays / 0 taints)
-#                           and stays OUT: not worth carrying for <1%.
+#   NSL_MATMUL_BF16=1       DO NOT USE for training runs. It measured +30%
+#                           and then a matched-pair discriminator convicted
+#                           it of ACCUMULATING DRIFT: identical batches, +0.53
+#                           nats of rise over 98M tokens vs f32's +0.16 (a
+#                           hard-region bump f32 recovers from), held-out a
+#                           full nat worse by 229M tokens. It is also
+#                           INVISIBLE to the execution fingerprint. The
+#                           conviction record and the bar any future bf16
+#                           scheme must clear:
+#                           POSTURE_1B_THROUGHPUT_2026_08_27.md.
+#                           --cuda-graphs measured +0.8% with clean counters
+#                           (76 captured / 2,052 replays / 0 taints) and
+#                           stays OUT: not worth carrying for <1%.
 #   --optim-state-offload   NOT in the line anymore (item 6). Before item 11
 #                           the resident configuration OOM'd in the forward
 #                           and this flag was load-bearing; per-segment
