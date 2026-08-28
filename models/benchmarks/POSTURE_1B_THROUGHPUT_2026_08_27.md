@@ -45,13 +45,22 @@ from ~89 to ~40 days; the intermediate run's 1B-token gate from ~6 days to
   no-recompute speedup for 18% of its memory, now confirmed AT 1B, and it
   fits: 25.23 GiB alloc beside 12.9 GiB resident optimizer state
   (driver margin ~3-4 GiB on the 32 GB card, desktop included).
-- **NSL_MATMUL_BF16=1: IN, with its caveat stated.** +30% on top of
-  selective (cuBLAS bf16 inputs, f32 accumulation; tensors, tape, and
-  non-cuBLAS kernels untouched). It is a RUNTIME env, invisible to the
-  execution fingerprint — the run's provenance file must carry it, and its
-  convergence at 1B is exactly what the staged run's first inspection gate
-  (~2,200 updates, first post-warmup behavior vs the pilot arm's known-good
-  f32 curve) checks rather than assumes.
+- **NSL_MATMUL_BF16=1: CONVICTED AND REMOVED (2026-08-28 addendum).** The
+  caveat this entry originally carried ("convergence at 1B is checked, not
+  assumed") fired one stage later than expected: stage 1 (36M tokens)
+  looked clean, but the stage-2 leg ROSE +1.5 nats after ~80M tokens and
+  the opt-14,000 state scored a full nat WORSE on held-out than opt-2000
+  (VAL_LOSS_STACK 8.730 vs 7.734). A write-free matched-pair discriminator
+  — the same opt-2000 state resumed with identical loader-slot/RNG batches,
+  bf16 unset — separated the causes cleanly: a shared hard-data-region bump
+  that f32 RECOVERS from (trend +0.16 over 98M tokens, descending again at
+  the probe's end) while bf16 degrades monotonically (+0.53, paired delta
+  growing to −0.42 by micro 32k). bf16's rounding drift accumulates in the
+  moments/θ at this horizon. The chain runs f32-selective at 5,053 tok/s
+  (+31% over the chain-eve posture); bf16's +30% stays on the table only
+  behind future work (stochastic rounding on the GEMM inputs, or periodic
+  f32 re-anchoring), with THIS record as the bar any such scheme must
+  clear on a matched pair before a chain carries it.
 
 ## The chain posture
 
