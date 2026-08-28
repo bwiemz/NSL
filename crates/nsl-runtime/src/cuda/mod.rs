@@ -2503,6 +2503,74 @@ pub(crate) mod cublas_inner {
     /// cuMemAlloc. Element counts are independent of the transpose flags (a
     /// transposed 2-D view is the same dense buffer read with swapped lda
     /// semantics, so casting the flat buffer is exact).
+    /// How the BF16 mode rounds an operand into its bf16 scratch.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Bf16Rounding {
+        /// `cvt.rn.bf16.f32` — round to nearest even. The default, and what
+        /// the mode has always done.
+        Rne,
+        /// Seeded stochastic rounding, dither drawn per launch.
+        Stochastic,
+    }
+
+    /// Resolve `NSL_MATMUL_BF16_ROUND`. Same tri-state discipline as the
+    /// math-mode resolver: only a literal value engages, anything
+    /// unrecognised falls through to the default rather than silently
+    /// changing arithmetic.
+    ///
+    /// ## Why an SR option exists at all
+    ///
+    /// RNE is unbiased over an ENSEMBLE of values, which is what makes it the
+    /// right default for a one-shot cast, and measuring it that way says it is
+    /// fine: mean operand error 0.0003 ULP over a real 1B weight tensor. That
+    /// measurement misses the thing that actually reaches the optimizer.
+    ///
+    /// `round(W)` is a deterministic function of `W`, and at 1B/lr=3e-5 **98.7%
+    /// of weight elements move less than half a bf16 ULP per optimizer step**
+    /// (measured by differencing chain checkpoints 4000 steps apart), with the
+    /// quantization error running ~45x the size of one step's update. So the
+    /// forward and the dgrad differentiate `W + delta` where `delta` holds
+    /// still: 0.98 self-correlation after one step, decaying only over
+    /// thousands. Half of the GEMM's squared error sits in that standing term.
+    /// A standing perturbation is a gradient BIAS, and Adam's moment windows
+    /// cannot average away what does not change.
+    ///
+    /// SR breaks the correlation by drawing a fresh dither per launch, which
+    /// converts the bias back into zero-mean noise — the same kind the
+    /// activation operand already contributes harmlessly, and small against
+    /// batch-sampling noise. Simulated on real weights, the time-averaged
+    /// operand error falls as 1/sqrt(T) under SR (0.409 -> 0.034 ULP at
+    /// T=1000) where RNE plateaus at roughly twice that.
+    ///
+    /// A dither that is a pure function of the VALUE (hashing `W`'s own bits)
+    /// does not work and was measured not to: it is still constant while `W`
+    /// is, so it reproduces the same standing error.
+    ///
+    /// **Not free, and not yet validated at scale.** The dither counter is a
+    /// kernel argument that changes every launch, so a cuda-graph region
+    /// containing an SR cast can never match its own digest and stays eager —
+    /// use SR or `--cuda-graphs`, not both. And whether this recovers the
+    /// ~0.5 nat the 1B chain lost to bf16 is an open question that only a
+    /// matched-pair run answers; the mechanism is measured, the cure is not.
+    pub(crate) fn bf16_rounding() -> Bf16Rounding {
+        static MODE: std::sync::OnceLock<Bf16Rounding> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            match std::env::var("NSL_MATMUL_BF16_ROUND").ok().as_deref() {
+                Some("sr") => {
+                    eprintln!(
+                        "[nsl-matmul] bf16 operand cast: STOCHASTIC rounding \
+                         (NSL_MATMUL_BF16_ROUND=sr). Decorrelates the \
+                         weight-operand error that round-to-nearest holds \
+                         standing across optimizer steps. Regions containing \
+                         an SR cast cannot be cuda-graph captured."
+                    );
+                    Bf16Rounding::Stochastic
+                }
+                _ => Bf16Rounding::Rne,
+            }
+        })
+    }
+
     fn prepare_bf16_operands(
         first_dev: *const f32,
         first_elems: usize,
@@ -2520,8 +2588,40 @@ pub(crate) mod cublas_inner {
         }
         let first16 = super::inner::alloc_managed(first_elems * 2);
         let second16 = super::inner::alloc_managed(second_elems * 2);
-        super::gpu_cast_raw_f32_to_bf16(first_dev as u64, first16 as u64, first_elems);
-        super::gpu_cast_raw_f32_to_bf16(second_dev as u64, second16 as u64, second_elems);
+        match bf16_rounding() {
+            Bf16Rounding::Rne => {
+                super::gpu_cast_raw_f32_to_bf16(first_dev as u64, first16 as u64, first_elems);
+                super::gpu_cast_raw_f32_to_bf16(second_dev as u64, second16 as u64, second_elems);
+            }
+            Bf16Rounding::Stochastic => {
+                // One key for the process, variation carried entirely by the
+                // counter — the same split `sr_bf16` uses, and the reason a
+                // resumed run needs only the counter restored, not a step.
+                let key = crate::sr_bf16::sr_step_key(
+                    crate::deterministic_ops::get_rng_seed(),
+                    0,
+                );
+                // Claimed SEPARATELY per operand so the two never share a
+                // dither window; overlapping windows would correlate the
+                // rounding of A with the rounding of B inside one product.
+                let c0 = crate::rng_state::bf16_sr_next_counter(first_elems as u64);
+                super::gpu_cast_raw_f32_to_bf16_sr(
+                    first_dev as u64,
+                    first16 as u64,
+                    first_elems,
+                    key,
+                    c0,
+                );
+                let c1 = crate::rng_state::bf16_sr_next_counter(second_elems as u64);
+                super::gpu_cast_raw_f32_to_bf16_sr(
+                    second_dev as u64,
+                    second16 as u64,
+                    second_elems,
+                    key,
+                    c1,
+                );
+            }
+        }
         Some(Bf16Scratch { first16, second16 })
     }
 
@@ -4568,6 +4668,60 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_raw(
         "GPU fase_fused_adamw_step_bf16sr_raw kernel failed: {}", result as u32
     );
     inner::sync_after_kernel();
+}
+
+/// Stochastically-rounded f32 -> bf16 cast over raw device buffers, for the
+/// BF16 matmul mode's operand staging (`NSL_MATMUL_BF16_ROUND=sr`).
+///
+/// Shares `SR_BF16_ROUND_PROBE_PTX` with the parity probe below — same
+/// arithmetic, same `(seed-key, counter)` dither contract, so the CPU
+/// reference `sr_bf16::sr_bf16_round` covers both. Two differences from the
+/// probe, and both matter on the hot path:
+///
+///   * NO `sync_after_kernel()`. The probe syncs because a parity gate reads
+///     the result straight back; a sync here would stall the pipeline on
+///     every GEMM and taint every cuda-graph region it appears in.
+///   * The grid MUST cover `n` exactly. This kernel is one-element-per-thread
+///     (no grid-stride loop, unlike `gpu_cast_raw`'s), so the 4096-block cap
+///     that path applies would silently leave the tail of any operand above
+///     ~1M elements UNCAST — reading whatever the scratch block last held.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cast_raw_f32_to_bf16_sr(
+    src_f32_dev: u64,
+    dst_bf16_dev: u64,
+    n: usize,
+    sr_key: u64,
+    sr_ctr_base: u64,
+) {
+    if n == 0 {
+        return;
+    }
+    let mut src = src_f32_dev;
+    let mut dst = dst_bf16_dev;
+    let mut n_val = n as u64;
+    let (mut key_val, mut ctr_val) = (sr_key, sr_ctr_base);
+    let args = [
+        &mut src as *mut _ as *mut std::ffi::c_void,
+        &mut dst as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut key_val as *mut _ as *mut std::ffi::c_void,
+        &mut ctr_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::SR_BF16_ROUND_PROBE_PTX.as_ptr(),
+        b"nsl_sr_bf16_round_probe\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU sr bf16 operand cast failed: {}",
+        result as u32
+    );
 }
 
 /// P4 item 17: SR-BF16 rounding-tail probe over raw device buffers — parity
@@ -9691,6 +9845,12 @@ mod dtype_guard_drift {
             "gpu_cast_raw",
             "the precision-cast launcher: raw src/dst device addresses whose widths \
              are the cast's two endpoints, so f32 on both sides would be the bug",
+        ),
+        (
+            "gpu_cast_raw_f32_to_bf16_sr",
+            "as gpu_cast_raw, for the stochastically-rounded operand cast: raw \
+             src/dst addresses, f32 in and bf16 out by construction, and the \
+             caller (prepare_bf16_operands) sizes both from the GEMM's own m/n/k",
         ),
         (
             "nsl_kernel_launch",

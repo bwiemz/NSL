@@ -131,6 +131,7 @@ fn probe_with(extra: &[(&str, &str)]) -> Probe {
         .env_remove("NSL_MATMUL_TF32")
         .env_remove("NSL_MATMUL_PEDANTIC")
         .env_remove("NSL_MATMUL_BF16")
+        .env_remove("NSL_MATMUL_BF16_ROUND")
         // Without NSL_CUDA_SYNC the loop times kernel ENQUEUE, not the
         // kernel (the TF32 probe's first run reported a 2048^3 gemm at
         // 4.9us this way).
@@ -216,6 +217,92 @@ fn bf16_is_faster_than_f32_and_less_accurate_than_tf32() {
         "BF16 drifted {:e}, far past the ~7.5e-3 that bf16-input rounding costs at \
          this size — this is not BF16-with-f32-accumulate, something is broken",
         bf16.max_rel_err
+    );
+}
+
+/// `NSL_MATMUL_BF16_ROUND=sr` must keep the mode's speed and its accuracy
+/// class, and must remain OFF unless asked for.
+///
+/// SR exists to decorrelate the weight-operand error across optimizer steps —
+/// see `bf16_rounding()` — and it is only worth having if it is close to free.
+/// The dither is six integer ops per element folded into a cast that was
+/// already bandwidth-bound, so the GEMM-level cost should be small; this
+/// measures it rather than assuming it.
+///
+/// Accuracy is asserted as a BAND, not a direction. SR does not round more
+/// accurately per cast — it rounds differently, trading a fixed error for a
+/// zero-mean one, and its single-cast rms is slightly HIGHER than RNE's. What
+/// must hold is that it stays in bf16's accuracy class: an SR arm that came
+/// back at TF32's error would mean the bf16-storage path silently declined.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn sr_rounding_keeps_bf16_speed_and_accuracy_class() {
+    // Timing arms take the MIN of three interleaved repetitions. A single
+    // pair is not measurable here: an unrelated GPU tenant made one draft run
+    // of this test report SR at 906% of RNE, where five interleaved rounds on
+    // a quiet card put it at 8.4% with under 3% spread. Contention and thermal
+    // throttling can only ever make a cell slower, so the minimum is the
+    // robust statistic; the mean is not.
+    let best = |extra: &[(&str, &str)]| -> Probe {
+        let mut best: Option<Probe> = None;
+        for _ in 0..3 {
+            let p = probe_with(extra);
+            if best.as_ref().is_none_or(|b| p.secs_per_call < b.secs_per_call) {
+                best = Some(p);
+            }
+        }
+        best.unwrap()
+    };
+
+    let tf32 = best(&[]);
+    let rne = best(&[("NSL_MATMUL_BF16", "1")]);
+    let sr = best(&[("NSL_MATMUL_BF16", "1"), ("NSL_MATMUL_BF16_ROUND", "sr")]);
+
+    let slowdown = sr.secs_per_call / rne.secs_per_call;
+    eprintln!(
+        "bf16+rne: {:.4} ms err {:e} | bf16+sr: {:.4} ms err {:e} | \
+         sr costs {:.1}% | tf32 err {:e}",
+        rne.secs_per_call * 1e3,
+        rne.max_rel_err,
+        sr.secs_per_call * 1e3,
+        sr.max_rel_err,
+        100.0 * (slowdown - 1.0),
+        tf32.max_rel_err
+    );
+
+    assert!(
+        slowdown < 1.15,
+        "SR rounding cost {:.1}% over RNE at this shape. The dither is six \
+         integer ops on a bandwidth-bound cast; a cost this large means the \
+         cast stopped being bandwidth-bound (grid sizing?) rather than that \
+         SR is expensive.",
+        100.0 * (slowdown - 1.0)
+    );
+    assert!(
+        sr.max_rel_err > 1.5 * tf32.max_rel_err,
+        "SR arm's error ({:e}) is in TF32's class ({:e}) — the bf16-storage \
+         path did not engage under NSL_MATMUL_BF16_ROUND=sr, so this arm is \
+         measuring the wrong thing",
+        sr.max_rel_err,
+        tf32.max_rel_err
+    );
+    assert!(
+        sr.max_rel_err < 3.0 * rne.max_rel_err,
+        "SR arm drifted {:e} against RNE's {:e}. SR is expected to be slightly \
+         worse per cast, not multiples worse — this looks like a broken \
+         dither, not stochastic rounding",
+        sr.max_rel_err,
+        rne.max_rel_err
+    );
+
+    // Opt-in: an unrecognised value must fall through to RNE, not engage SR
+    // and not change arithmetic (the tri-state discipline the mode resolvers
+    // all follow).
+    let typo = probe_with(&[("NSL_MATMUL_BF16", "1"), ("NSL_MATMUL_BF16_ROUND", "SR")]);
+    assert_eq!(
+        typo.max_rel_err, rne.max_rel_err,
+        "NSL_MATMUL_BF16_ROUND=SR (wrong case) changed the arithmetic; only \
+         the literal \"sr\" may engage stochastic rounding"
     );
 }
 
