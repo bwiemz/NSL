@@ -2597,10 +2597,18 @@ pub(crate) mod cublas_inner {
                 // One key for the process, variation carried entirely by the
                 // counter — the same split `sr_bf16` uses, and the reason a
                 // resumed run needs only the counter restored, not a step.
+                //
+                // DOMAIN-SEPARATED from the optimizer's SR stream. Without the
+                // salt this key is `sr_step_key(seed, 0)`, which is exactly
+                // what the fused bf16-sr AdamW draws with at step 0, and its
+                // counters are `param_idx << 40` — a block this counter walks
+                // into after ~137k GEMMs. Two unrelated roundings would then
+                // share a dither, which is not wrong so much as untraceable.
+                const MATMUL_OPERAND_DOMAIN: u64 = 0xBF16_0CA5_7D17_4E70;
                 let key = crate::sr_bf16::sr_step_key(
                     crate::deterministic_ops::get_rng_seed(),
                     0,
-                );
+                ) ^ MATMUL_OPERAND_DOMAIN;
                 // Claimed SEPARATELY per operand so the two never share a
                 // dither window; overlapping windows would correlate the
                 // rounding of A with the rounding of B inside one product.
