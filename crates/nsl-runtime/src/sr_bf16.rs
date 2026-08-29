@@ -1132,6 +1132,51 @@ pub fn sr_bf16_gpu_probe_host(vals: &[f32], seed: u64, step: u64, ctr_base: u64)
     out
 }
 
+/// Gate hook for the BF16 MATMUL OPERAND cast (`NSL_MATMUL_BF16_ROUND=sr`),
+/// as opposed to [`sr_bf16_gpu_probe_host`]'s optimizer-tail probe.
+///
+/// Deliberately routed through `gpu_cast_raw_f32_to_bf16_sr` — the function
+/// the GEMM wrappers actually call — rather than the probe launcher they do
+/// not. The two differ in grid sizing, and the difference is only observable
+/// above ~1M elements, which is precisely the size real operands have.
+#[cfg(feature = "cuda")]
+pub fn bf16_operand_cast_probe_host(vals: &[f32], key: u64, ctr_base: u64) -> Vec<u16> {
+    let n = vals.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    crate::cuda::inner::ensure_context();
+    let src = crate::cuda::inner::alloc_managed(n * 4);
+    crate::cuda::inner::memcpy_htod(src, vals.as_ptr() as *const std::ffi::c_void, n * 4);
+    let dst = crate::cuda::inner::alloc_managed(n * 2);
+    crate::cuda::gpu_cast_raw_f32_to_bf16_sr(src as u64, dst as u64, n, key, ctr_base);
+    let mut out = vec![0u16; n];
+    crate::cuda::inner::memcpy_dtoh(out.as_mut_ptr() as *mut std::ffi::c_void, dst, n * 2);
+    crate::cuda::inner::free_managed(src);
+    crate::cuda::inner::free_managed(dst);
+    out
+}
+
+/// The same, through the round-to-nearest cast the mode uses by default —
+/// the control arm for the decorrelation gate.
+#[cfg(feature = "cuda")]
+pub fn bf16_operand_cast_rne_host(vals: &[f32]) -> Vec<u16> {
+    let n = vals.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    crate::cuda::inner::ensure_context();
+    let src = crate::cuda::inner::alloc_managed(n * 4);
+    crate::cuda::inner::memcpy_htod(src, vals.as_ptr() as *const std::ffi::c_void, n * 4);
+    let dst = crate::cuda::inner::alloc_managed(n * 2);
+    crate::cuda::gpu_cast_raw_f32_to_bf16(src as u64, dst as u64, n);
+    let mut out = vec![0u16; n];
+    crate::cuda::inner::memcpy_dtoh(out.as_mut_ptr() as *mut std::ffi::c_void, dst, n * 2);
+    crate::cuda::inner::free_managed(src);
+    crate::cuda::inner::free_managed(dst);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

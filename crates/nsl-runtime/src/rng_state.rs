@@ -46,6 +46,50 @@ pub fn set_gpu_dropout_counter(v: u64) {
     GPU_DROPOUT_COUNTER.store(v, Ordering::SeqCst);
 }
 
+/// Counter for the BF16 matmul operand cast's stochastic-rounding dither
+/// (`NSL_MATMUL_BF16_ROUND=sr`).
+///
+/// Deliberately its OWN stream rather than a share of the dropout counter:
+/// the two are claimed at different rates (one per dropout call vs two per
+/// high-intensity GEMM), so folding them together would make either one's
+/// dither depend on whether the model happens to use dropout.
+static BF16_SR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Claim `len` dither values for one operand cast and return the base.
+///
+/// The BASE IS THE ONLY THING THAT DECORRELATES THE ROUNDING ACROSS STEPS,
+/// and that is the entire point of the SR mode. Under round-to-nearest the
+/// operand error is a standing perturbation — measured 0.98 self-correlation
+/// after one optimizer step, because 98.7% of 1B weight elements move less
+/// than half a bf16 ULP per step — so it biases the gradient instead of
+/// averaging out of it. A monotonically claimed window gives every launch a
+/// fresh dither, which is what turns that bias back into noise.
+///
+/// Claiming per launch (not per step) also means a GEMM that runs twice in
+/// one step — the same weight in the forward and again in the dgrad — draws
+/// two independent dithers. That is intentional: they are separate roundings
+/// of the same value, and correlating them would reinstate exactly the
+/// standing error this mode exists to break up.
+pub fn bf16_sr_next_counter(len: u64) -> u64 {
+    BF16_SR_COUNTER.fetch_add(len, Ordering::SeqCst)
+}
+
+/// Current BF16-SR dither counter (the value the next cast would claim).
+pub fn bf16_sr_counter() -> u64 {
+    BF16_SR_COUNTER.load(Ordering::SeqCst)
+}
+
+/// Restore the BF16-SR dither counter.
+///
+/// NOT yet carried in the checkpoint sidecar: unlike the dropout counter,
+/// this one selects a ROUNDING, not a mask, so a resume that restarts it at
+/// zero computes a statistically equivalent trajectory rather than a wrong
+/// one. Persisting it is a follow-up, and until then a resumed SR run is
+/// reproducible only from its own start.
+pub fn set_bf16_sr_counter(v: u64) {
+    BF16_SR_COUNTER.store(v, Ordering::SeqCst);
+}
+
 /// Serializes the tests that assert on the PROCESS-GLOBAL RNG state.
 ///
 /// Before item 8 the GPU dropout counter was a function-local `static` inside
