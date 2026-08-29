@@ -131,6 +131,7 @@ fn probe_with(extra: &[(&str, &str)]) -> Probe {
         .env_remove("NSL_MATMUL_TF32")
         .env_remove("NSL_MATMUL_PEDANTIC")
         .env_remove("NSL_MATMUL_BF16")
+        .env_remove("NSL_MATMUL_BF16_ROUND")
         // Without NSL_CUDA_SYNC the loop times kernel ENQUEUE, not the
         // kernel (the TF32 probe's first run reported a 2048^3 gemm at
         // 4.9us this way).
@@ -216,6 +217,105 @@ fn bf16_is_faster_than_f32_and_less_accurate_than_tf32() {
         "BF16 drifted {:e}, far past the ~7.5e-3 that bf16-input rounding costs at \
          this size — this is not BF16-with-f32-accumulate, something is broken",
         bf16.max_rel_err
+    );
+}
+
+/// `NSL_MATMUL_BF16_ROUND=sr` must keep the mode's speed and its accuracy
+/// class, and must remain OFF unless asked for.
+///
+/// SR exists to decorrelate the weight-operand error across optimizer steps —
+/// see `bf16_rounding()` — and it is only worth having if it is close to free.
+/// The dither is six integer ops per element folded into a cast that was
+/// already bandwidth-bound, so the GEMM-level cost should be small; this
+/// measures it rather than assuming it.
+///
+/// Accuracy is asserted as a BAND, not a direction. SR does not round more
+/// accurately per cast — it rounds differently, trading a fixed error for a
+/// zero-mean one, and its single-cast rms is slightly HIGHER than RNE's. What
+/// must hold is that it stays in bf16's accuracy class: an SR arm that came
+/// back at TF32's error would mean the bf16-storage path silently declined.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn sr_rounding_keeps_bf16_speed_and_accuracy_class() {
+    // Timing arms take the MIN of three repetitions, and report their own
+    // spread so the ratio can be DISCARDED when the box is not quiet.
+    //
+    // This box shares its GPU with multi-day training runs, and a timing
+    // assertion that fires on someone else's `pretrain_prod` is a false
+    // alarm, not a guard. Two draft runs of this test reported SR at 906% and
+    // 742% of RNE while a 27 GB tenant held the card at 100%; five
+    // interleaved rounds on a quiet card put it at 8.4% with under 3% spread.
+    // A minimum alone does not rescue that — under sustained contention every
+    // repetition is slow — so the SPREAD is what says whether the number
+    // means anything.
+    let best = |extra: &[(&str, &str)]| -> (Probe, f64) {
+        let mut runs: Vec<Probe> = (0..3).map(|_| probe_with(extra)).collect();
+        runs.sort_by(|a, b| a.secs_per_call.total_cmp(&b.secs_per_call));
+        let spread = runs[runs.len() - 1].secs_per_call / runs[0].secs_per_call;
+        (runs.swap_remove(0), spread)
+    };
+
+    let (tf32, _) = best(&[]);
+    let (rne, rne_spread) = best(&[("NSL_MATMUL_BF16", "1")]);
+    let (sr, sr_spread) = best(&[("NSL_MATMUL_BF16", "1"), ("NSL_MATMUL_BF16_ROUND", "sr")]);
+
+    let slowdown = sr.secs_per_call / rne.secs_per_call;
+    let quiet = rne_spread < 1.25 && sr_spread < 1.25;
+    eprintln!(
+        "bf16+rne: {:.4} ms err {:e} | bf16+sr: {:.4} ms err {:e} | \
+         sr costs {:.1}% | tf32 err {:e}",
+        rne.secs_per_call * 1e3,
+        rne.max_rel_err,
+        sr.secs_per_call * 1e3,
+        sr.max_rel_err,
+        100.0 * (slowdown - 1.0),
+        tf32.max_rel_err
+    );
+
+    if quiet {
+        assert!(
+            slowdown < 1.20,
+            "SR rounding cost {:.1}% over RNE at this shape (arm spreads \
+             {rne_spread:.2}/{sr_spread:.2}, so the box was quiet and this \
+             number is real). The dither is six integer ops on a \
+             bandwidth-bound cast; a cost this large means the cast stopped \
+             being bandwidth-bound — check the grid sizing — rather than that \
+             SR is expensive. Measured 8-11% on a quiet card.",
+            100.0 * (slowdown - 1.0)
+        );
+    } else {
+        eprintln!(
+            "  timing arm SKIPPED: repetition spread {rne_spread:.2}/{sr_spread:.2} \
+             exceeds 1.25, so this GPU has another tenant and the ratio is \
+             not a measurement. The accuracy assertions below still hold — \
+             they are deterministic."
+        );
+    }
+    assert!(
+        sr.max_rel_err > 1.5 * tf32.max_rel_err,
+        "SR arm's error ({:e}) is in TF32's class ({:e}) — the bf16-storage \
+         path did not engage under NSL_MATMUL_BF16_ROUND=sr, so this arm is \
+         measuring the wrong thing",
+        sr.max_rel_err,
+        tf32.max_rel_err
+    );
+    assert!(
+        sr.max_rel_err < 3.0 * rne.max_rel_err,
+        "SR arm drifted {:e} against RNE's {:e}. SR is expected to be slightly \
+         worse per cast, not multiples worse — this looks like a broken \
+         dither, not stochastic rounding",
+        sr.max_rel_err,
+        rne.max_rel_err
+    );
+
+    // Opt-in: an unrecognised value must fall through to RNE, not engage SR
+    // and not change arithmetic (the tri-state discipline the mode resolvers
+    // all follow).
+    let typo = probe_with(&[("NSL_MATMUL_BF16", "1"), ("NSL_MATMUL_BF16_ROUND", "SR")]);
+    assert_eq!(
+        typo.max_rel_err, rne.max_rel_err,
+        "NSL_MATMUL_BF16_ROUND=SR (wrong case) changed the arithmetic; only \
+         the literal \"sr\" may engage stochastic rounding"
     );
 }
 

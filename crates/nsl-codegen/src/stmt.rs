@@ -17010,6 +17010,19 @@ sched={sched_s}",
                             builder.def_var(var, step_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
+                            // RECORD THE TYPE. Without it the step-body sweep
+                            // below sees no `variable_types` entry, calls the
+                            // slot "indeterminate", and hands the COUNTER
+                            // VALUE to nsl_tensor_free_if_valid, which probes
+                            // it as a pointer. That probe returns early for
+                            // anything under 0x10000, so it is a silent no-op
+                            // for the first 65,535 micro-steps and a SIGSEGV
+                            // at exactly 65,536 — a hard ceiling every
+                            // training run with an `on_step` callback hit
+                            // (2026-08-29: the 1B chain, all three
+                            // matched-pair arms, and a 30-line CPU fixture
+                            // all faulted at fault address 0x10000).
+                            state.variable_types.insert(param.name, Type::Int);
                         }
                         "loss" => {
                             // loss is already in state.variables, but rebind for callback scope
@@ -17027,6 +17040,12 @@ sched={sched_s}",
                             builder.def_var(var, z);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
+                            // Typed for the same reason as `step`. Zero is a
+                            // no-op in the probe, so this arm never faulted —
+                            // but that safety came from the VALUE, not from a
+                            // rule, and the next binding to reach here would
+                            // not be so lucky.
+                            state.variable_types.insert(param.name, Type::Int);
                         }
                     }
                 }
