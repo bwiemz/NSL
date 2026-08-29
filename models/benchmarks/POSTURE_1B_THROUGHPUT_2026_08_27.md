@@ -107,3 +107,83 @@ never held-tested -> 1.5e-5 probe-measured); the chain restarts fresh on
 it. bf16 remains separately convicted as an amplifier (standing rounding
 bias — the concurrent session's PR #540 SR mode is the candidate fix,
 behind its own matched-pair bar).
+
+
+## 2026-08-29 addendum: the chain was never f32, and the 2^16 ceiling
+
+Two corrections to everything above, one of them to a claim this document
+states as fact.
+
+### 1. The lr=1.5e-5 chain ran BF16, not f32
+
+The sentence "The chain runs f32-selective at 5,053 tok/s" is **wrong for
+the legs that were actually run.** `stage1_driver.sh` had
+`NSL_MATMUL_BF16=1` removed; `stage2_driver.sh` and `stage3_driver.sh`
+were copied from it BEFORE that edit and kept the export. Both legs'
+stderr carries the runtime's own banner:
+
+    [nsl-matmul] cuBLAS math mode: BF16 tensor-core GEMMs (NSL_MATMUL_BF16=1)
+
+Nothing read it. The arm was asserted in prose and in a variable name, and
+in neither place against the runtime.
+
+**What that costs, and what it buys.** It costs the labelling of the leg.
+It buys a result: the 263M-token gate — VAL_LOSS_STACK/WEB **8.132/8.430
+at opt-2,000 -> 3.872/5.834 at opt-16,000**, train halves 6.208 -> 4.268,
+zero NaNs, eight clean cadence writes — was produced **by bf16 at
+lr=1.5e-5**, over 230M tokens. That is 2.3x the horizon at which bf16 was
+convicted, descending the whole way.
+
+So the conviction above is **LR-confounded**. It was measured at held
+lr=3e-5 — which the very next addendum identifies as the root instability,
+independently of precision. "bf16 degrades monotonically where f32
+recovers" was a real paired measurement, but it was taken inside a regime
+that was diverging anyway, and the natural reading now is that bf16
+AMPLIFIED an instability rather than caused one. At half the peak, no
+amplification is visible over 230M tokens. That is not proof bf16 is free
+— a paired measurement is still the only thing that settles it — but the
+conviction cannot stand as written.
+
+The two claims are not symmetric and should not be recorded as if they
+were: the LR verdict rests on a matched pair with a −2.28 paired delta and
+reversed trends; the bf16 acquittal so far rests on one unpaired leg that
+looks healthy. The three-arm probe is what closes that gap.
+
+### 2. Every leg above died at micro-step 65,536 — a compiler bug
+
+The stage-3 leg and all three arms of the first bf16 matched-pair attempt
+died at the identical step, 65,536, across two resume points and three
+precision modes. Not a workload: `on_step(step, loss)` bound its `step`
+parameter without recording a type, the step-body cleanup sweep treats an
+untyped slot as possibly-a-tensor, and the COUNTER VALUE was handed to
+`nsl_tensor_free_if_valid`, which dereferences it as a pointer. Its
+`< 0x10000` early-out is why it hid: a silent no-op for 65,535 steps, a
+SIGSEGV at 65,536. Fixed in PR #541 with a 3-second regression gate.
+
+This was a hard ceiling on every long run in the language — the 22.6B
+production epoch is 5,516,582 micro-steps and could never have completed.
+The campaign only avoided it this long because no single process had ever
+run past 64,220 steps.
+
+**Consequence for the numbers in this document:** the throughput table is
+unaffected (every posture arm was ~2,000 micro-steps). The first bf16
+matched pair measured NOTHING and is withdrawn, not reinterpreted.
+
+### 3. What the chain runs now
+
+    NSL_MATMUL_BF16=1  (explicit, asserted against the banner)
+    nsl build --source-ad --checkpoint-blocks --checkpoint-selective \
+        --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl -o stage4_prog
+
+bf16, because the chain's theta at 263M was trained under it — switching
+arithmetic mid-chain is itself a trajectory change — and because the
+observed descent under it is the healthiest of the campaign. `run-out/stage4_driver.sh`
+takes the arm as an ARGUMENT, sets the env from scratch, and refuses to
+continue unless the runtime prints the matching math-mode banner. The two
+bf16 arms print the SAME banner, so the stochastic-rounding line is
+checked separately, and the arms that must NOT have SR assert its absence
+— the half of the check that would have caught the mislabel above.
+
+Target: micro 248,000 = 62,000 optimizer updates = **1,015,808,000 tokens**,
+a multiple of both the 2,000-update cadence and the 16,384-token
+accumulation window, with the full 5,516,582-microstep scheduler preserved.

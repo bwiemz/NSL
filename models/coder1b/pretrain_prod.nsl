@@ -119,6 +119,8 @@
 # any cwd; the nsl invocation must be from THIS directory (the corpus paths and
 # `from model import ...` are relative to it):
 #   cd models/coder1b
+#   export NSL_MATMUL_BF16=1        # see the taxonomy below — set it
+#                                   # EXPLICITLY and read the banner back
 #   nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
 #           --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
 #
@@ -138,16 +140,26 @@
 #                           execution fingerprint treats the wgrad choice as
 #                           arithmetic identity, so adding it mid-chain would
 #                           refuse every prior checkpoint.
-#   NSL_MATMUL_BF16=1       DO NOT USE for training runs. It measured +30%
-#                           and then a matched-pair discriminator convicted
-#                           it of ACCUMULATING DRIFT: identical batches, +0.53
-#                           nats of rise over 98M tokens vs f32's +0.16 (a
-#                           hard-region bump f32 recovers from), held-out a
-#                           full nat worse by 229M tokens. It is also
-#                           INVISIBLE to the execution fingerprint. The
-#                           conviction record and the bar any future bf16
-#                           scheme must clear:
-#                           POSTURE_1B_THROUGHPUT_2026_08_27.md.
+#   NSL_MATMUL_BF16=1       IN THE LINE, and the reason is a correction.
+#                           A matched-pair discriminator once convicted it of
+#                           accumulating drift (+0.53 nats over 98M tokens vs
+#                           f32's +0.16), but that pair ran at HELD lr=3e-5 —
+#                           later shown to be diverging on its own, at any
+#                           precision. The conviction is LR-confounded. At
+#                           lr=1.5e-5 the chain descended 230M tokens under
+#                           bf16 with held-out going 8.132/8.430 -> 3.872/5.834
+#                           and no sign of the amplification. Withdrawn to
+#                           "unsettled" pending the three-arm matched pair
+#                           (f32 / bf16+RNE / bf16+SR, PR #540's SR mode).
+#                           STANDING HAZARD, unchanged: it is INVISIBLE to the
+#                           execution fingerprint, so a checkpoint cannot tell
+#                           you which arithmetic produced it and a resume will
+#                           not refuse a silent switch. Set it explicitly, and
+#                           check the runtime's `cuBLAS math mode:` banner —
+#                           two chain legs were reported as f32 while running
+#                           bf16 because a copied driver carried this variable
+#                           and nothing read the banner back.
+#                           Record: POSTURE_1B_THROUGHPUT_2026_08_27.md.
 #                           --cuda-graphs measured +0.8% with clean counters
 #                           (76 captured / 2,052 replays / 0 taints) and
 #                           stays OUT: not worth carrying for <1%.
@@ -252,7 +264,7 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
     optimizer: AdamW(lr=0.000015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
     scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.0000045)
     step(batch):

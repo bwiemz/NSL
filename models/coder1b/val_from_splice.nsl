@@ -26,7 +26,7 @@ from model import NSLCoder
 from nsl.nn.losses import cross_entropy
 
 let m = NSLCoder()
-model_load(m, "../../run-out/spliced_lr3e5_opt6000.nslm")
+model_load(m, "../../run-out/spliced_lr15_opt16000.nslm")
 m.to(cuda)
 
 print("SPLICE_VAL_BEGIN")
