@@ -120,15 +120,38 @@ fn averaging_sr_casts_converges_to_the_input_and_rne_does_not() {
     let rne = bf16_operand_cast_rne_host(&vals);
     let ulp = |v: f32| (v.abs().log2().floor() - 7.0).exp2() as f64;
 
+    // Two different statistics, and the difference is the whole point.
+    //
+    // The SIGNED MEAN across elements answers "is this cast biased?" and is
+    // small for BOTH modes -- round-to-nearest is unbiased over an ENSEMBLE,
+    // which is exactly the measurement this module's doc comment calls the
+    // wrong one. Asserting `rne_bias > sr_bias` would therefore be asserting
+    // something false.
+    //
+    // The PER-ELEMENT RMS answers the question that matters: after averaging
+    // `rounds` casts, how much error is LEFT ON EACH WEIGHT? SR's shrinks as
+    // 1/sqrt(rounds) because each cast draws a fresh dither; RNE's does not
+    // shrink at all, because every cast returns the identical value. That
+    // standing per-element error is the gradient bias the mode exists to
+    // break up, and it is invisible to the signed mean, which cancels it
+    // across elements.
     let mut sr_bias = 0.0f64;
     let mut rne_bias = 0.0f64;
+    let mut sr_sq = 0.0f64;
+    let mut rne_sq = 0.0f64;
     for i in 0..n {
         let u = ulp(vals[i]).max(f64::MIN_POSITIVE);
-        sr_bias += (acc[i] / rounds as f64 - vals[i] as f64) / u;
-        rne_bias += (bf16_bits_to_f32(rne[i]) as f64 - vals[i] as f64) / u;
+        let sr_err = (acc[i] / rounds as f64 - vals[i] as f64) / u;
+        let rne_err = (bf16_bits_to_f32(rne[i]) as f64 - vals[i] as f64) / u;
+        sr_bias += sr_err;
+        rne_bias += rne_err;
+        sr_sq += sr_err * sr_err;
+        rne_sq += rne_err * rne_err;
     }
     let sr_bias = (sr_bias / n as f64).abs();
     let rne_bias = (rne_bias / n as f64).abs();
+    let sr_rms = (sr_sq / n as f64).sqrt();
+    let rne_rms = (rne_sq / n as f64).sqrt();
 
     // With `rounds` independent dithers the SR mean sits within ~0.5/sqrt(64)
     // ULP of the input. RNE has no averaging to do -- its error is whatever
@@ -157,7 +180,32 @@ fn averaging_sr_casts_converges_to_the_input_and_rne_does_not() {
          than the {rounds}-cast mean ({sr_bias:.4} ULP) -- this gate would \
          pass even if averaging did nothing"
     );
-    let _ = rne_bias;
+    // The "and rne does not" half of this test's name, which until now was
+    // computed and thrown away.
+    //
+    // For a residual uniform in [0,1) ULP: RNE's error is uniform in
+    // [-0.5, 0.5] ULP, so its RMS is sqrt(1/12) = 0.289 and averaging cannot
+    // move it. One SR cast has variance r(1-r), averaging to
+    // sqrt(E[r(1-r)]/rounds) = sqrt(1/(6*64)) = 0.051. The expected ratio is
+    // about 5.7; the threshold is 3 so ordinary sampling spread cannot trip
+    // it, while a ratio near 1 -- which is what "SR stopped decorrelating"
+    // or "the dither is a pure function of the value" would produce -- fails.
+    assert!(
+        rne_rms > 3.0 * sr_rms,
+        "after {rounds} casts the per-element residual is {sr_rms:.4} ULP rms \
+         under SR and {rne_rms:.4} ULP rms under RNE (ratio {:.2}, expected \
+         ~5.7). RNE's error must SURVIVE averaging -- that standing \
+         per-element term is the gradient bias SR exists to break up. A ratio \
+         near 1 means the SR dither stopped advancing across casts.",
+        rne_rms / sr_rms.max(f64::MIN_POSITIVE)
+    );
+
+    // The signed means are reported, not compared: both modes are unbiased
+    // across the ensemble, so a comparison between them would be noise.
+    assert!(
+        rne_bias.is_finite(),
+        "rne signed mean bias is not finite ({rne_bias})"
+    );
 }
 
 /// The production cast must reach the LAST element of a large operand.
