@@ -74,3 +74,36 @@ only at checkpoint-cadence update boundaries): ~2,200 updates (36M tokens,
 past the 2,048-update warmup, first cadence write + resume + memory
 flatness + post-warmup behavior), then ~250M tokens, then the 1B-token
 hard gate, then 1.5-2B only if it answers a question.
+
+
+## 2026-08-28/29 addendum: the LR verdict — 3e-5 held was the root instability
+
+The bf16 conviction above was correct but incomplete. The restarted f32
+chain ALSO reversed upward post-warmup (trough 6.84 at micro 14-16k, then
+monotone rise to 8.32 by 30k) — a different starting θ than the
+discriminator, same stationarily-shuffled data whose statistics were
+verified normal in every suspect window (unique-token counts, repeat
+rates, 8-gram duplication). Three independent legs rising at held lr=3e-5,
+plus a re-read of the pilot arm (its "3e-5 works" descent happened while
+its SHORT cosine decayed lr below ~2.5e-5 — held-3e-5 was never tested),
+made sustained lr the prime suspect.
+
+The trajectory probe settled it causally: the f32 chain's opt-2000 state
+resumed WRITE-FREE under a halved-peak schedule (1.5e-5, 0.3 min ratio,
+NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1 — the #533 escape's first production
+use), identical loader/RNG batches:
+
+| micro window | 3e-5 held | 1.5e-5 | paired |
+|---|---|---|---|
+| 8-16k | 7.43 -> 6.85 | 7.30 -> 6.32 | -0.13 -> -0.53 |
+| 16-24k | REVERSES 7.55 -> 7.45 | descends 6.59 -> 6.06 | -0.96 -> -1.40 |
+| 24-30k | 7.87 -> 8.32 | 6.31 -> 6.04 | -1.56 -> **-2.28** |
+
+First-to-last-quarter trends: 3e-5 **+0.86**, 1.5e-5 **-1.03**. Halving
+the peak converts divergence into the strongest descent of the campaign.
+The recipe pair carries lr=1.5e-5 / min_lr=4.5e-6 with the full
+three-revision provenance chain (1e-4 flat -> 3e-5 pilot-ranked but
+never held-tested -> 1.5e-5 probe-measured); the chain restarts fresh on
+it. bf16 remains separately convicted as an amplifier (standing rounding
+bias — the concurrent session's PR #540 SR mode is the candidate fix,
+behind its own matched-pair bar).
