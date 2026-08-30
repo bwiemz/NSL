@@ -17222,6 +17222,14 @@ sched={sched_s}",
                             builder.def_var(var, epoch_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
+                            // Same invariant as on_step's `step` arm: an untyped
+                            // slot reads as indeterminate to any future
+                            // tensor-cleanup sweep over state.variables, which
+                            // would hand this raw counter to
+                            // nsl_tensor_free_if_valid. No such sweep runs over
+                            // epoch scope today, but the binding shouldn't rely
+                            // on that staying true.
+                            state.variable_types.insert(param.name, Type::Int);
                         }
                         "loss" => {
                             let var = state.new_variable();
@@ -17238,6 +17246,8 @@ sched={sched_s}",
                             builder.def_var(var, z);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
+                            // Typed for the same reason as `epoch` above.
+                            state.variable_types.insert(param.name, Type::Int);
                         }
                     }
                 }
