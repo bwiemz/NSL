@@ -163,6 +163,8 @@ pub use cuda::test_set_transpose_views;
 // extern) rather than a parallel test-only one.
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::{test_lt_matmul_reset, test_lt_matmul_stats};
 
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).

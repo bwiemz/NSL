@@ -24,7 +24,7 @@ rand = "0.9"
 # training checkpoints resumable (item 8). Same version rand pulls in, so
 # this adds no new crate to the build graph.
 rand_chacha = "0.9"
-cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
+cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cublaslt", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 safetensors = { version = "0.4" }
 hf-hub = { version = "0.3", optional = true }
 prost = { version = "0.13", optional = true }
@@ -39,6 +39,10 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
+# The cublasLt gate computes its f64 reference from HOST-rounded bf16 operand
+# values (`half::bf16::from_f32` is RNE, same as the device cast kernel).
+# Already a lib dependency at the same version — no new crate in the graph.
+half = { version = "2.4", features = ["std"] }
 # Used by tools/verify-ort-vendoring.sh to diff vendored ORT struct
 # definitions against upstream headers.
 bindgen = "0.69"

@@ -104,6 +104,22 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
+    // cublasLt bf16 matmul path: issued/tuned/fallback counts, enabled when
+    // NSL_BF16_LT_COUNTER=1 (or NSL_EVENTS). Anti-vacuity again, with a
+    // sharper edge than its neighbors: the Lt path falls back to GemmEx
+    // MID-FLIGHT on any decline, so an A/B arm that "enabled" Lt but
+    // silently degraded (a failed handle create, zero heuristic candidates)
+    // would measure DFALT against DFALT and bank a null result as a delta.
+    #[cfg(feature = "cuda")]
+    if events_on || std::env::var("NSL_BF16_LT_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_bf16_lt_atexit);
+        }
+    }
+
     // Item 7: fused weight-gradient GEMM vs decomposed-fallback counts,
     // enabled when NSL_WGRAD_COUNTER=1. The fallback inside
     // `nsl_tensor_wgrad_accum` is SILENT by design (a shape the compiler's
@@ -474,6 +490,28 @@ extern "C" fn nsl_bf16_cast_cache_atexit() {
     // (see the fase-fused reporter above).
     let report =
         format!("[bf16-cast-cache] hits={hits} recasts={recasts} evictions={evictions}\n");
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(report.as_bytes());
+}
+
+#[cfg(feature = "cuda")]
+extern "C" fn nsl_bf16_lt_atexit() {
+    let (issued, tuned, fallbacks) = crate::cuda::lt_matmul::stats();
+    crate::events::emit(
+        "bf16_lt_counters",
+        None,
+        &[
+            ("issued", crate::events::i(issued as i64)),
+            ("tuned", crate::events::i(tuned as i64)),
+            ("fallbacks", crate::events::i(fallbacks as i64)),
+        ],
+    );
+    if std::env::var("NSL_BF16_LT_COUNTER").ok().as_deref() != Some("1") {
+        return;
+    }
+    // One formatted write — multi-rank stderr TEARS per-fragment writes
+    // (see the fase-fused reporter above).
+    let report = format!("[bf16-lt] issued={issued} tuned={tuned} fallbacks={fallbacks}\n");
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(report.as_bytes());
 }
