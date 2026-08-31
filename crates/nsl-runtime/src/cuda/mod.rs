@@ -342,8 +342,67 @@ pub(crate) mod inner {
         }
     }
 
+    /// Exit code for a fatal GPU OOM, so a supervising driver can tell
+    /// "the card ran out" from "the program crashed" without parsing stderr.
+    pub(crate) const NSL_EXIT_GPU_OOM: i32 = 12;
+
+    /// Attribute the shortfall when the device has far less free memory than
+    /// this process can account for.
+    ///
+    /// `reserved` is what OUR caching allocator holds. If the driver reports
+    /// only `free` of `total` and we are not holding the difference, someone
+    /// ELSE is on the card -- another training job, a benchmark, a second
+    /// session. That is a completely different remedy from "reduce batch
+    /// size", and on 2026-08-31 the absence of this line cost a 1B run: a
+    /// concurrent unguarded benchmark took 14.4 GB, our chain OOM'd with
+    /// 73.9 MB free, and the diagnostic advised shrinking the batch.
+    ///
+    /// Pure and GPU-free on purpose, so it is unit-testable.
+    pub(crate) fn oom_contention_line(
+        free: usize, total: usize, reserved: usize,
+    ) -> Option<String> {
+        let others = total.saturating_sub(free).saturating_sub(reserved);
+        // Ignore small slack: driver context, the compositor, accounting drift.
+        if others < (total / 20).max(512 * 1024 * 1024) {
+            return None;
+        }
+        Some(format!(
+            "\n  *** {} of the {} device is held by OTHER PROCESSES ***\n\
+             \x20 This process's allocator reserves {}. Reducing batch size or\n\
+             \x20 precision will NOT help while another process holds the card.\n\
+             \x20 Check: nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv\n\
+             \x20 Serialise GPU work through scripts/gpu-guard.sh -- its lock only\n\
+             \x20 excludes runs that go THROUGH it, so an unguarded job evicts you.",
+            format_bytes(others), format_bytes(total), format_bytes(reserved),
+        ))
+    }
+
+    /// Fatal GPU OOM: report once, then leave.
+    ///
+    /// NOT `panic!`. The allocator is reached from `extern "C"` entry points
+    /// (`nsl_tensor_to_device` via `cpu_fallback_binary`, and ~790 others), and
+    /// a Rust panic in such a frame cannot unwind: it becomes
+    /// `panic in a function that cannot unwind` -> SIGABRT -> a multi-GB core
+    /// dump, with the real diagnostic buried under two backtraces. Observed
+    /// 2026-08-31: a 5.5 GB core for a condition we had already diagnosed in
+    /// full. `std::process::exit` on a fatal runtime condition is the existing
+    /// convention here (see `assert.rs`).
+    pub(crate) fn oom_fatal(msg: String) -> ! {
+        use std::io::Write;
+        eprintln!("{msg}");
+        let _ = std::io::stderr().flush();
+        std::process::exit(NSL_EXIT_GPU_OOM);
+    }
+
     fn oom_diagnostic(requested: usize, alloc_num: u64, pool_freed: usize) -> String {
         let (free_vram, total_vram) = query_vram();
+        // What WE hold, for the contention attribution below.
+        let reserved = match super::caching_allocator::CACHING_ALLOCATOR.try_lock() {
+            Ok(a) => { let (p, _, t, _) = a.pool_breakdown(); p + t }
+            Err(_) => 0,
+        };
+        let contention = oom_contention_line(free_vram, total_vram, reserved)
+            .unwrap_or_default();
         let ctx = current_oom_context();
         let op_line = if ctx.is_empty() {
             String::new()
@@ -392,7 +451,7 @@ pub(crate) mod inner {
                Requested:    {} ({})\n\
                VRAM free:    {} / {}\n\
                Pool drained: {}\n\
-               Allocation #: {}{}{}{}\n\
+               Allocation #: {}{}{}{}{}\n\
              Suggestions:\n\
                - Reduce batch size or sequence length\n\
                - Enable gradient checkpointing (@checkpoint)\n\
@@ -402,6 +461,7 @@ pub(crate) mod inner {
             format_bytes(free_vram), format_bytes(total_vram),
             format_bytes(pool_freed),
             alloc_num, op_line,
+            contention,
             allocator_report,
             async_note,
         )
@@ -557,7 +617,7 @@ pub(crate) mod inner {
         }
 
         // All recovery failed
-        panic!("{}", oom_diagnostic(size_bytes, n, pool_freed));
+        oom_fatal(oom_diagnostic(size_bytes, n, pool_freed));
     }
 
     // Track all CUDA allocations so we can validate frees
@@ -800,7 +860,7 @@ pub(crate) mod inner {
             }
 
             let n = ALLOC_COUNT_DBG.load(std::sync::atomic::Ordering::Relaxed);
-            panic!("{}", oom_diagnostic(size_bytes, n, pool_freed));
+            oom_fatal(oom_diagnostic(size_bytes, n, pool_freed));
         }
     }
 
@@ -10944,5 +11004,77 @@ DONE:
             let val = unsafe { *c.data_f64().add(i) };
             assert!((val - expected[i]).abs() < 0.1, "mismatch at {}: {} vs {}", i, val, expected[i]);
         }
+    }
+}
+
+
+#[cfg(all(test, feature = "cuda"))]
+mod oom_contention_tests {
+    use super::inner::oom_contention_line;
+
+    const GB: usize = 1024 * 1024 * 1024;
+
+    /// The 2026-08-31 incident, to the byte: a 31.39 GB card with 73.9 MB
+    /// free while our allocator held ~16 GB. The missing ~15 GB belonged to a
+    /// concurrent unguarded benchmark, and the diagnostic said "reduce batch
+    /// size". It must now say who really has the card.
+    #[test]
+    fn external_contention_is_named() {
+        let total = 32_623 * 1024 * 1024;
+        let free = 73_900_000;
+        let ours = 16 * GB;
+        let line = oom_contention_line(free, total, ours)
+            .expect("15 GB held by another process must be reported");
+        assert!(
+            line.contains("OTHER PROCESSES"),
+            "contention line must name the cause: {line}"
+        );
+        assert!(
+            line.contains("will NOT help"),
+            "must contradict the batch-size advice, which is wrong here: {line}"
+        );
+        assert!(
+            line.contains("gpu-guard"),
+            "must point at the remedy that actually applies: {line}"
+        );
+    }
+
+    /// The ordinary case: we filled the card ourselves. Naming "other
+    /// processes" here would send the operator chasing a phantom, so the line
+    /// must be ABSENT -- this is the half that keeps the message honest.
+    #[test]
+    fn self_inflicted_oom_is_not_blamed_on_others() {
+        let total = 32 * GB;
+        let free = 64 * 1024 * 1024;
+        let ours = total - free - (200 * 1024 * 1024); // ~all of it is ours
+        assert!(
+            oom_contention_line(free, total, ours).is_none(),
+            "a self-inflicted OOM must not accuse other processes"
+        );
+    }
+
+    /// Driver context, the compositor and accounting drift are always a few
+    /// hundred MB. Firing on those would make the warning noise, and a warning
+    /// that fires on every OOM carries no information.
+    #[test]
+    fn small_slack_does_not_trip_the_warning() {
+        let total = 32 * GB;
+        let ours = 30 * GB;
+        // ~300 MB unaccounted: compositor + context, not a competing job.
+        let free = total - ours - (300 * 1024 * 1024);
+        assert!(
+            oom_contention_line(free, total, ours).is_none(),
+            "sub-threshold slack must not be reported as contention"
+        );
+    }
+
+    /// Saturating arithmetic: accounting can transiently exceed the device
+    /// (freed-but-not-returned segments), and a diagnostic must never panic
+    /// while reporting a crash.
+    #[test]
+    fn over_accounting_cannot_underflow() {
+        let total = 32 * GB;
+        assert!(oom_contention_line(GB, total, 40 * GB).is_none());
+        assert!(oom_contention_line(0, 0, 0).is_none());
     }
 }
