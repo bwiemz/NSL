@@ -9,9 +9,10 @@
 //! the SAME bf16-rounded operand values the device consumes
 //! (`half::bf16::from_f32` and the device cast kernel are both
 //! round-to-nearest-even), sampled at deterministic output positions, with a
-//! tolerance scaled to each dot product's L1 mass — ~160x above honest f32
-//! accumulation error for these k, and ~4 orders of magnitude below what any
-//! layout/transpose/operand-swap bug produces.
+//! tolerance scaled to each dot product's L1 mass — ~40-60x above honest f32
+//! accumulation error at these k (sqrt-k RMS growth), and orders of
+//! magnitude below what any layout/transpose/operand-swap bug produces
+//! (those land at O(1) of the L1 mass).
 //!
 //! What the Lt path CAN promise bitwise is run-to-run determinism (the
 //! preference masks reduction schemes to the deterministic

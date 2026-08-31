@@ -52,14 +52,20 @@
 //!   attempt-burning failure shape the cast cache refuses graphs over. The
 //!   untimed pick keeps Lt available under graphs (algo per shape is stable,
 //!   so region digests are too).
-//! * the scratch D would exceed 1 GiB (m*n*4 bytes) — tuning is not worth an
-//!   OOM hazard on a nearly-full card.
+//! * the scratch D would exceed 1 GiB (ldc*n*4 bytes), or its RAW driver
+//!   allocation fails — tuning is optional, so a nearly-full card gets the
+//!   untimed pick, never an OOM kill (the scratch and the workspace both
+//!   bypass `alloc_managed` PRECISELY because that path cannot fail — it
+//!   exits the process — see [`raw_device_alloc`]).
 //! * `--deterministic` is active: a TIMED winner depends on machine state at
 //!   first use, so two runs of one program could select different kernels
 //!   and differ in bits ACROSS processes — the exact promise --deterministic
 //!   makes. The untimed heuristic[0] is a pure function of (shapes, library,
 //!   device, workspace cap) and keeps that promise. Within one process the
-//!   cached plan makes every repeat bit-identical regardless.
+//!   cached plan makes every repeat bit-identical regardless. (An embedder
+//!   that toggles the flag MID-process keeps plans tuned before the toggle;
+//!   compiled programs set it before the first GEMM, so only a foreign host
+//!   driving the runtime directly can reach that state.)
 //!
 //! Timed candidates run on the CURRENT device state: tune on a quiet card
 //! for production-representative picks. A busy card yields a valid but
@@ -153,7 +159,53 @@ fn workspace_bytes_configured() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(64)
+            // Clamp before the shift: an absurd value must degrade to "big",
+            // not wrap to small-or-zero in release.
+            .min(4096)
     }) << 20
+}
+
+/// Raw driver allocation for this module's two buffers (the process-lifetime
+/// workspace and the transient tune scratch). Deliberately NOT
+/// `alloc_managed`:
+///
+/// * `alloc_managed` cannot fail — every OOM path ends in `oom_fatal` ->
+///   process exit. This module's whole degradation story ("skip the tune",
+///   "run with zero workspace") requires an allocation that can say no.
+/// * `alloc_managed`'s first stop is the transient arena's pin. A
+///   plan-vs-reality drift could hand a PROCESS-LIFETIME workspace an arena
+///   slot the arena re-places every step — permanent aliasing, split-k
+///   scribbling over a live tensor (review finding on the first commit).
+///   The raw driver path cannot intersect the arena or the caching
+///   allocator's free lists at all.
+///
+/// Returns 0 on failure.
+fn raw_device_alloc(bytes: usize) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    super::inner::ensure_context();
+    let mut ptr: cudarc::driver::sys::CUdeviceptr = 0;
+    // SAFETY: out-pointer to a live local; result checked.
+    let r = unsafe { cudarc::driver::sys::cuMemAlloc_v2(&mut ptr, bytes) };
+    if r == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        ptr as u64
+    } else {
+        0
+    }
+}
+
+/// Free a [`raw_device_alloc`] buffer. Callers must ensure all enqueued work
+/// touching it has completed (the tune loop's per-rep `cuCtxSynchronize`
+/// brackets do exactly that before the scratch free).
+fn raw_device_free(ptr: u64) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: `ptr` came from cuMemAlloc_v2 and is freed exactly once.
+    unsafe {
+        cudarc::driver::sys::cuMemFree_v2(ptr as cudarc::driver::sys::CUdeviceptr);
+    }
 }
 
 /// (issued, tuned_shapes, fallbacks) — see the counter docs.
@@ -210,10 +262,11 @@ fn lt_handle() -> Option<lt::cublasLtHandle_t> {
         .map(|h| h.0)
 }
 
-/// Process-global workspace: allocated once, never freed (captured graph
-/// nodes may reference it for the life of the process). `(0, 0)` when the
-/// allocation failed — heuristics then select zero-workspace kernels, which
-/// is still at worst DFALT-equivalent.
+/// Process-global workspace: allocated once (raw driver path — see
+/// [`raw_device_alloc`]), never freed (captured graph nodes may reference it
+/// for the life of the process). `(0, 0)` when the allocation failed —
+/// heuristics then select zero-workspace kernels, which is still at worst
+/// DFALT-equivalent.
 fn workspace() -> (u64, usize) {
     static WS: OnceLock<(u64, usize)> = OnceLock::new();
     *WS.get_or_init(|| {
@@ -221,7 +274,7 @@ fn workspace() -> (u64, usize) {
         if bytes == 0 {
             return (0, 0);
         }
-        let ptr = super::inner::alloc_managed(bytes) as u64;
+        let ptr = raw_device_alloc(bytes);
         if ptr == 0 {
             eprintln!(
                 "[nsl-matmul] cublasLt workspace alloc ({} MiB) failed — \
@@ -410,7 +463,12 @@ unsafe fn build_plan(
     // Candidate timing. Every timed launch goes to a transient scratch D
     // with beta = 0 — NEVER the caller's C (its beta may be 1: wgrad
     // accumulates, and a timing rep into it would corrupt live gradients).
-    let out_bytes = (m as usize) * (n as usize) * 4;
+    // Scratch D footprint follows the C LAYOUT, not just m*n: the D
+    // descriptor carries `ld = ldc`, so a timed launch touches up to
+    // `ldc*(n-1)+m` elements. Today's callers all pass ldc == m; sizing by
+    // ldc keeps a future ldc>m caller from turning timing reps into device
+    // OOB writes (review finding).
+    let out_bytes = (ldc as usize) * (n as usize) * 4;
     // `--deterministic` disables the TIMED tune (read live, not cached: the
     // mode is set at program init, after this module's OnceLocks may exist in
     // tests): a timing-based winner is a function of machine state at first
@@ -425,7 +483,10 @@ unsafe fn build_plan(
         && out_bytes <= TUNE_SCRATCH_CAP_BYTES;
     let mut chosen: usize = 0;
     if tune && candidates.len() > 1 {
-        let scratch = super::inner::alloc_managed(out_bytes);
+        // Fallible by design: on a nearly-full card the tune is skipped
+        // (untimed heuristic[0]) instead of the process dying — which is
+        // what routing this through alloc_managed's oom_fatal would do.
+        let scratch = raw_device_alloc(out_bytes) as *mut std::ffi::c_void;
         if !scratch.is_null() {
             let stream = super::inner::current_stream() as lt::cudaStream_t;
             let (zero, one) = (0.0f32, 1.0f32);
@@ -479,7 +540,9 @@ unsafe fn build_plan(
                     chosen = i;
                 }
             }
-            super::inner::free_managed(scratch);
+            // Every timing rep ended in a cuCtxSynchronize, so no enqueued
+            // work still reads the scratch.
+            raw_device_free(scratch as u64);
             TUNED.fetch_add(1, Ordering::Relaxed);
             // The candidates were all timed anyway — under
             // NSL_MATMUL_BF16_LT_VERBOSE=1, say per shape what the untimed
@@ -549,9 +612,10 @@ pub(crate) unsafe fn matmul_bf16_f32(
     };
 
     let key: Key = (opa, opb, m, n, k, lda, ldb, ldc);
-    // Plan lookup / creation. The map lock is NOT held across the launch —
-    // build_plan syncs and allocates, and the free hook (via alloc_managed's
-    // OOM recovery) must never find this module's lock held.
+    // Plan lookup / creation. The map lock is NOT held across build_plan
+    // (which synchronizes the device while timing) nor across the launch —
+    // holding a lock over device-blocking work is how unrelated paths
+    // (teardown atexit, test resets) end up serialized behind a GEMM.
     let hit = {
         let plans = PLANS.lock().unwrap();
         plans.get(&key).map(|p| p.as_ref().map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes)))
@@ -631,8 +695,21 @@ pub(crate) unsafe fn matmul_bf16_f32(
     };
     if st != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         // A failed launch writes nothing, so GemmEx can still compute the
-        // product. Poison the plan so the shape does not fail-retry per GEMM.
-        PLANS.lock().unwrap().insert(key, None);
+        // product. Poison the plan so the shape does not fail-retry per GEMM,
+        // destroying the displaced handles (a bare insert leaked 4 objects
+        // per poisoned shape — review finding). Known residual: under
+        // --deterministic a TRANSIENT failure here switches this shape
+        // Lt->GemmEx mid-run, which can diverge two seeded runs — but a
+        // cached, heuristic-validated algo failing transiently is itself a
+        // machine-state anomaly no local choice repairs; documented rather
+        // than masked.
+        let displaced = PLANS.lock().unwrap().insert(key, None);
+        if let Some(Some(p)) = displaced {
+            // SAFETY: just removed from the map; no launch is in flight with
+            // these handles (single-threaded GPU work) and cublasLt keeps no
+            // reference past the failed call.
+            unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
+        }
         FALLBACKS.fetch_add(1, Ordering::Relaxed);
         print_fallback_once("cublasLtMatmul launch failure");
         return false;
