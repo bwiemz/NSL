@@ -56,7 +56,7 @@ PROG=$OUT/stage4_prog            # persistent, symbolizable
 # = 16,384 tokens, so it lands on a complete accumulation window.
 STOP=248200; CKPT_MICRO=248000; MAX_RESTARTS=6
 STALL_POLLS=15                   # 15 x 60 s of no progress = stalled
-RESUME_FROM=64000                # the state on disk when this leg starts
+RESUME_FROM=160000               # state on disk after the 2026-08-31 three-arm probe
 
 echo "STAGE4 arm=$ARM  nsl=$(md5sum "$NSL" | cut -c1-12)  $(date '+%F %T')"
 echo "STAGE4 env: NSL_MATMUL_BF16=${NSL_MATMUL_BF16:-unset} NSL_MATMUL_BF16_ROUND=${NSL_MATMUL_BF16_ROUND:-unset}"

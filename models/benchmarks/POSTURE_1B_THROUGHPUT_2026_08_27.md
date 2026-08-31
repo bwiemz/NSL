@@ -187,3 +187,19 @@ checked separately, and the arms that must NOT have SR assert its absence
 Target: micro 248,000 = 62,000 optimizer updates = **1,015,808,000 tokens**,
 a multiple of both the 2,000-update cadence and the 16,384-token
 accumulation window, with the full 5,516,582-microstep scheduler preserved.
+
+
+## 2026-08-31: the bf16 question is CLOSED — see the three-arm record
+
+Everything above about bf16 (the conviction, and the later "withdrawn to
+unsettled") is superseded. A three-arm matched pair — one checkpoint, identical
+batches, f32 / bf16+RNE / bf16+SR — put held-out at bf16+RNE 4.363/6.332 <
+bf16+SR 4.477/6.385 < f32 4.653/6.423, the same ranking on both sets, with the
+f32 arm WORST. bf16 is also +29.5% faster on those same arms.
+
+**bf16 is acquitted and stays in the recipe. SR is measured and rejected.**
+The chain's held-out excursion is precision-INDEPENDENT and is resolving on its
+own (+0.43 -> +0.15 -> +0.08 -> −0.21 nats per 98M tokens).
+
+Full record, including why the earlier conviction was wrong and the four
+instrument checks: PRECISION_1B_THREE_ARM_2026_08_31.md.

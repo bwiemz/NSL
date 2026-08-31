@@ -1,95 +1,74 @@
 #!/usr/bin/env bash
-# Three-arm matched pair: f32 / bf16+RNE / bf16+SR   (PR #540's validation run)
+# Three-arm matched pair: f32 / bf16+RNE / bf16+SR, from ONE checkpoint on
+# IDENTICAL batches (the checkpoint restores the loader slot and the RNG
+# sidecar), differing ONLY in arithmetic.
 #
-# WHY: #540's gates are all operand-level. Nothing yet connects "0.034 ULP
-# time-averaged bias" to "recovers the loss bf16 was thought to cost". This is
-# the run the PR itself names: ONE checkpoint, IDENTICAL batches (the
-# checkpoint restores the loader slot and the RNG sidecar), three arms
-# differing ONLY in environment.
+# ── why this exists, sharpened 2026-08-30 ────────────────────────────────
 #
-# READ: if the SR arm's paired delta vs f32 stays flat where the RNE arm's
-# grows, the standing-weight-bias mechanism is the whole story and bf16+SR is
-# usable for the chain. If SR also grows, the bias is real but not dominant.
-# If NEITHER grows, bf16 is simply not costing anything at this learning rate
-# -- which is what the (bf16, lr=1.5e-5) leg to 263M tokens already suggests,
-# and would retire the bf16 conviction outright.
+# The 1B chain's held-out PEAKED at 262M tokens and then went BACKWARDS:
+# VAL_STACK/WEB 3.872/5.834 at micro 64,000 -> 4.569/6.291 at micro 160,000,
+# +0.70/+0.46 nats WORSE over 393M tokens. Training loss over that same span
+# was FLAT to -0.03 +/- 0.13 nats per 100k micro, so the loss stream showed
+# nothing. The leg ran bf16 at lr=1.5e-5 throughout.
 #
-# ── two hard lessons are wired in as assertions ──────────────────────────
+# That is the same signature that convicted bf16 at held lr=3e-5, reappearing
+# at half the peak — halving the LR seems to have DELAYED the degradation, not
+# prevented it. This run decides whether precision is the cause.
 #
-# 1. THE MISLABEL. The bf16 conviction came from legs that were REPORTED as
-#    f32 and RAN bf16, because a copied driver carried NSL_MATMUL_BF16=1 and
-#    nothing checked. Every arm here sets its env from scratch and then must
-#    prove it on the runtime's own output. bf16+RNE and bf16+SR print the
-#    SAME math-mode banner, so SR needs its own witness -- and the arms that
-#    must NOT have SR assert its ABSENCE, which is the half that would have
-#    caught the original mislabel.
+# ── two design corrections over the previous version ─────────────────────
 #
-# 2. THE 2^16 CEILING. The previous attempt at this exact probe measured
-#    NOTHING: all three arms died at micro-step 65,536 (PR #541). The fix is
-#    a codegen change carried by the CLI, so the CLI is pinned and PROVEN
-#    functionally before any arm starts.
+# 1. EACH ARM SAVES ITS OWN THETA, and held-out is scored on all three at the
+#    end. The previous version was write-free and produced no per-arm weights,
+#    leaving only the paired training-loss delta as evidence — and the loss
+#    stream is exactly the instrument that just failed to see a 0.7 nat
+#    generalization change. Held-out is the instrument; training loss is the
+#    cheap proxy that missed it. Arms write to their OWN directory, never the
+#    chain's, and that is asserted below rather than assumed.
+# 2. Held-out is scored under TF32 for every arm, because the whole trajectory
+#    record was measured under TF32. (Verified 2026-08-30: bf16 vs TF32 on the
+#    same weights differ in the 5th decimal, so this does not bias any arm —
+#    but the comparison stays like-for-like on principle.)
 #
-# WRITE-FREE: checkpoint_load only, never checkpoint_save. No arm can touch
-# the chain's checkpoint. Arms run sequentially behind gpu-guard.
+# The arm's own identity is asserted on the runtime's output before it earns
+# wall-clock: bf16+RNE and bf16+SR print the SAME math-mode banner, so the
+# stochastic-rounding line is checked separately, and the arms that must NOT
+# have SR assert its ABSENCE — the half that would have caught the 30-hour
+# mislabel of stages 2 and 3.
 set -u
 WT=/home/brandon/Projects/NSL/.claude/worktrees/int1b
 cd "$WT/models/coder1b" || exit 9
 export NSL_STDLIB_PATH=$WT/stdlib
 GUARD=$WT/scripts/gpu-guard.sh
-NSL=/home/brandon/Projects/NSL-target-fix2p16/release/nsl   # post-#540 AND post-#541
+NSL=/home/brandon/Projects/NSL-target-fix2p16/release/nsl
 OUT=$WT/run-out
 BK=$WT/models/coder1b/checkpoints_backup
 SRLINE="bf16 operand cast: STOCHASTIC rounding"
+ARMDIR=checkpoints_sr3arm
+TEMPLATE=/home/brandon/Projects/NSL/.claude/worktrees/pilot1b/models/coder1b/checkpoints/pilot_lr3e5_final.nslm
 
-# ── phase 0: wait for the chain's 1B-gate leg (up to 60 h) ───────────────
-#
-# Wait on the leg's own TERMINAL MARKER first and only fall back to process
-# liveness. Two reasons the naive `pgrep -f stage4_driver` is wrong here:
-# it matches anything merely MENTIONING the driver -- a `tail -F
-# stage4_driver.log` monitor, another shell's `cat` -- which would park this
-# probe for the full 60 h behind a log reader; and the driver's own exit is
-# better evidenced by what it wrote than by whether it is still breathing.
-# The pattern below is anchored on the script name so a reader of the .log
-# cannot satisfy it.
-stage4_running() { pgrep -f 'stage4_driver\.sh' >/dev/null 2>&1; }
-stage4_done()    { grep -qE 'STAGE4_REACHED_1B_GATE|STAGE4 GAVE UP|STAGE4 ABORT|STAGE4 REFUSED' "$OUT/stage4_driver.log" 2>/dev/null; }
-for i in $(seq 1 720); do
-  stage4_done && break
-  stage4_running || { sleep 30; stage4_running || break; }   # settle: log may lag exit
-  sleep 300
-done
-if stage4_running && ! stage4_done; then echo "SR3ARM: stage4 still running after 60h — not starting"; exit 3; fi
-echo "SR3ARM: stage4 finished — $(tail -1 "$OUT/stage4_driver.log" 2>/dev/null)"
-[ -x "$NSL" ] || { echo "SR3ARM ABORT: $NSL missing — all three arms must share one SR-capable, 2^16-fixed binary"; exit 5; }
-
-# ── pre-flight: the binary must cross micro-step 65,536 ──────────────────
+[ -x "$NSL" ] || { echo "SR3ARM ABORT: $NSL missing"; exit 5; }
 if ! ( cd "$OUT/repro" && timeout 300 "$NSL" run --source-ad --seed 7 min4.nsl \
         > "$OUT/sr3arm_preflight.out" 2> "$OUT/sr3arm_preflight.err" ) \
    || ! grep -q REPRO_PASSED_2P16 "$OUT/sr3arm_preflight.out"; then
-  echo "SR3ARM ABORT: $NSL did not survive micro-step 65,536 — this is the bug that made the last attempt measure nothing"; exit 7
-fi
+  echo "SR3ARM ABORT: binary does not survive micro-step 65,536"; exit 7; fi
 echo "SR3ARM preflight OK: binary crosses 2^16"
 
-# Prefer the 1B-gate state; fall back to 263M if the chain did not reach it.
-if [ -f "$BK/lr15_1bgate_bf16/pretrain_prod_state.nslm" ]; then
-  CKPT="checkpoints_backup/lr15_1bgate_bf16/pretrain_prod_state.nslm"; BASE=248000
-  echo "SR3ARM: base = the 1B gate (micro 248,000, 1.016B tokens)"
+# Newest base first: the probe is most informative from the furthest-trained
+# theta, and the question is forward-going ("from HERE, does f32 recover?").
+if   [ -f "$BK/lr15_stage4_opt40000/pretrain_prod_state.nslm" ]; then
+  CKPT="checkpoints_backup/lr15_stage4_opt40000/pretrain_prod_state.nslm"; BASE=160000
+elif [ -f "$BK/lr15_stage4_opt24000/pretrain_prod_state.nslm" ]; then
+  CKPT="checkpoints_backup/lr15_stage4_opt24000/pretrain_prod_state.nslm"; BASE=96000
 else
   CKPT="checkpoints_backup/lr15_stage2_opt16000/pretrain_prod_state.nslm"; BASE=64000
-  echo "SR3ARM: 1B-gate checkpoint absent — falling back to micro 64,000 (263M tokens)"
 fi
-# NOTE FOR THE WRITE-UP: this base theta was trained under BF16 at lr=1.5e-5.
-# The probe measures the FORWARD-GOING cost of each arithmetic from a shared
-# state; it does not and cannot say what a from-scratch f32 run would have
-# done. Say so when reporting it.
-STOP=$((BASE + 24000))   # 98.3M tokens/arm — the length that convicted bf16
-echo "SR3ARM: base=$BASE stop=$STOP ckpt=$CKPT"
-
-# The probe recipe: production recipe, resume-only, no save.
-sed -e "s|checkpoint_load=\"checkpoints/pretrain_prod_state.nslm\", checkpoint_save=\"checkpoints/pretrain_prod_state.nslm\", checkpoint_every=2000|checkpoint_load=\"$CKPT\"|" \
-    pretrain_prod.nsl > sr3arm_probe.nsl
-grep -q "checkpoint_save" sr3arm_probe.nsl && { echo "SR3ARM ABORT: probe still has checkpoint_save — refusing to risk the chain checkpoint"; exit 4; }
-grep -q "checkpoint_load=\"$CKPT\"" sr3arm_probe.nsl || { echo "SR3ARM ABORT: probe has no checkpoint_load"; exit 4; }
+CKMICRO=$((BASE + 24000))          # 98.3M tokens/arm — the length that convicted bf16
+STOP=$((CKMICRO + 200))
+echo "SR3ARM: base=$BASE ($((BASE*4096/1000000))M tokens)  stop=$CKMICRO  ckpt=$CKPT"
+echo "SR3ARM: base theta is BF16-TRAINED — state that in the write-up; this"
+echo "SR3ARM: measures forward-going cost from a shared state, not what a"
+echo "SR3ARM: from-scratch f32 run would have done."
+mkdir -p "$ARMDIR"
 
 reap() {
   local pid=${1:-} pg="" mypg
@@ -101,52 +80,86 @@ reap() {
   sleep 4
   local p
   for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
-    case "$(readlink -f /proc/$p/exe 2>/dev/null)" in */nsl_run_*/*|*sr3arm*) kill -9 "$p" 2>/dev/null ;; esac
+    case "$(readlink -f /proc/$p/exe 2>/dev/null)" in */nsl_run_*/*) kill -9 "$p" 2>/dev/null ;; esac
   done
   sleep 8
 }
 
-# $1=name  $2=math-mode banner fragment  $3=present|absent for the SR line  $4..=env
+# $1=name $2=banner fragment $3=present|absent for SR $4..=env
 run_arm() {
   local name=$1 want=$2 srwant=$3; shift 3
-  echo "SR3ARM [$name] starting $(date '+%H:%M:%S')  env: ${*:-none}"
-  ( # Clear FIRST, then set only this arm's variables: a leaked
-    # NSL_MATMUL_BF16 from the caller is exactly how the mislabel happened.
-    unset NSL_MATMUL_BF16 NSL_MATMUL_BF16_ROUND
+  local save="$ARMDIR/${name}_state.nslm"
+  local probe="sr3arm_${name}.nsl"
+  # Build this arm's recipe: resume from the shared base, save to the ARM's
+  # own file. Never the chain's.
+  sed -e "s|checkpoint_load=\"checkpoints/pretrain_prod_state.nslm\", checkpoint_save=\"checkpoints/pretrain_prod_state.nslm\", checkpoint_every=2000|checkpoint_load=\"$CKPT\", checkpoint_save=\"$save\", checkpoint_every=2000|" \
+      pretrain_prod.nsl > "$probe"
+  grep -q "checkpoint_save=\"$save\"" "$probe" || { echo "SR3ARM [$name] ABORT: recipe rewrite failed"; return 3; }
+  grep -q 'checkpoint_save="checkpoints/pretrain_prod_state.nslm"' "$probe" \
+    && { echo "SR3ARM [$name] ABORT: recipe still writes the CHAIN checkpoint"; return 3; }
+
+  echo "SR3ARM [$name] start $(date '+%H:%M:%S')  env: ${*:-none}  -> $save"
+  ( unset NSL_MATMUL_BF16 NSL_MATMUL_BF16_ROUND
     for kv in "$@"; do export "$kv"; done
     bash "$GUARD" run -- "$NSL" run --source-ad --checkpoint-blocks --checkpoint-selective \
-      --fuse-rmsnorm-backward --fuse-wgrad-accum sr3arm_probe.nsl \
+      --fuse-rmsnorm-backward --fuse-wgrad-accum "$probe" \
       > "$OUT/sr3arm_$name.stdout" 2> "$OUT/sr3arm_$name.stderr" ) &
   local GPID=$! engaged="" laststep="" stall=0
   while true; do
     sleep 30
     if grep -q "panicked\|REFUSING" "$OUT/sr3arm_$name.stderr" 2>/dev/null; then
       echo "SR3ARM [$name] CRASHED: $(tr '\r' '\n' < "$OUT/sr3arm_$name.stderr" | grep -m1 'panicked\|REFUSING')"; reap "$GPID"; return 1; fi
-    if ! kill -0 "$GPID" 2>/dev/null; then echo "SR3ARM [$name] EXITED early at micro $(tr '\r' '\n' < "$OUT/sr3arm_$name.stdout" | grep -E '^[0-9]+$' | tail -1)"; return 1; fi
+    if ! kill -0 "$GPID" 2>/dev/null; then echo "SR3ARM [$name] EXITED early at $(tr '\r' '\n' < "$OUT/sr3arm_$name.stdout" | grep -E '^[0-9]+$' | tail -1)"; return 1; fi
     local cur; cur=$(tr '\r' '\n' < "$OUT/sr3arm_$name.stdout" 2>/dev/null | grep -E "^[0-9]+$" | tail -1)
     [ -z "${cur:-}" ] && continue
     if [ -z "$engaged" ]; then
       local E; E=$(tr '\r' '\n' < "$OUT/sr3arm_$name.stderr")
       case "$E" in *"cuBLAS math mode: $want"*) ;; *)
-        echo "SR3ARM [$name] ABORT: math-mode banner is not '$want' — this arm is mislabelled: $(printf '%s' "$E" | grep -m1 -oE 'cuBLAS math mode: [A-Za-z0-9 ()]*')"
+        echo "SR3ARM [$name] ABORT: banner is not '$want': $(printf '%s' "$E" | grep -m1 -oE 'cuBLAS math mode: [A-Za-z0-9 ()]*')"
         reap "$GPID"; return 2 ;; esac
       local seen=absent; case "$E" in *"$SRLINE"*) seen=present ;; esac
-      if [ "$seen" != "$srwant" ]; then
-        echo "SR3ARM [$name] ABORT: stochastic-rounding witness $seen, wanted $srwant — the bf16 arms share a math-mode banner and this line is the ONLY thing separating them"
-        reap "$GPID"; return 2; fi
+      [ "$seen" = "$srwant" ] || { echo "SR3ARM [$name] ABORT: SR witness $seen, wanted $srwant"; reap "$GPID"; return 2; }
       local first; first=$(tr '\r' '\n' < "$OUT/sr3arm_$name.stdout" | grep -m1 -E "^[0-9]+$")
-      if [ "$first" -le "$BASE" ]; then
-        echo "SR3ARM [$name] ABORT: from-scratch ($first, expected > $BASE)"; reap "$GPID"; return 2; fi
-      engaged=yes; echo "SR3ARM [$name] RESUME ENGAGED at $first  (math=$want, sr=$seen)"
+      [ "$first" -gt "$BASE" ] || { echo "SR3ARM [$name] ABORT: from-scratch ($first)"; reap "$GPID"; return 2; }
+      engaged=yes; echo "SR3ARM [$name] RESUME ENGAGED at $first (math=$want, sr=$seen)"
     fi
     if [ "$cur" = "$laststep" ]; then
       stall=$((stall+1)); [ "$stall" -ge 20 ] && { echo "SR3ARM [$name] STALLED at $cur"; reap "$GPID"; return 1; }
     else stall=0; laststep=$cur; fi
-    if [ "$cur" -ge "$STOP" ]; then echo "SR3ARM [$name] reached $cur — stopping"; reap "$GPID"; return 0; fi
+    if [ "$cur" -ge "$STOP" ]; then
+      grep -q "micro-batch step $CKMICRO" "$OUT/sr3arm_$name.stderr" \
+        && echo "SR3ARM [$name] reached $cur, theta saved at $CKMICRO" \
+        || echo "SR3ARM [$name] WARNING: reached $cur but no save at $CKMICRO"
+      reap "$GPID"; return 0
+    fi
   done
+}
+
+score() {   # $1=arm name -> splice its theta and score held-out under TF32
+  # SEPARATE `local` statements on purpose: the shell expands every word of a
+  # `local` command BEFORE the builtin performs any assignment, so a
+  # cross-reference like `local name=$1 ck="${name}..."` resolves ${name} in
+  # the OUTER scope -- unbound, and under `set -u` that aborts the script.
+  # This cost the 2026-08-30 probe its scoring stage after 14 h of arms.
+  local name=$1
+  local ck="$ARMDIR/${name}_state.nslm"
+  local sp="$OUT/spliced_sr3arm_${name}.nslm"
+  [ -f "$ck" ] || { echo "SR3ARM [$name] no theta to score"; return 1; }
+  python3 "$WT/tools/nslm_splice.py" "$ck" "$TEMPLATE" "$sp" || return 1
+  sed -i "s|model_load(m, \"../../run-out/spliced_[^\"]*\")|model_load(m, \"../../run-out/spliced_sr3arm_${name}.nslm\")|" val_from_splice.nsl
+  ( unset NSL_MATMUL_BF16 NSL_MATMUL_BF16_ROUND      # TF32: match the record
+    bash "$GUARD" run -- "$NSL" run --source-ad val_from_splice.nsl \
+      > "$OUT/sr3arm_${name}_val.stdout" 2> "$OUT/sr3arm_${name}_val.stderr" )
+  local s w
+  s=$(grep -A1 VAL_LOSS_STACK "$OUT/sr3arm_${name}_val.stdout" | tail -1)
+  w=$(grep -A1 VAL_LOSS_WEB   "$OUT/sr3arm_${name}_val.stdout" | tail -1)
+  echo "SR3ARM_VAL $name STACK=$s WEB=$w"
 }
 
 run_arm f32     "TF32 tensor cores" absent
 run_arm bf16rne "BF16 tensor"       absent  NSL_MATMUL_BF16=1
 run_arm bf16sr  "BF16 tensor"       present NSL_MATMUL_BF16=1 NSL_MATMUL_BF16_ROUND=sr
+echo "SR3ARM: all arms done, scoring held-out $(date '+%H:%M:%S')"
+for a in f32 bf16rne bf16sr; do score "$a"; done
+echo "SR3ARM: reference — base (micro $BASE) scored 4.569/6.291; the 262M peak scored 3.872/5.834"
 echo "SR3ARM_ALL_DONE $(date '+%F %T')"
