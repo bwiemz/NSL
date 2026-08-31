@@ -1539,6 +1539,14 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         return;
     }
     let byte_count = (dst.len as usize) * dst.element_size();
+    // BF16 matmul cast cache: overwriting a registered parameter's device
+    // buffer (checkpoint restore into a live model, `.copy_(...)`) must
+    // drop its cached bf16 image. One relaxed load when the cache never
+    // armed.
+    #[cfg(feature = "cuda")]
+    if dst.device > 0 {
+        crate::cuda::bf16_cast_cache::evict(dst.data as u64);
+    }
     // Handle device memory: use appropriate copy method
     #[cfg(feature = "cuda")]
     if dst.device > 0 && src.device > 0 {
@@ -1807,6 +1815,11 @@ pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
+    // BF16 matmul cast cache: same staleness rule as copy_data.
+    #[cfg(feature = "cuda")]
+    if dst.device > 0 {
+        crate::cuda::bf16_cast_cache::evict(dst.data as u64);
+    }
     {
         // PCA Stage C hardening: reconcile a mismatched src instead of
         // aborting. Legitimate gradients can arrive as transpose VIEWS
@@ -2032,6 +2045,8 @@ pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     // Device memory: use memset
     #[cfg(feature = "cuda")]
     if tensor.device > 0 {
+        // BF16 matmul cast cache: same staleness rule as copy_data.
+        crate::cuda::bf16_cast_cache::evict(tensor.data as u64);
         crate::cuda::inner::memset_d8(tensor.data, byte_count);
         return;
     }
@@ -2056,6 +2071,12 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
         return;
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    // BF16 matmul cast cache: same staleness rule as copy_data.
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 {
+        crate::cuda::bf16_cast_cache::evict(tensor.data as u64);
+    }
 
     // Device-resident contiguous f32: in-place scale kernel, no PCIe.
     // The scalar rounds to f32 before the multiply (as every other GPU
@@ -4477,6 +4498,12 @@ pub extern "C" fn nsl_tensor_set_element(
         offset += idx * stride;
     }
 
+    // BF16 matmul cast cache: an element poke into a registered parameter
+    // stales its bf16 image (see nsl_tensor_copy_data).
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 {
+        crate::cuda::bf16_cast_cache::evict(tensor.data as u64);
+    }
     tensor.write_scalar_from_f64(offset, value);
 }
 
@@ -4485,6 +4512,11 @@ pub extern "C" fn nsl_tensor_slice_assign(
     target_ptr: i64, src_ptr: i64, dims_ptr: i64, num_dims: i64,
 ) {
     let target = NslTensor::from_ptr(target_ptr);
+    // BF16 matmul cast cache: same staleness rule as copy_data.
+    #[cfg(feature = "cuda")]
+    if target.device > 0 {
+        crate::cuda::bf16_cast_cache::evict(target.data as u64);
+    }
     let ndim = num_dims as usize;
     if ndim != target.ndim as usize {
         eprintln!(

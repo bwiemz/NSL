@@ -17,6 +17,22 @@ pub(crate) mod tier_b1_prepass;
 #[cfg(feature = "cuda")]
 pub(crate) mod caching_allocator;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod bf16_cast_cache;
+
+/// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
+/// integration gate drives registration through the REAL fused-AdamW extern
+/// and needs only to observe (hits, recasts, evictions) and reset between
+/// tests.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_bf16_cast_cache_stats() -> (u64, u64, u64) {
+    bf16_cast_cache::stats()
+}
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_bf16_cast_cache_reset() {
+    bf16_cast_cache::reset_for_test()
+}
+
 pub(crate) mod graph_capture;
 
 
@@ -571,6 +587,12 @@ pub(crate) mod inner {
     /// Routes async-allocated pointers to cuMemFreeAsync.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
+        // BF16 cast cache: a registered parameter's image must die before the
+        // allocator can recycle this address. One relaxed load when the cache
+        // has never armed. MUST stay above every lock acquisition below —
+        // the hook takes the cache's own lock, and eviction frees the image
+        // through a nested call into this function.
+        super::bf16_cast_cache::on_free(ptr);
         // Stage-2B: an arena interior pointer was never handed out by the
         // caching allocator and must never reach `cuMemFree`. A range check
         // rather than a per-tensor flag: a flag has to be set correctly at
@@ -2451,6 +2473,12 @@ pub(crate) mod cublas_inner {
     struct Bf16Scratch {
         first16: *mut std::ffi::c_void,
         second16: *mut std::ffi::c_void,
+        /// Which operand buffers this GEMM owns and must free. A cached
+        /// weight image (see `bf16_cast_cache`) is BORROWED — it outlives
+        /// the GEMM by design, and freeing it here would hand the cache's
+        /// pointer back to the allocator while later GEMMs still replay it.
+        first_owned: bool,
+        second_owned: bool,
     }
 
     impl Drop for Bf16Scratch {
@@ -2475,8 +2503,12 @@ pub(crate) mod cublas_inner {
             // inside regions taint; any future writer without those
             // constraints must either event-defer these frees
             // (`defer_free_device`) or keep the scratch alive until a sync.
-            super::inner::free_managed(self.first16);
-            super::inner::free_managed(self.second16);
+            if self.first_owned {
+                super::inner::free_managed(self.first16);
+            }
+            if self.second_owned {
+                super::inner::free_managed(self.second16);
+            }
         }
     }
 
@@ -2586,12 +2618,32 @@ pub(crate) mod cublas_inner {
         if !bf16_storage_worthwhile(m, n, k, first_elems, second_elems) {
             return None;
         }
-        let first16 = super::inner::alloc_managed(first_elems * 2);
-        let second16 = super::inner::alloc_managed(second_elems * 2);
+        // Per-operand route: a registered parameter borrows its persistent
+        // image from the cast cache (casting only when the optimizer has
+        // moved it since); everything else gets fresh owned scratch, exactly
+        // the pre-cache behavior. `W^T` in dgrad shares the forward W's base
+        // pointer and element count, so it hits the same image — the flat
+        // cast is transpose-agnostic (see the doc above).
+        let route = |dev: *const f32, elems: usize| -> (*mut std::ffi::c_void, bool, bool) {
+            match super::bf16_cast_cache::acquire(dev as u64, elems) {
+                Some((buf, needs_cast)) => (buf as *mut std::ffi::c_void, false, needs_cast),
+                None => (super::inner::alloc_managed(elems * 2), true, true),
+            }
+        };
+        let (first16, first_owned, cast_first) = route(first_dev, first_elems);
+        let (second16, second_owned, cast_second) = route(second_dev, second_elems);
         match bf16_rounding() {
             Bf16Rounding::Rne => {
-                super::gpu_cast_raw_f32_to_bf16(first_dev as u64, first16 as u64, first_elems);
-                super::gpu_cast_raw_f32_to_bf16(second_dev as u64, second16 as u64, second_elems);
+                if cast_first {
+                    super::gpu_cast_raw_f32_to_bf16(first_dev as u64, first16 as u64, first_elems);
+                }
+                if cast_second {
+                    super::gpu_cast_raw_f32_to_bf16(
+                        second_dev as u64,
+                        second16 as u64,
+                        second_elems,
+                    );
+                }
             }
             Bf16Rounding::Stochastic => {
                 // One key for the process, variation carried entirely by the
@@ -2604,6 +2656,13 @@ pub(crate) mod cublas_inner {
                 // counters are `param_idx << 40` — a block this counter walks
                 // into after ~137k GEMMs. Two unrelated roundings would then
                 // share a dither, which is not wrong so much as untraceable.
+                //
+                // Cache interaction: a cached weight is SR-cast once per
+                // optimizer step instead of once per launch. That is still
+                // the decorrelation SR exists for — the standing error moves
+                // at the cadence theta moves, and theta moves per STEP — and
+                // counters advance only on actual casts, so hits do not
+                // consume dither.
                 const MATMUL_OPERAND_DOMAIN: u64 = 0xBF16_0CA5_7D17_4E70;
                 let key = crate::sr_bf16::sr_step_key(
                     crate::deterministic_ops::get_rng_seed(),
@@ -2612,25 +2671,29 @@ pub(crate) mod cublas_inner {
                 // Claimed SEPARATELY per operand so the two never share a
                 // dither window; overlapping windows would correlate the
                 // rounding of A with the rounding of B inside one product.
-                let c0 = crate::rng_state::bf16_sr_next_counter(first_elems as u64);
-                super::gpu_cast_raw_f32_to_bf16_sr(
-                    first_dev as u64,
-                    first16 as u64,
-                    first_elems,
-                    key,
-                    c0,
-                );
-                let c1 = crate::rng_state::bf16_sr_next_counter(second_elems as u64);
-                super::gpu_cast_raw_f32_to_bf16_sr(
-                    second_dev as u64,
-                    second16 as u64,
-                    second_elems,
-                    key,
-                    c1,
-                );
+                if cast_first {
+                    let c0 = crate::rng_state::bf16_sr_next_counter(first_elems as u64);
+                    super::gpu_cast_raw_f32_to_bf16_sr(
+                        first_dev as u64,
+                        first16 as u64,
+                        first_elems,
+                        key,
+                        c0,
+                    );
+                }
+                if cast_second {
+                    let c1 = crate::rng_state::bf16_sr_next_counter(second_elems as u64);
+                    super::gpu_cast_raw_f32_to_bf16_sr(
+                        second_dev as u64,
+                        second16 as u64,
+                        second_elems,
+                        key,
+                        c1,
+                    );
+                }
             }
         }
-        Some(Bf16Scratch { first16, second16 })
+        Some(Bf16Scratch { first16, second16, first_owned, second_owned })
     }
 
     /// The BF16 math-mode GEMM issue path: `cublasGemmEx(16BF, 16BF -> 32F,

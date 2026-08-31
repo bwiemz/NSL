@@ -158,6 +158,12 @@ pub use cuda::test_cuda_device_synchronize;
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::test_set_transpose_views;
 
+// Test-only re-export: bf16 weight-cast cache observability, so the gate can
+// assert hits/recasts against the REAL registration path (the fused AdamW
+// extern) rather than a parallel test-only one.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
+
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
 pub use cuda::cuda_device_name;

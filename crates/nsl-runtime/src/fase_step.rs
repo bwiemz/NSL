@@ -179,6 +179,14 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
                 "fase_fused_step: GPU path requires f32 tensors (theta={}, m={}, v={}, mp={})",
                 th.dtype, m.dtype, v.dtype, mp.dtype
             );
+            // BF16 matmul cast cache: this call is what makes theta a
+            // registered parameter AND what stales its bf16 image — every
+            // theta-writing arm must make it (see bf16_cast_cache's module
+            // doc; the multi/idx path notes in fase_multi_impl).
+            crate::cuda::bf16_cast_cache::note_param_stepped(
+                th.data as u64,
+                th.len as usize,
+            );
             // f64→f32 conversions mirror the decomposed FFI boundary exactly:
             // each scalar op received an f64 and did `as f32`; neg_lr and
             // neg_lr_wd were computed in f64 by codegen (`-(lr)`, `-(lr)*wd`)
@@ -506,6 +514,16 @@ fn fase_multi_impl(
             let m = unsafe { &*(mp_ as *const NslTensor) };
             let v = unsafe { &*(vp as *const NslTensor) };
             let a = unsafe { &*(ap as *const NslTensor) };
+            // BF16 matmul cast cache: BOTH arms below (batched grid and
+            // sequential fallback) write theta, so the staleness note happens
+            // here, before the arm split. Tied-weight aliases note twice —
+            // marking invalid twice is idempotent.
+            if th.device > 0 {
+                crate::cuda::bf16_cast_cache::note_param_stepped(
+                    th.data as u64,
+                    th.len as usize,
+                );
+            }
             let uniform_gpu_f32 = th.device > 0
                 && [th, m, v, a].iter().all(|t| {
                     t.device == th.device && t.dtype == 1 && t.is_contiguous() && t.len == th.len
