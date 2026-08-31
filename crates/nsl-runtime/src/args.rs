@@ -86,6 +86,24 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
+    // BF16 matmul cast cache: hit/recast/eviction counts, enabled when
+    // NSL_BF16_CAST_CACHE_COUNTER=1 (or NSL_EVENTS). Same anti-vacuity
+    // rationale as the counters around it: the cache degrades to
+    // fresh-scratch silently by design (unregistered operands, disabled
+    // mode), so a throughput A/B needs a positive witness that hits
+    // actually happened — a zero-hit run measures nothing.
+    #[cfg(feature = "cuda")]
+    if events_on
+        || std::env::var("NSL_BF16_CAST_CACHE_COUNTER").ok().as_deref() == Some("1")
+    {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_bf16_cast_cache_atexit);
+        }
+    }
+
     // Item 7: fused weight-gradient GEMM vs decomposed-fallback counts,
     // enabled when NSL_WGRAD_COUNTER=1. The fallback inside
     // `nsl_tensor_wgrad_accum` is SILENT by design (a shape the compiler's
@@ -433,6 +451,29 @@ extern "C" fn nsl_fase_fused_step_count_atexit() {
          [fase-fused] block-table builds: {table_builds}\n\
          [fase-fused] multi params: rank={rank} batched={batched} fallback={fallback}\n",
     );
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(report.as_bytes());
+}
+
+#[cfg(feature = "cuda")]
+extern "C" fn nsl_bf16_cast_cache_atexit() {
+    let (hits, recasts, evictions) = crate::cuda::bf16_cast_cache::stats();
+    crate::events::emit(
+        "bf16_cast_cache_counters",
+        None,
+        &[
+            ("hits", crate::events::i(hits as i64)),
+            ("recasts", crate::events::i(recasts as i64)),
+            ("evictions", crate::events::i(evictions as i64)),
+        ],
+    );
+    if std::env::var("NSL_BF16_CAST_CACHE_COUNTER").ok().as_deref() != Some("1") {
+        return;
+    }
+    // One formatted write — multi-rank stderr TEARS per-fragment writes
+    // (see the fase-fused reporter above).
+    let report =
+        format!("[bf16-cast-cache] hits={hits} recasts={recasts} evictions={evictions}\n");
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(report.as_bytes());
 }

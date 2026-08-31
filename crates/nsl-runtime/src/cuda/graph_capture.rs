@@ -1903,7 +1903,7 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 
 #[cfg(feature = "cuda")]
 pub(crate) use imp::{
-    in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
+    enabled, in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
     on_sgemm_full, queue_deferred_free, taint, taint_at,
     GemmPrecision, MemsetAction, SgemmKind,
 };

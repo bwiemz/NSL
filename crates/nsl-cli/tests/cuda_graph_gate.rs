@@ -597,3 +597,128 @@ fn cuda_graph_config_item_read_folds_and_captures_gpu() {
         "graph capture of the folded program diverged from the eager path"
     );
 }
+
+/// The bf16 weight-cast cache must change LAUNCH COUNTS, never numerics.
+///
+/// Cached weight images are RNE casts of theta, and RNE is deterministic, so
+/// a cached bf16 GEMM must be bit-identical to the fresh-scratch one — over
+/// a real train block (fused AdamW steps registering and staling params,
+/// grad accumulation re-reading each weight per window) the LOSS STREAM is
+/// the whole-program statement of that. The `[bf16-cast-cache]` counter line
+/// is the anti-vacuity witness on each side: hits>0 and recasts>0 on the
+/// default arm (the fixture actually exercised the cache — a run where
+/// registration or the acquire probe silently died would sail through the
+/// equality), hits==0 under the kill switch (the switch actually kills).
+///
+/// Graphs OFF here: `cuda_graph_bf16_storage_captures_gpu` above already
+/// pins graphs+bf16 (with the cache live), and running this eager isolates
+/// the cache itself from capture behavior.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn bf16_cast_cache_is_invisible_in_the_loss_stream_gpu() {
+    // Every mode var PINNED on both arms: run_fixture_env layers envs on the
+    // inherited environment, and this box's history includes campaign arms
+    // mislabeled by a leaked NSL_MATMUL_* export. In particular a leaked
+    // ROUND=sr would make the arms consume divergent dither streams (the
+    // cache claims counters only on actual casts) and fail the equality with
+    // a message blaming the cache; a leaked CAST_CACHE=0 — the exact export
+    // this PR's A/B instructions use — would kill the "on" arm.
+    let base: &[(&str, &str)] = &[
+        ("NSL_MATMUL_BF16", "1"),
+        ("NSL_MATMUL_BF16_MIN_RATIO", "1"),
+        ("NSL_MATMUL_PEDANTIC", "0"),
+        ("NSL_MATMUL_BF16_ROUND", "rne"),
+        ("NSL_MATMUL_BF16_CAST_CACHE", "1"),
+        ("NSL_BF16_CAST_CACHE_COUNTER", "1"),
+    ];
+    let cached = run_fixture_env(
+        "cuda_graph_gate.nsl",
+        "ccon",
+        &[GPU_MLP, XG, YG, EPOCHS],
+        &["--seed", "777"],
+        base,
+    );
+    assert!(cached.success, "cache-on run failed:\n{}", cached.stderr);
+    let cc = cast_cache_counters(&cached.stderr);
+    assert!(
+        cc["hits"] > 0 && cc["recasts"] > 0,
+        "the cast cache never engaged on a fused-AdamW train block \
+         (hits={} recasts={}) — registration or the acquire probe is dead, \
+         and the loss equality below would be vacuous:\n{}",
+        cc["hits"],
+        cc["recasts"],
+        cached.stderr
+    );
+
+    let mut off_env = base.to_vec();
+    off_env.push(("NSL_MATMUL_BF16_CAST_CACHE", "0"));
+    let fresh = run_fixture_env(
+        "cuda_graph_gate.nsl",
+        "ccoff",
+        &[GPU_MLP, XG, YG, EPOCHS],
+        &["--seed", "777"],
+        &off_env,
+    );
+    assert!(fresh.success, "cache-off run failed:\n{}", fresh.stderr);
+    let fc = cast_cache_counters(&fresh.stderr);
+    assert_eq!(
+        fc["hits"], 0,
+        "NSL_MATMUL_BF16_CAST_CACHE=0 did not disable the cache: {fc:?}"
+    );
+
+    assert!(!cached.losses.is_empty(), "no losses parsed:\n{}", cached.stdout);
+    assert_eq!(
+        cached.losses, fresh.losses,
+        "cached weight images changed the loss stream — a cached bf16 GEMM \
+         is supposed to be BIT-identical to the fresh-scratch one"
+    );
+
+    // Composition refusal: under --cuda-graphs a cache hit would leave the
+    // image address pinned ONLY inside captured graphs (no cast op in the
+    // verified sequence), so a mid-window evict could free memory a replay
+    // still reads, with mismatches=0. The cache must therefore DECLINE to
+    // arm — loudly. hits==0 alone would be a vacuous witness (a dead cache
+    // also reports 0), so the printed refusal notice is required too.
+    let graphs = run_fixture_env(
+        "cuda_graph_gate.nsl",
+        "ccgraphs",
+        &[GPU_MLP, XG, YG, EPOCHS],
+        &["--seed", "777", "--cuda-graphs"],
+        base,
+    );
+    assert!(graphs.success, "graphs arm failed:\n{}", graphs.stderr);
+    let gc = cast_cache_counters(&graphs.stderr);
+    assert_eq!(
+        gc["hits"], 0,
+        "the cast cache armed under --cuda-graphs — the composition refusal \
+         regressed and captured graphs can now replay freed images: {gc:?}"
+    );
+    assert!(
+        graphs.stderr.contains("disabled: --cuda-graphs"),
+        "the refusal must be printed, not silent — an operator composing the \
+         two would otherwise read hits=0 as 'the cache is broken':\n{}",
+        graphs.stderr
+    );
+}
+
+/// Parse the `[bf16-cast-cache] hits=H recasts=R evictions=E` teardown line —
+/// same k=v line shape as the graph banner, so the same parser serves both
+/// (a parsing fix must not have to land twice).
+fn cast_cache_counters(stderr: &str) -> std::collections::HashMap<String, u64> {
+    tagged_counters(stderr, "[bf16-cast-cache]")
+}
+
+/// Last stderr line containing `tag`, split into its k=v fields.
+fn tagged_counters(stderr: &str, tag: &str) -> std::collections::HashMap<String, u64> {
+    let line = stderr
+        .lines()
+        .filter(|l| l.contains(tag))
+        .next_back()
+        .unwrap_or_else(|| panic!("no {tag} line in stderr:\n{stderr}"));
+    line.split_whitespace()
+        .filter_map(|tok| {
+            let (k, v) = tok.split_once('=')?;
+            Some((k.to_string(), v.parse().ok()?))
+        })
+        .collect()
+}

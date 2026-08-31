@@ -1503,6 +1503,23 @@ pub extern "C" fn nsl_tensor_data_ptr(tensor_ptr: i64) -> i64 {
     unsafe { (*(tensor_ptr as *const NslTensor)).data as i64 }
 }
 
+/// BF16 matmul cast cache: an in-place write that bypasses the device-write
+/// transport helpers — a PTX kernel mutating its destination, or a host
+/// deref of managed memory (`write_scalar_from_f64`) — must stale the
+/// destination's cached image itself. Transport-mediated writes (htod/dtod/
+/// memset) are covered automatically by the probes in `cuda::inner`; the
+/// call sites here are the belt where routing is internal to the extern.
+/// One relaxed load when the cache never armed; no-op off-device.
+#[inline]
+pub(crate) fn evict_bf16_cast_image(t: &NslTensor) {
+    #[cfg(feature = "cuda")]
+    if t.device > 0 {
+        crate::cuda::bf16_cast_cache::evict(t.data as u64);
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = t;
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     if dst_ptr == 0 || src_ptr == 0 {
@@ -1539,6 +1556,7 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         return;
     }
     let byte_count = (dst.len as usize) * dst.element_size();
+    evict_bf16_cast_image(dst);
     // Handle device memory: use appropriate copy method
     #[cfg(feature = "cuda")]
     if dst.device > 0 && src.device > 0 {
@@ -1807,6 +1825,7 @@ pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
+    evict_bf16_cast_image(dst);
     {
         // PCA Stage C hardening: reconcile a mismatched src instead of
         // aborting. Legitimate gradients can arrive as transpose VIEWS
@@ -2032,6 +2051,7 @@ pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     // Device memory: use memset
     #[cfg(feature = "cuda")]
     if tensor.device > 0 {
+        evict_bf16_cast_image(tensor);
         crate::cuda::inner::memset_d8(tensor.data, byte_count);
         return;
     }
@@ -2056,6 +2076,8 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
         return;
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    evict_bf16_cast_image(tensor);
 
     // Device-resident contiguous f32: in-place scale kernel, no PCIe.
     // The scalar rounds to f32 before the multiply (as every other GPU
@@ -4477,6 +4499,7 @@ pub extern "C" fn nsl_tensor_set_element(
         offset += idx * stride;
     }
 
+    evict_bf16_cast_image(tensor);
     tensor.write_scalar_from_f64(offset, value);
 }
 
@@ -4485,6 +4508,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
     target_ptr: i64, src_ptr: i64, dims_ptr: i64, num_dims: i64,
 ) {
     let target = NslTensor::from_ptr(target_ptr);
+    evict_bf16_cast_image(target);
     let ndim = num_dims as usize;
     if ndim != target.ndim as usize {
         eprintln!(
