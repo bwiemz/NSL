@@ -166,6 +166,21 @@ fn zz_probe_child() {
     println!("PROBE {} {}", p.secs_per_call, p.max_rel_err);
 }
 
+/// Min-of-3 with the repetition spread (max/min secs_per_call). The ONE
+/// noise policy for every timing arm in this file: the minimum is the robust
+/// statistic (contention and thermals only ever slow a rep down), and the
+/// spread is what says whether the box was quiet enough for a ratio between
+/// arms to mean anything — callers skip speed assertions when it exceeds
+/// SPREAD_QUIET.
+const SPREAD_QUIET: f64 = 1.25;
+
+fn best_of_three(extra: &[(&str, &str)]) -> (Probe, f64) {
+    let mut runs: Vec<Probe> = (0..3).map(|_| probe_with(extra)).collect();
+    runs.sort_by(|a, b| a.secs_per_call.total_cmp(&b.secs_per_call));
+    let spread = runs[runs.len() - 1].secs_per_call / runs[0].secs_per_call;
+    (runs.swap_remove(0), spread)
+}
+
 /// BF16 must be faster than the FP32-cores opt-out AND in a distinctly worse
 /// accuracy band than TF32. Failure shapes this catches, by direction:
 /// not-faster => the GemmEx/FAST_16BF request never took effect (silent
@@ -181,16 +196,10 @@ fn bf16_is_faster_than_f32_and_less_accurate_than_tf32() {
     // held the card at 100%. The accuracy directions are deterministic and
     // always assert; only the speed directions are skippable, and only
     // when the arms' own spread says the box was not quiet.
-    let best = |extra: &[(&str, &str)]| -> (Probe, f64) {
-        let mut runs: Vec<Probe> = (0..3).map(|_| probe_with(extra)).collect();
-        runs.sort_by(|a, b| a.secs_per_call.total_cmp(&b.secs_per_call));
-        let spread = runs[runs.len() - 1].secs_per_call / runs[0].secs_per_call;
-        (runs.swap_remove(0), spread)
-    };
-    let (f32_cores, f32_spread) = best(&[("NSL_MATMUL_TF32", "0")]);
-    let (tf32, tf32_spread) = best(&[]); // the default
-    let (bf16, bf16_spread) = best(&[("NSL_MATMUL_BF16", "1")]);
-    let quiet = f32_spread < 1.25 && tf32_spread < 1.25 && bf16_spread < 1.25;
+    let (f32_cores, f32_spread) = best_of_three(&[("NSL_MATMUL_TF32", "0")]);
+    let (tf32, tf32_spread) = best_of_three(&[]); // the default
+    let (bf16, bf16_spread) = best_of_three(&[("NSL_MATMUL_BF16", "1")]);
+    let quiet = f32_spread < SPREAD_QUIET && tf32_spread < SPREAD_QUIET && bf16_spread < SPREAD_QUIET;
 
     let speedup_vs_f32 = f32_cores.secs_per_call / bf16.secs_per_call;
     let speedup_vs_tf32 = tf32.secs_per_call / bf16.secs_per_call;
@@ -271,19 +280,13 @@ fn sr_rounding_keeps_bf16_speed_and_accuracy_class() {
     // A minimum alone does not rescue that — under sustained contention every
     // repetition is slow — so the SPREAD is what says whether the number
     // means anything.
-    let best = |extra: &[(&str, &str)]| -> (Probe, f64) {
-        let mut runs: Vec<Probe> = (0..3).map(|_| probe_with(extra)).collect();
-        runs.sort_by(|a, b| a.secs_per_call.total_cmp(&b.secs_per_call));
-        let spread = runs[runs.len() - 1].secs_per_call / runs[0].secs_per_call;
-        (runs.swap_remove(0), spread)
-    };
 
-    let (tf32, _) = best(&[]);
-    let (rne, rne_spread) = best(&[("NSL_MATMUL_BF16", "1")]);
-    let (sr, sr_spread) = best(&[("NSL_MATMUL_BF16", "1"), ("NSL_MATMUL_BF16_ROUND", "sr")]);
+    let (tf32, _) = best_of_three(&[]);
+    let (rne, rne_spread) = best_of_three(&[("NSL_MATMUL_BF16", "1")]);
+    let (sr, sr_spread) = best_of_three(&[("NSL_MATMUL_BF16", "1"), ("NSL_MATMUL_BF16_ROUND", "sr")]);
 
     let slowdown = sr.secs_per_call / rne.secs_per_call;
-    let quiet = rne_spread < 1.25 && sr_spread < 1.25;
+    let quiet = rne_spread < SPREAD_QUIET && sr_spread < SPREAD_QUIET;
     eprintln!(
         "bf16+rne: {:.4} ms err {:e} | bf16+sr: {:.4} ms err {:e} | \
          sr costs {:.1}% | tf32 err {:e}",

@@ -183,10 +183,19 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
             // registered parameter AND what stales its bf16 image — every
             // theta-writing arm must make it (see bf16_cast_cache's module
             // doc; the multi/idx path notes in fase_multi_impl).
-            crate::cuda::bf16_cast_cache::note_param_stepped(
-                th.data as u64,
-                th.len as usize,
-            );
+            //
+            // owns_data is LOAD-BEARING: a weight-stream arena view
+            // (owns_data=0, interior pointer into a recycled slot) or a
+            // DLPack import (owns_data=0, dies in a foreign allocator) must
+            // never register — neither passes free_managed when its storage
+            // is reused, so a registered entry would outlive the bytes it
+            // describes and serve another tensor's weights.
+            if th.owns_data != 0 && th.is_contiguous() {
+                crate::cuda::bf16_cast_cache::note_param_stepped(
+                    th.data as u64,
+                    th.len as usize,
+                );
+            }
             // f64→f32 conversions mirror the decomposed FFI boundary exactly:
             // each scalar op received an f64 and did `as f32`; neg_lr and
             // neg_lr_wd were computed in f64 by codegen (`-(lr)`, `-(lr)*wd`)
@@ -518,7 +527,16 @@ fn fase_multi_impl(
             // sequential fallback) write theta, so the staleness note happens
             // here, before the arm split. Tied-weight aliases note twice —
             // marking invalid twice is idempotent.
-            if th.device > 0 {
+            //
+            // owns_data is LOAD-BEARING (see the single-param extern): the
+            // CSLA layerwise path steps weight-stream ARENA views
+            // (owns_data=0, interior pointers into recycled slots) through
+            // this very function, and registering one would serve layer A's
+            // cached image for layer B's weights after slot reuse. The
+            // f32/contiguous gates keep a fallback-arm-only run (f64 or
+            // strided thetas) from arming the cache with entries the f32
+            // GEMM path can never acquire.
+            if th.device > 0 && th.owns_data != 0 && th.dtype == 1 && th.is_contiguous() {
                 crate::cuda::bf16_cast_cache::note_param_stepped(
                     th.data as u64,
                     th.len as usize,

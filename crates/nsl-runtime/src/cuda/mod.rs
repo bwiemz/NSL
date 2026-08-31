@@ -592,7 +592,7 @@ pub(crate) mod inner {
         // has never armed. MUST stay above every lock acquisition below —
         // the hook takes the cache's own lock, and eviction frees the image
         // through a nested call into this function.
-        super::bf16_cast_cache::on_free(ptr);
+        super::bf16_cast_cache::evict(ptr as u64);
         // Stage-2B: an arena interior pointer was never handed out by the
         // caching allocator and must never reach `cuMemFree`. A range check
         // rather than a per-tensor flag: a flag has to be set correctly at
@@ -1133,6 +1133,12 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from host memory to device memory.
     pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         if size_bytes >= 262144 && crate::host_profile::enabled() {
             eprintln!("[copy] H2D {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
         }
@@ -1183,6 +1189,12 @@ pub(crate) mod inner {
         src_host: *const c_void,
         size_bytes: usize,
     ) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         crate::host_profile::record_h2d(size_bytes);
         ensure_context();
@@ -1227,6 +1239,12 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from one device pointer to another.
     pub(crate) fn memcpy_dtod(dst_device: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         ensure_context();
         // cuda-graphs: device-to-device copies are pseudo-ops (no host data).
         if !super::graph_capture::on_dtod(dst_device, src_device, size_bytes) {
@@ -1361,6 +1379,12 @@ pub(crate) mod inner {
     /// NULL-stream readers, or must drain before reuse.
     #[allow(dead_code)]
     pub(crate) fn memcpy_htod_async(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         crate::host_profile::record_h2d(size_bytes);
         ensure_context();
         let stream = transfer_stream();
@@ -1573,6 +1597,12 @@ pub(crate) mod inner {
     /// capture region exists — and must actually reach the device rather than
     /// becoming a recorded node that replays later.
     pub(crate) fn memset_d8_value(device_ptr: *mut c_void, value: u8, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(device_ptr as u64);
         ensure_context();
         unsafe {
             let result = cuMemsetD8_v2(device_ptr as CUdeviceptr, value, size_bytes);
@@ -1592,6 +1622,12 @@ pub(crate) mod inner {
     /// memset node — ordering-neutral vs the sync form thanks to
     /// blocking-stream semantics), verified/skipped during replay.
     pub(crate) fn memset_d8(device_ptr: *mut c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(device_ptr as u64);
         ensure_context();
         match super::graph_capture::on_memset(device_ptr as usize, size_bytes) {
             super::graph_capture::MemsetAction::Skip => return,

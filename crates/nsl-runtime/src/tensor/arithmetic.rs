@@ -1162,6 +1162,14 @@ pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f
             // through to the two-op path below.
             #[cfg(feature = "cuda")]
             if m.dtype == crate::tensor::DTYPE_F32 {
+                // BF16 cast cache: this kernel writes its destination in
+                // place, bypassing the transport probes — the fallback arm
+                // below evicts (via the hooked add_inplace) and this arm
+                // must match, or staleness would depend on WHICH arm ran.
+                // Today no caller targets a registered theta (destinations
+                // are moment/accumulator buffers); this is the contract, not
+                // a live fix.
+                crate::tensor::evict_bf16_cast_image(m);
                 crate::cuda::gpu_scalar_mul_add_inplace_f32(m_ptr, g_ptr, s as f32);
                 return;
             }

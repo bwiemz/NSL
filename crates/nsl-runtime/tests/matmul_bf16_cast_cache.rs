@@ -170,7 +170,7 @@ fn zz_probe_child() {
     register_via_zero_lr_step(w, m, v, mp);
     let _ = matmul_read(a, w); // warm the image
     let (_h, _r, e0) = test_bf16_cast_cache_stats();
-    nsl_tensor_free(w); // -> free_managed -> on_free -> evict
+    nsl_tensor_free(w); // -> free_managed -> evict at its top
     let (_h2, _r2, e1) = test_bf16_cast_cache_stats();
     assert!(
         e1 > e0,
@@ -204,8 +204,16 @@ fn cast_cache_gates_gpu() {
         .args(["--test-threads=1", "--nocapture", "--include-ignored", "zz_probe_child"])
         .env(PROBE, "1")
         .env("NSL_MATMUL_BF16", "1")
+        // Scrub EVERY mode var the resolvers consult, not just the two this
+        // test owns: a leaked NSL_MATMUL_PEDANTIC=1 outranks BF16=1 and a
+        // leaked MIN_RATIO>512 declines this test's ratio-exactly-512 GEMMs
+        // — both would fail check 2 with a message blaming the fase wiring.
         .env_remove("NSL_MATMUL_BF16_CAST_CACHE")
         .env_remove("NSL_MATMUL_BF16_ROUND")
+        .env_remove("NSL_MATMUL_BF16_MIN_RATIO")
+        .env_remove("NSL_MATMUL_PEDANTIC")
+        .env_remove("NSL_MATMUL_TF32")
+        .env_remove("NSL_ASYNC_ALLOC")
         .output()
         .expect("spawn probe child");
     let stdout = String::from_utf8_lossy(&out.stdout);
