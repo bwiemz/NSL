@@ -54,6 +54,12 @@
 //!   so region digests are too).
 //! * the scratch D would exceed 1 GiB (m*n*4 bytes) — tuning is not worth an
 //!   OOM hazard on a nearly-full card.
+//! * `--deterministic` is active: a TIMED winner depends on machine state at
+//!   first use, so two runs of one program could select different kernels
+//!   and differ in bits ACROSS processes — the exact promise --deterministic
+//!   makes. The untimed heuristic[0] is a pure function of (shapes, library,
+//!   device, workspace cap) and keeps that promise. Within one process the
+//!   cached plan makes every repeat bit-identical regardless.
 //!
 //! Timed candidates run on the CURRENT device state: tune on a quiet card
 //! for production-representative picks. A busy card yields a valid but
@@ -186,11 +192,14 @@ fn lt_handle() -> Option<lt::cublasLtHandle_t> {
                 "[nsl-matmul] bf16 GEMMs via cublasLt heuristics \
                  (NSL_MATMUL_BF16_LT=1): workspace {} MiB, autotune {}",
                 workspace_bytes_configured() >> 20,
-                if tune_enabled() && !super::graph_capture::enabled() {
-                    "on (1 warmup + min-of-3 per shape, first sight)"
-                } else if super::graph_capture::enabled() {
+                if super::graph_capture::enabled() {
                     "off (--cuda-graphs: a mid-capture sync would invalidate \
                      the capture; heuristic[0] per shape)"
+                } else if crate::deterministic_ops::is_deterministic() {
+                    "off (--deterministic: a timed winner varies across runs; \
+                     heuristic[0] per shape)"
+                } else if tune_enabled() {
+                    "on (1 warmup + min-of-3 per shape, first sight)"
                 } else {
                     "off (NSL_MATMUL_BF16_LT_TUNE=0; heuristic[0] per shape)"
                 },
@@ -402,8 +411,18 @@ unsafe fn build_plan(
     // with beta = 0 — NEVER the caller's C (its beta may be 1: wgrad
     // accumulates, and a timing rep into it would corrupt live gradients).
     let out_bytes = (m as usize) * (n as usize) * 4;
-    let tune =
-        tune_enabled() && !super::graph_capture::enabled() && out_bytes <= TUNE_SCRATCH_CAP_BYTES;
+    // `--deterministic` disables the TIMED tune (read live, not cached: the
+    // mode is set at program init, after this module's OnceLocks may exist in
+    // tests): a timing-based winner is a function of machine state at first
+    // use, so two runs of the same program could select different kernels and
+    // produce different bits ACROSS processes — run-to-run byte
+    // reproducibility is exactly what --deterministic sells. heuristic[0] is
+    // a pure function of (shapes, library, device, workspace cap), so the
+    // untimed pick keeps Lt available and cross-run stable.
+    let tune = tune_enabled()
+        && !super::graph_capture::enabled()
+        && !crate::deterministic_ops::is_deterministic()
+        && out_bytes <= TUNE_SCRATCH_CAP_BYTES;
     let mut chosen: usize = 0;
     if tune && candidates.len() > 1 {
         let scratch = super::inner::alloc_managed(out_bytes);
