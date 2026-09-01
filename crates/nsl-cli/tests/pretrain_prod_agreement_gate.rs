@@ -246,7 +246,12 @@ const PAIRS: &[ProdPair] = &[
             ("WEB_VAL_TOKENS", "data/tokens/mix/web_val.bin"),
         ],
         shuffle: Some(true),
-        run_line_flags: &["--checkpoint-blocks", "--fuse-rmsnorm-backward"],
+        run_line_flags: &[
+            "--checkpoint-blocks",
+            "--checkpoint-selective",
+            "--fuse-rmsnorm-backward",
+            "--fuse-wgrad-accum",
+        ],
         cites_validation_record: true,
         same_stream_split: false,
         two_phase_clip: true,
@@ -1301,6 +1306,13 @@ fn grad_clip_is_planned_and_the_incompatible_flag_still_refuses() {
         if !args.contains(&"--checkpoint-blocks") {
             args.push("--checkpoint-blocks");
         }
+        // `--fuse-wgrad-accum` (the 1B posture as of the 2026-08-27 bench) is
+        // declared mutually exclusive with `--layerwise-accum` at the CLI
+        // layer, so it has to come OUT here for the same reason 50M's
+        // `--checkpoint-blocks` had to go IN — with it present the observed
+        // "refusal" is clap's conflict error, not the codegen grad_clip
+        // refusal this arm exists to pin.
+        args.retain(|f| *f != "--fuse-wgrad-accum");
         args.push("--layerwise-accum");
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
             .arg("build")

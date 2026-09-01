@@ -1,3 +1,9 @@
+# f32 DISCRIMINATOR (2026-08-28): the bf16 chain's loss ROSE +1.5 nats after
+# ~micro 20k. This is pretrain_prod.nsl resumed WRITE-FREE (checkpoint_load
+# from the stage-1 opt-2000 BACKUP, no checkpoint_save) with NSL_MATMUL_BF16
+# UNSET: the loader-slot/RNG restore makes its batches IDENTICAL to the bf16
+# leg's, so the curves are a matched pair. f32 also rising => the sustained
+# lr=3e-5 is the cause; f32 flat/descending => bf16 accumulation drift.
 # models/coder1b/pretrain_prod.nsl
 # ============================================================================
 # NSL-Coder-1B — production pretraining + held-out validation (item 10)
@@ -73,41 +79,15 @@
 #
 # So lr = 1e-4 here is the WIDTH SCALING of item 9's measurement, not a repeat
 # of it: 1.5e-4 * 1280/2048 = 9.4e-5. A principled default, chosen because the
-# budget could not resolve a learning rate then. The pilot ranked 3e-5
-# over 1e-4; the intermediate run then showed 3e-5 HELD (not decaying, as
-# the full schedule holds it) reverses after warmup — three independent
-# legs — and the halved-peak trajectory probe descended monotonically
-# through the same region on identical batches. This recipe carries the
-# probe-measured 1.5e-5 (min_lr at the same 0.3 ratio). Full chain:
-# config.nsl's LR provenance block and POSTURE_1B_THROUGHPUT_2026_08_27.md.
+# budget could not resolve a learning rate then. The item-6 pilot DID
+# resolve it: 1e-4 went flat after warmup for 21,600 micro-steps, and the
+# matched-pair 3e-5 arm (identical batches) descended continuously to
+# VAL_LOSS_STACK 7.392 / VAL_LOSS_WEB 8.009. This recipe carries the
+# measured 3e-5 (min_lr scaled by the same 0.3 ratio); the intermediate
+# run checks its transfer to the full schedule.
+# (PILOT1B_VALIDATION_2026_08_25.md.)
 # Arms, corrected statistics, and the per-flag table:
 # models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
-#
-# 1.5e-5 IS NOW ITSELF INDICTED (2026-09-01, CHAIN_1B_GATE_2026_09_01.md).
-# The intermediate chain ran this lr to a 1B-token gate with theta scored on
-# held-out at sixteen points. It descended to 3.872/5.834 at 262M tokens and
-# then WORSENED monotonically in expectation: +0.753 +/- 0.137 (STACK) and
-# +0.627 +/- 0.126 (WEB) nats per 100k micro over 655M-1,016M, both 5 sigma,
-# with WEB showing the rate accelerating ~8x over the final 130M tokens. The
-# gate model is +1.269/+1.101 WORSE than the 262M model. Precision is NOT the
-# cause — the three-arm matched pair reproduced the rise under f32, bf16+RNE
-# and bf16+SR alike.
-#
-# THE SCHEDULE IS THE STANDING SUSPECT, AND IT IS AN ARITHMETIC FACT, NOT AN
-# INFERENCE: warmup_cosine below is sized for the full 22.6B-token epoch, so a
-# 1B-token run is 4.35% into the cosine and lr is 1.49510e-5 at the gate —
-# 99.67% of peak. A billion tokens at a HELD peak rate. Held rates have now
-# failed three times in this campaign (3e-4 and 1e-4 at item 10; 3e-5 on the
-# first intermediate chain; 1.5e-5 here), each time by failing to descend or by
-# reversing after an initial descent, and each time the schedule was the full
-# production cosine truncated by a short run.
-#
-# SO: DO NOT COPY THIS lr FOR A SHORT RUN. For any horizon materially shorter
-# than the full epoch, size total_steps to the horizon you will ACTUALLY run,
-# or the run trains at peak throughout. The unmade measurement is a matched
-# pair from the micro-64,000 checkpoint: held 1.5e-5 vs a cosine sized for the
-# horizon, identical batches, held-out at the same cadence. Nothing in this
-# file's lr provenance answers it.
 #
 # UNITS (same as the 50M/500M recipes): the scheduler counts MICRO-batches (lr
 # is recomputed every micro-batch; with grad_accumulation=4 the effective
@@ -145,9 +125,7 @@
 # any cwd; the nsl invocation must be from THIS directory (the corpus paths and
 # `from model import ...` are relative to it):
 #   cd models/coder1b
-#   export NSL_MATMUL_BF16=1        # see the taxonomy below — set it
-#                                   # EXPLICITLY and read the banner back
-#   nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
+#   NSL_MATMUL_BF16=1 nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
 #           --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
 #
 # THE FLAGS ARE NOT ALL THE SAME KIND OF THING, and an earlier draft of this
@@ -166,43 +144,15 @@
 #                           execution fingerprint treats the wgrad choice as
 #                           arithmetic identity, so adding it mid-chain would
 #                           refuse every prior checkpoint.
-#   NSL_MATMUL_BF16=1       IN THE LINE. ACQUITTED by a three-arm matched
-#                           pair (2026-08-31): from ONE checkpoint on identical
-#                           batches, held-out ranked bf16+RNE 4.363/6.332 <
-#                           bf16+SR 4.477/6.385 < f32 4.653/6.423 — the SAME
-#                           order on BOTH sets. The f32 arm was the WORST, and
-#                           bf16 is also +29.5% faster (6,500 vs 5,020 tok/s),
-#                           so it wins on both axes.
-#                           NSL_MATMUL_BF16_ROUND=sr (PR #540) is NOT worth it
-#                           here: it lands between RNE and f32 and costs 5.9%.
-#                           #540's operand gates are still correct — the
-#                           standing-bias mechanism is real, the cure is not
-#                           needed at this lr and horizon.
-#                           Record: PRECISION_1B_THREE_ARM_2026_08_31.md.
-#                           The history below is kept because the earlier
-#                           conviction was WRONG and the reason matters.
-#                           A matched-pair discriminator once convicted it of
-#                           accumulating drift (+0.53 nats over 98M tokens vs
-#                           f32's +0.16), but that pair ran at HELD lr=3e-5 —
-#                           later shown to be diverging on its own, at any
-#                           precision. The conviction is LR-confounded. At
-#                           lr=1.5e-5 the chain descended 230M tokens under
-#                           bf16 with held-out going 8.132/8.430 -> 3.872/5.834
-#                           and no sign of the amplification. Withdrawn to
-#                           "unsettled" pending the three-arm matched pair
-#                           (f32 / bf16+RNE / bf16+SR, PR #540's SR mode).
-#                           STANDING HAZARD, unchanged: it is INVISIBLE to the
-#                           execution fingerprint, so a checkpoint cannot tell
-#                           you which arithmetic produced it and a resume will
-#                           not refuse a silent switch. Set it explicitly, and
-#                           check the runtime's `cuBLAS math mode:` banner —
-#                           two chain legs were reported as f32 while running
-#                           bf16 because a copied driver carried this variable
-#                           and nothing read the banner back.
-#                           Record: POSTURE_1B_THROUGHPUT_2026_08_27.md.
-#                           --cuda-graphs measured +0.8% with clean counters
-#                           (76 captured / 2,052 replays / 0 taints) and
-#                           stays OUT: not worth carrying for <1%.
+#   NSL_MATMUL_BF16=1       RUNTIME env, not a flag: cuBLAS math mode (bf16
+#                           inputs, f32 accumulate) — +30% on top of selective.
+#                           INVISIBLE to the execution fingerprint (it changes
+#                           no compiled code), so the run's provenance file
+#                           must record it; convergence at 1B is validated by
+#                           the intermediate run's own staged inspections, not
+#                           assumed. --cuda-graphs measured +0.8% with clean
+#                           counters (76 captured / 2,052 replays / 0 taints)
+#                           and stays OUT: not worth carrying for <1%.
 #   --optim-state-offload   NOT in the line anymore (item 6). Before item 11
 #                           the resident configuration OOM'd in the forward
 #                           and this flag was load-bearing; per-segment
@@ -304,9 +254,9 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
-    optimizer: AdamW(lr=0.000015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.0000045)
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints_backup/stage1_opt2000/pretrain_prod_state.nslm"):
+    optimizer: AdamW(lr=0.00003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.000009)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
         let flat_logits = logits.reshape([4096, 49152])
