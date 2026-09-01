@@ -15,6 +15,20 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 
+# models/datasets/CORPUS_MANIFEST_v2.json pins a SHA-256 of the RAW BYTES of
+# each committed tokenizer, and corpus_manifest_gate.rs re-hashes the file on
+# disk to prove a retrained tokenizer cannot silently invalidate every bin
+# hash. That gate reads bytes, so any checkout that rewrites line endings
+# changes the hash and fails it. Windows runners default to
+# core.autocrlf=true, and *.json was not pinned here, so
+# models/tokenizers/special_tokens.json — the only one of the three hashed
+# tokenizers that contains newlines at all (22 lines; the other two are
+# single-line, which is why they never failed) — checked out as CRLF and the
+# gate has been red on windows-latest since at least 2026-08-26.
+# All 12 tracked .json blobs are LF today and all three recorded hashes are
+# the LF hashes, so this pin is a no-op on content and a fix for checkout.
+*.json text eol=lf
+
 # Committed CPDT calibration fixtures are binary safetensors; mark as such
 # so git skips text-diff heuristics and CRLF normalization.
 tests/fixtures/cpdt_calibration/*.safetensors binary
