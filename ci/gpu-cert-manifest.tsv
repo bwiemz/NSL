@@ -34,6 +34,7 @@ crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_bf16_storage_captures_gpu	gpu
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_survives_forced_first_op_divergence_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_self_heals_on_host_readbacks_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_config_item_read_folds_and_captures_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/cuda_graph_gate.rs	bf16_cast_cache_is_invisible_in_the_loss_stream_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/deferred_free_gpu_gate.rs	deferred_free_matches_eager_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
 crates/nsl-cli/tests/deterministic_flash_backward_gate.rs	deterministic_flag_makes_flash_backward_bit_reproducible	gpu	requires CUDA GPU
 crates/nsl-cli/tests/deterministic_flash_backward_gate.rs	flash_bwd_cpu_env_overrides_deterministic_loudly	gpu	requires CUDA GPU
@@ -424,6 +425,8 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	a_broadcast_operand_uses_a_zer
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	zz_partial_broadcast_child	helper	spawned by partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_slower_than_its_2d_form	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_bf16_cast_cache.rs	zz_probe_child	helper	spawned by cast_cache_gates_gpu
+crates/nsl-runtime/tests/matmul_bf16_cast_cache.rs	cast_cache_gates_gpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_is_faster_than_f32_and_less_accurate_than_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	sr_rounding_keeps_bf16_speed_and_accuracy_class	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_zero_is_a_no_op_and_the_default_stays_tf32	gpu	requires CUDA GPU
