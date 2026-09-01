@@ -171,6 +171,7 @@ the tree, classifies each one, and runs the classes that need a device.
 scripts/gpu-cert.sh --list             # inventory as TSV, no build
 scripts/gpu-cert.sh --run --tier gpu   # the device-requiring gates
 scripts/gpu-cert.sh --check-inventory  # drift gate (GPU-free; runs in CI)
+scripts/gpu-cert.sh --check-reasons    # no bare #[ignore] (GPU-free; CI)
 scripts/gpu-cert.sh --check-long-arms  # timeout-override gate (GPU-free; CI)
 ```
 
@@ -183,9 +184,21 @@ work, and tests needing opt-in cargo features are likewise excluded, as are
 `cpu-stub` placeholders — tests under `#[cfg(not(feature = "cuda"))]` exist
 only in non-cuda builds, so the cuda-featured binaries the lane runs compile
 them out and any RUN classification would report a permanent NOTFOUND. Anything
-the ruleset does not recognise is classified `unclassified` and never run; it
-appears in `--list` and in `ci/gpu-cert-manifest.tsv`, so the drift gate still
-tracks it even though it is absent from the run report.
+the ruleset does not recognise is classified `unclassified`, never run, and
+fails CI via `--check-reasons` — extend the vocabulary in
+`scripts/gpu-gate-inventory.awk` rather than inventing a new phrasing.
+
+The reason string is the classifier's input, so **every `#[ignore]` must carry
+one** — `#[ignore = "requires CUDA GPU"]`, `#[ignore = "diagnostic: ..."]`,
+`#[ignore = "blocked: ..."]`, and so on, using the vocabulary the rules in
+`scripts/gpu-gate-inventory.awk` match on. A bare `#[ignore]` is classified by
+guesswork (`gpu-inferred` in a cuda-gated file, `unclassified` otherwise), is
+never run, and fails CI via `--check-reasons` — as does a bare ignore that a
+name, path or `cfg` rule already parked in a never-run class, since the check
+also refuses an empty reason column outright. This was not always so: until
+2026-09-01 the lane ran `gpu-inferred` rows on the assumption that an
+unexplained ignore in a cuda-gated file wanted a device, and eight of the last
+67 such rows turned out to be report-writing timing probes and element dumps.
 
 The lane **refuses to start** if `NSL_SKIP_CUDA_TESTS` is set, if
 `CUDA_VISIBLE_DEVICES` is empty, or if `nvidia-smi` reports no device. Most
@@ -193,8 +206,8 @@ GPU tests early-return as a *pass* when no device is available, so a sweep
 under those conditions would report green having executed nothing — worse than
 not running at all.
 
-`--tier gpu` is the default and covers the `gpu` and `gpu-inferred` classes —
-397 gates as of this writing. It does **not** include the `toolchain` (13),
+`--tier gpu` is the default and covers the `gpu` class — 403 gates as of this
+writing. It does **not** include the `toolchain` (13),
 `multiproc` (6), or `isolate` (1) classes; run those separately. These counts
 are not mechanically gated, so treat them as indicative; `scripts/gpu-cert.sh
 --list | cut -f3 | sort | uniq -c` is the authority.

@@ -189,7 +189,7 @@ fn i64_to_i32_targets(src: &[i64]) -> Vec<i32> {
 ///   - CPU f64 reference = 102 valid rows * 49152 logits/row * 128 H
 ///     ≈ 6.4 * 10^8 f64 FMAs — runs in ~30 s on a modern CPU.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU; production-scale V=49152 pin, ~30 s CPU f64 reference"]
 fn fp16_forward_backward_at_v49152_production_scale() {
     if !cuda_available() {
         return;

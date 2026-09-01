@@ -170,7 +170,7 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
 // === Test 1: D pre-pass standalone (from Task 7) ===
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b2_d_prepass_vs_cpu_reduction() {
     // Test 1 of §6.1: D pre-pass standalone vs CPU rowsum(dO * O).
     // Validates the D pre-pass kernel in isolation, before dQ-kernel consumes D.
@@ -237,7 +237,7 @@ fn tier_b2_d_prepass_vs_cpu_reduction() {
 // === Test 1b: D pre-pass at non-trivial grid + hd sweep ===
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b2_d_prepass_grid_dispatch_and_hd_sweep() {
     // Exercises the kernel's full grid (ceil(seq/32), heads, batch) and the
     // 32-row CTA strip handling for seq > 32. Sweeps hd ∈ {32, 64, 128} to
@@ -329,7 +329,7 @@ fn tier_b2_d_prepass_grid_dispatch_and_hd_sweep() {
 // === Test 2: dQ-kernel smoke at canonical (Task 14) ===
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b2_dq_smoke_canonical() {
     // (bq=bkv=32, hd=32, non-causal, no RoPE) via the CpuNaive forward source.
     // Tolerance: tol_for_head_dim(32) = 5e-3.
@@ -339,7 +339,7 @@ fn tier_b2_dq_smoke_canonical() {
 // === Test 3: dQ-kernel sweeps — CpuNaive regression + B1Forward closure ===
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b2_dq_sweep_cpu_naive_forward() {
     // Phase 2.5 regression gate (refactored from tier_b2_dq_head_dim_sweep).
     // Preserves the original seq schedule (64/128) for multi-q-tile coverage.
@@ -353,7 +353,7 @@ fn tier_b2_dq_sweep_cpu_naive_forward() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU + nsl-test/cuda (FSource::B1Forward)"]
 fn tier_b2_dq_sweep_b1_forward() {
     // Phase 2.6 closure gate -- B.1 forward + adapter -> dQ-kernel end-to-end.
     // seq=32 (B.1 single-block precondition: launcher forces block_kv=32).

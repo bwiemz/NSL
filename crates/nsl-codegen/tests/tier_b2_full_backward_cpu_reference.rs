@@ -259,7 +259,7 @@ fn gen_norm_weight(d_model: usize) -> Vec<half::f16> {
 // ============================================================================
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b2_full_backward_sweep_cpu_naive() {
     // Phase 3 T8 — full 7-gradient gate, CpuNaive forward.
     // hd=64  -> seq=block_q=64 ; hd=128 -> seq=block_q=32 (SMEM + proj scope).
@@ -270,7 +270,7 @@ fn tier_b2_full_backward_sweep_cpu_naive() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU + nsl-test/cuda (FSource::B1Forward)"]
 fn tier_b2_full_backward_sweep_b1_forward() {
     // Phase 3 T8 — full 7-gradient gate, B.1 GPU forward + adapter.
     // B.1 single-block precondition pins seq=32 for all hd; seq==block_q holds.
@@ -289,7 +289,7 @@ fn tier_b2_full_backward_sweep_b1_forward() {
 // (`k_limit = qi + 1`), so the GPU output must match it under causal=true.
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b2_full_backward_sweep_cpu_naive_causal() {
     // Sprint 4 — full 7-gradient gate, CpuNaive forward, causal=true.
     for &hd in &[64i64, 128] {
@@ -301,7 +301,7 @@ fn tier_b2_full_backward_sweep_cpu_naive_causal() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU + nsl-test/cuda (FSource::B1Forward)"]
 fn tier_b2_full_backward_sweep_b1_forward_causal() {
     // Sprint 4 — full 7-gradient gate, B.1 GPU forward + adapter, causal=true.
     // B.1 single-block precondition pins seq=32 for all hd; seq==block_q holds.

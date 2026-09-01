@@ -495,6 +495,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check the GPU gate manifest agrees with the source
         run: ./scripts/gpu-cert.sh --check-inventory
+      - name: "Check every #[ignore] carries a reason"
+        # The reason string is the classifier's INPUT: it decides whether the
+        # cert lane runs the test, quarantines it, or refuses it as a fixture
+        # writer. A bare #[ignore] is a gate whose behaviour was guessed from
+        # its file name — and eight of the last 67 guesses ran timing probes as
+        # certification gates. Refuse the guess at the PR.
+        run: ./scripts/gpu-cert.sh --check-reasons
       - name: Check the long-arm timeout overrides still resolve
         # ci/gpu-cert-long-arms.txt raises the per-target budget for the
         # full-training gates. It is keyed by source path, so a test-file
@@ -535,3 +542,24 @@ jobs:
             exit 1
           fi
           echo "drift check correctly rejects a removed gate"
+
+      - name: Prove the reason check is not vacuous
+        run: |
+          set -euo pipefail
+          # Strip one gate's reason down to a bare #[ignore] and require
+          # --check-reasons to fail. Same posture as the step above: a scanner
+          # that stopped emitting the gpu-inferred/unclassified labels would
+          # otherwise turn this check into a permanent green.
+          victim="crates/nsl-cli/tests/fn_lifetime_leak_gate.rs"
+          cp "${victim}" /tmp/victim-reason.bak
+          trap 'cp /tmp/victim-reason.bak "${victim}"' EXIT
+          perl -0pi -e 's/#\[ignore = "requires CUDA GPU"\]/#[ignore]/' "${victim}"
+          if git diff --quiet -- "${victim}"; then
+            echo "victim pattern no longer matches — update this step" >&2
+            exit 1
+          fi
+          if ./scripts/gpu-cert.sh --check-reasons > /dev/null 2>&1; then
+            echo "ANTI-VACUITY FAILURE: a bare #[ignore] left --check-reasons green" >&2
+            exit 1
+          fi
+          echo "reason check correctly rejects a bare #[ignore]"

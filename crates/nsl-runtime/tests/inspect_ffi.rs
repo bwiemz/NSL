@@ -257,7 +257,7 @@ fn cuda_available() -> bool {
 /// same f64 reduction, so every slot must match the CPU result bit-exactly.
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_stats_parity_with_cpu() {
     if !cuda_available() {
         return;

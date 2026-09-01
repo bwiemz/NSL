@@ -54,7 +54,7 @@ fn matmul_cublas_pedantic_equivalence() {
 
 /// Llama-scale (4096,4096,4096) — explicit opt-in (may exceed 60 s).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU; Llama-scale 4096^3 matmul, may exceed 60 s"]
 fn matmul_cublas_pedantic_equivalence_llama() {
     setup_env();
     helper::run_matmul_and_verify(4096, 4096, 4096, 1e-5, "pedantic");

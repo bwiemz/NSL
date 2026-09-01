@@ -115,7 +115,7 @@ fn read_gpu_f32_as_host_f32(ptr: i64) -> Vec<f32> {
 /// bound the CPU round-trip test uses (a tighter bound would diverge from the
 /// CPU contract and create a hard-to-debug numerical gap).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_to_bf16_round_trip_within_epsilon() {
     if !cuda_available() {
         return;
@@ -156,7 +156,7 @@ fn gpu_to_bf16_round_trip_within_epsilon() {
 /// GPU `cvt.rn.f16.f32` is RTE, but we keep the CPU-test bound (1.1e-3) so
 /// the contract is uniform.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_to_fp16_round_trip_within_epsilon() {
     if !cuda_available() {
         return;
@@ -194,7 +194,7 @@ fn gpu_to_fp16_round_trip_within_epsilon() {
 /// Edge cases: numel = 1, 17 (not a multiple of 256), 4096 (block-aligned),
 /// 1 << 20 (multi-grid). Confirms the grid-stride loop covers every regime.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_to_bf16_size_sweep() {
     if !cuda_available() {
         return;
@@ -235,7 +235,7 @@ fn gpu_to_bf16_size_sweep() {
 /// Same-dtype "cast" — f32 -> f32 on GPU must produce a NEW buffer (not
 /// alias) and the values must be byte-identical (memcpy_dtod fast path).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_to_f32_same_dtype_is_copy() {
     if !cuda_available() {
         return;
@@ -299,7 +299,7 @@ fn fp16_round_trip(v: f32) -> f32 {
 ///   verify: cast(m_fp16, F32) matches update within fp16 eps,
 ///           m_fp16 buffer identity is PRESERVED across the step.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_moment_envelope_fp16_round_trip() {
     if !cuda_available() {
         return;

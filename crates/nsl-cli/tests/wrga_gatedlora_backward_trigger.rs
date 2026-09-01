@@ -335,7 +335,7 @@ fn is_oom(err: &str) -> bool {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore]
+#[ignore = "diagnostic: WRGA B.3.2 trigger measurement; writes target/wrga_b32_trigger_report.md, asserts nothing"]
 fn wrga_b32_trigger_measurement() {
     let mut report = String::new();
     report.push_str("# WRGA B.3.2 trigger measurement\n\n");
@@ -475,7 +475,7 @@ fn wrga_b32_trigger_measurement() {
 // Build-gate parity: without the cuda feature the file must still compile.
 #[cfg(not(feature = "cuda"))]
 #[test]
-#[ignore]
+#[ignore = "diagnostic: cpu-stub twin of wrga_b32_trigger_measurement; prints a pointer to --features cuda, asserts nothing"]
 fn wrga_b32_trigger_measurement_requires_cuda() {
     eprintln!("wrga_b32_trigger_measurement requires --features cuda");
 }
@@ -712,7 +712,7 @@ train(model = m, epochs = {n}):
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore]
+#[ignore = "diagnostic: WRGA B.3.2 fused-forward vs unfused-backward timing; writes a report, asserts nothing"]
 fn wrga_b32_fused_trigger_final() {
     // The actual B.3.2 trigger answer: fused-forward vs unfused-backward at
     // prescribed shape. Prerequisite (2026-04-19 K-loop rewrite) shipped, so
@@ -818,7 +818,7 @@ fn wrga_b32_fused_trigger_final() {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore]
+#[ignore = "diagnostic: WRGA B.3.2 unfused-triple side timing; writes a report, asserts nothing"]
 fn wrga_b32_unfused_side_measurement() {
     let mut report = String::new();
     report.push_str("# WRGA B.3.2 — unfused-triple side measurement\n\n");

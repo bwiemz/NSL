@@ -946,7 +946,7 @@ fn run_with_saves(
 /// GPU-only: `cargo test -p nsl-codegen --features cuda --test
 /// csha_cuda_launch_fused -- --ignored t1_forward_output_invariant`.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t1_forward_output_invariant_under_save_activations_flag() {
     if !cuda_available() {
         eprintln!("[T1.4] skipping — no CUDA");
@@ -986,7 +986,7 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
 /// forward O/LSE when seq_len spans multiple KV tiles, not just the single-tile
 /// smoke configuration above.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t1_forward_output_invariant_under_save_activations_flag_multitile() {
     if !cuda_available() {
         eprintln!("[T1.4-multitile] skipping — no CUDA");
@@ -1023,7 +1023,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
     if !cuda_available() {
         eprintln!("[T1.4-multitile-causal] skipping — no CUDA");
@@ -1070,7 +1070,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
 ///
 /// Two-equal-segments fixture: seq=128 = [seg0]×64 + [seg1]×64.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_two_equal() {
     if !cuda_available() {
         eprintln!("[T1.4-multitile-segmented-2eq] skipping — no CUDA");
@@ -1115,7 +1115,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
 /// `pca_tier_a_forward_correctness::tier_a_forward_unequal_segments_matches_unpacked_reference`
 /// and `pca_tier_a_backward_correctness` Fixture 3 packing).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_three_unequal() {
     if !cuda_available() {
         eprintln!("[T1.4-multitile-segmented-3uneq] skipping — no CUDA");
@@ -1168,7 +1168,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
 /// module load path against a real GPU. Numerical correctness is T6.3's
 /// job; here we just check the launch returns rc=0.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU; launch smoke (rc=0), numerics are t6_3's job"]
 #[cfg(feature = "cuda")]
 fn t4_csha_backward_ffi_smoke() {
     use nsl_codegen::flash_attention_v2::{

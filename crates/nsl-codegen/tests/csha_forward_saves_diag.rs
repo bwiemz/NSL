@@ -111,7 +111,7 @@ fn dump_pair(name: &str, gpu: &[f32], cpu: &[f32], n: usize) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "diagnostic: prints per-tensor forward-save diffs for triage; only asserts rc=0"]
 fn forward_saves_match_cpu_reference() {
     if !cuda_available() {
         eprintln!("[diag] skipping — no CUDA (source-level audit in agent report)");

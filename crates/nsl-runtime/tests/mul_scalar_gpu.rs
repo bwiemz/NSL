@@ -49,7 +49,7 @@ fn get1(t: i64, i: i64) -> f64 {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn mul_scalar_inplace_gpu_matches_cpu_reference() {
     if !cuda_available() {
         eprintln!("skipping: no usable CUDA GPU");

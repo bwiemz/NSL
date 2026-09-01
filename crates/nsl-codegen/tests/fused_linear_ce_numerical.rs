@@ -244,7 +244,7 @@ fn ptx_is_ascii_only() {
 // ─── GPU test ────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn fused_linear_ce_gpu_forward_and_backward() {
     if !cuda_available() {
         return;

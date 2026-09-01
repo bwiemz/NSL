@@ -57,7 +57,7 @@ fn get2(t: i64, r: i64, c: i64) -> f64 {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn rmsnorm_dx_gpu_matches_cpu_reference() {
     if !cuda_available() {
         eprintln!("skipping: no usable CUDA GPU");

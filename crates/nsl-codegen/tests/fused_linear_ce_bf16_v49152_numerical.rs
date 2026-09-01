@@ -195,7 +195,7 @@ fn i64_to_i32_targets(src: &[i64]) -> Vec<i32> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU; production-scale V=49152 pin, ~30 s CPU f64 reference"]
 fn bf16_forward_backward_at_v49152_production_scale() {
     if !cuda_available() {
         return;

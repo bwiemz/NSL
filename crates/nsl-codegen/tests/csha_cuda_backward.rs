@@ -553,7 +553,7 @@ fn tol_for_head_dim(hd: u32) -> f32 {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t6_3_smoke_single_config() {
     if !cuda_available() {
         eprintln!("[T6.3] skipping — no CUDA");
@@ -658,7 +658,7 @@ fn t6_3_smoke_single_config() {
 /// This is the smallest config that reaches the bug's d-range (d up to 56).
 /// Logs dV/dK/dQ max_abs + worst dV cell; no gate (diagnostic).
 #[test]
-#[ignore]
+#[ignore = "diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no gate"]
 fn t6_3_hd64_block32_dv_probe() {
     if !cuda_available() {
         eprintln!("[hd64] skipping — no CUDA");
@@ -719,7 +719,7 @@ fn t6_3_hd64_block32_dv_probe() {
 /// SMEM path avoids), and dW sums over 4× rows. Every per-gradient excess is
 /// logged so an excursion can be classified concentrated-vs-diffuse.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t6_3_multitile_seq128() {
     if !cuda_available() {
         eprintln!("[multitile] skipping — no CUDA");
@@ -812,7 +812,7 @@ fn t6_3_multitile_seq128() {
 /// aware forward tolerance (RoPE's extra f16 math ~doubles forward round-off:
 /// hd64 fwd ~2.6e-2 vs 1.2e-2 rope-off).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn t6_3_multitile_seq128_rope() {
     if !cuda_available() {
         eprintln!("[multitile-rope] skipping — no CUDA");
@@ -891,7 +891,7 @@ fn t6_3_multitile_seq128_rope() {
 /// skipped with a log line. Configs with rc≠0 at forward/backward
 /// launch are logged as FAIL but do not abort the sweep.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU; (head_dim, causal, rope_q) sweep, panics on any FAIL row"]
 fn t6_3_matrix_sweep_numerical() {
     if !cuda_available() {
         eprintln!("[T6.3 num] skipping — no CUDA");
@@ -1036,7 +1036,7 @@ fn t6_3_matrix_sweep_numerical() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "diagnostic: structural sweep that logs rc and finiteness per config and asserts nothing"]
 fn t6_3_matrix_sweep_structural() {
     if !cuda_available() {
         eprintln!("[T6.3] skipping — no CUDA");
@@ -1095,7 +1095,7 @@ fn t6_3_matrix_sweep_structural() {
 ///   * right sign, wrong k  → addressing / missing-term bug
 ///   * noise uncorrelated   → SMEM aliasing (K/V share kv_offset)
 #[test]
-#[ignore]
+#[ignore = "diagnostic: element dump for SMEM-tile divergence triage, no tolerance gate"]
 fn t6_3_element_dump_diag() {
     if !cuda_available() {
         eprintln!("[T6.3 diag] skipping — no CUDA");

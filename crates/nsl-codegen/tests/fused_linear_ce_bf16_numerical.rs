@@ -399,7 +399,7 @@ fn run_bf16_numerical(b: usize, s: usize, v: usize, h: usize, vocab_tile: u32) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn bf16_forward_backward_at_v4096() {
     if !cuda_available() {
         return;
@@ -408,7 +408,7 @@ fn bf16_forward_backward_at_v4096() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn bf16_forward_backward_at_v8192_boundary() {
     if !cuda_available() {
         return;
@@ -433,7 +433,7 @@ fn bf16_forward_backward_at_v8192_boundary() {
 // 0.0, producing an LSE that's catastrophically wrong.
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn bf16_large_vocab_non_divisor_no_tail_zero_corruption() {
     if !cuda_available() {
         return;
