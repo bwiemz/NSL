@@ -91,3 +91,12 @@ kernel_profile.json
 memory_profile.json
 profile.json
 models/benchmarks/srbf16_logs/
+
+# Schedule-campaign artefacts: 12.9 GB checkpoints per arm, theta snapshots,
+# run logs and compiled arm programs. The RECORDS (lineage json) are small and
+# are the evidence; the weights they describe are not committable.
+/campaign-sched3/ckpt_*/
+/campaign-sched3/snap_*/
+/campaign-sched3/out_*/
+/campaign-sched3/*.log
+/campaign-sched3/*.nohup
