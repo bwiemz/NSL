@@ -1,0 +1,40 @@
+# Dependabot — dependency freshness for the workspace and its CI actions.
+#
+# Rust updates are GROUPED into one weekly PR per update class so the lockfile
+# does not spray dozens of single-crate PRs. Major bumps of the crates the
+# compiler is welded to (cranelift-*, cudarc, tokenizers) are deliberately
+# excluded here: each of those is a migration with its own snapshot baselines
+# (roadmap D2 for Cranelift), not a dependency bump.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor-and-patch:
+        update-types: ["minor", "patch"]
+      rust-major:
+        update-types: ["major"]
+    ignore:
+      - dependency-name: "cranelift-*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "cudarc"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "tokenizers"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "ort"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    labels: ["dependencies"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: ["dependencies", "ci"]

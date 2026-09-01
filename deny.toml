@@ -1,0 +1,96 @@
+# cargo-deny configuration — supply-chain policy for the NSL workspace.
+#
+# Run locally with `cargo deny check` (cargo install cargo-deny). CI runs the
+# same command on every PR that touches a manifest or the lockfile, and
+# nightly against the live advisory database (.github/workflows/supply-chain.yml).
+#
+# Policy in one line: crates.io only, permissive licenses only, no yanked or
+# advisory-flagged crates, duplicate versions surfaced but not (yet) fatal.
+
+[graph]
+# The CUDA and ONNX features pull in cudarc / ort; check the graph WITH them so
+# a vulnerable driver-binding crate cannot hide behind a feature flag.
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# cargo-deny's DEFAULT scope for unsound advisories is "workspace": only a
+# crate that a workspace member depends on DIRECTLY is reported, and an
+# unsound crate three hops down (rand 0.8.5 <- hf-hub, RUSTSEC-2026-0097, which
+# GitHub's Dependabot did flag) passes silently. Every crate in the graph is
+# linked into the shipped binary, so the scope is the whole graph for both
+# kinds.
+unmaintained = "all"
+unsound = "all"
+# No known-vulnerable or unsound crate is tolerated (the first run of this
+# check found four — crossbeam-epoch RUSTSEC-2026-0204 (vulnerability); memmap2
+# RUSTSEC-2026-0186, rand 0.8 RUSTSEC-2026-0097 and anyhow RUSTSEC-2026-0190
+# (unsound) — and all were patched by `cargo update -p` in the same commit).
+# The entries below are UNMAINTAINED notices; each names the dependency chain
+# that pins it and the upgrade that would retire it.
+ignore = [
+    # paste 1.0.15 <- tokenizers 0.21 (directly, and via
+    # macro_rules_attribute). Archived upstream, no CVE. Retired by a
+    # tokenizers major bump, which is its own migration (added-token id
+    # handling changed across releases).
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, pinned by tokenizers 0.21; no safe upgrade short of a tokenizers migration" },
+    # number_prefix 0.4 <- indicatif 0.17 <- hf-hub 0.3 (progress bars for
+    # Hub downloads). Retired by an hf-hub bump.
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix: unmaintained, pinned by hf-hub 0.3's indicatif; no safe upgrade short of an hf-hub bump" },
+]
+
+[licenses]
+version = 2
+# Everything in the current tree is one of these (inventory taken 2026-09-01
+# from `cargo metadata`; 285 registry crates). MPL-2.0 (option-ext, via dirs)
+# and CDLA-Permissive-2.0 (webpki-roots' CA bundle) are file-level / data
+# licenses that impose nothing on a linking Apache-2.0 project.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+# Fail when a crate's license expression cannot be classified with confidence
+# instead of silently accepting it.
+confidence-threshold = 0.9
+
+[licenses.private]
+# Workspace crates are not published; do not require a license expression on them.
+ignore = true
+
+[bans]
+# 26 crates currently resolve to two or more versions (rand 0.8/0.9, thiserror
+# 1/2, windows-sys x4, ...). Surface them on every run; flipping this to "deny"
+# is the follow-up once the tree is consolidated — see the roadmap's D3.
+multiple-versions = "warn"
+# A wildcard version requirement is a floating dependency: it would let a
+# `cargo update` pull an arbitrary major release. Workspace path
+# dependencies (`nsl-errors.workspace = true`) carry no version by design and
+# are exempted — they cannot float.
+wildcards = "deny"
+allow-wildcard-paths = true
+# Only one of the duplicated versions is ours to fix; the rest live inside
+# dependencies. Highlight the shortest path to each duplicate.
+highlight = "simplest-path"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Every dependency must come from crates.io — no git or alternate-registry
+# dependencies can be added without editing this file (which is reviewed).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

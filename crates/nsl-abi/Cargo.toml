@@ -3,6 +3,7 @@ name = "nsl-abi"
 description = "Machine-checkable source of truth for the NSL runtime C-ABI: validates that the codegen's declared runtime-function signatures agree with the runtime's extern \"C\" implementations."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

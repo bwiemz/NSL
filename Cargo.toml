@@ -16,6 +16,9 @@ members = [
 [workspace.package]
 version = "0.9.0"
 edition = "2021"
+# The workspace crates are a toolchain, not a library set: path dependencies
+# carry no version, so none of them can be published as they stand.
+publish = false
 license = "Apache-2.0"
 authors = ["Brandon Wiemer"]
 repository = "https://github.com/bwiemz/NSL"
