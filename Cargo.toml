@@ -45,3 +45,47 @@ rand = "0.9"
 rand_chacha = "0.9"
 toml = "0.8"
 bytemuck = { version = "1", features = ["derive"] }
+
+# ── Build profiles ────────────────────────────────────────────────────────────
+#
+# Measured on the 9800X3D box, clean builds of `nsl` with `--features cuda`
+# (2026-09-01, campaign record in the PR that added this block):
+#
+#   profile                 clean build   `nsl build hello`   nsl / libnsl_runtime.a
+#   release (defaults)          43 s          0.267 s            22.9 MB / 64 MB
+#   + lto = "thin"              45 s          0.268 s            23.1 MB / 105 MB
+#   + lto = "fat"              125 s          0.269 s            19.2 MB / 105 MB
+#   + codegen-units = 1        121 s          0.192 s            18.9 MB / 52 MB
+#   + fat LTO + cgu = 1        176 s          0.193 s            18.4 MB / 86 MB
+#
+# The runtime-side workload (1500 CPU training steps) did not move under any
+# of them (4.41-4.47 s, inside the run-to-run spread). The ONLY knob that
+# changes the produced code measurably is `codegen-units = 1`: the compile+
+# link path of every `nsl build`/`nsl run` gets 28% faster and the archive
+# every compiled program links shrinks 20% — at 2.8x the build time. LTO on
+# top of it buys nothing (same link time, 0.5 MB off `nsl`) and GROWS the
+# archive 52 -> 86 MB, so `dist` deliberately does not enable it.
+#
+# `release` therefore keeps Cargo's defaults: it is the profile every session
+# rebuilds for each A/B iteration, and 90 ms per compiled program does not
+# repay 80 s per rebuild. `dist` takes the single-codegen-unit treatment for
+# the binaries that are built once per tag (release.yml). Debuginfo is
+# already stripped by `release` (Cargo's default since 1.77), and the
+# `linker.rs` CUDA-archive probe was checked against a `dist`-built,
+# cuda-featured toolchain (`nsl build` links; the 52 MB archive sits inside
+# the probe's 64 MiB window).
+#
+# `panic` stays at "unwind" everywhere: `cfie::engine` catches a panic in
+# production to release a partial device allocation, and the runtime's C-ABI
+# entry points are not audited for unwind-across-FFI (roadmap C1).
+
+# Shipped artifacts (release.yml): built once, run everywhere.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+
+# `release` with line tables, for perf/gdb on a binary that is otherwise the
+# release configuration.
+[profile.release-with-debug]
+inherits = "release"
+debug = 1
