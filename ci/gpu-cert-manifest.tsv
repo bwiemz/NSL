@@ -427,6 +427,9 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	zz_partial_broadcast_child	hel
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_slower_than_its_2d_form	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_cast_cache.rs	zz_probe_child	helper	spawned by cast_cache_gates_gpu
 crates/nsl-runtime/tests/matmul_bf16_cast_cache.rs	cast_cache_gates_gpu	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_bf16_lt.rs	zz_lt_probe_child	helper	spawned by lt_matmul_gates_gpu
+crates/nsl-runtime/tests/matmul_bf16_lt.rs	zz_lt_off_child	helper	spawned by lt_matmul_gates_gpu
+crates/nsl-runtime/tests/matmul_bf16_lt.rs	lt_matmul_gates_gpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_is_faster_than_f32_and_less_accurate_than_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	sr_rounding_keeps_bf16_speed_and_accuracy_class	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_zero_is_a_no_op_and_the_default_stays_tf32	gpu	requires CUDA GPU

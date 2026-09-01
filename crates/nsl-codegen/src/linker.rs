@@ -397,7 +397,12 @@ fn link_gcc_multi(
     }
 
     // Link CUDA driver library if available (Linux: lib64/, Windows: lib/x64/)
-    // Also link cuBLAS (added 2026-04-21 for the nsl_matmul_f32 cublasSgemm swap).
+    // Also link cuBLAS (added 2026-04-21 for the nsl_matmul_f32 cublasSgemm swap)
+    // and cublasLt (2026-09-01, the bf16 Lt issue path): Cargo-built binaries
+    // get these from cudarc's build-script directives, but this standalone
+    // link step sees none of that — an archive referencing cublasLt symbols
+    // without `-lcublasLt` here fails EVERY `nsl build`/`nsl run` with
+    // "DSO missing from command line".
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
         let cuda_lib_win = PathBuf::from(&cuda_path).join("lib").join("x64");
@@ -405,10 +410,12 @@ fn link_gcc_multi(
             cmd.arg(format!("-L{}", cuda_lib.display()));
             cmd.arg("-lcuda");
             cmd.arg("-lcublas");
+            cmd.arg("-lcublasLt");
         } else if cuda_lib_win.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib_win.display()));
             cmd.arg("-lcuda");
             cmd.arg("-lcublas");
+            cmd.arg("-lcublasLt");
         }
     }
     add_nccl_link_args(&mut cmd);
@@ -494,11 +501,14 @@ fn link_msvc_multi(
         ]);
         // Link CUDA driver + cuBLAS libraries if available (needed when runtime
         // has cuda feature).  cublas.lib added 2026-04-21 for the nsl_matmul_f32
-        // cublasSgemm swap.
+        // cublasSgemm swap; cublasLt.lib 2026-09-01 for the bf16 Lt issue path
+        // (same reason as the GCC arm above: cudarc's link directives never
+        // reach this standalone link step).
         if let Some(ref cuda_lib) = cuda_lib_dir {
             cmd.arg(format!("/LIBPATH:{}", cuda_lib.display()));
             cmd.arg("cuda.lib");
             cmd.arg("cublas.lib");
+            cmd.arg("cublasLt.lib");
         }
         cmd
     };

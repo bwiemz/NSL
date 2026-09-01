@@ -20,6 +20,9 @@ pub(crate) mod caching_allocator;
 #[cfg(feature = "cuda")]
 pub(crate) mod bf16_cast_cache;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod lt_matmul;
+
 /// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
 /// integration gate drives registration through the REAL fused-AdamW extern
 /// and needs only to observe (hits, recasts, evictions) and reset between
@@ -31,6 +34,18 @@ pub fn test_bf16_cast_cache_stats() -> (u64, u64, u64) {
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_bf16_cast_cache_reset() {
     bf16_cast_cache::reset_for_test()
+}
+
+/// Test-only views of the cublasLt matmul path, same shape as the cast-cache
+/// pair above: the gate observes (issued, tuned, fallbacks) and resets the
+/// plan cache between checks.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_lt_matmul_stats() -> (u64, u64, u64) {
+    lt_matmul::stats()
+}
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_lt_matmul_reset() {
+    lt_matmul::reset_for_test()
 }
 
 pub(crate) mod graph_capture;
@@ -2831,6 +2846,44 @@ pub(crate) mod cublas_inner {
         scratch: Option<&Bf16Scratch>,
     ) -> Result<(), cublas_result::CublasError> {
         let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
+        // bf16-storage products may issue through cublasLt (opt-in,
+        // `NSL_MATMUL_BF16_LT=1`): explicit heuristic kernel selection with a
+        // real workspace, where GemmEx's DFALT takes the first zero-workspace
+        // candidate unseen. A `true` return means the product is enqueued; any
+        // decline falls through to the GemmEx call below, which computes the
+        // identical product (`lt_matmul` guarantees a failed launch wrote
+        // nothing).
+        if let Some(s) = scratch {
+            if super::lt_matmul::enabled() {
+                let op_code = |o: cublas_sys::cublasOperation_t| match o {
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N => 0i32,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T => 1,
+                    _ => -1, // conjugate ops never reach real-typed GEMMs; declines inside
+                };
+                // SAFETY: forwards this call's live operand/output pointers
+                // under the same layout contract as the GemmEx call below.
+                let issued = unsafe {
+                    super::lt_matmul::matmul_bf16_f32(
+                        op_code(transa),
+                        op_code(transb),
+                        m,
+                        n,
+                        k,
+                        alpha,
+                        s.first16 as *const std::ffi::c_void,
+                        lda,
+                        s.second16 as *const std::ffi::c_void,
+                        ldb,
+                        beta,
+                        c_dev,
+                        ldc,
+                    )
+                };
+                if issued {
+                    return Ok(());
+                }
+            }
+        }
         let (a_ptr, b_ptr, ab_type, compute) = match scratch {
             Some(s) => (
                 s.first16 as *const std::ffi::c_void,
