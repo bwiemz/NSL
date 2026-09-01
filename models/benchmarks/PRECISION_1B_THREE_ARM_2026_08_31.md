@@ -49,31 +49,35 @@ moves the model survives all three arithmetics, so precision is not the
 explanation for the trajectory — which is what sent the investigation to the
 next section.
 
-## The trajectory was misread, and two points are why
+## RETRACTED 2026-09-01: the trajectory was NOT an excursion
 
-The chain's held-out looked like runaway degradation on a two-point read:
-3.872/5.834 at 262M -> 4.569/6.291 at 655M. Scoring the three intermediate
-checkpoints that were ALREADY ON DISK (15 minutes of GPU) showed something
-else:
+This section previously concluded that the chain's held-out rise was "an
+excursion resolving, not divergence". **That was wrong.** The chain ran on to
+its 1B gate and the degradation accelerated; the gate model is +1.269 nats
+(STACK) / +1.101 (WEB) worse than the 262M model, at 5σ over the leg. The full
+sixteen-point trajectory, the fitted slopes and the two errors behind the bad
+call are in **CHAIN_1B_GATE_2026_09_01.md**.
 
-| tokens | VAL_STACK | VAL_WEB | rate per 98M (STACK, WEB) |
-|---|---|---|---|
-| 33M | 8.132 | 8.430 | — |
-| 262M | **3.872** | **5.834** | −1.82, −1.11 |
-| 360M | 4.304 | 6.031 | +0.43, +0.20 |
-| 393M | 4.353 | 6.133 | +0.15, +0.31 |
-| 655M | 4.569 | 6.291 | +0.08, +0.06 |
-| 754M (bf16 arm) | 4.363 | 6.332 | **−0.21**, +0.04 |
+The errors in one line each, because they are cheap to repeat:
 
-The reversal **decelerates monotonically and STACK has turned back down**. This
-is an excursion resolving, not divergence. **Two points cannot distinguish a
-trend from an excursion.** Score every banked checkpoint before designing an
-experiment around a slope — the alternative here was a 4.4 h learning-rate arm
-aimed at a question that may not exist.
+- **Rates were read off WIDENING intervals** (98M, 33M, then 262M tokens).
+  Averaging a rate over a longer window mechanically flattens it. A sequence
+  of rates is a trend only if the intervals are equal — otherwise fit a slope.
+- **A probe ARM's point was tabled as the CHAIN's.** The "−0.21 recovery" at
+  754M was this document's own bf16 arm (4.363), a branch off micro 160,000.
+  The chain's own point at that micro-step is 4.635. Branch points and trunk
+  points do not belong in one trajectory table.
 
-Consequence for the run: the chain now snapshots theta at EVERY cadence write
-(`run-out/traj_snapshot.sh`, .nslm only, 4.3 GB each) so the next read is dense
-by construction.
+**What is retracted is only the trajectory reading.** The three-arm result
+above stands unchanged: it compares arms against each other from ONE
+checkpoint on identical batches, and never depended on the trajectory's shape.
+A matched pair survived the same data that defeated a trend read — which is
+the argument for differential designs, stated more sharply than the original
+draft managed.
+
+The one change that section made which was worth keeping: the chain now
+snapshots theta at EVERY cadence write (`run-out/traj_snapshot.sh`, .nslm
+only, 4.3 GB each). That is why the gate could be read densely at all.
 
 ## Instruments, and why each was checked
 

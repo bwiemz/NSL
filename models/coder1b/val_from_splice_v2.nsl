@@ -26,12 +26,12 @@ from model import NSLCoder
 from nsl.nn.losses import cross_entropy
 
 let m = NSLCoder()
-model_load(m, "../../run-out/spliced_traj_m248000.nslm")
+model_load(m, "../../run-out/spliced_sr3arm_bf16rne.nslm")
 m.to(cuda)
 
 print("SPLICE_VAL_BEGIN")
 
-let sval_tokens = load_mmap("../../data/tokens/pilot_val_stack_2m.bin", 3)
+let sval_tokens = load_mmap("../../data/tokens/mixval_stack_2m.bin", 3)
 let sval_loader = DataLoader(sval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
 
 let sval_total = 0.0
@@ -50,7 +50,7 @@ print(sval_total / sval_count)
 print("VAL_BATCHES_STACK")
 print(sval_count)
 
-let wval_tokens = load_mmap("../../data/tokens/pilot_val_web_2m.bin", 3)
+let wval_tokens = load_mmap("../../data/tokens/mixval_web_2m.bin", 3)
 let wval_loader = DataLoader(wval_tokens, batch_size=2, seq_len=2048, shuffle=false, drop_last=true)
 
 let wval_total = 0.0

@@ -18,6 +18,22 @@ NSL=${NSL_BIN:-/home/brandon/Projects/NSL-target-fix2p16/release/nsl}   # NSL_BI
 export NSL_STDLIB_PATH=$WT/stdlib
 
 shopt -s nullglob
+# The gate's own backup is a FALLBACK source for the final point.
+# traj_snapshot.sh tests "is the driver alive?" BEFORE it sweeps, so if the
+# driver exits between the micro-248,000 cadence write and the watcher's next
+# poll, that snapshot is never taken. The driver independently copies the same
+# state to checkpoints_backup/lr15_1bgate_<arm>/, so recover it from there
+# rather than losing the endpoint of the curve. (Not fixed in the watcher
+# itself: it is running right now, and bash reads a script incrementally --
+# editing one mid-execution corrupts it.)
+GATE_BK=$WT/models/coder1b/checkpoints_backup
+for g in "$GATE_BK"/lr15_1bgate_*/pretrain_prod_state.nslm; do
+  [ -f "$g" ] || continue
+  if [ ! -f "$TRAJ/m248000.nslm" ]; then
+    echo "  recovering the gate point from $(dirname "$g" | xargs basename)"
+    cp "$g" "$TRAJ/m248000.nslm"
+  fi
+done
 snaps=("$TRAJ"/m*.nslm)
 [ ${#snaps[@]} -gt 0 ] || { echo "no snapshots in $TRAJ"; exit 1; }
 
