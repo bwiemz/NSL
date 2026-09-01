@@ -33,6 +33,7 @@ crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_capture_replay_bitexact_gpu	g
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_bf16_storage_captures_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_survives_forced_first_op_divergence_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_self_heals_on_host_readbacks_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_config_item_read_folds_and_captures_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/deferred_free_gpu_gate.rs	deferred_free_matches_eager_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
 crates/nsl-cli/tests/deterministic_flash_backward_gate.rs	deterministic_flag_makes_flash_backward_bit_reproducible	gpu	requires CUDA GPU
 crates/nsl-cli/tests/deterministic_flash_backward_gate.rs	flash_bwd_cpu_env_overrides_deterministic_loudly	gpu	requires CUDA GPU
@@ -48,6 +49,8 @@ crates/nsl-cli/tests/dict_local_lifetime_gate.rs	loop_local_dicts_are_cleared_pe
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	unallowlisted_dispatch_results_do_not_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	identity_shaped_dispatch_does_not_steal_bindings	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dropout_backward_parity_gate.rs	gpu_source_backward_matches_tape_mask_backward	broken	requires CUDA GPU; blocked on a pre-existing source-AD GPU relu-backward dtype abort (nsl_tensor_compare data_f64 on f32) — reproduces with dropout elided
+crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_bit_exact_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_replay_fallback_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/events_stream_gate.rs	gpu_mem_events_agree_with_stderr_and_outlive_the_throttle	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	csla_block_tables_build_once_per_shape_list_gpu	gpu	requires CUDA GPU
@@ -103,11 +106,13 @@ crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	pretrain_loss_decreases_o
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	fase_deferred_matches_plain_adamw_checkpoint	gpu	requires CUDA GPU (runs two real training loops)
 crates/nsl-cli/tests/rmsnorm_dx_parity_gate.rs	fused_rmsnorm_gamma_backward_gpu_matches_reference	gpu	requires CUDA GPU
 crates/nsl-cli/tests/rmsnorm_residual_fold_gate.rs	residual_fold_bit_exact_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/rope_neg_fold_gate.rs	rope_fold_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	gpu_inputs_match_cpu_for_each_primitive	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	stdlib_sampling_chain_runs_on_gpu_logits	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	gpu_redirect_does_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	returned_sampling_results_do_not_double_own	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	topk_dicts_no_longer_strand	gpu	requires CUDA GPU
+crates/nsl-cli/tests/scalar_immediate_fold_gate.rs	scalar_immediates_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sdpa_decorator_free_gpu_backward.rs	decorator_free_sdpa_backward_dispatches_on_gpu	gpu	requires a CUDA-capable GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_batched_step_matches_per_param_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_e2e_deterministic_and_sane_gpu	gpu	requires CUDA GPU
@@ -386,6 +391,7 @@ crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_scale_probes_of_gpu_tensors
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_e5m2_backward_with_gpu_view_operands_matches_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	tape_fp8_training_backward_on_gpu_matches_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	block_quantizers_on_gpu_tensors_match_the_cpu_run	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/fused_ew_fallback.rs	gpu_fast_path_matches_hand_sequenced_and_counts	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_dtype_refusal.rs	both_producers_yield_a_real_device_resident_bf16_tensor	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_dtype_refusal.rs	contiguous_refuses_a_transposed_bf16_device_view	gpu	requires CUDA GPU; re-execs this test binary to observe the abort
 crates/nsl-runtime/tests/gpu_dtype_refusal.rs	slice_refuses_a_bf16_device_tensor	gpu	requires CUDA GPU; re-execs this test binary to observe the abort
@@ -419,6 +425,7 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	partial_batch_broadcast_refuse
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	zz_partial_broadcast_child	helper	spawned by partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_slower_than_its_2d_form	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_is_faster_than_f32_and_less_accurate_than_tf32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_bf16_mode.rs	sr_rounding_keeps_bf16_speed_and_accuracy_class	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_zero_is_a_no_op_and_the_default_stays_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	precedence_pedantic_beats_bf16_and_bf16_beats_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_cublas_equivalence.rs	matmul_cublas_pedantic_equivalence_llama	gpu-inferred	

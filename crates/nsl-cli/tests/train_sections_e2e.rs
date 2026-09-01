@@ -107,3 +107,44 @@ print("should_not_reach")
         "refusal must name the eval section and suggest on_epoch.\nstderr:{stderr}"
     );
 }
+
+// Regression for the on_epoch/on_epoch_end `loss` binding: that param
+// aliases the same tensor pointer as the training loop's internal
+// epoch_loss_var, which the loop frees itself right after the callback
+// runs (see nsl-codegen/src/stmt.rs, the on_epoch/on_epoch_end callback
+// block). Nothing under this repo's existing tests previously compiled
+// an on_epoch callback that binds `loss` at all, so a codegen mistake in
+// how that alias is registered (double free, or freeing the model's live
+// loss out from under a later epoch) would compile clean and only show up
+// as GPU-memory corruption in a real training run. Running across several
+// epochs and asserting each one printed exactly once is enough to catch a
+// crash or a corrupted/skipped read of that aliased value.
+#[test]
+fn e2e_train_on_epoch_binds_loss() {
+    let (code, stdout, stderr) = run_fixture(
+        r#"
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.0001)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_epoch(epoch, loss):
+            print("epoch-done")
+
+print("train-done")
+"#,
+        "on_epoch_loss",
+    );
+    assert_eq!(code, Some(0), "run failed.\nstdout:{stdout}\nstderr:{stderr}");
+    assert_eq!(
+        stdout.matches("epoch-done").count(),
+        3,
+        "on_epoch(epoch, loss) must fire exactly once per epoch with no crash \
+         or corruption from the loss alias.\nstdout:{stdout}\nstderr:{stderr}"
+    );
+    assert!(
+        stdout.contains("train-done"),
+        "training loop did not complete cleanly.\nstdout:{stdout}\nstderr:{stderr}"
+    );
+}

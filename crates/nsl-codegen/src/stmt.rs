@@ -17209,6 +17209,7 @@ sched={sched_s}",
             state.current_block = Some(current);
         }
 
+        let mut epoch_loss_alias_sym: Option<nsl_ast::Symbol> = None;
         for cb in &callbacks {
             let cb_name = self.resolve_sym(cb.name).to_string();
             if cb_name == "on_epoch" || cb_name == "on_epoch_end" {
@@ -17222,6 +17223,14 @@ sched={sched_s}",
                             builder.def_var(var, epoch_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
+                            // Same invariant as on_step's `step` arm: an untyped
+                            // slot reads as indeterminate to any future
+                            // tensor-cleanup sweep over state.variables, which
+                            // would hand this raw counter to
+                            // nsl_tensor_free_if_valid. No such sweep runs over
+                            // epoch scope today, but the binding shouldn't rely
+                            // on that staying true.
+                            state.variable_types.insert(param.name, Type::Int);
                         }
                         "loss" => {
                             let var = state.new_variable();
@@ -17230,6 +17239,25 @@ sched={sched_s}",
                             builder.def_var(var, epoch_loss);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
+                            // Unlike `epoch`, this one really is a tensor
+                            // pointer: it aliases the exact value in
+                            // epoch_loss_var, which this function frees
+                            // explicitly (nsl_tensor_free_if_valid) right
+                            // after the callback body below runs. Typing it
+                            // Int like `epoch` would misrepresent it; leaving
+                            // it untyped makes it read as "indeterminate" to
+                            // the step-body sweep's own filter a few hundred
+                            // lines up (`is_tensor || is_unknown`) — and a
+                            // future epoch-scope sweep modeled on that one
+                            // would free this alias too, double-freeing the
+                            // same pointer. non_owning_symbols is the flag
+                            // that sweep already checks (see its
+                            // `!state.non_owning_symbols.contains(sym)`
+                            // filter) to skip exactly this kind of borrowed
+                            // alias, so mark it and clear the mark once this
+                            // callback's body is done using it.
+                            state.non_owning_symbols.insert(param.name);
+                            epoch_loss_alias_sym = Some(param.name);
                         }
                         _ => {
                             let var = state.new_variable();
@@ -17238,6 +17266,8 @@ sched={sched_s}",
                             builder.def_var(var, z);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
+                            // Typed for the same reason as `epoch` above.
+                            state.variable_types.insert(param.name, Type::Int);
                         }
                     }
                 }
@@ -17250,6 +17280,14 @@ sched={sched_s}",
                     self.compile_stmt(builder, state, stmt)?;
                 }
                 self.emit_callback_residency_close(builder, ws_guard)?;
+                // Scope the non_owning mark to this callback's body: it isn't
+                // covered by the saved_variables/saved_variable_types restore
+                // at the end of this train block, and `loss` is common enough
+                // as a symbol name elsewhere that leaving the mark set would
+                // wrongly suppress freeing unrelated tensors bound to it later.
+                if let Some(sym) = epoch_loss_alias_sym.take() {
+                    state.non_owning_symbols.remove(&sym);
+                }
             }
         }
 

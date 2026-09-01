@@ -17,6 +17,22 @@ pub(crate) mod tier_b1_prepass;
 #[cfg(feature = "cuda")]
 pub(crate) mod caching_allocator;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod bf16_cast_cache;
+
+/// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
+/// integration gate drives registration through the REAL fused-AdamW extern
+/// and needs only to observe (hits, recasts, evictions) and reset between
+/// tests.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_bf16_cast_cache_stats() -> (u64, u64, u64) {
+    bf16_cast_cache::stats()
+}
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_bf16_cast_cache_reset() {
+    bf16_cast_cache::reset_for_test()
+}
+
 pub(crate) mod graph_capture;
 
 
@@ -326,8 +342,67 @@ pub(crate) mod inner {
         }
     }
 
+    /// Exit code for a fatal GPU OOM, so a supervising driver can tell
+    /// "the card ran out" from "the program crashed" without parsing stderr.
+    pub(crate) const NSL_EXIT_GPU_OOM: i32 = 12;
+
+    /// Attribute the shortfall when the device has far less free memory than
+    /// this process can account for.
+    ///
+    /// `reserved` is what OUR caching allocator holds. If the driver reports
+    /// only `free` of `total` and we are not holding the difference, someone
+    /// ELSE is on the card -- another training job, a benchmark, a second
+    /// session. That is a completely different remedy from "reduce batch
+    /// size", and on 2026-08-31 the absence of this line cost a 1B run: a
+    /// concurrent unguarded benchmark took 14.4 GB, our chain OOM'd with
+    /// 73.9 MB free, and the diagnostic advised shrinking the batch.
+    ///
+    /// Pure and GPU-free on purpose, so it is unit-testable.
+    pub(crate) fn oom_contention_line(
+        free: usize, total: usize, reserved: usize,
+    ) -> Option<String> {
+        let others = total.saturating_sub(free).saturating_sub(reserved);
+        // Ignore small slack: driver context, the compositor, accounting drift.
+        if others < (total / 20).max(512 * 1024 * 1024) {
+            return None;
+        }
+        Some(format!(
+            "\n  *** {} of the {} device is held by OTHER PROCESSES ***\n\
+             \x20 This process's allocator reserves {}. Reducing batch size or\n\
+             \x20 precision will NOT help while another process holds the card.\n\
+             \x20 Check: nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv\n\
+             \x20 Serialise GPU work through scripts/gpu-guard.sh -- its lock only\n\
+             \x20 excludes runs that go THROUGH it, so an unguarded job evicts you.",
+            format_bytes(others), format_bytes(total), format_bytes(reserved),
+        ))
+    }
+
+    /// Fatal GPU OOM: report once, then leave.
+    ///
+    /// NOT `panic!`. The allocator is reached from `extern "C"` entry points
+    /// (`nsl_tensor_to_device` via `cpu_fallback_binary`, and ~790 others), and
+    /// a Rust panic in such a frame cannot unwind: it becomes
+    /// `panic in a function that cannot unwind` -> SIGABRT -> a multi-GB core
+    /// dump, with the real diagnostic buried under two backtraces. Observed
+    /// 2026-08-31: a 5.5 GB core for a condition we had already diagnosed in
+    /// full. `std::process::exit` on a fatal runtime condition is the existing
+    /// convention here (see `assert.rs`).
+    pub(crate) fn oom_fatal(msg: String) -> ! {
+        use std::io::Write;
+        eprintln!("{msg}");
+        let _ = std::io::stderr().flush();
+        std::process::exit(NSL_EXIT_GPU_OOM);
+    }
+
     fn oom_diagnostic(requested: usize, alloc_num: u64, pool_freed: usize) -> String {
         let (free_vram, total_vram) = query_vram();
+        // What WE hold, for the contention attribution below.
+        let reserved = match super::caching_allocator::CACHING_ALLOCATOR.try_lock() {
+            Ok(a) => { let (p, _, t, _) = a.pool_breakdown(); p + t }
+            Err(_) => 0,
+        };
+        let contention = oom_contention_line(free_vram, total_vram, reserved)
+            .unwrap_or_default();
         let ctx = current_oom_context();
         let op_line = if ctx.is_empty() {
             String::new()
@@ -376,7 +451,7 @@ pub(crate) mod inner {
                Requested:    {} ({})\n\
                VRAM free:    {} / {}\n\
                Pool drained: {}\n\
-               Allocation #: {}{}{}{}\n\
+               Allocation #: {}{}{}{}{}\n\
              Suggestions:\n\
                - Reduce batch size or sequence length\n\
                - Enable gradient checkpointing (@checkpoint)\n\
@@ -386,6 +461,7 @@ pub(crate) mod inner {
             format_bytes(free_vram), format_bytes(total_vram),
             format_bytes(pool_freed),
             alloc_num, op_line,
+            contention,
             allocator_report,
             async_note,
         )
@@ -541,7 +617,7 @@ pub(crate) mod inner {
         }
 
         // All recovery failed
-        panic!("{}", oom_diagnostic(size_bytes, n, pool_freed));
+        oom_fatal(oom_diagnostic(size_bytes, n, pool_freed));
     }
 
     // Track all CUDA allocations so we can validate frees
@@ -571,6 +647,12 @@ pub(crate) mod inner {
     /// Routes async-allocated pointers to cuMemFreeAsync.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
+        // BF16 cast cache: a registered parameter's image must die before the
+        // allocator can recycle this address. One relaxed load when the cache
+        // has never armed. MUST stay above every lock acquisition below —
+        // the hook takes the cache's own lock, and eviction frees the image
+        // through a nested call into this function.
+        super::bf16_cast_cache::evict(ptr as u64);
         // Stage-2B: an arena interior pointer was never handed out by the
         // caching allocator and must never reach `cuMemFree`. A range check
         // rather than a per-tensor flag: a flag has to be set correctly at
@@ -778,7 +860,7 @@ pub(crate) mod inner {
             }
 
             let n = ALLOC_COUNT_DBG.load(std::sync::atomic::Ordering::Relaxed);
-            panic!("{}", oom_diagnostic(size_bytes, n, pool_freed));
+            oom_fatal(oom_diagnostic(size_bytes, n, pool_freed));
         }
     }
 
@@ -1111,6 +1193,12 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from host memory to device memory.
     pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         if size_bytes >= 262144 && crate::host_profile::enabled() {
             eprintln!("[copy] H2D {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
         }
@@ -1161,6 +1249,12 @@ pub(crate) mod inner {
         src_host: *const c_void,
         size_bytes: usize,
     ) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         crate::host_profile::record_h2d(size_bytes);
         ensure_context();
@@ -1205,6 +1299,12 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from one device pointer to another.
     pub(crate) fn memcpy_dtod(dst_device: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         ensure_context();
         // cuda-graphs: device-to-device copies are pseudo-ops (no host data).
         if !super::graph_capture::on_dtod(dst_device, src_device, size_bytes) {
@@ -1339,6 +1439,12 @@ pub(crate) mod inner {
     /// NULL-stream readers, or must drain before reuse.
     #[allow(dead_code)]
     pub(crate) fn memcpy_htod_async(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(dst_device as u64);
         crate::host_profile::record_h2d(size_bytes);
         ensure_context();
         let stream = transfer_stream();
@@ -1551,6 +1657,12 @@ pub(crate) mod inner {
     /// capture region exists — and must actually reach the device rather than
     /// becoming a recorded node that replays later.
     pub(crate) fn memset_d8_value(device_ptr: *mut c_void, value: u8, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(device_ptr as u64);
         ensure_context();
         unsafe {
             let result = cuMemsetD8_v2(device_ptr as CUdeviceptr, value, size_bytes);
@@ -1570,6 +1682,12 @@ pub(crate) mod inner {
     /// memset node — ordering-neutral vs the sync form thanks to
     /// blocking-stream semantics), verified/skipped during replay.
     pub(crate) fn memset_d8(device_ptr: *mut c_void, size_bytes: usize) {
+        // BF16 cast cache: an addressed device write into a registered
+        // parameter stales its image — this transport probe is what covers
+        // checkpoint/model restore (raw htod into live theta), copy_data,
+        // zeroing, and every future transport-mediated writer without each
+        // remembering a hook. One relaxed load when the cache never armed.
+        super::bf16_cast_cache::evict(device_ptr as u64);
         ensure_context();
         match super::graph_capture::on_memset(device_ptr as usize, size_bytes) {
             super::graph_capture::MemsetAction::Skip => return,
@@ -2451,6 +2569,12 @@ pub(crate) mod cublas_inner {
     struct Bf16Scratch {
         first16: *mut std::ffi::c_void,
         second16: *mut std::ffi::c_void,
+        /// Which operand buffers this GEMM owns and must free. A cached
+        /// weight image (see `bf16_cast_cache`) is BORROWED — it outlives
+        /// the GEMM by design, and freeing it here would hand the cache's
+        /// pointer back to the allocator while later GEMMs still replay it.
+        first_owned: bool,
+        second_owned: bool,
     }
 
     impl Drop for Bf16Scratch {
@@ -2475,8 +2599,12 @@ pub(crate) mod cublas_inner {
             // inside regions taint; any future writer without those
             // constraints must either event-defer these frees
             // (`defer_free_device`) or keep the scratch alive until a sync.
-            super::inner::free_managed(self.first16);
-            super::inner::free_managed(self.second16);
+            if self.first_owned {
+                super::inner::free_managed(self.first16);
+            }
+            if self.second_owned {
+                super::inner::free_managed(self.second16);
+            }
         }
     }
 
@@ -2586,12 +2714,32 @@ pub(crate) mod cublas_inner {
         if !bf16_storage_worthwhile(m, n, k, first_elems, second_elems) {
             return None;
         }
-        let first16 = super::inner::alloc_managed(first_elems * 2);
-        let second16 = super::inner::alloc_managed(second_elems * 2);
+        // Per-operand route: a registered parameter borrows its persistent
+        // image from the cast cache (casting only when the optimizer has
+        // moved it since); everything else gets fresh owned scratch, exactly
+        // the pre-cache behavior. `W^T` in dgrad shares the forward W's base
+        // pointer and element count, so it hits the same image — the flat
+        // cast is transpose-agnostic (see the doc above).
+        let route = |dev: *const f32, elems: usize| -> (*mut std::ffi::c_void, bool, bool) {
+            match super::bf16_cast_cache::acquire(dev as u64, elems) {
+                Some((buf, needs_cast)) => (buf as *mut std::ffi::c_void, false, needs_cast),
+                None => (super::inner::alloc_managed(elems * 2), true, true),
+            }
+        };
+        let (first16, first_owned, cast_first) = route(first_dev, first_elems);
+        let (second16, second_owned, cast_second) = route(second_dev, second_elems);
         match bf16_rounding() {
             Bf16Rounding::Rne => {
-                super::gpu_cast_raw_f32_to_bf16(first_dev as u64, first16 as u64, first_elems);
-                super::gpu_cast_raw_f32_to_bf16(second_dev as u64, second16 as u64, second_elems);
+                if cast_first {
+                    super::gpu_cast_raw_f32_to_bf16(first_dev as u64, first16 as u64, first_elems);
+                }
+                if cast_second {
+                    super::gpu_cast_raw_f32_to_bf16(
+                        second_dev as u64,
+                        second16 as u64,
+                        second_elems,
+                    );
+                }
             }
             Bf16Rounding::Stochastic => {
                 // One key for the process, variation carried entirely by the
@@ -2604,6 +2752,13 @@ pub(crate) mod cublas_inner {
                 // counters are `param_idx << 40` — a block this counter walks
                 // into after ~137k GEMMs. Two unrelated roundings would then
                 // share a dither, which is not wrong so much as untraceable.
+                //
+                // Cache interaction: a cached weight is SR-cast once per
+                // optimizer step instead of once per launch. That is still
+                // the decorrelation SR exists for — the standing error moves
+                // at the cadence theta moves, and theta moves per STEP — and
+                // counters advance only on actual casts, so hits do not
+                // consume dither.
                 const MATMUL_OPERAND_DOMAIN: u64 = 0xBF16_0CA5_7D17_4E70;
                 let key = crate::sr_bf16::sr_step_key(
                     crate::deterministic_ops::get_rng_seed(),
@@ -2612,25 +2767,29 @@ pub(crate) mod cublas_inner {
                 // Claimed SEPARATELY per operand so the two never share a
                 // dither window; overlapping windows would correlate the
                 // rounding of A with the rounding of B inside one product.
-                let c0 = crate::rng_state::bf16_sr_next_counter(first_elems as u64);
-                super::gpu_cast_raw_f32_to_bf16_sr(
-                    first_dev as u64,
-                    first16 as u64,
-                    first_elems,
-                    key,
-                    c0,
-                );
-                let c1 = crate::rng_state::bf16_sr_next_counter(second_elems as u64);
-                super::gpu_cast_raw_f32_to_bf16_sr(
-                    second_dev as u64,
-                    second16 as u64,
-                    second_elems,
-                    key,
-                    c1,
-                );
+                if cast_first {
+                    let c0 = crate::rng_state::bf16_sr_next_counter(first_elems as u64);
+                    super::gpu_cast_raw_f32_to_bf16_sr(
+                        first_dev as u64,
+                        first16 as u64,
+                        first_elems,
+                        key,
+                        c0,
+                    );
+                }
+                if cast_second {
+                    let c1 = crate::rng_state::bf16_sr_next_counter(second_elems as u64);
+                    super::gpu_cast_raw_f32_to_bf16_sr(
+                        second_dev as u64,
+                        second16 as u64,
+                        second_elems,
+                        key,
+                        c1,
+                    );
+                }
             }
         }
-        Some(Bf16Scratch { first16, second16 })
+        Some(Bf16Scratch { first16, second16, first_owned, second_owned })
     }
 
     /// The BF16 math-mode GEMM issue path: `cublasGemmEx(16BF, 16BF -> 32F,
@@ -10845,5 +11004,77 @@ DONE:
             let val = unsafe { *c.data_f64().add(i) };
             assert!((val - expected[i]).abs() < 0.1, "mismatch at {}: {} vs {}", i, val, expected[i]);
         }
+    }
+}
+
+
+#[cfg(all(test, feature = "cuda"))]
+mod oom_contention_tests {
+    use super::inner::oom_contention_line;
+
+    const GB: usize = 1024 * 1024 * 1024;
+
+    /// The 2026-08-31 incident, to the byte: a 31.39 GB card with 73.9 MB
+    /// free while our allocator held ~16 GB. The missing ~15 GB belonged to a
+    /// concurrent unguarded benchmark, and the diagnostic said "reduce batch
+    /// size". It must now say who really has the card.
+    #[test]
+    fn external_contention_is_named() {
+        let total = 32_623 * 1024 * 1024;
+        let free = 73_900_000;
+        let ours = 16 * GB;
+        let line = oom_contention_line(free, total, ours)
+            .expect("15 GB held by another process must be reported");
+        assert!(
+            line.contains("OTHER PROCESSES"),
+            "contention line must name the cause: {line}"
+        );
+        assert!(
+            line.contains("will NOT help"),
+            "must contradict the batch-size advice, which is wrong here: {line}"
+        );
+        assert!(
+            line.contains("gpu-guard"),
+            "must point at the remedy that actually applies: {line}"
+        );
+    }
+
+    /// The ordinary case: we filled the card ourselves. Naming "other
+    /// processes" here would send the operator chasing a phantom, so the line
+    /// must be ABSENT -- this is the half that keeps the message honest.
+    #[test]
+    fn self_inflicted_oom_is_not_blamed_on_others() {
+        let total = 32 * GB;
+        let free = 64 * 1024 * 1024;
+        let ours = total - free - (200 * 1024 * 1024); // ~all of it is ours
+        assert!(
+            oom_contention_line(free, total, ours).is_none(),
+            "a self-inflicted OOM must not accuse other processes"
+        );
+    }
+
+    /// Driver context, the compositor and accounting drift are always a few
+    /// hundred MB. Firing on those would make the warning noise, and a warning
+    /// that fires on every OOM carries no information.
+    #[test]
+    fn small_slack_does_not_trip_the_warning() {
+        let total = 32 * GB;
+        let ours = 30 * GB;
+        // ~300 MB unaccounted: compositor + context, not a competing job.
+        let free = total - ours - (300 * 1024 * 1024);
+        assert!(
+            oom_contention_line(free, total, ours).is_none(),
+            "sub-threshold slack must not be reported as contention"
+        );
+    }
+
+    /// Saturating arithmetic: accounting can transiently exceed the device
+    /// (freed-but-not-returned segments), and a diagnostic must never panic
+    /// while reporting a crash.
+    #[test]
+    fn over_accounting_cannot_underflow() {
+        let total = 32 * GB;
+        assert!(oom_contention_line(GB, total, 40 * GB).is_none());
+        assert!(oom_contention_line(0, 0, 0).is_none());
     }
 }
