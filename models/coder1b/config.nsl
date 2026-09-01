@@ -74,21 +74,25 @@ const WEB_VAL_TOKENS = 11942304
 # So the sign of "which LR is better at 1B" is not established, and this file
 # must not launder either arm into a measured constant.
 #
-# The item-6 pilot ran the width-scaled default (1e-4) over 98.3M corpus-v2
-# tokens and got warmup descent followed by 21,600 micro-steps of ZERO
-# slope. The matched-pair arm — identical data, seed, batches and cosine
-# shape, peak lr 3e-5 — descended CONTINUOUSLY (post-warmup halves 7.50 ->
-# 6.88), finishing 1.6-1.9 nats better on identical batches, with held-out
-# VAL_LOSS_STACK 7.392 / VAL_LOSS_WEB 8.009 against the ln(49152)=10.803
-# uniform bound. So 1e-4 is measured TOO HIGH at 1B and 3e-5 is the
-# measured-better value this config now carries. Honest scope: a two-arm
-# comparison at 0.09 tokens/param — 3e-5 beats 1e-4; it is not a swept
-# optimum, and transfer to the 5.5M-micro full schedule is an assumption
-# the intermediate run exists to check.
-# Records: models/benchmarks/PILOT1B_VALIDATION_2026_08_25.md (this
-# comparison) and PROD1B_VALIDATION_2026_08_19.md (the earlier arms whose
-# budget could not rank anything).
-const PRETRAIN_LR = 0.00003
+# Third revision, each one measured (the provenance chain matters here):
+#   1e-4  (width-scaled default)  — ZERO post-warmup slope at pilot budget
+#         (PILOT1B_VALIDATION_2026_08_25.md).
+#   3e-5  (pilot matched pair)    — beat 1e-4 by 1.6-1.9 nats on identical
+#         batches; BUT the pilot's short cosine decayed lr below ~2.5e-5
+#         during its best descent, so 3e-5-HELD was never actually tested.
+#         The intermediate run tested it: THREE independent legs (bf16 and
+#         f32, different starting θ, stationarily-shuffled data with
+#         verified-normal statistics) all REVERSED upward once warmup ended
+#         and lr sat at 3e-5, and held-out DEGRADED a full nat by 229M
+#         tokens on the bf16 leg (bf16's standing rounding bias amplified
+#         the rise — see POSTURE_1B_THROUGHPUT_2026_08_27.md — but the f32
+#         legs rose too).
+#   1.5e-5 (this value)           — the trajectory-drift probe: the same
+#         opt-2000 state, identical loader/RNG batches, halved-peak
+#         schedule, descended monotonically through the exact region where
+#         3e-5 reversed (paired delta -0.97 by micro 17k and growing).
+# min_lr keeps the arms' 0.3 peak ratio (1.5e-5 * 0.3 = 4.5e-6).
+const PRETRAIN_LR = 0.000015
 # Warmup 8192 micro-steps = 2,048 optimizer steps = ~33.5M tokens (~0.15% of
 # the schedule). A CHOSEN default in the large-corpus convention, not a
 # measurement — the item-6 pilot validated the shape (descent through
@@ -98,9 +102,7 @@ const PRETRAIN_LR = 0.00003
 const PRETRAIN_WARMUP = 8192
 # floor(22,595,922,912 / (2048 * 2)) = 5,516,582 micro-steps (1 epoch).
 const PRETRAIN_TOTAL_STEPS = 5516582
-# min_lr keeps the pilot arms' 0.3 peak ratio (3e-5 * 0.3 = 9e-6) so the
-# cosine SHAPE matches the measured configuration.
-const PRETRAIN_MIN_LR = 0.000009
+const PRETRAIN_MIN_LR = 0.0000045
 const PRETRAIN_BATCH_SIZE = 2
 const PRETRAIN_GRAD_ACCUMULATION = 4
 const PRETRAIN_WEIGHT_DECAY = 0.1
@@ -108,7 +110,7 @@ const PRETRAIN_BETA1 = 0.9
 const PRETRAIN_BETA2 = 0.95
 const PRETRAIN_EPOCHS = 1
 const PRETRAIN_GRAD_CLIP = 1.0
-# 2,000 optimizer steps ≈ 3.1 h at the measured resident 2,914 tok/s — a
+# 2,000 optimizer steps ≈ 83 min at the measured selective+bf16 6,568 tok/s — a
 # 12.9 GB θ+sidecar rewrite per cadence. 100 was ~9 min at this scale.
 const PRETRAIN_CHECKPOINT_EVERY = 2000
 # Shuffled, for the reason the 500M recipe records: a concatenated corpus

@@ -83,32 +83,6 @@
 # Arms, corrected statistics, and the per-flag table:
 # models/benchmarks/PROD1B_VALIDATION_2026_08_19.md.
 #
-# 1.5e-5 IS NOW ITSELF INDICTED (2026-09-01, CHAIN_1B_GATE_2026_09_01.md).
-# The intermediate chain ran this lr to a 1B-token gate with theta scored on
-# held-out at sixteen points. It descended to 3.872/5.834 at 262M tokens and
-# then WORSENED monotonically in expectation: +0.753 +/- 0.137 (STACK) and
-# +0.627 +/- 0.126 (WEB) nats per 100k micro over 655M-1,016M, both 5 sigma,
-# with WEB showing the rate accelerating ~8x over the final 130M tokens. The
-# gate model is +1.269/+1.101 WORSE than the 262M model. Precision is NOT the
-# cause — the three-arm matched pair reproduced the rise under f32, bf16+RNE
-# and bf16+SR alike.
-#
-# THE SCHEDULE IS THE STANDING SUSPECT, AND IT IS AN ARITHMETIC FACT, NOT AN
-# INFERENCE: warmup_cosine below is sized for the full 22.6B-token epoch, so a
-# 1B-token run is 4.35% into the cosine and lr is 1.49510e-5 at the gate —
-# 99.67% of peak. A billion tokens at a HELD peak rate. Held rates have now
-# failed three times in this campaign (3e-4 and 1e-4 at item 10; 3e-5 on the
-# first intermediate chain; 1.5e-5 here), each time by failing to descend or by
-# reversing after an initial descent, and each time the schedule was the full
-# production cosine truncated by a short run.
-#
-# SO: DO NOT COPY THIS lr FOR A SHORT RUN. For any horizon materially shorter
-# than the full epoch, size total_steps to the horizon you will ACTUALLY run,
-# or the run trains at peak throughout. The unmade measurement is a matched
-# pair from the micro-64,000 checkpoint: held 1.5e-5 vs a cosine sized for the
-# horizon, identical batches, held-out at the same cadence. Nothing in this
-# file's lr provenance answers it.
-#
 # UNITS (same as the 50M/500M recipes): the scheduler counts MICRO-batches (lr
 # is recomputed every micro-batch; with grad_accumulation=4 the effective
 # warmup is 8192/4 = 2,048 optimizer steps). checkpoint_every counts OPTIMIZER
@@ -166,21 +140,7 @@
 #                           execution fingerprint treats the wgrad choice as
 #                           arithmetic identity, so adding it mid-chain would
 #                           refuse every prior checkpoint.
-#   NSL_MATMUL_BF16=1       IN THE LINE. ACQUITTED by a three-arm matched
-#                           pair (2026-08-31): from ONE checkpoint on identical
-#                           batches, held-out ranked bf16+RNE 4.363/6.332 <
-#                           bf16+SR 4.477/6.385 < f32 4.653/6.423 — the SAME
-#                           order on BOTH sets. The f32 arm was the WORST, and
-#                           bf16 is also +29.5% faster (6,500 vs 5,020 tok/s),
-#                           so it wins on both axes.
-#                           NSL_MATMUL_BF16_ROUND=sr (PR #540) is NOT worth it
-#                           here: it lands between RNE and f32 and costs 5.9%.
-#                           #540's operand gates are still correct — the
-#                           standing-bias mechanism is real, the cure is not
-#                           needed at this lr and horizon.
-#                           Record: PRECISION_1B_THREE_ARM_2026_08_31.md.
-#                           The history below is kept because the earlier
-#                           conviction was WRONG and the reason matters.
+#   NSL_MATMUL_BF16=1       IN THE LINE, and the reason is a correction.
 #                           A matched-pair discriminator once convicted it of
 #                           accumulating drift (+0.53 nats over 98M tokens vs
 #                           f32's +0.16), but that pair ran at HELD lr=3e-5 —
@@ -304,7 +264,7 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints_backup/lr15_stage4_opt40000/pretrain_prod_state.nslm", checkpoint_save="checkpoints_sr3arm/bf16sr_state.nslm", checkpoint_every=2000):
     optimizer: AdamW(lr=0.000015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
     scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.0000045)
     step(batch):
