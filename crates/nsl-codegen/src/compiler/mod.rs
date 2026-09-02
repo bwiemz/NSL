@@ -6,7 +6,7 @@ pub(crate) mod kernel;
 mod main_entry;
 mod ownership_api;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::Value;
@@ -128,7 +128,15 @@ pub struct PendingLambda {
 
 /// Sub-struct grouping all type-system registration state out of the `Compiler` god-object.
 pub struct TypeRegistry {
-    pub struct_layouts: HashMap<String, StructLayout>,
+    /// Keyed by struct name, ordered by it: `declaration.rs` declares one
+    /// constructor per non-model entry and `functions.rs` defines them by
+    /// walking this map, so its iteration order is both the declaration
+    /// order of every struct constructor (its `FuncId`, hence the object's
+    /// symbol order and every `fn0 = u0:N` reference) and their definition
+    /// order (the `function u0:N` header, the text-section order). A
+    /// `HashMap` here made both differ from run to run for any program with
+    /// two or more structs (bugs.md 2026-09-02).
+    pub struct_layouts: BTreeMap<String, StructLayout>,
     pub enum_variants: HashMap<String, i64>,
     pub enum_defs: HashMap<String, Vec<(String, i64)>>,
     pub custom_dtype_ids: HashMap<String, u16>,
@@ -137,7 +145,7 @@ pub struct TypeRegistry {
 impl TypeRegistry {
     fn new() -> Self {
         Self {
-            struct_layouts: HashMap::new(),
+            struct_layouts: BTreeMap::new(),
             enum_variants: HashMap::new(),
             enum_defs: HashMap::new(),
             custom_dtype_ids: HashMap::new(),
