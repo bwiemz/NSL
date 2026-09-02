@@ -45,7 +45,7 @@ jobs:
         # separately from a policy regression introduced by a PR.
         check: [advisories, bans licenses sources]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: cargo deny check ${{ matrix.check }}
         uses: EmbarkStudios/cargo-deny-action@v2
