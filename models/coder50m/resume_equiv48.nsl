@@ -1,0 +1,60 @@
+# models/coder50m/resume_equiv.nsl
+# ===========================================================================
+# INTERRUPTION EQUIVALENCE: does save/exit/resume change WHICH mathematical
+# trajectory the run is asking for?
+# ===========================================================================
+# Two arms run this same file:
+#   UNINT   one process, micro 0 -> 24
+#   RESUME  micro 0 -> 12, killed after the cadence write, then resumed with
+#           checkpoint_load= and run 12 -> 24
+# Both end at micro 24. Everything about them should agree.
+#
+# WHY THIS SHAPE:
+#  * shuffle=true. The 1B production loader shuffles, and that is the path the
+#    0.272-nat anomaly ran under. With shuffle=false the loader slot alone
+#    fixes the batch and the RNG-restore path is never exercised -- the test
+#    would pass without testing anything.
+#  * DISTINCT windows. det_train_check.nsl builds its stream by expand()ing one
+#    row, so every window is identical and a shuffle is unobservable. arange
+#    gives 24 windows of 1024 that differ everywhere, so a wrong batch order
+#    changes the loss.
+#  * grad_accumulation=2 with checkpoint_every=6 OPTIMIZER steps puts cadence
+#    writes at micro 12 and 24 -- the interruption point is a real cadence
+#    boundary, which is the only place the chain protocol ever stops.
+#  * dropout is 0 at this size, so mask sampling cannot explain a difference.
+#
+# Run under --deterministic. det_train_check.nsl already established that this
+# scale is bit-reproducible run-to-run with that flag (max spread 0.000e+00,
+# 2026-08-21), which is what lets any difference here be attributed to resume
+# state rather than to GPU reduction nondeterminism.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+
+# 24 micro-steps x batch 1 x seq 1024. arange(24576) keeps every id < VOCAB
+# (49152) and makes all 24 windows distinct.
+let tokens = arange(49152)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=true, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2,
+      checkpoint_save="RESUME_EQUIV_CKPT", checkpoint_every=6):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=4, total_steps=48, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("RESUME_EQUIV_COMPLETE")

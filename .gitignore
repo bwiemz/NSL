@@ -104,3 +104,12 @@ models/benchmarks/srbf16_logs/
 /campaign-sched3/out_*/
 /campaign-sched3/*.log
 /campaign-sched3/*.nohup
+
+# Interruption-equivalence artefacts: per-arm checkpoints (585 MB a pair) and
+# run logs. The comparison OUTPUT is the evidence; the weights are not.
+/campaign-resumeq/unint1/
+/campaign-resumeq/unint2/
+/campaign-resumeq/resume/
+/campaign-resumeq/nondet/
+/campaign-resumeq/nd48/
+/campaign-resumeq/*.nohup
