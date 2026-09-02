@@ -209,15 +209,15 @@ impl DeterminismChecker {
     fn scan_expr(&mut self, expr: &Expr, interner: &Interner) {
         match &expr.kind {
             ExprKind::Call { callee, args, .. } => {
-                if let ExprKind::Ident(sym) = &callee.kind {
-                    if let Some(name) = interner.resolve(sym.0) {
-                        // Check for explicit RNG keyword arg named "rng"
-                        let has_rng_arg = args.iter().any(|a| {
-                            a.name.as_ref().and_then(|sym| interner.resolve(sym.0)) == Some("rng")
-                        });
-                        if let Some(diag) = self.check_call(name, has_rng_arg, expr.span) {
-                            self.diagnostics.push(diag);
-                        }
+                if let ExprKind::Ident(sym) = &callee.kind
+                    && let Some(name) = interner.resolve(sym.0)
+                {
+                    // Check for explicit RNG keyword arg named "rng"
+                    let has_rng_arg = args.iter().any(|a| {
+                        a.name.as_ref().and_then(|sym| interner.resolve(sym.0)) == Some("rng")
+                    });
+                    if let Some(diag) = self.check_call(name, has_rng_arg, expr.span) {
+                        self.diagnostics.push(diag);
                     }
                 }
                 for arg in args {

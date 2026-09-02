@@ -194,10 +194,10 @@ fn regex_lite_positional_assign_in(line: &str, struct_literal_scope: bool) -> bo
     // placeholder) do not match.
     if struct_literal_scope {
         let t = line.trim_start();
-        if let Some(rhs) = t.strip_prefix("id:") {
-            if converts_to_op_id(rhs) {
-                return true;
-            }
+        if let Some(rhs) = t.strip_prefix("id:")
+            && converts_to_op_id(rhs)
+        {
+            return true;
         }
     }
 

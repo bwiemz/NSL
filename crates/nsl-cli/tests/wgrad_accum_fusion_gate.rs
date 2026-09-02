@@ -201,13 +201,12 @@ const DECLINED: &str = "[wgrad-fusion] declined:";
 fn fused_chains(stderr: &str) -> Option<u64> {
     let mut total = None;
     for line in stderr.lines() {
-        if let Some(rest) = line.trim().strip_prefix("[wgrad-fusion] ") {
-            if let Some(n) = rest
+        if let Some(rest) = line.trim().strip_prefix("[wgrad-fusion] ")
+            && let Some(n) = rest
                 .split_once(" chain(s)")
                 .and_then(|(n, _)| n.trim().parse::<u64>().ok())
-            {
-                total = Some(total.unwrap_or(0) + n);
-            }
+        {
+            total = Some(total.unwrap_or(0) + n);
         }
     }
     total

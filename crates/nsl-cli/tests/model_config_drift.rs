@@ -324,10 +324,10 @@ fn parse_decorator_hints(line: &str) -> BTreeMap<String, f64> {
         return out;
     };
     for pair in args.split(',') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if let Ok(n) = v.trim().parse::<f64>() {
-                out.insert(k.trim().to_string(), n);
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && let Ok(n) = v.trim().parse::<f64>()
+        {
+            out.insert(k.trim().to_string(), n);
         }
     }
     out

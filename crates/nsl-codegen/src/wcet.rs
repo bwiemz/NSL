@@ -242,10 +242,10 @@ pub fn extract_wcet_budget_decorator<'a>(
                 for arg in args {
                     if let Some(name_sym) = arg.name {
                         let name = resolve_sym(name_sym);
-                        if name == "max_cycles" {
-                            if let ExprKind::IntLiteral(v) = &arg.value.kind {
-                                max_cycles = *v as u64;
-                            }
+                        if name == "max_cycles"
+                            && let ExprKind::IntLiteral(v) = &arg.value.kind
+                        {
+                            max_cycles = *v as u64;
                         }
                     }
                 }

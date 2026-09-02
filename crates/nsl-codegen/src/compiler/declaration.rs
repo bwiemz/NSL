@@ -162,12 +162,11 @@ impl Compiler<'_> {
                             for arg in args {
                                 if let Some(name_sym) = arg.name {
                                     let arg_name = self.resolve_sym(name_sym).to_string();
-                                    if arg_name == "start_rule" {
-                                        if let nsl_ast::expr::ExprKind::StringLiteral(s) =
+                                    if arg_name == "start_rule"
+                                        && let nsl_ast::expr::ExprKind::StringLiteral(s) =
                                             &arg.value.kind
-                                        {
-                                            start_rule = s.clone();
-                                        }
+                                    {
+                                        start_rule = s.clone();
                                     }
                                 } else {
                                     // Positional arg = grammar source / schema kind string
@@ -548,19 +547,17 @@ impl Compiler<'_> {
                 decorators,
                 stmt: inner,
             } = &stmt.kind
+                && let StmtKind::ModelDef(md) = &inner.kind
+                && let Some(mode) = crate::zk::extract_zk_proof_decorator(decorators, &|sym| {
+                    self.resolve_sym(sym)
+                })
             {
-                if let StmtKind::ModelDef(md) = &inner.kind {
-                    if let Some(mode) = crate::zk::extract_zk_proof_decorator(decorators, &|sym| {
-                        self.resolve_sym(sym)
-                    }) {
-                        let model_name = self.resolve_sym(md.name).to_string();
-                        for member in &md.members {
-                            if let ModelMember::Method(fn_def, _) = member {
-                                let method_name = self.resolve_sym(fn_def.name).to_string();
-                                let mangled = format!("__nsl_model_{model_name}_{method_name}");
-                                self.features.zk_proof_fns.insert(mangled, mode);
-                            }
-                        }
+                let model_name = self.resolve_sym(md.name).to_string();
+                for member in &md.members {
+                    if let ModelMember::Method(fn_def, _) = member {
+                        let method_name = self.resolve_sym(fn_def.name).to_string();
+                        let mangled = format!("__nsl_model_{model_name}_{method_name}");
+                        self.features.zk_proof_fns.insert(mangled, mode);
                     }
                 }
             }
@@ -1016,10 +1013,10 @@ fn extract_export_decorator(
             for arg in args {
                 if let Some(name_sym) = arg.name {
                     let arg_name = interner.resolve(name_sym.0).unwrap_or("");
-                    if arg_name == "name" {
-                        if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
-                            override_name = Some(s.clone());
-                        }
+                    if arg_name == "name"
+                        && let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind
+                    {
+                        override_name = Some(s.clone());
                     }
                 }
             }

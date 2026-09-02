@@ -59,28 +59,28 @@ pub(crate) fn build_to_temp(
     // CPDT: post-compile rendering, mirroring the `nsl build` path. Stderr
     // diagnostics always fire when CPDT ran; the stdout plan only with
     // --cpdt-report. The plan slot was populated during the compile above.
-    if let Some(slot) = options.cpdt.plan_out.as_ref() {
-        if let Some(plan) = slot.lock().ok().and_then(|g| g.clone()) {
-            for diag in &plan.override_diagnostics {
-                eprintln!(
-                    "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
-                    diag.requested, diag.applied, diag.reason
-                );
-            }
-            if options.cpdt.report_requested {
-                print!("{}", plan.render_report());
-                println!();
-                println!("=== Defaults Assumed ===");
-                println!("precision_cfg: BF16-mixed (override: --cpdt-precision, future)");
-                let jc = nsl_codegen::cpdt_joint::JointConfig::default();
-                println!("joint_cfg:     {:?} (override: --cpdt-budget, future)", jc);
-                println!("expert_cfg:    none (no MoE block detected)");
-                match &options.weight_file {
-                    Some(p) => println!("weights:       {}", p.display()),
-                    None => println!(
-                        "weights:       none (no --weights flag and no AST load_safetensors)"
-                    ),
-                }
+    if let Some(slot) = options.cpdt.plan_out.as_ref()
+        && let Some(plan) = slot.lock().ok().and_then(|g| g.clone())
+    {
+        for diag in &plan.override_diagnostics {
+            eprintln!(
+                "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
+                diag.requested, diag.applied, diag.reason
+            );
+        }
+        if options.cpdt.report_requested {
+            print!("{}", plan.render_report());
+            println!();
+            println!("=== Defaults Assumed ===");
+            println!("precision_cfg: BF16-mixed (override: --cpdt-precision, future)");
+            let jc = nsl_codegen::cpdt_joint::JointConfig::default();
+            println!("joint_cfg:     {:?} (override: --cpdt-budget, future)", jc);
+            println!("expert_cfg:    none (no MoE block detected)");
+            match &options.weight_file {
+                Some(p) => println!("weights:       {}", p.display()),
+                None => println!(
+                    "weights:       none (no --weights flag and no AST load_safetensors)"
+                ),
             }
         }
     }

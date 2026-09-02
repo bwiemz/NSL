@@ -176,15 +176,15 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // NSL_WS_DECISION_JSON=<path>, an atexit writes the policy's inputs and
     // outcome as JSON — the decision existed only as a human stderr line
     // before, so no artifact could bank WHY the policy pinned what it pinned.
-    if let Ok(path) = std::env::var("NSL_WS_DECISION_JSON") {
-        if !path.is_empty() {
-            *WS_DECISION_JSON_PATH.lock().unwrap() = Some(path);
-            unsafe extern "C" {
-                fn atexit(cb: extern "C" fn()) -> i32;
-            }
-            unsafe {
-                atexit(nsl_ws_decision_json_atexit);
-            }
+    if let Ok(path) = std::env::var("NSL_WS_DECISION_JSON")
+        && !path.is_empty()
+    {
+        *WS_DECISION_JSON_PATH.lock().unwrap() = Some(path);
+        unsafe extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_ws_decision_json_atexit);
         }
     }
 

@@ -308,10 +308,10 @@ pub fn prune(
 pub fn param_ids_matching(list: &WengertList, patterns: &[&str]) -> BTreeSet<VarId> {
     let mut out = BTreeSet::new();
     for op in &list.ops {
-        if let PrimalOp::Param(name) = &op.op {
-            if patterns.iter().any(|p| glob_match(p, name)) {
-                out.insert(op.result);
-            }
+        if let PrimalOp::Param(name) = &op.op
+            && patterns.iter().any(|p| glob_match(p, name))
+        {
+            out.insert(op.result);
         }
     }
     out

@@ -515,21 +515,21 @@ impl<'a> VmapTransformer<'a> {
     /// name. Instead, the rewrite target is stored in `self.matmul_rewrites` and
     /// the compiler applies it when it has `&mut Interner`.
     fn rewrite_matmul_call(&mut self, expr: &mut Expr) -> Result<(), VmapError> {
-        if let ExprKind::Call { args, .. } = &expr.kind {
-            if args.len() >= 2 {
-                let left_status = self.classify_expr(&args[0].value);
-                let right_status = self.classify_expr(&args[1].value);
-                let rewrite = classify_matmul_rewrite(left_status, right_status);
+        if let ExprKind::Call { args, .. } = &expr.kind
+            && args.len() >= 2
+        {
+            let left_status = self.classify_expr(&args[0].value);
+            let right_status = self.classify_expr(&args[1].value);
+            let rewrite = classify_matmul_rewrite(left_status, right_status);
 
-                let new_name = match rewrite {
-                    MatmulRewrite::LeftBatched | MatmulRewrite::BothBatched => "batched_matmul",
-                    MatmulRewrite::RightBatched => "batched_matmul_right",
-                    MatmulRewrite::NoRewrite => return Ok(()),
-                };
+            let new_name = match rewrite {
+                MatmulRewrite::LeftBatched | MatmulRewrite::BothBatched => "batched_matmul",
+                MatmulRewrite::RightBatched => "batched_matmul_right",
+                MatmulRewrite::NoRewrite => return Ok(()),
+            };
 
-                // Record the rewrite for later application by the compiler.
-                self.matmul_rewrites.push((expr.id, new_name.to_string()));
-            }
+            // Record the rewrite for later application by the compiler.
+            self.matmul_rewrites.push((expr.id, new_name.to_string()));
         }
         Ok(())
     }

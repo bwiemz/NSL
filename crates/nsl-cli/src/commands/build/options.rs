@@ -649,46 +649,46 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
 
             // Validate WGGO mode string early so users get a clear error
             // instead of a silent no-op.
-            if let Some(ref m) = wggo {
-                if nsl_codegen::wggo::WggoMode::parse(m).is_none() {
-                    eprintln!(
-                        "error: --wggo value '{}' is not one of full|greedy|off|auto",
-                        m
-                    );
-                    process::exit(1);
-                }
+            if let Some(ref m) = wggo
+                && nsl_codegen::wggo::WggoMode::parse(m).is_none()
+            {
+                eprintln!(
+                    "error: --wggo value '{}' is not one of full|greedy|off|auto",
+                    m
+                );
+                process::exit(1);
             }
             // wggo_importance is now a typed CliWggoImportance enum; clap
             // rejects unknown values before we get here.  The Grad variant
             // requires a calibration sidecar — build_scorer enforces that at
             // compile time and emits the --calibration-data error message.
-            if let Some(f) = wggo_prune_fraction {
-                if !(0.0..=0.9).contains(&f) {
-                    eprintln!(
-                        "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
-                        f
-                    );
-                    process::exit(1);
-                }
+            if let Some(f) = wggo_prune_fraction
+                && !(0.0..=0.9).contains(&f)
+            {
+                eprintln!(
+                    "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
+                    f
+                );
+                process::exit(1);
             }
-            if let Some(ref p) = wggo_weights {
-                if !p.exists() {
-                    eprintln!(
-                        "error: --wggo-weights path does not exist: {}",
-                        p.display()
-                    );
-                    process::exit(1);
-                }
+            if let Some(ref p) = wggo_weights
+                && !p.exists()
+            {
+                eprintln!(
+                    "error: --wggo-weights path does not exist: {}",
+                    p.display()
+                );
+                process::exit(1);
             }
             // Validate CSHA mode string early.
-            if let Some(ref m) = csha {
-                if nsl_codegen::csha::CshaMode::parse(m).is_none() {
-                    eprintln!(
-                        "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
-                        m
-                    );
-                    process::exit(1);
-                }
+            if let Some(ref m) = csha
+                && nsl_codegen::csha::CshaMode::parse(m).is_none()
+            {
+                eprintln!(
+                    "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
+                    m
+                );
+                process::exit(1);
             }
 
             if standalone {
@@ -736,28 +736,28 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
 
             // CPDT: post-compile rendering. Stderr diagnostics always fire
             // when CPDT ran; stdout plan only with --cpdt-report.
-            if let Some(slot) = cpdt_plan_out.as_ref() {
-                if let Some(plan) = slot.lock().ok().and_then(|g| g.clone()) {
-                    for diag in &plan.override_diagnostics {
-                        eprintln!(
-                            "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
-                            diag.requested, diag.applied, diag.reason
-                        );
-                    }
-                    if cpdt_report {
-                        print!("{}", plan.render_report());
-                        println!();
-                        println!("=== Defaults Assumed ===");
-                        println!("precision_cfg: BF16-mixed (override: --cpdt-precision, future)");
-                        let jc = nsl_codegen::cpdt_joint::JointConfig::default();
-                        println!("joint_cfg:     {:?} (override: --cpdt-budget, future)", jc);
-                        println!("expert_cfg:    none (no MoE block detected)");
-                        match &resolved_weight_file {
-                            Some(p) => println!("weights:       {}", p.display()),
-                            None => println!(
-                                "weights:       none (no --weights flag and no AST load_safetensors)"
-                            ),
-                        }
+            if let Some(slot) = cpdt_plan_out.as_ref()
+                && let Some(plan) = slot.lock().ok().and_then(|g| g.clone())
+            {
+                for diag in &plan.override_diagnostics {
+                    eprintln!(
+                        "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
+                        diag.requested, diag.applied, diag.reason
+                    );
+                }
+                if cpdt_report {
+                    print!("{}", plan.render_report());
+                    println!();
+                    println!("=== Defaults Assumed ===");
+                    println!("precision_cfg: BF16-mixed (override: --cpdt-precision, future)");
+                    let jc = nsl_codegen::cpdt_joint::JointConfig::default();
+                    println!("joint_cfg:     {:?} (override: --cpdt-budget, future)", jc);
+                    println!("expert_cfg:    none (no MoE block detected)");
+                    match &resolved_weight_file {
+                        Some(p) => println!("weights:       {}", p.display()),
+                        None => println!(
+                            "weights:       none (no --weights flag and no AST load_safetensors)"
+                        ),
                     }
                 }
             }

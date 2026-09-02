@@ -283,31 +283,31 @@ pub(crate) fn run_fpga_compile(
 
     // Optional manifest hash check (spec §6.1). Missing .toml is not an
     // error — the bin is still parsed; we just skip the integrity check.
-    if let Some(toml_path) = derive_toml_path(&fixture_path) {
-        if toml_path.exists() {
-            let toml_text = std::fs::read_to_string(&toml_path).map_err(|e| {
-                format!("read manifest `{}`: {e}", toml_path.display())
-            })?;
-            let manifest: toml::Value = toml::from_str(&toml_text).map_err(|e| {
-                format!("parse manifest `{}`: {e}", toml_path.display())
-            })?;
-            let expected_hash = manifest
-                .get("sha256")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    format!(
-                        "manifest `{}` missing `sha256` top-level field",
-                        toml_path.display()
-                    )
-                })?;
-            nsl_test::fixture::verify_hash(&fixture_bytes, expected_hash).map_err(|e| {
+    if let Some(toml_path) = derive_toml_path(&fixture_path)
+        && toml_path.exists()
+    {
+        let toml_text = std::fs::read_to_string(&toml_path).map_err(|e| {
+            format!("read manifest `{}`: {e}", toml_path.display())
+        })?;
+        let manifest: toml::Value = toml::from_str(&toml_text).map_err(|e| {
+            format!("parse manifest `{}`: {e}", toml_path.display())
+        })?;
+        let expected_hash = manifest
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 format!(
-                    "fixture `{}` hash mismatch against manifest `{}`: {e}",
-                    fixture_path.display(),
+                    "manifest `{}` missing `sha256` top-level field",
                     toml_path.display()
                 )
             })?;
-        }
+        nsl_test::fixture::verify_hash(&fixture_bytes, expected_hash).map_err(|e| {
+            format!(
+                "fixture `{}` hash mismatch against manifest `{}`: {e}",
+                fixture_path.display(),
+                toml_path.display()
+            )
+        })?;
     }
 
     let fixture_file = nsl_test::fixture::parse(&fixture_bytes)
@@ -330,10 +330,8 @@ pub(crate) fn run_fpga_compile(
     println!("Wrote {}", out_path.display());
 
     // M57.2: print the deterministic cycle count when --seq was requested.
-    if seq {
-        if let Some(cycles) = cycle_count {
-            println!("total_cycles={cycles}");
-        }
+    if seq && let Some(cycles) = cycle_count {
+        println!("total_cycles={cycles}");
     }
 
     Ok(())

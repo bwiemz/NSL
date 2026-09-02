@@ -206,40 +206,39 @@ impl Visitor for LoaderCollector<'_> {
     }
 
     fn visit_expr(&mut self, expr: &nsl_ast::expr::Expr) {
-        if let ExprKind::Call { callee, args } = &expr.kind {
-            if let ExprKind::Ident(sym) = &callee.kind {
-                if self.interner.resolve(sym.0) == Some("DataLoader") {
-                    let mut site = LoaderSite {
-                        batch_size: None,
-                        seq_len: None,
-                        drop_last: true,
-                    };
-                    for arg in args {
-                        let Some(name) = arg.name else { continue };
-                        // A negative or oversized literal is not a usable
-                        // dimension; leaving the slot `None` declines rather
-                        // than wrapping into a plausible-looking u32.
-                        let as_u32 = || match &arg.value.kind {
-                            ExprKind::IntLiteral(v) if *v > 0 => u32::try_from(*v).ok(),
-                            _ => None,
-                        };
-                        match self.interner.resolve(name.0) {
-                            Some("batch_size") => site.batch_size = as_u32(),
-                            Some("seq_len") => site.seq_len = as_u32(),
-                            Some("drop_last") => {
-                                // Anything that is not a literal `true` — a
-                                // literal `false`, or a non-literal that
-                                // `expr/calls.rs` will reject anyway — leaves
-                                // the short-batch risk unrefuted.
-                                site.drop_last =
-                                    matches!(&arg.value.kind, ExprKind::BoolLiteral(true));
-                            }
-                            _ => {}
-                        }
+        if let ExprKind::Call { callee, args } = &expr.kind
+            && let ExprKind::Ident(sym) = &callee.kind
+            && self.interner.resolve(sym.0) == Some("DataLoader")
+        {
+            let mut site = LoaderSite {
+                batch_size: None,
+                seq_len: None,
+                drop_last: true,
+            };
+            for arg in args {
+                let Some(name) = arg.name else { continue };
+                // A negative or oversized literal is not a usable
+                // dimension; leaving the slot `None` declines rather
+                // than wrapping into a plausible-looking u32.
+                let as_u32 = || match &arg.value.kind {
+                    ExprKind::IntLiteral(v) if *v > 0 => u32::try_from(*v).ok(),
+                    _ => None,
+                };
+                match self.interner.resolve(name.0) {
+                    Some("batch_size") => site.batch_size = as_u32(),
+                    Some("seq_len") => site.seq_len = as_u32(),
+                    Some("drop_last") => {
+                        // Anything that is not a literal `true` — a
+                        // literal `false`, or a non-literal that
+                        // `expr/calls.rs` will reject anyway — leaves
+                        // the short-batch risk unrefuted.
+                        site.drop_last =
+                            matches!(&arg.value.kind, ExprKind::BoolLiteral(true));
                     }
-                    self.sites.push(site);
+                    _ => {}
                 }
             }
+            self.sites.push(site);
         }
         nsl_ast::visitor::walk_expr(self, expr);
     }

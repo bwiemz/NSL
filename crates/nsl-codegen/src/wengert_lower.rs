@@ -564,18 +564,16 @@ pub fn compile_wengert_ops_range(
                     // P0.2 guard can't see, since `d_out` stays "resolved"). When
                     // deferred, `d_out` is left in var_map + owned_values and
                     // end-of-backward cleanup frees it exactly once.
-                    if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape") {
-                        if let Some(&input_vid) = op.inputs.first() {
-                            let raw_still_needed = last_input_use
-                                .as_ref()
-                                .and_then(|m| m.get(&input_vid))
-                                .is_some_and(|&last| last > abs_i);
-                            if !raw_still_needed {
-                                if let Some(&input_val) = var_map.get(&input_vid) {
-                                    call(compiler, builder, "nsl_tensor_free", &[input_val])?;
-                                    hook_freed_input_vars.insert(input_vid);
-                                }
-                            }
+                    if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape")
+                        && let Some(&input_vid) = op.inputs.first()
+                    {
+                        let raw_still_needed = last_input_use
+                            .as_ref()
+                            .and_then(|m| m.get(&input_vid))
+                            .is_some_and(|&last| last > abs_i);
+                        if !raw_still_needed && let Some(&input_val) = var_map.get(&input_vid) {
+                            call(compiler, builder, "nsl_tensor_free", &[input_val])?;
+                            hook_freed_input_vars.insert(input_vid);
                         }
                     }
                 }
@@ -1124,29 +1122,27 @@ fn emit_fused_forward_under_claim(
     let null = builder.ins().iconst(cl_types::I64, 0);
     let (mut x_v, mut norm_w_v, mut wq_v, mut wk_v, mut wv_v) =
         (null, null, null, null, null);
-    if let Some(claims) = compiler.bus.csha_backward_claims() {
-        if let Some(&chain_idx) = claims.op_to_chain.get(&op.id) {
-            if let Some(mark) = claims.chain_marks.get(chain_idx) {
-                if let Some(chain) = mark.chain_varids.as_ref() {
-                    if let Some(&v) = var_map.get(&chain.x_norm_var) {
-                        x_v = v;
-                    }
-                    if let Some(nw) = chain.norm_weight_var {
-                        if let Some(&v) = var_map.get(&nw) {
-                            norm_w_v = v;
-                        }
-                    }
-                    if let Some(&v) = var_map.get(&chain.wq_var) {
-                        wq_v = v;
-                    }
-                    if let Some(&v) = var_map.get(&chain.wk_var) {
-                        wk_v = v;
-                    }
-                    if let Some(&v) = var_map.get(&chain.wv_var) {
-                        wv_v = v;
-                    }
-                }
-            }
+    if let Some(claims) = compiler.bus.csha_backward_claims()
+        && let Some(&chain_idx) = claims.op_to_chain.get(&op.id)
+        && let Some(mark) = claims.chain_marks.get(chain_idx)
+        && let Some(chain) = mark.chain_varids.as_ref()
+    {
+        if let Some(&v) = var_map.get(&chain.x_norm_var) {
+            x_v = v;
+        }
+        if let Some(nw) = chain.norm_weight_var
+            && let Some(&v) = var_map.get(&nw)
+        {
+            norm_w_v = v;
+        }
+        if let Some(&v) = var_map.get(&chain.wq_var) {
+            wq_v = v;
+        }
+        if let Some(&v) = var_map.get(&chain.wk_var) {
+            wk_v = v;
+        }
+        if let Some(&v) = var_map.get(&chain.wv_var) {
+            wv_v = v;
         }
     }
     // Output projection not part of this chain at Level 0/1 fusion.

@@ -201,12 +201,11 @@ fn resolve(interner: &Interner, sym: nsl_ast::Symbol) -> &str {
 
 fn extract_model_name(train: &TrainBlock, interner: &Interner) -> Option<String> {
     for arg in &train.config {
-        if let Some(name_sym) = arg.name {
-            if resolve(interner, name_sym) == "model" {
-                if let ExprKind::Ident(sym) = &arg.value.kind {
-                    return Some(resolve(interner, *sym).to_string());
-                }
-            }
+        if let Some(name_sym) = arg.name
+            && resolve(interner, name_sym) == "model"
+            && let ExprKind::Ident(sym) = &arg.value.kind
+        {
+            return Some(resolve(interner, *sym).to_string());
         }
     }
     None
@@ -250,11 +249,11 @@ fn extract_fase_config(train: &TrainBlock, interner: &Interner) -> FaseConfig {
 fn extract_optimizer(train: &TrainBlock, interner: &Interner) -> FaseOptimizer {
     for section in &train.sections {
         if let TrainSection::Optimizer(expr) = section {
-            if let ExprKind::Call { callee, .. } = &expr.kind {
-                if let ExprKind::Ident(sym) = &callee.kind {
-                    let name = resolve(interner, *sym);
-                    return FaseOptimizer::parse(name);
-                }
+            if let ExprKind::Call { callee, .. } = &expr.kind
+                && let ExprKind::Ident(sym) = &callee.kind
+            {
+                let name = resolve(interner, *sym);
+                return FaseOptimizer::parse(name);
             }
             // Bare identifier (no args): `optimizer: AdamW`
             if let ExprKind::Ident(sym) = &expr.kind {
@@ -369,11 +368,11 @@ fn format_phases(phases: &[fase::BackwardPhase]) -> String {
     let mut runs: Vec<(String, usize)> = Vec::new();
     for p in phases {
         let label = format!("{:?}", p);
-        if let Some(last) = runs.last_mut() {
-            if last.0 == label {
-                last.1 += 1;
-                continue;
-            }
+        if let Some(last) = runs.last_mut()
+            && last.0 == label
+        {
+            last.1 += 1;
+            continue;
         }
         runs.push((label, 1));
     }

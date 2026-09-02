@@ -26,10 +26,10 @@ impl Compiler<'_> {
             .iter()
             .filter(|s| {
                 // Filter out decorated function definitions (compiled as top-level fns)
-                if let StmtKind::Decorated { stmt, .. } = &s.kind {
-                    if matches!(stmt.kind, StmtKind::FnDef(_)) {
-                        return false;
-                    }
+                if let StmtKind::Decorated { stmt, .. } = &s.kind
+                    && matches!(stmt.kind, StmtKind::FnDef(_))
+                {
+                    return false;
                 }
                 !matches!(
                     s.kind,

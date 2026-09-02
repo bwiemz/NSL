@@ -543,19 +543,19 @@ fn try_recognize_v1_mlp_chain(
             if prev_out != m_a {
                 break;
             }
-            if let Some(prev_no) = prev_n_outputs {
-                if prev_no != m_a_shape[1] {
-                    return Err(FpgaLoweringError::UnsupportedV1Shape {
-                        found: format!(
-                            "layer {} k_dim={} != layer {} n_outputs={}",
-                            layers_matched + 1,
-                            m_a_shape[1],
-                            layers_matched,
-                            prev_no,
-                        ),
-                        expected: "prev_layer.n_outputs == this_layer.k_dim",
-                    });
-                }
+            if let Some(prev_no) = prev_n_outputs
+                && prev_no != m_a_shape[1]
+            {
+                return Err(FpgaLoweringError::UnsupportedV1Shape {
+                    found: format!(
+                        "layer {} k_dim={} != layer {} n_outputs={}",
+                        layers_matched + 1,
+                        m_a_shape[1],
+                        layers_matched,
+                        prev_no,
+                    ),
+                    expected: "prev_layer.n_outputs == this_layer.k_dim",
+                });
             }
         }
 
@@ -1779,14 +1779,12 @@ mod tests {
         for line in v.lines() {
             let trimmed = line.trim();
             // Match: "wire signed [<bits>:0] _w<N>;"
-            if let Some(rest) = trimmed.strip_prefix("wire signed [") {
-                if let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..]) {
-                    if let Some(id_str) = id_part.strip_suffix(';') {
-                        if let Ok(id) = id_str.parse::<u64>() {
-                            declared.insert(id);
-                        }
-                    }
-                }
+            if let Some(rest) = trimmed.strip_prefix("wire signed [")
+                && let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..])
+                && let Some(id_str) = id_part.strip_suffix(';')
+                && let Ok(id) = id_str.parse::<u64>()
+            {
+                declared.insert(id);
             }
         }
 
@@ -1794,12 +1792,11 @@ mod tests {
         let mut assigned: HashSet<u64> = HashSet::new();
         for line in v.lines() {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("assign _w") {
-                if let Some(eq_pos) = rest.find(" = ") {
-                    if let Ok(id) = rest[..eq_pos].parse::<u64>() {
-                        assigned.insert(id);
-                    }
-                }
+            if let Some(rest) = trimmed.strip_prefix("assign _w")
+                && let Some(eq_pos) = rest.find(" = ")
+                && let Ok(id) = rest[..eq_pos].parse::<u64>()
+            {
+                assigned.insert(id);
             }
         }
 
@@ -1843,14 +1840,12 @@ mod tests {
         for line in v.lines() {
             let trimmed = line.trim();
             // Match: "wire signed [<bits>:0] _w<N>;"
-            if let Some(rest) = trimmed.strip_prefix("wire signed [") {
-                if let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..]) {
-                    if let Some(id_str) = id_part.strip_suffix(';') {
-                        if let Ok(id) = id_str.parse::<u64>() {
-                            declared.insert(id);
-                        }
-                    }
-                }
+            if let Some(rest) = trimmed.strip_prefix("wire signed [")
+                && let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..])
+                && let Some(id_str) = id_part.strip_suffix(';')
+                && let Ok(id) = id_str.parse::<u64>()
+            {
+                declared.insert(id);
             }
         }
 
@@ -1858,12 +1853,11 @@ mod tests {
         let mut assigned: HashSet<u64> = HashSet::new();
         for line in v.lines() {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("assign _w") {
-                if let Some(eq_pos) = rest.find(" = ") {
-                    if let Ok(id) = rest[..eq_pos].parse::<u64>() {
-                        assigned.insert(id);
-                    }
-                }
+            if let Some(rest) = trimmed.strip_prefix("assign _w")
+                && let Some(eq_pos) = rest.find(" = ")
+                && let Ok(id) = rest[..eq_pos].parse::<u64>()
+            {
+                assigned.insert(id);
             }
         }
 

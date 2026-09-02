@@ -12,13 +12,13 @@ pub fn validate_multimodal_decorator(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
     // @multimodal takes no arguments -- just validate it exists
-    if let Some(ref args) = deco.args {
-        if !args.is_empty() {
-            diagnostics.push(
-                Diagnostic::warning("@multimodal takes no arguments")
-                    .with_label(deco.span, "unexpected arguments"),
-            );
-        }
+    if let Some(ref args) = deco.args
+        && !args.is_empty()
+    {
+        diagnostics.push(
+            Diagnostic::warning("@multimodal takes no arguments")
+                .with_label(deco.span, "unexpected arguments"),
+        );
     }
     true
 }

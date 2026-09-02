@@ -76,12 +76,11 @@ pub fn resolve_packing_config_for_stmts(
             StmtKind::DistillBlock(distill) => &distill.sections,
             _ => continue,
         };
-        if let Some(ds_name) = extract_dataset_ref_in(sections, interner) {
-            if let Some(cfg) = datasets.get(&ds_name) {
-                if cfg.enabled {
-                    return Some(cfg.clone());
-                }
-            }
+        if let Some(ds_name) = extract_dataset_ref_in(sections, interner)
+            && let Some(cfg) = datasets.get(&ds_name)
+            && cfg.enabled
+        {
+            return Some(cfg.clone());
         }
     }
     None
@@ -92,11 +91,11 @@ fn check_sections_pack(
     datasets: &std::collections::HashMap<String, DatasetPackingConfig>,
     interner: &Interner,
 ) -> bool {
-    if let Some(ds_name) = extract_dataset_ref_in(sections, interner) {
-        if let Some(cfg) = datasets.get(&ds_name) {
-            let det = pca_detect::detect(cfg, &PcaDetectConfig::default(), 2);
-            return det.strategy != PcaStrategy::NoPacking;
-        }
+    if let Some(ds_name) = extract_dataset_ref_in(sections, interner)
+        && let Some(cfg) = datasets.get(&ds_name)
+    {
+        let det = pca_detect::detect(cfg, &PcaDetectConfig::default(), 2);
+        return det.strategy != PcaStrategy::NoPacking;
     }
     false
 }
@@ -136,14 +135,12 @@ fn extract_dataset_ref_in(sections: &[TrainSection], interner: &Interner) -> Opt
         if let TrainSection::Data(stmts) = section {
             for stmt in stmts {
                 // Pattern: `source = <ident>` → StmtKind::Assign
-                if let StmtKind::Assign { target, value, .. } = &stmt.kind {
-                    if let ExprKind::Ident(target_sym) = &target.kind {
-                        if resolve(interner, *target_sym) == "source" {
-                            if let ExprKind::Ident(val_sym) = &value.kind {
-                                return Some(resolve(interner, *val_sym).to_string());
-                            }
-                        }
-                    }
+                if let StmtKind::Assign { target, value, .. } = &stmt.kind
+                    && let ExprKind::Ident(target_sym) = &target.kind
+                    && resolve(interner, *target_sym) == "source"
+                    && let ExprKind::Ident(val_sym) = &value.kind
+                {
+                    return Some(resolve(interner, *val_sym).to_string());
                 }
                 // Pattern: `let source = <ident>` → StmtKind::VarDecl
                 if let StmtKind::VarDecl {
@@ -151,14 +148,11 @@ fn extract_dataset_ref_in(sections: &[TrainSection], interner: &Interner) -> Opt
                     value: Some(val),
                     ..
                 } = &stmt.kind
+                    && let nsl_ast::pattern::PatternKind::Ident(name) = &pattern.kind
+                    && resolve(interner, *name) == "source"
+                    && let ExprKind::Ident(val_sym) = &val.kind
                 {
-                    if let nsl_ast::pattern::PatternKind::Ident(name) = &pattern.kind {
-                        if resolve(interner, *name) == "source" {
-                            if let ExprKind::Ident(val_sym) = &val.kind {
-                                return Some(resolve(interner, *val_sym).to_string());
-                            }
-                        }
-                    }
+                    return Some(resolve(interner, *val_sym).to_string());
                 }
             }
         }

@@ -5870,10 +5870,10 @@ pub fn flash_attention_backward_cpu_gqa(
                 for j in 0..j_max {
                     // PCA Stage C: cross-segment pairs contribute nothing
                     // (see the seg contract in the doc comment).
-                    if let Some(seg) = seg {
-                        if seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j] {
-                            continue;
-                        }
+                    if let Some(seg) = seg
+                        && seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j]
+                    {
+                        continue;
                     }
                     let kj = kv_base + j * s_stride;
                     let vj = kv_base + j * s_stride;
@@ -5963,10 +5963,10 @@ fn compute_logsumexp_gqa(
                 for j in 0..j_max {
                     // PCA Stage C: cross-segment keys are outside row i's
                     // softmax support.
-                    if let Some(seg) = seg {
-                        if seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j] {
-                            continue;
-                        }
+                    if let Some(seg) = seg
+                        && seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j]
+                    {
+                        continue;
                     }
                     let k_row = k_base_bh + j * s_stride;
                     let mut dot = 0.0f32;
@@ -5981,10 +5981,10 @@ fn compute_logsumexp_gqa(
 
                 let mut sum_exp = 0.0f32;
                 for j in 0..j_max {
-                    if let Some(seg) = seg {
-                        if seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j] {
-                            continue;
-                        }
+                    if let Some(seg) = seg
+                        && seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j]
+                    {
+                        continue;
                     }
                     let k_row = k_base_bh + j * s_stride;
                     let mut dot = 0.0f32;

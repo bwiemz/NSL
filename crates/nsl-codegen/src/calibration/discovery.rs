@@ -324,10 +324,10 @@ fn collect_rhs_expr(expr: &nsl_ast::expr::Expr, interner: &Interner, out: &mut V
                     }
                 }
                 ExprKind::Call { callee, .. } => {
-                    if let ExprKind::Ident(sym) = &callee.kind {
-                        if let Some(name) = interner.resolve(sym.0) {
-                            out.push(name.to_string());
-                        }
+                    if let ExprKind::Ident(sym) = &callee.kind
+                        && let Some(name) = interner.resolve(sym.0)
+                    {
+                        out.push(name.to_string());
                     }
                 }
                 _ => {
@@ -413,10 +413,10 @@ fn collect_model_layer_metadata(
                 let init_expr = init.as_ref()?;
                 // Try evaluator-backed resolution first when a scope is available
                 // (handles `zeros([param, param])` patterns).
-                if let Some(s) = scope {
-                    if let Some(shape) = resolve_field_shape_via_evaluator(init_expr, s, interner) {
-                        return Some(shape);
-                    }
+                if let Some(s) = scope
+                    && let Some(shape) = resolve_field_shape_via_evaluator(init_expr, s, interner)
+                {
+                    return Some(shape);
                 }
                 // Fall through to literal-only path (back-compat for plain literals).
                 extract_shape_from_tensor_init(init_expr, interner)
@@ -446,12 +446,11 @@ fn find_first_instantiation_args(
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::VarDecl { value: Some(init), .. } => {
-                if let ExprKind::Call { callee, args } = &init.kind {
-                    if let ExprKind::Ident(sym) = &callee.kind {
-                        if *sym == model_sym {
-                            return Some(args.as_slice());
-                        }
-                    }
+                if let ExprKind::Call { callee, args } = &init.kind
+                    && let ExprKind::Ident(sym) = &callee.kind
+                    && *sym == model_sym
+                {
+                    return Some(args.as_slice());
                 }
             }
             StmtKind::FnDef(fn_def) => {
@@ -479,12 +478,11 @@ fn find_first_instantiation_args(
                         return Some(r);
                     }
                 }
-                if let Some(blk) = else_block {
-                    if let Some(r) =
+                if let Some(blk) = else_block
+                    && let Some(r) =
                         find_first_instantiation_args(&blk.stmts, model_sym)
-                    {
-                        return Some(r);
-                    }
+                {
+                    return Some(r);
                 }
             }
             StmtKind::For { body, .. }
@@ -889,12 +887,11 @@ fn walk_for_wggo_instantiations(
             } => {
                 if let PatternKind::Ident(name_sym) = &pattern.kind {
                     let var_name = interner.resolve(name_sym.0).unwrap_or("").to_string();
-                    if !var_name.is_empty() {
-                        if let Some(t) =
+                    if !var_name.is_empty()
+                        && let Some(t) =
                             try_build_wggo_target(&var_name, init, decorated, interner)
-                        {
-                            targets.push(t);
-                        }
+                    {
+                        targets.push(t);
                     }
                 }
             }
@@ -1033,10 +1030,10 @@ pub fn pre_scan_wggo_targets_from_ast(
             },
             _ => None,
         };
-        if let Some(model_def) = model_def_opt {
-            if model_has_wggo_target_decorator(model_def, interner) {
-                decorated.insert(model_def.name, model_def);
-            }
+        if let Some(model_def) = model_def_opt
+            && model_has_wggo_target_decorator(model_def, interner)
+        {
+            decorated.insert(model_def.name, model_def);
         }
     }
 
@@ -1066,10 +1063,10 @@ pub fn ast_has_wggo_target_decorators(ast: &nsl_ast::Module, interner: &Interner
             },
             _ => None,
         };
-        if let Some(model_def) = model_def_opt {
-            if model_has_wggo_target_decorator(model_def, interner) {
-                return true;
-            }
+        if let Some(model_def) = model_def_opt
+            && model_has_wggo_target_decorator(model_def, interner)
+        {
+            return true;
         }
     }
     false
@@ -1089,12 +1086,12 @@ pub fn list_decorated_class_names(ast: &nsl_ast::Module, interner: &Interner) ->
             },
             _ => None,
         };
-        if let Some(model_def) = model_def_opt {
-            if model_has_wggo_target_decorator(model_def, interner) {
-                let name = interner.resolve(model_def.name.0).unwrap_or("").to_string();
-                if !name.is_empty() {
-                    out.push(name);
-                }
+        if let Some(model_def) = model_def_opt
+            && model_has_wggo_target_decorator(model_def, interner)
+        {
+            let name = interner.resolve(model_def.name.0).unwrap_or("").to_string();
+            if !name.is_empty() {
+                out.push(name);
             }
         }
     }

@@ -181,10 +181,10 @@ impl<'a> TypeChecker<'a> {
                 .unwrap_or(false);
             if !user_declared {
             let name = self.interner.resolve(sym.0).unwrap_or("").to_string();
-            if name == "enumerate" {
-                if let Some(Type::List(elem_ty)) = arg_types.first() {
-                    return Type::List(Box::new(Type::Tuple(vec![Type::Int, *elem_ty.clone()])));
-                }
+            if name == "enumerate"
+                && let Some(Type::List(elem_ty)) = arg_types.first()
+            {
+                return Type::List(Box::new(Type::Tuple(vec![Type::Int, *elem_ty.clone()])));
             }
             if name == "zip" && arg_types.len() >= 2 {
                 let a = match &arg_types[0] {
@@ -225,21 +225,19 @@ impl<'a> TypeChecker<'a> {
 
             // Math builtins (exp, log, sqrt, sin, cos, abs) — when called with tensor or
             // unknown args, return the arg type (tensor) instead of Float.
-            if matches!(name.as_str(), "exp" | "log" | "sqrt" | "sin" | "cos" | "abs" | "neg" | "floor") {
-                if let Some(first_arg_ty) = arg_types.first() {
-                    if first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate() {
-                        return first_arg_ty.clone();
-                    }
-                }
+            if matches!(name.as_str(), "exp" | "log" | "sqrt" | "sin" | "cos" | "abs" | "neg" | "floor")
+                && let Some(first_arg_ty) = arg_types.first()
+                && (first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate())
+            {
+                return first_arg_ty.clone();
             }
 
             // Tensor reduction / manipulation builtins — always return tensor-like
-            if matches!(name.as_str(), "mean" | "sum" | "reduce_max" | "gather" | "clamp" | "neg") {
-                if let Some(first_arg_ty) = arg_types.first() {
-                    if first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate() {
-                        return first_arg_ty.clone();
-                    }
-                }
+            if matches!(name.as_str(), "mean" | "sum" | "reduce_max" | "gather" | "clamp" | "neg")
+                && let Some(first_arg_ty) = arg_types.first()
+                && (first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate())
+            {
+                return first_arg_ty.clone();
             }
             } // end !user_declared — by-name special cases yield to user declarations
         }
@@ -259,15 +257,15 @@ impl<'a> TypeChecker<'a> {
                                     let mut solver = crate::shape_algebra::ShapeAlgebraSolver::new();
                                     let src_expr = Self::shape_to_product(source_shape, &mut solver);
                                     let tgt_expr = Self::shape_to_product(&target_shape, &mut solver);
-                                    if let (Some(src), Some(tgt)) = (src_expr, tgt_expr) {
-                                        if let Err(pf) = solver.prove_eq_normalized(&src, &tgt) {
-                                            // Only warn — runtime check still active as fallback
-                                            self.diagnostics.push(
-                                                Diagnostic::warning(format!(
-                                                    "reshape may be invalid: {}", pf.reason
-                                                ))
-                                            );
-                                        }
+                                    if let (Some(src), Some(tgt)) = (src_expr, tgt_expr)
+                                        && let Err(pf) = solver.prove_eq_normalized(&src, &tgt)
+                                    {
+                                        // Only warn — runtime check still active as fallback
+                                        self.diagnostics.push(
+                                            Diagnostic::warning(format!(
+                                                "reshape may be invalid: {}", pf.reason
+                                            ))
+                                        );
                                     }
                                 }
                             }
@@ -302,16 +300,16 @@ impl<'a> TypeChecker<'a> {
                                         ExprKind::IntLiteral(n) => Some(*n as usize),
                                         _ => None,
                                     };
-                                    if let (Some(d0), Some(d1)) = (d0, d1) {
-                                        if d0 < shape.rank() && d1 < shape.rank() {
-                                            let mut new_dims = shape.dims.clone();
-                                            new_dims.swap(d0, d1);
-                                            return Type::Tensor {
-                                                shape: Shape { dims: new_dims },
-                                                dtype: *dtype,
-                                                device: device.clone(),
-                                            };
-                                        }
+                                    if let (Some(d0), Some(d1)) = (d0, d1)
+                                        && d0 < shape.rank() && d1 < shape.rank()
+                                    {
+                                        let mut new_dims = shape.dims.clone();
+                                        new_dims.swap(d0, d1);
+                                        return Type::Tensor {
+                                            shape: Shape { dims: new_dims },
+                                            dtype: *dtype,
+                                            device: device.clone(),
+                                        };
                                     }
                                 }
                                 // Can't determine statically — return unknown shape

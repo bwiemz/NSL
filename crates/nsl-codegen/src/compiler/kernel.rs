@@ -74,12 +74,11 @@ fn contains_train_block_stmt(stmt: &Stmt) -> bool {
 fn first_dim_from_init_expr(expr: &nsl_ast::expr::Expr) -> Option<i64> {
     if let ExprKind::Call { args, .. } = &expr.kind {
         let first_arg = args.first()?;
-        if let ExprKind::ListLiteral(elems) = &first_arg.value.kind {
-            if let Some(first) = elems.first() {
-                if let ExprKind::IntLiteral(v) = first.kind {
-                    return Some(v);
-                }
-            }
+        if let ExprKind::ListLiteral(elems) = &first_arg.value.kind
+            && let Some(first) = elems.first()
+            && let ExprKind::IntLiteral(v) = first.kind
+        {
+            return Some(v);
         }
     }
     None
@@ -88,12 +87,11 @@ fn first_dim_from_init_expr(expr: &nsl_ast::expr::Expr) -> Option<i64> {
 fn last_dim_from_init_expr(expr: &nsl_ast::expr::Expr) -> Option<i64> {
     if let ExprKind::Call { args, .. } = &expr.kind {
         let first_arg = args.first()?;
-        if let ExprKind::ListLiteral(elems) = &first_arg.value.kind {
-            if let Some(last) = elems.last() {
-                if let ExprKind::IntLiteral(v) = last.kind {
-                    return Some(v);
-                }
-            }
+        if let ExprKind::ListLiteral(elems) = &first_arg.value.kind
+            && let Some(last) = elems.last()
+            && let ExprKind::IntLiteral(v) = last.kind
+        {
+            return Some(v);
         }
     }
     None
@@ -754,15 +752,15 @@ impl Compiler<'_> {
             // irrelevant to the CSHA training config.
             let mut has_flash = false;
             for member in &md.members {
-                if let ModelMember::Method(_, decos) = member {
-                    if decos.iter().any(|d| {
+                if let ModelMember::Method(_, decos) = member
+                    && decos.iter().any(|d| {
                         d.name.len() == 1
-                            && self.interner.resolve(d.name[0].0).unwrap_or("")
-                                == "flash_attention"
-                    }) {
-                        has_flash = true;
-                        break;
-                    }
+                    && self.interner.resolve(d.name[0].0).unwrap_or("")
+                        == "flash_attention"
+            })
+                {
+                    has_flash = true;
+                    break;
                 }
             }
             if !has_flash {
@@ -774,12 +772,11 @@ impl Compiler<'_> {
             for member in &md.members {
                 if let ModelMember::LayerDecl { name, init: Some(init), .. } = member {
                     let nm = self.interner.resolve(name.0).unwrap_or("");
-                    if NORM_NAMES.contains(&nm) {
-                        if let Some(v) = first_dim_from_init_expr(init) {
-                            if v > 0 {
-                                return Some(v as u32);
-                            }
-                        }
+                    if NORM_NAMES.contains(&nm)
+                        && let Some(v) = first_dim_from_init_expr(init)
+                        && v > 0
+                    {
+                        return Some(v as u32);
                     }
                 }
             }
@@ -790,17 +787,17 @@ impl Compiler<'_> {
                 if let ModelMember::LayerDecl { name, init: Some(init), .. } = member {
                     let nm = self.interner.resolve(name.0).unwrap_or("");
                     if PROJ_NAMES.contains(&nm) {
-                        if let Some(v) = first_dim_from_init_expr(init) {
-                            if v > 0 {
-                                return Some(v as u32);
-                            }
-                            // Last-dim fallback in case the user wrote
-                            // `[d_kv, d_model]` (transposed convention).
+                        if let Some(v) = first_dim_from_init_expr(init)
+                            && v > 0
+                        {
+                            return Some(v as u32);
                         }
-                        if let Some(v) = last_dim_from_init_expr(init) {
-                            if v > 0 {
-                                return Some(v as u32);
-                            }
+                        // Last-dim fallback in case the user wrote
+                        // `[d_kv, d_model]` (transposed convention).
+                        if let Some(v) = last_dim_from_init_expr(init)
+                            && v > 0
+                        {
+                            return Some(v as u32);
                         }
                     }
                 }
@@ -1593,23 +1590,23 @@ impl Compiler<'_> {
                                 if let ExprKind::BoolLiteral(b) = arg.value.kind {
                                     causal = b;
                                 }
-                            } else if aname == "head_dim" {
-                                if let ExprKind::IntLiteral(v) = arg.value.kind {
-                                    // Validate against the v2 emitter's
-                                    // allowed set. Everything downstream
-                                    // (SMEM validator, kernel-name encoder,
-                                    // backward synthesizer) assumes this.
-                                    if !crate::flash_attention_v2::smem_layout::ALLOWED_HEAD_DIM
-                                        .contains(&v)
-                                    {
-                                        return Err(CodegenError::new(format!(
-                                            "@flash_attention(head_dim={}) is not allowed — must be one of {:?}",
-                                            v,
-                                            crate::flash_attention_v2::smem_layout::ALLOWED_HEAD_DIM,
-                                        )));
-                                    }
-                                    head_dim_override = Some(v);
+                            } else if aname == "head_dim"
+                                && let ExprKind::IntLiteral(v) = arg.value.kind
+                            {
+                                // Validate against the v2 emitter's
+                                // allowed set. Everything downstream
+                                // (SMEM validator, kernel-name encoder,
+                                // backward synthesizer) assumes this.
+                                if !crate::flash_attention_v2::smem_layout::ALLOWED_HEAD_DIM
+                                    .contains(&v)
+                                {
+                                    return Err(CodegenError::new(format!(
+                                        "@flash_attention(head_dim={}) is not allowed — must be one of {:?}",
+                                        v,
+                                        crate::flash_attention_v2::smem_layout::ALLOWED_HEAD_DIM,
+                                    )));
                                 }
+                                head_dim_override = Some(v);
                             }
                         }
                     }
@@ -1624,10 +1621,10 @@ impl Compiler<'_> {
                                 .as_ref()
                                 .and_then(|s| self.interner.resolve(s.0))
                                 .unwrap_or("");
-                            if aname == "block_size" {
-                                if let ExprKind::IntLiteral(v) = arg.value.kind {
-                                    paged_block_size = v;
-                                }
+                            if aname == "block_size"
+                                && let ExprKind::IntLiteral(v) = arg.value.kind
+                            {
+                                paged_block_size = v;
                             }
                         }
                     }
@@ -1641,12 +1638,11 @@ impl Compiler<'_> {
                                 .as_ref()
                                 .and_then(|s| self.interner.resolve(s.0))
                                 .unwrap_or("");
-                            if aname == "style" {
-                                if let ExprKind::StringLiteral(ref s) = arg.value.kind {
-                                    if s == "adjacent" {
-                                        rope_style = crate::flash_attention::RopeStyle::Adjacent;
-                                    }
-                                }
+                            if aname == "style"
+                                && let ExprKind::StringLiteral(ref s) = arg.value.kind
+                                && s == "adjacent"
+                            {
+                                rope_style = crate::flash_attention::RopeStyle::Adjacent;
                             }
                         }
                     }
@@ -1659,10 +1655,10 @@ impl Compiler<'_> {
                                 .as_ref()
                                 .and_then(|s| self.interner.resolve(s.0))
                                 .unwrap_or("");
-                            if aname == "groups" {
-                                if let ExprKind::IntLiteral(v) = arg.value.kind {
-                                    gqa_group_size = v as u32;
-                                }
+                            if aname == "groups"
+                                && let ExprKind::IntLiteral(v) = arg.value.kind
+                            {
+                                gqa_group_size = v as u32;
                             }
                         }
                     }
@@ -1673,12 +1669,12 @@ impl Compiler<'_> {
                     // (e.g. a max-depth budget) require an explicit spec
                     // update + extraction-site change rather than silently
                     // being ignored.
-                    if let Some(ref args) = deco.args {
-                        if !args.is_empty() {
-                            return Err(CodegenError::new(
-                                "@tree_mask takes no arguments in v1 (bare decorator only)".to_string(),
-                            ));
-                        }
+                    if let Some(ref args) = deco.args
+                        && !args.is_empty()
+                    {
+                        return Err(CodegenError::new(
+                            "@tree_mask takes no arguments in v1 (bare decorator only)".to_string(),
+                        ));
                     }
                     tree_mask = true;
                 }
@@ -1709,12 +1705,11 @@ impl Compiler<'_> {
                                     .interner
                                     .resolve(name_sym.0)
                                     .unwrap_or("");
-                                if aname == "tokens" {
-                                    if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                                        if *n > 0 {
-                                            num_sink_tokens = *n as u32;
-                                        }
-                                    }
+                                if aname == "tokens"
+                                    && let ExprKind::IntLiteral(n) = &arg.value.kind
+                                    && *n > 0
+                                {
+                                    num_sink_tokens = *n as u32;
                                 }
                             }
                         }

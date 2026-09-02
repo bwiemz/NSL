@@ -611,21 +611,21 @@ pub fn emit(
         // region per the Blackwell static+extern fix, so no separate
         // `.shared` label exists. `emit_range_table_preamble` detects the
         // leading `%` and emits `mov.u64` instead of `cvta.shared.u64`.
-        if let Some((seq_len, residency)) = tier_b {
-            if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-                let range_table_base =
-                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
-                        config,
-                        Direction::Backward,
-                    );
-                crate::pca_tilerange::emit_range_table_preamble(
-                    ptx,
+        if let Some((seq_len, residency)) = tier_b
+            && crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+        {
+            let range_table_base =
+                crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
                     config,
-                    seq_len,
-                    "%seg_base",
-                    range_table_base,
+                    Direction::Backward,
                 );
-            }
+            crate::pca_tilerange::emit_range_table_preamble(
+                ptx,
+                config,
+                seq_len,
+                "%seg_base",
+                range_table_base,
+            );
         }
     }
 }

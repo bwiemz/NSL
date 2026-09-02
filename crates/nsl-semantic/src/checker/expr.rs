@@ -356,12 +356,11 @@ impl<'a> TypeChecker<'a> {
                     }
                     self.current_scope = prev;
                     // Use first arm's last expr type as result
-                    if matches!(result_ty, Type::Unknown) {
-                        if let Some(last) = arm.body.stmts.last() {
-                            if let StmtKind::Expr(e) = &last.kind {
-                                result_ty = self.type_map.get(&e.id).cloned().unwrap_or(Type::Unknown);
-                            }
-                        }
+                    if matches!(result_ty, Type::Unknown)
+                        && let Some(last) = arm.body.stmts.last()
+                        && let StmtKind::Expr(e) = &last.kind
+                    {
+                        result_ty = self.type_map.get(&e.id).cloned().unwrap_or(Type::Unknown);
                     }
                 }
                 result_ty

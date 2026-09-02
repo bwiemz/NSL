@@ -88,10 +88,10 @@ fn parse_integrity(stderr: &str) -> Option<(u64, u64, u64, u64, u64, usize)> {
             } else {
                 inner.split(',').count()
             };
-        } else if let Some((k, v)) = l.split_once('=') {
-            if let Ok(n) = v.trim().parse::<u64>() {
-                map.insert(k.trim().to_string(), n);
-            }
+        } else if let Some((k, v)) = l.split_once('=')
+            && let Ok(n) = v.trim().parse::<u64>()
+        {
+            map.insert(k.trim().to_string(), n);
         }
     }
     Some((

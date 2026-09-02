@@ -204,11 +204,11 @@ pub fn build(list: &WengertList) -> OptGraph {
         }
         let mut chosen: Option<String> = None;
         for &inp in &op.inputs {
-            if let Some(&producer_idx) = var_to_op.get(&inp) {
-                if let Some(layer) = op_to_layer[producer_idx].as_ref() {
-                    chosen = Some(layer.clone());
-                    break;
-                }
+            if let Some(&producer_idx) = var_to_op.get(&inp)
+                && let Some(layer) = op_to_layer[producer_idx].as_ref()
+            {
+                chosen = Some(layer.clone());
+                break;
             }
         }
         let layer_name = chosen.unwrap_or_else(|| "other".to_string());
@@ -247,12 +247,11 @@ pub fn build(list: &WengertList) -> OptGraph {
             continue;
         };
         for &inp in &op.inputs {
-            if let Some(&producer_op) = var_to_op.get(&inp) {
-                if let Some(&producer_layer) = layer_of.get(&(producer_op as u32)) {
-                    if producer_layer != consumer_layer {
-                        dependencies[consumer_layer as usize].insert(producer_layer);
-                    }
-                }
+            if let Some(&producer_op) = var_to_op.get(&inp)
+                && let Some(&producer_layer) = layer_of.get(&(producer_op as u32))
+                && producer_layer != consumer_layer
+            {
+                dependencies[consumer_layer as usize].insert(producer_layer);
             }
         }
     }

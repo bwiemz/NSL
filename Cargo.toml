@@ -77,14 +77,6 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # all at once.
 unsafe_op_in_unsafe_fn = "deny"
 
-[workspace.lints.clippy]
-# Edition 2024 stabilised `let` chains, and clippy now reports every
-# `if … { if let … { … } }` nest as collapsible — 404 sites the day of the
-# flip (roadmap D4), all pre-existing. Collapsing them is a mechanical
-# rewrite that belongs in its own PR (D4 slice 2), not in the edition
-# flip; this `allow` goes with it.
-collapsible_if = "allow"
-
 # ── Build profiles ────────────────────────────────────────────────────────────
 #
 # Measured on the 9800X3D box, clean builds of `nsl` with `--features cuda`

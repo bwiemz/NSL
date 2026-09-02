@@ -305,10 +305,10 @@ train(model = m, epochs = 1):
     let mut called: std::collections::HashSet<String> = std::collections::HashSet::new();
     for section in file.sections() {
         for (_offset, reloc) in section.relocations() {
-            if let object::RelocationTarget::Symbol(idx) = reloc.target() {
-                if let Some(name) = name_by_index.get(&idx) {
-                    called.insert(name.clone());
-                }
+            if let object::RelocationTarget::Symbol(idx) = reloc.target()
+                && let Some(name) = name_by_index.get(&idx)
+            {
+                called.insert(name.clone());
             }
         }
     }

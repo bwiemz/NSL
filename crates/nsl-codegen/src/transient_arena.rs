@@ -548,17 +548,16 @@ pub fn propagate_size_info(
     for list in [forward, adjoint] {
         for op in &list.ops {
             for v in op.inputs.iter().chain(std::iter::once(&op.result)) {
-                if !prop.known.contains_key(v) {
-                    if let Some(dims) = seed(*v) {
-                        if shape_numel(&dims).is_some() {
-                            prop.known.insert(*v, SizeInfo::Shape(dims));
-                        }
-                    }
+                if !prop.known.contains_key(v)
+                    && let Some(dims) = seed(*v)
+                    && shape_numel(&dims).is_some()
+                {
+                    prop.known.insert(*v, SizeInfo::Shape(dims));
                 }
-                if !prop.consts.contains_key(v) {
-                    if let Some(val) = scalar_seed(*v) {
-                        prop.consts.insert(*v, ConstEntry::Num(val));
-                    }
+                if !prop.consts.contains_key(v)
+                    && let Some(val) = scalar_seed(*v)
+                {
+                    prop.consts.insert(*v, ConstEntry::Num(val));
                 }
             }
         }
@@ -587,10 +586,10 @@ impl<'a> SizeProp<'a> {
             // Constant values first: they feed the very size rules below
             // (a `shape` read of a sized var -> the reshape list that sizes
             // the next var).
-            if !self.consts.contains_key(&op.result) {
-                if let Some(c) = self.derive_const(op) {
-                    self.consts.insert(op.result, c);
-                }
+            if !self.consts.contains_key(&op.result)
+                && let Some(c) = self.derive_const(op)
+            {
+                self.consts.insert(op.result, c);
             }
             if self.known.contains_key(&op.result) {
                 continue;
@@ -600,10 +599,10 @@ impl<'a> SizeProp<'a> {
             if self.ty_of.get(&op.result) != Some(&WengertType::Tensor) {
                 continue;
             }
-            if let Some(info) = self.derive_size(op) {
-                if info.numel().is_some() {
-                    self.known.insert(op.result, info);
-                }
+            if let Some(info) = self.derive_size(op)
+                && info.numel().is_some()
+            {
+                self.known.insert(op.result, info);
             }
         }
     }
@@ -636,10 +635,10 @@ impl<'a> SizeProp<'a> {
     /// `const_shape:` op (dims baked into the op name), a `list`
     /// passthrough whose every element folded, or a folded `shape` read.
     fn static_list_dims(&self, v: VarId) -> Option<Vec<i64>> {
-        if let Some(ConstEntry::List(dims)) = self.const_of(v) {
-            if !dims.is_empty() && dims.iter().all(|&d| d > 0) {
-                return Some(dims.clone());
-            }
+        if let Some(ConstEntry::List(dims)) = self.const_of(v)
+            && !dims.is_empty() && dims.iter().all(|&d| d > 0)
+        {
+            return Some(dims.clone());
         }
         None
     }

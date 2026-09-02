@@ -164,14 +164,12 @@ impl CheckpointManager {
                 let path = entry.path();
                 if path.extension().map(|e| e == "nslm").unwrap_or(false) {
                     // Extract iteration from filename: ckpt_<iter>.nslm
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        if let Some(iter_str) = stem.strip_prefix("ckpt_") {
-                            if let Ok(iter) = iter_str.parse::<u64>() {
-                                if latest.as_ref().map(|(i, _)| iter > *i).unwrap_or(true) {
-                                    latest = Some((iter, path));
-                                }
-                            }
-                        }
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                        && let Some(iter_str) = stem.strip_prefix("ckpt_")
+                        && let Ok(iter) = iter_str.parse::<u64>()
+                        && latest.as_ref().map(|(i, _)| iter > *i).unwrap_or(true)
+                    {
+                        latest = Some((iter, path));
                     }
                 }
             }

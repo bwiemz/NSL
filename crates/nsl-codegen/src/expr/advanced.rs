@@ -802,14 +802,14 @@ impl Compiler<'_> {
             }
         }
         // Error if first arg is a closure (captures variables) -- HOFs in C runtime expect bare fn ptrs
-        if let ExprKind::Ident(sym) = &args[0].value.kind {
-            if state.closure_info.contains_key(sym) {
-                let name = self.resolve_sym(*sym).to_string();
-                return Err(CodegenError::new(format!(
-                    "cannot pass closure '{name}' to {func_name}() -- closures with captured variables \
+        if let ExprKind::Ident(sym) = &args[0].value.kind
+            && state.closure_info.contains_key(sym)
+        {
+            let name = self.resolve_sym(*sym).to_string();
+            return Err(CodegenError::new(format!(
+                "cannot pass closure '{name}' to {func_name}() -- closures with captured variables \
                      are not supported in higher-order functions yet. Use a non-capturing lambda instead."
-                )));
-            }
+            )));
         }
         let fn_val = self.compile_expr(builder, state, &args[0].value)?;
         // Also catch inline capturing lambdas (not just named variables)
@@ -866,30 +866,30 @@ impl Compiler<'_> {
             }
 
             // M52b: Identity layer elimination — if one operand is a near-identity weight, skip the matmul
-            if op == BinOp::MatMul {
-                if let Some(pass_through) = self.try_identity_elim(state, lhs, rhs) {
-                    // ELTLS: try_identity_elim returns one of the existing
-                    // operands unchanged — no new ownership entry is needed
-                    // because the operand retains its previously-registered
-                    // state (BorrowedWeight for the weight or whatever the
-                    // other operand was).
-                    return Ok(pass_through);
-                }
+            if op == BinOp::MatMul
+                && let Some(pass_through) = self.try_identity_elim(state, lhs, rhs)
+            {
+                // ELTLS: try_identity_elim returns one of the existing
+                // operands unchanged — no new ownership entry is needed
+                // because the operand retains its previously-registered
+                // state (BorrowedWeight for the weight or whatever the
+                // other operand was).
+                return Ok(pass_through);
             }
 
             // M52c: Try sparse matmul if RHS weight is >50% sparse
-            if op == BinOp::MatMul && !state.flags.is_fp8_compute {
-                if let Some(sparse_result) = self.try_sparse_matmul(builder, state, lhs, rhs)? {
-                    state.cleanup.tensor_temporaries.push(sparse_result);
-                    // ELTLS: nsl_sparse_matmul returns a fresh owned tensor.
-                    self.set_ownership(
-                        builder,
-                        state,
-                        sparse_result,
-                        Ownership::Owned,
-                    );
-                    return Ok(sparse_result);
-                }
+            if op == BinOp::MatMul && !state.flags.is_fp8_compute
+                && let Some(sparse_result) = self.try_sparse_matmul(builder, state, lhs, rhs)?
+            {
+                state.cleanup.tensor_temporaries.push(sparse_result);
+                // ELTLS: nsl_sparse_matmul returns a fresh owned tensor.
+                self.set_ownership(
+                    builder,
+                    state,
+                    sparse_result,
+                    Ownership::Owned,
+                );
+                return Ok(sparse_result);
             }
 
             // Tensor-tensor ops (normal runtime path)
@@ -1253,14 +1253,12 @@ impl Compiler<'_> {
             "clone" => {
                 // M38b: Ownership lowering can prove clone is unnecessary when
                 // the source is linear, consumed once, with no borrows or sharing.
-                if let ExprKind::Ident(sym) = &object.kind {
-                    if let Some(ref lowering) = state.ownership.lowering {
-                        if lowering.decide_clone(sym) == crate::ownership::CloneDecision::Eliminate
-                            && !state.flags.in_tape_region
-                        {
-                            return Ok(obj_val); // elide clone — linear single-owner
-                        }
-                    }
+                if let ExprKind::Ident(sym) = &object.kind
+                    && let Some(ref lowering) = state.ownership.lowering
+                    && lowering.decide_clone(sym) == crate::ownership::CloneDecision::Eliminate
+                    && !state.flags.in_tape_region
+                {
+                    return Ok(obj_val); // elide clone — linear single-owner
                 }
                 // FBIP Phase 2 used to skip the clone here whenever the source
                 // binding was textually single-use (`uc.is_single_use(sym)`),
@@ -2451,87 +2449,87 @@ impl Compiler<'_> {
         let resolve =
             |sym: Symbol| -> Option<String> { interner.resolve(sym.0).map(|s| s.to_string()) };
 
-        if let Some((ops, inputs)) = crate::fusion::analyze_fusible_chain(expr, &resolve) {
-            if ops.len() >= 2 && !inputs.is_empty() && inputs.len() <= 2 {
-                // Convert op names to runtime op codes
-                let op_codes: Vec<i64> = ops
-                    .iter()
-                    .filter_map(|op| match op.as_str() {
-                        "add" => Some(0), // FUSED_OP_ADD
-                        "mul" => Some(1),
-                        "sub" => Some(2),
-                        "div" => Some(3),
-                        "relu" => Some(4),
-                        "sigmoid" => Some(5),
-                        "tanh" => Some(6),
-                        "neg" => Some(7),
-                        "exp" => Some(8),
-                        "log" => Some(9),
-                        "sqrt" => Some(10),
-                        "abs" => Some(11),
-                        "gelu" => Some(12),
-                        "silu" => Some(13),
-                        _ => None, // Unknown op — skip fusion
-                    })
-                    .collect();
-                if op_codes.len() != ops.len() {
-                    return Ok(None); // Some op couldn't be fused — fall back
-                }
-
-                // Only fuse when ALL inputs are confirmed tensors (not Unknown/Error).
-                // Unknown types could be scalars (struct fields, function returns)
-                // which would crash the fused tensor kernel.
-                let all_confirmed_tensors =
-                    inputs.iter().all(|inp| self.node_type(inp.id).is_tensor());
-                if !all_confirmed_tensors {
-                    return Ok(None);
-                }
-
-                // Only fuse same-shape ops (no broadcast).
-                // Skip fusion for binary ops with 2 inputs — shapes might differ
-                // (e.g., tensor * scalar_tensor from Xavier init).
-                // Unary chains (1 input) are always safe.
-                if inputs.len() > 1 {
-                    return Ok(None); // TODO: add shape comparison when shapes are known
-                }
-
-                // Compile inputs (bypass fusion to avoid infinite recursion)
-                state.flags.in_fuse_bypass = true;
-                let compiled_inputs: Vec<Value> = inputs
-                    .iter()
-                    .map(|inp| self.compile_expr(builder, state, inp))
-                    .collect::<Result<Vec<_>, _>>()?;
-                state.flags.in_fuse_bypass = false;
-
-                // Build op-codes list
-                let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-                for &code in &op_codes {
-                    let code_val = builder.ins().iconst(cl_types::I64, code);
-                    self.compile_call_by_name(builder, "nsl_list_push", &[ops_list, code_val])?;
-                }
-                let num_ops = builder.ins().iconst(cl_types::I64, op_codes.len() as i64);
-
-                let result = if compiled_inputs.len() == 2 {
-                    // Binary + unary chain: nsl_fused_elementwise_2(a, b, ops, num_ops)
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_fused_elementwise_2",
-                        &[compiled_inputs[0], compiled_inputs[1], ops_list, num_ops],
-                    )?
-                } else {
-                    // Single input + unary chain: nsl_fused_elementwise_1(a, ops, num_ops)
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_fused_elementwise_1",
-                        &[compiled_inputs[0], ops_list, num_ops],
-                    )?
-                };
-
-                // Free the ops list (small allocation, not a tensor)
-                self.compile_call_by_name(builder, "nsl_list_free", &[ops_list])?;
-
-                return Ok(Some(result));
+        if let Some((ops, inputs)) = crate::fusion::analyze_fusible_chain(expr, &resolve)
+            && ops.len() >= 2 && !inputs.is_empty() && inputs.len() <= 2
+        {
+            // Convert op names to runtime op codes
+            let op_codes: Vec<i64> = ops
+                .iter()
+                .filter_map(|op| match op.as_str() {
+                    "add" => Some(0), // FUSED_OP_ADD
+                    "mul" => Some(1),
+                    "sub" => Some(2),
+                    "div" => Some(3),
+                    "relu" => Some(4),
+                    "sigmoid" => Some(5),
+                    "tanh" => Some(6),
+                    "neg" => Some(7),
+                    "exp" => Some(8),
+                    "log" => Some(9),
+                    "sqrt" => Some(10),
+                    "abs" => Some(11),
+                    "gelu" => Some(12),
+                    "silu" => Some(13),
+                    _ => None, // Unknown op — skip fusion
+                })
+                .collect();
+            if op_codes.len() != ops.len() {
+                return Ok(None); // Some op couldn't be fused — fall back
             }
+
+            // Only fuse when ALL inputs are confirmed tensors (not Unknown/Error).
+            // Unknown types could be scalars (struct fields, function returns)
+            // which would crash the fused tensor kernel.
+            let all_confirmed_tensors =
+                inputs.iter().all(|inp| self.node_type(inp.id).is_tensor());
+            if !all_confirmed_tensors {
+                return Ok(None);
+            }
+
+            // Only fuse same-shape ops (no broadcast).
+            // Skip fusion for binary ops with 2 inputs — shapes might differ
+            // (e.g., tensor * scalar_tensor from Xavier init).
+            // Unary chains (1 input) are always safe.
+            if inputs.len() > 1 {
+                return Ok(None); // TODO: add shape comparison when shapes are known
+            }
+
+            // Compile inputs (bypass fusion to avoid infinite recursion)
+            state.flags.in_fuse_bypass = true;
+            let compiled_inputs: Vec<Value> = inputs
+                .iter()
+                .map(|inp| self.compile_expr(builder, state, inp))
+                .collect::<Result<Vec<_>, _>>()?;
+            state.flags.in_fuse_bypass = false;
+
+            // Build op-codes list
+            let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            for &code in &op_codes {
+                let code_val = builder.ins().iconst(cl_types::I64, code);
+                self.compile_call_by_name(builder, "nsl_list_push", &[ops_list, code_val])?;
+            }
+            let num_ops = builder.ins().iconst(cl_types::I64, op_codes.len() as i64);
+
+            let result = if compiled_inputs.len() == 2 {
+                // Binary + unary chain: nsl_fused_elementwise_2(a, b, ops, num_ops)
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_fused_elementwise_2",
+                    &[compiled_inputs[0], compiled_inputs[1], ops_list, num_ops],
+                )?
+            } else {
+                // Single input + unary chain: nsl_fused_elementwise_1(a, ops, num_ops)
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_fused_elementwise_1",
+                    &[compiled_inputs[0], ops_list, num_ops],
+                )?
+            };
+
+            // Free the ops list (small allocation, not a tensor)
+            self.compile_call_by_name(builder, "nsl_list_free", &[ops_list])?;
+
+            return Ok(Some(result));
         }
 
         Ok(None)
@@ -3009,40 +3007,40 @@ impl Compiler<'_> {
         let wmap = self.features.weight_map.as_ref()?;
 
         // Check RHS (more common: x @ W where W ≈ I)
-        if let Some(key) = state.weight_values.get(&rhs) {
-            if let Some(entry) = wmap.get(key) {
-                let elim = crate::weight_aware::DeadWeightEliminator::new(
-                    &self.compile_options.weight_config,
+        if let Some(key) = state.weight_values.get(&rhs)
+            && let Some(entry) = wmap.get(key)
+        {
+            let elim = crate::weight_aware::DeadWeightEliminator::new(
+                &self.compile_options.weight_config,
+            );
+            if elim.is_near_identity(
+                entry,
+                self.compile_options.weight_config.dead_weight_threshold,
+            ) {
+                eprintln!(
+                    "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
+                    key
                 );
-                if elim.is_near_identity(
-                    entry,
-                    self.compile_options.weight_config.dead_weight_threshold,
-                ) {
-                    eprintln!(
-                        "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
-                        key
-                    );
-                    return Some(lhs); // x @ I ≈ x
-                }
+                return Some(lhs); // x @ I ≈ x
             }
         }
 
         // Check LHS (less common: W @ x where W ≈ I)
-        if let Some(key) = state.weight_values.get(&lhs) {
-            if let Some(entry) = wmap.get(key) {
-                let elim = crate::weight_aware::DeadWeightEliminator::new(
-                    &self.compile_options.weight_config,
+        if let Some(key) = state.weight_values.get(&lhs)
+            && let Some(entry) = wmap.get(key)
+        {
+            let elim = crate::weight_aware::DeadWeightEliminator::new(
+                &self.compile_options.weight_config,
+            );
+            if elim.is_near_identity(
+                entry,
+                self.compile_options.weight_config.dead_weight_threshold,
+            ) {
+                eprintln!(
+                    "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
+                    key
                 );
-                if elim.is_near_identity(
-                    entry,
-                    self.compile_options.weight_config.dead_weight_threshold,
-                ) {
-                    eprintln!(
-                        "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
-                        key
-                    );
-                    return Some(rhs); // I @ x ≈ x
-                }
+                return Some(rhs); // I @ x ≈ x
             }
         }
 
@@ -3185,69 +3183,69 @@ impl Compiler<'_> {
         };
 
         // Check RHS weight for sparsity
-        if let Some(key) = state.weight_values.get(&rhs) {
-            if let Some(entry) = wmap.get(key) {
-                let hint = if let Some(info) = entry.sparsity() {
-                    if info.use_sparse_kernel {
-                        if let Some(ref csr) = info.csr {
-                            eprintln!(
-                                "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
-                                key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
-                            );
-                            SparsityHint::Sparse {
-                                weight_name: key.clone(),
-                                nnz: csr.nnz,
-                                nrows: csr.nrows,
-                                ncols: csr.ncols,
-                                sparsity: info.near_zero_fraction,
-                            }
-                        } else {
-                            SparsityHint::Dense
+        if let Some(key) = state.weight_values.get(&rhs)
+            && let Some(entry) = wmap.get(key)
+        {
+            let hint = if let Some(info) = entry.sparsity() {
+                if info.use_sparse_kernel {
+                    if let Some(ref csr) = info.csr {
+                        eprintln!(
+                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
+                            key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
+                        );
+                        SparsityHint::Sparse {
+                            weight_name: key.clone(),
+                            nnz: csr.nnz,
+                            nrows: csr.nrows,
+                            ncols: csr.ncols,
+                            sparsity: info.near_zero_fraction,
                         }
                     } else {
                         SparsityHint::Dense
                     }
                 } else {
                     SparsityHint::Dense
-                };
-                // Key by rhs Value's u32 index (NodeId namespace is disjoint from
-                // Cranelift Value namespace; this is a codegen-internal hint only).
-                self.features
-                    .sparsity_hints
-                    .insert(NodeId(rhs.as_u32()), hint);
-            }
+                }
+            } else {
+                SparsityHint::Dense
+            };
+            // Key by rhs Value's u32 index (NodeId namespace is disjoint from
+            // Cranelift Value namespace; this is a codegen-internal hint only).
+            self.features
+                .sparsity_hints
+                .insert(NodeId(rhs.as_u32()), hint);
         }
 
         // Check LHS weight for sparsity
-        if let Some(key) = state.weight_values.get(&lhs) {
-            if let Some(entry) = wmap.get(key) {
-                let hint = if let Some(info) = entry.sparsity() {
-                    if info.use_sparse_kernel {
-                        if let Some(ref csr) = info.csr {
-                            eprintln!(
-                                "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
-                                key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
-                            );
-                            SparsityHint::Sparse {
-                                weight_name: key.clone(),
-                                nnz: csr.nnz,
-                                nrows: csr.nrows,
-                                ncols: csr.ncols,
-                                sparsity: info.near_zero_fraction,
-                            }
-                        } else {
-                            SparsityHint::Dense
+        if let Some(key) = state.weight_values.get(&lhs)
+            && let Some(entry) = wmap.get(key)
+        {
+            let hint = if let Some(info) = entry.sparsity() {
+                if info.use_sparse_kernel {
+                    if let Some(ref csr) = info.csr {
+                        eprintln!(
+                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
+                            key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
+                        );
+                        SparsityHint::Sparse {
+                            weight_name: key.clone(),
+                            nnz: csr.nnz,
+                            nrows: csr.nrows,
+                            ncols: csr.ncols,
+                            sparsity: info.near_zero_fraction,
                         }
                     } else {
                         SparsityHint::Dense
                     }
                 } else {
                     SparsityHint::Dense
-                };
-                self.features
-                    .sparsity_hints
-                    .insert(NodeId(lhs.as_u32()), hint);
-            }
+                }
+            } else {
+                SparsityHint::Dense
+            };
+            self.features
+                .sparsity_hints
+                .insert(NodeId(lhs.as_u32()), hint);
         }
     }
 
@@ -3266,35 +3264,34 @@ impl Compiler<'_> {
         }
 
         // Check if the scalar comes from a known weight (e.g., scale tensor loaded from safetensors)
-        if let Some(key) = state.weight_values.get(&scalar_val) {
-            if let Some(&scale) = self.memory.weight_scales.get(key) {
-                eprintln!(
-                    "[nsl] M52d: fused scaling constant {:.6e} for weight '{}'",
-                    scale, key
-                );
-                let const_val = builder.ins().f64const(scale as f64);
-                return (Some(const_val), true);
-            }
+        if let Some(key) = state.weight_values.get(&scalar_val)
+            && let Some(&scale) = self.memory.weight_scales.get(key)
+        {
+            eprintln!(
+                "[nsl] M52d: fused scaling constant {:.6e} for weight '{}'",
+                scale, key
+            );
+            let const_val = builder.ins().f64const(scale as f64);
+            return (Some(const_val), true);
         }
 
         // Also check: if the scalar is from a weight entry that IS a scale factor
         // (common pattern: model has a `scale` field that's a single-element tensor)
-        if let Some(key) = state.weight_values.get(&scalar_val) {
-            if let Some(ref wmap) = self.features.weight_map {
-                if let Some(entry) = wmap.get(key) {
-                    // Single-element weight used as a scalar multiplier → embed as constant
-                    if entry.num_elements == 1 {
-                        let bw = entry.dtype.byte_width();
-                        if bw <= entry.data.len() {
-                            let val = entry.dtype.to_f64(&entry.data[0..bw]);
-                            eprintln!(
-                                "[nsl] M52d: fused single-element weight '{}' = {:.6e} as compile-time constant",
-                                key, val
-                            );
-                            let const_val = builder.ins().f64const(val);
-                            return (Some(const_val), true);
-                        }
-                    }
+        if let Some(key) = state.weight_values.get(&scalar_val)
+            && let Some(ref wmap) = self.features.weight_map
+            && let Some(entry) = wmap.get(key)
+        {
+            // Single-element weight used as a scalar multiplier → embed as constant
+            if entry.num_elements == 1 {
+                let bw = entry.dtype.byte_width();
+                if bw <= entry.data.len() {
+                    let val = entry.dtype.to_f64(&entry.data[0..bw]);
+                    eprintln!(
+                        "[nsl] M52d: fused single-element weight '{}' = {:.6e} as compile-time constant",
+                        key, val
+                    );
+                    let const_val = builder.ins().f64const(val);
+                    return (Some(const_val), true);
                 }
             }
         }

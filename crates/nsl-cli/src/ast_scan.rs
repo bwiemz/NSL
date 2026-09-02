@@ -151,10 +151,10 @@ fn scan_model_def_for_weight_ref(m: &ModelDef, interner: &Interner) -> Option<Pa
     for member in &m.members {
         match member {
             ModelMember::LayerDecl { init, .. } => {
-                if let Some(e) = init {
-                    if let Some(p) = scan_expr_for_weight_ref(e, interner) {
-                        return Some(p);
-                    }
+                if let Some(e) = init
+                    && let Some(p) = scan_expr_for_weight_ref(e, interner)
+                {
+                    return Some(p);
                 }
             }
             ModelMember::Method(f, _decorators) => {
@@ -362,20 +362,20 @@ fn scan_stmt_for_cpdt_weight_aware(stmt: &Stmt, interner: &Interner) -> Option<b
         StmtKind::FnDef(f) => scan_block_for_cpdt_weight_aware(&f.body, interner),
         StmtKind::ModelDef(m) => {
             for member in &m.members {
-                if let ModelMember::Method(f, _decorators) = member {
-                    if let Some(b) = scan_block_for_cpdt_weight_aware(&f.body, interner) {
-                        return Some(b);
-                    }
+                if let ModelMember::Method(f, _decorators) = member
+                    && let Some(b) = scan_block_for_cpdt_weight_aware(&f.body, interner)
+                {
+                    return Some(b);
                 }
             }
             None
         }
         StmtKind::TrainBlock(tb) => {
             for section in &tb.sections {
-                if let TrainSection::Stmt(s) = section {
-                    if let Some(b) = scan_stmt_for_cpdt_weight_aware(s, interner) {
-                        return Some(b);
-                    }
+                if let TrainSection::Stmt(s) = section
+                    && let Some(b) = scan_stmt_for_cpdt_weight_aware(s, interner)
+                {
+                    return Some(b);
                 }
             }
             None
@@ -407,10 +407,10 @@ fn extract_cpdt_weight_aware(d: &Decorator, interner: &Interner) -> Option<bool>
             continue;
         };
         let aname = interner.resolve(name_sym.0)?;
-        if aname == "weight_aware" {
-            if let ExprKind::BoolLiteral(b) = arg.value.kind {
-                return Some(b);
-            }
+        if aname == "weight_aware"
+            && let ExprKind::BoolLiteral(b) = arg.value.kind
+        {
+            return Some(b);
         }
     }
     None

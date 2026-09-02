@@ -217,21 +217,21 @@ pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_p
     }
 
     // 2. Next to current executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // Try matching the compiled binary stem first, else the exe name
-            let stem = if !compiled_path_str.is_empty() {
-                std::path::Path::new(compiled_path_str)
-                    .file_stem()
-                    .map(|s| s.to_owned())
-            } else {
-                exe.file_stem().map(|s| s.to_owned())
-            };
-            if let Some(stem) = stem {
-                let mut pb = dir.join(&stem);
-                pb.set_extension("nslweights");
-                candidates.push(pb);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        // Try matching the compiled binary stem first, else the exe name
+        let stem = if !compiled_path_str.is_empty() {
+            std::path::Path::new(compiled_path_str)
+                .file_stem()
+                .map(|s| s.to_owned())
+        } else {
+            exe.file_stem().map(|s| s.to_owned())
+        };
+        if let Some(stem) = stem {
+            let mut pb = dir.join(&stem);
+            pb.set_extension("nslweights");
+            candidates.push(pb);
         }
     }
 

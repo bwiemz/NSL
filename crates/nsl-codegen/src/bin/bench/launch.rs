@@ -725,36 +725,36 @@ pub unsafe fn run_fixture(
     // capture per-fixture Tier-B-on / Tier-B-off outputs and assert
     // byte-equality (spec §6.1). The dump happens BEFORE Step 10's
     // cleanup so we read from a still-live device allocation.
-    if let Some(path) = dump_output {
-        if result.is_ok() {
-            let mut host_out = vec![0u8; out_bytes];
-            let rc = unsafe {
-                sys::cuMemcpyDtoH_v2(
-                    host_out.as_mut_ptr() as *mut c_void,
-                    out_dev,
-                    out_bytes,
-                )
-            };
-            if rc != sys::CUresult::CUDA_SUCCESS {
-                let msg = format!(
-                    "cuMemcpyDtoH(out for --dump-output) rc={:?}: {}",
-                    rc,
-                    cu_error_string(rc)
-                );
-                for p in &allocations {
-                    let _ = unsafe { sys::cuMemFree_v2(*p) };
-                }
-                let _ = unsafe { sys::cuModuleUnload(module) };
-                return Err(msg);
+    if let Some(path) = dump_output
+        && result.is_ok()
+    {
+        let mut host_out = vec![0u8; out_bytes];
+        let rc = unsafe {
+            sys::cuMemcpyDtoH_v2(
+                host_out.as_mut_ptr() as *mut c_void,
+                out_dev,
+                out_bytes,
+            )
+        };
+        if rc != sys::CUresult::CUDA_SUCCESS {
+            let msg = format!(
+                "cuMemcpyDtoH(out for --dump-output) rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            );
+            for p in &allocations {
+                let _ = unsafe { sys::cuMemFree_v2(*p) };
             }
-            if let Err(e) = std::fs::write(path, &host_out) {
-                let msg = format!("failed to write --dump-output to {:?}: {}", path, e);
-                for p in &allocations {
-                    let _ = unsafe { sys::cuMemFree_v2(*p) };
-                }
-                let _ = unsafe { sys::cuModuleUnload(module) };
-                return Err(msg);
+            let _ = unsafe { sys::cuModuleUnload(module) };
+            return Err(msg);
+        }
+        if let Err(e) = std::fs::write(path, &host_out) {
+            let msg = format!("failed to write --dump-output to {:?}: {}", path, e);
+            for p in &allocations {
+                let _ = unsafe { sys::cuMemFree_v2(*p) };
             }
+            let _ = unsafe { sys::cuModuleUnload(module) };
+            return Err(msg);
         }
     }
 

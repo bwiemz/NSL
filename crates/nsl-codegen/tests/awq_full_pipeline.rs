@@ -288,10 +288,10 @@ fn discovery_from_fixture_nsl_finds_both_projections() {
         use nsl_ast::stmt::StmtKind;
         match &s.kind {
             StmtKind::Decorated { stmt: inner, .. } => {
-                if let StmtKind::ModelDef(md) = &inner.kind {
-                    if interner.resolve(md.name.0).unwrap_or("") == "TinyMLP" {
-                        return Some(md);
-                    }
+                if let StmtKind::ModelDef(md) = &inner.kind
+                    && interner.resolve(md.name.0).unwrap_or("") == "TinyMLP"
+                {
+                    return Some(md);
                 }
                 None
             }
@@ -318,10 +318,10 @@ fn discovery_from_fixture_nsl_finds_both_projections() {
     // Find the forward body.
     let forward_body = model_def_ref.members.iter().find_map(|m| {
         use nsl_ast::decl::ModelMember;
-        if let ModelMember::Method(fn_def, _) = m {
-            if interner.resolve(fn_def.name.0).unwrap_or("") == "forward" {
-                return Some(&fn_def.body);
-            }
+        if let ModelMember::Method(fn_def, _) = m
+            && interner.resolve(fn_def.name.0).unwrap_or("") == "forward"
+        {
+            return Some(&fn_def.body);
         }
         None
     });

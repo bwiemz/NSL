@@ -193,22 +193,21 @@ pub fn compile_zk(
                         dtype_bits,
                         ..
                     } = op
+                        && let Some(entry) = wmap.get_mut(name)
                     {
-                        if let Some(entry) = wmap.get_mut(name) {
-                            let bw = entry.dtype.byte_width();
-                            let vals: Vec<i64> = (0..entry.num_elements)
-                                .map(|i| {
-                                    let offset = i * bw;
-                                    if offset + bw <= entry.data.len() {
-                                        entry.dtype.to_f64(&entry.data[offset..offset + bw]) as i64
-                                    } else {
-                                        0i64
-                                    }
-                                })
-                                .collect();
-                            *dtype_bits = (entry.dtype.byte_width() * 8) as u32;
-                            *values = Some(vals);
-                        }
+                        let bw = entry.dtype.byte_width();
+                        let vals: Vec<i64> = (0..entry.num_elements)
+                            .map(|i| {
+                                let offset = i * bw;
+                                if offset + bw <= entry.data.len() {
+                                    entry.dtype.to_f64(&entry.data[offset..offset + bw]) as i64
+                                } else {
+                                    0i64
+                                }
+                            })
+                            .collect();
+                        *dtype_bits = (entry.dtype.byte_width() * 8) as u32;
+                        *values = Some(vals);
                     }
                 }
             }
@@ -288,35 +287,35 @@ impl<'a> ZkDagBuilder<'a> {
     }
 
     fn extract_shape(&self, node_id: nsl_ast::NodeId) -> Vec<usize> {
-        if let Some(ty) = self.type_map.get(&node_id) {
-            if let Some((shape, _, _)) = ty.as_tensor_parts() {
-                return shape
-                    .dims
-                    .iter()
-                    .filter_map(|d| {
-                        if let nsl_semantic::types::Dim::Concrete(n) = d {
-                            Some(*n as usize)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-            }
+        if let Some(ty) = self.type_map.get(&node_id)
+            && let Some((shape, _, _)) = ty.as_tensor_parts()
+        {
+            return shape
+                .dims
+                .iter()
+                .filter_map(|d| {
+                    if let nsl_semantic::types::Dim::Concrete(n) = d {
+                        Some(*n as usize)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         vec![1] // fallback: scalar
     }
 
     fn extract_dtype_bits(&self, node_id: nsl_ast::NodeId) -> u32 {
-        if let Some(ty) = self.type_map.get(&node_id) {
-            if let Some((_, dtype, _)) = ty.as_tensor_parts() {
-                return match dtype {
-                    nsl_semantic::types::DType::F64 => 64,
-                    nsl_semantic::types::DType::F32 => 32,
-                    nsl_semantic::types::DType::Fp16 | nsl_semantic::types::DType::Bf16 => 16,
-                    nsl_semantic::types::DType::Int8 | nsl_semantic::types::DType::Uint8 => 8,
-                    _ => 32,
-                };
-            }
+        if let Some(ty) = self.type_map.get(&node_id)
+            && let Some((_, dtype, _)) = ty.as_tensor_parts()
+        {
+            return match dtype {
+                nsl_semantic::types::DType::F64 => 64,
+                nsl_semantic::types::DType::F32 => 32,
+                nsl_semantic::types::DType::Fp16 | nsl_semantic::types::DType::Bf16 => 16,
+                nsl_semantic::types::DType::Int8 | nsl_semantic::types::DType::Uint8 => 8,
+                _ => 32,
+            };
         }
         32 // default
     }

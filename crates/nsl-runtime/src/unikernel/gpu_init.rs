@@ -295,10 +295,11 @@ pub extern "C" fn nsl_unikernel_gpu_init(strategy: i64) -> i64 {
 /// Returns 1 if GPU is ready, 0 otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_gpu_ready() -> i64 {
-    if let Ok(guard) = GPU_STATE.lock() {
-        if let Some(ref result) = *guard {
-            if result.success { return 1; }
-        }
+    if let Ok(guard) = GPU_STATE.lock()
+        && let Some(ref result) = *guard
+        && result.success
+    {
+        return 1;
     }
     0
 }
@@ -308,12 +309,11 @@ pub extern "C" fn nsl_unikernel_gpu_ready() -> i64 {
 /// Returns the device ID (u16) or 0 if no GPU.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_gpu_device_id() -> i64 {
-    if let Ok(guard) = GPU_STATE.lock() {
-        if let Some(ref result) = *guard {
-            if let Some(ref dev) = result.device {
-                return dev.device_id as i64;
-            }
-        }
+    if let Ok(guard) = GPU_STATE.lock()
+        && let Some(ref result) = *guard
+        && let Some(ref dev) = result.device
+    {
+        return dev.device_id as i64;
     }
     0
 }

@@ -235,18 +235,16 @@ fn find_runtime_lib() -> Result<PathBuf, CodegenError> {
     }
 
     // 2. Check relative to executable: <exe>/../lib/ (toolchain distribution)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            if let Some(toolchain_dir) = bin_dir.parent() {
-                if let Some(lib_path) = find_runtime_lib_in_toolchain_dir(
-                    toolchain_dir,
-                    current_target_os(),
-                    current_target_env(),
-                ) {
-                    return Ok(lib_path);
-                }
-            }
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin_dir) = exe.parent()
+        && let Some(toolchain_dir) = bin_dir.parent()
+        && let Some(lib_path) = find_runtime_lib_in_toolchain_dir(
+            toolchain_dir,
+            current_target_os(),
+            current_target_env(),
+        )
+    {
+        return Ok(lib_path);
     }
 
     // 3. Fallback to compile-time path (cargo build scenario)
@@ -613,22 +611,22 @@ fn find_msvc() -> Result<MsvcPaths, CodegenError> {
     for root in &vs_roots {
         let vc_tools = PathBuf::from(root).join(r"VC\Tools\MSVC");
         checked_roots.push(vc_tools.display().to_string());
-        if vc_tools.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&vc_tools) {
-                let mut versions: Vec<PathBuf> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect();
-                versions.sort();
-                if let Some(latest) = versions.last() {
-                    let bin = latest.join(r"bin\Hostx64\x64");
-                    let lib = latest.join(r"lib\x64");
-                    if bin.join("link.exe").exists() {
-                        msvc_bin = Some(bin);
-                        msvc_lib = Some(lib);
-                        break;
-                    }
+        if vc_tools.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&vc_tools)
+        {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            versions.sort();
+            if let Some(latest) = versions.last() {
+                let bin = latest.join(r"bin\Hostx64\x64");
+                let lib = latest.join(r"lib\x64");
+                if bin.join("link.exe").exists() {
+                    msvc_bin = Some(bin);
+                    msvc_lib = Some(lib);
+                    break;
                 }
             }
         }
@@ -695,23 +693,23 @@ fn find_msvc() -> Result<MsvcPaths, CodegenError> {
     let mut sdk_lib_paths = Vec::new();
 
     // Find latest SDK version for libs
-    if sdk_lib_root.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&sdk_lib_root) {
-            let mut versions: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            versions.sort();
-            if let Some(latest) = versions.last() {
-                let ucrt = latest.join(r"ucrt\x64");
-                let um = latest.join(r"um\x64");
-                if ucrt.is_dir() {
-                    sdk_lib_paths.push(ucrt);
-                }
-                if um.is_dir() {
-                    sdk_lib_paths.push(um);
-                }
+    if sdk_lib_root.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&sdk_lib_root)
+    {
+        let mut versions: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        versions.sort();
+        if let Some(latest) = versions.last() {
+            let ucrt = latest.join(r"ucrt\x64");
+            let um = latest.join(r"um\x64");
+            if ucrt.is_dir() {
+                sdk_lib_paths.push(ucrt);
+            }
+            if um.is_dir() {
+                sdk_lib_paths.push(um);
             }
         }
     }

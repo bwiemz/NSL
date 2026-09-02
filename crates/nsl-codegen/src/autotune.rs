@@ -1263,13 +1263,12 @@ fn validate_record(
     // unchanged — so without this check the A100-priced winner survives every
     // rebuild until someone passes --autotune-fresh.
     if let (SelectionMethod::CostModel { spec }, Some(expected)) = (&record.selection, cost_model_spec)
+        && spec != expected
     {
-        if spec != expected {
-            return Err(CacheReject::CostModelSpecChanged {
-                found: spec.clone(),
-                expected: expected.to_string(),
-            });
-        }
+        return Err(CacheReject::CostModelSpecChanged {
+            found: spec.clone(),
+            expected: expected.to_string(),
+        });
     }
     if record.winner.is_empty() {
         return Err(CacheReject::EmptyWinner);

@@ -81,23 +81,23 @@ fn discover_optimizer_modules(entry: &Module, interner: &nsl_lexer::Interner) ->
             for section in sections {
                 match section {
                     TrainSection::Optimizer(expr) => {
-                        if let ExprKind::Call { callee, .. } = &expr.kind {
-                            if let ExprKind::Ident(sym) = &callee.kind {
-                                let name = interner.resolve(sym.0).unwrap_or("").to_lowercase();
-                                let module = match name.as_str() {
-                                    "sgd" => Some("nsl.optim.sgd"),
-                                    "adam" => Some("nsl.optim.adam"),
-                                    "adamw" => Some("nsl.optim.adamw"),
-                                    "lion" => Some("nsl.optim.lion"),
-                                    "muon" => Some("nsl.optim.muon"),
-                                    "soap" => Some("nsl.optim.soap"),
-                                    _ => None,
-                                };
-                                if let Some(m) = module {
-                                    if !modules.iter().any(|x: &String| x == m) {
-                                        modules.push(m.to_string());
-                                    }
-                                }
+                        if let ExprKind::Call { callee, .. } = &expr.kind
+                            && let ExprKind::Ident(sym) = &callee.kind
+                        {
+                            let name = interner.resolve(sym.0).unwrap_or("").to_lowercase();
+                            let module = match name.as_str() {
+                                "sgd" => Some("nsl.optim.sgd"),
+                                "adam" => Some("nsl.optim.adam"),
+                                "adamw" => Some("nsl.optim.adamw"),
+                                "lion" => Some("nsl.optim.lion"),
+                                "muon" => Some("nsl.optim.muon"),
+                                "soap" => Some("nsl.optim.soap"),
+                                _ => None,
+                            };
+                            if let Some(m) = module
+                                && !modules.iter().any(|x: &String| x == m)
+                            {
+                                modules.push(m.to_string());
                             }
                         }
                     }

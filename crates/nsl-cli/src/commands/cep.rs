@@ -18,14 +18,14 @@ fn find_cep_decorator<'a>(
 ) -> Option<&'a nsl_ast::decl::Decorator> {
     use nsl_ast::stmt::StmtKind;
     for stmt in &module.stmts {
-        if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind {
-            if matches!(inner.kind, StmtKind::ModelDef(_)) {
-                for deco in decorators {
-                    if deco.name.len() == 1
-                        && interner.resolve(deco.name[0].0).unwrap_or("") == want
-                    {
-                        return Some(deco);
-                    }
+        if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind
+            && matches!(inner.kind, StmtKind::ModelDef(_))
+        {
+            for deco in decorators {
+                if deco.name.len() == 1
+                    && interner.resolve(deco.name[0].0).unwrap_or("") == want
+                {
+                    return Some(deco);
                 }
             }
         }

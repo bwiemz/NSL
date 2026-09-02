@@ -163,12 +163,11 @@ impl NanAnalyzer {
             StmtKind::VarDecl { pattern, value: Some(val_expr), .. } => {
                 // If the RHS is a function call that produces a known constraint,
                 // propagate it to the LHS binding.
-                if let Some(constraint) = self.expr_constraint(val_expr, interner) {
-                    if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
-                        if constraint != ValueConstraint::Unconstrained {
-                            self.set_constraint(*sym, constraint);
-                        }
-                    }
+                if let Some(constraint) = self.expr_constraint(val_expr, interner)
+                    && let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind
+                    && constraint != ValueConstraint::Unconstrained
+                {
+                    self.set_constraint(*sym, constraint);
                 }
                 // Also check the RHS expression itself for risky calls
                 self.walk_expr(val_expr, interner);
@@ -197,12 +196,11 @@ impl NanAnalyzer {
                 self.walk_block(body, interner);
             }
             StmtKind::Assign { target, value, .. } => {
-                if let Some(constraint) = self.expr_constraint(value, interner) {
-                    if let ExprKind::Ident(sym) = &target.kind {
-                        if constraint != ValueConstraint::Unconstrained {
-                            self.set_constraint(*sym, constraint);
-                        }
-                    }
+                if let Some(constraint) = self.expr_constraint(value, interner)
+                    && let ExprKind::Ident(sym) = &target.kind
+                    && constraint != ValueConstraint::Unconstrained
+                {
+                    self.set_constraint(*sym, constraint);
                 }
                 self.walk_expr(value, interner);
             }
@@ -254,15 +252,14 @@ impl NanAnalyzer {
                     }
 
                     // Detect log(softmax(x)) — should use log_softmax instead
-                    if name == "log" {
-                        if let Some(inner) = args.first() {
-                            if self.is_call_to(&inner.value, "softmax", interner) {
-                                self.diagnostics.push(
-                                    Diagnostic::warning("log(softmax(x)) is numerically unstable — use log_softmax(x) instead")
-                                        .with_label(expr.span, "here")
-                                );
-                            }
-                        }
+                    if name == "log"
+                        && let Some(inner) = args.first()
+                        && self.is_call_to(&inner.value, "softmax", interner)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::warning("log(softmax(x)) is numerically unstable — use log_softmax(x) instead")
+                                .with_label(expr.span, "here")
+                        );
                     }
                 }
 
@@ -273,15 +270,15 @@ impl NanAnalyzer {
             }
             ExprKind::BinaryOp { op, left, right } => {
                 // Check a / b where b may be zero
-                if matches!(op, nsl_ast::operator::BinOp::Div) {
-                    if let ExprKind::Ident(sym) = &right.kind {
-                        let c = self.get_constraint(sym);
-                        if c != ValueConstraint::StrictlyPositive {
-                            self.diagnostics.push(
-                                Diagnostic::warning("division by value that may be zero — Inf risk")
-                                    .with_label(expr.span, "here")
-                            );
-                        }
+                if matches!(op, nsl_ast::operator::BinOp::Div)
+                    && let ExprKind::Ident(sym) = &right.kind
+                {
+                    let c = self.get_constraint(sym);
+                    if c != ValueConstraint::StrictlyPositive {
+                        self.diagnostics.push(
+                            Diagnostic::warning("division by value that may be zero — Inf risk")
+                                .with_label(expr.span, "here")
+                        );
                     }
                 }
                 self.walk_expr(left, interner);
@@ -380,10 +377,10 @@ impl NanAnalyzer {
             }
             // x * x is always NonNegative
             ExprKind::BinaryOp { op: nsl_ast::operator::BinOp::Mul, left, right } => {
-                if let (ExprKind::Ident(a), ExprKind::Ident(b)) = (&left.kind, &right.kind) {
-                    if a == b {
-                        return Some(ValueConstraint::NonNegative);
-                    }
+                if let (ExprKind::Ident(a), ExprKind::Ident(b)) = (&left.kind, &right.kind)
+                    && a == b
+                {
+                    return Some(ValueConstraint::NonNegative);
                 }
                 None
             }

@@ -33,10 +33,10 @@ fn cfg(hd: i64, bq: i64) -> FlashAttentionConfig {
 }
 
 fn find_ptxas() -> Option<String> {
-    if let Ok(p) = std::env::var("PTXAS") {
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
+    if let Ok(p) = std::env::var("PTXAS")
+        && std::path::Path::new(&p).exists()
+    {
+        return Some(p);
     }
     for name in ["ptxas", "ptxas.exe"] {
         if Command::new(name)

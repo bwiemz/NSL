@@ -84,16 +84,16 @@ pub fn render_comparison(manifest: &Manifest, actual: &ActualReport) -> String {
             "{:<20} {:>10.2}\u{03BC}s {} {}{}\n",
             k.op_name, k.predicted_us, actual_str, delta_str, flag
         ));
-        if let Some(a) = agg {
-            if a.count > 0 {
-                let mean = a.sum_us / a.count as f64;
-                let d_pct = (mean - k.predicted_us) / k.predicted_us * 100.0;
-                if d_pct.abs() > 20.0 {
-                    out.push_str(&format!(
-                        "   \u{2192} likely cause: {}\n",
-                        likely_cause(k)
-                    ));
-                }
+        if let Some(a) = agg
+            && a.count > 0
+        {
+            let mean = a.sum_us / a.count as f64;
+            let d_pct = (mean - k.predicted_us) / k.predicted_us * 100.0;
+            if d_pct.abs() > 20.0 {
+                out.push_str(&format!(
+                    "   \u{2192} likely cause: {}\n",
+                    likely_cause(k)
+                ));
             }
         }
     }

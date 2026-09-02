@@ -65,21 +65,20 @@ impl<'a> TypeChecker<'a> {
                             value,
                             op: nsl_ast::operator::AssignOp::Assign,
                         } = &stmt.kind
+                            && let nsl_ast::expr::ExprKind::Ident(name_sym) = target.kind
                         {
-                            if let nsl_ast::expr::ExprKind::Ident(name_sym) = target.kind {
-                                let name = self.resolve_name(name_sym);
-                                if DATA_SECTION_KEYS.contains(&name.as_str()) {
-                                    self.check_expr(value);
-                                } else {
-                                    self.diagnostics.push(
-                                        Diagnostic::error(format!(
-                                            "unknown data-section key '{name}'"
-                                        ))
-                                        .with_label(target.span, "unknown data-section key"),
-                                    );
-                                }
-                                continue;
+                            let name = self.resolve_name(name_sym);
+                            if DATA_SECTION_KEYS.contains(&name.as_str()) {
+                                self.check_expr(value);
+                            } else {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "unknown data-section key '{name}'"
+                                    ))
+                                    .with_label(target.span, "unknown data-section key"),
+                                );
                             }
+                            continue;
                         }
                         self.check_stmt(stmt);
                     }
@@ -354,15 +353,15 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         }
-        if let (Some(t), Some(s)) = (teacher_sym, student_sym) {
-            if t == s {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "distill teacher and student must be distinct model instances",
-                    )
-                    .with_label(distill.span, "teacher == student"),
-                );
-            }
+        if let (Some(t), Some(s)) = (teacher_sym, student_sym)
+            && t == s
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "distill teacher and student must be distinct model instances",
+                )
+                .with_label(distill.span, "teacher == student"),
+            );
         }
 
         // loss: section — literal-only key=value entries in v1.
@@ -487,21 +486,20 @@ impl<'a> TypeChecker<'a> {
                             value,
                             op: nsl_ast::operator::AssignOp::Assign,
                         } = &stmt.kind
+                            && let nsl_ast::expr::ExprKind::Ident(name_sym) = target.kind
                         {
-                            if let nsl_ast::expr::ExprKind::Ident(name_sym) = target.kind {
-                                let name = self.resolve_name(name_sym);
-                                if DATA_SECTION_KEYS.contains(&name.as_str()) {
-                                    self.check_expr(value);
-                                } else {
-                                    self.diagnostics.push(
-                                        Diagnostic::error(format!(
-                                            "unknown data-section key '{name}'"
-                                        ))
-                                        .with_label(target.span, "unknown data-section key"),
-                                    );
-                                }
-                                continue;
+                            let name = self.resolve_name(name_sym);
+                            if DATA_SECTION_KEYS.contains(&name.as_str()) {
+                                self.check_expr(value);
+                            } else {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "unknown data-section key '{name}'"
+                                    ))
+                                    .with_label(target.span, "unknown data-section key"),
+                                );
                             }
+                            continue;
                         }
                         self.check_stmt(stmt);
                     }
@@ -727,13 +725,13 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 "drain_timeout_ms" => {
-                    if let ExprKind::IntLiteral(v) = &entry.value.kind {
-                        if *v < 0 {
-                            self.diagnostics.push(
-                                Diagnostic::error("drain_timeout_ms must be >= 0")
-                                    .with_label(entry.value.span, "negative timeout"),
-                            );
-                        }
+                    if let ExprKind::IntLiteral(v) = &entry.value.kind
+                        && *v < 0
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::error("drain_timeout_ms must be >= 0")
+                                .with_label(entry.value.span, "negative timeout"),
+                        );
                     }
                 }
                 _ => {} // other config entries validated elsewhere

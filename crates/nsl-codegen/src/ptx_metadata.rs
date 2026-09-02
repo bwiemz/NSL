@@ -102,11 +102,9 @@ pub fn extract_ptx_metadata(ptx: &[u8]) -> Vec<KernelMetadata> {
         let line = raw.trim();
 
         // Module-scope target directive (applies to subsequent kernels).
-        if !in_kernel {
-            if let Some(sm) = parse_target_sm(line) {
-                target_sm = sm;
-                continue;
-            }
+        if !in_kernel && let Some(sm) = parse_target_sm(line) {
+            target_sm = sm;
+            continue;
         }
 
         // Shared-memory declaration (may be module- or kernel-scope).

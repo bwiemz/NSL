@@ -532,10 +532,10 @@ fn find_train_block(module: &Module) -> Option<&TrainBlock> {
 fn find_fn_by_name<'a>(module: &'a Module, interner: &Interner, name: &str) -> Option<&'a FnDef> {
     for s in &module.stmts {
         let st = unwrap_decorated_stmt(s);
-        if let StmtKind::FnDef(f) = &st.kind {
-            if sym_str(interner, f.name) == name {
-                return Some(f);
-            }
+        if let StmtKind::FnDef(f) = &st.kind
+            && sym_str(interner, f.name) == name
+        {
+            return Some(f);
         }
     }
     None
@@ -558,10 +558,10 @@ fn find_sole_top_fn(module: &Module) -> Option<&FnDef> {
 fn find_model_by_name<'a>(module: &'a Module, interner: &Interner, name: &str) -> Option<&'a ModelDef> {
     for s in &module.stmts {
         let st = unwrap_decorated_stmt(s);
-        if let StmtKind::ModelDef(m) = &st.kind {
-            if sym_str(interner, m.name) == name {
-                return Some(m);
-            }
+        if let StmtKind::ModelDef(m) = &st.kind
+            && sym_str(interner, m.name) == name
+        {
+            return Some(m);
         }
     }
     None

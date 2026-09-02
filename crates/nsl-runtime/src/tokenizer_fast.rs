@@ -384,19 +384,18 @@ impl FastBpeEncoder {
         let mut seg_start = 0usize;
         let mut i = 0usize;
         while i < bytes.len() {
-            if self.special_lead[bytes[i] as usize] {
-                if let Some(sp) = self
+            if self.special_lead[bytes[i] as usize]
+                && let Some(sp) = self
                     .specials
                     .iter()
                     .find(|sp| bytes[i..].starts_with(&sp.surface))
-                {
-                    // Text before the surface, then the surface's own id.
-                    self.encode_span(&text[seg_start..i], cache, out);
-                    out.push(sp.id);
-                    i += sp.surface.len();
-                    seg_start = i;
-                    continue;
-                }
+            {
+                // Text before the surface, then the surface's own id.
+                self.encode_span(&text[seg_start..i], cache, out);
+                out.push(sp.id);
+                i += sp.surface.len();
+                seg_start = i;
+                continue;
             }
             i += 1;
         }
@@ -549,15 +548,15 @@ impl FastBpeEncoder {
             next[right] = NONE;
 
             let left = prev[pos];
-            if left != NONE {
-                if let Some((r, _)) = self.rank_of(symbols[left as usize], symbols[pos]) {
-                    heap.push(Reverse(((r as u64) << 32) | left as u64));
-                }
+            if left != NONE
+                && let Some((r, _)) = self.rank_of(symbols[left as usize], symbols[pos])
+            {
+                heap.push(Reverse(((r as u64) << 32) | left as u64));
             }
-            if next[pos] != NONE {
-                if let Some((r, _)) = self.rank_of(symbols[pos], symbols[next[pos] as usize]) {
-                    heap.push(Reverse(((r as u64) << 32) | pos as u64));
-                }
+            if next[pos] != NONE
+                && let Some((r, _)) = self.rank_of(symbols[pos], symbols[next[pos] as usize])
+            {
+                heap.push(Reverse(((r as u64) << 32) | pos as u64));
             }
         }
 

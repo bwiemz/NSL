@@ -1501,10 +1501,10 @@ fn emit_model_backward_bridge(
         let mut primal_vars = crate::wengert_lower::VarMap::new();
 
         // Map input symbol.
-        if let Some(input_sym) = input_sym_opt {
-            if let Some(&vid) = extractor.symbol_var_map().get(&input_sym) {
-                primal_vars.insert(vid, input_handle);
-            }
+        if let Some(input_sym) = input_sym_opt
+            && let Some(&vid) = extractor.symbol_var_map().get(&input_sym)
+        {
+            primal_vars.insert(vid, input_handle);
         }
         // Map weight params via named_param_var_ids.
         for (compound_name, primal_vid) in extractor.named_param_var_ids() {
@@ -2031,10 +2031,10 @@ pub fn emit_calibration_model_object(
     // compile_user_functions (which cannot lower a void model method to a returning IR).
     if compile_opts.calibration_grad_retention.is_some() {
         let forward_has_return = model_def.members.iter().any(|m| {
-            if let nsl_ast::decl::ModelMember::Method(fn_def, _) = m {
-                if bundle.interner.resolve(fn_def.name.0) == Some("forward") {
-                    return fn_def.return_type.is_some();
-                }
+            if let nsl_ast::decl::ModelMember::Method(fn_def, _) = m
+                && bundle.interner.resolve(fn_def.name.0) == Some("forward")
+            {
+                return fn_def.return_type.is_some();
             }
             false
         });
@@ -5135,16 +5135,14 @@ mod loop_body_dispatch {
                 continue;
             }
             for (_offset, reloc) in sec.relocations() {
-                if let RelocationTarget::Symbol(sym_idx) = reloc.target() {
-                    if let Ok(sym) = obj.symbol_by_index(sym_idx) {
-                        if sym
-                            .name()
-                            .map(|n| strip_host_symbol_prefix(n).starts_with("__nsl_wggo_grad."))
-                            .unwrap_or(false)
-                        {
-                            count += 1;
-                        }
-                    }
+                if let RelocationTarget::Symbol(sym_idx) = reloc.target()
+                    && let Ok(sym) = obj.symbol_by_index(sym_idx)
+                    && sym
+                        .name()
+                        .map(|n| strip_host_symbol_prefix(n).starts_with("__nsl_wggo_grad."))
+                        .unwrap_or(false)
+                {
+                    count += 1;
                 }
             }
         }

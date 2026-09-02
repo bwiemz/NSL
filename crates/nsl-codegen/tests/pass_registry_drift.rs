@@ -229,10 +229,8 @@ fn wiki_pass_sections() -> Vec<String> {
             in_section = line.trim() == "## Per-pass descriptions";
             continue;
         }
-        if in_section {
-            if let Some(h) = line.strip_prefix("### ") {
-                out.push(h.trim().to_string());
-            }
+        if in_section && let Some(h) = line.strip_prefix("### ") {
+            out.push(h.trim().to_string());
         }
     }
     assert!(
@@ -249,10 +247,10 @@ fn every_documented_pass_has_its_wiki_section() {
     let sections = wiki_pass_sections();
     let mut missing = Vec::new();
     for p in PASSES {
-        if let WikiCoverage::Documented(heading) = p.wiki {
-            if !sections.iter().any(|s| s == heading) {
-                missing.push(format!("{}: expected '### {heading}'", p.name));
-            }
+        if let WikiCoverage::Documented(heading) = p.wiki
+            && !sections.iter().any(|s| s == heading)
+        {
+            missing.push(format!("{}: expected '### {heading}'", p.name));
         }
     }
     assert!(
@@ -509,10 +507,10 @@ fn every_decorator_trigger_is_recognised_somewhere() {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    if let Ok(s) = std::fs::read_to_string(&p) {
-                        haystack.push_str(&strip_line_comments(&s));
-                    }
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && let Ok(s) = std::fs::read_to_string(&p)
+                {
+                    haystack.push_str(&strip_line_comments(&s));
                 }
             }
         }
@@ -1004,26 +1002,26 @@ fn every_pass_trace_record_names_a_registered_pass() {
     for f in files {
         let Ok(text) = std::fs::read_to_string(&f) else { continue };
         for line in strip_line_comments(&text).lines() {
-            if let Some(rest) = line.split("pass_trace::record(\"").nth(1) {
-                if let Some(name) = rest.split('"').next() {
-                    sites += 1;
-                    entry_names.insert(name.to_string());
-                    if nsl_codegen::pass_registry::pass(name).is_none() {
-                        bad.push(format!("{}: record(\"{name}\")", f.display()));
-                    }
+            if let Some(rest) = line.split("pass_trace::record(\"").nth(1)
+                && let Some(name) = rest.split('"').next()
+            {
+                sites += 1;
+                entry_names.insert(name.to_string());
+                if nsl_codegen::pass_registry::pass(name).is_none() {
+                    bad.push(format!("{}: record(\"{name}\")", f.display()));
                 }
             }
             // A call whose name argument wraps onto the next line is invisible
             // to this scan. That is a deliberate constraint on the call sites,
             // not an oversight: every site is written with the name on the
             // same line as the call, and the floors below fail if one drifts.
-            if let Some(rest) = line.split("pass_trace::record_disposition(\"").nth(1) {
-                if let Some(name) = rest.split('"').next() {
-                    disposition_sites += 1;
-                    disposition_names.insert(name.to_string());
-                    if nsl_codegen::pass_registry::pass(name).is_none() {
-                        bad.push(format!("{}: record_disposition(\"{name}\")", f.display()));
-                    }
+            if let Some(rest) = line.split("pass_trace::record_disposition(\"").nth(1)
+                && let Some(name) = rest.split('"').next()
+            {
+                disposition_sites += 1;
+                disposition_names.insert(name.to_string());
+                if nsl_codegen::pass_registry::pass(name).is_none() {
+                    bad.push(format!("{}: record_disposition(\"{name}\")", f.display()));
                 }
             }
         }

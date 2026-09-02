@@ -219,10 +219,8 @@ fn marker_i64(stdout: &str, tag: &str) -> Option<i64> {
             in_block = true;
         } else if t == end {
             in_block = false;
-        } else if in_block {
-            if let Ok(v) = t.parse::<f64>() {
-                return Some(v as i64);
-            }
+        } else if in_block && let Ok(v) = t.parse::<f64>() {
+            return Some(v as i64);
         }
     }
     None

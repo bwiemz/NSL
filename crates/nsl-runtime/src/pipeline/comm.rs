@@ -102,11 +102,11 @@ impl PipelineBackend for SharedMemPipeline {
         loop {
             // Check if data is available for our (rank, tag)
             // We receive using our own rank as the key — sender wrote to (dst_rank=us, tag)
-            if let Some(mailbox) = guard.get_mut(&(src_rank, tag)) {
-                if let Some(data) = mailbox.data.take() {
-                    guard.remove(&(src_rank, tag));
-                    return data;
-                }
+            if let Some(mailbox) = guard.get_mut(&(src_rank, tag))
+                && let Some(data) = mailbox.data.take()
+            {
+                guard.remove(&(src_rank, tag));
+                return data;
             }
             // Wait for data — note: we use the mailbox key from the sender's perspective
             // Sender writes to (dst_rank, tag), so we check (dst_rank=us, tag)
@@ -326,11 +326,11 @@ pub extern "C" fn nsl_pipeline_recv(
     let rank = my_rank as usize;
     let mut mbox_guard = backend_mailboxes.lock().unwrap();
     loop {
-        if let Some(mailbox) = mbox_guard.get_mut(&(rank, tag)) {
-            if let Some(data) = mailbox.data.take() {
-                mbox_guard.remove(&(rank, tag));
-                return deserialize_tensor(&data);
-            }
+        if let Some(mailbox) = mbox_guard.get_mut(&(rank, tag))
+            && let Some(data) = mailbox.data.take()
+        {
+            mbox_guard.remove(&(rank, tag));
+            return deserialize_tensor(&data);
         }
         mbox_guard = backend_cv.wait(mbox_guard).unwrap();
     }

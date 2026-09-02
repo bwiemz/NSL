@@ -1763,10 +1763,11 @@ pub fn synthesize_backward_with_tier_b(
     // `fused_projections = true` (`n1_p1`, i.e. `level1_with_fused_proj`) is
     // exercised by passing GPU gates and must keep working. Only `level1()`
     // produces the broken pair — `level2`/`level3` set both flags.
-    if let Some(csha) = config.csha.as_ref() {
-        if csha.fused_rmsnorm && !csha.fused_projections {
-            return Err(format!(
-                "CSHA fused backward refused for fused_rmsnorm=true + \
+    if let Some(csha) = config.csha.as_ref()
+        && csha.fused_rmsnorm && !csha.fused_projections
+    {
+        return Err(format!(
+            "CSHA fused backward refused for fused_rmsnorm=true + \
                  fused_projections=false (kernel suffix n1_p0): the RoPE-Q \
                  epilogue reads cos/sin from SMEM staged only by the \
                  fused-projection prologue, so with rope_q=true the forward \
@@ -1777,9 +1778,8 @@ pub fn synthesize_backward_with_tier_b(
                  with LevelTooLow and falls back to the scalar backward — so \
                  set fused_projections=true (CshaExtras::level1_with_fused_proj) \
                  or use level >= 2 if you are calling this entry directly.",
-                csha.level
-            ));
-        }
+            csha.level
+        ));
     }
 
     // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`.
@@ -2011,32 +2011,30 @@ pub fn synthesize_backward_with_tier_b(
         // for all q_iters too, so the predicate result is actually loop-
         // invariant across q_iters; we still emit per-q_iter labels for
         // ptxas's BRA.U inference and to avoid label namespace collisions).
-        if tier_b_active {
-            if let Some((seq_len, _residency)) = tier_b {
-                let range_table_base =
-                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
-                        config,
-                        crate::flash_attention_v2::smem_layout::Direction::Backward,
-                    );
-                let skip_label = format!("BWD_KV_TILE_SKIP_TB_{q_iter}");
-                ptx.push_str(&format!(
-                    "    {{ // PCA Tier B.2 per-q_iter skip-predicate scope (q_iter={q_iter})\n"
-                ));
-                crate::pca_tilerange::emit_skip_predicate(
-                    &mut ptx,
+        if tier_b_active && let Some((seq_len, _residency)) = tier_b {
+            let range_table_base =
+                crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
                     config,
-                    seq_len,
-                    // B2-2.5: %r_qt_ord_TB_BWD = (%q_start >> log2(block_q)).
-                    // Correct under BOTH grid_x=num_q_tiles (bench legacy) and
-                    // grid_x=1 (production, q-block in seq_lens_ptr).
-                    "%r_qt_ord_TB_BWD",
-                    "%r_kvt_ord_TB_BWD",
-                    range_table_base,
-                    &skip_label,
-                    crate::pca_tilerange::IterationOrder::KVOuter,
+                    crate::flash_attention_v2::smem_layout::Direction::Backward,
                 );
-                ptx.push_str("    } // end per-q_iter skip-predicate scope\n");
-            }
+            let skip_label = format!("BWD_KV_TILE_SKIP_TB_{q_iter}");
+            ptx.push_str(&format!(
+                "    {{ // PCA Tier B.2 per-q_iter skip-predicate scope (q_iter={q_iter})\n"
+            ));
+            crate::pca_tilerange::emit_skip_predicate(
+                &mut ptx,
+                config,
+                seq_len,
+                // B2-2.5: %r_qt_ord_TB_BWD = (%q_start >> log2(block_q)).
+                // Correct under BOTH grid_x=num_q_tiles (bench legacy) and
+                // grid_x=1 (production, q-block in seq_lens_ptr).
+                "%r_qt_ord_TB_BWD",
+                "%r_kvt_ord_TB_BWD",
+                range_table_base,
+                &skip_label,
+                crate::pca_tilerange::IterationOrder::KVOuter,
+            );
+            ptx.push_str("    } // end per-q_iter skip-predicate scope\n");
         }
 
         let hd = config.head_dim as u32;

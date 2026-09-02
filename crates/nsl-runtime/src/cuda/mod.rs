@@ -2853,35 +2853,35 @@ pub(crate) mod cublas_inner {
         // decline falls through to the GemmEx call below, which computes the
         // identical product (`lt_matmul` guarantees a failed launch wrote
         // nothing).
-        if let Some(s) = scratch {
-            if super::lt_matmul::enabled() {
-                let op_code = |o: cublas_sys::cublasOperation_t| match o {
-                    cublas_sys::cublasOperation_t::CUBLAS_OP_N => 0i32,
-                    cublas_sys::cublasOperation_t::CUBLAS_OP_T => 1,
-                    _ => -1, // conjugate ops never reach real-typed GEMMs; declines inside
-                };
-                // SAFETY: forwards this call's live operand/output pointers
-                // under the same layout contract as the GemmEx call below.
-                let issued = unsafe {
-                    super::lt_matmul::matmul_bf16_f32(
-                        op_code(transa),
-                        op_code(transb),
-                        m,
-                        n,
-                        k,
-                        alpha,
-                        s.first16 as *const std::ffi::c_void,
-                        lda,
-                        s.second16 as *const std::ffi::c_void,
-                        ldb,
-                        beta,
-                        c_dev,
-                        ldc,
-                    )
-                };
-                if issued {
-                    return Ok(());
-                }
+        if let Some(s) = scratch
+            && super::lt_matmul::enabled()
+        {
+            let op_code = |o: cublas_sys::cublasOperation_t| match o {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N => 0i32,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T => 1,
+                _ => -1, // conjugate ops never reach real-typed GEMMs; declines inside
+            };
+            // SAFETY: forwards this call's live operand/output pointers
+            // under the same layout contract as the GemmEx call below.
+            let issued = unsafe {
+                super::lt_matmul::matmul_bf16_f32(
+                    op_code(transa),
+                    op_code(transb),
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    s.first16 as *const std::ffi::c_void,
+                    lda,
+                    s.second16 as *const std::ffi::c_void,
+                    ldb,
+                    beta,
+                    c_dev,
+                    ldc,
+                )
+            };
+            if issued {
+                return Ok(());
             }
         }
         let (a_ptr, b_ptr, ab_type, compute) = match scratch {
@@ -3600,17 +3600,17 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     assert_gpu_f32(a, kernel_name, "lhs");
     assert_gpu_f32(b, kernel_name, "rhs");
     if a.len != b.len || !a.is_contiguous() || !b.is_contiguous() {
-        if let Some((prepared_a, prepared_b, free_a, free_b)) = gpu_prepare_binary_operands(a_ptr, b_ptr) {
-            if prepared_a != a_ptr || prepared_b != b_ptr {
-                let result = gpu_elementwise_binary(prepared_a, prepared_b, ptx, kernel_name);
-                if free_a {
-                    crate::tensor::nsl_tensor_free(prepared_a);
-                }
-                if free_b {
-                    crate::tensor::nsl_tensor_free(prepared_b);
-                }
-                return result;
+        if let Some((prepared_a, prepared_b, free_a, free_b)) = gpu_prepare_binary_operands(a_ptr, b_ptr)
+            && (prepared_a != a_ptr || prepared_b != b_ptr)
+        {
+            let result = gpu_elementwise_binary(prepared_a, prepared_b, ptx, kernel_name);
+            if free_a {
+                crate::tensor::nsl_tensor_free(prepared_a);
             }
+            if free_b {
+                crate::tensor::nsl_tensor_free(prepared_b);
+            }
+            return result;
         }
         // Fall back to CPU only when GPU broadcast materialization is impossible.
         if a.len != b.len {

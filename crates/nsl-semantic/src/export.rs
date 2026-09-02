@@ -60,10 +60,10 @@ fn validate_model_method_exports(
         .members
         .iter()
         .filter_map(|m| {
-            if let ModelMember::LayerDecl { name, type_ann, .. } = m {
-                if is_tensor_type(type_ann) {
-                    return Some(interner.resolve(name.0).unwrap_or(""));
-                }
+            if let ModelMember::LayerDecl { name, type_ann, .. } = m
+                && is_tensor_type(type_ann)
+            {
+                return Some(interner.resolve(name.0).unwrap_or(""));
             }
             None
         })
@@ -572,21 +572,21 @@ fn validate_fn_signature(
         validate_param(param, interner, diagnostics);
     }
 
-    if let Some(ref ret_ty) = fn_def.return_type {
-        if !is_c_abi_compatible(ret_ty, interner) {
-            diagnostics.push(
-                Diagnostic::error(
-                    format!(
-                        "@export function must return a tensor, a tuple of those, or one \
+    if let Some(ref ret_ty) = fn_def.return_type
+        && !is_c_abi_compatible(ret_ty, interner)
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "@export function must return a tensor, a tuple of those, or one \
                          of the C-ABI scalars {} (other scalar spellings lower \
                          inconsistently across the header, the wrapper and the function \
                          body — see C_ABI_SCALARS)",
-                        C_ABI_SCALARS.join("/")
-                    ),
-                )
-                .with_label(ret_ty.span, "non-ABI return type"),
-            );
-        }
+                    C_ABI_SCALARS.join("/")
+                ),
+            )
+            .with_label(ret_ty.span, "non-ABI return type"),
+        );
     }
 
     // Warn if the body references model weights — these are silently absent
@@ -660,10 +660,10 @@ fn check_no_model_weight_access(
         if param_name == "self" {
             has_self_param = true;
             suspect_syms.insert(param.name);
-        } else if let Some(ref ty) = param.type_ann {
-            if is_model_typed(ty, interner) {
-                suspect_syms.insert(param.name);
-            }
+        } else if let Some(ref ty) = param.type_ann
+            && is_model_typed(ty, interner)
+        {
+            suspect_syms.insert(param.name);
         }
     }
 
@@ -849,10 +849,10 @@ fn find_weight_access_in_expr(
         }
         ExprKind::FString(parts) => {
             for part in parts {
-                if let nsl_ast::expr::FStringPart::Expr(e) = part {
-                    if let Some(s) = find_weight_access_in_expr(e, suspects, has_self_param) {
-                        return Some(s);
-                    }
+                if let nsl_ast::expr::FStringPart::Expr(e) = part
+                    && let Some(s) = find_weight_access_in_expr(e, suspects, has_self_param)
+                {
+                    return Some(s);
                 }
             }
             None
@@ -882,12 +882,11 @@ fn find_weight_access_in_expr(
         ExprKind::MatchExpr { subject, arms } => {
             find_weight_access_in_expr(subject, suspects, has_self_param).or_else(|| {
                 for arm in arms {
-                    if let Some(guard) = &arm.guard {
-                        if let Some(s) =
+                    if let Some(guard) = &arm.guard
+                        && let Some(s) =
                             find_weight_access_in_expr(guard, suspects, has_self_param)
-                        {
-                            return Some(s);
-                        }
+                    {
+                        return Some(s);
                     }
                     if let Some(s) =
                         find_weight_access_in_block(&arm.body, suspects, has_self_param)

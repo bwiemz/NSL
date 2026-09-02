@@ -564,10 +564,10 @@ pub fn rematerialize(
             &info.op_name,
             info.dtype_bytes,
             inputs_live,
-        ) {
-            if candidate.score >= threshold || candidate.recompute_class == RecomputeClass::Free {
-                candidates.push((idx, candidate));
-            }
+        )
+            && (candidate.score >= threshold || candidate.recompute_class == RecomputeClass::Free)
+        {
+            candidates.push((idx, candidate));
         }
     }
 
@@ -958,29 +958,27 @@ fn walk_stmt(
             }
 
             // Check if this binding is a tensor with static shape
-            if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
-                if let Some(name_str) = interner.resolve(sym.0) {
-                    let name = name_str.to_string();
-                    // Type map stores types on expr IDs, not stmt IDs.
-                    // Check the RHS expression's type for tensor shape info.
-                    // Only plan GPU tensors (device = Cuda) — CPU tensors use heap.
-                    let expr_ty = value.as_ref().and_then(|v| type_map.get(&v.id));
-                    if let Some(ty) = expr_ty {
-                        if let Some((shape, dtype, device)) = ty.as_tensor_parts() {
-                            let is_gpu = matches!(device, nsl_semantic::types::Device::Cuda(_));
-                            if is_gpu {
-                                if let Some((size_bytes, size_kind)) =
-                                    compute_tensor_bytes(shape, dtype)
-                                {
-                                    if size_bytes > 0 {
-                                        let loc = format!("byte {}", stmt.span.start.0);
-                                        analyzer.record_alloc(&name, size_bytes, size_kind, &loc);
-                                        let id = analyzer.current_pp();
-                                        name_to_id.insert(name, id);
-                                    }
-                                }
-                            }
-                        }
+            if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind
+                && let Some(name_str) = interner.resolve(sym.0)
+            {
+                let name = name_str.to_string();
+                // Type map stores types on expr IDs, not stmt IDs.
+                // Check the RHS expression's type for tensor shape info.
+                // Only plan GPU tensors (device = Cuda) — CPU tensors use heap.
+                let expr_ty = value.as_ref().and_then(|v| type_map.get(&v.id));
+                if let Some(ty) = expr_ty
+                    && let Some((shape, dtype, device)) = ty.as_tensor_parts()
+                {
+                    let is_gpu = matches!(device, nsl_semantic::types::Device::Cuda(_));
+                    if is_gpu
+                        && let Some((size_bytes, size_kind)) =
+                            compute_tensor_bytes(shape, dtype)
+                        && size_bytes > 0
+                    {
+                        let loc = format!("byte {}", stmt.span.start.0);
+                        analyzer.record_alloc(&name, size_bytes, size_kind, &loc);
+                        let id = analyzer.current_pp();
+                        name_to_id.insert(name, id);
                     }
                 }
             }
@@ -1046,10 +1044,10 @@ fn walk_expr_uses(
 
     match &expr.kind {
         ExprKind::Ident(sym) => {
-            if let Some(name) = interner.resolve(sym.0) {
-                if name_to_id.contains_key(name) {
-                    analyzer.record_use(name);
-                }
+            if let Some(name) = interner.resolve(sym.0)
+                && name_to_id.contains_key(name)
+            {
+                analyzer.record_use(name);
             }
         }
 

@@ -306,12 +306,11 @@ fn infer_n_layers(weights: &WeightMap) -> Option<u32> {
     for name in weights.names() {
         let mut parts = name.split('.').peekable();
         while let Some(part) = parts.next() {
-            if matches!(part, "layers" | "blocks" | "h" | "layer") {
-                if let Some(next) = parts.peek() {
-                    if let Ok(idx) = next.parse::<u32>() {
-                        max_idx = Some(max_idx.map_or(idx, |m| m.max(idx)));
-                    }
-                }
+            if matches!(part, "layers" | "blocks" | "h" | "layer")
+                && let Some(next) = parts.peek()
+                && let Ok(idx) = next.parse::<u32>()
+            {
+                max_idx = Some(max_idx.map_or(idx, |m| m.max(idx)));
             }
         }
     }
@@ -332,20 +331,19 @@ fn infer_vocab_d_model(weights: &WeightMap) -> Option<(u32, u32)> {
         "transformer.wte.weight",
     ];
     for cand in CANDIDATES {
-        if let Some(entry) = weights.get(cand) {
-            if let [vocab, d_model] = entry.shape[..] {
-                return Some((vocab as u32, d_model as u32));
-            }
+        if let Some(entry) = weights.get(cand)
+            && let [vocab, d_model] = entry.shape[..]
+        {
+            return Some((vocab as u32, d_model as u32));
         }
     }
     // Fall back to any name ending in a recognisable embedding suffix.
     for name in weights.names() {
-        if name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight") {
-            if let Some(entry) = weights.get(name) {
-                if let [vocab, d_model] = entry.shape[..] {
-                    return Some((vocab as u32, d_model as u32));
-                }
-            }
+        if (name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight"))
+            && let Some(entry) = weights.get(name)
+            && let [vocab, d_model] = entry.shape[..]
+        {
+            return Some((vocab as u32, d_model as u32));
         }
     }
     None
@@ -363,11 +361,11 @@ pub fn resolve_model_shape(
                         default: u32,
                         sources: &mut Vec<(&'static str, &'static str)>|
      -> u32 {
-        if let Some(v) = explicit {
-            if v > 0 {
-                sources.push((field, "serve-config"));
-                return v as u32;
-            }
+        if let Some(v) = explicit
+            && v > 0
+        {
+            sources.push((field, "serve-config"));
+            return v as u32;
         }
         if let Some((v, label)) = inferred {
             sources.push((field, label));
@@ -602,15 +600,15 @@ pub fn prepare<'a>(
     // LM-head vocab; a tokenizer of a different size would silently
     // index the wrong rows once the mask is bound (G16 seam) — enforce
     // equality at the only point that sees both numbers.
-    if let Some(dfa) = grammar_dfa.as_ref() {
-        if dfa.vocab_size != shape.vocab_size {
-            return Err(CodegenError::new(format!(
-                "CFIE grammar fusion: tokenizer vocabulary has {} tokens but the \
+    if let Some(dfa) = grammar_dfa.as_ref()
+        && dfa.vocab_size != shape.vocab_size
+    {
+        return Err(CodegenError::new(format!(
+            "CFIE grammar fusion: tokenizer vocabulary has {} tokens but the \
                  model's vocab_size is {} — the baked mask row stride requires \
                  them to match. Fix the tokenizer file or the vocab_size key.",
-                dfa.vocab_size, shape.vocab_size
-            )));
-        }
+            dfa.vocab_size, shape.vocab_size
+        )));
     }
 
     let max_seq = cfg.max_seq.unwrap_or(4096).max(1) as u32;

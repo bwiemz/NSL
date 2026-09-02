@@ -96,10 +96,10 @@ impl Compiler<'_> {
         let top_level: Vec<_> = stmts
             .iter()
             .filter(|s| {
-                if let StmtKind::Decorated { stmt, .. } = &s.kind {
-                    if matches!(stmt.kind, StmtKind::FnDef(_)) {
-                        return false;
-                    }
+                if let StmtKind::Decorated { stmt, .. } = &s.kind
+                    && matches!(stmt.kind, StmtKind::FnDef(_))
+                {
+                    return false;
                 }
                 !matches!(
                     s.kind,

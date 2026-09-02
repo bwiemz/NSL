@@ -586,14 +586,14 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
 
     let mut missing: Vec<String> = Vec::new();
     for v in all_variants() {
-        if let Coverage::Exercised(test_name) = classify_coverage(&v) {
-            if !produced.contains(&v.discriminant_name()) {
-                missing.push(format!(
-                    "{} (claimed exercised by `{}`)",
-                    v.discriminant_name(),
-                    test_name
-                ));
-            }
+        if let Coverage::Exercised(test_name) = classify_coverage(&v)
+            && !produced.contains(&v.discriminant_name())
+        {
+            missing.push(format!(
+                "{} (claimed exercised by `{}`)",
+                v.discriminant_name(),
+                test_name
+            ));
         }
     }
     assert!(

@@ -26,14 +26,13 @@ pub fn extract_shard_decorator<'a>(
                 for arg in args {
                     if let Some(name_sym) = arg.name {
                         let name = resolve_sym(name_sym);
-                        if name == "dim" {
-                            if let nsl_ast::expr::Expr {
+                        if name == "dim"
+                            && let nsl_ast::expr::Expr {
                                 kind: nsl_ast::expr::ExprKind::IntLiteral(v),
                                 ..
                             } = &arg.value
-                            {
-                                dim = *v as usize;
-                            }
+                        {
+                            dim = *v as usize;
                         }
                     }
                 }

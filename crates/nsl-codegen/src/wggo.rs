@@ -1403,23 +1403,21 @@ pub fn run_on_wengert_with_weights(
         n_kv_heads: 4,
         dtype_bytes: 2,
     };
-    if memory_budget_bytes.is_some() {
-        if let Some(opts) = compile_options {
-            if let Some(cfg) = opts
-                .fused_ce_configs
-                .iter()
-                .find(|c| c.hidden_size.is_some() || c.batch_size.is_some() || c.seq_len.is_some())
-            {
-                if let Some(h) = cfg.hidden_size {
-                    layer_shape.d_model = h as u64;
-                }
-                if let Some(b) = cfg.batch_size {
-                    layer_shape.batch = b as u64;
-                }
-                if let Some(s) = cfg.seq_len {
-                    layer_shape.seq = s as u64;
-                }
-            }
+    if memory_budget_bytes.is_some()
+        && let Some(opts) = compile_options
+        && let Some(cfg) = opts
+            .fused_ce_configs
+            .iter()
+            .find(|c| c.hidden_size.is_some() || c.batch_size.is_some() || c.seq_len.is_some())
+    {
+        if let Some(h) = cfg.hidden_size {
+            layer_shape.d_model = h as u64;
+        }
+        if let Some(b) = cfg.batch_size {
+            layer_shape.batch = b as u64;
+        }
+        if let Some(s) = cfg.seq_len {
+            layer_shape.seq = s as u64;
         }
     }
     // Cheap fidelity bundle (recon §6 footnote): when a `dataset` block carries
@@ -1431,10 +1429,10 @@ pub fn run_on_wengert_with_weights(
     // precedence over the budget path's fused-CE `seq_len` because the packed
     // sequence is the geometry both the cost term and the packing saving must
     // agree on.
-    if let Some(cfg) = packing_stats.as_ref() {
-        if cfg.max_sequence_length > 0 {
-            layer_shape.seq = cfg.max_sequence_length as u64;
-        }
+    if let Some(cfg) = packing_stats.as_ref()
+        && cfg.max_sequence_length > 0
+    {
+        layer_shape.seq = cfg.max_sequence_length as u64;
     }
 
     let mut input = WggoInput {
@@ -1511,12 +1509,12 @@ pub fn run_on_wengert_with_weights(
 
     // Cache-hit reports were passed into run() via `cached_analysis`
     // (pre-solve), so the plan already carries them.
-    if cached_report.is_none() {
-        if let Some(p) = weights_path {
-        // Cache miss — persist the freshly-computed report alongside
-        // the checkpoint.  Failures are silent; the cache is advisory.
-        let _ = crate::wggo_weight_analysis_cache::store(p, &plan.weight_analysis);
-        }
+    if cached_report.is_none()
+        && let Some(p) = weights_path
+    {
+    // Cache miss — persist the freshly-computed report alongside
+    // the checkpoint.  Failures are silent; the cache is advisory.
+    let _ = crate::wggo_weight_analysis_cache::store(p, &plan.weight_analysis);
     }
 
     Ok(Some(plan))

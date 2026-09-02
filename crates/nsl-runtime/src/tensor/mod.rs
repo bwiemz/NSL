@@ -710,14 +710,13 @@ impl NslTensor {
     /// Total byte size of the data buffer, accounting for block-packed custom dtypes.
     #[inline]
     pub(crate) fn data_byte_size(&self) -> usize {
-        if self.dtype >= DTYPE_CUSTOM_START {
-            if let Some(info) = get_registry().get(&self.dtype) {
-                if info.block_size > 0 && info.packed_block_size > 0 {
-                    let num_blocks = (self.len as usize)
-                        .div_ceil(info.block_size as usize);
-                    return num_blocks * info.packed_block_size;
-                }
-            }
+        if self.dtype >= DTYPE_CUSTOM_START
+            && let Some(info) = get_registry().get(&self.dtype)
+            && info.block_size > 0 && info.packed_block_size > 0
+        {
+            let num_blocks = (self.len as usize)
+                .div_ceil(info.block_size as usize);
+            return num_blocks * info.packed_block_size;
         }
         (self.len as usize) * self.element_size()
     }

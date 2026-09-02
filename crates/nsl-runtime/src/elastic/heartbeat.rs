@@ -135,12 +135,11 @@ impl HeartbeatMonitor {
                     state.failure_count += 1;
 
                     // Check for repeated failures → permanent exclusion
-                    if let Some(last_fail) = state.last_failure_time {
-                        if now.duration_since(last_fail) < self.exclusion_window
-                            && state.failure_count >= self.max_failures_before_exclude
-                        {
-                            state.health = RankHealth::Excluded;
-                        }
+                    if let Some(last_fail) = state.last_failure_time
+                        && now.duration_since(last_fail) < self.exclusion_window
+                        && state.failure_count >= self.max_failures_before_exclude
+                    {
+                        state.health = RankHealth::Excluded;
                     }
                     state.last_failure_time = Some(now);
                     newly_dead.push(rank);

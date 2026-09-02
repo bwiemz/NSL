@@ -253,10 +253,10 @@ pub fn build_onnx_model(graph: &TraceGraph) -> ModelProto {
     // single-output models where the output is always the last node.  For
     // multi-output models, a full name_map update pass would be needed.
     for (ptr, name) in &graph.outputs {
-        if let Some(&node_id) = graph.ptr_to_node.get(ptr) {
-            if node_id < nodes.len() {
-                nodes[node_id].output = vec![name.clone()];
-            }
+        if let Some(&node_id) = graph.ptr_to_node.get(ptr)
+            && node_id < nodes.len()
+        {
+            nodes[node_id].output = vec![name.clone()];
         }
     }
 

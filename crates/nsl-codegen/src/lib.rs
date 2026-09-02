@@ -1884,14 +1884,14 @@ pub fn compile_and_calibrate(
                 ));
                 compiler.compile_options.calibration_retention = Some(awq_projections);
             }
-            if let Some(targets) = compiler.compile_options.calibration_grad_retention.as_ref() {
-                if !targets.is_empty() {
-                    registry.register(Box::new(
-                        crate::calibration::wggo_gradient_hook::WggoGradientHook::new(
-                            targets.clone(),
-                        ),
-                    ));
-                }
+            if let Some(targets) = compiler.compile_options.calibration_grad_retention.as_ref()
+                && !targets.is_empty()
+            {
+                registry.register(Box::new(
+                    crate::calibration::wggo_gradient_hook::WggoGradientHook::new(
+                        targets.clone(),
+                    ),
+                ));
             }
             if registry.is_empty() {
                 eprintln!(

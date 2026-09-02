@@ -571,10 +571,10 @@ pub extern "C" fn nsl_adapter_fused_lora_matmul(
     }
     record_fused_launch();
 
-    if real_cuda_path_enabled() {
-        if let Some(out) = try_cuda_launch_fused_lora(x, w, lora_a, lora_b, scale, kernel_handle) {
-            return out;
-        }
+    if real_cuda_path_enabled()
+        && let Some(out) = try_cuda_launch_fused_lora(x, w, lora_a, lora_b, scale, kernel_handle)
+    {
+        return out;
     }
     cpu_fallback_fused_lora(x, w, lora_a, lora_b, scale)
 }
@@ -609,10 +609,10 @@ pub extern "C" fn nsl_adapter_fused_ia3_matmul(
     }
     record_fused_launch();
 
-    if real_cuda_path_enabled() {
-        if let Some(out) = try_cuda_launch_fused_ia3(x, w, ia3_scale, kernel_handle) {
-            return out;
-        }
+    if real_cuda_path_enabled()
+        && let Some(out) = try_cuda_launch_fused_ia3(x, w, ia3_scale, kernel_handle)
+    {
+        return out;
     }
     cpu_fallback_fused_ia3(x, w, ia3_scale)
 }
@@ -876,12 +876,11 @@ pub extern "C" fn nsl_adapter_fused_gatedlora_matmul(
     }
     record_fused_launch();
 
-    if real_cuda_path_enabled() {
-        if let Some(out) =
+    if real_cuda_path_enabled()
+        && let Some(out) =
             try_cuda_launch_fused_gatedlora(x, w, lora_a, lora_b, scale, gate, kernel_handle)
-        {
-            return out;
-        }
+    {
+        return out;
     }
     cpu_fallback_fused_gatedlora(x, w, lora_a, lora_b, scale, gate)
 }

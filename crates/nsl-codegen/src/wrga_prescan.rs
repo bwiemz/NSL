@@ -260,10 +260,10 @@ pub(crate) fn rewrite_model_method_bodies_with_adapter_sites(
                 &fn_def,
                 &fn_def.body.stmts,
             );
-            if let Some(map) = compiler.models.model_method_bodies.get_mut(&model_name) {
-                if let Some(body) = map.get_mut(&method_name) {
-                    body.body.stmts = rewritten;
-                }
+            if let Some(map) = compiler.models.model_method_bodies.get_mut(&model_name)
+                && let Some(body) = map.get_mut(&method_name)
+            {
+                body.body.stmts = rewritten;
             }
         }
     }

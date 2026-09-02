@@ -132,10 +132,10 @@ impl Visitor for DictLocalScan<'_> {
                         }
                     }
                     ExprKind::Subscript { object, .. } => {
-                        if let ExprKind::Ident(sym) = &object.kind {
-                            if self.is_live_candidate(*sym) {
-                                self.vetoed.insert(*sym);
-                            }
+                        if let ExprKind::Ident(sym) = &object.kind
+                            && self.is_live_candidate(*sym)
+                        {
+                            self.vetoed.insert(*sym);
                         }
                     }
                     _ => {}

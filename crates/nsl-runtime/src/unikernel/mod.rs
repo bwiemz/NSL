@@ -295,22 +295,22 @@ pub extern "C" fn nsl_unikernel_init(config_json_ptr: i64, config_json_len: i64)
     serial_puts("[nsl] Boot config parsed\n");
 
     // Initialize memory pools if sizes are known
-    if config.model_pool_bytes > 0 {
-        if let Ok(mut pool) = MODEL_POOL.lock() {
-            // In bare-metal, base address comes from linker script (__heap_start)
-            // In hosted mode, we allocate from the system heap
-            let base = crate::memory::checked_alloc(config.model_pool_bytes as usize) as u64;
-            pool.init(base, config.model_pool_bytes);
-            serial_puts("[nsl] Model pool initialized\n");
-        }
+    if config.model_pool_bytes > 0
+        && let Ok(mut pool) = MODEL_POOL.lock()
+    {
+        // In bare-metal, base address comes from linker script (__heap_start)
+        // In hosted mode, we allocate from the system heap
+        let base = crate::memory::checked_alloc(config.model_pool_bytes as usize) as u64;
+        pool.init(base, config.model_pool_bytes);
+        serial_puts("[nsl] Model pool initialized\n");
     }
 
-    if config.kv_cache_pool_bytes > 0 {
-        if let Ok(mut pool) = KV_CACHE_POOL.lock() {
-            let base = crate::memory::checked_alloc(config.kv_cache_pool_bytes as usize) as u64;
-            pool.init(base, config.kv_cache_pool_bytes);
-            serial_puts("[nsl] KV-cache pool initialized\n");
-        }
+    if config.kv_cache_pool_bytes > 0
+        && let Ok(mut pool) = KV_CACHE_POOL.lock()
+    {
+        let base = crate::memory::checked_alloc(config.kv_cache_pool_bytes as usize) as u64;
+        pool.init(base, config.kv_cache_pool_bytes);
+        serial_puts("[nsl] KV-cache pool initialized\n");
     }
 
     serial_puts("[nsl] Unikernel runtime ready\n");

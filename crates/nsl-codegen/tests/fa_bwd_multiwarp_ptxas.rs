@@ -22,10 +22,10 @@ use nsl_codegen::flash_attention::{
 };
 
 fn find_ptxas() -> Option<String> {
-    if let Ok(p) = std::env::var("PTXAS") {
-        if std::path::Path::new(&p).is_file() {
-            return Some(p);
-        }
+    if let Ok(p) = std::env::var("PTXAS")
+        && std::path::Path::new(&p).is_file()
+    {
+        return Some(p);
     }
     for cand in ["ptxas", "/usr/local/cuda/bin/ptxas", "/opt/cuda/bin/ptxas"] {
         if Command::new(cand).arg("--version").output().is_ok() {

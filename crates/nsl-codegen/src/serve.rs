@@ -954,61 +954,61 @@ impl Compiler<'_> {
             };
             (mask, spec.config.k_tokens)
         });
-        if let Some((mask, k_tokens)) = spec_inputs {
-            if plan.kv.uses_direct_indexing() {
-                let per_slot = plan
-                    .kv
-                    .direct
-                    .as_ref()
-                    .map(|d| d.per_sequence_max_tokens)
-                    .unwrap_or(0);
-                let max_slots = plan.persistent.scheduler.max_active;
-                let s = &prepared.shape;
-                let num_nodes = mask.num_nodes;
-                let supported = s.head_dim >= 1
-                    && s.head_dim <= 128
-                    && s.n_heads % s.n_kv_heads.max(1) == 0
-                    && (1..=33).contains(&num_nodes)
-                    && per_slot >= num_nodes
-                    && max_slots >= 1
-                    && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64
-                    && k_tokens >= 1
-                    && (k_tokens as u64) * (s.vocab_size as u64) <= u32::MAX as u64;
-                if supported {
-                    let verify_cfg = crate::cfie_speculative_ptx::VerifyAttentionConfig {
-                        n_heads: s.n_heads,
-                        n_kv_heads: s.n_kv_heads,
-                        head_dim: s.head_dim,
-                        per_slot_max_tokens: per_slot,
-                        max_slots,
-                        num_nodes,
-                        mask_bits: crate::cfie_speculative_ptx::mask_bits_from_tree(&mask),
-                        sm_version: gpu.sm_version,
-                    };
-                    let (vptx, vmeta) =
-                        crate::cfie_speculative_ptx::emit_verify_attention(&verify_cfg);
-                    let reject_cfg = crate::cfie_speculative_ptx::RejectionConfig {
-                        k_tokens,
-                        vocab_size: s.vocab_size,
-                        sm_version: gpu.sm_version,
-                    };
-                    let (rptx, rmeta) =
-                        crate::cfie_speculative_ptx::emit_rejection_kernel(&reject_cfg);
-                    plan.spec_verify_launch = Some(crate::cfie::CfieLaunchSpec {
-                        grid_x: if vmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
-                        block_x: vmeta.block_dim,
-                        smem_dyn_bytes: 0,
-                    });
-                    plan.spec_reject_launch = Some(crate::cfie::CfieLaunchSpec {
-                        grid_x: if rmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
-                        block_x: rmeta.block_dim,
-                        smem_dyn_bytes: 0,
-                    });
-                    plan.spec_verify_kernel = Some(vmeta.kernel_name);
-                    plan.spec_verify_ptx = Some(vptx);
-                    plan.spec_reject_kernel = Some(rmeta.kernel_name);
-                    plan.spec_reject_ptx = Some(rptx);
-                }
+        if let Some((mask, k_tokens)) = spec_inputs
+            && plan.kv.uses_direct_indexing()
+        {
+            let per_slot = plan
+                .kv
+                .direct
+                .as_ref()
+                .map(|d| d.per_sequence_max_tokens)
+                .unwrap_or(0);
+            let max_slots = plan.persistent.scheduler.max_active;
+            let s = &prepared.shape;
+            let num_nodes = mask.num_nodes;
+            let supported = s.head_dim >= 1
+                && s.head_dim <= 128
+                && s.n_heads % s.n_kv_heads.max(1) == 0
+                && (1..=33).contains(&num_nodes)
+                && per_slot >= num_nodes
+                && max_slots >= 1
+                && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64
+                && k_tokens >= 1
+                && (k_tokens as u64) * (s.vocab_size as u64) <= u32::MAX as u64;
+            if supported {
+                let verify_cfg = crate::cfie_speculative_ptx::VerifyAttentionConfig {
+                    n_heads: s.n_heads,
+                    n_kv_heads: s.n_kv_heads,
+                    head_dim: s.head_dim,
+                    per_slot_max_tokens: per_slot,
+                    max_slots,
+                    num_nodes,
+                    mask_bits: crate::cfie_speculative_ptx::mask_bits_from_tree(&mask),
+                    sm_version: gpu.sm_version,
+                };
+                let (vptx, vmeta) =
+                    crate::cfie_speculative_ptx::emit_verify_attention(&verify_cfg);
+                let reject_cfg = crate::cfie_speculative_ptx::RejectionConfig {
+                    k_tokens,
+                    vocab_size: s.vocab_size,
+                    sm_version: gpu.sm_version,
+                };
+                let (rptx, rmeta) =
+                    crate::cfie_speculative_ptx::emit_rejection_kernel(&reject_cfg);
+                plan.spec_verify_launch = Some(crate::cfie::CfieLaunchSpec {
+                    grid_x: if vmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
+                    block_x: vmeta.block_dim,
+                    smem_dyn_bytes: 0,
+                });
+                plan.spec_reject_launch = Some(crate::cfie::CfieLaunchSpec {
+                    grid_x: if rmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
+                    block_x: rmeta.block_dim,
+                    smem_dyn_bytes: 0,
+                });
+                plan.spec_verify_kernel = Some(vmeta.kernel_name);
+                plan.spec_verify_ptx = Some(vptx);
+                plan.spec_reject_kernel = Some(rmeta.kernel_name);
+                plan.spec_reject_ptx = Some(rptx);
             }
         }
 
@@ -1416,13 +1416,13 @@ impl Compiler<'_> {
             );
         }
         eprint!("{report}");
-        if let Some(path) = self.compile_options.cfie.report_path.clone() {
-            if let Err(e) = std::fs::write(&path, &report) {
-                eprintln!(
-                    "warning: --cfie-report: failed to write {}: {e}",
-                    path.display()
-                );
-            }
+        if let Some(path) = self.compile_options.cfie.report_path.clone()
+            && let Err(e) = std::fs::write(&path, &report)
+        {
+            eprintln!(
+                "warning: --cfie-report: failed to write {}: {e}",
+                path.display()
+            );
         }
 
         // Cycle 6: registration list for the compile-time-chosen family

@@ -558,11 +558,9 @@ impl<R: Fn(Symbol) -> String> Walker<'_, R> {
         let mut out = Taint::new();
         for (i, st) in b.stmts.iter().enumerate() {
             let is_last = i + 1 == b.stmts.len();
-            if is_last {
-                if let StmtKind::Expr(e) = &st.kind {
-                    out.extend(self.taint_of(e));
-                    continue;
-                }
+            if is_last && let StmtKind::Expr(e) = &st.kind {
+                out.extend(self.taint_of(e));
+                continue;
             }
             self.walk_stmt(st);
         }

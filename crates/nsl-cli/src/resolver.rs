@@ -20,24 +20,23 @@ pub(crate) fn stdlib_roots() -> Vec<PathBuf> {
     }
 
     // 2. exe-relative stdlib/
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let stdlib = exe_dir.join("stdlib");
-            if stdlib.is_dir() {
-                roots.push(stdlib);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        let stdlib = exe_dir.join("stdlib");
+        if stdlib.is_dir() {
+            roots.push(stdlib);
         }
     }
 
     // 3. Toolchain distribution: <exe>/../lib/stdlib/
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            if let Some(toolchain_dir) = bin_dir.parent() {
-                let lib_stdlib = toolchain_dir.join("lib").join("stdlib");
-                if lib_stdlib.is_dir() && !roots.iter().any(|r| r == &lib_stdlib) {
-                    roots.push(lib_stdlib);
-                }
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin_dir) = exe.parent()
+        && let Some(toolchain_dir) = bin_dir.parent()
+    {
+        let lib_stdlib = toolchain_dir.join("lib").join("stdlib");
+        if lib_stdlib.is_dir() && !roots.iter().any(|r| r == &lib_stdlib) {
+            roots.push(lib_stdlib);
         }
     }
 

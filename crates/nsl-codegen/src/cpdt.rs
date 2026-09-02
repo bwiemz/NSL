@@ -263,20 +263,20 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
                 None => {
                     // Nothing feasible at-or-below rec; fall back to planner default.
                     let actual = zero_search.best.clone();
-                    if let Some(ref eval) = actual {
-                        if eval.config.s_p > rec {
-                            override_diagnostics
-                                .push(crate::wggo_overrides::OverrideDiagnostic {
-                                    layer_index: 0,
-                                    layer_name: "global".into(),
-                                    reason: crate::wggo_overrides::OverrideRejectReason::ShardFactorOverriddenByMemory {
-                                        recommended: rec,
-                                        applied: eval.config.s_p,
-                                    },
-                                    requested: rec.to_string(),
-                                    applied: eval.config.s_p.to_string(),
-                                });
-                        }
+                    if let Some(ref eval) = actual
+                        && eval.config.s_p > rec
+                    {
+                        override_diagnostics
+                            .push(crate::wggo_overrides::OverrideDiagnostic {
+                                layer_index: 0,
+                                layer_name: "global".into(),
+                                reason: crate::wggo_overrides::OverrideRejectReason::ShardFactorOverriddenByMemory {
+                                    recommended: rec,
+                                    applied: eval.config.s_p,
+                                },
+                                requested: rec.to_string(),
+                                applied: eval.config.s_p.to_string(),
+                            });
                     }
                     actual
                 }
