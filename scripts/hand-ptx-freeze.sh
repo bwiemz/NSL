@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+#
+# hand-ptx-freeze.sh — the hand-written-PTX freeze (roadmap item A2, step 1).
+#
+# NSL has two ways to produce a GPU kernel. The compiler path builds a
+# KernelIR (crates/nsl-codegen/src/kernel_ir.rs) and lowers it through
+# backend_ptx.rs, which allocates registers, checks well-formedness, and can
+# in principle target something other than PTX. The other path is a Rust
+# function that `push_str`s PTX text with hand-numbered registers, and it is
+# where nearly every kernel in the tree lives: flash attention (three copies),
+# the fused loss heads, CFIE, MoE, the precision casts. Nothing verifies that
+# text before ptxas sees it, a wrong `%rd` offset is a silent numerical bug,
+# and every ISA change is a hand edit across all of it.
+#
+# The KIR migration is a multi-quarter job. What can happen today is a
+# FREEZE: the set of files that emit PTX by hand is written down, and CI
+# refuses a change that adds one. New kernels go through KIR. Existing
+# members may still be edited — this is a gate on the file set, not a line
+# count — so kernel bug fixes are unaffected.
+#
+# Membership is decided by scripts/hand-ptx-scan.awk, which finds PTX text in
+# string literals only (comments and `#[cfg(test)]` items do not count; see
+# the scanner's header). A PTX or CUDA source file under crates/ (`.ptx`,
+# `.cu`, `.cuh`, `.cubin`, `.fatbin` — the `include_str!` route around the
+# scanner) is a member by definition. Files under any `tests/` or `benches/`
+# directory are never scanned: a test that asserts on KIR-generated PTX is
+# exactly what the freeze wants more of.
+#
+# Commands:
+#   scripts/hand-ptx-freeze.sh --check            drift gate, for CI
+#   scripts/hand-ptx-freeze.sh --list             every member with its PTX line count
+#   scripts/hand-ptx-freeze.sh --explain <file>   print the lines that make a file a member
+#   scripts/hand-ptx-freeze.sh --write-manifest   refresh ci/hand-ptx-manifest.txt
+#   scripts/hand-ptx-freeze.sh --self-test        prove the scanner on synthetic sources
+#
+# --check fails on BOTH kinds of drift. A member missing from the manifest is
+# the freeze doing its job — the fix is to build the kernel on KIR, or, for a
+# deliberate exception, to add the path with a reviewed justification. A
+# manifest entry that no longer emits PTX is stale, and must be removed so
+# the file cannot quietly become a hand-PTX emitter again under an old
+# blessing.
+#
+set -euo pipefail
+
+# Byte-order collation so the manifest is reproducible across machines; see
+# gpu-cert.sh for the phantom-drift this prevents.
+export LC_ALL=C
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}"
+
+SCANNER="scripts/hand-ptx-scan.awk"
+MANIFEST="ci/hand-ptx-manifest.txt"
+
+# A floor on the member count, so a scanner that silently degrades to
+# near-zero matches cannot be blessed by re-running --write-manifest. The
+# freeze started at 71 files (2026-09-02); the count only goes DOWN as
+# kernels migrate to KIR, so the floor is generous and gets lowered on
+# purpose.
+MIN_MEMBERS=60
+
+# Every candidate Rust file, one per line, sorted.
+candidates() {
+    find crates -name '*.rs' -type f \
+        -not -path '*/tests/*' -not -path '*/benches/*' | sort
+}
+
+# PTX/CUDA source shipped as a file rather than a Rust string. There are none
+# today; one appearing is a new hand-written kernel by definition.
+ptx_files() {
+    find crates -type f \
+        \( -name '*.ptx' -o -name '*.cu' -o -name '*.cuh' -o -name '*.cubin' -o -name '*.fatbin' \) \
+        -not -path '*/tests/*' -not -path '*/benches/*' | sort
+}
+
+# "count<TAB>file" for every member: Rust files with at least one PTX string
+# line, then PTX files with their line count.
+inventory_counted() {
+    local f n
+    while IFS= read -r f; do
+        n="$(awk -f "${SCANNER}" "${f}")"
+        if [[ "${n}" -gt 0 ]]; then
+            printf '%s\t%s\n' "${n}" "${f}"
+        fi
+    done < <(candidates)
+    while IFS= read -r f; do
+        printf '%s\t%s\n' "$(wc -l < "${f}" | tr -d ' ')" "${f}"
+    done < <(ptx_files)
+}
+
+# Member paths, byte-sorted (the two lists above are each sorted, their
+# union is not).
+inventory() { inventory_counted | cut -f2 | sort; }
+
+# The manifest's paths: comments (whole-line or trailing `# reason`), blank
+# lines, CRs and trailing whitespace dropped, byte-sorted. sed rather than
+# grep -v so a header-only manifest yields an empty list, not a pipefail.
+manifest_entries() {
+    sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' -e '/^$/d' "${MANIFEST}" | sort
+}
+
+cmd_list() { inventory_counted; }
+
+cmd_explain() {
+    local f="${1:?--explain needs a file}"
+    [[ -f "${f}" ]] || { echo "hand-ptx-freeze: no such file: ${f}" >&2; exit 2; }
+    awk -v show=1 -f "${SCANNER}" "${f}"
+}
+
+cmd_write_manifest() {
+    local members
+    members="$(inventory)"
+    mkdir -p "$(dirname "${MANIFEST}")"
+    {
+        echo "# Hand-written PTX emitters — the A2 freeze. Generated by scripts/hand-ptx-freeze.sh"
+        echo "# Regenerate with: scripts/hand-ptx-freeze.sh --write-manifest"
+        echo "#"
+        echo "# Every file below writes PTX text into a string by hand. CI refuses a file"
+        echo "# that joins this list: new kernels are built on KernelIR (kernel_ir.rs ->"
+        echo "# backend_ptx.rs). backend_ptx.rs is the one member that belongs here by"
+        echo "# construction — it is the PTX printer KIR lowers through. Everything else"
+        echo "# is hand-PTX, including the shared preludes in kernel_skeleton/ that the"
+        echo "# hand-written kernels compose. The list is meant to shrink."
+        printf '%s\n' "${members}"
+    } > "${MANIFEST}"
+    echo "wrote ${MANIFEST} ($(manifest_entries | wc -l | tr -d ' ') files)"
+}
+
+cmd_check() {
+    if [[ ! -f "${MANIFEST}" ]]; then
+        echo "hand-ptx-freeze: ${MANIFEST} is missing — run --write-manifest" >&2
+        exit 1
+    fi
+    # Script-global, not `local`: the EXIT trap outlives this function's
+    # frame, and under `set -u` a dead local would fail the trap itself.
+    SCRATCH="$(mktemp)"
+    trap 'rm -f "${SCRATCH:-}"' EXIT
+    inventory > "${SCRATCH}"
+
+    # The manifest is re-sorted here so a hand-appended exception (the
+    # documented way to bless one) compares cleanly instead of tripping comm.
+    local added stale
+    added="$(comm -13 <(manifest_entries) "${SCRATCH}" || true)"
+    stale="$(comm -23 <(manifest_entries) "${SCRATCH}" || true)"
+
+    if [[ -n "${added}" ]]; then
+        echo "hand-ptx-freeze: NEW HAND-WRITTEN PTX — these files emit PTX text and are not in ${MANIFEST}:" >&2
+        echo "" >&2
+        sed 's/^/  /' <<< "${added}" >&2
+        echo "" >&2
+        echo "The hand-PTX file set is frozen (roadmap A2). New kernels go through KernelIR." >&2
+        echo "See what tripped the scanner:  scripts/hand-ptx-freeze.sh --explain <file>" >&2
+        echo "A deliberate exception adds the path to ${MANIFEST} in the same PR, with the reason in the PR." >&2
+    fi
+    if [[ -n "${stale}" ]]; then
+        echo "hand-ptx-freeze: STALE MANIFEST — these entries no longer emit PTX text:" >&2
+        echo "" >&2
+        sed 's/^/  /' <<< "${stale}" >&2
+        echo "" >&2
+        echo "Remove them (scripts/hand-ptx-freeze.sh --write-manifest) so the file cannot regain hand-PTX under an old blessing." >&2
+    fi
+    if [[ -n "${added}" || -n "${stale}" ]]; then
+        exit 1
+    fi
+
+    local n
+    n="$(manifest_entries | wc -l | tr -d ' ')"
+    if [[ "${n}" -lt "${MIN_MEMBERS}" ]]; then
+        echo "hand-ptx-freeze: manifest holds ${n} files, below the floor of ${MIN_MEMBERS} — scanner degraded?" >&2
+        exit 1
+    fi
+    echo "hand-ptx-freeze: tree agrees with ${MANIFEST} (${n} hand-PTX files, none added)"
+}
+
+# Synthetic sources with a known answer. Each case is one file; the expected
+# count is the number in its name. This is the proof that --check is not
+# vacuous: the scanner must count real emitters (else a manifest full of
+# entries would pass forever with the scanner returning nothing), must NOT
+# count the four ways a mnemonic appears in a non-emitter (comment, test
+# assertion or fixture, prose, a parser's fragment), and must survive the
+# lexical traps that would desync it from the string state.
+cmd_self_test() {
+    local fail=0 name want got
+    # Global for the same reason as SCRATCH above.
+    FIXTURES="$(mktemp -d)"
+    trap 'rm -rf "${FIXTURES:-}"' EXIT
+
+    # 0: comments only — the grep false positive.
+    cat > "${FIXTURES}/comment_0.rs" <<'EOF'
+//! The kernel reads targets with `ld.global.s64` and writes `st.global.f32`.
+/// Caller declares `.reg .u32 %tmp` first. bar.sync 0 follows.
+fn nothing() {
+    // mma.sync.aligned.m16n8k16 is what the tensor-core path emits
+    let x = 1; /* .visible .entry k() { ld.param.u64 } */
+    let _ = x;
+}
+EOF
+    # 0: a test module asserting on PTX, plus a #[cfg(test)] use and a #[test] fn.
+    cat > "${FIXTURES}/cfg_test_0.rs" <<'EOF'
+pub fn lower() -> String { String::new() }
+#[cfg(test)]
+use std::fmt::Write;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn emits_loads() {
+        let ptx = lower();
+        assert!(ptx.contains("ld.global.f32 %f1, [%rd1];"));
+        assert!(ptx.contains(".visible .entry k("));
+        let want = r#"
+    .reg .f32 %f<4>;
+    st.global.f32 [%rd2], %f3;
+"#;
+        assert_eq!(ptx, want);
+    }
+}
+EOF
+    # 0: prose in strings — an error message that names a directive.
+    cat > "${FIXTURES}/prose_0.rs" <<'EOF'
+fn refuse(bytes: usize) -> String {
+    format!("the draft decode block's static .shared footprint exceeds {bytes} bytes; \
+             tensor.shape {:?} was {}", (1, 2), "mma")
+}
+const HELP: &str = "Print the cache hit count to stderr at exit; NSL_EVENTS gets the JSON twin.";
+const NOTE: &str = "installed for the duration of a serve body and cleared on exit; \
+    a bra is not a branch and a ret is not a return\n";
+EOF
+    # 0: a PTX consumer — parses or inspects PTX text, emits none. Its
+    # fragments name directives but are not emitted lines.
+    cat > "${FIXTURES}/consumer_0.rs" <<'EOF'
+pub fn arch_of(ptx: &str) -> &'static str {
+    if ptx.contains(".target sm_90") { "sm_90" } else { "sm_80" }
+}
+pub fn entry_offset(ptx: &str) -> Option<usize> { ptx.find(".visible .entry") }
+pub fn is_smem_decl(line: &str) -> bool {
+    line.starts_with(".shared") || line.starts_with(".extern .shared")
+}
+pub fn is_reg_decl(line: &str) -> bool { line.trim_start().starts_with(".reg .") }
+EOF
+    # 3: the ordinary emitter — push_str, format!, writeln!.
+    cat > "${FIXTURES}/emitter_3.rs" <<'EOF'
+use std::fmt::Write;
+pub fn emit(ptx: &mut String, out_reg: &str, sizeof_dtype: u32) {
+    ptx.push_str("    mul.lo.u32 %row_index_tmp, %r1, %r2;\n");
+    ptx.push_str(&format!("    mul.wide.u32 {out_reg}, %row_index_tmp, {sizeof_dtype};\n"));
+    let _ = writeln!(ptx, "    st.shared.b{} [{} + {}], 0;", 32, "%r5", 4);
+}
+EOF
+    # 7: a raw multi-line kernel (seven directive/instruction lines counting
+    # `ret;`; the closing brace is not), plus the lexical traps before it: a
+    # `'"'` char literal, an adjacent `'\'','"'` pair, a lifetime, a string
+    # holding `//`, a `br"…"` byte string (no escapes in a raw string — a
+    # `\"` would close it), and a nested block comment holding a quote.
+    cat > "${FIXTURES}/raw_7.rs" <<'EOF'
+fn traps<'a>(s: &'a str) -> &'a str {
+    let q = '"'; let e = ('\'','"'); let _ = (q, e);
+    let url = "http://example.invalid"; let b = br"raw bytes \ with a hash #";
+    /* outer /* inner " */ still comment */
+    let _ = (url, b, s);
+    s
+}
+pub const KERNEL: &str = r#"
+.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry nsl_k(.param .u64 p0) {
+    .reg .b32 %r<4>;
+    ld.param.u64 %rd1, [p0];
+    ret;
+}
+"#;
+EOF
+    # 1: #[cfg(test)] on a brace-less item must not swallow the emitter after it.
+    cat > "${FIXTURES}/cfg_semicolon_1.rs" <<'EOF'
+#[cfg(test)]
+mod scan_fixtures;
+pub fn emit(ptx: &mut String) {
+    ptx.push_str("    bar.sync 0;\n");
+}
+EOF
+    # 1: a #[cfg(test)] fn followed by a real emitter — the skip must end at
+    # the matching brace, not at the first `}`.
+    cat > "${FIXTURES}/cfg_nested_1.rs" <<'EOF'
+#[cfg(test)]
+fn helper() -> String {
+    let inner = { let s = String::from("ld.global.f32 %f1, [%rd1];"); s };
+    if inner.is_empty() { String::new() } else { inner }
+}
+pub fn emit(ptx: &mut String) {
+    ptx.push_str("    @%p1 bra DONE;\n");
+}
+EOF
+    # 0: a #[test] inside an already-skipped `mod tests` must not reset the
+    # skip depth — everything after the first test fn closes is still test
+    # code (cuda/mod.rs's VEC_ADD_PTX fixture had this shape).
+    cat > "${FIXTURES}/nested_test_reset_0.rs" <<'EOF'
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    #[test]
+    fn first() {}
+    fn fixture() -> String { String::from("    ld.global.f32 %f1, [%rd1];\n") }
+    const EXPECTED: &str = "    st.global.f32 [%rd2], %f3;\n";
+    #[test]
+    fn second() { assert_eq!(fixture().len(), EXPECTED.len()); }
+}
+EOF
+    # 0: #[cfg(test)] on brace-less items that HOLD the string — a fixture
+    # constant, a multi-line raw one, and a one-line module.
+    cat > "${FIXTURES}/cfg_test_const_0.rs" <<'EOF'
+#[cfg(test)]
+const K: &str = "    ld.global.f32 %f1, [%rd1];\n";
+#[cfg(test)]
+const KERNEL: &str = r#"
+.visible .entry k() {
+    .reg .b32 %r<4>;
+    ret;
+}
+"#;
+#[cfg(all(test, feature = "cuda"))] mod gpu { const K: &str = "st.global.f32 [%rd2], %f1;\n"; }
+pub fn unrelated() -> usize { 0 }
+EOF
+    # 6: mnemonics with digits and the operand-less statements.
+    cat > "${FIXTURES}/digits_6.rs" <<'EOF'
+pub fn emit(ptx: &mut String) {
+    ptx.push_str("    ex2.approx.f32 %f1, %f2;\n");
+    ptx.push_str("    mul24.lo.u32 %r1, %r2, %r3;\n");
+    ptx.push_str("    membar.gl;\n");
+    ptx.push_str("    fence.acq_rel.gpu;\n");
+    ptx.push_str("    bra LOOP_TOP;\n");
+    ptx.push_str("ret;\n");
+}
+EOF
+    # 1: an escaped-quote char literal directly followed by a `'"'` one —
+    # landing on the closer instead of past it would open a phantom string
+    # and hide the emitter on the next line.
+    cat > "${FIXTURES}/escquote_1.rs" <<'EOF'
+pub fn emit(ptx: &mut String) {
+    let p = ('\'','"'); let _ = p;
+    ptx.push_str("    bar.sync 0;\n");
+}
+EOF
+    # 1: #[cfg(test)] on a `,`-terminated field and on a match arm — the
+    # attribute must be spent when the enclosing block closes, not carried
+    # to the next fn's `{` (which would swallow the emitter).
+    cat > "${FIXTURES}/cfg_field_1.rs" <<'EOF'
+pub struct Ctx {
+    pub n: usize,
+    #[cfg(test)]
+    pub probe: Option<String>,
+}
+pub fn kind(k: u8) -> &'static str {
+    match k {
+        #[cfg(test)]
+        0 => "ld.global.f32 %f1, [%rd1];\n",
+        _ => "other",
+    }
+}
+pub fn emit(ptx: &mut String) {
+    ptx.push_str("    st.global.f32 [%rd2], %f1;\n");
+}
+EOF
+    # 1: a `.pragma` line in a normal string carries the escaped quotes.
+    cat > "${FIXTURES}/pragma_1.rs" <<'EOF'
+pub fn emit(ptx: &mut String) {
+    ptx.push_str("    .pragma \"nounroll\";\n");
+}
+EOF
+
+    for f in "${FIXTURES}"/*.rs; do
+        name="$(basename "${f}" .rs)"
+        want="${name##*_}"
+        got="$(awk -f "${SCANNER}" "${f}")"
+        if [[ "${got}" == "${want}" ]]; then
+            echo "  ok   ${name}: ${got}"
+        else
+            echo "  FAIL ${name}: scanner counted ${got}, expected ${want}" >&2
+            awk -v show=1 -f "${SCANNER}" "${f}" >&2 || true
+            fail=1
+        fi
+    done
+    if [[ "${fail}" -ne 0 ]]; then
+        echo "hand-ptx-freeze: SELF-TEST FAILED" >&2
+        exit 1
+    fi
+    echo "hand-ptx-freeze: scanner self-test passed"
+}
+
+usage() {
+    sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+    --check)          cmd_check ;;
+    --list)           cmd_list ;;
+    --explain)        cmd_explain "${2:-}" ;;
+    --write-manifest) cmd_write_manifest ;;
+    --self-test)      cmd_self_test ;;
+    -h|--help)        usage ;;
+    *)                usage >&2; exit 2 ;;
+esac
