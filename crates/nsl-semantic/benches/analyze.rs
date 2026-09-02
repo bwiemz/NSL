@@ -9,6 +9,7 @@
 //! with real imported types — is nsl-cli's `frontend` bench.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use nsl_ast::Module;
@@ -92,6 +93,10 @@ fn bench_analyze(c: &mut Criterion) {
     let bytes: usize = modules.iter().map(|(_, n, _)| *n).sum();
 
     let mut group = c.benchmark_group("analyze");
+    // The whole-corpus pass is ~2.6 ms; criterion's linear sampling needs
+    // ~5000 passes for its default 100 samples, which does not fit the
+    // default 5 s window (it warns and runs long anyway).
+    group.measurement_time(Duration::from_secs(15));
 
     group.throughput(Throughput::Bytes(bytes as u64));
     group.bench_function("examples", |b| {

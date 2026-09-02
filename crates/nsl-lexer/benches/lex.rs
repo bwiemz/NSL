@@ -7,6 +7,7 @@
 //! with the corpus size.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use nsl_errors::FileId;
@@ -76,6 +77,11 @@ fn bench_lex(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("lex");
+    // The whole-corpus pass is ~2 ms; criterion's linear sampling needs
+    // ~5000 passes for its default 100 samples, which does not fit the
+    // default 5 s window (it warns and runs long anyway). 15 s leaves room
+    // for a slower runner.
+    group.measurement_time(Duration::from_secs(15));
 
     // Fresh interner per pass, as every `nsl build` starts with one: symbol
     // interning is part of what the lexer costs.

@@ -11,17 +11,20 @@
 #   nsl-parser     parse      tokens/s over the same corpus, pre-tokenized
 #   nsl-semantic   analyze    single-module analysis of the import-free examples
 #   nsl-cli        frontend   load_all_modules over the three coder recipes
-#   nsl-codegen    compile    compile_module over the clean import-free examples
+#   nsl-codegen    compile    nsl_codegen::compile over the clean import-free examples
 #   nsl-runtime    tape       tape record+backward, CPU f32 matmul, alloc churn
 #
 # Usage:
 #   scripts/bench.sh                        run all six, compare with the last run
 #   scripts/bench.sh save NAME              run, store the results as baseline NAME
 #   scripts/bench.sh compare NAME           run, compare against baseline NAME
-#   scripts/bench.sh ... -- <criterion args>
-#                                           e.g. `-- --quick`, `-- --noplot`,
-#                                           `-- --noise-threshold 0.05`, or a
-#                                           name filter such as `-- lex/corpus`
+#                                           (a bench with no baseline of that
+#                                           name is reported as new, not fatal)
+#   scripts/bench.sh ... [--] <criterion args>
+#                                           e.g. `--quick`, `--noplot`,
+#                                           `--noise-threshold 0.05`, or a name
+#                                           filter such as `-- lex/corpus` (the
+#                                           `--` is needed only before a filter)
 #   NSL_BENCH_ONLY="lex parse" scripts/bench.sh ...
 #                                           run a subset (bench names, space-separated)
 #
@@ -33,7 +36,7 @@
 #
 # Why the benches are named here rather than `cargo bench --workspace`: that
 # form also runs every crate's libtest harness in bench mode, which compiles
-# the test targets of all eleven crates to execute zero benchmarks.
+# the test targets of all ten crates to execute zero benchmarks.
 #
 # Baselines live under $CARGO_TARGET_DIR/criterion/ (default target/), so a
 # target dir per worktree means a baseline per worktree: save and compare
@@ -68,7 +71,8 @@ case "${1:-}" in
         usage
         exit 0
         ;;
-    ""|--)
+    ""|--|-*)
+        # No mode: everything left is for criterion.
         ;;
     *)
         die "unknown argument '$1' (try --help)"
@@ -78,11 +82,14 @@ if [[ "${1:-}" == "--" ]]; then
     shift
 fi
 
-# Arguments for the criterion binary (after cargo's own `--`).
+# Arguments for the criterion binary (after cargo's own `--`). Lenient
+# comparison: a bench added since the baseline was saved has nothing to
+# compare against and is reported without a change line; the strict
+# `--baseline` would abort that bench binary and take its siblings with it.
 args=()
 case "${mode}" in
     save)    args+=(--save-baseline "${name}") ;;
-    compare) args+=(--baseline "${name}") ;;
+    compare) args+=(--baseline-lenient "${name}") ;;
 esac
 args+=("$@")
 
@@ -97,7 +104,8 @@ for pair in ${BENCHES}; do
         continue
     fi
     echo "bench.sh: ${pkg} --bench ${bench}" >&2
-    cargo bench -p "${pkg}" --bench "${bench}" -- "${args[@]}"
+    # `${args[@]+...}`: an empty array is "unbound" to bash < 4.4 under -u.
+    cargo bench -p "${pkg}" --bench "${bench}" -- ${args[@]+"${args[@]}"}
     ran=$((ran + 1))
 done
 

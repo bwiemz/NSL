@@ -3,11 +3,11 @@
 #
 # INFORMATIONAL, NOT A GATE. Two reasons it cannot be one:
 #   - a hosted runner's neighbours are unknown; on this project's own
-#     workstation the same commit measured +12% on lex/largest_file between
-#     two `--quick` runs while a training job shared the box. Both halves of
-#     the comparison run on the SAME runner in the SAME job, back to back,
-#     which removes the runner-to-runner variance but not the moment-to-moment
-#     kind;
+#     workstation the same commit measured +8% ("Performance has regressed")
+#     on lex/largest_file between two full 100-sample runs while a training
+#     job shared the box. Both halves of the comparison run on the SAME
+#     runner in the SAME job, back to back, which removes the runner-to-runner
+#     variance but not the moment-to-moment kind;
 #   - criterion's verdict is a statistical one (p < 0.05 AND the whole
 #     confidence interval past the noise threshold); a true 3% regression
 #     reads "within noise" at the 5% threshold this lane uses.
@@ -86,19 +86,26 @@ jobs:
 
       - name: Resolve base and head
         id: refs
+        # Event data goes through env, not `${{ }}` inside `run`: the
+        # dispatch input is free text and the PR base ref is a branch name,
+        # and either interpolated into the script would be executed as shell.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_INPUT: ${{ github.event.inputs.base }}
         run: |
           set -euo pipefail
           head="$(git rev-parse HEAD)"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
             # actions/checkout gives a pull_request run the PR merged onto its
             # base branch, so the merge-base with that branch is the branch's
             # tip and head-minus-base is exactly the PR's delta.
-            git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
-            base="$(git merge-base "${head}" "origin/${{ github.event.pull_request.base.ref }}")"
-          elif [ -n "${{ github.event.inputs.base }}" ]; then
-            git fetch --no-tags origin "${{ github.event.inputs.base }}" || true
-            base="$(git rev-parse --verify "${{ github.event.inputs.base }}^{commit}" \
-                    || git rev-parse --verify "origin/${{ github.event.inputs.base }}^{commit}")"
+            git fetch --no-tags origin "${PR_BASE_REF}"
+            base="$(git merge-base "${head}" "origin/${PR_BASE_REF}")"
+          elif [ -n "${BASE_INPUT}" ]; then
+            git fetch --no-tags origin "${BASE_INPUT}" || true
+            base="$(git rev-parse --verify "${BASE_INPUT}^{commit}" \
+                    || git rev-parse --verify "origin/${BASE_INPUT}^{commit}")"
           else
             git fetch --no-tags origin main
             base="$(git merge-base "${head}" origin/main)"
@@ -113,43 +120,71 @@ jobs:
 
       # The base's benches are the base's own: a bench added by the PR has no
       # baseline and is reported as new (--baseline-lenient below), and a
-      # bench the PR removed is not run at all.
+      # bench the PR removed is not run at all. A base that fails to build or
+      # bench (the PR may be the fix) is not fatal either: the head still runs,
+      # compared against whatever the base did save, and the base log lands in
+      # the summary.
+      #
+      # The cache restores target/ — criterion's results with it — from
+      # whichever run first wrote this Cargo.lock key, and an exact hit is never
+      # re-saved, so without the rm a head run would compare against that
+      # run's base, a different commit.
       - name: Save baseline at base
+        id: save
+        continue-on-error: true
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
         run: |
           set -euo pipefail
-          git checkout --quiet --detach "${{ steps.refs.outputs.base }}"
+          rm -rf target/criterion
+          git checkout --quiet --detach "${BASE}"
           if [ ! -x scripts/bench.sh ]; then
             echo "scripts/bench.sh does not exist at the base commit; nothing to compare against" >&2
-            echo "no_baseline=1" >> "${GITHUB_ENV}"
             exit 0
           fi
           scripts/bench.sh save base -- --noplot 2>&1 | tee bench-base.txt
 
+      # Lenient: a bench with no `base` baseline (added by this PR, or the base
+      # never saved one) is reported without a change line instead of failing
+      # the run. 5% is the audit's "worth a look" threshold — below it
+      # criterion says "within noise threshold" whatever the p-value.
       - name: Compare at head
         id: compare
         continue-on-error: true
+        env:
+          HEAD: ${{ steps.refs.outputs.head }}
         run: |
           set -euo pipefail
-          git checkout --quiet --detach "${{ steps.refs.outputs.head }}"
-          if [ "${no_baseline:-0}" = "1" ]; then
-            scripts/bench.sh -- --noplot 2>&1 | tee bench-head.txt
-          else
-            # Lenient: a bench this PR adds has no baseline and is reported
-            # without a change line instead of failing the run. 5% is the
-            # audit's "worth a look" threshold — below it criterion says
-            # "within noise threshold" whatever the p-value.
-            scripts/bench.sh -- --noplot --baseline-lenient base --noise-threshold 0.05 2>&1 | tee bench-head.txt
-          fi
+          git checkout --quiet --detach "${HEAD}"
+          scripts/bench.sh -- --noplot --baseline-lenient base --noise-threshold 0.05 2>&1 | tee bench-head.txt
 
       - name: Summary
         if: always()
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+          SAVE_OUTCOME: ${{ steps.save.outcome }}
+          COMPARE_OUTCOME: ${{ steps.compare.outcome }}
         run: |
           set -euo pipefail
           {
-            echo "## Benchmarks: \`${{ steps.refs.outputs.base }}\` (base) vs \`${{ steps.refs.outputs.head }}\` (head)"
+            echo "## Benchmarks: \`${BASE}\` (base) vs \`${HEAD}\` (head)"
             echo
             echo "Informational only — see the header of \`.github/workflows/bench.yml\`."
             echo
+            if [ "${SAVE_OUTCOME}" != "success" ]; then
+              echo "**The base commit did not bench to completion** (step outcome: ${SAVE_OUTCOME}); a head bench with no verdict below had no baseline to compare against."
+              if [ -s bench-base.txt ]; then
+                echo
+                echo "<details><summary>base log (tail)</summary>"
+                echo
+                echo '```'
+                tail -n 40 bench-base.txt
+                echo '```'
+                echo "</details>"
+              fi
+              echo
+            fi
             if [ ! -s bench-head.txt ]; then
               echo "No results: the compare step did not produce output (see its log)."
             else
@@ -160,10 +195,11 @@ jobs:
               echo "|---|---|"
               awk '
                 /^[^ \t]/ { name = $1 }
-                /Performance has regressed/  { printf "| `%s` | **regressed** |\n", name }
-                /Performance has improved/   { printf "| `%s` | improved |\n", name }
-                /within noise threshold/     { printf "| `%s` | within noise |\n", name }
-                /No change in performance/   { printf "| `%s` | no change |\n", name }
+                /Performance has regressed/  { n++; printf "| `%s` | **regressed** |\n", name }
+                /Performance has improved/   { n++; printf "| `%s` | improved |\n", name }
+                /within noise threshold/     { n++; printf "| `%s` | within noise |\n", name }
+                /No change in performance/   { n++; printf "| `%s` | no change |\n", name }
+                END { if (!n) print "| (none) | no bench had a baseline to compare against |" }
               ' bench-head.txt
               echo
               echo "<details><summary>criterion output (head)</summary>"
@@ -174,6 +210,6 @@ jobs:
               echo "</details>"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
-          if [ "${{ steps.compare.outcome }}" != "success" ]; then
-            echo "compare step outcome: ${{ steps.compare.outcome }} (non-blocking)"
+          if [ "${COMPARE_OUTCOME}" != "success" ]; then
+            echo "compare step outcome: ${COMPARE_OUTCOME} (non-blocking)"
           fi

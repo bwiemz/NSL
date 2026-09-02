@@ -6,6 +6,7 @@
 //! tokens/s figure is what to compare across baselines.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use nsl_errors::{FileId, Level};
@@ -89,6 +90,10 @@ fn bench_parse(c: &mut Criterion) {
     eprintln!("parse corpus: {} files, {} tokens", files.len(), tokens);
 
     let mut group = c.benchmark_group("parse");
+    // The whole-corpus pass is ~1 ms; criterion's linear sampling needs
+    // ~5000 passes for its default 100 samples, which does not fit the
+    // default 5 s window (it warns and runs long anyway).
+    group.measurement_time(Duration::from_secs(10));
 
     group.throughput(Throughput::Elements(tokens as u64));
     group.bench_function("corpus", |b| {

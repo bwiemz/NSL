@@ -9,7 +9,7 @@
 //! exactly as a training loop's do.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use nsl_runtime::autodiff::{nsl_tape_backward, nsl_tape_start, nsl_tape_stop};
+use nsl_runtime::autodiff::{nsl_tape_backward_train, nsl_tape_start, nsl_tape_stop};
 use nsl_runtime::list::{nsl_list_free, nsl_list_get, nsl_list_len, nsl_list_new, nsl_list_push};
 use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_randn, nsl_tensor_relu, nsl_tensor_sum,
@@ -34,14 +34,18 @@ fn randn(dims: &[i64]) -> i64 {
 
 /// One optimizer-free training step of `sum(relu(x @ w1) @ w2)`: record on
 /// the tape, backward to both weights, release everything the step made.
-/// Returns the gradient count as a cheap liveness value.
+/// Returns the gradient count as a cheap liveness value. The backward is the
+/// train-block entry, which aborts if every gradient comes back zero — so a
+/// step that recorded nothing fails the bench instead of timing a no-op (the
+/// permissive `nsl_tape_backward` zero-fills and always returns one gradient
+/// per parameter).
 fn tape_step(x: i64, w1: i64, w2: i64, params: i64) -> i64 {
     nsl_tape_start(params);
     let h_pre = nsl_tensor_matmul(x, w1, 0);
     let h = nsl_tensor_relu(h_pre);
     let y = nsl_tensor_matmul(h, w2, 0);
     let loss = nsl_tensor_sum(y);
-    let grads = nsl_tape_backward(loss, params);
+    let grads = nsl_tape_backward_train(loss, params);
     let n = nsl_list_len(grads);
     for i in 0..n {
         nsl_tensor_free(nsl_list_get(grads, i));
