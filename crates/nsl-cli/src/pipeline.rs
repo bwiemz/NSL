@@ -3,20 +3,29 @@
 //!
 //! Extracted from main.rs; behavior is unchanged.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
+use nsl_codegen::CodegenError;
 use nsl_errors::{Level, SourceMap};
 use nsl_lexer::Interner;
-
-pub(crate) fn frontend(file: &PathBuf) -> (Interner, nsl_parser::ParseResult, nsl_semantic::AnalysisResult) {
-    frontend_with_flags(file, false)
-}
 
 pub(crate) fn frontend_with_flags(
     file: &PathBuf,
     linear_types: bool,
 ) -> (Interner, nsl_parser::ParseResult, nsl_semantic::AnalysisResult) {
+    let (_, interner, parse_result, analysis) = frontend_with_source_map(file, linear_types);
+    (interner, parse_result, analysis)
+}
+
+/// The single-file frontend, keeping the `SourceMap` the diagnostics were
+/// rendered through so a later codegen error can be rendered the same way
+/// ([`exit_on_codegen_error`]). Any lex/parse/semantic error has already
+/// been reported and exited on when this returns.
+pub(crate) fn frontend_with_source_map(
+    file: &PathBuf,
+    linear_types: bool,
+) -> (SourceMap, Interner, nsl_parser::ParseResult, nsl_semantic::AnalysisResult) {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -68,7 +77,44 @@ pub(crate) fn frontend_with_flags(
         process::exit(1);
     }
 
-    (interner, parse_result, analysis)
+    (source_map, interner, parse_result, analysis)
+}
+
+/// Report a codegen failure and exit(1). An error that knows where it was
+/// raised (see `CodegenError::span`) is rendered through the source map the
+/// way the frontend's own diagnostics are — `error: <message>`, then
+/// `file:line:col` and the excerpt; the phase tag would only stutter there
+/// (`error: codegen error: …`), and the excerpt already names the file. One
+/// without a span, or whose span the map cannot locate, is the plain
+/// `codegen error: <message>` line; `context`, when given, follows the
+/// prefix (`codegen error in 'lib.nsl': …`) so a multi-module build still
+/// names the module.
+pub(crate) fn exit_on_codegen_error(
+    source_map: &SourceMap,
+    e: &CodegenError,
+    context: Option<&str>,
+) -> ! {
+    match e.span {
+        Some(span) if source_map.contains_span(span) => {
+            source_map.emit_diagnostic(&e.to_diagnostic());
+        }
+        _ => {
+            match context {
+                Some(ctx) => eprintln!("codegen error {ctx}: {e}"),
+                None => eprintln!("codegen error: {e}"),
+            }
+            for note in &e.notes {
+                eprintln!("  = note: {note}");
+            }
+        }
+    }
+    process::exit(1)
+}
+
+/// `exit_on_codegen_error` with the `in '<path>'` context a multi-module
+/// build uses to name the module that failed.
+pub(crate) fn exit_on_codegen_error_in(source_map: &SourceMap, e: &CodegenError, module: &Path) -> ! {
+    exit_on_codegen_error(source_map, e, Some(&format!("in '{}'", module.display())))
 }
 
 /// Convert WRGA decorator configs captured by nsl-semantic into the codegen-side

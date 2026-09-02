@@ -20,6 +20,7 @@
 use serde::Serialize;
 
 use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
+use crate::error::CodegenError;
 use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::wengert::WengertList;
 use crate::wggo_apply::{apply, AppliedPlan};
@@ -150,10 +151,11 @@ pub struct WggoInput<'a> {
 /// even at the fp16-moment floor (the smallest the moment-precision axis can
 /// make the model without dropping below fp16). Carried on [`WggoPlan`] so the
 /// detection is unit-testable; [`run_on_wengert_with_weights`] converts a
-/// `Some(_)` into a hard compile failure (`eprintln!` + `process::exit(1)`,
-/// the repo's compile-fatal convention — cf. `stmt.rs` CPDT validate). This is
-/// deliberately NOT the silent degrade-to-Off warning path: the user asked for
-/// a hard cap and the model does not fit, so the compile must refuse loudly.
+/// `Some(_)` into a hard compile failure (a returned [`CodegenError`], which
+/// the CLI renders and exits on — cf. the CPDT weight-map validate in
+/// `stmt.rs`). This is deliberately NOT the silent degrade-to-Off warning
+/// path: the user asked for a hard cap and the model does not fit, so the
+/// compile must refuse loudly.
 #[derive(Debug, Clone, Serialize)]
 pub struct BudgetInfeasibility {
     /// Per-device budget the user requested, in bytes (`--wggo-memory-budget`
@@ -1292,6 +1294,11 @@ pub fn run_on_wengert(
 /// construct the appropriate [`GradientScorer`] and wire it into
 /// `WggoInput`.  Passing `None` preserves the Phase 1 magnitude-only
 /// path (used in tests that don't need gradient scoring).
+///
+/// `Ok(None)` means WGGO did not run (an unrecognised mode string, or the
+/// scorer could not be built — reported on stderr). `Err` is a compile
+/// failure: the `--wggo-memory-budget` refusal, see
+/// [`WggoPlan::budget_infeasible`].
 pub fn run_on_wengert_with_weights(
     wengert: &WengertList,
     target: &str,
@@ -1302,11 +1309,13 @@ pub fn run_on_wengert_with_weights(
     compile_options: Option<&crate::CompileOptions>,
     packing_supported: bool,
     packing_stats: Option<DatasetPackingConfig>,
-) -> Option<WggoPlan> {
+) -> Result<Option<WggoPlan>, CodegenError> {
     use crate::wggo_gradient_scorer::build_scorer;
     use std::sync::Arc;
 
-    let mode = WggoMode::parse(mode_str)?;
+    let Some(mode) = WggoMode::parse(mode_str) else {
+        return Ok(None);
+    };
     let cluster = ClusterSpec {
         num_gpus: world_size.max(1) as u32,
         ..ClusterSpec::default()
@@ -1362,7 +1371,7 @@ pub fn run_on_wengert_with_weights(
                 Ok(s) => Some(s),
                 Err(e) => {
                     eprintln!("[wggo] error: {e:?}");
-                    return None;
+                    return Ok(None);
                 }
             }
         } else {
@@ -1470,13 +1479,14 @@ pub fn run_on_wengert_with_weights(
     // when the plan cannot fit even at the fp16-moment floor. This is a
     // compile-fatal diagnostic — the user asked for a hard cap and the model
     // does not fit, so we refuse loudly rather than silently degrade (the
-    // degrade-to-Off warning path is for the no-budget case). `eprintln!` +
-    // `process::exit(1)` is the repo's compile-fatal convention (cf. the CPDT
-    // weight-map validate in `stmt.rs`). The detection lives on the plan so it
-    // stays unit-testable without spawning a process.
+    // degrade-to-Off warning path is for the no-budget case). It is returned
+    // as a `CodegenError` rather than printed-and-exited here so a library
+    // caller (tests, tools, a future server) sees a failure it can handle;
+    // the CLI renders it and exits. The detection lives on the plan so it
+    // stays unit-testable.
     if let Some(ref bi) = plan.budget_infeasible {
-        eprintln!(
-            "error: --wggo-memory-budget of {budget} bytes ({budget_mib} MiB) is \
+        return Err(CodegenError::new(format!(
+            "--wggo-memory-budget of {budget} bytes ({budget_mib} MiB) is \
              infeasible: the model needs at least {required} bytes ({required_mib} MiB) \
              even at the fp16-moment floor (16-bit Adam m/v, no structural relief){layers}. \
              Raise the budget or shrink the model.",
@@ -1489,8 +1499,7 @@ pub fn run_on_wengert_with_weights(
             } else {
                 String::new()
             },
-        );
-        std::process::exit(1);
+        )));
     }
 
     // Surface the weights-load failure (if any) in the report itself, not
@@ -1510,7 +1519,7 @@ pub fn run_on_wengert_with_weights(
         }
     }
 
-    Some(plan)
+    Ok(Some(plan))
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,6 +1660,61 @@ mod tests {
             run(below).budget_infeasible.is_some(),
             "a budget below the global floor must hard-refuse"
         );
+    }
+
+    #[test]
+    fn infeasible_budget_is_a_returned_compile_error_not_an_exit() {
+        // The entry point stmt.rs and the pre-pass call. Before C1 this site
+        // printed and `process::exit(1)`-ed from inside the library, which no
+        // test could observe without spawning a process; now the refusal is
+        // an `Err` naming the budget, the floor, and what to do.
+        let w = two_block_wengert();
+        let mut opts = crate::CompileOptions::default();
+        opts.wggo.memory_budget_bytes = Some(1);
+        opts.wggo.importance = crate::WggoImportance::Magnitude;
+        let err = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            None,
+            AnalysisConfig::default(),
+            Some(&opts),
+            true,
+            None,
+        )
+        .expect_err("a 1-byte budget must refuse the compile");
+        assert!(
+            err.message.starts_with("--wggo-memory-budget of 1 bytes (0 MiB) is infeasible"),
+            "refusal must name the flag and the budget: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Raise the budget or shrink the model"),
+            "refusal must say what to do: {}",
+            err.message
+        );
+        assert!(
+            !err.message.starts_with("error:"),
+            "the CLI adds the severity prefix; the library message must not: {}",
+            err.message
+        );
+        assert!(err.span.is_none(), "the planner has no statement; the pre-pass attaches one");
+
+        // An unrecognised mode is still "WGGO did not run", not a failure.
+        let none = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "not-a-mode",
+            1,
+            None,
+            AnalysisConfig::default(),
+            Some(&opts),
+            true,
+            None,
+        )
+        .expect("an unknown mode is not a compile error");
+        assert!(none.is_none());
     }
 
     #[test]
@@ -1910,6 +1974,7 @@ mod tests {
             true,
             None,
         )
+        .expect("no compile error")
         .expect("plan");
         // Every layer should be counted as without_weights since the
         // checkpoint didn't load.
@@ -2155,6 +2220,7 @@ mod tests {
             true,
             None,
         )
+        .expect("no compile error")
         .expect("plan is still produced via uniform-importance fallback");
         assert!(
             plan.warnings.iter().any(|m| m.contains("could not load weights")),
@@ -2405,6 +2471,7 @@ mod tests {
             true,
             None,
         )
+        .expect("no compile error")
         .expect("plan");
 
         // The calibrated scorer should have replaced magnitude scores for

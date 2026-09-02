@@ -198,11 +198,15 @@ fn cpdt_forced_stale_plan() -> bool {
         .unwrap_or(false)
 }
 
+/// Plan CPDT for one train block and publish the plan on the bus. `Err` is
+/// a compile failure — today only the weight-map validation refusal, which
+/// the CLI renders and exits on; every "CPDT does not apply here" outcome
+/// is a typed decline on the pass trace and `Ok(())`.
 pub(crate) fn invoke_cpdt_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     applied_plan: Option<&crate::wggo_apply::AppliedPlan>,
     train_block: Option<&nsl_ast::block::TrainBlock>,
-) {
+) -> Result<(), CodegenError> {
     // Experimental subsystem (CPDT). Compiled in by default; a build that opts
     // out (`--no-default-features` without `experimental-cpdt`) turns CPDT
     // planning into a no-op here. See STATUS.md / docs/architecture/.
@@ -231,7 +235,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
                 },
             },
         );
-        return;
+        return Ok(());
     }
     use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
     use crate::cpdt_expert::ExpertConfig;
@@ -253,7 +257,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
                 reason: crate::pass_trace::DeclineReason::ModeOff,
             },
         );
-        return;
+        return Ok(());
     }
     let Some(cluster) = compiler.cpdt_cluster.clone() else {
         // Reachable from source alone: `@cpdt(mode = full)` with no cluster
@@ -268,7 +272,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
                 ),
             },
         );
-        return;
+        return Ok(());
     };
 
     // Weights-only path: an absent plan contributes an empty override set and
@@ -341,14 +345,20 @@ pub(crate) fn invoke_cpdt_if_enabled(
                 // die here on the stale one; say so, because a validation
                 // error that names the wrong plan generation sends the user
                 // at the wrong artifact.
-                eprintln!(
-                    "error: {} (checked against the WGGO plan available at \
-                     this point — the pre-pass offer when one exists; if the \
-                     graph changed since the pre-pass, recompile so it \
-                     regenerates)",
-                    e
+                let mut err = CodegenError::new(e.to_string()).with_note(
+                    "checked against the WGGO plan available at this point — \
+                     the pre-pass offer when one exists; if the graph changed \
+                     since the pre-pass, recompile so it regenerates",
                 );
-                std::process::exit(1);
+                if let Some(train) = train_block {
+                    // The header's `model = …`, not the whole block: the
+                    // refusal is about that model's weights.
+                    err = err.with_span(crate::wggo_prepass::model_arg_span(
+                        train,
+                        compiler.interner,
+                    ));
+                }
+                return Err(err);
             }
         }
     }
@@ -455,6 +465,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
         }
     }
     compiler.bus.publish_cpdt_plan(plan);
+    Ok(())
 }
 
 pub(crate) fn invoke_wrga_if_enabled(
@@ -1560,7 +1571,22 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Compile one statement. An error raised anywhere beneath it — by this
+    /// dispatcher, an expression, or a helper that never sees a span — leaves
+    /// here pointing at the innermost statement or expression that was being
+    /// compiled (`CodegenError::with_span_if_unset`: the first node on the
+    /// way out to attach a span wins, so nested statements keep theirs).
     pub fn compile_stmt(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        stmt: &Stmt,
+    ) -> Result<(), CodegenError> {
+        self.compile_stmt_dispatch(builder, state, stmt)
+            .map_err(|e| e.with_span_if_unset(stmt.span))
+    }
+
+    fn compile_stmt_dispatch(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
@@ -5877,11 +5903,11 @@ impl Compiler<'_> {
                 let sched = self.passes.scheduler();
                 sched
                     .schedule("CPDT", None, || {
-                        crate::stmt::invoke_cpdt_if_enabled(self, Some(&applied), Some(train));
+                        crate::stmt::invoke_cpdt_if_enabled(self, Some(&applied), Some(train))
                     })
                     .map_err(CodegenError::new)?
                     .finish(&self.bus)
-                    .map_err(CodegenError::new)?;
+                    .map_err(CodegenError::new)??;
             }
             // Explicitly cleared, never a previous block's leftovers — the
             // pre-restructure stale-leak this site exists to prevent. The
@@ -5905,11 +5931,11 @@ impl Compiler<'_> {
                 let sched = self.passes.scheduler();
                 sched
                     .schedule("CPDT", None, || {
-                        crate::stmt::invoke_cpdt_if_enabled(self, None, Some(train));
+                        crate::stmt::invoke_cpdt_if_enabled(self, None, Some(train))
                     })
                     .map_err(CodegenError::new)?
                     .finish(&self.bus)
-                    .map_err(CodegenError::new)?;
+                    .map_err(CodegenError::new)??;
             }
         }
         let result =
@@ -9277,7 +9303,13 @@ sched={sched_s}",
                                 // so an in-place replan prices packing from the
                                 // real distribution too.
                                 self.features.dataset_packing_stats.clone(),
-                            ),
+                            )
+                            .map_err(|e| {
+                                e.with_span_if_unset(crate::wggo_prepass::model_arg_span(
+                                    train,
+                                    self.interner,
+                                ))
+                            })?,
                         };
                         // Test-only knob: simulate a rejected pre-plan whose
                         // in-place replan diverges on FASE decisions, so the
@@ -9696,11 +9728,11 @@ sched={sched_s}",
                                     self,
                                     Some(applied),
                                     Some(train),
-                                );
+                                )
                             })
                             .map_err(CodegenError::new)?
                             .finish(&self.bus)
-                            .map_err(CodegenError::new)?;
+                            .map_err(CodegenError::new)??;
                     }
                     // Re-arbitrate what the moments WOULD be typed as under
                     // the CURRENT plan and overrides — the same pipeline the

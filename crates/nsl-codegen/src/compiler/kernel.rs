@@ -670,7 +670,7 @@ impl Compiler<'_> {
         } else {
             // Into a local first: `run` takes `&mut self`, so publishing
             // inline would borrow `self.bus` mutably while `self` already is.
-            let preplans = crate::wggo_prepass::run(self, stmts);
+            let preplans = crate::wggo_prepass::run(self, stmts)?;
             self.bus.publish_wggo_preplans(preplans);
         }
 

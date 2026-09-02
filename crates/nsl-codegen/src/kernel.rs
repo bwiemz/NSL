@@ -377,7 +377,15 @@ impl KernelCompiler {
         Ok(())
     }
 
+    /// Compile one kernel statement; an error raised beneath it leaves here
+    /// pointing at the innermost statement or expression being compiled
+    /// (`CodegenError::with_span_if_unset`, as in the Cranelift dispatchers).
     fn compile_stmt(&mut self, stmt: &Stmt, interner: &Interner) -> Result<(), CodegenError> {
+        self.compile_stmt_dispatch(stmt, interner)
+            .map_err(|e| e.with_span_if_unset(stmt.span))
+    }
+
+    fn compile_stmt_dispatch(&mut self, stmt: &Stmt, interner: &Interner) -> Result<(), CodegenError> {
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value, .. } => {
                 use nsl_ast::pattern::PatternKind;
@@ -421,8 +429,18 @@ impl KernelCompiler {
         }
     }
 
-    /// Compile an expression; returns (register_name, RegKind).
+    /// Compile an expression; returns (register_name, RegKind). Errors leave
+    /// here carrying the innermost expression's span (see `compile_stmt`).
     fn compile_expr(
+        &mut self,
+        expr: &Expr,
+        interner: &Interner,
+    ) -> Result<(String, RegKind), CodegenError> {
+        self.compile_expr_dispatch(expr, interner)
+            .map_err(|e| e.with_span_if_unset(expr.span))
+    }
+
+    fn compile_expr_dispatch(
         &mut self,
         expr: &Expr,
         interner: &Interner,

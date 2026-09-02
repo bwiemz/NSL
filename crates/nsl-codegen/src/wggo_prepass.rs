@@ -47,6 +47,7 @@ use nsl_ast::pattern::PatternKind;
 use nsl_ast::stmt::{Stmt, StmtKind};
 
 use crate::compiler::Compiler;
+use crate::error::CodegenError;
 
 /// One train block's pre-computed plan, keyed by the train block's stmt
 /// NodeId (the same key `set_active_fused_ce_config_for_train_block` uses).
@@ -392,12 +393,16 @@ pub fn fn_bodies_contain_packed_sdpa<'a>(
     false
 }
 
-pub fn run(compiler: &mut Compiler, stmts: &[Stmt]) -> Vec<WggoPrePlan> {
+/// Pre-plan every train block in `stmts`. `Err` is a compile failure raised
+/// by the planner itself (today: the `--wggo-memory-budget` refusal, see
+/// `wggo::run_on_wengert_with_weights`); a block the pre-pass cannot plan
+/// simply yields no pre-plan.
+pub fn run(compiler: &mut Compiler, stmts: &[Stmt]) -> Result<Vec<WggoPrePlan>, CodegenError> {
     if !compiler.features.source_ad_enabled {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if !wggo_mode_enabled(&compiler.compile_options) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Linear walk: accumulate top-level `let`/`const` types as the
@@ -407,8 +412,8 @@ pub fn run(compiler: &mut Compiler, stmts: &[Stmt]) -> Vec<WggoPrePlan> {
     let mut prefix_types: HashMap<nsl_ast::Symbol, nsl_semantic::types::Type> = HashMap::new();
     let mut preplans = Vec::new();
     let mut train_blocks_seen = 0usize;
-    walk_stmts(compiler, stmts, &mut prefix_types, &mut train_blocks_seen, &mut preplans);
-    preplans
+    walk_stmts(compiler, stmts, &mut prefix_types, &mut train_blocks_seen, &mut preplans)?;
+    Ok(preplans)
 }
 
 fn walk_stmts(
@@ -417,7 +422,7 @@ fn walk_stmts(
     prefix_types: &mut HashMap<nsl_ast::Symbol, nsl_semantic::types::Type>,
     train_blocks_seen: &mut usize,
     out: &mut Vec<WggoPrePlan>,
-) {
+) -> Result<(), CodegenError> {
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value, .. } => {
@@ -430,8 +435,12 @@ fn walk_stmts(
             StmtKind::TrainBlock(train) => {
                 let is_first = *train_blocks_seen == 0;
                 *train_blocks_seen += 1;
-                if let Some(mut preplan) =
-                    plan_train_block(compiler, train, stmt.id, prefix_types)
+                // The planner's refusals already name the `model:` argument;
+                // this is the fallback for any future error path inside it
+                // that forgets a span — the train block is the statement the
+                // budget was checked against, so it is the right one.
+                if let Some(mut preplan) = plan_train_block(compiler, train, stmt.id, prefix_types)
+                    .map_err(|e| e.with_span_if_unset(stmt.span))?
                 {
                     preplan.is_first_train_block = is_first;
                     out.push(preplan);
@@ -493,7 +502,7 @@ fn walk_stmts(
                     prefix_types,
                     train_blocks_seen,
                     out,
-                );
+                )?;
             }
             // A train block can sit inside a `for` loop (e.g. an ensemble
             // trained via `for m in models: train(model=m): ...`) or a
@@ -508,11 +517,12 @@ fn walk_stmts(
             StmtKind::For { body, .. }
             | StmtKind::While { body, .. }
             | StmtKind::WhileLet { body, .. } => {
-                walk_stmts(compiler, &body.stmts, prefix_types, train_blocks_seen, out);
+                walk_stmts(compiler, &body.stmts, prefix_types, train_blocks_seen, out)?;
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -740,15 +750,32 @@ mod tests {
     }
 }
 
+/// Where a planner refusal points: the `model = …` argument of the train
+/// header — the refusal is about that model's size — falling back to the
+/// whole block when the header has no such argument. A train block spans
+/// its entire body, so the caret on the whole block is a page of excerpt
+/// for a one-line fact.
+pub(crate) fn model_arg_span(
+    train: &nsl_ast::block::TrainBlock,
+    interner: &nsl_lexer::Interner,
+) -> nsl_errors::Span {
+    train
+        .config
+        .iter()
+        .find(|arg| arg.name.is_some_and(|n| interner.resolve(n.0) == Some("model")))
+        .map(|arg| arg.span)
+        .unwrap_or(train.span)
+}
+
 fn plan_train_block(
     compiler: &mut Compiler,
     train: &nsl_ast::block::TrainBlock,
     train_block_stmt_id: nsl_ast::NodeId,
     prefix_types: &HashMap<nsl_ast::Symbol, nsl_semantic::types::Type>,
-) -> Option<WggoPrePlan> {
+) -> Result<Option<WggoPrePlan>, CodegenError> {
     // `train(model = <ident>)` — pure AST, same extraction as the in-place
     // path's config scan.
-    let model_sym = train.config.iter().find_map(|arg| {
+    let Some(model_sym) = train.config.iter().find_map(|arg| {
         let name_sym = arg.name?;
         if compiler.resolve_sym(name_sym) != "model" {
             return None;
@@ -757,11 +784,13 @@ fn plan_train_block(
             ExprKind::Ident(sym) => Some(*sym),
             _ => None,
         }
-    })?;
+    }) else {
+        return Ok(None);
+    };
 
     // Model type: for-loop model vars first (same priority as in-place),
     // then the semantic type of the model variable's initializer.
-    let model_type_name = compiler
+    let Some(model_type_name) = compiler
         .models
         .model_var_types
         .get(&model_sym)
@@ -772,12 +801,17 @@ fn plan_train_block(
                 Some(compiler.resolve_sym(*name).to_string())
             }
             _ => None,
-        })?;
+        })
+    else {
+        return Ok(None);
+    };
 
-    let (step_body, step_param_sym) = train.sections.iter().find_map(|s| match s {
+    let Some((step_body, step_param_sym)) = train.sections.iter().find_map(|s| match s {
         nsl_ast::block::TrainSection::Step { body, param } => Some((body, *param)),
         _ => None,
-    })?;
+    }) else {
+        return Ok(None);
+    };
 
     // Install THIS block's fused-CE config for the extraction, exactly as
     // `compile_train_block` does, and restore unconditionally.
@@ -823,7 +857,7 @@ fn plan_train_block(
             // Source-AD extraction failed here; the in-place path may still
             // succeed (it registers codegen-time state we don't model) or
             // fall back to tape AD — either way, planning stays in place.
-            return None;
+            return Ok(None);
         }
 
         // Fused-LCE dead-chain drain (review D2c-1): the in-place path
@@ -836,7 +870,7 @@ fn plan_train_block(
         // path raises the hard refusal with the full diagnosis, so the
         // prepass just skips WGGO planning for this block.
         if extractor.apply_pending_fused_lce_prunes().is_err() {
-            return None;
+            return Ok(None);
         }
 
         let mut analysis_config = crate::wggo_weight_analysis::AnalysisConfig::default();
@@ -868,6 +902,7 @@ fn plan_train_block(
                 // distribution; `None` on non-packed modules → legacy constants.
                 compiler.features.dataset_packing_stats.clone(),
             )
+            .map_err(|e| e.with_span_if_unset(model_arg_span(train, compiler.interner)))
         }) {
             Ok(s) => s,
             // A schedule refusal here is a compiler defect (this is a
@@ -883,11 +918,14 @@ fn plan_train_block(
         // at the TrainBlock boundary, the one place it is sound. The
         // TrainBlock schedule's finish() and the end-of-compile bus finding
         // judge it where it can hold.
-        let plan = scheduled.defer_postconditions(
+        let Some(plan) = scheduled.defer_postconditions(
             "wggo_overrides is published per train block by the TrainBlock \
              driver; the prepass invocation cannot satisfy applied=>published \
              at any point inside KernelPrepass",
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         let overrides = crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied);
         let contains_attention = extractor.wengert_list().ops.iter().any(|op| {
             matches!(
@@ -912,7 +950,7 @@ fn plan_train_block(
             compiler.features.packed_sdpa_in_module = true;
         }
         let graph_fingerprint = fingerprint_wengert(extractor.wengert_list());
-        Some(WggoPrePlan {
+        Ok(Some(WggoPrePlan {
             train_block_stmt_id,
             plan,
             overrides,
@@ -921,7 +959,7 @@ fn plan_train_block(
             // failed extractions too.
             is_first_train_block: false,
             contains_attention,
-        })
+        }))
     })();
     compiler.restore_active_fused_ce_config(saved_fused_ce);
     result
