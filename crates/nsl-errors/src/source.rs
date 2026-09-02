@@ -1,6 +1,7 @@
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+use std::io::IsTerminal;
 
 use crate::diagnostic::{Diagnostic, Label, LabelStyle, Level};
 use crate::span::{FileId, Span};
@@ -78,7 +79,17 @@ impl SourceMap {
             cs_diag = cs_diag.with_notes(diag.notes.clone());
         }
 
-        let writer = StandardStream::stderr(ColorChoice::Auto);
+        // `ColorChoice::Auto` never asks whether stderr is a terminal: on
+        // Unix it declines only when `TERM` is unset or "dumb", and on
+        // Windows it emits ANSI escapes unconditionally — so a piped
+        // `nsl build 2> log` (or a test capturing stderr) got colour codes
+        // spliced into `error: …` there. Decide on the stream, not the env.
+        let choice = if std::io::stderr().is_terminal() {
+            ColorChoice::Auto
+        } else {
+            ColorChoice::Never
+        };
+        let writer = StandardStream::stderr(choice);
         let config = term::Config::default();
         let _ = term::emit(&mut writer.lock(), &config, &self.files, &cs_diag);
     }
