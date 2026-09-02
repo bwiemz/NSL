@@ -47,21 +47,23 @@ static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.alloc(layout)
+        // SAFETY: the caller's `GlobalAlloc` contract on `layout` is passed
+        // through to `System` unchanged (and so for the three below).
+        unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.alloc_zeroed(layout)
+        unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // A growth is a new allocation as far as the budget is concerned: a
         // `Vec::push` that spills is exactly the kind of hot-path cost this
         // gate exists to catch.
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
 }
 
