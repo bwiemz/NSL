@@ -7,7 +7,7 @@ use crate::autodiff;
 use crate::memory::checked_alloc_zeroed;
 
 use super::creation::create_scalar_tensor_dtype;
-use super::{get_shape_vec, get_strides_vec, nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
+use super::{get_strides_vec, nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
 
 /// Global sum reduction (backward compatible wrapper).
 #[no_mangle]
@@ -41,7 +41,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
                     crate::cuda::gpu_sum_dim_f32(c_ptr, d, keepdim_bool)
                 };
                 super::nsl_tensor_free(c_ptr);
-                let input_shape = get_shape_vec(tensor);
+                let input_shape = autodiff::tape_shape(tensor);
                 if autodiff::is_recording() {
                     autodiff::maybe_record(autodiff::TapeOp::SumReduce {
                         a: tensor_ptr,
@@ -66,7 +66,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_c);
-    let input_shape = get_shape_vec(tensor);
+    let input_shape = autodiff::tape_shape(tensor);
     let keepdim_bool = keepdim != 0;
 
     if dim == -1 {
@@ -185,7 +185,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
             #[cfg(feature = "cuda")]
             {
                 let keepdim_bool = keepdim != 0;
-                let input_shape = get_shape_vec(tensor);
+                let input_shape = autodiff::tape_shape(tensor);
                 let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
 
                 if dim == -1 {
@@ -234,7 +234,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_c);
-    let input_shape = get_shape_vec(tensor);
+    let input_shape = autodiff::tape_shape(tensor);
     let keepdim_bool = keepdim != 0;
 
     if dim == -1 {
@@ -327,7 +327,7 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
                 let keepdim_bool = keepdim != 0;
                 let ndim = tensor.ndim as usize;
                 let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
-                let input_shape = get_shape_vec(tensor);
+                let input_shape = autodiff::tape_shape(tensor);
                 let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
                 let result = crate::cuda::gpu_max_dim_f32(c_ptr, d, keepdim_bool);
                 super::nsl_tensor_free(c_ptr);
@@ -360,7 +360,7 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_c);
-    let input_shape = get_shape_vec(tensor);
+    let input_shape = autodiff::tape_shape(tensor);
     let keepdim_bool = keepdim != 0;
     let ndim = tensor.ndim as usize;
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
@@ -489,7 +489,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                 // Tape record on the GPU arm — mirrors the CPU record site
                 // (indices saved with a refcount bump for backward).
                 if autodiff::is_recording() {
-                    let input_shape = get_shape_vec(NslTensor::from_ptr(tensor_ptr));
+                    let input_shape = autodiff::tape_shape(NslTensor::from_ptr(tensor_ptr));
                     NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
                     autodiff::maybe_record(autodiff::TapeOp::Gather {
                         a: tensor_ptr,
@@ -508,7 +508,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
             #[cfg(feature = "cuda")]
             if tensor.dtype == 1 && gather_dim_gpu_enabled() {
                 let d = d as usize;
-                let shape = get_shape_vec(tensor);
+                let shape = super::get_shape_vec(tensor);
                 if d < shape.len() {
                     let outer: usize =
                         shape[..d].iter().map(|&s| s as usize).product::<usize>().max(1);
@@ -600,7 +600,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                             ));
                             let result_ptr = NslTensor::publish(result);
                             if autodiff::is_recording() {
-                                let input_shape = get_shape_vec(NslTensor::from_ptr(tensor_ptr));
+                                let input_shape = autodiff::tape_shape(NslTensor::from_ptr(tensor_ptr));
                                 NslTensor::from_ptr(indices_ptr)
                                     .refcount
                                     .fetch_add(1, Ordering::SeqCst);
@@ -633,7 +633,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                 gpu_result
             };
             if was_recording {
-                let input_shape = get_shape_vec(NslTensor::from_ptr(tensor_ptr));
+                let input_shape = autodiff::tape_shape(NslTensor::from_ptr(tensor_ptr));
                 NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
                 autodiff::maybe_record(autodiff::TapeOp::Gather {
                     a: tensor_ptr,
@@ -650,7 +650,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     let i_c = nsl_tensor_contiguous(indices_ptr);
     let tensor = NslTensor::from_ptr(t_c);
     let indices = NslTensor::from_ptr(i_c);
-    let input_shape = get_shape_vec(tensor);
+    let input_shape = autodiff::tape_shape(tensor);
     let ndim = tensor.ndim as usize;
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
 

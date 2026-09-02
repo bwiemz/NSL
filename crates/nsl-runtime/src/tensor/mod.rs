@@ -3339,9 +3339,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         // established metadata-only relabel — backward passes the gradient
         // through unchanged.
         if autodiff::is_recording() {
-            let t = NslTensor::from_ptr(tensor_ptr);
-            let input_shape: Vec<i64> =
-                (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect();
+            let input_shape = autodiff::tape_shape(NslTensor::from_ptr(tensor_ptr));
             autodiff::maybe_record(autodiff::TapeOp::Reshape {
                 a: tensor_ptr,
                 out,
@@ -3756,7 +3754,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
                 let saved_argmax: Vec<usize> = argmax_vec.iter().map(|&x| x as usize).collect();
                 autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
                     a: input_ptr, out: result, saved_argmax,
-                    input_shape: vec![n, c, h, w],
+                    input_shape: autodiff::TapeShape::from_slice(&[n, c, h, w]),
                 });
             }
             return result;
@@ -3845,7 +3843,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
         NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
             a: input_ptr, out: result_ptr, saved_argmax: argmax_indices,
-            input_shape: vec![n as i64, c as i64, h as i64, w as i64],
+            input_shape: autodiff::TapeShape::from_slice(&[n as i64, c as i64, h as i64, w as i64]),
         });
     }
 

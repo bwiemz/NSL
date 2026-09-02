@@ -71,8 +71,8 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                 // graph with no Add edges (and, with the whole elementwise
                 // family affected, zero parameter gradients).
                 if autodiff::is_recording() {
-                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+                    let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
                     autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
                 }
                 // Out-of-place GPU fallback: honor caller relinquish flags.
@@ -142,12 +142,12 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
     // Ensure contiguous inputs for flat-indexed CPU ops
     let a_c = nsl_tensor_contiguous(a);
     let b_c = nsl_tensor_contiguous(b);
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
     let result = tensor_elementwise_op(a_c, b_c, |x, y| x + y);
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
+        let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+        let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
         autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
     }
     #[cfg(feature = "interop")]
@@ -194,8 +194,8 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add).
                 if autodiff::is_recording() {
-                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+                    let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
                     autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
                 }
                 if relinq_a { nsl_tensor_free(a); }
@@ -249,12 +249,12 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
     super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(a);
     let b_c = nsl_tensor_contiguous(b);
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
     let result = tensor_elementwise_op(a_c, b_c, |x, y| x - y);
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
+        let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+        let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
         autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
     }
     #[cfg(feature = "interop")]
@@ -296,8 +296,8 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
                 // are bumped BEFORE the relinquish frees below so the tape's
                 // reference keeps a relinquished operand alive for backward.
                 if autodiff::is_recording() {
-                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+                    let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
                     NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
                     NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
                     autodiff::maybe_record(autodiff::TapeOp::Mul {
@@ -355,12 +355,12 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
     super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(a);
     let b_c = nsl_tensor_contiguous(b);
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
     let result = tensor_elementwise_op(a_c, b_c, |x, y| x * y);
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
+        let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+        let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
         NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
         NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Mul {
@@ -411,8 +411,8 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
                 // Tape record on the GPU arm (see nsl_tensor_mul for the
                 // saved-ref-before-relinquish ordering).
                 if autodiff::is_recording() {
-                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+                    let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
                     NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
                     NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
                     autodiff::maybe_record(autodiff::TapeOp::Div {
@@ -470,12 +470,12 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
     super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(a);
     let b_c = nsl_tensor_contiguous(b);
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
     let result = tensor_elementwise_op(a_c, b_c, |x, y| x / y);
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
+        let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
+        let b_shape = autodiff::tape_shape(NslTensor::from_ptr(b));
         NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
         NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Div {
