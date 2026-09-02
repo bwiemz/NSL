@@ -46,7 +46,8 @@
 //! ZeRO-3 elementwise step and the bf16-sr twins (GPU/multi-rank only —
 //! the roadmap item scopes to single-GPU), the WGGO unified dispatcher
 //! (needs per-layer --wggo overrides; its two arms re-enter the covered
-//! emitters), and the Muon-CSLA lr read (stmt.rs MuonCslaCtx) — recorded
+//! emitters), and the Muon-CSLA lr read (the `MuonCslaCtx { lr: … }`
+//! construction in stmt.rs; the struct lives in stmt_csla.rs) — recorded
 //! as the one #520 lr site with no dedicated gate.
 //!
 //! WHY NO "applied lr" observation surface was added instead: a reported
