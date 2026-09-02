@@ -9,6 +9,10 @@ target/
 /.VSCodeCounter/
 *.exe
 *.o
+# `examples/m6_features.nsl` writes this into the CURRENT directory as part of
+# its file-I/O demo, and the e2e harness runs every example from the repo root.
+# It was committed once (as were five examples/*.exe, before the rule above).
+/test_m6.txt
 .worktrees/
 desktop.ini
 
