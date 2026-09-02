@@ -678,6 +678,12 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          defs, not a stage that rewrites anything itself",
     ),
     ("inspect", "dev-tools inspection"),
+    (
+        "ir_capture",
+        "in-process capture of what `--dump-ir` prints (roadmap A1) — records \
+         each function's finished CLIF for the train-block snapshot tests, \
+         observes the compile and transforms nothing",
+    ),
     ("kernel", "kernel skeleton/IR/lowering machinery"),
     ("layerwise", "CSLA layerwise accumulation scheduling"),
     ("lib", "crate root"),

@@ -269,13 +269,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!(
-                "--- IR: lambda '{}' ---\n{}",
-                lambda.name,
-                ctx.func.display()
-            );
-        }
+        self.record_ir(format_args!("lambda '{}'", lambda.name), &ctx.func);
 
         self.module
             .define_function(lambda.func_id, &mut ctx)
@@ -322,9 +316,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!("--- IR: struct ctor '{name}' ---\n{}", ctx.func.display());
-        }
+        self.record_ir(format_args!("struct ctor '{name}'"), &ctx.func);
 
         self.module
             .define_function(func_id, &mut ctx)
@@ -552,12 +544,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!(
-                "--- IR: model ctor '{model_name}' ---\n{}",
-                ctx.func.display()
-            );
-        }
+        self.record_ir(format_args!("model ctor '{model_name}'"), &ctx.func);
 
         self.module
             .define_function(func_id, &mut ctx)
@@ -716,12 +703,7 @@ impl Compiler<'_> {
                         builder.finalize();
                     }
 
-                    if self.dump_ir {
-                        eprintln!(
-                            "--- IR: model method '{mangled}' ---\n{}",
-                            ctx.func.display()
-                        );
-                    }
+                    self.record_ir(format_args!("model method '{mangled}'"), &ctx.func);
 
                     self.module
                         .define_function(func_id, &mut ctx)
@@ -874,14 +856,12 @@ impl Compiler<'_> {
                         builder.finalize();
                     }
 
-                    if self.dump_ir {
-                        let impl_name =
-                            format!("__nsl_export_impl_{model_name}_{method_name}");
-                        eprintln!(
-                            "--- IR: @export impl '{impl_name}' ---\n{}",
-                            ctx.func.display()
-                        );
-                    }
+                    self.record_ir(
+                        format_args!(
+                            "@export impl '__nsl_export_impl_{model_name}_{method_name}'"
+                        ),
+                        &ctx.func,
+                    );
 
                     self.module.define_function(func_id, &mut ctx).map_err(
                         |e| {

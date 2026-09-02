@@ -1,0 +1,27 @@
+# Muon over a model with a 2-D weight (orthogonalised) and a 1-D bias
+# (falls to the AdamW side), so both halves of the split optimizer lower.
+# The Muon fixtures are the ones the `--layerwise-accum` (CSLA) and
+# resident-momentum variants are compiled under. Import-free (see
+# mlp_adamw.nsl).
+
+model Mlp:
+    w1: Tensor = ones([4, 8])
+    b1: Tensor = zeros([8])
+    w2: Tensor = ones([8, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = silu(x @ self.w1 + self.b1)
+        return h @ self.w2
+
+let m = Mlp()
+let x = ones([4, 4])
+let y = zeros([4, 2])
+
+train(model = m, epochs = 1, grad_accumulation = 2):
+    optimizer: Muon(lr = 0.002, momentum = 0.95, nesterov = true, ns_steps = 5, weight_decay = 0.01, beta1 = 0.9, beta2 = 0.95, eps = 1e-8)
+    step(batch):
+        let pred = m.forward(x)
+        let d = pred - y
+        let loss = mean(d * d)
+
+print(sum(m.w2))

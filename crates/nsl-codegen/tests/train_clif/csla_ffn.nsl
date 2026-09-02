@@ -1,0 +1,52 @@
+# A blocks-structured FFN LM — the model shape the checkpoint plan
+# (`--checkpoint-blocks`) and the layerwise-accumulation schedule
+# (`--layerwise-accum`, CSLA) require — with a DataLoader step and
+# gradient accumulation. 128 tokens / (batch 2 x seq 8) = 8 micro-batches
+# per epoch, grad_accumulation = 2. A cut-down csla_layerwise_ffn.nsl
+# (crates/nsl-cli/tests/fixtures) with the cross-entropy inline: the
+# harness compiles the entry module alone (see mlp_adamw.nsl).
+
+model Blk:
+    norm_f: Tensor = ones([16])
+    w_up: Tensor = ones([16, 32])
+    w_down: Tensor = ones([32, 16])
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let f = (rmsnorm(h, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h + f
+
+model TinyLM:
+    embed: Tensor = ones([16, 16])
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([16])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 16])
+        for block in self.blocks:
+            h = block.forward(h)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        return hn @ self.embed.transpose(0, 1)
+
+let m = TinyLM()
+let tokens = arange(128)
+let loader = DataLoader(tokens, batch_size = 2, seq_len = 8, shuffle = false, drop_last = true)
+
+train(model = m, epochs = 1, grad_accumulation = 2):
+    optimizer: AdamW(lr = 0.002, weight_decay = 0.01, beta1 = 0.9, beta2 = 0.95, eps = 1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let nll = neg(gather(log_softmax(flat_logits, 1), 1, flat_labels))
+        let loss = mean(nll)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print(sum(m.norm_out))

@@ -407,8 +407,12 @@ pub fn insert_adjoint_last_use_frees(
         let at = last_use.get(var).copied().unwrap_or(prod_idx).max(prod_idx);
         pending.push((at, *var));
     }
-    // Insert from the back so earlier indices stay valid.
-    pending.sort_by_key(|p| std::cmp::Reverse(p.0));
+    // Insert from the back so earlier indices stay valid. The victim is
+    // part of the key: `produced` is a `HashMap`, and victims that share a
+    // last use otherwise kept its walk order — every compile freed them in
+    // a different order, so no two `--dump-ir` runs of a checkpointed
+    // program agreed (the CLIF snapshot tests need them to).
+    pending.sort_by_key(|&(at, var)| std::cmp::Reverse((at, var)));
     let inserted = pending.len();
     for (at, victim) in pending {
         let result = *fresh;

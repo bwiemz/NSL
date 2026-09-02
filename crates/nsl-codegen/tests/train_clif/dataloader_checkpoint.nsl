@@ -1,0 +1,27 @@
+# A DataLoader-driven step (the batch dict, its per-step release) with
+# full-train-state checkpointing (`checkpoint_save`/`checkpoint_every`)
+# — the pretraining shape of a train block. 64 tokens / (batch 2 x seq
+# 4) = 8 micro-batches per epoch. Import-free (see mlp_adamw.nsl).
+
+model Tiny:
+    emb: Tensor = ones([64, 4])
+
+    fn forward(self, ids: Tensor) -> Tensor:
+        return embedding_lookup(self.emb, ids.reshape([8]))
+
+let m = Tiny()
+let corpus = arange(64)
+let loader = DataLoader(corpus, batch_size = 2, seq_len = 4, shuffle = false, drop_last = true)
+let target = zeros([8, 4])
+
+train(model = m, epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 3):
+    optimizer: AdamW(lr = 0.01)
+    step(batch):
+        let pred = m.forward(batch.input_ids)
+        let d = pred - target
+        let loss = mean(d * d)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+
+print(sum(m.emb))

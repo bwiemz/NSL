@@ -31,7 +31,7 @@ pub use entry_points::{
     compile, compile_entry, compile_module, compile_module_with_imports,
     compile_module_with_imports_best_effort_plan, compile_module_with_imports_best_effort_plans,
     compile_module_with_imports_returning_plan,
-    compile_entry_returning_plan, compile_returning_plan,
+    compile_entry_capturing_ir, compile_entry_returning_plan, compile_returning_plan,
     compile_returning_splice_count_for_tests, compile_standalone,
     compile_standalone_returning_plan, compile_test, compile_with_profile_captures,
     compile_with_zk_info, compile_with_zk_info_returning_plan,
@@ -1031,6 +1031,11 @@ pub struct Compiler<'a> {
     /// extraction on unresolved optimizer stdlib symbols).
     pub profile_capture_slot: Option<crate::profiling::captures::ProfileCaptureSlot>,
 
+    /// Where [`Compiler::record_ir`] keeps the CLIF of every function it
+    /// defines when a caller asked for it in-process rather than on stderr.
+    /// Installed only by `compile_entry_capturing_ir`; `None` costs nothing.
+    pub ir_capture: Option<crate::ir_capture::IrCaptureSlot>,
+
     // ── Dev Tools Phase 5: @inspect decorator state ─────────────────────
     pub inspect_train_step_var: Option<cranelift_frontend::Variable>,
     pub inspect_pinned_vars: std::collections::BTreeSet<crate::wengert::VarId>,
@@ -1300,6 +1305,7 @@ impl<'a> Compiler<'a> {
             manifest_builder: None,
             fusion_plan_for_profile: None,
             profile_capture_slot: None,
+            ir_capture: None,
             source_text: String::new(),
             source_file_name: String::new(),
             inspect_train_step_var: None,
@@ -1322,6 +1328,27 @@ impl<'a> Compiler<'a> {
     /// Resolve a Symbol to its interned string.
     pub fn resolve_sym(&self, sym: Symbol) -> &str {
         self.interner.resolve(sym.0).unwrap_or("<unknown>")
+    }
+
+    /// The one place a finished function's CLIF leaves the compiler: called
+    /// just before `define_function`, it prints `--- IR: <label> ---` and the
+    /// function under `--dump-ir`, and keeps the same text in `ir_capture`
+    /// when a caller installed one. `label` is formatted only when either
+    /// is on.
+    pub fn record_ir(&self, label: std::fmt::Arguments<'_>, func: &cranelift_codegen::ir::Function) {
+        if !self.dump_ir && self.ir_capture.is_none() {
+            return;
+        }
+        if self.dump_ir {
+            eprintln!("--- IR: {label} ---\n{}", func.display());
+        }
+        if let Some(slot) = &self.ir_capture {
+            slot.borrow_mut().push(crate::ir_capture::IrDump::capture(
+                label.to_string(),
+                func,
+                &self.module,
+            ));
+        }
     }
 
     /// CFTP v10 (item 3): install the fused-CE decorator config for the

@@ -1,0 +1,20 @@
+# Lion: the sign-update optimizer path. Import-free (see mlp_adamw.nsl).
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 1):
+    optimizer: Lion(lr = 0.01, beta1 = 0.9, beta2 = 0.99)
+    step(batch):
+        let pred = m.forward(x)
+        let d = pred - y
+        let loss = mean(d * d)
+
+print(sum(m.w))

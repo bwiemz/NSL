@@ -1,0 +1,33 @@
+# Two-layer MLP under AdamW with a scheduler, gradient accumulation,
+# gradient clipping and both callbacks — the config surface of a
+# production train block, on a program small enough to read the CLIF of.
+# Import-free on purpose: the snapshot harness compiles the entry module
+# alone (only the optimizer modules are resolved), so the loss is inline.
+
+model Mlp:
+    w1: Tensor = ones([4, 8])
+    b1: Tensor = zeros([8])
+    w2: Tensor = ones([8, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = silu(x @ self.w1 + self.b1)
+        return h @ self.w2
+
+let m = Mlp()
+let x = ones([4, 4])
+let y = zeros([4, 2])
+
+train(model = m, epochs = 2, grad_accumulation = 2, grad_clip = 1.0):
+    optimizer: AdamW(lr = 0.01, weight_decay = 0.01)
+    scheduler: warmup_cosine(warmup_steps = 1, total_steps = 4, min_lr = 0.001)
+    step(batch):
+        let pred = m.forward(x)
+        let d = pred - y
+        let loss = mean(d * d)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+        on_epoch(epoch, loss):
+            print(epoch)
+
+print(sum(m.w2))
