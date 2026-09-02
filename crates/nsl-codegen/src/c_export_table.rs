@@ -35,7 +35,7 @@ use crate::compiler::Compiler;
 use crate::error::CodegenError;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, Signature, UserFuncName,
+    types as cl_types, AbiParam, Function, InstBuilder, MemFlagsData, Signature, UserFuncName,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -92,7 +92,7 @@ pub(crate) fn emit_export_table(
             fb.seal_block(block);
             let count = fb.ins().iconst(cl_types::I64, n);
             fb.ins().return_(&[count]);
-            fb.finalize();
+            fb.finalize(compiler.module.target_config());
         }
         compiler
             .module
@@ -223,11 +223,11 @@ fn emit_indexed_string_accessor(
         let eight = fb.ins().iconst(cl_types::I64, 8);
         let off_bytes = fb.ins().imul(idx, eight);
         let off_addr = fb.ins().iadd(base, off_bytes);
-        let off = fb.ins().load(cl_types::I64, MemFlags::trusted(), off_addr, 0);
+        let off = fb.ins().load(cl_types::I64, MemFlagsData::trusted(), off_addr, 0);
         let str_ptr = fb.ins().iadd(base, off);
         fb.ins().return_(&[str_ptr]);
 
-        fb.finalize();
+        fb.finalize(compiler.module.target_config());
     }
     compiler
         .module

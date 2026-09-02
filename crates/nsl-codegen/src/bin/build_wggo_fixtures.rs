@@ -93,7 +93,7 @@ fn write_calib_data(out_dir: &Path) {
     let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
     tensors.insert("calibration".into(), view);
 
-    let serialized = serialize(&tensors, &None).unwrap();
+    let serialized = serialize(&tensors, None).unwrap();
     let path = out_dir.join("wggo_calib_data.safetensors");
     std::fs::write(&path, &serialized).unwrap();
     eprintln!("wrote {} ({} bytes)", path.display(), serialized.len());
@@ -140,7 +140,7 @@ fn write_calib_weights(out_dir: &Path) {
         tensors.insert((*name).to_string(), view);
     }
 
-    let serialized = serialize(&tensors, &None).unwrap();
+    let serialized = serialize(&tensors, None).unwrap();
     let path = out_dir.join("wggo_calib_weights.safetensors");
     std::fs::write(&path, &serialized).unwrap();
     eprintln!("wrote {} ({} bytes)", path.display(), serialized.len());

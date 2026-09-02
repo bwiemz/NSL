@@ -87,7 +87,7 @@ fn write_hf_mixtral_safetensors(path: &Path, hf_prefix: &str) {
     // Drop the borrow-of-_unused_ references (silence dead-code/borrow
     // checker; the safetensors crate's TensorView only borrows the
     // contents above for the lifetime of `views`).
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&bytes).unwrap();
 }

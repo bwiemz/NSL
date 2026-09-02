@@ -126,7 +126,7 @@ fn write_canonical_safetensors(path: &Path) {
             )
         })
         .collect();
-    let bytes = serialize(&views, &None).expect("serialize canonical safetensors");
+    let bytes = serialize(&views, None).expect("serialize canonical safetensors");
     std::fs::write(path, bytes).expect("write canonical safetensors");
 }
 

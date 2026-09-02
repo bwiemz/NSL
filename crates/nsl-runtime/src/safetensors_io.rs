@@ -317,7 +317,7 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
         .collect();
 
     // Serialize to bytes and write file manually for better error messages
-    let serialized = match safetensors::tensor::serialize(&data, &None) {
+    let serialized = match safetensors::tensor::serialize(data, None) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[nsl] safetensors_save: serialize error: {}", e);
@@ -356,7 +356,7 @@ mod tests {
         .unwrap();
         let mut map = HashMap::new();
         map.insert(name.to_string(), view);
-        let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
+        let serialized = safetensors::tensor::serialize(map, None).unwrap();
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&serialized).unwrap();
@@ -377,7 +377,7 @@ mod tests {
         .unwrap();
         let mut map = HashMap::new();
         map.insert(name.to_string(), view);
-        let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
+        let serialized = safetensors::tensor::serialize(map, None).unwrap();
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&serialized).unwrap();

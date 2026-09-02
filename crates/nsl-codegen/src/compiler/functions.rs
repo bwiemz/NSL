@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{types as cl_types, Function, InstBuilder, MemFlags, UserFuncName};
+use cranelift_codegen::ir::{types as cl_types, Function, InstBuilder, MemFlagsData, UserFuncName};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::Module;
@@ -207,8 +207,7 @@ impl Compiler<'_> {
             // Bind normal parameters
             for (i, (sym, cl_type)) in lambda.params.iter().enumerate() {
                 let param_val = builder.block_params(entry)[i];
-                let var = state.new_variable();
-                builder.declare_var(var, *cl_type);
+                let var = builder.declare_var(*cl_type);
                 builder.def_var(var, param_val);
                 state.variables.insert(*sym, (var, *cl_type));
             }
@@ -224,17 +223,16 @@ impl Compiler<'_> {
                 let bound = if *cl_type == cl_types::F64 {
                     builder
                         .ins()
-                        .bitcast(cl_types::F64, MemFlags::new(), param_val)
+                        .bitcast(cl_types::F64, MemFlagsData::new(), param_val)
                 } else if *cl_type == cl_types::F32 {
                     let bits32 = builder.ins().ireduce(cl_types::I32, param_val);
-                    builder.ins().bitcast(cl_types::F32, MemFlags::new(), bits32)
+                    builder.ins().bitcast(cl_types::F32, MemFlagsData::new(), bits32)
                 } else if cl_type.is_int() && *cl_type != cl_types::I64 {
                     builder.ins().ireduce(*cl_type, param_val)
                 } else {
                     param_val
                 };
-                let var = state.new_variable();
-                builder.declare_var(var, *cl_type);
+                let var = builder.declare_var(*cl_type);
                 builder.def_var(var, bound);
                 state.variables.insert(*sym, (var, *cl_type));
             }
@@ -266,7 +264,7 @@ impl Compiler<'_> {
                 };
                 builder.ins().return_(&[result]);
             }
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("lambda '{}'", lambda.name), &ctx.func);
@@ -309,11 +307,11 @@ impl Compiler<'_> {
                 let param_val = builder.block_params(entry)[i];
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), param_val, ptr, *offset as i32);
+                    .store(MemFlagsData::trusted(), param_val, ptr, *offset as i32);
             }
 
             builder.ins().return_(&[ptr]);
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("struct ctor '{name}'"), &ctx.func);
@@ -357,8 +355,7 @@ impl Compiler<'_> {
                 } else {
                     cl_types::I64
                 };
-                let var = state.new_variable();
-                builder.declare_var(var, cl_type);
+                let var = builder.declare_var(cl_type);
                 builder.def_var(var, param_val);
                 state.variables.insert(param.name, (var, cl_type));
                 state.param_symbols.insert(param.name);
@@ -405,8 +402,7 @@ impl Compiler<'_> {
                                 if let Some(init_expr) = init {
                                     let init_expr_clone = init_expr.clone();
                                     // Generate loop: for i in 0..arr_size, compile init, store at ptr+field_offset+i*8
-                                    let counter_var = state.new_variable();
-                                    builder.declare_var(counter_var, cl_types::I64);
+                                    let counter_var = builder.declare_var(cl_types::I64);
                                     let zero = builder.ins().iconst(cl_types::I64, 0);
                                     builder.def_var(counter_var, zero);
 
@@ -443,7 +439,7 @@ impl Compiler<'_> {
                                         builder.ins().iconst(cl_types::I64, field_offset as i64);
                                     let total_off = builder.ins().iadd(base_off, elem_byte_offset);
                                     let addr = builder.ins().iadd(ptr, total_off);
-                                    builder.ins().store(MemFlags::trusted(), init_val, addr, 0);
+                                    builder.ins().store(MemFlagsData::trusted(), init_val, addr, 0);
 
                                     let next_counter = builder.use_var(counter_var);
                                     let one = builder.ins().iconst(cl_types::I64, 1);
@@ -467,7 +463,7 @@ impl Compiler<'_> {
                                 let val = self.compile_expr(&mut builder, &mut state, init_expr)?;
                                 builder
                                     .ins()
-                                    .store(MemFlags::trusted(), val, ptr, *offset as i32);
+                                    .store(MemFlagsData::trusted(), val, ptr, *offset as i32);
                             } else {
                                 // Store zero for uninitialized fields
                                 let zero = if cl_type.is_float() {
@@ -477,7 +473,7 @@ impl Compiler<'_> {
                                 };
                                 builder
                                     .ins()
-                                    .store(MemFlags::trusted(), zero, ptr, *offset as i32);
+                                    .store(MemFlagsData::trusted(), zero, ptr, *offset as i32);
                             }
                         }
                     }
@@ -499,7 +495,7 @@ impl Compiler<'_> {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), zero, ptr, slot_off as i32);
+                        .store(MemFlagsData::trusted(), zero, ptr, slot_off as i32);
                 }
             }
 
@@ -541,7 +537,7 @@ impl Compiler<'_> {
             }
 
             builder.ins().return_(&[ptr]);
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("model ctor '{model_name}'"), &ctx.func);
@@ -619,8 +615,7 @@ impl Compiler<'_> {
                             .find(|p| self.resolve_sym(p.name) == "self")
                             .map(|p| p.name)
                             .unwrap_or_else(|| fn_def.params[0].name);
-                        let self_var = state.new_variable();
-                        builder.declare_var(self_var, pointer_type());
+                        let self_var = builder.declare_var(pointer_type());
                         builder.def_var(self_var, self_val);
                         state.variables.insert(self_sym, (self_var, pointer_type()));
                         state.param_symbols.insert(self_sym);
@@ -638,8 +633,7 @@ impl Compiler<'_> {
                             } else {
                                 cl_types::I64
                             };
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_type);
+                            let var = builder.declare_var(cl_type);
                             builder.def_var(var, param_val);
                             state.variables.insert(param.name, (var, cl_type));
                             state.param_symbols.insert(param.name);
@@ -700,7 +694,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(format_args!("model method '{mangled}'"), &ctx.func);
@@ -790,8 +784,7 @@ impl Compiler<'_> {
                         // not complain about an unused param.
                         let _num_weights_val = builder.block_params(entry)[1];
 
-                        let weight_ptrs_var = state.new_variable();
-                        builder.declare_var(weight_ptrs_var, cl_types::I64);
+                        let weight_ptrs_var = builder.declare_var(cl_types::I64);
                         builder.def_var(weight_ptrs_var, weight_ptrs_val);
 
                         state.self_resolution =
@@ -810,8 +803,7 @@ impl Compiler<'_> {
                             } else {
                                 cl_types::I64
                             };
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_type);
+                            let var = builder.declare_var(cl_type);
                             builder.def_var(var, param_val);
                             state.variables.insert(param.name, (var, cl_type));
                             state.param_symbols.insert(param.name);
@@ -853,7 +845,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(

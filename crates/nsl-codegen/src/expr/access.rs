@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
@@ -79,7 +79,7 @@ impl Compiler<'_> {
                 let offset_bytes = (idx as i64) * 8;
                 let tensor_ptr = builder.ins().load(
                     cl_types::I64,
-                    MemFlags::trusted(),
+                    MemFlagsData::trusted(),
                     weight_ptrs,
                     offset_bytes as i32,
                 );
@@ -115,7 +115,7 @@ impl Compiler<'_> {
                     if field.name == member_name {
                         let val = builder.ins().load(
                             field.cl_type,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             obj_val,
                             field.offset as i32,
                         );
@@ -172,7 +172,7 @@ impl Compiler<'_> {
                             })?;
                         let table_ptr = builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             obj_val,
                             slot_off as i32,
                         );
@@ -193,7 +193,7 @@ impl Compiler<'_> {
                         let merge_blk = builder.create_block();
                         builder.append_block_param(merge_blk, cl_types::I64);
                         let base_is_null =
-                            builder.ins().icmp_imm(IntCC::Equal, table_ptr, 0);
+                            builder.ins().icmp_imm_s(IntCC::Equal, table_ptr, 0);
                         builder
                             .ins()
                             .brif(base_is_null, null_blk, &[], deref_blk, &[]);
@@ -202,18 +202,18 @@ impl Compiler<'_> {
                         builder.seal_block(null_blk);
                         state.current_block = Some(null_blk);
                         let null_tensor = builder.ins().iconst(cl_types::I64, 0);
-                        builder.ins().jump(merge_blk, &[null_tensor]);
+                        builder.ins().jump(merge_blk, &[BlockArg::Value(null_tensor)]);
 
                         builder.switch_to_block(deref_blk);
                         builder.seal_block(deref_blk);
                         state.current_block = Some(deref_blk);
                         let loaded = builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             table_ptr,
                             byte_off,
                         );
-                        builder.ins().jump(merge_blk, &[loaded]);
+                        builder.ins().jump(merge_blk, &[BlockArg::Value(loaded)]);
 
                         builder.switch_to_block(merge_blk);
                         builder.seal_block(merge_blk);
@@ -235,7 +235,7 @@ impl Compiler<'_> {
                     if field.name == member_name {
                         let val = builder.ins().load(
                             field.cl_type,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             obj_val,
                             field.offset as i32,
                         );
@@ -285,7 +285,7 @@ impl Compiler<'_> {
                     if field.name == member_name {
                         let val = builder.ins().load(
                             field.cl_type,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             obj_val,
                             field.offset as i32,
                         );
@@ -518,7 +518,7 @@ impl Compiler<'_> {
             "bool" => match &src_type {
                 Type::Bool => Ok(val),
                 Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8 => {
-                    Ok(builder.ins().icmp_imm(IntCC::NotEqual, val, 0))
+                    Ok(builder.ins().icmp_imm_s(IntCC::NotEqual, val, 0))
                 }
                 Type::Float | Type::F64 => {
                     let zero = builder.ins().f64const(0.0);
@@ -528,7 +528,7 @@ impl Compiler<'_> {
                     let zero = builder.ins().f32const(0.0);
                     Ok(builder.ins().fcmp(FloatCC::NotEqual, val, zero))
                 }
-                _ => Ok(builder.ins().icmp_imm(IntCC::NotEqual, val, 0)),
+                _ => Ok(builder.ins().icmp_imm_s(IntCC::NotEqual, val, 0)),
             },
             _ => Err(CodegenError::new(format!(
                 "unknown type conversion: {target_type}()"

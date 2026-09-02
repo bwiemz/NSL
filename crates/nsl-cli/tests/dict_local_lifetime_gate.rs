@@ -116,7 +116,7 @@ fn load_safetensors_dict_is_swept_at_exit() {
         "b".to_string(),
         TensorView::new(Dtype::F32, vec![2], b_bytes.as_slice()).unwrap(),
     );
-    std::fs::write(tmp.join("w.safetensors"), serialize(&views, &None).unwrap()).unwrap();
+    std::fs::write(tmp.join("w.safetensors"), serialize(&views, None).unwrap()).unwrap();
 
     let src = r#"
 let w = load_safetensors("w.safetensors", 1)

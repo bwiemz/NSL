@@ -18,7 +18,7 @@ use std::path::Path;
 
 use half::f16;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use safetensors::tensor::{serialize, TensorView};
 use safetensors::Dtype;
 
@@ -254,7 +254,7 @@ fn write_fixture(out_dir: &Path, name: &str, shape: TransformerShape, dtype: DTy
             (k.clone(), view)
         })
         .collect();
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let path = out_dir.join(format!("{name}.safetensors"));
     std::fs::write(&path, &bytes).unwrap();
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
@@ -265,8 +265,8 @@ fn kaiming_normal_tensor(rng: &mut StdRng, shape: &[usize], dtype: DType, fan_in
     let stddev = (2.0_f64 / fan_in as f64).sqrt();
     let mut f32_vals = Vec::with_capacity(numel);
     for _ in 0..numel {
-        let u1: f64 = rng.gen_range(1e-10..1.0);
-        let u2: f64 = rng.gen_range(0.0..1.0);
+        let u1: f64 = rng.random_range(1e-10..1.0);
+        let u2: f64 = rng.random_range(0.0..1.0);
         let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
         f32_vals.push((z * stddev) as f32);
     }

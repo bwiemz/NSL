@@ -391,8 +391,7 @@ impl Compiler<'_> {
                             .map(|p| p.name)
                             .or_else(|| fn_def.params.first().map(|p| p.name))
                             .expect("agent method missing both explicit 'self' param and any params at all");
-                        let self_var = state.new_variable();
-                        builder.declare_var(self_var, pointer_type());
+                        let self_var = builder.declare_var(pointer_type());
                         builder.def_var(self_var, state_ptr_val);
                         state.variables.insert(self_sym, (self_var, pointer_type()));
                         state.param_symbols.insert(self_sym);
@@ -410,8 +409,7 @@ impl Compiler<'_> {
                             } else {
                                 cl_types::I64
                             };
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_type);
+                            let var = builder.declare_var(cl_type);
                             builder.def_var(var, param_val);
                             state.variables.insert(param.name, (var, cl_type));
                             state.param_symbols.insert(param.name);
@@ -459,7 +457,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(format_args!("agent method '{mangled}'"), &ctx.func);
@@ -556,8 +554,7 @@ impl Compiler<'_> {
                 } else {
                     cl_types::I64
                 };
-                let var = state.new_variable();
-                builder.declare_var(var, cl_type);
+                let var = builder.declare_var(cl_type);
                 builder.def_var(var, param_val);
                 state.variables.insert(param.name, (var, cl_type));
                 state.param_symbols.insert(param.name);
@@ -585,8 +582,7 @@ impl Compiler<'_> {
                     .map(Symbol);
 
                 if let Some(binding_sym) = binding_sym_opt {
-                    let var = state.new_variable();
-                    builder.declare_var(var, pointer_type());
+                    let var = builder.declare_var(pointer_type());
                     builder.def_var(var, state_ptr);
                     state.variables.insert(binding_sym, (var, pointer_type()));
                     // Register for Unknown-type dispatch in calls.rs.
@@ -628,7 +624,7 @@ impl Compiler<'_> {
                 }
             }
 
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("@pipeline_agent fn '{fn_name}'"), &ctx.func);

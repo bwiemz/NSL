@@ -738,7 +738,7 @@ fn create_small_safetensors(dir: &std::path::Path) -> std::path::PathBuf {
     tensors.insert("bias".to_string(), bias_view);
     tensors.insert("weight".to_string(), weight_view);
 
-    let serialized = safetensors::tensor::serialize(&tensors, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(&tensors, None).unwrap();
     let path = dir.join("weights.safetensors");
     std::fs::write(&path, &serialized).unwrap();
     path
@@ -1502,7 +1502,7 @@ fn e2e_convert_safetensors_to_nslm() {
         safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2, 2], &bytes).unwrap();
     let mut map: HashMap<String, safetensors::tensor::TensorView<'_>> = HashMap::new();
     map.insert("mat".to_string(), view);
-    let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(&map, None).unwrap();
     std::fs::write(&st_path, &serialized).unwrap();
 
     // Run nsl convert

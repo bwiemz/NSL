@@ -1161,7 +1161,13 @@ pub fn hash_kernel_ast(
     field(&device.sm_version.to_le_bytes());
     field(&device.sm_count.to_le_bytes());
     field(&device.driver_version.to_le_bytes());
-    format!("{:x}", hasher.finalize())
+    hex(&hasher.finalize())
+}
+
+/// Lower-case hex of a digest. sha2 0.11 hands back a `hybrid_array::Array`,
+/// which — unlike the 0.10 `GenericArray` — does not implement `LowerHex`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Returns the autotune cache directory path.
@@ -1290,7 +1296,7 @@ pub fn freeze_records(records: &mut Vec<AutotuneCacheRecord>) -> (String, String
     let json = serde_json::to_string_pretty(&records).expect("records serialize");
     let mut h = Sha256::new();
     h.update(json.as_bytes());
-    (json, format!("{:x}", h.finalize()))
+    (json, hex(&h.finalize()))
 }
 
 /// Load a frozen tuning DB for this process. Consulted by every cache
@@ -1307,7 +1313,7 @@ pub fn load_frozen_db(path: &std::path::Path, expected_sha256: Option<&str>) -> 
     if let Some(expected) = expected_sha256 {
         let mut h = Sha256::new();
         h.update(&bytes);
-        let got = format!("{:x}", h.finalize());
+        let got = hex(&h.finalize());
         if !got.eq_ignore_ascii_case(expected) {
             return Err(format!(
                 "--autotune-db-sha256 mismatch for {}: expected {expected}, got {got} — \

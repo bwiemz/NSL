@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, MemFlags};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData};
 use cranelift_frontend::{FunctionBuilder, Variable};
 use cranelift_module::Module;
 
@@ -1420,8 +1420,7 @@ impl Compiler<'_> {
                 PatternKind::Ident(sym) => {
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let elem = builder.inst_results(call)[0];
-                    let var = state.new_variable();
-                    builder.declare_var(var, cl_types::I64);
+                    let var = builder.declare_var(cl_types::I64);
                     builder.def_var(var, elem);
                     state.variables.insert(*sym, (var, cl_types::I64));
                     if let Some(elem_ty) =
@@ -1475,8 +1474,7 @@ impl Compiler<'_> {
                             // Nested pattern: { x: (a, b) } → destructure the field value
                             match &pat.kind {
                                 PatternKind::Ident(sym) => {
-                                    let var = state.new_variable();
-                                    builder.declare_var(var, cl_types::I64);
+                                    let var = builder.declare_var(cl_types::I64);
                                     builder.def_var(var, field_val);
                                     state.variables.insert(*sym, (var, cl_types::I64));
                                     if let Some(field_ty) = field_ty.clone() {
@@ -1502,8 +1500,7 @@ impl Compiler<'_> {
                             }
                         } else {
                             // Simple field binding: { name } binds `name` to the value
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             builder.def_var(var, field_val);
                             state.variables.insert(field.name, (var, cl_types::I64));
                             if let Some(field_ty) = field_ty {
@@ -1520,8 +1517,7 @@ impl Compiler<'_> {
                         self.destructure_element_type(container_ty, i, rest_index, patterns.len());
                     match &pattern.kind {
                         PatternKind::Ident(sym) => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             builder.def_var(var, elem);
                             state.variables.insert(*sym, (var, cl_types::I64));
                             if let Some(elem_ty) = elem_ty {
@@ -1561,8 +1557,7 @@ impl Compiler<'_> {
                     )?;
 
                     if let Some(sym) = rest_sym {
-                        let var = state.new_variable();
-                        builder.declare_var(var, cl_types::I64);
+                        let var = builder.declare_var(cl_types::I64);
                         builder.def_var(var, rest_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
                         if let Some(rest_ty) =
@@ -1699,8 +1694,7 @@ impl Compiler<'_> {
                             }
                             builder.def_var(var, init_val);
                         } else {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_type);
+                            let var = builder.declare_var(cl_type);
                             builder.def_var(var, init_val);
                             state.variables.insert(sym, (var, cl_type));
                         }
@@ -1831,8 +1825,7 @@ impl Compiler<'_> {
                             if let Some(ref pat) = field.pattern {
                                 match &pat.kind {
                                     PatternKind::Ident(sym) => {
-                                        let var = state.new_variable();
-                                        builder.declare_var(var, cl_types::I64);
+                                        let var = builder.declare_var(cl_types::I64);
                                         builder.def_var(var, field_val);
                                         state.variables.insert(*sym, (var, cl_types::I64));
                                         if let Some(field_ty) = field_ty.clone() {
@@ -1857,8 +1850,7 @@ impl Compiler<'_> {
                                     }
                                 }
                             } else {
-                                let var = state.new_variable();
-                                builder.declare_var(var, cl_types::I64);
+                                let var = builder.declare_var(cl_types::I64);
                                 builder.def_var(var, field_val);
                                 state.variables.insert(field.name, (var, cl_types::I64));
                                 if let Some(field_ty) = field_ty {
@@ -2010,7 +2002,7 @@ impl Compiler<'_> {
                         if vt == cranelift_codegen::ir::types::F64 {
                             val = builder.ins().bitcast(
                                 cranelift_codegen::ir::types::I64,
-                                cranelift_codegen::ir::MemFlags::new(),
+                                cranelift_codegen::ir::MemFlagsData::new(),
                                 val,
                             );
                         }
@@ -2132,8 +2124,7 @@ impl Compiler<'_> {
                 let addr = builder
                     .ins()
                     .func_addr(crate::types::pointer_type(), func_ref);
-                let var = state.new_variable();
-                builder.declare_var(var, cl_types::I64);
+                let var = builder.declare_var(cl_types::I64);
                 builder.def_var(var, addr);
                 state.variables.insert(fn_def.name, (var, cl_types::I64));
                 // Scoped liveness for the shadow-dispatch guard — the
@@ -2717,7 +2708,7 @@ impl Compiler<'_> {
                                 } else {
                                     let old_val = builder.ins().load(
                                         field.cl_type,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         obj_val,
                                         field.offset as i32,
                                     );
@@ -2750,7 +2741,7 @@ impl Compiler<'_> {
                                             let ok_blk = builder.create_block();
                                             let trap_blk = builder.create_block();
                                             let is_zero =
-                                                builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                                builder.ins().icmp_imm_s(IntCC::Equal, new_val, 0);
                                             builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
                                             builder.switch_to_block(trap_blk);
                                             builder.seal_block(trap_blk);
@@ -2766,7 +2757,7 @@ impl Compiler<'_> {
                                     }
                                 };
                                 builder.ins().store(
-                                    cranelift_codegen::ir::MemFlags::trusted(),
+                                    cranelift_codegen::ir::MemFlagsData::trusted(),
                                     final_val,
                                     obj_val,
                                     field.offset as i32,
@@ -2803,7 +2794,7 @@ impl Compiler<'_> {
                                         })?;
                                     let table_ptr = builder.ins().load(
                                         cl_types::I64,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         obj_val,
                                         slot_off as i32,
                                     );
@@ -2813,7 +2804,7 @@ impl Compiler<'_> {
                                     // the tensors it holds).
                                     let old_ptr = builder.ins().load(
                                         cl_types::I64,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         table_ptr,
                                         byte_off,
                                     );
@@ -2823,7 +2814,7 @@ impl Compiler<'_> {
                                         &[old_ptr],
                                     )?;
                                     builder.ins().store(
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         new_val,
                                         table_ptr,
                                         byte_off,
@@ -2850,7 +2841,7 @@ impl Compiler<'_> {
                                 } else {
                                     let old_val = builder.ins().load(
                                         field.cl_type,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         obj_val,
                                         field.offset as i32,
                                     );
@@ -2883,7 +2874,7 @@ impl Compiler<'_> {
                                             let ok_blk = builder.create_block();
                                             let trap_blk = builder.create_block();
                                             let is_zero =
-                                                builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                                builder.ins().icmp_imm_s(IntCC::Equal, new_val, 0);
                                             builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
                                             builder.switch_to_block(trap_blk);
                                             builder.seal_block(trap_blk);
@@ -2899,7 +2890,7 @@ impl Compiler<'_> {
                                     }
                                 };
                                 builder.ins().store(
-                                    cranelift_codegen::ir::MemFlags::trusted(),
+                                    cranelift_codegen::ir::MemFlagsData::trusted(),
                                     final_val,
                                     obj_val,
                                     field.offset as i32,
@@ -2994,8 +2985,7 @@ impl Compiler<'_> {
             if state.param_symbols.contains(&sym) {
                 continue;
             }
-            let var = state.new_variable();
-            builder.declare_var(var, cl_types::I64);
+            let var = builder.declare_var(cl_types::I64);
             builder.def_var(var, zero);
             state.variables.insert(sym, (var, cl_types::I64));
             state.eltls_loop_predeclared.insert(sym);
@@ -3062,8 +3052,7 @@ impl Compiler<'_> {
         if !dict_syms.is_empty() {
             let zero = builder.ins().iconst(cl_types::I64, 0);
             for sym in dict_syms {
-                let var = state.new_variable();
-                builder.declare_var(var, cl_types::I64);
+                let var = builder.declare_var(cl_types::I64);
                 builder.def_var(var, zero);
                 state.variables.insert(sym, (var, cl_types::I64));
                 // The rebind clear keys off this set — ONLY slots this
@@ -3839,8 +3828,7 @@ impl Compiler<'_> {
         // Pre-declare the pattern variable before the loop (once per function, not per iteration)
         let pattern_var = match &pattern.kind {
             PatternKind::Ident(sym) => {
-                let var = state.new_variable();
-                builder.declare_var(var, cl_types::I64);
+                let var = builder.declare_var(cl_types::I64);
                 let zero = builder.ins().iconst(cl_types::I64, 0);
                 builder.def_var(var, zero);
                 state.variables.insert(*sym, (var, cl_types::I64));
@@ -3883,7 +3871,7 @@ impl Compiler<'_> {
         // defensive, but a tracked `val` would otherwise be a
         // freed-then-read bug, not a leak).
         self.free_condition_temporaries(builder, state, expr_base, val);
-        let cond = builder.ins().icmp_imm(IntCC::NotEqual, val, 0);
+        let cond = builder.ins().icmp_imm_s(IntCC::NotEqual, val, 0);
         builder.ins().brif(cond, body_block, &[], exit_block, &[]);
 
         // Body: update pattern variable with current value, execute body
@@ -3975,16 +3963,14 @@ impl Compiler<'_> {
         let call = builder.ins().call(len_ref, &[list_val]);
         let list_len = builder.inst_results(call)[0];
 
-        let counter_var = state.new_variable();
-        builder.declare_var(counter_var, cl_types::I64);
+        let counter_var = builder.declare_var(cl_types::I64);
         let zero = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(counter_var, zero);
 
         // Pre-declare pattern variables before the loop
         match &pattern.kind {
             PatternKind::Ident(sym) => {
-                let elem_var = state.new_variable();
-                builder.declare_var(elem_var, cl_types::I64);
+                let elem_var = builder.declare_var(cl_types::I64);
                 builder.def_var(elem_var, zero);
                 state.variables.insert(*sym, (elem_var, cl_types::I64));
             }
@@ -4002,14 +3988,12 @@ impl Compiler<'_> {
                 for sub_pat in sub_patterns {
                     match &sub_pat.kind {
                         PatternKind::Ident(sym) => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             builder.def_var(var, zero);
                             state.variables.insert(*sym, (var, cl_types::I64));
                         }
                         PatternKind::Rest(Some(sym)) => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             builder.def_var(var, zero);
                             state.variables.insert(*sym, (var, cl_types::I64));
                         }
@@ -4204,8 +4188,7 @@ impl Compiler<'_> {
             }
         };
         let zero = builder.ins().iconst(cl_types::I64, 0);
-        let elem_var = state.new_variable();
-        builder.declare_var(elem_var, cl_types::I64);
+        let elem_var = builder.declare_var(cl_types::I64);
         builder.def_var(elem_var, zero);
         state
             .variables
@@ -4216,8 +4199,7 @@ impl Compiler<'_> {
         self.models.model_var_types.insert(loop_var_sym, model_name);
 
         // Counter variable
-        let counter_var = state.new_variable();
-        builder.declare_var(counter_var, cl_types::I64);
+        let counter_var = builder.declare_var(cl_types::I64);
         builder.def_var(counter_var, zero);
 
         let header_block = builder.create_block();
@@ -4254,7 +4236,7 @@ impl Compiler<'_> {
         let addr = builder.ins().iadd(base_val, elem_offset);
         let elem_ptr = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
+            .load(cl_types::I64, MemFlagsData::trusted(), addr, 0);
         builder.def_var(elem_var, elem_ptr);
 
         // Compile body statements
@@ -4369,8 +4351,7 @@ impl Compiler<'_> {
         };
 
         // Declare cranelift variable for the batch pointer
-        let batch_var = state.new_variable();
-        builder.declare_var(batch_var, cl_types::I64);
+        let batch_var = builder.declare_var(cl_types::I64);
         let zero = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(batch_var, zero);
         let prev_binding = state
@@ -4415,7 +4396,7 @@ impl Compiler<'_> {
         let batch_ptr =
             self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_val])?;
         builder.def_var(batch_var, batch_ptr);
-        let is_null = builder.ins().icmp_imm(IntCC::Equal, batch_ptr, 0);
+        let is_null = builder.ins().icmp_imm_s(IntCC::Equal, batch_ptr, 0);
         builder
             .ins()
             .brif(is_null, exhausted_exit_block, &[], body_block, &[]);
@@ -4583,8 +4564,7 @@ impl Compiler<'_> {
                         }
                     } else {
                         // Binding — bind subject to variable, always taken
-                        let var = state.new_variable();
-                        builder.declare_var(var, cl_types::I64);
+                        let var = builder.declare_var(cl_types::I64);
                         builder.def_var(var, subject_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
                         state.flags.conditional_depth += 1;
@@ -4927,14 +4907,14 @@ impl Compiler<'_> {
         state.current_block = Some(alloc_b);
         let real = self.emit_moment_zeros_like(builder, param_i, idx, precision_list, offload)?;
         self.compile_call_by_name(builder, "nsl_zero_note_optim_alloc", &[real])?;
-        builder.ins().jump(merge_b, &[real]);
+        builder.ins().jump(merge_b, &[BlockArg::Value(real)]);
 
         // Non-owner: allocate nothing — push a null (0) placeholder.
         builder.switch_to_block(skip_b);
         builder.seal_block(skip_b);
         state.current_block = Some(skip_b);
         let null = builder.ins().iconst(cl_types::I64, 0);
-        builder.ins().jump(merge_b, &[null]);
+        builder.ins().jump(merge_b, &[BlockArg::Value(null)]);
 
         // Merge — both predecessors connected, safe to seal.
         builder.switch_to_block(merge_b);
@@ -5053,7 +5033,7 @@ impl Compiler<'_> {
 
         let slot0 = builder.ins().iconst(cl_types::I64, 0);
         let done = self.compile_call_by_name(builder, "nsl_list_get", &[latch, slot0])?;
-        let first_window = builder.ins().icmp_imm(IntCC::Equal, done, 0);
+        let first_window = builder.ins().icmp_imm_s(IntCC::Equal, done, 0);
         let fill_b = builder.create_block();
         let after_b = builder.create_block();
         builder.ins().brif(first_window, fill_b, &[], after_b, &[]);
@@ -5091,7 +5071,7 @@ impl Compiler<'_> {
                     // an AdamW-routed one still allocates only its share.
                     let routed =
                         self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
-                    let needs_v = builder.ins().icmp_imm(IntCC::Equal, routed, 0);
+                    let needs_v = builder.ins().icmp_imm_s(IntCC::Equal, routed, 0);
                     let alloc_b = builder.create_block();
                     let skip_b = builder.create_block();
                     let merge_b = builder.create_block();
@@ -5104,13 +5084,13 @@ impl Compiler<'_> {
                     let real = self.emit_filled_moment(
                         builder, state, mode, param_i, idx, v_codes, offload,
                     )?;
-                    builder.ins().jump(merge_b, &[real]);
+                    builder.ins().jump(merge_b, &[BlockArg::Value(real)]);
 
                     builder.switch_to_block(skip_b);
                     builder.seal_block(skip_b);
                     state.current_block = Some(skip_b);
                     let null_v = builder.ins().iconst(cl_types::I64, 0);
-                    builder.ins().jump(merge_b, &[null_v]);
+                    builder.ins().jump(merge_b, &[BlockArg::Value(null_v)]);
 
                     builder.switch_to_block(merge_b);
                     builder.seal_block(merge_b);
@@ -6973,8 +6953,7 @@ impl Compiler<'_> {
             // then redirect to the zero3 broadcast-fill backend at runtime.
             if self.features.zero_stage == Some(3) {
                 self.compile_call_by_name(builder, "nsl_zero3_enable", &[])?;
-                let z3_i_var = state.new_variable();
-                builder.declare_var(z3_i_var, cl_types::I64);
+                let z3_i_var = builder.declare_var(cl_types::I64);
                 let z3_zero = builder.ins().iconst(cl_types::I64, 0);
                 builder.def_var(z3_i_var, z3_zero);
                 let z3_hdr = builder.create_block();
@@ -7745,8 +7724,7 @@ impl Compiler<'_> {
 
         // Loop: for i in 0..num_params, create zeros_like(param_list[i])
         {
-            let init_counter_var = state.new_variable();
-            builder.declare_var(init_counter_var, cl_types::I64);
+            let init_counter_var = builder.declare_var(cl_types::I64);
             let init_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(init_counter_var, init_zero);
 
@@ -7840,14 +7818,14 @@ impl Compiler<'_> {
                 state.current_block = Some(dev_b);
                 let dev_m =
                     self.emit_moment_zeros_like(builder, param_i, idx, m_list, false)?;
-                builder.ins().jump(merge_b, &[dev_m]);
+                builder.ins().jump(merge_b, &[BlockArg::Value(dev_m)]);
 
                 builder.switch_to_block(host_b);
                 builder.seal_block(host_b);
                 state.current_block = Some(host_b);
                 let host_m =
                     self.emit_moment_zeros_like(builder, param_i, idx, m_list, true)?;
-                builder.ins().jump(merge_b, &[host_m]);
+                builder.ins().jump(merge_b, &[BlockArg::Value(host_m)]);
 
                 builder.switch_to_block(merge_b);
                 builder.seal_block(merge_b);
@@ -7888,7 +7866,7 @@ impl Compiler<'_> {
                     // (`flag != 0 || rank != 2`) a fourth time.
                     let routed =
                         self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
-                    let needs_v = builder.ins().icmp_imm(IntCC::Equal, routed, 0);
+                    let needs_v = builder.ins().icmp_imm_s(IntCC::Equal, routed, 0);
                     let alloc_b = builder.create_block();
                     let skip_b = builder.create_block();
                     let merge_b = builder.create_block();
@@ -7905,13 +7883,13 @@ impl Compiler<'_> {
                     } else {
                         self.emit_moment_zeros_like(builder, param_i, idx, v_list, offload)?
                     };
-                    builder.ins().jump(merge_b, &[real]);
+                    builder.ins().jump(merge_b, &[BlockArg::Value(real)]);
 
                     builder.switch_to_block(skip_b);
                     builder.seal_block(skip_b);
                     state.current_block = Some(skip_b);
                     let null_v = builder.ins().iconst(cl_types::I64, 0);
-                    builder.ins().jump(merge_b, &[null_v]);
+                    builder.ins().jump(merge_b, &[BlockArg::Value(null_v)]);
 
                     builder.switch_to_block(merge_b);
                     builder.seal_block(merge_b);
@@ -7941,13 +7919,11 @@ impl Compiler<'_> {
         }
 
         // ── 5. Initialize lr and step_count variables ───────────────────
-        let lr_var = state.new_variable();
-        builder.declare_var(lr_var, cl_types::F64);
+        let lr_var = builder.declare_var(cl_types::F64);
         let lr_const = builder.ins().f64const(lr_value);
         builder.def_var(lr_var, lr_const);
 
-        let step_count_var = state.new_variable();
-        builder.declare_var(step_count_var, cl_types::I64);
+        let step_count_var = builder.declare_var(cl_types::I64);
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
@@ -8099,8 +8075,7 @@ sched={sched_s}",
             let surface_m_partial = builder.ins().iconst(cl_types::I8, SURFACE_M_PARTIAL);
             self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_m_partial])?;
             // Runtime loop over param_list (not layout.fields — which may include sub-models)
-            let accum_i_var = state.new_variable();
-            builder.declare_var(accum_i_var, cl_types::I64);
+            let accum_i_var = builder.declare_var(cl_types::I64);
             let accum_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(accum_i_var, accum_zero);
             let accum_hdr = builder.create_block();
@@ -8182,12 +8157,10 @@ sched={sched_s}",
         // re-news them for the next window. The lists are host heap objects —
         // no GPU surface bracket applies.
         let csla_buffers: Option<(Variable, Variable)> = if csla_active {
-            let saves_outer_var = state.new_variable();
-            builder.declare_var(saves_outer_var, cl_types::I64);
+            let saves_outer_var = builder.declare_var(cl_types::I64);
             let so = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
             builder.def_var(saves_outer_var, so);
-            let dicts_var = state.new_variable();
-            builder.declare_var(dicts_var, cl_types::I64);
+            let dicts_var = builder.declare_var(cl_types::I64);
             let dl = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
             builder.def_var(dicts_var, dl);
             Some((saves_outer_var, dicts_var))
@@ -8196,8 +8169,7 @@ sched={sched_s}",
         };
 
         // ── 6. Emit epoch loop ──────────────────────────────────────────
-        let epoch_counter_var = state.new_variable();
-        builder.declare_var(epoch_counter_var, cl_types::I64);
+        let epoch_counter_var = builder.declare_var(cl_types::I64);
         // Item 8: a resumed run starts at the epoch the checkpoint recorded,
         // not 0. Without this the loop re-runs every completed epoch while
         // the step counter (and therefore the LR schedule and bias
@@ -8238,8 +8210,7 @@ sched={sched_s}",
         // `has_dataloader` is bound at the checkpoint-load site above.
 
         // Declare step parameter variable
-        let step_param_var = state.new_variable();
-        builder.declare_var(step_param_var, cl_types::I64);
+        let step_param_var = builder.declare_var(cl_types::I64);
         let init_null = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_param_var, init_null);
         state
@@ -8252,16 +8223,13 @@ sched={sched_s}",
         // same identity sentinel the runtime registry uses. The wrapper
         // clears the field on every exit path — see `packing_meta_vars`'s
         // doc for why it must not outlive this function.
-        let seg_meta_var = state.new_variable();
-        builder.declare_var(seg_meta_var, cl_types::I64);
+        let seg_meta_var = builder.declare_var(cl_types::I64);
         builder.def_var(seg_meta_var, init_null);
-        let doc_meta_var = state.new_variable();
-        builder.declare_var(doc_meta_var, cl_types::I64);
+        let doc_meta_var = builder.declare_var(cl_types::I64);
         builder.def_var(doc_meta_var, init_null);
         self.packing_meta_vars = Some((seg_meta_var, doc_meta_var));
 
-        let epoch_loss_var = state.new_variable();
-        builder.declare_var(epoch_loss_var, cl_types::I64);
+        let epoch_loss_var = builder.declare_var(cl_types::I64);
         let epoch_loss_null = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(epoch_loss_var, epoch_loss_null);
 
@@ -10093,7 +10061,7 @@ sched={sched_s}",
                         if let Ok(array_idx) = part.parse::<usize>() {
                             current_ptr = builder.ins().load(
                                 cl_types::I64,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 current_ptr,
                                 (array_idx * 8) as i32,
                             );
@@ -10105,7 +10073,7 @@ sched={sched_s}",
                             let offset = field.offset as i32;
                             let field_val = builder.ins().load(
                                 field.cl_type,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 current_ptr,
                                 offset,
                             );
@@ -10140,14 +10108,14 @@ sched={sched_s}",
                         if let Some(index) = self.adapter_field_index(&current_type_name, last) {
                             let table_ptr = builder.ins().load(
                                 cl_types::I64,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 current_ptr,
                                 slot_off as i32,
                             );
                             let byte_off = (index * 8) as i32;
                             let tensor_ptr = builder.ins().load(
                                 cl_types::I64,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 table_ptr,
                                 byte_off,
                             );
@@ -12734,7 +12702,7 @@ sched={sched_s}",
                         } else if vty == cl_types::F64 {
                             let bits = builder.ins().bitcast(
                                 cl_types::I64,
-                                MemFlags::new(),
+                                MemFlagsData::new(),
                                 val,
                             );
                             self.compile_call_by_name(builder, "nsl_list_push", &[inner, bits])?;
@@ -13251,8 +13219,7 @@ sched={sched_s}",
                 self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_grads])?;
 
                 // 8a. Initialize one zero gradient per runtime parameter.
-                let fill_i_var = state.new_variable();
-                builder.declare_var(fill_i_var, cl_types::I64);
+                let fill_i_var = builder.declare_var(cl_types::I64);
                 let fill_zero = builder.ins().iconst(cl_types::I64, 0);
                 builder.def_var(fill_i_var, fill_zero);
                 let fill_hdr = builder.create_block();
@@ -13359,10 +13326,8 @@ sched={sched_s}",
                         continue;
                     }
 
-                    let scan_i_var = state.new_variable();
-                    let scan_match_count_var = state.new_variable();
-                    builder.declare_var(scan_i_var, cl_types::I64);
-                    builder.declare_var(scan_match_count_var, cl_types::I64);
+                    let scan_i_var = builder.declare_var(cl_types::I64);
+                    let scan_match_count_var = builder.declare_var(cl_types::I64);
                     let scan_zero = builder.ins().iconst(cl_types::I64, 0);
                     builder.def_var(scan_i_var, scan_zero);
                     builder.def_var(scan_match_count_var, scan_zero);
@@ -13422,7 +13387,7 @@ sched={sched_s}",
                     builder.switch_to_block(scan_exit);
                     builder.seal_block(scan_exit);
                     let match_count = builder.use_var(scan_match_count_var);
-                    let matched = builder.ins().icmp_imm(IntCC::NotEqual, match_count, 0);
+                    let matched = builder.ins().icmp_imm_s(IntCC::NotEqual, match_count, 0);
                     let missing_msg = format!(
                         "source AD gradient could not be aligned with runtime param list: {}",
                         param_name,
@@ -13630,8 +13595,8 @@ sched={sched_s}",
         }
 
         if self.compile_options.health_monitor {
-            use cranelift_codegen::ir::{types as cl_types, MemFlags};
-            let _ = MemFlags::trusted(); // keep import valid across cfgs
+            use cranelift_codegen::ir::{types as cl_types, MemFlagsData};
+            let _ = MemFlagsData::trusted(); // keep import valid across cfgs
 
             // Precompute step-gating flags shared by grad/weight/flush hooks.
             let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
@@ -13789,8 +13754,7 @@ sched={sched_s}",
         // is active) and at the optimizer-gate branch below.
         // For steps == 1 the value is unused; define it anyway to keep the Variable
         // live (its value is never read in that branch).
-        let should_step_var = state.new_variable();
-        builder.declare_var(should_step_var, cl_types::I8);
+        let should_step_var = builder.declare_var(cl_types::I8);
         if grad_accumulation_steps > 1 {
             let sc_early = builder.use_var(step_count_var);
             let one_early = builder.ins().iconst(cl_types::I64, 1);
@@ -13832,8 +13796,7 @@ sched={sched_s}",
             };
 
             // Runtime loop: accum[i] += grads[i], then free grads[i]
-            let ga_i_var = state.new_variable();
-            builder.declare_var(ga_i_var, cl_types::I64);
+            let ga_i_var = builder.declare_var(cl_types::I64);
             let ga_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(ga_i_var, ga_zero);
             let ga_hdr = builder.create_block();
@@ -14920,8 +14883,7 @@ sched={sched_s}",
                 };
 
                 // b-loop over the buffered micro-batches, oldest first.
-                let b_var = state.new_variable();
-                builder.declare_var(b_var, cl_types::I64);
+                let b_var = builder.declare_var(cl_types::I64);
                 let b_zero = builder.ins().iconst(cl_types::I64, 0);
                 builder.def_var(b_var, b_zero);
                 let b_hdr = builder.create_block();
@@ -14982,7 +14944,7 @@ sched={sched_s}",
                     let val = match kind {
                         CslaSlotKind::Raw { .. } => raw,
                         CslaSlotKind::F64Bits => {
-                            builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw)
+                            builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), raw)
                         }
                     };
                     seed.insert(*vid, val);
@@ -15761,14 +15723,12 @@ sched={sched_s}",
                     // L2 norm. When the hook already accumulated during adjoint
                     // lowering AND the norm is batched, there is nothing left
                     // for the loop to do — skip emitting it entirely.
-                    let pa_tot_var = state.new_variable();
-                    builder.declare_var(pa_tot_var, cl_types::F64);
+                    let pa_tot_var = builder.declare_var(cl_types::F64);
                     let pa_zero_f = builder.ins().f64const(0.0);
                     builder.def_var(pa_tot_var, pa_zero_f);
 
                     if !(fase_hook_active && batch_sumsq) {
-                    let pa_i_var = state.new_variable();
-                    builder.declare_var(pa_i_var, cl_types::I64);
+                    let pa_i_var = builder.declare_var(cl_types::I64);
                     let pa_i_zero = builder.ins().iconst(cl_types::I64, 0);
                     builder.def_var(pa_i_var, pa_i_zero);
 
@@ -15820,7 +15780,7 @@ sched={sched_s}",
                         let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
                         builder.def_var(pa_tot_var, pa_tot_new);
                     }
-                    let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
+                    let pa_i_next = builder.ins().iadd_imm_s(pa_i, 1);
                     builder.def_var(pa_i_var, pa_i_next);
                     builder.ins().jump(pa_hdr, &[]);
 
@@ -15884,8 +15844,7 @@ sched={sched_s}",
                         )?;
                     } else {
                     // ── Phase B: scale m_partial in place, then fused optimizer step ──
-                    let pb_i_var = state.new_variable();
-                    builder.declare_var(pb_i_var, cl_types::I64);
+                    let pb_i_var = builder.declare_var(cl_types::I64);
                     let pb_i_zero = builder.ins().iconst(cl_types::I64, 0);
                     builder.def_var(pb_i_var, pb_i_zero);
 
@@ -15976,7 +15935,7 @@ sched={sched_s}",
                         builder.switch_to_block(pb_join);
                         builder.seal_block(pb_join);
                     }
-                    let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
+                    let pb_i_next = builder.ins().iadd_imm_s(pb_i, 1);
                     builder.def_var(pb_i_var, pb_i_next);
                     builder.ins().jump(pb_hdr, &[]);
 
@@ -16032,8 +15991,7 @@ sched={sched_s}",
                             one_scale,
                         )?;
                     } else {
-                    let fs_i_var = state.new_variable();
-                    builder.declare_var(fs_i_var, cl_types::I64);
+                    let fs_i_var = builder.declare_var(cl_types::I64);
                     let fs_zero = builder.ins().iconst(cl_types::I64, 0);
                     builder.def_var(fs_i_var, fs_zero);
                     let fs_hdr = builder.create_block();
@@ -16216,8 +16174,7 @@ sched={sched_s}",
                 )?;
             }
 
-            let opt_i_var = state.new_variable();
-            builder.declare_var(opt_i_var, cl_types::I64);
+            let opt_i_var = builder.declare_var(cl_types::I64);
             let opt_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(opt_i_var, opt_zero);
 
@@ -16391,8 +16348,7 @@ sched={sched_s}",
         // 7g. Post-optimizer cleanup: zero accum buffers or free direct grads
         // Runtime loop over num_params_val
         if let Some(accum) = accum_list {
-            let cleanup_i_var = state.new_variable();
-            builder.declare_var(cleanup_i_var, cl_types::I64);
+            let cleanup_i_var = builder.declare_var(cl_types::I64);
             let c_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(cleanup_i_var, c_zero);
             let c_header = builder.create_block();
@@ -16422,8 +16378,7 @@ sched={sched_s}",
             // No accumulation — free gradient tensors and grads_list every batch.
             // Skip when FASE hook is active: grads are already freed during
             // adjoint lowering, and grads_list is a null sentinel.
-            let cleanup_i_var = state.new_variable();
-            builder.declare_var(cleanup_i_var, cl_types::I64);
+            let cleanup_i_var = builder.declare_var(cl_types::I64);
             let c_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(cleanup_i_var, c_zero);
             let c_header = builder.create_block();
@@ -16528,7 +16483,7 @@ sched={sched_s}",
 
         // 7h. Increment step count (after scheduler so step 0 uses the initial LR)
         let sc = builder.use_var(step_count_var);
-        let one_i64 = builder.ins().iadd_imm(sc, 1);
+        let one_i64 = builder.ins().iadd_imm_s(sc, 1);
         builder.def_var(step_count_var, one_i64);
 
         // Milestone B: periodic full-train-state checkpoint. Post-increment
@@ -16574,7 +16529,7 @@ sched={sched_s}",
             let epoch_now = if has_dataloader.is_some() {
                 epoch_ctr
             } else {
-                builder.ins().iadd_imm(epoch_ctr, 1)
+                builder.ins().iadd_imm_s(epoch_ctr, 1)
             };
             self.compile_call_by_name(
                 builder,
@@ -16606,8 +16561,7 @@ sched={sched_s}",
                     let pname = self.resolve_sym(param.name).to_string();
                     match pname.as_str() {
                         "step" => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             let step_val = builder.use_var(step_count_var);
                             builder.def_var(var, step_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
@@ -16628,16 +16582,14 @@ sched={sched_s}",
                         }
                         "loss" => {
                             // loss is already in state.variables, but rebind for callback scope
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             builder.def_var(var, loss_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
                             state.param_symbols.insert(param.name);
                         }
                         _ => {
                             // Unknown callback param — bind to zero
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             let z = builder.ins().iconst(cl_types::I64, 0);
                             builder.def_var(var, z);
                             state.variables.insert(param.name, (var, cl_types::I64));
@@ -16823,8 +16775,7 @@ sched={sched_s}",
                     let pname = self.resolve_sym(param.name).to_string();
                     match pname.as_str() {
                         "epoch" => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             let epoch_val = builder.use_var(epoch_counter_var);
                             builder.def_var(var, epoch_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
@@ -16839,8 +16790,7 @@ sched={sched_s}",
                             state.variable_types.insert(param.name, Type::Int);
                         }
                         "loss" => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             let epoch_loss = builder.use_var(epoch_loss_var);
                             builder.def_var(var, epoch_loss);
                             state.variables.insert(param.name, (var, cl_types::I64));
@@ -16866,8 +16816,7 @@ sched={sched_s}",
                             epoch_loss_alias_sym = Some(param.name);
                         }
                         _ => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
+                            let var = builder.declare_var(cl_types::I64);
                             let z = builder.ins().iconst(cl_types::I64, 0);
                             builder.def_var(var, z);
                             state.variables.insert(param.name, (var, cl_types::I64));
@@ -17041,7 +16990,7 @@ sched={sched_s}",
         let has_seg_block = builder.create_block();
         let no_seg_block = builder.create_block();
         let after_block = builder.create_block();
-        let has_seg_cond = builder.ins().icmp_imm(IntCC::NotEqual, has_seg, 0);
+        let has_seg_cond = builder.ins().icmp_imm_s(IntCC::NotEqual, has_seg, 0);
         builder
             .ins()
             .brif(has_seg_cond, has_seg_block, &[], no_seg_block, &[]);
@@ -17311,7 +17260,7 @@ sched={sched_s}",
                 // Each element is an i64 pointer at offset array_idx * 8.
                 let elem_ptr = builder.ins().load(
                     cl_types::I64,
-                    cranelift_codegen::ir::MemFlags::trusted(),
+                    cranelift_codegen::ir::MemFlagsData::trusted(),
                     current_ptr,
                     (array_idx * 8) as i32,
                 );
@@ -17345,7 +17294,7 @@ sched={sched_s}",
                     let elem_type = inner.split(';').next().unwrap_or("").trim();
 
                     // Set current_ptr to address of array base in parent struct
-                    current_ptr = builder.ins().iadd_imm(current_ptr, field.offset as i64);
+                    current_ptr = builder.ins().iadd_imm_s(current_ptr, field.offset as i64);
                     current_type_name = elem_type.to_string();
                     current_layout = self.types.struct_layouts.get(elem_type)?.clone();
                     // Next component should be a numeric index
@@ -17357,7 +17306,7 @@ sched={sched_s}",
             // Regular field: load the value
             let field_val = builder.ins().load(
                 field.cl_type,
-                cranelift_codegen::ir::MemFlags::trusted(),
+                cranelift_codegen::ir::MemFlagsData::trusted(),
                 current_ptr,
                 field.offset as i32,
             );
@@ -17677,8 +17626,7 @@ sched={sched_s}",
 
         // Runtime loop: for i in 0..num_params, create zeros_like(param_list[i])
         {
-            let init_i = state.new_variable();
-            builder.declare_var(init_i, cl_types::I64);
+            let init_i = builder.declare_var(cl_types::I64);
             let init_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(init_i, init_zero);
             let hdr = builder.create_block();
@@ -17710,24 +17658,21 @@ sched={sched_s}",
         }
 
         // ── 5. Declare step parameter and step counter ──────────────────
-        let step_param_var = state.new_variable();
-        builder.declare_var(step_param_var, cl_types::I64);
+        let step_param_var = builder.declare_var(cl_types::I64);
         let init_null = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_param_var, init_null);
         state
             .variables
             .insert(step_param_sym, (step_param_var, cl_types::I64));
 
-        let step_count_var = state.new_variable();
-        builder.declare_var(step_count_var, cl_types::I64);
+        let step_count_var = builder.declare_var(cl_types::I64);
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
         // Phase 5 Task 7: publish step counter for @inspect in pipelined train.
         self.inspect_train_step_var = Some(step_count_var);
 
-        let lr_var = state.new_variable();
-        builder.declare_var(lr_var, cl_types::F64);
+        let lr_var = builder.declare_var(cl_types::F64);
         let lr_const = builder.ins().f64const(lr_value);
         builder.def_var(lr_var, lr_const);
 
@@ -17787,8 +17732,7 @@ sched={sched_s}",
         // with its parameter index for correct matching.
         let prev_stage = builder.ins().iconst(cl_types::I64, 0);
         {
-            let gs_i = state.new_variable();
-            builder.declare_var(gs_i, cl_types::I64);
+            let gs_i = builder.declare_var(cl_types::I64);
             let gs_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(gs_i, gs_zero);
             let gs_hdr = builder.create_block();
@@ -17879,8 +17823,7 @@ sched={sched_s}",
         let eps_const = builder.ins().f64const(eps_value);
 
         {
-            let opt_i = state.new_variable();
-            builder.declare_var(opt_i, cl_types::I64);
+            let opt_i = builder.declare_var(cl_types::I64);
             let opt_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(opt_i, opt_zero);
             let opt_hdr = builder.create_block();
@@ -18025,8 +17968,7 @@ sched={sched_s}",
         // ── 13. Cleanup — free gradients, param_list, optimizer buffers ─
         // Runtime loop for gradient + state buffer cleanup
         {
-            let cl_i = state.new_variable();
-            builder.declare_var(cl_i, cl_types::I64);
+            let cl_i = builder.declare_var(cl_types::I64);
             let cl_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(cl_i, cl_zero);
             let cl_hdr = builder.create_block();
@@ -18115,15 +18057,13 @@ sched={sched_s}",
                 PatternKind::Tuple(pats) if pats.len() == 2 => {
                     // Bind loss (scalar tensor ptr)
                     if let PatternKind::Ident(loss_sym) = &pats[0].kind {
-                        let var = state.new_variable();
-                        builder.declare_var(var, cl_types::I64);
+                        let var = builder.declare_var(cl_types::I64);
                         builder.def_var(var, loss_tensor);
                         state.variables.insert(*loss_sym, (var, cl_types::I64));
                     }
                     // Bind grads (tensor ptr)
                     if let PatternKind::Ident(grads_sym) = &pats[1].kind {
-                        let var = state.new_variable();
-                        builder.declare_var(var, cl_types::I64);
+                        let var = builder.declare_var(cl_types::I64);
                         builder.def_var(var, grad_tensor);
                         state.variables.insert(*grads_sym, (var, cl_types::I64));
                     }
@@ -18729,7 +18669,7 @@ sched={sched_s}",
             let is_excluded = quant.exclude.iter().any(|pat| glob_match(pat, &field.name));
             let src_val = builder.ins().load(
                 field.cl_type,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 source_val,
                 field.offset as i32,
             );
@@ -18739,7 +18679,7 @@ sched={sched_s}",
                 let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[src_val])?;
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
+                    .store(MemFlagsData::trusted(), cloned, new_ptr, field.offset as i32);
             } else {
                 // For AWQ with a calibration sidecar, pre-scale the weight tensor using
                 // the per-input-channel activation statistics before quantizing.
@@ -18840,7 +18780,7 @@ sched={sched_s}",
                 }
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
+                    .store(MemFlagsData::trusted(), deq, new_ptr, field.offset as i32);
             }
         }
 
@@ -18855,8 +18795,7 @@ sched={sched_s}",
         }
 
         // 7. Bind the new struct pointer as the output variable
-        let var = state.new_variable();
-        builder.declare_var(var, cl_types::I64);
+        let var = builder.declare_var(cl_types::I64);
         builder.def_var(var, new_ptr);
         state.variables.insert(quant.name, (var, cl_types::I64));
 

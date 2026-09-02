@@ -6,7 +6,7 @@ mod literals;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
@@ -359,7 +359,7 @@ impl Compiler<'_> {
                 Ok(builder.ins().fneg(val))
             }
             UnaryOp::Neg => Ok(builder.ins().ineg(val)),
-            UnaryOp::Not => Ok(builder.ins().icmp_imm(IntCC::Equal, val, 0)),
+            UnaryOp::Not => Ok(builder.ins().icmp_imm_s(IntCC::Equal, val, 0)),
         }
     }
 
@@ -422,7 +422,7 @@ impl Compiler<'_> {
         let self_ptr = builder.use_var(self_var);
         let field_val = builder.ins().load(
             cl_types::I64,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             self_ptr,
             field_offset as i32,
         );
@@ -965,7 +965,7 @@ impl Compiler<'_> {
         const DATA_FIELD_OFFSET: i32 = nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
         let data_ptr = builder.ins().load(
             cl_types::I64,
-            MemFlags::new(),
+            MemFlagsData::new(),
             input_val,
             DATA_FIELD_OFFSET,
         );

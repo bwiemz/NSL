@@ -1,6 +1,6 @@
 use super::types::VerifyResult;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Greedy rejection sampling (temperature=0).
 /// Accepts draft token at position i iff verifier's argmax equals draft token.

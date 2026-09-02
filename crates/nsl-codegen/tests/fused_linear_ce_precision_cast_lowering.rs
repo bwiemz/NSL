@@ -260,7 +260,7 @@ fn lower_and_resolve(
             .copied()
             .expect("output VarId must be in var_map");
         builder.ins().return_(&[res]);
-        builder.finalize();
+        builder.finalize(compiler.module.target_config());
     }
 
     let mut name_to_index: HashMap<String, u32> = HashMap::new();

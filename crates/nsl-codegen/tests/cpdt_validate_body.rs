@@ -26,7 +26,7 @@ fn wm_with_names(tensor_names: &[&str]) -> (WeightMap, tempfile::TempPath) {
         .iter()
         .map(|(n, b)| (n.clone(), TensorView::new(Dtype::F32, vec![1], b.as_slice()).unwrap()))
         .collect();
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
 
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
     tmp.write_all(&bytes).unwrap();

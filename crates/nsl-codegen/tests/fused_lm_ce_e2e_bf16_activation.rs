@@ -201,7 +201,7 @@ fn lower_and_resolve(
         );
         let res = lowered.var_map.get(&5).copied().expect("FusedLinearCe result");
         builder.ins().return_(&[res]);
-        builder.finalize();
+        builder.finalize(compiler.module.target_config());
     }
 
     let mut name_to_index: HashMap<String, u32> = HashMap::new();

@@ -86,7 +86,7 @@ fn write_hf_mixtral_safetensors(path: &Path, hf_prefix: &str) {
             TensorView::new(Dtype::F32, vec![hidden, intermediate], &per_expert_w2[e]).unwrap(),
         );
     }
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&bytes).unwrap();
 }

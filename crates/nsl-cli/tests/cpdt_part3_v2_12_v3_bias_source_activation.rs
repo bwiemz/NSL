@@ -109,7 +109,7 @@ fn write_v3_safetensors(
         views.insert("Block.experts.down.bias".to_string(), v);
     }
 
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&bytes).unwrap();
 }
@@ -451,7 +451,7 @@ fn write_orphaned_bias_only_safetensors(path: &Path) {
     let mut views: HashMap<String, TensorView<'_>> = HashMap::new();
     views.insert("Block.experts.up.bias".to_string(), up_view);
     views.insert("Block.experts.down.bias".to_string(), down_view);
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&bytes).unwrap();
 }

@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 

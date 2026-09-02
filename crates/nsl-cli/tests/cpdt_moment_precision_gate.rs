@@ -216,7 +216,7 @@ fn a_wrong_checkpoint_refuses_instead_of_activating_nothing() {
             )
         })
         .collect();
-    std::fs::write(&wrong, serialize(&views, &None).unwrap()).unwrap();
+    std::fs::write(&wrong, serialize(&views, None).unwrap()).unwrap();
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));

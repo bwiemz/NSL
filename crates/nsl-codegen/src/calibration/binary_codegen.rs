@@ -42,8 +42,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, StackSlotData, StackSlotKind,
-    UserFuncName,
+    types as cl_types, AbiParam, BlockArg, Function, InstBuilder, MemFlagsData, StackSlotData,
+    StackSlotKind, UserFuncName,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -366,7 +366,7 @@ fn emit_2d_max_abs_loop(
     b.append_block_param(col_header, cl_types::I32); // j
 
     let zero_i32 = b.ins().iconst(cl_types::I32, 0);
-    b.ins().jump(row_header, &[zero_i32]);
+    b.ins().jump(row_header, &[BlockArg::Value(zero_i32)]);
 
     // row_header: if i < rows → row_body else row_exit
     b.switch_to_block(row_header);
@@ -378,7 +378,7 @@ fn emit_2d_max_abs_loop(
     // row_body: jump to col_header(j=0)
     b.switch_to_block(row_body);
     b.seal_block(row_body);
-    b.ins().jump(col_header, &[zero_i32]);
+    b.ins().jump(col_header, &[BlockArg::Value(zero_i32)]);
 
     // col_header: if j < channels → col_body else col_exit
     b.switch_to_block(col_header);
@@ -406,20 +406,20 @@ fn emit_2d_max_abs_loop(
     let j_off_p = b.ins().uextend(ptr_ty, j_off);
     let run_addr = b.ins().iadd(running_base, j_off_p);
 
-    let v    = b.ins().load(cl_types::F32, MemFlags::new(), src_addr, 0);
+    let v    = b.ins().load(cl_types::F32, MemFlagsData::new(), src_addr, 0);
     let absv = b.ins().fabs(v);
-    let cur  = b.ins().load(cl_types::F32, MemFlags::new(), run_addr, 0);
+    let cur  = b.ins().load(cl_types::F32, MemFlagsData::new(), run_addr, 0);
     let new  = b.ins().fmax(cur, absv);
-    b.ins().store(MemFlags::new(), new, run_addr, 0);
+    b.ins().store(MemFlagsData::new(), new, run_addr, 0);
 
-    let jp1 = b.ins().iadd_imm(j, 1);
-    b.ins().jump(col_header, &[jp1]);
+    let jp1 = b.ins().iadd_imm_s(j, 1);
+    b.ins().jump(col_header, &[BlockArg::Value(jp1)]);
 
     // col_exit: i++ → row_header
     b.switch_to_block(col_exit);
     b.seal_block(col_exit);
-    let ip1 = b.ins().iadd_imm(i, 1);
-    b.ins().jump(row_header, &[ip1]);
+    let ip1 = b.ins().iadd_imm_s(i, 1);
+    b.ins().jump(row_header, &[BlockArg::Value(ip1)]);
 
     // seal the back-edge blocks now that all predecessors are known
     b.seal_block(row_header);
@@ -492,7 +492,7 @@ pub(crate) fn emit_per_head_dot_abs_accum(
     let soff_c        = b.ins().iconst(cl_types::I32, src_offset as i64);
 
     // Jump from caller into the outer loop.
-    b.ins().jump(head_header, &[zero_i32]);
+    b.ins().jump(head_header, &[BlockArg::Value(zero_i32)]);
 
     // ── head_header: if h < n_proj_heads → head_body else head_exit ────────
     b.switch_to_block(head_header);
@@ -503,7 +503,7 @@ pub(crate) fn emit_per_head_dot_abs_accum(
     // ── head_body: jump to elem_header(e=0) ────────────────────────────────
     b.switch_to_block(head_body);
     b.seal_block(head_body);
-    b.ins().jump(elem_header, &[zero_i32]);
+    b.ins().jump(elem_header, &[BlockArg::Value(zero_i32)]);
 
     // ── elem_header: if e < elements_per_head → elem_body else elem_exit ───
     b.switch_to_block(elem_header);
@@ -533,8 +533,8 @@ pub(crate) fn emit_per_head_dot_abs_accum(
     let wt_addr   = b.ins().iadd(weight_data_base, raw_w_p);
 
     // Load f32 values.
-    let gv  = b.ins().load(cl_types::F32, MemFlags::new(), grad_addr, 0);
-    let wv  = b.ins().load(cl_types::F32, MemFlags::new(), wt_addr,   0);
+    let gv  = b.ins().load(cl_types::F32, MemFlagsData::new(), grad_addr, 0);
+    let wv  = b.ins().load(cl_types::F32, MemFlagsData::new(), wt_addr,   0);
 
     // |grad * weight| — compute in f32, then promote to f64.
     let prod    = b.ins().fmul(gv, wv);
@@ -554,20 +554,20 @@ pub(crate) fn emit_per_head_dot_abs_accum(
         let slot_off = b.ins().imul(slot_idx, eight);      // * 8 bytes
         let slot_p   = b.ins().uextend(ptr_ty, slot_off);
         let run_addr = b.ins().iadd(running_base, slot_p);
-        let cur      = b.ins().load(cl_types::F64, MemFlags::new(), run_addr, 0);
+        let cur      = b.ins().load(cl_types::F64, MemFlagsData::new(), run_addr, 0);
         let new_val  = b.ins().fadd(cur, v64);
-        b.ins().store(MemFlags::new(), new_val, run_addr, 0);
+        b.ins().store(MemFlagsData::new(), new_val, run_addr, 0);
     }
 
     // e++ → elem_header
-    let ep1 = b.ins().iadd_imm(e, 1);
-    b.ins().jump(elem_header, &[ep1]);
+    let ep1 = b.ins().iadd_imm_s(e, 1);
+    b.ins().jump(elem_header, &[BlockArg::Value(ep1)]);
 
     // ── elem_exit: h++ → head_header ────────────────────────────────────────
     b.switch_to_block(elem_exit);
     b.seal_block(elem_exit);
-    let hp1 = b.ins().iadd_imm(h, 1);
-    b.ins().jump(head_header, &[hp1]);
+    let hp1 = b.ins().iadd_imm_s(h, 1);
+    b.ins().jump(head_header, &[BlockArg::Value(hp1)]);
 
     // Seal back-edge blocks now that all predecessors are known.
     b.seal_block(head_header);
@@ -870,12 +870,12 @@ fn emit_model_forward_bridge(
                 b.ins().iconst(field.cl_type, 0)
             };
             b.ins()
-                .store(MemFlags::trusted(), zero, model_addr, field.offset as i32);
+                .store(MemFlagsData::trusted(), zero, model_addr, field.offset as i32);
         }
         if let Some(slot_off) = layout.adapter_sidetable_offset {
             let zero = b.ins().iconst(cl_types::I64, 0);
             b.ins()
-                .store(MemFlags::trusted(), zero, model_addr, slot_off as i32);
+                .store(MemFlagsData::trusted(), zero, model_addr, slot_off as i32);
         }
 
         let tensor_fields = model_tensor_field_names(model_def, compiler.interner);
@@ -916,7 +916,7 @@ fn emit_model_forward_bridge(
                 transposed_tensors.push(tensor_ptr);
             }
             b.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 tensor_ptr,
                 model_addr,
                 field.offset as i32,
@@ -967,7 +967,7 @@ fn emit_model_forward_bridge(
             b.ins().iconst(cl_types::I64, 0)
         };
         b.ins().return_(&[output_tensor]);
-        b.finalize();
+        b.finalize(compiler.module.target_config());
     }
 
     compiler
@@ -1093,14 +1093,14 @@ fn emit_calibration_forward_wrapper(
         let shape_ref = compiler.module.declare_data_in_func(shape_data, b.func);
         let shape_ptr = b.ins().symbol_value(cl_types::I64, shape_ref);
 
-        b.ins().store(MemFlags::trusted(), batch_ptr, desc_addr, 0);
-        b.ins().store(MemFlags::trusted(), shape_ptr, desc_addr, 8);
-        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 16);
-        b.ins().store(MemFlags::trusted(), ndim_i32, desc_addr, 24);
-        b.ins().store(MemFlags::trusted(), dtype_f32, desc_addr, 28);
-        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
-        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
-        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 40);
+        b.ins().store(MemFlagsData::trusted(), batch_ptr, desc_addr, 0);
+        b.ins().store(MemFlagsData::trusted(), shape_ptr, desc_addr, 8);
+        b.ins().store(MemFlagsData::trusted(), zero_i64, desc_addr, 16);
+        b.ins().store(MemFlagsData::trusted(), ndim_i32, desc_addr, 24);
+        b.ins().store(MemFlagsData::trusted(), dtype_f32, desc_addr, 28);
+        b.ins().store(MemFlagsData::trusted(), zero_i32, desc_addr, 32);
+        b.ins().store(MemFlagsData::trusted(), zero_i32, desc_addr, 36);
+        b.ins().store(MemFlagsData::trusted(), zero_i64, desc_addr, 40);
 
         let desc_to_tensor_ref = compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);
         let desc_call = b.ins().call(desc_to_tensor_ref, &[desc_addr]);
@@ -1118,7 +1118,7 @@ fn emit_calibration_forward_wrapper(
         b.ins().call(tensor_free_ref, &[y_tensor]);
         b.ins().call(tensor_free_ref, &[input_tensor]);
         b.ins().return_(&[zero_i32]);
-        b.finalize();
+        b.finalize(compiler.module.target_config());
     }
 
     compiler
@@ -1232,7 +1232,7 @@ fn emit_model_backward_bridge(
             b.switch_to_block(entry);
             b.seal_block(entry);
             b.ins().return_(&[]);
-            b.finalize();
+            b.finalize(compiler.module.target_config());
         }
         compiler
             .module
@@ -1309,7 +1309,7 @@ fn emit_model_backward_bridge(
                 b.switch_to_block(entry);
                 b.seal_block(entry);
                 b.ins().return_(&[]);
-                b.finalize();
+                b.finalize(compiler.module.target_config());
             }
             compiler
                 .module
@@ -1396,7 +1396,7 @@ fn emit_model_backward_bridge(
             b.switch_to_block(entry);
             b.seal_block(entry);
             b.ins().return_(&[]);
-            b.finalize();
+            b.finalize(compiler.module.target_config());
         }
         compiler
             .module
@@ -1634,7 +1634,7 @@ fn emit_model_backward_bridge(
                 nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
             let src_ptr = fb.ins().load(
                 cl_types::I64,
-                MemFlags::new(),
+                MemFlagsData::new(),
                 grad_val,
                 DATA_OFF,
             );
@@ -1676,7 +1676,7 @@ fn emit_model_backward_bridge(
         }
 
         b.ins().return_(&[]);
-        b.finalize();
+        b.finalize(compiler.module.target_config());
         Ok::<(), HarnessError>(())
     })();
 
@@ -1834,14 +1834,14 @@ fn emit_calibration_backward_wrapper(
         let shape_ref = compiler.module.declare_data_in_func(shape_data, b.func);
         let shape_ptr = b.ins().symbol_value(cl_types::I64, shape_ref);
 
-        b.ins().store(MemFlags::trusted(), batch_ptr, desc_addr, 0);
-        b.ins().store(MemFlags::trusted(), shape_ptr, desc_addr, 8);
-        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 16);
-        b.ins().store(MemFlags::trusted(), ndim_i32, desc_addr, 24);
-        b.ins().store(MemFlags::trusted(), dtype_f32, desc_addr, 28);
-        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
-        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
-        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 40);
+        b.ins().store(MemFlagsData::trusted(), batch_ptr, desc_addr, 0);
+        b.ins().store(MemFlagsData::trusted(), shape_ptr, desc_addr, 8);
+        b.ins().store(MemFlagsData::trusted(), zero_i64, desc_addr, 16);
+        b.ins().store(MemFlagsData::trusted(), ndim_i32, desc_addr, 24);
+        b.ins().store(MemFlagsData::trusted(), dtype_f32, desc_addr, 28);
+        b.ins().store(MemFlagsData::trusted(), zero_i32, desc_addr, 32);
+        b.ins().store(MemFlagsData::trusted(), zero_i32, desc_addr, 36);
+        b.ins().store(MemFlagsData::trusted(), zero_i64, desc_addr, 40);
 
         let desc_to_tensor_ref =
             compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);
@@ -1881,7 +1881,7 @@ fn emit_calibration_backward_wrapper(
         let ok = b.ins().iconst(cl_types::I32, 0);
         b.ins().return_(&[ok]);
 
-        b.finalize();
+        b.finalize(compiler.module.target_config());
     }
 
     compiler
@@ -2717,8 +2717,8 @@ pub fn emit_calibration_scaffolding_object(
         b.switch_to_block(load_data);
         b.seal_block(load_data);
 
-        let argv1_addr = b.ins().load(cl_types::I64, MemFlags::new(), argv, 8);
-        let argv2_addr = b.ins().load(cl_types::I64, MemFlags::new(), argv, 16);
+        let argv1_addr = b.ins().load(cl_types::I64, MemFlagsData::new(), argv, 8);
+        let argv2_addr = b.ins().load(cl_types::I64, MemFlagsData::new(), argv, 16);
 
         if !needs_forward_pass {
             let json_gv = module.declare_data_in_func(json_data, b.func);
@@ -2763,7 +2763,7 @@ pub fn emit_calibration_scaffolding_object(
             b.ins().brif(
                 batches_ok,
                 load_model,
-                &[batches_ptr, argv2_addr],
+                &[BlockArg::Value(batches_ptr), BlockArg::Value(argv2_addr)],
                 data_null,
                 &[],
             );
@@ -2805,8 +2805,8 @@ pub fn emit_calibration_scaffolding_object(
                 let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
                 b.ins().call(calib_batch_ref, &[lm_batches, zero_i64, out_ptr_addr, out_len_addr]);
 
-                let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
-                let actual_batch_elems = b.ins().ushr_imm(batch_len, 2);
+                let batch_len = b.ins().load(cl_types::I64, MemFlagsData::new(), out_len_addr, 0);
+                let actual_batch_elems = b.ins().ushr_imm_u(batch_len, 2);
                 let expected_batch_elems =
                     b.ins().iconst(cl_types::I64, (first_entry.2 / 4) as i64);
                 let batch_ok =
@@ -2858,7 +2858,7 @@ pub fn emit_calibration_scaffolding_object(
 
             b.switch_to_block(model_create_entry);
             b.seal_block(model_create_entry);
-            let argv3_addr = b.ins().load(cl_types::I64, MemFlags::new(), argv, 24);
+            let argv3_addr = b.ins().load(cl_types::I64, MemFlagsData::new(), argv, 24);
 
             let model_create_ref = module.declare_func_in_func(model_create_id, b.func);
             let model_create_call = b.ins().call(model_create_ref, &[argv3_addr]);
@@ -2867,7 +2867,7 @@ pub fn emit_calibration_scaffolding_object(
             b.ins().brif(
                 model_ok,
                 model_ready,
-                &[lm_batches, lm_sidecar_ptr, model_ptr],
+                &[BlockArg::Value(lm_batches), BlockArg::Value(lm_sidecar_ptr), BlockArg::Value(model_ptr)],
                 model_null,
                 &[],
             );
@@ -2892,10 +2892,10 @@ pub fn emit_calibration_scaffolding_object(
             let weight_ptrs_call = b.ins().call(model_weight_ptrs_ref, &[mr_model_ptr]);
             let weight_ptrs = b.inst_results(weight_ptrs_call)[0];
 
-            b.ins().store(MemFlags::new(), mr_model_ptr, model_ptr_addr, 0);
-            b.ins().store(MemFlags::new(), weight_ptrs, weight_ptrs_addr, 0);
-            b.ins().store(MemFlags::new(), num_weights, num_weights_addr, 0);
-            b.ins().jump(loop_header, &[mr_batches, mr_sidecar_ptr, zero_i64]);
+            b.ins().store(MemFlagsData::new(), mr_model_ptr, model_ptr_addr, 0);
+            b.ins().store(MemFlagsData::new(), weight_ptrs, weight_ptrs_addr, 0);
+            b.ins().store(MemFlagsData::new(), num_weights, num_weights_addr, 0);
+            b.ins().jump(loop_header, &[BlockArg::Value(mr_batches), BlockArg::Value(mr_sidecar_ptr), BlockArg::Value(zero_i64)]);
 
             b.switch_to_block(loop_header);
             let lh_batches = b.block_params(loop_header)[0];
@@ -2906,7 +2906,7 @@ pub fn emit_calibration_scaffolding_object(
             let count_call = b.ins().call(calib_count_ref, &[lh_batches]);
             let count = b.inst_results(count_call)[0];
             let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
-            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_batches, lh_sidecar_ptr]);
+            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[BlockArg::Value(lh_batches), BlockArg::Value(lh_sidecar_ptr)]);
 
             b.switch_to_block(loop_body);
             b.seal_block(loop_body);
@@ -2927,11 +2927,11 @@ pub fn emit_calibration_scaffolding_object(
             let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
             b.ins().call(calib_batch_ref, &[lh_batches, i_cur, out_ptr_addr, out_len_addr]);
 
-            let batch_ptr = b.ins().load(cl_types::I64, MemFlags::new(), out_ptr_addr, 0);
-            let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
-            let batch_elems = b.ins().ushr_imm(batch_len, 2);
-            let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
-            let num_weights = b.ins().load(cl_types::I64, MemFlags::new(), num_weights_addr, 0);
+            let batch_ptr = b.ins().load(cl_types::I64, MemFlagsData::new(), out_ptr_addr, 0);
+            let batch_len = b.ins().load(cl_types::I64, MemFlagsData::new(), out_len_addr, 0);
+            let batch_elems = b.ins().ushr_imm_u(batch_len, 2);
+            let model_ptr = b.ins().load(cl_types::I64, MemFlagsData::new(), model_ptr_addr, 0);
+            let num_weights = b.ins().load(cl_types::I64, MemFlagsData::new(), num_weights_addr, 0);
 
             // Task 17 (spec §4.5): dispatch to backward wrapper when needs_backward,
             // otherwise call forward.  The backward wrapper internally runs forward
@@ -3047,7 +3047,7 @@ pub fn emit_calibration_scaffolding_object(
                             ));
                         let run_gv = module.declare_data_in_func(*run_id, b.func);
                         let run_ptr = b.ins().symbol_value(ptr_ty, run_gv);
-                        b.ins().stack_store(run_ptr, scratch_slot, 0);
+                        b.ins().stack_store(cl_types::I64, run_ptr, scratch_slot, 0);
                     }
                 } else {
                     // Real per-head reduction loop.
@@ -3154,7 +3154,7 @@ pub fn emit_calibration_scaffolding_object(
                             // keeps the WGGO accumulator on the same code path
                             // as the model body.
                             let model_ptr =
-                                b.ins().load(ptr_ty, cranelift_codegen::ir::MemFlags::new(), model_ptr_addr, 0);
+                                b.ins().load(ptr_ty, cranelift_codegen::ir::MemFlagsData::new(), model_ptr_addr, 0);
                             let field = proj_path
                                 .split_once('.')
                                 .map(|(_, after)| after)
@@ -3202,7 +3202,7 @@ pub fn emit_calibration_scaffolding_object(
                                 nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
                             let weight_data_ptr = b.ins().load(
                                 ptr_ty,
-                                cranelift_codegen::ir::MemFlags::new(),
+                                cranelift_codegen::ir::MemFlagsData::new(),
                                 weight_handle,
                                 NSL_TENSOR_DATA_OFFSET_I32,
                             );
@@ -3229,7 +3229,7 @@ pub fn emit_calibration_scaffolding_object(
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
             let i_next = b.ins().iadd(i_cur, one_i64);
-            b.ins().jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
+            b.ins().jump(loop_header, &[BlockArg::Value(lh_batches), BlockArg::Value(lh_sidecar_ptr), BlockArg::Value(i_next)]);
 
             b.seal_block(loop_header);
 
@@ -3237,7 +3237,7 @@ pub fn emit_calibration_scaffolding_object(
             b.seal_block(loop_exit);
             let le_batches = b.block_params(loop_exit)[0];
             let le_sidecar_ptr = b.block_params(loop_exit)[1];
-            b.ins().jump(finalize, &[le_batches, le_sidecar_ptr]);
+            b.ins().jump(finalize, &[BlockArg::Value(le_batches), BlockArg::Value(le_sidecar_ptr)]);
 
             b.switch_to_block(finalize);
             b.seal_block(finalize);
@@ -3251,7 +3251,7 @@ pub fn emit_calibration_scaffolding_object(
                 let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
                 let write_ref = module.declare_func_in_func(write_file_id, b.func);
                 b.ins().call(write_ref, &[fin_sidecar_ptr, json_ptr]);
-                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+                let model_ptr = b.ins().load(cl_types::I64, MemFlagsData::new(), model_ptr_addr, 0);
                 b.ins().call(model_destroy_ref, &[model_ptr]);
                 b.ins().call(calib_free_ref, &[fin_batches]);
                 let zero = b.ins().iconst(cl_types::I32, 0);
@@ -3292,21 +3292,21 @@ pub fn emit_calibration_scaffolding_object(
                     let path_id = path_data_ids[&fp.projection.0];
                     let path_gv = module.declare_data_in_func(path_id, b.func);
                     let path_ptr_v = b.ins().symbol_value(ptr_ty, path_gv);
-                    b.ins().stack_store(path_ptr_v, stack_slot, off);
+                    b.ins().stack_store(cl_types::I64, path_ptr_v, stack_slot, off);
 
                     let path_len_v = b.ins().iconst(ptr_ty, fp.projection.0.len() as i64);
-                    b.ins().stack_store(path_len_v, stack_slot, off + 8);
+                    b.ins().stack_store(cl_types::I64, path_len_v, stack_slot, off + 8);
 
                     let channels_v = b.ins().iconst(cl_types::I32, fp.channels as i64);
-                    b.ins().stack_store(channels_v, stack_slot, off + 16);
+                    b.ins().stack_store(cl_types::I64, channels_v, stack_slot, off + 16);
 
                     let pad_v = b.ins().iconst(cl_types::I32, 0);
-                    b.ins().stack_store(pad_v, stack_slot, off + 20);
+                    b.ins().stack_store(cl_types::I64, pad_v, stack_slot, off + 20);
 
                     let run_id = running_data_ids[&fp.running_symbol];
                     let run_gv = module.declare_data_in_func(run_id, b.func);
                     let run_ptr_v = b.ins().symbol_value(ptr_ty, run_gv);
-                    b.ins().stack_store(run_ptr_v, stack_slot, off + 24);
+                    b.ins().stack_store(cl_types::I64, run_ptr_v, stack_slot, off + 24);
                 }
 
                 let strlen_ref2 = module.declare_func_in_func(strlen_id, b.func);
@@ -3356,25 +3356,25 @@ pub fn emit_calibration_scaffolding_object(
                         // rejecting unknown values via UnknownVersion (error code 5). See
                         // spec §6.2-6.3.
                         let version_v = b.ins().iconst(cl_types::I32, 1);
-                        b.ins().stack_store(version_v, wggo_slot, off);
+                        b.ins().stack_store(cl_types::I64, version_v, wggo_slot, off);
                         // _pad0: u32 at offset 4 — zero-initialised by stack slot
 
                         // layer_key_ptr: *const u8 at offset 8
                         let key_id = wggo_layer_key_data_ids[&target.layer_key];
                         let key_gv = module.declare_data_in_func(key_id, b.func);
                         let key_ptr = b.ins().symbol_value(ptr_ty, key_gv);
-                        b.ins().stack_store(key_ptr, wggo_slot, off + 8);
+                        b.ins().stack_store(cl_types::I64, key_ptr, wggo_slot, off + 8);
 
                         // layer_key_len: usize at offset 16
                         let key_len_v =
                             b.ins().iconst(ptr_ty, target.layer_key.len() as i64);
-                        b.ins().stack_store(key_len_v, wggo_slot, off + 16);
+                        b.ins().stack_store(cl_types::I64, key_len_v, wggo_slot, off + 16);
 
                         // running_buffer_len: u32 at offset 24 (number of f64 slots = n_o_heads)
                         let n_o_heads = wggo_n_o_heads(target);
                         let n_heads_v =
                             b.ins().iconst(cl_types::I32, n_o_heads as i64);
-                        b.ins().stack_store(n_heads_v, wggo_slot, off + 24);
+                        b.ins().stack_store(cl_types::I64, n_heads_v, wggo_slot, off + 24);
                         // _pad1: u32 at offset 28 — zero-initialised
 
                         // running_ptr: *const f64 at offset 32 (BSS running buffer)
@@ -3396,10 +3396,10 @@ pub fn emit_calibration_scaffolding_object(
                         };
                         let run_gv = module.declare_data_in_func(run_id, b.func);
                         let run_ptr_v = b.ins().symbol_value(ptr_ty, run_gv);
-                        b.ins().stack_store(run_ptr_v, wggo_slot, off + 32);
+                        b.ins().stack_store(cl_types::I64, run_ptr_v, wggo_slot, off + 32);
 
                         // batches_observed: u32 at offset 40
-                        b.ins().stack_store(batches_i32, wggo_slot, off + 40);
+                        b.ins().stack_store(cl_types::I64, batches_i32, wggo_slot, off + 40);
                         // _pad2: u32 at offset 44 — zero-initialised
                     }
 
@@ -3416,7 +3416,7 @@ pub fn emit_calibration_scaffolding_object(
                     &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count, wggo_descs_base, wggo_count_v],
                 );
                 let rc = b.inst_results(ws_call)[0];
-                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+                let model_ptr = b.ins().load(cl_types::I64, MemFlagsData::new(), model_ptr_addr, 0);
                 b.ins().call(model_destroy_ref, &[model_ptr]);
                 b.ins().call(calib_free_ref, &[fin_batches]);
 
@@ -3435,7 +3435,7 @@ pub fn emit_calibration_scaffolding_object(
             }
         }
 
-        b.finalize();
+        b.finalize(module.target_config());
     }
 
     module
@@ -3862,7 +3862,7 @@ fn emit_and_link_calibration_binary(
 
             let off2 = b.ins().iconst(cl_types::I64, 16i64);
             let argv2_addr = b.ins().iadd(argv, off2);
-            let sidecar_path_ptr = b.ins().load(cl_types::I64, MemFlags::trusted(), argv2_addr, 0);
+            let sidecar_path_ptr = b.ins().load(cl_types::I64, MemFlagsData::trusted(), argv2_addr, 0);
 
             let json_gv = module.declare_data_in_func(json_data, b.func);
             let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
@@ -3872,7 +3872,7 @@ fn emit_and_link_calibration_binary(
             let zero = b.ins().iconst(cl_types::I32, 0);
             b.ins().return_(&[zero]);
 
-            b.finalize();
+            b.finalize(module.target_config());
         } else {
             // ── Forward-pass path: load calibration data + batch loop ──
             let load_data   = b.create_block();
@@ -3910,8 +3910,8 @@ fn emit_and_link_calibration_binary(
             let argv1_addr = b.ins().iadd(argv, off1);
             let argv2_addr = b.ins().iadd(argv, off2);
 
-            let data_path_ptr    = b.ins().load(cl_types::I64, MemFlags::trusted(), argv1_addr, 0);
-            let sidecar_path_ptr = b.ins().load(cl_types::I64, MemFlags::trusted(), argv2_addr, 0);
+            let data_path_ptr    = b.ins().load(cl_types::I64, MemFlagsData::trusted(), argv1_addr, 0);
+            let sidecar_path_ptr = b.ins().load(cl_types::I64, MemFlagsData::trusted(), argv2_addr, 0);
 
             let strlen_ref = module.declare_func_in_func(strlen_id, b.func);
             let data_len_call = b.ins().call(strlen_ref, &[data_path_ptr]);
@@ -3921,11 +3921,11 @@ fn emit_and_link_calibration_binary(
             let calib_call = b.ins().call(calib_load_ref, &[data_path_ptr, data_path_len]);
             let batches_ptr = b.inst_results(calib_call)[0];
 
-            let batches_ok = b.ins().icmp_imm(IntCC::NotEqual, batches_ptr, 0);
+            let batches_ok = b.ins().icmp_imm_s(IntCC::NotEqual, batches_ptr, 0);
             let zero_i64 = b.ins().iconst(cl_types::I64, 0);
             b.ins().brif(
                 batches_ok,
-                loop_header, &[batches_ptr, sidecar_path_ptr, zero_i64],
+                loop_header, &[BlockArg::Value(batches_ptr), BlockArg::Value(sidecar_path_ptr), BlockArg::Value(zero_i64)],
                 data_null, &[],
             );
 
@@ -3946,7 +3946,7 @@ fn emit_and_link_calibration_binary(
             let count = b.inst_results(count_call)[0];
 
             let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
-            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_sidecar_ptr]);
+            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[BlockArg::Value(lh_sidecar_ptr)]);
 
             // loop_body: call nsl_calibration_batch_at + plan-driven 2D max-abs loops
             b.switch_to_block(loop_body);
@@ -3990,7 +3990,7 @@ fn emit_and_link_calibration_binary(
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
             let i_next = b.ins().iadd(i_cur, one_i64);
-            b.ins().jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
+            b.ins().jump(loop_header, &[BlockArg::Value(lh_batches), BlockArg::Value(lh_sidecar_ptr), BlockArg::Value(i_next)]);
 
             b.seal_block(loop_header);
 
@@ -3998,7 +3998,7 @@ fn emit_and_link_calibration_binary(
             b.switch_to_block(loop_exit);
             b.seal_block(loop_exit);
             let le_sidecar_ptr = b.block_params(loop_exit)[0];
-            b.ins().jump(finalize, &[le_sidecar_ptr]);
+            b.ins().jump(finalize, &[BlockArg::Value(le_sidecar_ptr)]);
 
             // ── Step 5: finalize — build descriptor array, call nsl_awq_write_sidecar ──
             b.switch_to_block(finalize);
@@ -4031,25 +4031,25 @@ fn emit_and_link_calibration_binary(
                     let path_id = path_data_ids[&fp.projection.0];
                     let path_gv = module.declare_data_in_func(path_id, b.func);
                     let path_ptr_v = b.ins().symbol_value(ptr_ty, path_gv);
-                    b.ins().stack_store(path_ptr_v, stack_slot, off);
+                    b.ins().stack_store(cl_types::I64, path_ptr_v, stack_slot, off);
 
                     // path_len (offset 8, 8 bytes — usize on 64-bit)
                     let path_len_v = b.ins().iconst(ptr_ty, fp.projection.0.len() as i64);
-                    b.ins().stack_store(path_len_v, stack_slot, off + 8);
+                    b.ins().stack_store(cl_types::I64, path_len_v, stack_slot, off + 8);
 
                     // channels (offset 16, 4 bytes — u32)
                     let channels_v = b.ins().iconst(cl_types::I32, fp.channels as i64);
-                    b.ins().stack_store(channels_v, stack_slot, off + 16);
+                    b.ins().stack_store(cl_types::I64, channels_v, stack_slot, off + 16);
 
                     // _pad (offset 20, 4 bytes — u32)
                     let pad_v = b.ins().iconst(cl_types::I32, 0);
-                    b.ins().stack_store(pad_v, stack_slot, off + 20);
+                    b.ins().stack_store(cl_types::I64, pad_v, stack_slot, off + 20);
 
                     // running_ptr (offset 24, 8 bytes — *const f32)
                     let run_id = running_data_ids[&fp.running_symbol];
                     let run_gv = module.declare_data_in_func(run_id, b.func);
                     let run_ptr_v = b.ins().symbol_value(ptr_ty, run_gv);
-                    b.ins().stack_store(run_ptr_v, stack_slot, off + 24);
+                    b.ins().stack_store(cl_types::I64, run_ptr_v, stack_slot, off + 24);
                 }
 
                 // Compute the sidecar path length via strlen.
@@ -4083,7 +4083,7 @@ fn emit_and_link_calibration_binary(
                 b.ins().return_(&[zero]);
             }
 
-            b.finalize();
+            b.finalize(module.target_config());
         }
     }
 
@@ -5212,7 +5212,7 @@ mod per_head_dot {
 
             // head_exit is now current; terminate.
             b.ins().return_(&[]);
-            b.finalize();
+            b.finalize(crate::calibration::host_frontend_config());
         }
 
         format!("{}", func.display())

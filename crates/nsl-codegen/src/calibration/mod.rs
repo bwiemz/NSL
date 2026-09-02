@@ -342,6 +342,22 @@ fn hex_digest_ids(ids: &[String]) -> String {
     s
 }
 
+/// Frontend config for unit tests that build a bare `Function` and only
+/// inspect its IR text. `FunctionBuilder::finalize` needs one, but only
+/// reads it (its pointer type) to spill stack-map values at safepoints;
+/// nothing in this crate declares a stack-map value, so the host's config
+/// is as good as any.
+#[cfg(test)]
+pub(crate) fn host_frontend_config() -> cranelift_codegen::isa::TargetFrontendConfig {
+    cranelift_native::builder()
+        .expect("cranelift native builder")
+        .finish(cranelift_codegen::settings::Flags::new(
+            cranelift_codegen::settings::builder(),
+        ))
+        .expect("cranelift ISA")
+        .frontend_config()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

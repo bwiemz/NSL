@@ -61,7 +61,7 @@ fn write_matching_safetensors(path: &Path) {
             )
         })
         .collect();
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     fs::write(path, bytes).unwrap();
 }
 

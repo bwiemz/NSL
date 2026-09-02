@@ -333,7 +333,7 @@ fn write_toy_safetensors(m: &ToyModel) -> tempfile::TempPath {
             (name.clone(), view)
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(&data, &None).expect("safetensors serialize");
+    let serialized = safetensors::tensor::serialize(&data, None).expect("safetensors serialize");
 
     let tmp = tempfile::Builder::new()
         .prefix("cfie_spec_toy_")

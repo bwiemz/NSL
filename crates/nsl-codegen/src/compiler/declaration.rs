@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::{
-    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, Signature, UserFuncName,
+    types as cl_types, AbiParam, Function, InstBuilder, MemFlagsData, Signature, UserFuncName,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -842,18 +842,16 @@ impl Compiler<'_> {
                                 // Bitcast i64 → f64 for the value parameter
                                 let f64_val = builder.ins().bitcast(
                                     cl_types::F64,
-                                    MemFlags::new(),
+                                    MemFlagsData::new(),
                                     param_val,
                                 );
-                                let var = state.new_variable();
-                                builder.declare_var(var, cl_types::F64);
+                                let var = builder.declare_var(cl_types::F64);
                                 builder.def_var(var, f64_val);
                                 state.variables.insert(param.name, (var, cl_types::F64));
                                 state.param_symbols.insert(param.name);
                             } else {
                                 let cl_type = sig.params[i].value_type;
-                                let var = state.new_variable();
-                                builder.declare_var(var, cl_type);
+                                let var = builder.declare_var(cl_type);
                                 builder.def_var(var, param_val);
                                 state.variables.insert(param.name, (var, cl_type));
                                 state.param_symbols.insert(param.name);
@@ -890,7 +888,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(format_args!("dtype method '{fn_name}'"), &ctx.func);

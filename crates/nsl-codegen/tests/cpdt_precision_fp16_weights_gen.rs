@@ -90,7 +90,7 @@ fn gen_cpdt_precision_fp16_weights() {
         views.insert(name.to_string(), view);
     }
 
-    let serialized = serialize(&views, &None).unwrap();
+    let serialized = serialize(&views, None).unwrap();
 
     let out_path = fixture_dir().join("cpdt_precision_fp16_weights.safetensors");
     let mut f = std::fs::File::create(&out_path).unwrap();
