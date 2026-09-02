@@ -1,6 +1,7 @@
 //! CPU runtime hot paths through the C ABI compiled programs call:
-//! the autodiff tape (record a small MLP step, run backward), the tiled
-//! f32 matmul, and tensor allocation churn. `cargo bench -p nsl-runtime`.
+//! the autodiff tape (record a small MLP step, run backward; the per-op
+//! record cost on a chain of tiny elementwise ops), the tiled f32 matmul,
+//! and tensor allocation churn. `cargo bench -p nsl-runtime`.
 //!
 //! Everything here is host-side (no `cuda` feature needed), and every
 //! iteration returns the runtime to its starting state — tensors are
@@ -12,8 +13,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use nsl_runtime::autodiff::{nsl_tape_backward_train, nsl_tape_start, nsl_tape_stop};
 use nsl_runtime::list::{nsl_list_free, nsl_list_get, nsl_list_len, nsl_list_new, nsl_list_push};
 use nsl_runtime::tensor::{
-    nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_randn, nsl_tensor_relu, nsl_tensor_sum,
-    nsl_tensor_zeros,
+    nsl_tensor_add, nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_mul, nsl_tensor_randn,
+    nsl_tensor_relu, nsl_tensor_sum, nsl_tensor_zeros,
 };
 
 /// An NslList holding `dims`, for the shape-list-taking constructors.
@@ -85,6 +86,55 @@ fn bench_tape(c: &mut Criterion) {
     group.finish();
 }
 
+/// A chain of `n` elementwise ops (`add`, `mul` alternating) on one small
+/// tensor, with or without the tape recording. At [8, 8] the op itself is a
+/// few dozen flops, so what this times is the per-op fixed cost: the result
+/// allocation, and — when recording — the shape capture, the tape push and
+/// the saved-operand refcount traffic. The un-recorded arm is the control;
+/// the difference between the two is the tape's own overhead per op.
+///
+/// Each intermediate is freed as soon as its successor exists; under
+/// recording the `mul` nodes hold their operands alive until `tape_stop`,
+/// exactly as a forward pass's transients are.
+fn elementwise_chain(x: i64, w: i64, params: i64, n: usize, record: bool) {
+    if record {
+        nsl_tape_start(params);
+    }
+    let mut cur = x;
+    for i in 0..n {
+        let next = if i % 2 == 0 { nsl_tensor_add(cur, w, 0) } else { nsl_tensor_mul(cur, w, 0) };
+        if cur != x {
+            nsl_tensor_free(cur);
+        }
+        cur = next;
+    }
+    if record {
+        nsl_tape_stop();
+    }
+    nsl_tensor_free(cur);
+}
+
+fn bench_record(c: &mut Criterion) {
+    let mut group = c.benchmark_group("record");
+    let n = 64usize;
+    let x = randn(&[8, 8]);
+    let w = randn(&[8, 8]);
+    let params = nsl_list_new();
+    nsl_list_push(params, w);
+    group.throughput(Throughput::Elements(n as u64));
+
+    for &(label, record) in &[("elementwise_norecord", false), ("elementwise_record", true)] {
+        group.bench_with_input(BenchmarkId::new(label, n), &record, |b, &record| {
+            b.iter(|| elementwise_chain(x, w, params, n, record))
+        });
+    }
+
+    nsl_list_free(params);
+    nsl_tensor_free(w);
+    nsl_tensor_free(x);
+    group.finish();
+}
+
 fn bench_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul_f32");
     // ~1 ms and ~9 ms per call: 100 samples do not fit the default window.
@@ -132,5 +182,5 @@ fn bench_alloc(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_tape, bench_matmul, bench_alloc);
+criterion_group!(benches, bench_tape, bench_record, bench_matmul, bench_alloc);
 criterion_main!(benches);
