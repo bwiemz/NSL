@@ -1213,7 +1213,9 @@ impl Default for MatmulConfig {
             mode: MatmulMode::Tf32,
             bf16_rounding: Bf16Rounding::Rne,
             bf16_min_ratio: 512.0,
-            bf16_cast_cache: false,
+            // ON before #583; the pre-#583 env read was `!= Some("0")`,
+            // which is TRUE when the variable is unset.
+            bf16_cast_cache: true,
             bf16_lt: false,
             bf16_lt_workspace_mib: 64,
             bf16_lt_tune: true,
@@ -1222,6 +1224,84 @@ impl Default for MatmulConfig {
 }
 
 impl MatmulConfig {
+    /// Apply the deprecated `NSL_MATMUL_BF16*` environment variables to any
+    /// option still sitting at its default, and warn once per variable.
+    ///
+    /// Resolving the environment HERE rather than in the runtime is what makes
+    /// an env-driven run honest: the value ends up in `CompileOptions`, so it
+    /// reaches the execution fingerprint and the checkpoint records which
+    /// arithmetic actually ran. #583 read the environment in the runtime
+    /// instead, where codegen's unconditional `nsl_set_matmul_config` call made
+    /// it unreachable -- `NSL_MATMUL_BF16=1` silently produced TF32.
+    ///
+    /// An EXPLICIT flag always wins: `defaults` is the untouched
+    /// `MatmulConfig::default()`, and a field is only taken from the
+    /// environment when it still equals that default.
+    pub fn with_env_fallback(mut self) -> Self {
+        let d = MatmulConfig::default();
+        let mut warned: Vec<&'static str> = Vec::new();
+        let warn = |var: &'static str, flag: &'static str, warned: &mut Vec<&'static str>| {
+            if warned.contains(&var) {
+                return;
+            }
+            warned.push(var);
+            eprintln!(
+                "[nsl-matmul] DEPRECATED: {var} is set; use {flag}. The variable \
+                 still works and its value IS recorded in the execution \
+                 fingerprint, but the flag is the supported spelling."
+            );
+        };
+        if self.mode == d.mode
+            && let Ok(v) = std::env::var("NSL_MATMUL_BF16")
+            && v == "1"
+        {
+            warn("NSL_MATMUL_BF16", "--matmul-mode bf16", &mut warned);
+            self.mode = MatmulMode::Bf16;
+        }
+        if self.bf16_rounding == d.bf16_rounding
+            && let Ok(v) = std::env::var("NSL_MATMUL_BF16_ROUND")
+        {
+            warn("NSL_MATMUL_BF16_ROUND", "--bf16-rounding", &mut warned);
+            self.bf16_rounding = if v == "sr" { Bf16Rounding::Sr } else { Bf16Rounding::Rne };
+        }
+        if self.bf16_min_ratio == d.bf16_min_ratio
+            && let Ok(v) = std::env::var("NSL_MATMUL_BF16_MIN_RATIO")
+        {
+            warn("NSL_MATMUL_BF16_MIN_RATIO", "--bf16-min-ratio", &mut warned);
+            if let Some(r) = v.parse::<f64>().ok().filter(|r| r.is_finite() && *r >= 0.0) {
+                self.bf16_min_ratio = r;
+            }
+        }
+        if self.bf16_cast_cache == d.bf16_cast_cache
+            && let Ok(v) = std::env::var("NSL_MATMUL_BF16_CAST_CACHE")
+        {
+            warn("NSL_MATMUL_BF16_CAST_CACHE", "--bf16-cast-cache", &mut warned);
+            self.bf16_cast_cache = v != "0";
+        }
+        if self.bf16_lt == d.bf16_lt
+            && let Ok(v) = std::env::var("NSL_MATMUL_BF16_LT")
+            && v == "1"
+        {
+            warn("NSL_MATMUL_BF16_LT", "--bf16-lt", &mut warned);
+            self.bf16_lt = true;
+        }
+        if self.bf16_lt_workspace_mib == d.bf16_lt_workspace_mib
+            && let Ok(v) = std::env::var("NSL_MATMUL_BF16_LT_WORKSPACE_MIB")
+        {
+            warn("NSL_MATMUL_BF16_LT_WORKSPACE_MIB", "--bf16-lt-workspace-mib", &mut warned);
+            if let Ok(n) = v.parse::<u32>() {
+                self.bf16_lt_workspace_mib = n;
+            }
+        }
+        if self.bf16_lt_tune == d.bf16_lt_tune
+            && let Ok(v) = std::env::var("NSL_MATMUL_BF16_LT_TUNE")
+        {
+            warn("NSL_MATMUL_BF16_LT_TUNE", "--no-bf16-lt-tune", &mut warned);
+            self.bf16_lt_tune = v != "0";
+        }
+        self
+    }
+
     /// Clamp exactly as the runtime does, so a fingerprint records the
     /// EFFECTIVE value. Fingerprinting a raw string that the runtime then
     /// clamps would let two runs with identical arithmetic disagree.
@@ -2185,6 +2265,56 @@ mod exec_fingerprint_tests {
     use super::*;
 
 
+    /// #583 broke `NSL_MATMUL_BF16=1` and nothing caught it until a GPU gate
+    /// ran: the env fallback lived in the RUNTIME, where codegen's
+    /// unconditional `nsl_set_matmul_config` call made it unreachable, so the
+    /// variable silently produced TF32 and every driver that set it ran the
+    /// wrong arithmetic. Resolution now happens at compile-option level, which
+    /// is where this test can reach it.
+    ///
+    /// ONE test, not three: environment variables are process-global and cargo
+    /// runs tests on parallel threads, so three separate env tests race each
+    /// other and fail intermittently. Sequenced by hand instead.
+    #[test]
+    fn env_fallback_selects_reaches_the_fingerprint_and_loses_to_an_explicit_flag() {
+        // SAFETY: this test owns the variable for its duration and removes it
+        // on every path below.
+        unsafe { std::env::set_var("NSL_MATMUL_BF16", "1") };
+
+        // 1. the variable still selects bf16 (the #583 regression)
+        let got = MatmulConfig::default().with_env_fallback();
+        assert_eq!(
+            got.mode,
+            MatmulMode::Bf16,
+            "NSL_MATMUL_BF16=1 must still select bf16 -- #583 made it silently TF32"
+        );
+
+        // 2. and an env-driven run REACHES THE FINGERPRINT, which #583 did not
+        //    manage even when it worked -- the whole point of the feature.
+        let mut o = CompileOptions::default();
+        o.matmul = o.matmul.with_env_fallback();
+        let fp = o.exec_fingerprint();
+        assert!(fp.contains("mm=bf16"), "env-driven bf16 must reach the fingerprint: {fp}");
+
+        // 3. an explicit flag still wins.
+        let explicit = MatmulConfig { mode: MatmulMode::F32, ..MatmulConfig::default() }
+            .with_env_fallback();
+        assert_eq!(explicit.mode, MatmulMode::F32, "an explicit flag must beat the env");
+
+        unsafe { std::env::remove_var("NSL_MATMUL_BF16") };
+    }
+
+    #[test]
+    fn the_cast_cache_default_is_on_as_it_was_before_583() {
+        // The pre-#583 runtime read `var != Some("0")`, which is TRUE when the
+        // variable is unset. #583 defaulted it to false and silently disabled
+        // the cache for every run that did not set the variable.
+        assert!(
+            MatmulConfig::default().bf16_cast_cache,
+            "the weight-cast cache defaulted ON before #583"
+        );
+    }
+
     #[test]
     fn the_matmul_mode_changes_the_fingerprint_but_dtype_does_not() {
         // THE BUG THIS FEATURE EXISTS FOR. Two checkpoints taken on 2026-09-02
@@ -2228,7 +2358,7 @@ mod exec_fingerprint_tests {
             ("mode", |o| o.matmul.mode = MatmulMode::F32),
             ("rounding", |o| o.matmul.bf16_rounding = Bf16Rounding::Sr),
             ("min_ratio", |o| o.matmul.bf16_min_ratio = 256.0),
-            ("cast_cache", |o| o.matmul.bf16_cast_cache = true),
+            ("cast_cache", |o| o.matmul.bf16_cast_cache = false),
             ("lt", |o| o.matmul.bf16_lt = true),
             ("lt_workspace", |o| o.matmul.bf16_lt_workspace_mib = 128),
             ("lt_tune", |o| o.matmul.bf16_lt_tune = false),

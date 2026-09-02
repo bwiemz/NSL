@@ -452,6 +452,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     bf16_lt_workspace_mib,
                     bf16_lt_tune: !no_bf16_lt_tune,
                 }
+                // Deprecated env vars fill in any flag left at its default, so an
+                // env-driven run still reaches the fingerprint. Explicit flags win.
+                .with_env_fallback()
                 .clamped(),
                 no_autotune: false,
                 autotune_fresh: false,
