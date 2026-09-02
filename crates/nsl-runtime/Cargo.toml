@@ -18,25 +18,25 @@ crate-type = ["staticlib", "rlib"]
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 once_cell = "1"
-libloading = "0.8"
+libloading = "0.9"
 memmap2 = "0.9"
-rand = "0.9"
+rand = "0.10"
 # Direct dep on the generator `rand::rngs::StdRng` already resolves to, for
 # `get_word_pos`/`set_word_pos` — the O(1) RNG snapshot/restore that makes
 # training checkpoints resumable (item 8). Same version rand pulls in, so
 # this adds no new crate to the build graph.
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 # Inline-capacity shape vectors for the autodiff tape (`TapeShape`): a tape
 # node stores its operands' shapes, and a `Vec` per shape was one heap
 # allocation per recorded shape on every elementwise op. Already in the build
 # graph via cranelift; no new crate.
 smallvec = "1"
 cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cublaslt", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
-safetensors = { version = "0.4" }
-hf-hub = { version = "0.3", optional = true }
-prost = { version = "0.13", optional = true }
+safetensors = { version = "0.8" }
+hf-hub = { version = "1.0", optional = true }
+prost = { version = "0.14", optional = true }
 half = { version = "2.4", features = ["std"] }
 rustc-hash = "2"
 ahash = "0.8"
@@ -54,7 +54,7 @@ assert_cmd = "2"
 half = { version = "2.4", features = ["std"] }
 # Used by tools/verify-ort-vendoring.sh to diff vendored ORT struct
 # definitions against upstream headers.
-bindgen = "0.69"
+bindgen = "0.72"
 criterion.workspace = true
 
 [features]
