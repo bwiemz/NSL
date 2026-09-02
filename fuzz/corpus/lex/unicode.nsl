@@ -1,0 +1,3 @@
+let s = "héllo wörld ∑ 🎉"
+# comment with ünïcödé
+let π = 3.14

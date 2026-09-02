@@ -4,11 +4,41 @@ use nsl_errors::Diagnostic;
 use nsl_lexer::{Token, TokenKind};
 use nsl_lexer::Interner;
 
-/// Sentinel EOF token used when the parser has reached the end of input.
+/// Sentinel for an empty token stream, or one that does not end in `Eof`.
+///
+/// Its span is `Span::DUMMY`, which is in `FileId(0)` — merging it with a
+/// span from any other file panics — so the parser must not otherwise
+/// reach it: the lexer ends every stream with an `Eof` token, and
+/// `advance` never steps past it.
 const EOF_TOKEN: Token = Token {
     kind: TokenKind::Eof,
     span: Span::DUMMY,
 };
+
+/// The deepest nesting the parser accepts: statements, expressions,
+/// blocks, types and patterns together, the outermost counting as level
+/// one, so a nested `if` costs two levels (the statement and its block)
+/// and a parenthesis one. One level more is refused with a diagnostic and
+/// parsing stops.
+///
+/// The parser is recursive descent, so every level costs a few stack
+/// frames and nothing else bounds it; at two thousand levels — found by
+/// the parse fuzz target — it segfaults. The budget is set by the tightest
+/// stack the parser runs on, `cargo test`'s 2 MB threads with the debug
+/// build (`nsl` itself runs on a 16 MB thread): at this limit the
+/// hungriest shape, nested tuple patterns, uses about 1 MB of that and
+/// the others 200–700 KB; the release build needs at most 210 KB for any
+/// shape. `tests/nesting_limit.rs` parses every nesting shape at the
+/// limit on such a thread, so the margin is checked on every platform CI
+/// runs, not assumed. When the limit was set, the deepest of the 418
+/// tracked `.nsl` files (`stdlib/nsl/optim/muon.nsl`) nested 13 levels.
+///
+/// This bounds the parser's recursion, which is also the depth of any
+/// *nested* construct in the tree. A flat chain — `a + b + c + …`, `x.a.b.c`,
+/// `x |> f |> g` — parses in a loop and builds a tree as deep as the chain
+/// is long without ever nesting; later passes that recurse over the tree
+/// have no such bound.
+pub const MAX_NESTING: u32 = 128;
 
 /// The core parser state.
 pub struct Parser<'a> {
@@ -16,6 +46,11 @@ pub struct Parser<'a> {
     pos: usize,
     pub diagnostics: Vec<Diagnostic>,
     pub interner: &'a mut Interner,
+    /// Current nesting level; see `enter_nesting`.
+    depth: u32,
+    /// Index in `diagnostics` of the nesting-limit error, once it has been
+    /// reported.
+    nesting_overflow: Option<usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -25,7 +60,26 @@ impl<'a> Parser<'a> {
             pos: 0,
             diagnostics: Vec::new(),
             interner,
+            depth: 0,
+            nesting_overflow: None,
         }
+    }
+
+    /// The diagnostics to report, once parsing is finished.
+    ///
+    /// After the nesting limit was hit, the recursion unwinds through every
+    /// open construct, and each would report a bogus "expected `)`, found
+    /// end of file"; those are dropped, keeping everything reported before
+    /// the limit and the limit error itself. A check that runs on a
+    /// construct *after* its inner parse returns (the `&&T` borrow errors
+    /// in `types.rs`) goes with the cascade when that inner parse is the
+    /// one that hit the limit; it fires again once the nesting is reduced.
+    pub fn finish(self) -> Vec<Diagnostic> {
+        let mut diagnostics = self.diagnostics;
+        if let Some(at) = self.nesting_overflow {
+            diagnostics.truncate(at + 1);
+        }
+        diagnostics
     }
 
     // === Token inspection ===
@@ -70,12 +124,20 @@ impl<'a> Parser<'a> {
 
     // === Token consumption ===
 
+    /// Consume and return the current token.
+    ///
+    /// Never steps past an `Eof` token: consuming it again returns it
+    /// again. Stepping past it would leave `peek_token` on the sentinel
+    /// `EOF_TOKEN`, whose `Span::DUMMY` is in `FileId(0)`, and the next
+    /// `Span::merge` with a span of any other file — every imported module
+    /// — would panic. Unclosed brackets reached that state on
+    /// `let x = f(` followed by a newline (found by the parse fuzz
+    /// target).
     pub fn advance(&mut self) -> &Token {
-        if self.tokens.is_empty() {
+        let Some(tok) = self.tokens.get(self.pos) else {
             return &EOF_TOKEN;
-        }
-        let tok = &self.tokens[self.pos.min(self.tokens.len() - 1)];
-        if self.pos < self.tokens.len() {
+        };
+        if !matches!(tok.kind, TokenKind::Eof) {
             self.pos += 1;
         }
         tok
@@ -206,9 +268,59 @@ impl<'a> Parser<'a> {
         self.eat(&TokenKind::Newline);
     }
 
+    // === Nesting ===
+
+    /// Enter one level of nesting: a statement, expression, block, type or
+    /// pattern.
+    ///
+    /// Returns `false` when that would exceed `MAX_NESTING`; the caller then
+    /// returns an error node without recursing. The first time this
+    /// happens the overflow is reported and the parser is moved onto the
+    /// input's `Eof` token, so the open constructs unwind against `Eof` —
+    /// a state every truncated input already puts the parser in — and
+    /// nothing after the limit is parsed. On `true`, pair with
+    /// `leave_nesting`.
+    pub fn enter_nesting(&mut self, what: &str) -> bool {
+        if self.depth >= MAX_NESTING {
+            if self.nesting_overflow.is_none() {
+                let span = self.current_span();
+                self.nesting_overflow = Some(self.diagnostics.len());
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "{what} nested more than {MAX_NESTING} levels deep"
+                    ))
+                    .with_label(span, "nesting limit reached here; the rest of the file was not parsed"),
+                );
+                // Onto the trailing `Eof` token, not past it: past it is
+                // the `EOF_TOKEN` sentinel, whose span is in `FileId(0)`.
+                self.pos = self.tokens.len().saturating_sub(1);
+            }
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    pub fn leave_nesting(&mut self) {
+        self.depth -= 1;
+    }
+
     // === Block parsing ===
 
     pub fn parse_block(&mut self) -> nsl_ast::stmt::Block {
+        if !self.enter_nesting("block") {
+            let span = self.current_span();
+            return nsl_ast::stmt::Block {
+                stmts: Vec::new(),
+                span,
+            };
+        }
+        let block = self.parse_block_nested();
+        self.leave_nesting();
+        block
+    }
+
+    fn parse_block_nested(&mut self) -> nsl_ast::stmt::Block {
         self.skip_newlines();
         let start = self.current_span();
         self.expect(&TokenKind::Indent);
@@ -262,6 +374,46 @@ impl<'a> Parser<'a> {
                 _ => {
                     self.advance();
                 }
+            }
+        }
+    }
+
+    /// Recovery for a body loop that does not parse statements (tokenizer,
+    /// dataset, key-value blocks): drop the rest of the current line, its
+    /// newline, and the indented suite that follows it, if any — `if b:`
+    /// and its block are one bad line to such a loop, not one bad line
+    /// and then an `Indent` it has no arm for.
+    ///
+    /// `synchronize` stops *before* a statement keyword so that a statement
+    /// parser can pick it up. A loop that only accepts `key = value` lines
+    /// never does, so calling `synchronize` on a line such as `if b` left
+    /// the parser on `if`, and the loop pushed the same diagnostic forever
+    /// (found by the parse fuzz target). This always consumes up to a
+    /// `Newline`, `Dedent` or `Eof` and never a `Dedent` of the enclosing
+    /// body, so a loop that calls it on every iteration terminates and
+    /// still sees the end of its body.
+    pub fn skip_to_next_line(&mut self) {
+        while !self.at_any(&[TokenKind::Newline, TokenKind::Dedent, TokenKind::Eof]) {
+            self.advance();
+        }
+        if !self.eat(&TokenKind::Newline) {
+            return;
+        }
+        self.skip_newlines();
+        if !self.at(&TokenKind::Indent) {
+            return;
+        }
+        // The suite, tokens only: it is not parsed, so it reports nothing.
+        let mut depth = 0u32;
+        while !self.at(&TokenKind::Eof) {
+            match self.peek() {
+                TokenKind::Indent => depth += 1,
+                TokenKind::Dedent => depth -= 1,
+                _ => {}
+            }
+            self.advance();
+            if depth == 0 {
+                break;
             }
         }
     }

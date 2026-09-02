@@ -32,7 +32,24 @@ pub fn parse_type(p: &mut Parser) -> TypeExpr {
 
 /// Parse a single (non-union) type expression. Public so lambda params can
 /// use this to avoid consuming `|` as a union-type separator.
+///
+/// Every nested type (`[T]`, `&T`, generic arguments, ...) comes back
+/// through here, so this is where type nesting is counted.
 pub fn parse_primary_type(p: &mut Parser) -> TypeExpr {
+    if !p.enter_nesting("type") {
+        let sym = p.intern("error");
+        return TypeExpr {
+            kind: TypeExprKind::Named(sym),
+            span: p.current_span(),
+            id: p.next_node_id(),
+        };
+    }
+    let ty = parse_primary_type_nested(p);
+    p.leave_nesting();
+    ty
+}
+
+fn parse_primary_type_nested(p: &mut Parser) -> TypeExpr {
     // Immutable borrow: &Type
     if p.at(&TokenKind::Ampersand) {
         let start = p.advance().span;

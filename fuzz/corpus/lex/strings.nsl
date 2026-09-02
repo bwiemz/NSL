@@ -1,0 +1,7 @@
+let a = "double \"q\" \n \t \\ \x41 \u{1F600}"
+let b = 'single'
+let c = """multi
+line"""
+let d = f"{a + b} and {c}!"
+let e = f'{outer(f"{inner}")}'
+## doc comment

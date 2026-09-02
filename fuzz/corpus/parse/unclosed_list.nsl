@@ -1,0 +1,3 @@
+# An unclosed list literal, ending in a blank line (see unclosed_call.nsl).
+let x = [1,
+

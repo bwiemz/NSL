@@ -1,0 +1,7 @@
+let a = 1 ! 2
+let b = "open
+let c = 0x
+let d = `
+fn f():
+        let e = 1
+    let g = 2

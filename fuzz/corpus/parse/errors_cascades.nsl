@@ -1,0 +1,8 @@
+let a = 1
+let b = (2 + 3
+let c = 4
+let e = 6 +
+let f = 7
+fn broken(x: int) -> int
+    return x
+let g = 8

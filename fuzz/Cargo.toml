@@ -1,0 +1,51 @@
+# Coverage-guided fuzzing of the frontend with cargo-fuzz (nightly only):
+#
+#     cargo install cargo-fuzz
+#     cargo +nightly fuzz run parse -- -max_len=4096 -timeout=10 -rss_limit_mb=4096
+#     cargo +nightly fuzz run lex   -- -max_len=4096 -timeout=10 -rss_limit_mb=4096
+#
+# `-rss_limit_mb`: libFuzzer's resident size creeps on the parse target
+# under AddressSanitizer and trips the default 2 GB limit after a few
+# minutes; the "oom" artifacts it then writes replay in a millisecond
+# and are not a parser leak.
+#
+# `-max_len=4096`: the parser's nesting limit bounds recursion, not the
+# depth of a flat chain (`a + b + …`), which the tree's drop glue recurses
+# over; a longer input can overflow there, which is a known follow-up
+# (see `MAX_NESTING` in crates/nsl-parser/src/parser.rs), not a finding.
+#
+# Its own workspace, so the stable-toolchain workspace build never sees
+# libfuzzer-sys. The invariants each target checks live in
+# crates/nsl-parser/tests/common/frontend_check.rs, which
+# crates/nsl-parser/tests/fuzz_seeds.rs also runs over fuzz/corpus/ on
+# stable, so a regression on a committed seed is caught in CI.
+[package]
+name = "nsl-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nsl-errors = { path = "../crates/nsl-errors" }
+nsl-lexer = { path = "../crates/nsl-lexer" }
+nsl-parser = { path = "../crates/nsl-parser" }
+
+[[bin]]
+name = "lex"
+path = "fuzz_targets/lex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

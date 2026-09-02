@@ -1,0 +1,14 @@
+pub fn add(a: int, b: int = 1) -> int:
+    return a + b
+
+async fn fetch(url: str) -> str:
+    let r = await get(url)
+    return r
+
+fn gen<T>(xs: List<T>) -> T:
+    for x in xs:
+        yield x
+
+@decorator(1)
+fn dec():
+    pass_through()

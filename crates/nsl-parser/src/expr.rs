@@ -12,7 +12,24 @@ pub fn parse_expr(p: &mut Parser) -> Expr {
 }
 
 /// Parse an expression using Pratt parsing with the given minimum binding power.
+///
+/// Every recursive entry into the expression grammar — parenthesised or
+/// bracketed operands, prefix operands, right-hand sides, lambda bodies —
+/// comes through here, so this is where expression nesting is counted.
 fn parse_expr_bp(p: &mut Parser, min_bp: u8) -> Expr {
+    if !p.enter_nesting("expression") {
+        return Expr {
+            kind: ExprKind::Error,
+            span: p.current_span(),
+            id: p.next_node_id(),
+        };
+    }
+    let expr = parse_expr_bp_nested(p, min_bp);
+    p.leave_nesting();
+    expr
+}
+
+fn parse_expr_bp_nested(p: &mut Parser, min_bp: u8) -> Expr {
     let mut lhs = parse_prefix_or_atom(p);
 
     loop {

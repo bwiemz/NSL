@@ -1,0 +1,6 @@
+let a: int = 1
+let b: &str = "s"
+let c: Option<int> | None = None
+let d: Tensor<[_], fp32> = zeros([3])
+fn f(x: Self, y: (int, str), z: List<Dict<str, int>>) -> Self:
+    return x

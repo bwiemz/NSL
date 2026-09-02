@@ -1,0 +1,7 @@
+a + b - c * d / e // f % g ** h @ i
+a == b != c < d > e <= f >= g
+x = 1; x += 2; x -= 3; x *= 4; x /= 5
+x |> f | g & h
+a -> b => c
+a.b, c: d; #x _ ...
+(a) [b] {c}

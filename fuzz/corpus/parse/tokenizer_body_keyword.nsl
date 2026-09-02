@@ -1,0 +1,16 @@
+# A statement keyword where a section, key = value entry, or dataset
+# field is expected. `synchronize` stops in front of statement keywords,
+# so before `skip_to_next_line` these three loops never advanced and
+# pushed the same diagnostic until memory ran out.
+tokenizer t:
+    if b
+    special_tokens:
+        pad = 0
+        for x
+        eos = 1
+    normalize: lowercase
+
+dataset d(source):
+    path = "x"
+    return
+    shards = 4
