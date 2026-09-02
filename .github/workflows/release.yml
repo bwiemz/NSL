@@ -34,11 +34,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # `dist` = release + one codegen unit (workspace Cargo.toml, with the
+      # measurements). Built once per tag, so the 2.8x build time buys a 20%
+      # smaller runtime archive and a 28% faster link for every program the
+      # shipped toolchain compiles.
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p nsl-cli
+        run: cargo build --profile dist --target ${{ matrix.target }} -p nsl-cli
 
       - name: Build runtime library
-        run: cargo build --release --target ${{ matrix.target }} -p nsl-runtime
+        run: cargo build --profile dist --target ${{ matrix.target }} -p nsl-runtime
 
       - name: Package toolchain (Unix)
         if: matrix.archive == 'tar.gz'
@@ -46,8 +50,8 @@ jobs:
           TAG=${GITHUB_REF#refs/tags/}
           DIR="nsl-${TAG}-${{ matrix.target }}"
           mkdir -p "${DIR}/bin" "${DIR}/lib"
-          cp "target/${{ matrix.target }}/release/nsl" "${DIR}/bin/nsl" || cp "target/${{ matrix.target }}/release/nsl-cli" "${DIR}/bin/nsl"
-          cp "target/${{ matrix.target }}/release/libnsl_runtime.a" "${DIR}/lib/"
+          cp "target/${{ matrix.target }}/dist/nsl" "${DIR}/bin/nsl" || cp "target/${{ matrix.target }}/dist/nsl-cli" "${DIR}/bin/nsl"
+          cp "target/${{ matrix.target }}/dist/libnsl_runtime.a" "${DIR}/lib/"
           cp -r stdlib "${DIR}/lib/stdlib"
           cp LICENSE README.md "${DIR}/"
           tar czf "${DIR}.tar.gz" "${DIR}"
@@ -59,9 +63,9 @@ jobs:
           $TAG = $env:GITHUB_REF -replace 'refs/tags/',''
           $DIR = "nsl-${TAG}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path "${DIR}/bin","${DIR}/lib" -Force
-          Copy-Item "target/${{ matrix.target }}/release/nsl.exe" "${DIR}/bin/nsl.exe" -ErrorAction SilentlyContinue
-          if (-not (Test-Path "${DIR}/bin/nsl.exe")) { Copy-Item "target/${{ matrix.target }}/release/nsl-cli.exe" "${DIR}/bin/nsl.exe" }
-          Copy-Item "target/${{ matrix.target }}/release/nsl_runtime.lib" "${DIR}/lib/" -ErrorAction SilentlyContinue
+          Copy-Item "target/${{ matrix.target }}/dist/nsl.exe" "${DIR}/bin/nsl.exe" -ErrorAction SilentlyContinue
+          if (-not (Test-Path "${DIR}/bin/nsl.exe")) { Copy-Item "target/${{ matrix.target }}/dist/nsl-cli.exe" "${DIR}/bin/nsl.exe" }
+          Copy-Item "target/${{ matrix.target }}/dist/nsl_runtime.lib" "${DIR}/lib/" -ErrorAction SilentlyContinue
           Copy-Item -Recurse "stdlib" "${DIR}/lib/stdlib"
           Copy-Item LICENSE,README.md "${DIR}/"
           Compress-Archive -Path "${DIR}" -DestinationPath "${DIR}.zip"
