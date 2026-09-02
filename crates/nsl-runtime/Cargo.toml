@@ -47,6 +47,7 @@ half = { version = "2.4", features = ["std"] }
 # Used by tools/verify-ort-vendoring.sh to diff vendored ORT struct
 # definitions against upstream headers.
 bindgen = "0.69"
+criterion.workspace = true
 
 [features]
 default = []
@@ -84,3 +85,7 @@ strict-matmul = []
 # c19 probe test invocations and never in production builds. See project memory
 # `project_csha_paper_completion_cycle18.md` DEGENERATE-PROBE meta-lesson.
 csha_cycle19_probe = []
+
+[[bench]]
+name = "tape"
+harness = false

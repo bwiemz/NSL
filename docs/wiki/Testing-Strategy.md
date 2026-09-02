@@ -311,6 +311,43 @@ Each test compiles and runs a `.nsl` file through the full pipeline (parse → s
 
 The `tests/` directory contains the full range of integration fixtures: GPU broadcast/matmul/rope shapes, source-AD training programs, checkpoint round-trips, sampling, and transformer block tests. These are the same programs exercised by the reading order in [Examples-Guide](Examples-Guide.md).
 
+## Benchmarks — criterion (not a test layer)
+
+Six `criterion` benches, one per compiler stage plus the runtime's host-side
+hot paths, driven by `scripts/bench.sh`:
+
+| package | bench | measures |
+|---|---|---|
+| `nsl-lexer` | `lex` | bytes/s over `stdlib/` + `examples/` + `models/` |
+| `nsl-parser` | `parse` | tokens/s over the same corpus, pre-tokenized |
+| `nsl-semantic` | `analyze` | single-module analysis of the import-free examples |
+| `nsl-cli` | `frontend` | `loader::load_all_modules` over the three coder recipes |
+| `nsl-codegen` | `compile` | `compile_module` over the clean import-free examples |
+| `nsl-runtime` | `tape` | tape record + backward, CPU f32 matmul, alloc churn |
+
+The corpora are discovered from the tree, not listed, and each bench drops
+what its stage cannot take (a deliberately broken example, an `import`, an
+`@autotune` kernel) and says so on stderr — so compare the per-byte or
+per-token figure, which survives the file set drifting, over the absolute
+time. The `compile` bench measures the single-module entry only; the
+multi-module compile lives inside `run_build_multi` and is not
+library-callable (roadmap A1).
+
+```bash
+scripts/bench.sh save main          # on main
+scripts/bench.sh compare main       # on the branch: per-bench change, p-value, verdict
+NSL_BENCH_ONLY="lex parse" scripts/bench.sh -- --quick   # a subset, fast and rough
+```
+
+Baselines live under `$CARGO_TARGET_DIR/criterion/`, so save and compare
+from the same target dir. `.github/workflows/bench.yml` runs the same
+save/compare on a hosted runner for a PR carrying the `bench` label (or on
+`workflow_dispatch`) and posts the verdicts to the job summary; it is
+informational and never a required check — the same commit has measured 8%
+apart on this project's own workstation while a training job shared the box.
+The main CI lane clippies the six bench targets by name (not `--benches`,
+which would also lint every lib's test module) so the sources cannot rot.
+
 ## Test discipline
 
 - **New language feature** → unit + snapshot (AST, IR) + at least one e2e example

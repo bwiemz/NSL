@@ -16,3 +16,8 @@ nsl-ast.workspace = true
 [dev-dependencies]
 string-interner.workspace = true
 nsl-parser.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "analyze"
+harness = false

@@ -1,0 +1,179 @@
+# CPU benchmark lane (roadmap T3): scripts/bench.sh on a hosted runner,
+# base commit vs. head, verdicts to the job summary.
+#
+# INFORMATIONAL, NOT A GATE. Two reasons it cannot be one:
+#   - a hosted runner's neighbours are unknown; on this project's own
+#     workstation the same commit measured +12% on lex/largest_file between
+#     two `--quick` runs while a training job shared the box. Both halves of
+#     the comparison run on the SAME runner in the SAME job, back to back,
+#     which removes the runner-to-runner variance but not the moment-to-moment
+#     kind;
+#   - criterion's verdict is a statistical one (p < 0.05 AND the whole
+#     confidence interval past the noise threshold); a true 3% regression
+#     reads "within noise" at the 5% threshold this lane uses.
+# So the compare step is `continue-on-error`, the workflow is not a required
+# check, and a "regressed" verdict is a prompt to reproduce locally
+# (`scripts/bench.sh save main` on main, `compare main` on the branch), not a
+# finding. The audit asked for a PR comment on >5% regressions; a comment
+# needs `pull-requests: write` on a workflow that runs pull_request events
+# from forks of a PUBLIC repo, and the step summary carries the same table
+# with `contents: read` only.
+#
+# Triggers: manual (`workflow_dispatch`, pick a base ref), or a pull request
+# carrying the `bench` label — every push to a labelled PR re-runs it. A
+# push to main is deliberately NOT a trigger: a self-compare of main against
+# main is a noise-floor measurement, which is what the dispatch form gives
+# you on demand without spending ~15 min of runner per merge.
+#
+# Runs ONLY on ubuntu-latest. Never point this at the self-hosted GPU runner:
+# that runner accepts `schedule`/`workflow_dispatch` alone (see gpu-cert.yml)
+# because this repository is public and pull_request runs execute the PR's
+# code.
+
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base ref to compare against (default: merge-base with origin/main)"
+        required: false
+        default: ""
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: no debuginfo, no incremental. The bench profile inherits
+  # release, which carries no debuginfo already; the dev-profile settings keep
+  # the build scripts and proc-macros small.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  bench:
+    name: base vs head (informational)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'bench')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base commit has to be checkable-out, and merge-base needs
+          # history on both sides.
+          fetch-depth: 0
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Separate key from ci.yml's: this target dir holds release-profile
+          # bench artifacts, not the test tree.
+          key: ${{ runner.os }}-cargo-bench-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Resolve base and head
+        id: refs
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # actions/checkout gives a pull_request run the PR merged onto its
+            # base branch, so the merge-base with that branch is the branch's
+            # tip and head-minus-base is exactly the PR's delta.
+            git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+            base="$(git merge-base "${head}" "origin/${{ github.event.pull_request.base.ref }}")"
+          elif [ -n "${{ github.event.inputs.base }}" ]; then
+            git fetch --no-tags origin "${{ github.event.inputs.base }}" || true
+            base="$(git rev-parse --verify "${{ github.event.inputs.base }}^{commit}" \
+                    || git rev-parse --verify "origin/${{ github.event.inputs.base }}^{commit}")"
+          else
+            git fetch --no-tags origin main
+            base="$(git merge-base "${head}" origin/main)"
+          fi
+          echo "base=${base}" >> "${GITHUB_OUTPUT}"
+          echo "head=${head}" >> "${GITHUB_OUTPUT}"
+          echo "base ${base}"
+          echo "head ${head}"
+          if [ "${base}" = "${head}" ]; then
+            echo "base == head: this run measures the noise floor, every verdict below is noise"
+          fi
+
+      # The base's benches are the base's own: a bench added by the PR has no
+      # baseline and is reported as new (--baseline-lenient below), and a
+      # bench the PR removed is not run at all.
+      - name: Save baseline at base
+        run: |
+          set -euo pipefail
+          git checkout --quiet --detach "${{ steps.refs.outputs.base }}"
+          if [ ! -x scripts/bench.sh ]; then
+            echo "scripts/bench.sh does not exist at the base commit; nothing to compare against" >&2
+            echo "no_baseline=1" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+          scripts/bench.sh save base -- --noplot 2>&1 | tee bench-base.txt
+
+      - name: Compare at head
+        id: compare
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git checkout --quiet --detach "${{ steps.refs.outputs.head }}"
+          if [ "${no_baseline:-0}" = "1" ]; then
+            scripts/bench.sh -- --noplot 2>&1 | tee bench-head.txt
+          else
+            # Lenient: a bench this PR adds has no baseline and is reported
+            # without a change line instead of failing the run. 5% is the
+            # audit's "worth a look" threshold — below it criterion says
+            # "within noise threshold" whatever the p-value.
+            scripts/bench.sh -- --noplot --baseline-lenient base --noise-threshold 0.05 2>&1 | tee bench-head.txt
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Benchmarks: \`${{ steps.refs.outputs.base }}\` (base) vs \`${{ steps.refs.outputs.head }}\` (head)"
+            echo
+            echo "Informational only — see the header of \`.github/workflows/bench.yml\`."
+            echo
+            if [ ! -s bench-head.txt ]; then
+              echo "No results: the compare step did not produce output (see its log)."
+            else
+              # Criterion prints the bench name at column 0 and everything
+              # about it indented on the following lines; the verdict line is
+              # one of those. Pair each verdict with the last name seen.
+              echo "| bench | verdict |"
+              echo "|---|---|"
+              awk '
+                /^[^ \t]/ { name = $1 }
+                /Performance has regressed/  { printf "| `%s` | **regressed** |\n", name }
+                /Performance has improved/   { printf "| `%s` | improved |\n", name }
+                /within noise threshold/     { printf "| `%s` | within noise |\n", name }
+                /No change in performance/   { printf "| `%s` | no change |\n", name }
+              ' bench-head.txt
+              echo
+              echo "<details><summary>criterion output (head)</summary>"
+              echo
+              echo '```'
+              grep -v '^Benchmarking' bench-head.txt || true
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${{ steps.compare.outcome }}" != "success" ]; then
+            echo "compare step outcome: ${{ steps.compare.outcome }} (non-blocking)"
+          fi
