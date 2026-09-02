@@ -16,8 +16,8 @@ fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64
 /// Returns `(effective_b_ptr, true)` if a transfer was made (caller must free),
 /// or `(b, false)` if no transfer was needed.
 fn reconcile_device(a: i64, b: i64) -> (i64, bool) {
-    let ta = unsafe { &*(a as *const NslTensor) };
-    let tb = unsafe { &*(b as *const NslTensor) };
+    let ta = NslTensor::from_ptr_ref(a);
+    let tb = NslTensor::from_ptr_ref(b);
     if tb.device != ta.device {
         (nsl_tensor_to_device(b, ta.device as i64), true)
     } else {
@@ -37,11 +37,11 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
     let b_orig = b;
     let (b, b_transferred) = reconcile_device(a, b);
     {
-        let ta = unsafe { &*(a as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                let tb = unsafe { &*(b as *const NslTensor) };
+                let tb = NslTensor::from_ptr_ref(b);
                 // In-place reuse is skipped while recording: the tape needs
                 // out != a for a well-formed chain (relinquish flags never come
                 // from a taped forward today; the guard keeps that a non-event
@@ -95,8 +95,8 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
     // FBIP-3: the relinquish flag is the caller's promise that no other holder exists,
     // so the in-place path is safe even if the refcount heuristic would normally reject it.
     {
-        let ta = unsafe { &mut *(a as *mut NslTensor) };
-        let tb = unsafe { &*(b as *const NslTensor) };
+        let ta = NslTensor::from_ptr(a);
+        let tb = NslTensor::from_ptr_ref(b);
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
             if ta.dtype == crate::tensor::DTYPE_FP16 {
@@ -178,11 +178,11 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
     let b_orig = b;
     let (b, b_transferred) = reconcile_device(a, b);
     {
-        let ta = unsafe { &*(a as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                let tb = unsafe { &*(b as *const NslTensor) };
+                let tb = NslTensor::from_ptr_ref(b);
                 if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
@@ -210,8 +210,8 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
     // FBIP-3: relinq_a grants in-place reuse even if the refcount heuristic rejects it.
     {
-        let ta = unsafe { &mut *(a as *mut NslTensor) };
-        let tb = unsafe { &*(b as *const NslTensor) };
+        let ta = NslTensor::from_ptr(a);
+        let tb = NslTensor::from_ptr_ref(b);
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
             if ta.dtype == crate::tensor::DTYPE_FP16 {
@@ -278,11 +278,11 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
     let b_orig = b;
     let (b, b_transferred) = reconcile_device(a, b);
     {
-        let ta = unsafe { &*(a as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                let tb = unsafe { &*(b as *const NslTensor) };
+                let tb = NslTensor::from_ptr_ref(b);
                 if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
@@ -316,8 +316,8 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
     // FBIP-3: relinq_a grants in-place reuse even if the refcount heuristic rejects it.
     {
-        let ta = unsafe { &mut *(a as *mut NslTensor) };
-        let tb = unsafe { &*(b as *const NslTensor) };
+        let ta = NslTensor::from_ptr(a);
+        let tb = NslTensor::from_ptr_ref(b);
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
             if ta.dtype == crate::tensor::DTYPE_FP16 {
@@ -394,11 +394,11 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
     let b_orig = b;
     let (b, b_transferred) = reconcile_device(a, b);
     {
-        let ta = unsafe { &*(a as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                let tb = unsafe { &*(b as *const NslTensor) };
+                let tb = NslTensor::from_ptr_ref(b);
                 if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
@@ -431,8 +431,8 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
     // FBIP-3: relinq_a grants in-place reuse even if the refcount heuristic rejects it.
     {
-        let ta = unsafe { &mut *(a as *mut NslTensor) };
-        let tb = unsafe { &*(b as *const NslTensor) };
+        let ta = NslTensor::from_ptr(a);
+        let tb = NslTensor::from_ptr_ref(b);
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
             if ta.dtype == crate::tensor::DTYPE_FP16 {
@@ -504,7 +504,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -527,7 +527,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(a_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
@@ -624,7 +624,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::relinquish_a;
     let relinq_a = relinquish_a(flags);
     {
-        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -649,7 +649,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
     // Skip for i32 — needs type conversion to float, can't mutate in-place.
     {
-        let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(a_ptr);
         if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
@@ -755,7 +755,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::relinquish_a;
     let relinq_a = relinquish_a(flags);
     {
-        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -781,7 +781,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     // Skip for i32 — the dtype arms below would flat-index it as f64 (8-byte
     // writes into a 4-byte-element buffer). Same guard as nsl_tensor_add_scalar.
     {
-        let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(a_ptr);
         if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
@@ -901,7 +901,7 @@ pub extern "C" fn nsl_tensor_div_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     );
     let relinq_a = relinquish_a(flags);
     {
-        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -923,7 +923,7 @@ pub extern "C" fn nsl_tensor_div_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     // Skip for i32 — the dtype arms below would flat-index it as f64 (8-byte
     // writes into a 4-byte-element buffer). Same guard as nsl_tensor_mul_scalar.
     {
-        let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(a_ptr);
         if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
@@ -1025,7 +1025,7 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     );
     let relinq_a = relinquish_a(flags);
     {
-        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(a_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -1046,7 +1046,7 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     // FBIP: mutate in-place when the caller relinquished (CPU). i32 guard as
     // in nsl_tensor_mul_scalar.
     {
-        let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(a_ptr);
         if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
@@ -1440,7 +1440,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     let (b_ptr, b_transferred) = reconcile_device(a_ptr, b_ptr);
     // GPU dispatch
     {
-        let a = unsafe { &*(a_ptr as *const NslTensor) };
+        let a = NslTensor::from_ptr_ref(a_ptr);
         if a.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -1730,7 +1730,7 @@ mod fbip_add_tests {
     }
 
     fn read_f64(ptr: i64, idx: usize) -> f64 {
-        let t = unsafe { &*(ptr as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(ptr);
         unsafe { *(t.data as *const f64).add(idx) }
     }
 
@@ -1780,7 +1780,7 @@ mod fbip_add_tests {
         let g = [0.3f32, 4.0, -1.5, 9.9, 2.5e-3, -8.125];
         let s = 0.1f64;
         let read_f32 = |ptr: i64, i: usize| -> f32 {
-            let t = unsafe { &*(ptr as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(ptr);
             unsafe { *(t.data as *const f32).add(i) }
         };
         let m_ref = make_tensor_f32(&m0);
@@ -2108,7 +2108,7 @@ mod fbip_add_tests {
         let vals = [1.5f32, -2.25, 3.0, 1e-3, -8.125, 0.0];
         let s = 0.30000000000000004f64; // no exact f32/f64 form
         let read_f32 = |ptr: i64, i: usize| -> f32 {
-            let t = unsafe { &*(ptr as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(ptr);
             unsafe { *(t.data as *const f32).add(i) }
         };
         let a1 = make_tensor_f32(&vals);
@@ -2156,7 +2156,7 @@ mod fbip_add_tests {
         let vals = [1.5f32, -2.25, 3.0, 1e-3, -8.125, 0.0];
         let s = 0.30000000000000004f64;
         let read_f32 = |ptr: i64, i: usize| -> f32 {
-            let t = unsafe { &*(ptr as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(ptr);
             unsafe { *(t.data as *const f32).add(i) }
         };
         let a1 = make_tensor_f32(&vals);

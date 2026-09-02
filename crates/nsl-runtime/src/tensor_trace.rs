@@ -165,7 +165,9 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     if ptr.is_null() {
         return zero_stats();
     }
-    let t = unsafe { &*ptr };
+    // Null stays "no operand" (unary ops pass 0); anything non-null must be a
+    // live tensor.
+    let t = NslTensor::from_ptr_ref(ptr as i64);
     let ndim = t.ndim as u8;
     let dtype = t.dtype as u8;
     let device = t.device;

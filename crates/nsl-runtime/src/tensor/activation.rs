@@ -14,7 +14,7 @@ use super::{nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -40,7 +40,7 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -108,7 +108,7 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -134,7 +134,7 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -202,7 +202,7 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -228,7 +228,7 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -296,7 +296,7 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -322,7 +322,7 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -384,7 +384,7 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -402,7 +402,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -471,7 +471,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -497,7 +497,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     }
     // FBIP: mutate in-place when uniquely owned (skip for i32 — needs dtype conversion)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.dtype != super::DTYPE_I32 && t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -628,7 +628,7 @@ pub(crate) fn nsl_tensor_clamp_backward(
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -654,7 +654,7 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -730,7 +730,7 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -756,7 +756,7 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -834,7 +834,7 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -860,7 +860,7 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -944,8 +944,8 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
 /// decomposed path's per-op kernels do.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
-    let xt = unsafe { &*(x_ptr as *const NslTensor) };
-    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    let xt = NslTensor::from_ptr_ref(x_ptr);
+    let gt = NslTensor::from_ptr_ref(grad_ptr);
     // Only f64/f32 are handled (both the fused kernel and the decomposed
     // fallback branch f32-vs-f64). Reject f16/bf16 loudly rather than let a
     // `data_f64()`/`data_f32()` accessor over-read a narrower buffer.
@@ -1059,9 +1059,9 @@ pub extern "C" fn nsl_tensor_swiglu_gate_backward(
     up_ptr: i64,
     x_ptr: i64,
 ) -> i64 {
-    let xt = unsafe { &*(x_ptr as *const NslTensor) };
-    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
-    let ut = unsafe { &*(up_ptr as *const NslTensor) };
+    let xt = NslTensor::from_ptr_ref(x_ptr);
+    let gt = NslTensor::from_ptr_ref(grad_ptr);
+    let ut = NslTensor::from_ptr_ref(up_ptr);
     assert!(
         (xt.dtype == 0 || xt.dtype == 1)
             && (gt.dtype == 0 || gt.dtype == 1)
@@ -1168,8 +1168,8 @@ pub extern "C" fn nsl_tensor_swiglu_gate_backward(
 /// first, as the decomposed path's per-op kernels do.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
-    let yt = unsafe { &*(y_ptr as *const NslTensor) };
-    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    let yt = NslTensor::from_ptr_ref(y_ptr);
+    let gt = NslTensor::from_ptr_ref(grad_ptr);
     assert!(
         (yt.dtype == 0 || yt.dtype == 1) && (gt.dtype == 0 || gt.dtype == 1),
         "sigmoid_backward: unsupported dtype (y={}, grad={}); f16/bf16 activation backward is not implemented",
@@ -1257,8 +1257,8 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
 /// computes the same order in f64/f32. `grad` and `y` are made contiguous first.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
-    let yt = unsafe { &*(y_ptr as *const NslTensor) };
-    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    let yt = NslTensor::from_ptr_ref(y_ptr);
+    let gt = NslTensor::from_ptr_ref(grad_ptr);
     assert!(
         (yt.dtype == 0 || yt.dtype == 1) && (gt.dtype == 0 || gt.dtype == 1),
         "tanh_backward: unsupported dtype (y={}, grad={}); f16/bf16 activation backward is not implemented",
@@ -1401,8 +1401,8 @@ fn gelu_deriv_cpu(x_ptr: i64) -> i64 {
 /// 0.5 at x=0. Fusing eliminates the temp; no aliasing exists inside one kernel.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
-    let xt = unsafe { &*(x_ptr as *const NslTensor) };
-    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    let xt = NslTensor::from_ptr_ref(x_ptr);
+    let gt = NslTensor::from_ptr_ref(grad_ptr);
     assert!(
         (xt.dtype == 0 || xt.dtype == 1) && (gt.dtype == 0 || gt.dtype == 1),
         "gelu_backward: unsupported dtype (x={}, grad={}); f16/bf16 activation backward is not implemented",
@@ -1496,7 +1496,7 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -1522,7 +1522,7 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -1598,7 +1598,7 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -1624,7 +1624,7 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
-        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(tensor_ptr);
         if t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -1699,7 +1699,7 @@ macro_rules! define_inplace_unary {
     ($name:ident, $op_f32:expr, $op_f64:expr, $ptx:expr, $kernel_name:literal) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn $name(ptr: i64) -> i64 {
-            let t = unsafe { &mut *(ptr as *mut NslTensor) };
+            let t = NslTensor::from_ptr(ptr);
             // GPU path: dispatch to GPU kernel (device memory not CPU-accessible)
             if t.device > 0 {
                 #[cfg(feature = "cuda")]
@@ -1748,7 +1748,7 @@ define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } e
 /// GELU in-place.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
-    let t = unsafe { &mut *(ptr as *mut NslTensor) };
+    let t = NslTensor::from_ptr(ptr);
     // GPU path: dispatch to GPU kernel
     if t.device > 0 {
         #[cfg(feature = "cuda")]
@@ -1785,7 +1785,7 @@ pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
 /// SiLU in-place.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
-    let t = unsafe { &mut *(ptr as *mut NslTensor) };
+    let t = NslTensor::from_ptr(ptr);
     // GPU path: dispatch to GPU kernel
     if t.device > 0 {
         #[cfg(feature = "cuda")]
@@ -1829,8 +1829,8 @@ pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
 /// Unconditional in-place add: left += right.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = unsafe { &*(left_ptr as *const NslTensor) };
-    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let left = NslTensor::from_ptr_ref(left_ptr);
+    let right = NslTensor::from_ptr_ref(right_ptr);
     let len = left.len.min(right.len) as usize;
     if left.dtype == 1 && right.dtype == 1 {
         let ld = left.data as *mut f32;
@@ -1848,8 +1848,8 @@ pub extern "C" fn nsl_tensor_add_inplace_fbip(left_ptr: i64, right_ptr: i64) -> 
 /// Unconditional in-place sub: left -= right.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sub_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = unsafe { &*(left_ptr as *const NslTensor) };
-    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let left = NslTensor::from_ptr_ref(left_ptr);
+    let right = NslTensor::from_ptr_ref(right_ptr);
     let len = left.len.min(right.len) as usize;
     if left.dtype == 1 && right.dtype == 1 {
         let ld = left.data as *mut f32;
@@ -1867,8 +1867,8 @@ pub extern "C" fn nsl_tensor_sub_inplace_fbip(left_ptr: i64, right_ptr: i64) -> 
 /// Unconditional in-place mul: left *= right.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mul_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = unsafe { &*(left_ptr as *const NslTensor) };
-    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let left = NslTensor::from_ptr_ref(left_ptr);
+    let right = NslTensor::from_ptr_ref(right_ptr);
     let len = left.len.min(right.len) as usize;
     if left.dtype == 1 && right.dtype == 1 {
         let ld = left.data as *mut f32;
@@ -1886,8 +1886,8 @@ pub extern "C" fn nsl_tensor_mul_inplace_fbip(left_ptr: i64, right_ptr: i64) -> 
 /// Unconditional in-place div: left /= right.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_div_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = unsafe { &*(left_ptr as *const NslTensor) };
-    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let left = NslTensor::from_ptr_ref(left_ptr);
+    let right = NslTensor::from_ptr_ref(right_ptr);
     let len = left.len.min(right.len) as usize;
     if left.dtype == 1 && right.dtype == 1 {
         let ld = left.data as *mut f32;

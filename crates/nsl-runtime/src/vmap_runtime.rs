@@ -20,7 +20,7 @@ pub extern "C" fn nsl_vmap_check_batch(
     if tensor_ptr == 0 {
         return -1;
     }
-    let tensor = unsafe { &*(tensor_ptr as *const crate::tensor::NslTensor) };
+    let tensor = crate::tensor::NslTensor::from_ptr_ref(tensor_ptr);
     let dim = batch_dim as usize;
     if dim >= tensor.ndim as usize {
         eprintln!(

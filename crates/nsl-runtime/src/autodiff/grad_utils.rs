@@ -272,7 +272,7 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
     // the root of the CPU-f64 gamma-chain smell the add_inplace
     // reconciling front door papered over.
     if orig_ndim < grad_ndim {
-        let res = unsafe { &mut *(result as *mut NslTensor) };
+        let res = NslTensor::from_ptr(result);
         debug_assert!(
             res.is_contiguous(),
             "reduce_grad_for_broadcast: clone/sum output must be contiguous"

@@ -614,9 +614,9 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
     #[cfg(feature = "cuda")]
     {
         let th = NslTensor::from_ptr(theta_ptr);
-        let m = unsafe { &*(m_ptr as *const NslTensor) };
-        let v = unsafe { &*(v_ptr as *const NslTensor) };
-        let mp = unsafe { &*(mp_ptr as *const NslTensor) };
+        let m = NslTensor::from_ptr_ref(m_ptr);
+        let v = NslTensor::from_ptr_ref(v_ptr);
+        let mp = NslTensor::from_ptr_ref(mp_ptr);
         let (dev_bf16, len, param_idx) = {
             let guard = SRBF16_TABLE.lock().unwrap();
             match guard.as_ref().and_then(|g| g.get(&theta_ptr)) {
@@ -916,9 +916,9 @@ fn bf16sr_multi_impl(
                         continue;
                     }
                     let th = NslTensor::from_ptr(tp);
-                    let m = unsafe { &*(mp_ as *const NslTensor) };
-                    let v = unsafe { &*(vp as *const NslTensor) };
-                    let mp = unsafe { &*(ap as *const NslTensor) };
+                    let m = NslTensor::from_ptr_ref(mp_);
+                    let v = NslTensor::from_ptr_ref(vp);
+                    let mp = NslTensor::from_ptr_ref(ap);
                     assert!(
                         m.len as usize == len
                             && v.len as usize == len
@@ -1054,8 +1054,8 @@ pub extern "C" fn nsl_muon_state_sr_store(
     step: i64,
     param_idx: i64,
 ) {
-    let src = unsafe { &*(src_f32_ptr as *const NslTensor) };
-    let dst = unsafe { &*(dst_bf16_ptr as *const NslTensor) };
+    let src = NslTensor::from_ptr_ref(src_f32_ptr);
+    let dst = NslTensor::from_ptr_ref(dst_bf16_ptr);
     assert!(
         src.device == dst.device,
         "[muon-state] SR store device mismatch (src dev={}, dst dev={})",

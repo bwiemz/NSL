@@ -258,10 +258,10 @@ fn try_cuda_launch_fused_lora(
     //    returns `None` and the caller takes the CPU-math path, which is
     //    correct for any dtype.  A hard abort would be a regression against
     //    an opt-in (`NSL_WRGA_FUSED_CUDA=1`) fast path.
-    let xt = unsafe { &*(x as *const NslTensor) };
-    let wt = unsafe { &*(w as *const NslTensor) };
-    let at = unsafe { &*(lora_a as *const NslTensor) };
-    let bt = unsafe { &*(lora_b as *const NslTensor) };
+    let xt = NslTensor::from_ptr_ref(x);
+    let wt = NslTensor::from_ptr_ref(w);
+    let at = NslTensor::from_ptr_ref(lora_a);
+    let bt = NslTensor::from_ptr_ref(lora_b);
     if xt.device == 0 || wt.device == 0 || at.device == 0 || bt.device == 0 {
         eprintln!(
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but inputs not on GPU — \
@@ -405,9 +405,9 @@ fn try_cuda_launch_fused_ia3(
         (entry.ptx.clone(), entry.kernel_name.clone())
     };
 
-    let xt = unsafe { &*(x as *const NslTensor) };
-    let wt = unsafe { &*(w as *const NslTensor) };
-    let gt = unsafe { &*(ia3_scale as *const NslTensor) };
+    let xt = NslTensor::from_ptr_ref(x);
+    let wt = NslTensor::from_ptr_ref(w);
+    let gt = NslTensor::from_ptr_ref(ia3_scale);
     if xt.device == 0 || wt.device == 0 || gt.device == 0 {
         eprintln!(
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but inputs not on GPU — \
@@ -693,11 +693,11 @@ fn try_cuda_launch_fused_gatedlora(
 
     // 2. All inputs must be on GPU.  We do not perform dtype conversion here;
     //    that is a synthesizer concern.
-    let xt = unsafe { &*(x as *const NslTensor) };
-    let wt = unsafe { &*(w as *const NslTensor) };
-    let at = unsafe { &*(lora_a as *const NslTensor) };
-    let bt = unsafe { &*(lora_b as *const NslTensor) };
-    let gat = unsafe { &*(gate as *const NslTensor) };
+    let xt = NslTensor::from_ptr_ref(x);
+    let wt = NslTensor::from_ptr_ref(w);
+    let at = NslTensor::from_ptr_ref(lora_a);
+    let bt = NslTensor::from_ptr_ref(lora_b);
+    let gat = NslTensor::from_ptr_ref(gate);
     if xt.device == 0 || wt.device == 0 || at.device == 0 || bt.device == 0 || gat.device == 0 {
         eprintln!(
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but GatedLoRA inputs not on GPU - \
@@ -932,12 +932,12 @@ mod forward_only_adapter_regression_tests {
     }
 
     fn read_f64(ptr: i64, idx: usize) -> f64 {
-        let t = unsafe { &*(ptr as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(ptr);
         unsafe { *(t.data as *const f64).add(idx) }
     }
 
     fn tensor_len(ptr: i64) -> usize {
-        let t = unsafe { &*(ptr as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(ptr);
         t.len as usize
     }
 

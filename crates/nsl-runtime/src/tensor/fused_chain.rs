@@ -453,10 +453,10 @@ pub extern "C" fn nsl_fused_ew_chain(
 
     #[cfg(feature = "cuda")]
     {
-        let first: &NslTensor = unsafe { &*(inputs[0] as *const NslTensor) };
+        let first: &NslTensor = NslTensor::from_ptr_ref(inputs[0]);
         let mut refs: [&NslTensor; MAX_INPUTS] = [first; MAX_INPUTS];
         for (k, &h) in inputs.iter().enumerate().skip(1) {
-            refs[k] = unsafe { &*(h as *const NslTensor) };
+            refs[k] = NslTensor::from_ptr_ref(h);
         }
         let refs = &refs[..inputs.len()];
         match fast_path_reject_reason(refs, ptx, kname) {
@@ -508,7 +508,7 @@ pub extern "C" fn nsl_tensor_scalar_rhs(x: i64, s: f64, opcode: i64) -> i64 {
          this op is emitted only in the source-AD adjoint and has no tape rule"
     );
     assert!(x != 0, "nsl_tensor_scalar_rhs: null tensor handle");
-    let t = unsafe { &*(x as *const crate::tensor::NslTensor) };
+    let t = crate::tensor::NslTensor::from_ptr_ref(x);
     if t.dtype == crate::tensor::DTYPE_F32 {
         return match opcode as u8 {
             OP_ADD => super::arithmetic::nsl_tensor_add_scalar(x, s, 0),

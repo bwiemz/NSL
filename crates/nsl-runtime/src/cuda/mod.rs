@@ -3445,9 +3445,9 @@ pub(crate) mod cublas_inner {
 /// CPU fallback for a binary elementwise op when GPU allocation fails.
 #[cfg(feature = "cuda")]
 fn cpu_fallback_binary(a_ptr: i64, b_ptr: i64, kernel_name: &str) -> i64 {
-    let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
+    let a = crate::tensor::NslTensor::from_ptr_ref(a_ptr);
     let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
-    let b_cpu = if unsafe { &*(b_ptr as *const crate::tensor::NslTensor) }.device > 0 {
+    let b_cpu = if crate::tensor::NslTensor::from_ptr_ref(b_ptr).device > 0 {
         crate::tensor::nsl_tensor_to_device(b_ptr, 0)
     } else {
         b_ptr
@@ -3506,7 +3506,7 @@ fn gpu_broadcast_shape(a: &crate::tensor::NslTensor, b: &crate::tensor::NslTenso
 
 #[cfg(feature = "cuda")]
 fn gpu_prepare_binary_operand(ptr: i64, out_shape: &[i64]) -> (i64, bool) {
-    let tensor = unsafe { &*(ptr as *const crate::tensor::NslTensor) };
+    let tensor = crate::tensor::NslTensor::from_ptr_ref(ptr);
     let current_shape = tensor_shape_slice(tensor);
     let needs_expand = current_shape != out_shape;
 
@@ -3533,8 +3533,8 @@ fn gpu_prepare_binary_operand(ptr: i64, out_shape: &[i64]) -> (i64, bool) {
 
 #[cfg(feature = "cuda")]
 fn gpu_prepare_binary_operands(a_ptr: i64, b_ptr: i64) -> Option<(i64, i64, bool, bool)> {
-    let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
-    let b = unsafe { &*(b_ptr as *const crate::tensor::NslTensor) };
+    let a = crate::tensor::NslTensor::from_ptr_ref(a_ptr);
+    let b = crate::tensor::NslTensor::from_ptr_ref(b_ptr);
     let out_shape = gpu_broadcast_shape(a, b)?;
     let (a_prepared, free_a) = gpu_prepare_binary_operand(a_ptr, &out_shape);
     let (b_prepared, free_b) = gpu_prepare_binary_operand(b_ptr, &out_shape);
@@ -3595,8 +3595,8 @@ pub(crate) fn assert_gpu_f32(t: &crate::tensor::NslTensor, op: &str, role: &str)
 pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
-    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
     assert_gpu_f32(a, kernel_name, "lhs");
     assert_gpu_f32(b, kernel_name, "rhs");
     if a.len != b.len || !a.is_contiguous() || !b.is_contiguous() {
@@ -3673,7 +3673,7 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
 /// CPU fallback for a unary elementwise op when GPU allocation fails.
 #[cfg(feature = "cuda")]
 fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
-    let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
+    let a = crate::tensor::NslTensor::from_ptr_ref(a_ptr);
     let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
     let op_fn: fn(f64) -> f64 = match kernel_name.trim_end_matches('\0') {
         "nsl_neg_f32" => |x| -x,
@@ -3687,11 +3687,11 @@ fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
         "nsl_tanh_f32" => |x| x.tanh(),
         _ => |x| x,
     };
-    let a_t = unsafe { &*(a_cpu as *const crate::tensor::NslTensor) };
+    let a_t = crate::tensor::NslTensor::from_ptr_ref(a_cpu);
     let n = a_t.len as usize;
     let src = a_t.data as *const f64;
     let result_ptr = crate::tensor::nsl_tensor_zeros_like(a_cpu);
-    let result_t = unsafe { &*(result_ptr as *const crate::tensor::NslTensor) };
+    let result_t = crate::tensor::NslTensor::from_ptr_ref(result_ptr);
     let dst = result_t.data as *mut f64;
     for i in 0..n {
         unsafe { *dst.add(i) = op_fn(*src.add(i)); }
@@ -3708,7 +3708,7 @@ fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
 pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
     assert_gpu_f32(a, kernel_name, "input");
     // The kernels index flat row-major; a zero-copy view (transpose/expand)
     // would be read as if contiguous — same stride-blindness class as the
@@ -3780,7 +3780,7 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
 
     inner::set_oom_context(KERNEL_NAME.trim_end_matches('\0'));
 
-    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     assert!(tensor.device > 0, "gpu_rotate_half_f32 requires a CUDA tensor");
 
     // BEFORE the materialization below, not after. This function's contract is
@@ -3800,7 +3800,7 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
     } else {
         crate::tensor::nsl_tensor_contiguous(tensor_ptr)
     };
-    let contiguous = unsafe { &*(contiguous_ptr as *const NslTensor) };
+    let contiguous = NslTensor::from_ptr_ref(contiguous_ptr);
 
     let ndim = contiguous.ndim as usize;
     assert!(ndim > 0, "nsl: rotate_half requires at least 1 dimension");
@@ -3911,7 +3911,7 @@ pub(crate) fn gpu_rotate_half_neg_f32(tensor_ptr: i64) -> i64 {
 
     inner::set_oom_context(KERNEL_NAME.trim_end_matches('\0'));
 
-    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     assert!(tensor.device > 0, "gpu_rotate_half_neg_f32 requires a CUDA tensor");
 
     // Dtype degrade BEFORE materialization, for the reason documented in
@@ -3926,7 +3926,7 @@ pub(crate) fn gpu_rotate_half_neg_f32(tensor_ptr: i64) -> i64 {
     } else {
         crate::tensor::nsl_tensor_contiguous(tensor_ptr)
     };
-    let contiguous = unsafe { &*(contiguous_ptr as *const NslTensor) };
+    let contiguous = NslTensor::from_ptr_ref(contiguous_ptr);
 
     let ndim = contiguous.ndim as usize;
     assert!(ndim > 0, "nsl: rotate_half_neg requires at least 1 dimension");
@@ -4010,7 +4010,7 @@ pub(crate) fn gpu_rotate_half_neg_f32(tensor_ptr: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_elementwise_unary_inplace(a_ptr: i64, ptx: &str, kernel_name: &str) {
     use crate::tensor::NslTensor;
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
     // The FBIP arms that reach here (`nsl_tensor_relu` and its ~10 siblings in
     // activation.rs) branch on `can_mutate_inplace_gpu()` alone, so the guard
     // in the non-FBIP twin `gpu_elementwise_unary` does not cover them — and
@@ -4043,8 +4043,8 @@ pub(crate) fn gpu_elementwise_unary_inplace(a_ptr: i64, ptx: &str, kernel_name: 
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_elementwise_binary_inplace(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) {
     use crate::tensor::NslTensor;
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
-    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
     assert_eq!(a.len, b.len, "GPU inplace elementwise: length mismatch");
     assert_gpu_f32(a, kernel_name, "destination");
     assert_gpu_f32(b, kernel_name, "rhs");
@@ -4074,7 +4074,7 @@ pub(crate) fn gpu_elementwise_binary_inplace(a_ptr: i64, b_ptr: i64, ptx: &str, 
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &str) {
     use crate::tensor::NslTensor;
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
     assert_gpu_f32(a, kernel_name, "destination");
     let n = a.len as usize;
 
@@ -4158,9 +4158,9 @@ pub(crate) fn gpu_wgrad_accum_f32(
     scale: f32,
 ) {
     use crate::tensor::NslTensor;
-    let m = unsafe { &*(m_ptr as *const NslTensor) };
-    let x = unsafe { &*(x_ptr as *const NslTensor) };
-    let g = unsafe { &*(g_ptr as *const NslTensor) };
+    let m = NslTensor::from_ptr_ref(m_ptr);
+    let x = NslTensor::from_ptr_ref(x_ptr);
+    let g = NslTensor::from_ptr_ref(g_ptr);
     debug_assert_eq!(
         m.len as u64,
         d_in * d_out,
@@ -4221,8 +4221,8 @@ pub(crate) fn gpu_wgrad_accum_f32(
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_scalar_mul_add_inplace_f32(m_ptr: i64, g_ptr: i64, scale: f32) {
     use crate::tensor::NslTensor;
-    let m = unsafe { &*(m_ptr as *const NslTensor) };
-    let g = unsafe { &*(g_ptr as *const NslTensor) };
+    let m = NslTensor::from_ptr_ref(m_ptr);
+    let g = NslTensor::from_ptr_ref(g_ptr);
     let n = m.len as usize;
     debug_assert_eq!(m.len, g.len, "scalar_mul_add_inplace length mismatch");
 
@@ -4264,10 +4264,10 @@ pub(crate) fn gpu_fase_fused_adamw_step(
     if n == 0 {
         return;
     }
-    let th = unsafe { &*(theta_ptr as *const NslTensor) };
-    let m = unsafe { &*(m_ptr as *const NslTensor) };
-    let v = unsafe { &*(v_ptr as *const NslTensor) };
-    let mp = unsafe { &*(mp_ptr as *const NslTensor) };
+    let th = NslTensor::from_ptr_ref(theta_ptr);
+    let m = NslTensor::from_ptr_ref(m_ptr);
+    let v = NslTensor::from_ptr_ref(v_ptr);
+    let mp = NslTensor::from_ptr_ref(mp_ptr);
     gpu_fase_fused_adamw_step_raw(
         th.data as u64, m.data as u64, v.data as u64, mp.data as u64, n,
         b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2, has_wd,
@@ -4817,9 +4817,9 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr(
     if n == 0 {
         return;
     }
-    let m = unsafe { &*(m_ptr as *const NslTensor) };
-    let v = unsafe { &*(v_ptr as *const NslTensor) };
-    let mp = unsafe { &*(mp_ptr as *const NslTensor) };
+    let m = NslTensor::from_ptr_ref(m_ptr);
+    let v = NslTensor::from_ptr_ref(v_ptr);
+    let mp = NslTensor::from_ptr_ref(mp_ptr);
     gpu_fase_fused_adamw_step_bf16sr_raw(
         theta_dev, m.data as u64, v.data as u64, mp.data as u64, n,
         b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2, has_wd,
@@ -5224,8 +5224,8 @@ pub fn test_set_transpose_views(enabled: bool) {
 #[cfg(feature = "cuda")]
 pub(crate) fn matmul_operand_needs_no_copy(a_ptr: i64, b_ptr: i64, is_a: bool) -> bool {
     use crate::tensor::NslTensor;
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
-    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
     let me = if is_a { a } else { b };
 
     if me.is_contiguous() {
@@ -5294,8 +5294,8 @@ pub(crate) fn matmul_operand_needs_no_copy(a_ptr: i64, b_ptr: i64, is_a: bool) -
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context("matmul_f32");
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
-    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
 
     assert!(a.ndim >= 2 && b.ndim >= 2, "matmul requires 2D+ tensors");
 
@@ -5722,7 +5722,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
 pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
     assert_gpu_f32(a, kernel_name, "input");
     // Flat row-major kernel — materialize strided views first (see
     // gpu_elementwise_unary; same stride-blindness class as the
@@ -5787,9 +5787,9 @@ pub(crate) fn gpu_backward_ternary(
 ) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
-    let b = unsafe { &*(b_ptr as *const NslTensor) };
-    let c = unsafe { &*(c_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
+    let c = NslTensor::from_ptr_ref(c_ptr);
     assert_gpu_f32(a, kernel_name, "operand 0");
     assert_gpu_f32(b, kernel_name, "operand 1");
     assert_gpu_f32(c, kernel_name, "operand 2");
@@ -5973,8 +5973,8 @@ pub(crate) fn gpu_fused_ew_launch(
 pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
-    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
     assert_gpu_f32(a, kernel_name, "grad");
     assert_gpu_f32(b, kernel_name, "saved tensor");
     assert_eq!(a.len, b.len, "GPU backward: length mismatch between grad and saved tensors");
@@ -6069,7 +6069,7 @@ pub(crate) fn gpu_silu_backward(grad: i64, input: i64) -> i64 {
 pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     use crate::tensor::NslTensor;
     inner::set_oom_context("clamp_f32");
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
     assert_gpu_f32(a, "clamp_f32", "input");
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4);
@@ -6117,7 +6117,7 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
     use crate::tensor::NslTensor;
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
     assert_gpu_f32(a, "clamp_f32_inplace", "input");
     let n = a.len as usize;
 
@@ -6147,8 +6147,8 @@ pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f32) -> i64 {
     use crate::tensor::NslTensor;
-    let a = unsafe { &*(grad as *const NslTensor) };
-    let b = unsafe { &*(input as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(grad);
+    let b = NslTensor::from_ptr_ref(input);
     assert_gpu_f32(a, "clamp_backward_f32", "grad");
     assert_gpu_f32(b, "clamp_backward_f32", "input");
     assert_eq!(a.len, b.len, "GPU clamp_backward: length mismatch");
@@ -6501,7 +6501,7 @@ pub extern "C" fn nsl_kernel_launch_tensors(
         // reads the argument values synchronously at launch time).
         let mut device_ptrs: Vec<u64> = Vec::with_capacity(n);
         for (i, &handle) in handles.iter().enumerate() {
-            let tensor = unsafe { &*(handle as *const NslTensor) };
+            let tensor = NslTensor::from_ptr_ref(handle);
             // Kernel arguments must be GPU-resident. Passing a CPU tensor here
             // would feed a host pointer to the kernel as a device address and
             // crash with an opaque CUDA_ERROR_ILLEGAL_ADDRESS — refuse loudly
@@ -6557,8 +6557,8 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     inner::set_oom_context("embedding_lookup");
     use crate::tensor::NslTensor;
 
-    let weight = unsafe { &*(weight_ptr as *const NslTensor) };
-    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    let weight = NslTensor::from_ptr_ref(weight_ptr);
+    let indices = NslTensor::from_ptr_ref(indices_ptr);
     // Weight only. `indices` is dtype-dispatched on its own further down
     // (DTYPE_I32 vs the i64 default), so it is deliberately not routed
     // through the f32 guard.
@@ -6581,11 +6581,11 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     let indices_on_gpu = if indices.device == 0 {
         crate::tensor::nsl_tensor_to_device(indices_ptr, weight.device as i64)
     } else {
-        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(indices_ptr);
         t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         indices_ptr
     };
-    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+    let indices_gpu = NslTensor::from_ptr_ref(indices_on_gpu);
 
     let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
@@ -6670,8 +6670,8 @@ pub(crate) fn gpu_embedding_backward(
     inner::set_oom_context("embedding_backward");
     use crate::tensor::NslTensor;
 
-    let grad = unsafe { &*(grad_ptr as *const NslTensor) };
-    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    let grad = NslTensor::from_ptr_ref(grad_ptr);
+    let indices = NslTensor::from_ptr_ref(indices_ptr);
     assert_gpu_f32(grad, "embedding_backward", "grad");
 
     // A2 / M46: under deterministic mode, use the per-output-row kernel
@@ -6767,8 +6767,8 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     use fused_kernels::BIAS_ADD_F32_PTX;
 
-    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
-    let bias_ref = unsafe { &*(bias_ptr as *const NslTensor) };
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
+    let bias_ref = NslTensor::from_ptr_ref(bias_ptr);
     assert_gpu_f32(tensor, "bias_add", "input");
 
     let rows = unsafe { *tensor.shape.add(0) } as u64;
@@ -6781,11 +6781,11 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let bias_on_gpu = if bias_ref.device == 0 {
         crate::tensor::nsl_tensor_to_device(bias_ptr, tensor.device as i64)
     } else {
-        let t = unsafe { &mut *(bias_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(bias_ptr);
         t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         bias_ptr
     };
-    let bias_gpu = unsafe { &*(bias_on_gpu as *const NslTensor) };
+    let bias_gpu = NslTensor::from_ptr_ref(bias_on_gpu);
     // Guarded AFTER the transfer, not before: a host-resident bias is
     // legitimately f64 (CPU model params are f64) and
     // `nsl_tensor_to_device` converts f64 -> f32 on the way to the
@@ -7373,12 +7373,12 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
     // read through an explicit dtype match below, so both are deliberately
     // outside the f32 guard.
     assert_gpu_f32(
-        unsafe { &*(logits_ptr as *const NslTensor) },
+        NslTensor::from_ptr_ref(logits_ptr),
         "cross_entropy_backward_f32",
         "logits",
     );
     let sm = gpu_softmax_f32(logits_ptr);
-    let smt = unsafe { &*(sm as *const NslTensor) };
+    let smt = NslTensor::from_ptr_ref(sm);
     let ndim = smt.ndim as usize;
     let cols = unsafe { *smt.shape.add(ndim - 1) } as u32;
     let total = smt.len as u32;
@@ -7394,7 +7394,7 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
         c.get()
     });
 
-    let tgt = unsafe { &*(targets_ptr as *const NslTensor) };
+    let tgt = NslTensor::from_ptr_ref(targets_ptr);
     let tgt_i32: u32 = u32::from(tgt.dtype == crate::tensor::DTYPE_I32);
 
     // K1: valid-target count -> scratch[0] (denom, already max(count,1)).
@@ -7423,7 +7423,7 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
     // grad_output: device f32 scalar -> read in-kernel; host scalar ->
     // folded immediate (a host read of a CPU tensor is free); non-scalar
     // -> 1.0 (CPU-arm semantics).
-    let go = unsafe { &*(grad_out_ptr as *const NslTensor) };
+    let go = NslTensor::from_ptr_ref(grad_out_ptr);
     let (go_mode, gop, go_imm): (u32, u64, f32) = if go.len == 1 {
         if go.device > 0 && go.dtype == 1 {
             (1, go.data as u64, 1.0)
@@ -7494,7 +7494,7 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     use kernels::MUON_SCALE_INV_FROB_F32_PTX;
 
     inner::set_oom_context("muon_frobenius_scale_f32");
-    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let a = NslTensor::from_ptr_ref(a_ptr);
     // Review finding: the kernels index the buffer as f32 — a quantized /
     // custom-dtype tensor (1 byte/elem) reached via the direct builtin
     // would be read len*4 bytes OOB. Refuse anything but f32 loudly (the
@@ -7898,8 +7898,8 @@ pub(crate) fn gpu_det_scatter_add_f32(
     use fused_kernels::DET_SCATTER_ADD_F32_PTX;
 
     let input = NslTensor::from_ptr(input_ptr);
-    let src = unsafe { &*(src_ptr as *const NslTensor) };
-    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    let src = NslTensor::from_ptr_ref(src_ptr);
+    let indices = NslTensor::from_ptr_ref(indices_ptr);
     assert_gpu_f32(input, "det_scatter_add_f32", "destination");
     assert_gpu_f32(src, "det_scatter_add_f32", "source");
 
@@ -7928,11 +7928,11 @@ pub(crate) fn gpu_det_scatter_add_f32(
     let indices_on_gpu = if indices.device == 0 {
         crate::tensor::nsl_tensor_to_device(indices_ptr, input.device as i64)
     } else {
-        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(indices_ptr);
         t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         indices_ptr
     };
-    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+    let indices_gpu = NslTensor::from_ptr_ref(indices_on_gpu);
 
     let mut s_data = src.data as u64;
     let mut i_data = indices_gpu.data as u64;
@@ -8458,8 +8458,8 @@ pub(crate) fn gpu_scatter_add_f32(
     use crate::tensor::NslTensor;
     use fused_kernels::SCATTER_ADD_F32_PTX;
 
-    let src = unsafe { &*(src_ptr as *const NslTensor) };
-    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    let src = NslTensor::from_ptr_ref(src_ptr);
+    let indices = NslTensor::from_ptr_ref(indices_ptr);
     assert_gpu_f32(src, "scatter_add_f32", "source");
 
     let num_indices = unsafe { *indices.shape.add(0) } as u64;
@@ -8477,11 +8477,11 @@ pub(crate) fn gpu_scatter_add_f32(
     let indices_on_gpu = if indices.device == 0 {
         crate::tensor::nsl_tensor_to_device(indices_ptr, src.device as i64)
     } else {
-        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(indices_ptr);
         t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         indices_ptr
     };
-    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+    let indices_gpu = NslTensor::from_ptr_ref(indices_on_gpu);
 
     let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
@@ -8619,7 +8619,7 @@ pub(crate) fn gpu_gather_dim_f32(
     inner::set_oom_context("gather_dim_f32");
     use crate::tensor::NslTensor;
 
-    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let input = NslTensor::from_ptr_ref(input_ptr);
     assert_gpu_f32(input, "gather_dim_f32", "input");
     let out_elems = (outer * inner_size) as usize;
     if out_elems == 0 {
@@ -8675,8 +8675,8 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     use fused_kernels::GATHER_F32_PTX;
 
-    let input = unsafe { &*(input_ptr as *const NslTensor) };
-    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+    let input = NslTensor::from_ptr_ref(input_ptr);
+    let indices = NslTensor::from_ptr_ref(indices_ptr);
     assert_gpu_f32(input, "gather_f32", "input");
 
     let input_rows = unsafe { *input.shape.add(0) } as u64;
@@ -8695,11 +8695,11 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     let indices_on_gpu = if indices.device == 0 {
         crate::tensor::nsl_tensor_to_device(indices_ptr, input.device as i64)
     } else {
-        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(indices_ptr);
         t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         indices_ptr
     };
-    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+    let indices_gpu = NslTensor::from_ptr_ref(indices_on_gpu);
 
     // Build output shape: [num_indices, dim1, dim2, ...]
     let out_ndim = input.ndim;
@@ -8778,8 +8778,8 @@ pub(crate) fn gpu_conv2d_f32(
     use crate::tensor::NslTensor;
     use fused_kernels::CONV2D_F32_PTX;
 
-    let input = unsafe { &*(input_ptr as *const NslTensor) };
-    let weight = unsafe { &*(weight_ptr as *const NslTensor) };
+    let input = NslTensor::from_ptr_ref(input_ptr);
+    let weight = NslTensor::from_ptr_ref(weight_ptr);
     assert_gpu_f32(input, "conv2d_f32", "input");
 
     let n = unsafe { *input.shape.add(0) } as u64;
@@ -8809,11 +8809,11 @@ pub(crate) fn gpu_conv2d_f32(
     let weight_on_gpu = if weight.device == 0 {
         crate::tensor::nsl_tensor_to_device(weight_ptr, input.device as i64)
     } else {
-        let t = unsafe { &mut *(weight_ptr as *mut NslTensor) };
+        let t = NslTensor::from_ptr(weight_ptr);
         t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         weight_ptr
     };
-    let weight_gpu = unsafe { &*(weight_on_gpu as *const NslTensor) };
+    let weight_gpu = NslTensor::from_ptr_ref(weight_on_gpu);
     // weight/bias are guarded AFTER their transfer for the same reason as
     // `gpu_bias_add`: a host-resident parameter is legitimately f64 and
     // `nsl_tensor_to_device` narrows it to f32 in flight, while a 16-bit
@@ -8822,10 +8822,10 @@ pub(crate) fn gpu_conv2d_f32(
 
     // Bias pointer (0 if no bias)
     let bias_data: u64 = if bias_ptr != 0 {
-        let bias = unsafe { &*(bias_ptr as *const NslTensor) };
+        let bias = NslTensor::from_ptr_ref(bias_ptr);
         if bias.device == 0 {
             let bp = crate::tensor::nsl_tensor_to_device(bias_ptr, input.device as i64);
-            let b = unsafe { &*(bp as *const NslTensor) };
+            let b = NslTensor::from_ptr_ref(bp);
             assert_gpu_f32(b, "conv2d_f32", "bias");
             let d = b.data as u64;
             // We leak the bias transfer — acceptable for now
@@ -8901,7 +8901,7 @@ pub(crate) fn gpu_maxpool2d_f32(
     use crate::tensor::NslTensor;
     use fused_kernels::MAXPOOL2D_F32_PTX;
 
-    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let input = NslTensor::from_ptr_ref(input_ptr);
     assert_gpu_f32(input, "maxpool2d_f32", "input");
 
     let n = unsafe { *input.shape.add(0) } as u64;
@@ -8996,7 +8996,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     use crate::tensor::NslTensor;
     use fused_kernels::DROPOUT_F32_PTX;
 
-    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let input = NslTensor::from_ptr_ref(input_ptr);
     assert_gpu_f32(input, "dropout_f32", "input");
     let len = input.len as u64;
     let ndim = input.ndim;
@@ -9069,7 +9069,7 @@ pub(crate) fn gpu_slice_f32(tensor_ptr: i64, dim: usize, start: usize) -> i64 {
     use crate::tensor::NslTensor;
     use fused_kernels::GPU_SLICE_F32_PTX;
 
-    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(tensor_ptr);
     let ndim = t.ndim as usize;
 
     // Compute output shape: same as source but with sliced dim size
@@ -9104,7 +9104,7 @@ pub(crate) fn gpu_slice_f32_with_shape(
     use crate::tensor::NslTensor;
     use fused_kernels::GPU_SLICE_F32_PTX;
 
-    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(tensor_ptr);
     assert_gpu_f32(t, "slice_f32_with_shape", "input");
     let ndim = t.ndim as usize;
 
@@ -9182,7 +9182,7 @@ pub(crate) fn gpu_slice_f32_with_shape(
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    let b = NslTensor::from_ptr_ref(dense_ptr);
     assert_gpu_f32(b, "csr_spmm_f32", "dense operand");
     let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
     let m = sparse.rows as usize;
@@ -9265,7 +9265,7 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    let b = NslTensor::from_ptr_ref(dense_ptr);
     assert_gpu_f32(b, "coo_spmm_f32", "dense operand");
     let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
     let m = sparse.rows as usize;
@@ -9336,7 +9336,7 @@ pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    let x = unsafe { &*(vec_ptr as *const NslTensor) };
+    let x = NslTensor::from_ptr_ref(vec_ptr);
     assert_gpu_f32(x, "csr_spmv_f32", "dense vector");
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
@@ -9412,7 +9412,7 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    let b = NslTensor::from_ptr_ref(dense_ptr);
     assert_gpu_f32(b, "bsr_spmm_f32", "dense operand");
     let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
     let m = sparse.rows as usize;
@@ -9504,7 +9504,7 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    let x = unsafe { &*(vec_ptr as *const NslTensor) };
+    let x = NslTensor::from_ptr_ref(vec_ptr);
     assert_gpu_f32(x, "coo_spmv_f32", "dense vector");
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
@@ -9588,7 +9588,7 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
     use crate::tensor::NslTensor;
     use fused_kernels::CSR_SPMM_F32_PTX;
 
-    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let b = NslTensor::from_ptr_ref(b_ptr);
     assert_gpu_f32(b, "sparse_matmul_csr_f32", "dense operand");
     // B must be 2D: [K, N]
     let last_dim = if b.ndim >= 2 {
@@ -9673,7 +9673,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     use fused_kernels::STRIDED_COPY_F32_PTX;
 
-    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(tensor_ptr);
     assert_gpu_f32(t, "strided_copy_f32", "input");
     let ndim = t.ndim as usize;
     let total = t.len as u64;
@@ -10924,13 +10924,13 @@ DONE:
 
         // Transfer CPU → GPU
         let gpu_tensor = nsl_tensor_to_device(cpu_tensor, 1);
-        let gpu_t = unsafe { &*(gpu_tensor as *const NslTensor) };
+        let gpu_t = NslTensor::from_ptr_ref(gpu_tensor);
         assert_eq!(gpu_t.device, 1);
         assert_eq!(gpu_t.dtype, 1); // f32
 
         // Transfer GPU → CPU
         let cpu_back = nsl_tensor_to_device(gpu_tensor, 0);
-        let cpu_t = unsafe { &*(cpu_back as *const NslTensor) };
+        let cpu_t = NslTensor::from_ptr_ref(cpu_back);
         assert_eq!(cpu_t.device, 0);
         assert_eq!(cpu_t.dtype, 0); // f64
 
@@ -10992,7 +10992,7 @@ DONE:
         // Sync and transfer back
         unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
         let c_cpu = nsl_tensor_to_device(c_gpu, 0);
-        let c = unsafe { &*(c_cpu as *const NslTensor) };
+        let c = NslTensor::from_ptr_ref(c_cpu);
 
         // Expected: [[58, 64], [139, 154]]
         // 1*7+2*9+3*11=58, 1*8+2*10+3*12=64
@@ -11054,7 +11054,7 @@ DONE:
         // Sync and transfer back
         unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
         let c_cpu = nsl_tensor_to_device(c_gpu, 0);
-        let c = unsafe { &*(c_cpu as *const NslTensor) };
+        let c = NslTensor::from_ptr_ref(c_cpu);
 
         let expected = [11.0, 22.0, 33.0, 44.0];
         for i in 0..4 {

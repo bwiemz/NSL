@@ -12,7 +12,7 @@ use super::{NslTensor, nsl_tensor_contiguous, nsl_tensor_free};
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
@@ -76,7 +76,7 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
     {
-        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        let ta = NslTensor::from_ptr_ref(tensor_ptr);
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {

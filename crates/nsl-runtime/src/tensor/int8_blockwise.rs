@@ -140,7 +140,7 @@ pub extern "C" fn nsl_tensor_quant_int8_blockwise(
     if src_ptr == 0 {
         return 0;
     }
-    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(src_ptr);
     assert_eq!(
         t.device, 0,
         "nsl_tensor_quant_int8_blockwise: GPU not supported in v1 (device={})",
@@ -215,7 +215,7 @@ pub extern "C" fn nsl_tensor_dequant_int8_blockwise(src_ptr: i64) -> i64 {
     if src_ptr == 0 {
         return 0;
     }
-    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(src_ptr);
     assert_eq!(
         t.device, 0,
         "nsl_tensor_dequant_int8_blockwise: GPU not supported in v1 (device={})",
@@ -291,7 +291,7 @@ mod tests {
     }
 
     fn read_f32(ptr: i64) -> Vec<f32> {
-        let t = unsafe { &*(ptr as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(ptr);
         let n = t.len as usize;
         let s = unsafe { std::slice::from_raw_parts(t.data as *const f32, n) };
         s.to_vec()
@@ -376,7 +376,7 @@ mod tests {
     fn dtype_and_len_set_on_output() {
         let src = make_f32(&vec![0.5f32; 32]);
         let qt = nsl_tensor_quant_int8_blockwise(src, 0);
-        let t = unsafe { &*(qt as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(qt);
         assert_eq!(t.dtype, DTYPE_INT8);
         assert_eq!(t.len, 32);
         nsl_tensor_free(src);

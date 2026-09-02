@@ -387,11 +387,12 @@ fn check_hint_extents(
 /// alone. There is no shape to compare against at that boundary, which is
 /// precisely why a wrong hint reaches the hardware. Reinterpreting one of
 /// those addresses as an `NslTensor` reads device memory as a host struct:
-/// tried, and it killed the CORRECT run too — silently, because
-/// `NslTensor::from_ptr`'s magic check is a `debug_assert!` and CI and
-/// production both ship release builds. Hence the explicit `TENSOR_MAGIC`
-/// check here: passing a data pointer where a handle belongs is one careless
-/// edit away at the call sites, and it must diagnose rather than corrupt.
+/// tried, and it killed the CORRECT run too — silently, back when
+/// `NslTensor::from_ptr`'s magic check was a `debug_assert!` and CI and
+/// production both ship release builds. `from_ptr` checks in every profile
+/// now, but the explicit `TENSOR_MAGIC` check stays here because this site
+/// wants its own diagnostic: it can say *which* operand was handed a data
+/// pointer instead of a handle, which the generic abort cannot.
 ///
 /// So the pin belongs at the lowering, where `x_t` and `w_t` are still tensor
 /// values — the same place and shape of guard as
@@ -429,9 +430,10 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
             eprintln!("{site}: null {what} tensor");
             std::process::abort();
         }
-        // NOT `NslTensor::from_ptr`: its magic check is a `debug_assert!`,
-        // so in the release builds we ship it would silently reinterpret a
-        // device data pointer as a host struct instead of diagnosing.
+        // NOT `NslTensor::from_ptr_ref`: that would abort with the generic
+        // handle diagnostic, and this site can name the operand and tell the
+        // caller they passed `nsl_tensor_data_ptr`'s result instead of the
+        // tensor — which is the mistake that actually happens here.
         let t = unsafe { &*(ptr as *const crate::tensor::NslTensor) };
         if t.magic != crate::tensor::TENSOR_MAGIC {
             eprintln!(

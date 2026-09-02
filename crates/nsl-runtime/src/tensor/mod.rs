@@ -201,6 +201,53 @@ pub const TENSOR_MAGIC: u32 = 0x4E534C54;
 /// Poison value written into the magic field when a tensor is freed.
 pub const TENSOR_FREED: u32 = 0x0000DEAD;
 
+/// Why [`NslTensor::check_handle`] rejected a handle.
+enum BadHandle {
+    /// The handle is 0.
+    Null,
+    /// The handle cannot name an `NslTensor` whatever memory holds: it is in
+    /// the first page, or it is not 8-aligned (the struct's first pointer
+    /// field forces 8). Reported before the magic is read, because reading
+    /// it at such an address is what would fault.
+    Implausible,
+    /// The handle addresses readable memory whose first word is not the live
+    /// magic.
+    Magic(u32),
+}
+
+/// Fatal path of [`NslTensor::from_ptr`] and [`NslTensor::from_ptr_ref`].
+/// Out of line so the check itself stays a load and a branch at every one of
+/// the ~1180 call sites.
+///
+/// Aborts rather than panics: the callers are `extern "C"` frames a panic
+/// cannot unwind through (it would abort anyway, after a second backtrace),
+/// and abort is what the neighbouring null-handle checks (`nsl_tensor_clone`)
+/// and `assert.rs` do. `RUST_BACKTRACE=1` adds the Rust backtrace, which is
+/// the fastest way to find the op that was handed the stale handle.
+#[cold]
+#[inline(never)]
+fn bad_handle(ptr: i64, why: BadHandle) -> ! {
+    use std::io::Write;
+    let what = match why {
+        BadHandle::Null => "null handle".to_string(),
+        BadHandle::Implausible => {
+            "not an address a tensor can live at (first page, or not 8-aligned)".to_string()
+        }
+        BadHandle::Magic(TENSOR_FREED) => {
+            "use-after-free: this tensor was already freed".to_string()
+        }
+        BadHandle::Magic(m) => {
+            format!("not a tensor (magic 0x{m:08X}, expected 0x{TENSOR_MAGIC:08X})")
+        }
+    };
+    eprintln!("nsl: invalid tensor handle 0x{ptr:X}: {what}");
+    if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| v != "0") {
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
+    let _ = std::io::stderr().flush();
+    std::process::abort();
+}
+
 #[repr(C)]
 pub struct NslTensor {
     pub(crate) magic: u32,          // MUST be first — 0x4E534C54 ("NSLT") when live, 0x0000DEAD after free
@@ -489,22 +536,60 @@ impl NslTensor {
         }
     }
 
-    /// Returns `true` if this tensor has the expected live magic marker.
+    /// Turn a handle that compiled code (or another runtime op) passed in
+    /// back into the tensor it names.
+    ///
+    /// The magic check is a real check, in release builds too. Every
+    /// `extern "C"` tensor op is an entry point for a handle the compiler
+    /// cannot type-check, and a stale or wrong-type handle used to be silent
+    /// UB outside debug builds; now it is one load-and-compare of a field the
+    /// op is about to read anyway, and a fatal diagnostic that says which
+    /// handle and whether it was a freed tensor (the free path poisons the
+    /// magic with `TENSOR_FREED`) or never a tensor at all.
+    ///
+    /// The magic is read through the raw pointer, so no reference to the
+    /// struct exists until the handle has passed.
     #[inline]
-    #[allow(dead_code)] // intentional API for future safety assertions and debugging
-    pub(crate) fn is_valid(&self) -> bool {
-        self.magic == TENSOR_MAGIC
+    pub(crate) fn from_ptr(ptr: i64) -> &'static mut NslTensor {
+        Self::check_handle(ptr);
+        unsafe { &mut *(ptr as *mut NslTensor) }
     }
 
-    pub(crate) fn from_ptr(ptr: i64) -> &'static mut NslTensor {
-        let t = unsafe { &mut *(ptr as *mut NslTensor) };
-        debug_assert!(
-            t.magic == TENSOR_MAGIC,
-            "NslTensor::from_ptr: bad magic 0x{:08X} at ptr 0x{:X} — possible use-after-free or invalid pointer",
-            t.magic,
-            ptr
-        );
-        t
+    /// Shared-reference twin of [`from_ptr`](Self::from_ptr) for the ops that
+    /// only read the tensor. Same check; replaces the bare
+    /// `unsafe { &*(ptr as *const NslTensor) }` that used to skip it.
+    #[inline]
+    pub(crate) fn from_ptr_ref(ptr: i64) -> &'static NslTensor {
+        Self::check_handle(ptr);
+        unsafe { &*(ptr as *const NslTensor) }
+    }
+
+    /// Null, plausibility, then magic — in that order, because each step is
+    /// what makes the next one's memory access defined.
+    ///
+    /// The plausibility test is the same pair `nsl_tensor_free_if_valid` and
+    /// `nsl_tensor_clone_if_valid` apply before their own raw magic probes:
+    /// below the first page nothing can be mapped, and an `NslTensor` begins
+    /// with `u32` + `*mut c_void`, so its address is always 8-aligned. A
+    /// handle failing either is not a tensor whatever the memory says, and
+    /// reading a `u32` there is exactly what would fault — turning the
+    /// diagnostic this exists to print into a bare SIGSEGV. It cannot rule
+    /// out every unmapped address (nothing short of a syscall can), but it
+    /// covers the shape a mis-read scalar field actually takes.
+    #[inline]
+    fn check_handle(ptr: i64) {
+        if ptr == 0 {
+            bad_handle(ptr, BadHandle::Null);
+        }
+        if (ptr as u64) < 0x10000 || !(ptr as usize).is_multiple_of(8) {
+            bad_handle(ptr, BadHandle::Implausible);
+        }
+        // `magic` is the first field of a `#[repr(C)]` struct, so it sits at
+        // offset 0 of the allocation the handle names.
+        let magic = unsafe { (ptr as *const u32).read() };
+        if magic != TENSOR_MAGIC {
+            bad_handle(ptr, BadHandle::Magic(magic));
+        }
     }
 
     /// Finalize a boxed tensor: convert to raw pointer, register with scope, return i64.
@@ -1202,7 +1287,6 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         eprintln!("nsl: clone called on null tensor");
         std::process::abort();
     }
-    debug_assert!(NslTensor::from_ptr(tensor_ptr).is_valid(), "nsl_tensor_clone: invalid tensor");
     // Note: clone always allocates to maintain memory accounting invariants.
     // (FBIP for clone is Phase 2 — requires codegen-level ownership tracking.)
     // Ensure we clone from contiguous data so non-contiguous views are handled correctly
@@ -1403,7 +1487,10 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                 checked_free(strides_ptr as *mut u8, shape_size);
             }
             crate::fp8::remove_fp8_scale(tensor_ptr);
-            // Poison magic before drop so use-after-free is caught by from_ptr debug_assert.
+            // Poison the magic before the drop so a use-after-free is caught
+            // by `from_ptr`'s check — and reported as a use-after-free rather
+            // than as "not a tensor", for as long as the allocator leaves the
+            // freed chunk's first word alone.
             (*(tensor_ptr as *mut NslTensor)).magic = TENSOR_FREED;
             drop(Box::from_raw(tensor_ptr as *mut NslTensor));
         }
@@ -1513,15 +1600,17 @@ pub extern "C" fn nsl_tensor_clone_if_valid(ptr: i64) -> i64 {
 /// `2026-05-17-pca-rope-activation-design.md`).
 ///
 /// Returns 0 when `tensor_ptr == 0` (matches the runtime's null-passthrough
-/// convention used at other FFI entry points). Returns whatever raw value
-/// the `data` field holds otherwise — no validation, same risk class as
-/// `csha_tensor_data_ptr`.
+/// convention used at other FFI entry points). Any other handle must name a
+/// live tensor: handing this the `data` pointer of a tensor rather than the
+/// tensor itself used to return that pointer's first 8 bytes as if they were
+/// a device address, which is the mistake `fused_linear_ce.rs`'s own probe
+/// was written to diagnose.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_data_ptr(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
     }
-    unsafe { (*(tensor_ptr as *const NslTensor)).data as i64 }
+    NslTensor::from_ptr_ref(tensor_ptr).data as i64
 }
 
 /// BF16 matmul cast cache: an in-place write that bypasses the device-write
@@ -3687,6 +3776,11 @@ pub extern "C" fn nsl_tensor_conv2d(
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc_zeroed(out_len * elem_size);
 
+    // Resolved once, not once per output pixel: the handle cannot change
+    // inside the loop nest, and `from_ptr` is a real check now rather than
+    // the release no-op a `debug_assert!` compiled to.
+    let bias_ref = if bias_ptr != 0 { Some(NslTensor::from_ptr_ref(bias_ptr)) } else { None };
+
     for ni in 0..n {
         for co in 0..c_out {
             for oh in 0..h_out {
@@ -3705,8 +3799,7 @@ pub extern "C" fn nsl_tensor_conv2d(
                             }
                         }
                     }
-                    if bias_ptr != 0 {
-                        let bias = NslTensor::from_ptr(bias_ptr);
+                    if let Some(bias) = bias_ref {
                         let bv = if bias.dtype == 1 { unsafe { *bias.data_f32().add(co) as f64 } }
                                  else { unsafe { *bias.data_f64().add(co) } };
                         val += bv;
@@ -3964,12 +4057,11 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 /// Transfer a tensor to a different device.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i64 {
-    debug_assert!(NslTensor::from_ptr(tensor_ptr).is_valid(), "nsl_tensor_to_device: invalid tensor");
-    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(tensor_ptr);
     let target = target_device as u8;
 
     if t.device == target {
-        let t_mut = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        let t_mut = NslTensor::from_ptr(tensor_ptr);
         t_mut.refcount.fetch_add(1, Ordering::SeqCst);
         return tensor_ptr;
     }
@@ -4023,7 +4115,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     } else {
         nsl_tensor_contiguous(tensor_ptr)
     };
-    let transfer_src = unsafe { &*(transfer_src_ptr as *const NslTensor) };
+    let transfer_src = NslTensor::from_ptr_ref(transfer_src_ptr);
 
     #[allow(unused_variables)]
     let len = transfer_src.len as usize;
@@ -4205,7 +4297,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
 /// gradients with GPU-resident m_partial buffers before in-place accumulation.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
-    let r = unsafe { &*(ref_ptr as *const NslTensor) };
+    let r = NslTensor::from_ptr_ref(ref_ptr);
     nsl_tensor_to_device(src_ptr, r.device as i64)
 }
 
@@ -4641,7 +4733,7 @@ fn clone_shape(src: *mut i64, ndim: usize) -> *mut i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i64) -> i64 {
     let target_dtype_id = target_dtype_id as u16;
-    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     let registry = get_registry();
 
     let info = match registry.get(&target_dtype_id) {
@@ -4732,7 +4824,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
-    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
 
     if tensor.dtype < DTYPE_CUSTOM_START {
         return tensor_ptr;
@@ -4811,7 +4903,7 @@ pub fn test_build_tensor_2d_f32(rows: usize, cols: usize, data: &[f32]) -> i64 {
     crate::list::nsl_list_push(shape, cols as i64);
     let ptr = nsl_tensor_zeros(shape);
 
-    let t = unsafe { &*(ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(ptr);
     let buf = t.data as *mut f32;
     for (i, &v) in data.iter().enumerate() {
         unsafe { *buf.add(i) = v };
@@ -4822,7 +4914,7 @@ pub fn test_build_tensor_2d_f32(rows: usize, cols: usize, data: &[f32]) -> i64 {
 
 #[cfg(feature = "test-hooks")]
 pub fn test_read_tensor_f32(ptr: i64) -> Vec<f32> {
-    let t = unsafe { &*(ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(ptr);
     assert_eq!(t.dtype, 1, "expected f32 tensor (dtype=1), got dtype={}", t.dtype);
     let len = t.len as usize;
     let buf = t.data as *const f32;
@@ -4831,7 +4923,7 @@ pub fn test_read_tensor_f32(ptr: i64) -> Vec<f32> {
 
 #[cfg(feature = "test-hooks")]
 pub fn test_read_tensor_f64(ptr: i64) -> Vec<f64> {
-    let t = unsafe { &*(ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(ptr);
     assert_eq!(t.dtype, 0, "expected f64 tensor (dtype=0), got dtype={}", t.dtype);
     let len = t.len as usize;
     let buf = t.data as *const f64;
@@ -4846,7 +4938,7 @@ pub fn test_read_tensor_f64(ptr: i64) -> Vec<f64> {
 /// `tape_id` field as-is — `0` means "untracked".
 #[cfg(feature = "test-hooks")]
 pub fn test_tensor_tape_id(ptr: i64) -> i64 {
-    let t = unsafe { &*(ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(ptr);
     t.tape_id
 }
 

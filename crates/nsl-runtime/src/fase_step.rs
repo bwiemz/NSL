@@ -112,7 +112,7 @@ pub extern "C" fn nsl_fase_sum_sq_list(mp_list: i64) -> f64 {
     {
         let uniform_gpu_f32 = ptrs.iter().all(|&p| {
             p != 0 && {
-                let t = unsafe { &*(p as *const NslTensor) };
+                let t = NslTensor::from_ptr_ref(p);
                 t.device > 0 && t.dtype == 1 && t.is_contiguous()
             }
         });
@@ -149,10 +149,10 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
     bc1_inv: f64,
     bc2_inv: f64,
 ) {
-    let th = unsafe { &*(theta_ptr as *const NslTensor) };
-    let m = unsafe { &*(m_ptr as *const NslTensor) };
-    let v = unsafe { &*(v_ptr as *const NslTensor) };
-    let mp = unsafe { &*(mp_ptr as *const NslTensor) };
+    let th = NslTensor::from_ptr_ref(theta_ptr);
+    let m = NslTensor::from_ptr_ref(m_ptr);
+    let v = NslTensor::from_ptr_ref(v_ptr);
+    let mp = NslTensor::from_ptr_ref(mp_ptr);
 
     let n = th.len;
     assert!(
@@ -519,10 +519,10 @@ fn fase_multi_impl(
         );
         #[cfg(feature = "cuda")]
         {
-            let th = unsafe { &*(tp as *const NslTensor) };
-            let m = unsafe { &*(mp_ as *const NslTensor) };
-            let v = unsafe { &*(vp as *const NslTensor) };
-            let a = unsafe { &*(ap as *const NslTensor) };
+            let th = NslTensor::from_ptr_ref(tp);
+            let m = NslTensor::from_ptr_ref(mp_);
+            let v = NslTensor::from_ptr_ref(vp);
+            let a = NslTensor::from_ptr_ref(ap);
             // BF16 matmul cast cache: BOTH arms below (batched grid and
             // sequential fallback) write theta, so the staleness note happens
             // here, before the arm split. Tied-weight aliases note twice —
