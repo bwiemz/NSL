@@ -3,7 +3,6 @@
 
 // PTX constants are loaded at runtime by name via the CUDA driver API;
 // Rust's dead-code analysis cannot see these usages.
-#![allow(dead_code)]
 
 // ---------------------------------------------------------------------------
 // GPU Embedding Lookup
@@ -1743,6 +1742,8 @@ DX_DONE: ret;\n\
 //
 // Target: sm_80 (Ampere base, compatible with Ada Lovelace sm_89, Hopper sm_90, Blackwell sm_100)
 // ---------------------------------------------------------------------------
+// the PTX for `gpu_scatter_add_f32`, which has no caller either
+#[allow(dead_code)]
 pub(crate) const SCATTER_ADD_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_80\n\

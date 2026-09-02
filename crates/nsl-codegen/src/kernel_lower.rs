@@ -578,17 +578,6 @@ fn lower_expr_typed(
     }
 }
 
-/// Legacy wrapper: lower an expression returning only the VarId.
-/// Used by code that doesn't need the type information.
-#[allow(dead_code)]
-fn lower_expr(
-    lowerer: &mut KernelLowerer,
-    expr: &Expr,
-    interner: &Interner,
-) -> Result<VarId, CodegenError> {
-    Ok(lower_expr_typed(lowerer, expr, interner)?.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -468,7 +468,11 @@ struct ForwardArtifacts {
     saves: nsl_runtime::flash_attention::CshaBackwardActivations,
     // Sizes (so backward knows readback shapes).
     qkv_bytes: i64,
+    // `w_bytes`/`rope_bytes` complete the readback-size record the harness
+    // keeps per buffer; backward sizes its reads off `qkv_bytes` and `d*_bytes`.
+    #[allow(dead_code)]
     w_bytes: i64,
+    #[allow(dead_code)]
     rope_bytes: i64,
     dw_bytes: i64,
     dx_bytes: i64,

@@ -60,6 +60,8 @@ train(model = m, epochs = 1):
         "warning should name the specific unrecognized FFI.\nstderr:\n{stderr}",
     );
 }
+// the tests that shell out to `nsl` are `#[cfg(feature = "cuda")]`
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 /// Path to the `nsl` binary built by `cargo test --workspace`.
 ///
 /// `nsl` lives in the sibling `nsl-cli` crate, so Cargo does not set

@@ -387,6 +387,5 @@ mod tests {
     }
 
     // Suppress unused-import warning on AppliedLayer (used implicitly via apply()).
-    #[allow(dead_code)]
     fn _touch(_: AppliedLayer) {}
 }

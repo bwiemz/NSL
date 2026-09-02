@@ -7896,17 +7896,6 @@ mod tests {
         a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
     }
 
-    #[allow(dead_code)]
-    fn rel_error(a: &[f32], b: &[f32]) -> f32 {
-        let mut max_rel = 0.0f32;
-        for (x, y) in a.iter().zip(b.iter()) {
-            let denom = x.abs().max(y.abs()).max(1e-8);
-            let rel = (x - y).abs() / denom;
-            if rel > max_rel { max_rel = rel; }
-        }
-        max_rel
-    }
-
     #[test]
     fn test_flash_backward_matches_naive_non_causal() {
         let batch = 1;

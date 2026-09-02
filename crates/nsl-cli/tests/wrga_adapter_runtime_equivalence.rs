@@ -303,6 +303,8 @@ print(y)
 // Kept separate from BUILD4_SRC because the non-ignored build_4* tests
 // must continue to exercise the CPU-fallback path on machines without
 // a CUDA device.
+// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const BUILD4_SRC_GPU: &str = r#"from nsl.nn.losses import mse_loss
 
 model Toy:
@@ -652,6 +654,8 @@ fn build_4_fused_real_launch() {
 // Proves γ is read from HBM and applied via broadcast-multiply.  If
 // Fixture A passes but B fails (y still = 8), γ is being ignored.
 
+// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const IA3_FIXTURE_A_SRC: &str = r#"from nsl.nn.losses import mse_loss
 
 model Toy:
@@ -675,6 +679,8 @@ let y = m.forward(x)
 print(y)
 "#;
 
+// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const IA3_FIXTURE_B_SRC: &str = r#"from nsl.nn.losses import mse_loss
 
 model Toy:
@@ -760,6 +766,8 @@ fn ia3_fixture_b_gamma_scaling() {
 // adapter delta (x@A@B = 16), sigmoid gate folded at the correct value (0.5),
 // and scale=1.0 applied.  Tolerance 1e-4.
 
+// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const GATEDLORA_FIXTURE_A_SRC: &str = r#"from nsl.nn.losses import mse_loss
 
 model Toy:
@@ -859,6 +867,8 @@ fn gatedlora_fixture_a_baseline() {
     run_gatedlora_fixture(GATEDLORA_FIXTURE_A_SRC, 16.0, 1e-4, "gatedlora_fixture_a");
 }
 
+// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 /// Fixture B — positive saturation. alpha=2, rank=2, scale=1.0.
 /// Same model/x as Fixture A; gate = full([8], 30.0).  sigmoid(30) ≈ 1.0
 /// exactly in fp32 (ex2.approx(-30 * log2e) = ex2.approx(-43.3) → 2^-43
@@ -895,6 +905,8 @@ fn gatedlora_fixture_b_positive_saturation() {
     run_gatedlora_fixture(GATEDLORA_FIXTURE_B_SRC, 24.0, 1e-4, "fixture_b");
 }
 
+// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 /// Fixture C — negative saturation. alpha=2, rank=2, scale=1.0.
 /// gate = full([8], -30.0).  sigmoid(-30) ≈ 0.0 exactly (ex2.approx(+43)
 /// overflows in the denominator; 1/huge ≈ 0.0 in fp32).
@@ -936,6 +948,8 @@ fn gatedlora_fixture_c_negative_saturation() {
     run_gatedlora_fixture(GATEDLORA_FIXTURE_C_SRC, 8.0, 1e-4, "fixture_c");
 }
 
+// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 /// Fixture D — mid-range sigmoid curve validation.
 /// alpha=2, rank=2, scale=1.0.  gate = full([8], 1.0f) exact f32.
 /// sigmoid(1.0) ≈ 0.7310586.  y[i,j] = 8 + 0.7310586 * 16 * 1.0 ≈ 19.697 per element.
@@ -992,6 +1006,8 @@ let y = m.forward(x)
 print(y)
 "#;
 
+// reference activation for the `#[cfg(feature = "cuda")]` gated-LoRA checks
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn sigmoid_f64(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }

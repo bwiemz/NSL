@@ -7,6 +7,9 @@ pub struct PackingFixture {
     pub seq_len: u32,
     pub doc_lengths: Vec<u32>,
     pub doc_offsets: Vec<u32>,
+    /// Part of the fixture tuple the spec pins; the current consumers assert
+    /// on `seq_len`, `doc_lengths` and `doc_offsets`.
+    #[allow(dead_code)]
     pub padding_locs: Vec<u32>,
 }
 

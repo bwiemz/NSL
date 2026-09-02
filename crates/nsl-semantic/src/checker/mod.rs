@@ -24,6 +24,10 @@ use nsl_lexer::Interner;
 const DTYPE_CUSTOM_START: u16 = 256;
 
 /// Semantic metadata for a user-defined `datatype` block.
+// Parsed out of a `datatype` block and held for the codegen side, which
+// reads the same facts off the AST today. Kept so the checker's view of a
+// custom dtype stays complete rather than shrinking to what one consumer
+// happens to need.
 #[allow(dead_code)]
 struct CustomDtypeSemanticInfo {
     dtype_id: u16,

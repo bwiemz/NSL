@@ -18,9 +18,11 @@ use std::sync::Mutex;
 const NVIDIA_VENDOR_ID: u16 = 0x10DE;
 
 /// PCI configuration space access port (x86).
-#[allow(dead_code)]
+// PCI config-space access is bare-metal only
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 const PCI_CONFIG_ADDR: u16 = 0xCF8;
-#[allow(dead_code)]
+// PCI config-space access is bare-metal only
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 /// A discovered PCI device.

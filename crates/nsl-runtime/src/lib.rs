@@ -101,6 +101,7 @@ pub use cuda::{
     nsl_test_cuda_jit_log,
 };
 #[doc(hidden)]
+#[cfg(feature = "cuda")]
 pub use cuda::strided_copy::nsl_test_strided_copy_arm_launches;
 
 // CFTP v7 follow-on (findings 3/11/13): expose the runtime-embedded PTX
@@ -135,6 +136,7 @@ pub use fused_kl_ce::{nsl_fused_kl_ce_backward, nsl_fused_kl_ce_forward};
 // tests in `tests/tier_b1_prepass_gpu.rs`; the orchestration FFI uses
 // them internally via `cuda::tier_b1_prepass::launch_*`).
 #[doc(hidden)]
+#[cfg(feature = "cuda")]
 pub use cuda::tier_b1_prepass::{
     CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
 };

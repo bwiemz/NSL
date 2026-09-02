@@ -1410,9 +1410,8 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
     ptx.push_str("    @%p13 bra CSHA_PROJECTION_END;\n");
 
     // Emit MMA temporary registers (laneid, row indices, addr scratch).
-    // `emit_mma_temp_registers` is `#[allow(dead_code)]` so calling it here
-    // both gives us the standard MMA scaffolding and removes the dead-code
-    // annotation's need in future commits.
+    // This call is what keeps `emit_mma_temp_registers` live; it used to
+    // carry `#[allow(dead_code)]` for the window before this caller existed.
     emit_mma_temp_registers(ptx);
 
     // Projection-weight SMEM slot starts right after the Q-tile slot.
@@ -2699,7 +2698,6 @@ fn emit_rope_cache_write_entry(ptx: &mut String, head_dim: i64, rope_style: Rope
 ///
 /// Each destination register holds two f16 values packed into a 32-bit word.
 /// `src_f32` names are f32 register names (even count), `dst_b32` are .b32 output names (half count).
-#[allow(dead_code)]
 fn emit_f32_to_f16_pack(ptx: &mut String, src_f32: &[String], dst_b32: &[String]) {
     assert_eq!(
         src_f32.len(),
@@ -2725,8 +2723,8 @@ fn emit_f32_to_f16_pack(ptx: &mut String, src_f32: &[String], dst_b32: &[String]
 // PTX m16n8k16 spec compliance. The dead local copies still emitted the
 // broken single-row-fixed-col-pattern AND the `mad.lo.u32` form that
 // causes CUDA_ERROR_INVALID_PTX on PTX ISA 7.0 (see MEMORY.md). Keeping
-// them as `#[allow(dead_code)]` was a latent landmine: any future
-// reader copying the pattern would inherit both bugs.
+// them alive behind an `#[allow(dead_code)]` was a latent landmine: any
+// future reader copying the pattern would inherit both bugs.
 //
 // The three `#[cfg(test)]` tests that exercised them
 // (`test_load_a_fragment_emission`, `test_load_b_fragment_emission`,
@@ -2746,7 +2744,9 @@ fn emit_f32_to_f16_pack(ptx: &mut String, src_f32: &[String], dst_b32: &[String]
 ///
 /// Output: S accumulators in `%acc_s_{nt}_{r}` registers for the current m-tile.
 /// The caller must consume S (softmax + P@V) before advancing to the next m-tile.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_qk_matmul_mma(
     ptx: &mut String,
     _block_q: usize,
@@ -2890,7 +2890,9 @@ fn emit_qk_matmul_mma(
 /// V is in shared memory at shmem_k_offset (reuses K's region).
 ///
 /// Accumulates into O registers: O += P @ V for the current m-tile.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_pv_matmul_mma(ptx: &mut String, block_kv: usize, head_dim: usize, shmem_k_offset: usize) {
     let n_tiles_o = head_dim / MMA_N;
     let k_iters = block_kv / MMA_K; // k-dim for P@V is block_kv
@@ -3005,7 +3007,9 @@ fn emit_pv_matmul_mma(ptx: &mut String, block_kv: usize, head_dim: usize, shmem_
 }
 
 /// Emit MMA-specific register declarations for the Q@K^T and P@V paths.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_mma_qk_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
     let n_tiles_s = block_kv / MMA_N;
     let n_tiles_o = head_dim / MMA_N;
@@ -3068,7 +3072,9 @@ pub fn swizzle_smem_offset(row: usize, col_bytes: usize) -> usize {
 /// Produces PTX that transforms a linear byte offset into a swizzled offset
 /// before storing to shared memory. Used when loading Q/K/V tiles from global
 /// to shared memory to ensure bank-conflict-free MMA fragment loads.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_smem_swizzle_store(ptx: &mut String) {
     ptx.push_str("    // XOR swizzle for bank-conflict-free shared memory\n");
     ptx.push_str("    // Input: %smem_linear_off (linear byte offset)\n");
@@ -3099,7 +3105,9 @@ fn emit_smem_swizzle_store(ptx: &mut String) {
 ///   3. Rescale existing O accumulators by exp(old_max - new_max)
 ///   4. Compute P = exp(S - new_max), accumulate row_sum
 ///   5. Warp shuffle to compute per-row global sum
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_mma_online_softmax(ptx: &mut String, block_kv: usize, head_dim: usize) {
     let n_tiles_s = block_kv / MMA_N;
     let n_tiles_o = head_dim / MMA_N;
@@ -3185,7 +3193,9 @@ fn emit_mma_online_softmax(ptx: &mut String, block_kv: usize, head_dim: usize) {
 }
 
 /// Emit register declarations for the MMA online softmax path.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_mma_softmax_registers(ptx: &mut String) {
     ptx.push_str("    // MMA softmax registers\n");
     ptx.push_str("    .reg .f32 %mma_row_max, %mma_row_sum;\n");
@@ -3198,7 +3208,9 @@ fn emit_mma_softmax_registers(ptx: &mut String) {
 }
 
 /// Emit register declarations for shared memory swizzle temporaries.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_smem_swizzle_registers(ptx: &mut String) {
     ptx.push_str("    .reg .u32 %smem_linear_off, %smem_swiz_off;\n");
     ptx.push_str("    .reg .u32 %smem_bank, %smem_row_bits, %smem_bank_lo, %smem_swiz;\n");
@@ -3207,9 +3219,17 @@ fn emit_smem_swizzle_registers(ptx: &mut String) {
 // ── wgmma.mma_async PTX emission helpers (sm_90+ / Hopper) ──────────
 
 /// wgmma tile dimensions: m64n64k16 for f16, m64n64k32 for fp8.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 const WGMMA_M: usize = 64;
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 const WGMMA_N: usize = 64;
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 const WGMMA_K_F16: usize = 16;
 
 /// Emit PTX for a wgmma shared memory matrix descriptor.
@@ -3222,7 +3242,9 @@ const WGMMA_K_F16: usize = 16;
 /// `smem_base_expr`: PTX expression for the base address of the tile in shared memory.
 /// `leading_dim_bytes`: stride in bytes between rows (must be 128-byte aligned for wgmma).
 /// `swizzle_mode`: 0=none, 1=32B, 2=64B, 3=128B (128B required for peak performance).
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_wgmma_smem_descriptor(
     ptx: &mut String,
     desc_reg: &str,
@@ -3288,7 +3310,9 @@ fn emit_wgmma_smem_descriptor(
 /// Both A (Q) and B (K^T) are read from shared memory via descriptors.
 /// The async execution allows overlapping softmax scalar math between
 /// commit_group and wait_group.
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_qk_matmul_wgmma(
     ptx: &mut String,
     _block_q: usize,
@@ -3383,7 +3407,9 @@ fn emit_qk_matmul_wgmma(
 ///
 /// P (softmax output) must be staged to shared memory first since wgmma
 /// requires shared memory inputs (unlike mma.sync which can use registers).
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_pv_matmul_wgmma(
     ptx: &mut String,
     block_kv: usize,
@@ -3439,7 +3465,9 @@ fn emit_pv_matmul_wgmma(
 }
 
 /// Emit wgmma register declarations (descriptor registers, accumulators).
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 fn emit_wgmma_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
     use std::fmt::Write;
 
@@ -3472,7 +3500,6 @@ fn emit_wgmma_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
 /// Emit MMA register declarations needed by the fragment load and MMA helpers.
 /// These are shared temporaries — the actual accumulator registers are declared
 /// separately based on the tiling configuration.
-#[allow(dead_code)]
 fn emit_mma_temp_registers(ptx: &mut String) {
     ptx.push_str("    // MMA temporary registers\n");
     ptx.push_str("    .reg .f16 %mma_h0, %mma_h1;       // f32->f16 conversion temps\n");

@@ -154,7 +154,7 @@ impl Fp8Format {
 // `emit_fp8_matmul_ptx` and `emit_fp8_matmul_ptx_wgmma` lived here — ~340
 // lines emitting `mma.sync.aligned.m16n8k32...e4m3` / wgmma PTX under a
 // `.target sm_90` preamble. Deleted: `compile_fp8_matmul` had no caller
-// outside this file, both emitters were already `#[allow(dead_code)]`, the
+// outside this file, both emitters were already dead, the
 // PTX was never assembled by ptxas let alone launched, and every test was a
 // `.contains()` check on the emitted string. Reinstate from git history if
 // an FP8 tensor-core path is ever actually wired up; note it targets sm_90,

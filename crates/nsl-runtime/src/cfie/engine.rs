@@ -91,7 +91,6 @@ struct EngineState {
     pool_base: u64,
     /// Recorded for diagnostics/symmetry with the slot allocator's
     /// attach record; `free_managed` only needs the base.
-    #[allow(dead_code)]
     pool_bytes: u64,
     /// Device addresses (as `usize`) of every weight buffer uploaded via
     /// `nsl_cfie_upload_weight_f16` / `_f32`.  Engine-owned, freed by
@@ -128,7 +127,6 @@ struct EngineState {
     draft_pool_base: u64,
     /// Recorded for diagnostics/symmetry with `pool_bytes`; the frees
     /// only need the base.
-    #[allow(dead_code)]
     draft_pool_bytes: u64,
 }
 

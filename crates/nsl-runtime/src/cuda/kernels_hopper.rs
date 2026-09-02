@@ -2,7 +2,6 @@
 //! Uses wgmma.mma_async, TMA (cp.async.bulk.tensor), setmaxnreg, and mbarrier.
 //! Required: PTX ISA 8.4, target sm_90a.
 
-#![allow(dead_code)]
 
 /// PTX header for Hopper kernels.
 pub(crate) const HOPPER_PTX_HEADER: &str = "\
@@ -256,8 +255,12 @@ pub(crate) struct FA3Config {
     pub head_dim: usize,
     pub seq_len: usize,
     pub batch_heads: usize,
+    // `causal` and `scale` are carried in the Hopper launch descriptor for
+    // parity with the sm_80 path; the wgmma launcher does not consult them yet.
+    #[allow(dead_code)]
     pub causal: bool,
     pub fp8: bool,
+    #[allow(dead_code)]
     pub scale: f32,
 }
 

@@ -138,9 +138,13 @@ pub extern "C" fn nsl_fused_adapter_gpu_launch_count_atexit() {
 /// Entry recorded by `nsl_wrga_register_fused_ptx`.  `ptx` is a
 /// null-terminated PTX source string; `kernel_name` is the entry symbol
 /// to pass to `cuModuleGetFunction` (as null-terminated bytes).
-#[allow(dead_code)] // fields read only on cfg(feature = "cuda")
+// Fields read only on `cfg(feature = "cuda")`.
 struct FusedPtxEntry {
+    // read only when the CUDA loader compiles the adapter
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     ptx: String,
+    // read by the CUDA loader when it compiles the adapter
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     kernel_name: String,
 }
 

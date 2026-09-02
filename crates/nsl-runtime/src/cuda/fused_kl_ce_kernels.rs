@@ -5,7 +5,6 @@
 //! through the public FFI in `crates/nsl-runtime/src/fused_kl_ce.rs`, so
 //! this crate never depends on nsl-codegen.
 
-#![allow(dead_code)]
 
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;

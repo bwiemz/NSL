@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 // ---------------------------------------------------------------------------
 
 /// COM1 I/O port base address.
-#[allow(dead_code)]
+// the serial-console I/O is bare-metal only
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 const COM1_PORT: u16 = 0x3F8;
 
 /// Write a byte to the serial console (COM1).

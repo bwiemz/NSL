@@ -1685,7 +1685,6 @@ mod tests {
 mod sprint1_cycle2_cos_sin_field_present {
     use super::*;
     use cranelift_codegen::ir::Value;
-    #[allow(dead_code)]
     fn _ensure_fields_exist(s: &CshaSavePointers) {
         // If these fields don't exist, this won't compile.
         let _: Value = s.cos;

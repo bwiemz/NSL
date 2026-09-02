@@ -17,6 +17,10 @@
 //! Per spec §5.2 (per-variant SASS baselines) and §6.3.1 (institutional
 //! baseline pattern).
 
+// A shared `tests/` helper module: several snapshot suites include it and each
+// uses a different subset, so a helper unused by THIS binary is normal.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::process::Command;
 

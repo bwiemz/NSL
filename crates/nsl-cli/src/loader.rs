@@ -15,7 +15,9 @@ use nsl_ast::expr::ExprKind;
 use crate::resolver;
 
 /// Data for a single parsed and analyzed module.
-#[allow(dead_code)] // Fields reserved for future tooling (LSP, debugger, etc.)
+// Reserved for the tooling that reads a loaded module (LSP, debugger).
+// The loader fills them in because that is when the information exists.
+#[allow(dead_code)]
 pub struct ModuleData {
     pub path: PathBuf,
     pub ast: Module,
@@ -84,7 +86,13 @@ pub struct ModuleGraph {
 #[derive(Clone)]
 enum ImportInfo {
     From(FromImportStmt),
-    Alias { #[allow(dead_code)] stmt: ImportStmt, alias: Symbol },
+    Alias {
+        // Carried so an alias import keeps its originating statement for
+        // future diagnostics; resolution uses the alias alone.
+        #[allow(dead_code)]
+        stmt: ImportStmt,
+        alias: Symbol,
+    },
 }
 
 /// Scan a module's AST for import statements and resolve them to file paths.

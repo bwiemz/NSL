@@ -1111,6 +1111,10 @@ fn launch_pca_ex(
 // ===========================================================================
 
 /// CPU adjacent-pair RoPE for a single [seq_len, head_dim] Q matrix.
+// Kept as the readable statement of the theta formula the GPU kernel has to
+// match; the assertions in this file compare against
+// `pca_rope_numerical::cpu_reference_rope_single_doc` instead.
+#[allow(dead_code)]
 /// Mirrors the theta formula in pca_rope_numerical::cpu_reference_rope_single_doc.
 fn cpu_rope_adjacent_pairs(q: &[f32], seq_len: usize, head_dim: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; q.len()];

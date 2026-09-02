@@ -79,6 +79,9 @@ fn band_of(name: &str) -> Option<Band> {
     None
 }
 
+// carried through the calibration record for the report writer, which
+// formats `fixture`/`pos`/`band` today
+#[allow(dead_code)]
 struct TensorRecord {
     fixture: String,
     name: String,
@@ -377,10 +380,15 @@ fn geomean(xs: &[f64]) -> f64 {
 }
 
 struct BandStats {
+    // Recorded per band; the emitted report quotes the geomean rather than
+    // the extremes and the count.
+    #[allow(dead_code)]
     min: f64,
+    #[allow(dead_code)]
     max: f64,
-    #[allow(dead_code)] // surfaced in diagnostic later
+    // surfaced in diagnostic later
     geomean: f64,
+    #[allow(dead_code)]
     n: usize,
 }
 

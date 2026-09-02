@@ -36,7 +36,6 @@ fn supports_flat_value_dtype(dtype: u16) -> bool {
 // ---------------------------------------------------------------------------
 
 // Fields are reserved for future use (parallelism, memory-pinning, etc.)
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct DataLoaderConfig {
     batch_size: usize,
@@ -44,6 +43,10 @@ struct DataLoaderConfig {
     shuffle: bool,
     num_workers: usize,
     prefetch: usize,
+    // Parsed from the loader config and not yet acted on — see the note above
+    // the struct. Dropping it would silently accept `pin_memory` in a config
+    // file and lose it.
+    #[allow(dead_code)]
     pin_memory: bool,
     drop_last: bool,
     packing: bool,

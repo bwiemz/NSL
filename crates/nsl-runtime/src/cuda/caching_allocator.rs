@@ -120,6 +120,8 @@ pub struct SurfaceCounters {
     pub at_global_peak_bytes: usize,
 }
 
+// the pooled-block state the allocator does not enter yet
+#[allow(dead_code)]
 /// The mechanism by which a device VRAM allocation was obtained. Every
 /// device allocation — pooled block, stream-ordered async, or direct
 /// `cuMemAlloc_v2` region — carries one so the memory report and peak
@@ -330,6 +332,11 @@ pub struct AllocStats {
 pub(crate) trait DriverAlloc {
     fn alloc(&self, size: usize) -> Result<*mut c_void, ()>;
     fn free(&self, ptr: *mut c_void);
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     fn memset_zero(&self, ptr: *mut c_void, size: usize);
 }
 
@@ -1142,6 +1149,11 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.clone()
     }
 
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     /// Check if a pointer is managed by this allocator.
     pub(crate) fn is_allocated(&self, ptr: *mut c_void) -> bool {
         self.allocated_blocks.contains_key(&(ptr as usize))

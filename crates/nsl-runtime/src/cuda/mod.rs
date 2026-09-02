@@ -5,13 +5,28 @@
 use std::ffi::c_void;
 // AtomicI64 and Ordering used by inner module functions when cuda feature is enabled
 
+// Hand-written PTX and its launch helpers. Nothing outside a CUDA build can
+// reach any of it, so these are gated like their siblings below rather than
+// compiled into every build and silenced with a module-wide
+// `#![allow(dead_code)]`.
+#[cfg(feature = "cuda")]
 pub(crate) mod kernels;
+#[cfg(feature = "cuda")]
 pub(crate) mod fused_kernels;
+#[cfg(feature = "cuda")]
 pub(crate) mod fused_ce_kernels;
+#[cfg(feature = "cuda")]
 pub(crate) mod fused_kl_ce_kernels;
+#[cfg(feature = "cuda")]
 pub(crate) mod kernels_hopper;
+// NOT gated: `precision_cast_ptx_runtime_parity` compares these constants
+// against codegen's emitter as pure text and must run on a machine with no
+// GPU, so this module has to exist in a non-CUDA build. Its two launch
+// helpers are gated individually instead.
 pub(crate) mod precision_cast_kernels;
+#[cfg(feature = "cuda")]
 pub(crate) mod strided_copy;
+#[cfg(feature = "cuda")]
 pub(crate) mod tier_b1_prepass;
 
 #[cfg(feature = "cuda")]
@@ -60,7 +75,6 @@ pub(crate) mod inner {
 
     struct CudaState {
         device: CUdevice,
-        #[allow(dead_code)]
         context: CUcontext,
         // Keyed by FNV-1a hash of PTX content so different PTX Vecs at the
         // same address (heap reuse between sequential test calls) don't
@@ -84,6 +98,11 @@ pub(crate) mod inner {
 
     static CUDA_SYNC_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     pub fn set_cuda_sync_mode(enabled: bool) {
         CUDA_SYNC_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
@@ -647,6 +666,11 @@ pub(crate) mod inner {
         }
     }
 
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     pub(crate) fn is_cuda_alloc(ptr: *mut c_void) -> bool {
         if ptr.is_null() { return false; }
         CUDA_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
@@ -741,6 +765,11 @@ pub(crate) mod inner {
     static ASYNC_ALLOC_SET: std::sync::LazyLock<std::sync::Mutex<HashSet<usize>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     /// Allocate device memory asynchronously on the default stream.
     /// Falls back to synchronous allocation (with OOM recovery) on failure.
     pub(crate) fn alloc_async(size_bytes: usize) -> *mut c_void {
@@ -1437,6 +1466,11 @@ pub(crate) mod inner {
         }
     }
 
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     /// Async HtoD on the per-thread transfer stream (P0.2 item 3; the HtoD
     /// prefetch consumer is a deferred follow-up — no production caller
     /// yet). `src_host` should be pinned for true async DMA. NULL-stream
@@ -1452,7 +1486,6 @@ pub(crate) mod inner {
     /// memory on the non-blocking transfer stream — a future caller must
     /// only target buffers that were never freed-and-recycled with pending
     /// NULL-stream readers, or must drain before reuse.
-    #[allow(dead_code)]
     pub(crate) fn memcpy_htod_async(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
         // BF16 cast cache: an addressed device write into a registered
         // parameter stales its image — this transport probe is what covers
@@ -1610,6 +1643,11 @@ pub(crate) mod inner {
         }
     }
 
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     /// P4 item 14: watchdog-bounded synchronization of the calling thread's
     /// COMPUTE stream. Polls `cuStreamQuery` until the stream drains or
     /// `timeout_secs` elapses — the per-collective watchdog for NCCL ops
@@ -1774,6 +1812,11 @@ pub(crate) mod inner {
         unsafe { cuEventCreate(event as *mut CUevent, 0) }; // CU_EVENT_DEFAULT = 0
     }
 
+    // no caller anywhere in the CUDA build. Kept rather than deleted here:
+    // `dead_code = "deny"` is what made it visible at all, and the CUDA
+    // lane compiles but does not run on CI, so removal wants someone who can
+    // exercise the GPU suite. Deletion candidate.
+    #[allow(dead_code)]
     pub unsafe fn cu_event_record(event: u64, stream: *mut std::ffi::c_void) {
         unsafe { cuEventRecord(event as CUevent, stream as CUstream) };
     }
@@ -8454,6 +8497,11 @@ pub(crate) fn gpu_rmsnorm_dx_backward_f32(
 // GPU Scatter-Add (embedding backward / index-based gradient accumulation)
 // ---------------------------------------------------------------------------
 
+// no caller anywhere in the CUDA build. Kept rather than deleted here:
+// `dead_code = "deny"` is what made it visible at all, and the CUDA
+// lane compiles but does not run on CI, so removal wants someone who can
+// exercise the GPU suite. Deletion candidate.
+#[allow(dead_code)]
 /// GPU scatter_add: out[indices[i], j] += src[i, j] for all (i, j).
 /// Uses atomicAdd for thread safety (multiple indices may alias the same row).
 /// `out` must be pre-zeroed. Both src and indices must be on GPU.
@@ -9071,6 +9119,11 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
 // GPU Slice (native on-device slicing, no CPU round-trip)
 // ---------------------------------------------------------------------------
 
+// no caller anywhere in the CUDA build. Kept rather than deleted here:
+// `dead_code = "deny"` is what made it visible at all, and the CUDA
+// lane compiles but does not run on CI, so removal wants someone who can
+// exercise the GPU suite. Deletion candidate.
+#[allow(dead_code)]
 /// GPU slice: extracts a contiguous sub-range along one dimension without
 /// transferring to CPU. Replaces the GPU→CPU→slice→CPU→GPU round-trip.
 #[cfg(feature = "cuda")]
@@ -9581,6 +9634,11 @@ pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
 // GPU CSR Sparse MatMul (M52c: weight-aware sparse kernel)
 // ---------------------------------------------------------------------------
 
+// no caller anywhere in the CUDA build. Kept rather than deleted here:
+// `dead_code = "deny"` is what made it visible at all, and the CUDA
+// lane compiles but does not run on CI, so removal wants someone who can
+// exercise the GPU suite. Deletion candidate.
+#[allow(dead_code)]
 /// CSR SpMM: C[M,N] = A_sparse[M,K] @ B_dense[K,N]
 /// CSR arrays (row_ptrs, col_indices, values) are host pointers — uploaded to device.
 /// B is a device tensor pointer. Returns a new dense tensor C.

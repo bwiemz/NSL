@@ -3,7 +3,6 @@
 
 // PTX constants are loaded at runtime by name via the CUDA driver API;
 // Rust's dead-code analysis cannot see these usages.
-#![allow(dead_code)]
 
 // --- Binary ops ---
 

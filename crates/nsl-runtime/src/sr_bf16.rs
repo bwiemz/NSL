@@ -254,6 +254,9 @@ mod no_cuda {
     }
     // register's redirect lives inside weight_stream's cfg(cuda) block, so
     // this arm is unreachable-by-construction — kept for API symmetry.
+    // The enclosing module is already `cfg(not(feature = "cuda"))`, so this
+    // is unconditional: kept for API symmetry with the cuda arm, per the
+    // note above.
     #[allow(dead_code)]
     pub(crate) fn srbf16_register(_: i64) { refuse("register") }
     pub(crate) fn srbf16_upload(_: i64) { refuse("upload") }

@@ -35,12 +35,6 @@ pub(crate) fn accumulate_grad(grads: &mut HashMap<i64, i64>, key: i64, grad_tens
     }
 }
 
-/// Create a tensor with the given shape, filled with zeros (f64, dtype=0).
-#[allow(dead_code)]
-pub(crate) fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
-    create_tensor_with_shape_dtype(shape, fill, 0)
-}
-
 /// Create a tensor with the given shape, filled with `fill`, and a specified dtype.
 pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u16) -> i64 {
     use crate::memory::checked_alloc_zeroed;

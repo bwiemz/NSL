@@ -459,9 +459,9 @@ fn emit_2d_max_abs_loop(
 // Task 22 (scaffolding wire-up) will call this from the scaffolding loop body
 // to perform the per-batch |g·w| reduction per (target, projection).
 // Task 21 implemented WggoGradientHook::emit_per_step and unit-tested the
-// iteration logic; Task 22 threads weight-data pointers in and removes the
-// allow(dead_code) suppression below.
-#[allow(dead_code)]
+// iteration logic; Task 22 threads weight-data pointers in. (The
+// `allow(dead_code)` this note used to promise Task 22 would remove is
+// already gone — the function has a live caller.)
 pub(crate) fn emit_per_head_dot_abs_accum(
     b: &mut FunctionBuilder,
     grad_arena_base: cranelift_codegen::ir::Value,

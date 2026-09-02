@@ -97,7 +97,9 @@ pub(crate) fn tensor_from_shape_list_f16(shape_list: i64, fill: f64) -> i64 {
 
 /// Helper: create a tensor from a shape list, filling data with a given value (f64, dtype=0).
 /// Used for operations that explicitly require double precision.
-#[allow(dead_code)]
+// exercised only by `tensor/mod.rs`'s own unit tests; `#[cfg(test)]` code
+// does not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tensor_from_shape_list_f64(shape_list: i64, fill: f64) -> i64 {
     let list = NslList::from_ptr(shape_list);
     let ndim = list.len;

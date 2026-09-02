@@ -37,7 +37,6 @@
 //! hooks at the bottom of this file.  Any future drift (mnemonic swap,
 //! `.version` bump, reg-decl reorder, blank-line shift) trips that test.
 
-#![allow(dead_code)]
 
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
@@ -53,6 +52,8 @@ pub(crate) const KNAME_FP16_TO_F32: &str = "nsl_cast_fp16_to_f32\0";
 
 /// Block dim every cast kernel launches with. Pinned by codegen
 /// (`CAST_BLOCK_DIM_X = 256`).
+// used by the CUDA-gated cast launcher
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const CAST_BLOCK_DIM_X: u32 = 256;
 
 // ─── Embedded PTX (must be byte-identical to codegen output) ──────────────
@@ -302,6 +303,9 @@ pub fn __test_runtime_kernel_names() -> [&'static str; 4] {
 ///
 /// `src_dtype` / `target_dtype` use `crate::tensor::DTYPE_*` constants
 /// (F32=1, FP16=2, BF16=3).
+// Called from `tensor/precision_cast.rs`'s cuda-gated dispatch and from the
+// unit tests here — dead only when neither applies.
+#[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
 pub(crate) fn pick_cast_kernel(src_dtype: u16, target_dtype: u16) -> Option<(&'static str, &'static str)> {
     use crate::tensor::{DTYPE_BF16, DTYPE_F32, DTYPE_FP16};
     match (src_dtype, target_dtype) {

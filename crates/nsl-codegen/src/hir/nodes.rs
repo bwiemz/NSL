@@ -362,7 +362,9 @@ impl Register {
     /// lowering-completeness tests (spec §3.3 Pin 2). Pattern 1 / IR-009:
     /// HIR can represent alternate dialects; v1 public API only constructs
     /// the codegen default. This constructor documents the extension point.
-    #[allow(dead_code)]
+    // exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+    // not silence the lint in the plain lib build
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new_active_low_for_test(width: usize, d: SignalRef) -> Self {
         use crate::hir::clock_reset::*;
         use crate::hir::ids::*;
@@ -379,7 +381,8 @@ impl Register {
     }
 
     /// pub(crate) — async active-high test-only constructor.
-    #[allow(dead_code)]
+    // constructors used only by this crate's own unit tests
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new_async_for_test(width: usize, d: SignalRef) -> Self {
         use crate::hir::clock_reset::*;
         use crate::hir::ids::*;
@@ -395,8 +398,9 @@ impl Register {
         }
     }
 
+    // constructors used only by this crate's own unit tests
+    #[cfg_attr(not(test), allow(dead_code))]
     /// pub(crate) — async active-low test-only constructor.
-    #[allow(dead_code)]
     pub(crate) fn new_async_active_low_for_test(width: usize, d: SignalRef) -> Self {
         use crate::hir::clock_reset::*;
         use crate::hir::ids::*;
@@ -412,8 +416,9 @@ impl Register {
         }
     }
 
+    // constructors used only by this crate's own unit tests
+    #[cfg_attr(not(test), allow(dead_code))]
     /// pub(crate) — alternate clock domain test-only constructor.
-    #[allow(dead_code)]
     pub(crate) fn new_with_clock_domain_for_test(
         width: usize, d: SignalRef, domain: crate::hir::ids::ClockDomainId,
     ) -> Self {

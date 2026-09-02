@@ -455,6 +455,9 @@ impl Compiler<'_> {
     /// ELTLS commit 3: the sole caller (the retain/release dance in binary_ops)
     /// has been deleted. Task 13 will revive this helper to drive the relinquish
     /// flag bytes on tensor binary FFIs.
+    // ELTLS commit 3 deleted the sole caller (the retain/release dance in
+    // binary_ops). Task 13 revives this helper to drive the relinquish flag
+    // bytes on tensor binary FFIs.
     #[allow(dead_code)]
     pub(crate) fn should_elide_refcount_for_ident(
         state: &FuncState,
