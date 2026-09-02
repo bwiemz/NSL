@@ -95,6 +95,7 @@ pub mod schema_convert;
 pub mod standalone;
 pub mod stdlib_loader;
 pub mod stmt;
+pub mod stmt_csla;
 pub mod stmt_fase;
 pub mod types;
 pub mod use_count;
@@ -294,8 +295,8 @@ pub mod core {
     pub use crate::{
         agent, builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
         error, expr, ffi_ownership, func, grammar_compiler, linker, ownership,
-        ownership_expr, schema_convert, standalone, stdlib_loader, stmt, stmt_fase,
-        types, use_count,
+        ownership_expr, schema_convert, standalone, stdlib_loader, stmt, stmt_csla,
+        stmt_fase, types, use_count,
     };
 }
 

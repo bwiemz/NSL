@@ -112,12 +112,12 @@ impl Compiler<'_> {
                     // A1: model weights are allocated on the device here, OUTSIDE
                     // the train block's surface brackets, so without this they
                     // land in `other`. Tag the whole (recursive) transfer as
-                    // Weights (surface tag 1 = caching_allocator::SurfaceTag::
-                    // Weights), restoring the caller's surface after (get/set is
+                    // Weights, restoring the caller's surface after (get/set is
                     // nesting-safe). Harmless for `.to(cpu)` — no device allocs.
                     let surface_prev =
                         self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
-                    let surface_weights = builder.ins().iconst(cl_types::I8, 1);
+                    let surface_weights =
+                        builder.ins().iconst(cl_types::I8, crate::stmt::SURFACE_WEIGHTS);
                     self.compile_call_by_name(
                         builder,
                         "nsl_gpu_set_alloc_surface",
