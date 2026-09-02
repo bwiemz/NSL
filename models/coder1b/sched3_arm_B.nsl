@@ -104,31 +104,10 @@
 #
 # SO: DO NOT COPY THIS lr FOR A SHORT RUN. For any horizon materially shorter
 # than the full epoch, size total_steps to the horizon you will ACTUALLY run,
-# or the run trains at peak throughout.
-#
-# MEASURED 2026-09-02 (SCHEDULE_3ARM_262M_2026_09_02.md). The pair this block
-# called "the unmade measurement" has now been made, three-armed, from the
-# micro-64,000 checkpoint on identical batches:
-#
-#   A  this schedule, unchanged        held-out +0.539/+0.295 WORSE over 131M
-#                                      tokens; slope +1.691 (7.1 sigma) STACK,
-#                                      +0.988 (5.9 sigma) WEB. It reproduces
-#                                      the 1B gate's degradation exactly.
-#   B  same LR at the branch, cosine   ends BETTER than the branch it started
-#      sized to the horizon             from: -0.047/-0.072. Slopes negative.
-#   C  0.5x B pointwise                 -0.075/-0.079; C-B is -0.028/-0.008,
-#                                      WITHIN the local swing (0.027/0.018).
-#
-# THE FIX IS THE SCHEDULE SHAPE, NOT A LOWER RATE. Once the cosine decays,
-# halving the peak buys nothing measurable, so stop searching for the correct
-# held LR -- three attempts (3e-4/1e-4 at item 10, held 3e-5, 1.5e-5) all
-# failed the same way, and every one of them was THIS cosine truncated by a
-# short run. Use arm B's schedule: keep this lr, size total_steps to the run.
-#
-# Second finding, not sought: a held rate makes the trajectory CHAOTIC. Mean
-# adjacent-point swing was 0.135/0.082 on the held arm against 0.027/0.018
-# decayed -- a 4-5x noise reduction. An A/B at this size should decay for
-# MEASUREMENT reasons alone, independent of convergence.
+# or the run trains at peak throughout. The unmade measurement is a matched
+# pair from the micro-64,000 checkpoint: held 1.5e-5 vs a cosine sized for the
+# horizon, identical batches, held-out at the same cadence. Nothing in this
+# file's lr provenance answers it.
 #
 # UNITS (same as the 50M/500M recipes): the scheduler counts MICRO-batches (lr
 # is recomputed every micro-batch; with grad_accumulation=4 the effective
@@ -325,9 +304,9 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
-    optimizer: AdamW(lr=0.000015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.0000045)
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="/home/brandon/Projects/NSL/.claude/worktrees/sched3/campaign-sched3/ckpt_B/state.nslm", checkpoint_save="/home/brandon/Projects/NSL/.claude/worktrees/sched3/campaign-sched3/ckpt_B/state.nslm", checkpoint_every=2000):
+    optimizer: AdamW(lr=4.0274691550751784e-05, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=8192, total_steps=96000, min_lr=4.5000000000000001e-06)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
         let flat_logits = logits.reshape([4096, 49152])
