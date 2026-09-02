@@ -1373,6 +1373,7 @@ dependencies = [
  "nsl-semantic",
  "nsl-test",
  "predicates",
+ "regex",
  "safetensors",
  "serde_json",
  "sha2",

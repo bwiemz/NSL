@@ -61,6 +61,8 @@ sha2 = "0.10"
 assert_cmd = "2"
 predicates = "3"
 criterion.workspace = true
+# fmt_roundtrip: scrubs spans/ids out of the AST Debug form
+regex = "1"
 
 [[bench]]
 name = "frontend"
