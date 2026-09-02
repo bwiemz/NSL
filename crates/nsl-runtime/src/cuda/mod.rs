@@ -2419,8 +2419,17 @@ pub(crate) mod cublas_inner {
         // Same tri-state discipline as NSL_MATMUL_TF32: only the literal "1"
         // engages, only the literal "0" is an (explicit, defensive) opt-out,
         // and anything else falls through so a typo cannot change arithmetic.
-        if std::env::var("NSL_MATMUL_BF16").ok().as_deref() == Some("1") {
-            return CublasMathMode::Bf16;
+        // Item 4: the compiled --matmul-mode wins; the environment variable is
+        // a deprecated fallback inside `matmul_config::config()`. Reading the
+        // env directly here would let a program whose FINGERPRINT says tf32 run
+        // bf16 anyway, which is the exact divergence this work removes.
+        match crate::matmul_config::config().mode {
+            crate::matmul_config::MODE_BF16 => return CublasMathMode::Bf16,
+            // `--matmul-mode f32` means f32 throughout on FP32 CUDA cores,
+            // which this enum spells Fp32Cores (NOT a variant named F32 -- see
+            // its doc comment on why the old `Default` name was a lie).
+            crate::matmul_config::MODE_F32 => return CublasMathMode::Fp32Cores,
+            _ => {}
         }
         match std::env::var("NSL_MATMUL_TF32").ok().as_deref() {
             Some("1") => return CublasMathMode::Tf32,
@@ -2559,10 +2568,7 @@ pub(crate) mod cublas_inner {
     fn bf16_storage_worthwhile(m: i64, n: i64, k: i64, a_elems: usize, b_elems: usize) -> bool {
         static MIN_RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
         let min_ratio = *MIN_RATIO.get_or_init(|| {
-            std::env::var("NSL_MATMUL_BF16_MIN_RATIO")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(512.0)
+            crate::matmul_config::config().min_ratio
         });
         let flops_cells = m as f64 * n as f64 * k as f64;
         let cast_cells = (a_elems + b_elems) as f64;
@@ -2698,7 +2704,10 @@ pub(crate) mod cublas_inner {
     pub(crate) fn bf16_rounding() -> Bf16Rounding {
         static MODE: std::sync::OnceLock<Bf16Rounding> = std::sync::OnceLock::new();
         *MODE.get_or_init(|| {
-            match std::env::var("NSL_MATMUL_BF16_ROUND").ok().as_deref() {
+            // Item 4: driven by --bf16-rounding through the config sink.
+            let sr = crate::matmul_config::config().rounding
+                == crate::matmul_config::ROUND_SR;
+            match if sr { Some("sr") } else { None } {
                 Some("sr") => {
                     eprintln!(
                         "[nsl-matmul] bf16 operand cast: STOCHASTIC rounding \

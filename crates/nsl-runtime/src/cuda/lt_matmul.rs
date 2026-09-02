@@ -144,24 +144,22 @@ static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// once: a typo cannot change which kernels a run measured.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NSL_MATMUL_BF16_LT").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| crate::matmul_config::config().lt)
 }
 
 fn tune_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NSL_MATMUL_BF16_LT_TUNE").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| crate::matmul_config::config().lt_tune)
 }
 
 fn workspace_bytes_configured() -> usize {
     static MIB: OnceLock<usize> = OnceLock::new();
     *MIB.get_or_init(|| {
-        std::env::var("NSL_MATMUL_BF16_LT_WORKSPACE_MIB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64)
-            // Clamp before the shift: an absurd value must degrade to "big",
-            // not wrap to small-or-zero in release.
-            .min(4096)
+        // Item 4: --bf16-lt-workspace-mib through the config sink, which
+        // applies the SAME 4096 clamp so the fingerprint records the effective
+        // value. Still clamped here: a hand-written C host could call
+        // nsl_set_matmul_config directly.
+        (crate::matmul_config::config().lt_workspace_mib as usize).min(4096)
     }) << 20
 }
 

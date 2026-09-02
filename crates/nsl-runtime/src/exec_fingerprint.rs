@@ -46,10 +46,28 @@ static EXEC_FINGERPRINT: Mutex<String> = Mutex::new(String::new());
 const ARITHMETIC_KEYS: &[&str] = &[
     "ad", "det", "dtype", "fusion", "fuse_rms", "fuse_wgrad", "zero", "zero_elem", "ws",
     "muon_bns", "muon_resmom", "lmhead",
+    // The matmul family, promoted from environment variables 2026-09-02.
+    //   mm        bf16 vs tf32 vs f32 operands -- different products.
+    //   mmround   RNE vs SR -- a different cast, and SR re-dithers per launch.
+    //   mmratio   WHICH gemms take the bf16 path at all.
+    //   mmlt      cuBLASLt vs GemmEx -- a different kernel and reduction order.
+    //   mmltws    the workspace cap FILTERS the heuristic's candidates, so it
+    //             selects a different kernel and a different reduction order.
+    //   mmlttune  timed first-use selection: with it on, plan choice depends on
+    //             live machine state and is not reproducible ACROSS PROCESSES.
+    //             It is in this class because it decides whether the other Lt
+    //             keys mean anything, not because it is arithmetic itself.
+    "mm", "mmround", "mmratio", "mmlt", "mmltws", "mmlttune",
 ];
 
 /// Keys that move bytes without changing the value computed.
-const PLACEMENT_KEYS: &[&str] = &["arena", "graphs", "ckpt", "offload"];
+// `mmcache` is here, not in the arithmetic class, because the weight-cast
+// cache is bit-preserving: a hit hands the GEMM the same bf16 image a fresh
+// cast would have produced. That holds by INVARIANT rather than construction
+// (four staleness classes in `cuda/bf16_cast_cache.rs`), and it costs ~2 GiB
+// of pinned VRAM at 1B -- so a resume that flips it ON can OOM where the
+// original run did not. Warn, and say what it costs.
+const PLACEMENT_KEYS: &[&str] = &["arena", "graphs", "ckpt", "offload", "mmcache"];
 
 /// Install the fingerprint. Called from compiled `main()`.
 ///
@@ -138,6 +156,60 @@ pub fn render(diffs: &[FieldDiff]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+
+    #[test]
+    fn matmul_arithmetic_keys_refuse_and_the_cache_key_only_warns() {
+        // The classification IS the feature. Assert both directions: an
+        // arithmetic key must appear in the refusal set and NOT in the warn
+        // set, and the cache key the other way round. A key in neither class
+        // is silently unguarded (the #519 doctrine), which is the failure this
+        // pins against.
+        let base = "mm=tf32,mmround=rne,mmratio=512,mmlt=0,mmltws=64,mmlttune=1,mmcache=0";
+        for (live, key) in [
+            ("mm=bf16,mmround=rne,mmratio=512,mmlt=0,mmltws=64,mmlttune=1,mmcache=0", "mm"),
+            ("mm=tf32,mmround=sr,mmratio=512,mmlt=0,mmltws=64,mmlttune=1,mmcache=0", "mmround"),
+            ("mm=tf32,mmround=rne,mmratio=256,mmlt=0,mmltws=64,mmlttune=1,mmcache=0", "mmratio"),
+            ("mm=tf32,mmround=rne,mmratio=512,mmlt=1,mmltws=64,mmlttune=1,mmcache=0", "mmlt"),
+            ("mm=tf32,mmround=rne,mmratio=512,mmlt=0,mmltws=128,mmlttune=1,mmcache=0", "mmltws"),
+            ("mm=tf32,mmround=rne,mmratio=512,mmlt=0,mmltws=64,mmlttune=0,mmcache=0", "mmlttune"),
+        ] {
+            let a = arithmetic_diff(base, live);
+            assert!(
+                a.iter().any(|d| d.key == key),
+                "{key} must be arithmetic-class (a resume MUST refuse)"
+            );
+            assert!(
+                !placement_diff(base, live).iter().any(|d| d.key == key),
+                "{key} must not be warn-only"
+            );
+        }
+
+        // The cast cache is bit-preserving, so it warns rather than refusing --
+        // but it must still be SEEN, because turning it on costs ~2 GiB of
+        // pinned VRAM at 1B and can OOM a resume that previously fit.
+        let cache_on = "mm=tf32,mmround=rne,mmratio=512,mmlt=0,mmltws=64,mmlttune=1,mmcache=1";
+        assert!(
+            placement_diff(base, cache_on).iter().any(|d| d.key == "mmcache"),
+            "mmcache must be reported as a placement difference"
+        );
+        assert!(
+            !arithmetic_diff(base, cache_on).iter().any(|d| d.key == "mmcache"),
+            "mmcache must NOT abort a resume: it is bit-preserving"
+        );
+    }
+
+    #[test]
+    fn an_old_sidecar_without_the_matmul_keys_is_not_a_mismatch() {
+        // Absent on BOTH sides is the back-compatible case. A sidecar written
+        // before these keys existed must not start refusing resumes.
+        let old = "ad=source,det=0";
+        assert!(arithmetic_diff(old, old).is_empty());
+        // Absent on ONE side IS a difference, and deliberately so: it means the
+        // two builds disagree about whether the key exists.
+        let new_fp = "ad=source,det=0,mm=bf16";
+        assert!(arithmetic_diff(old, new_fp).iter().any(|d| d.key == "mm"));
+    }
     use super::*;
 
     #[test]

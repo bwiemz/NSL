@@ -2941,6 +2941,24 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64],
         Some(types::I64),
     ),
+    // Item 4 (2026-09-02): the matmul arithmetic configuration, promoted from
+    // the NSL_MATMUL_BF16* environment family. Installed before user code, from
+    // the same compile options the execution fingerprint renders -- so the
+    // runtime and the fingerprint cannot disagree about which arithmetic ran.
+    // (mode, rounding, min_ratio, cast_cache, lt, lt_workspace_mib, lt_tune)
+    (
+        "nsl_set_matmul_config",
+        &[
+            types::I64,
+            types::I64,
+            types::F64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     // Item 4 (2026-08-25): the resolved train/optimizer/scheduler record,
     // installed at TRAIN-BLOCK entry (per block, not per program — a module
     // can hold several train blocks). Joins the .optim sidecar as checkpoint
