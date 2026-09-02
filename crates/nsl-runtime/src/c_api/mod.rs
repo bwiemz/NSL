@@ -2149,10 +2149,9 @@ pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
 /// reconstructs the autodiff identity (Spec B per-call grad context).
 pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
     // Null guard, matching the extern-C sibling `nsl_tensor_to_desc_ffi`.
-    // `NslTensor::from_ptr` only checks the magic sentinel under a
-    // `debug_assert!`, which is a NO-OP in the release builds CI and the
-    // shared library ship — so a 0 here dereferenced address 0 on the very
-    // next line and took the host process down.
+    // `NslTensor::from_ptr` refuses a null handle in every profile now, but
+    // it refuses it by aborting; this entry point answers a null with a
+    // null instead, so the test below still needs the guard to be here.
     if tensor_ptr == 0 {
         return;
     }
@@ -2296,10 +2295,10 @@ mod tests {
     /// `nsl_tensor_to_desc` is `pub(crate)`, so this cannot live in
     /// `tests/` alongside the rest of the M62 dtype gates. It re-execs
     /// through the lib test binary instead. The scenario runs in a CHILD
-    /// because the failure mode is a SIGSEGV: `NslTensor::from_ptr` only
-    /// checks the magic sentinel under `debug_assert!`, a NO-OP in the
-    /// release builds CI ships, so the next line reads address 0 and no
-    /// `#[should_panic]` can observe it.
+    /// because the failure mode is fatal either way: without the guard the
+    /// null reaches `NslTensor::from_ptr`, which aborts (it used to read
+    /// address 0 and SIGSEGV), and no `#[should_panic]` can observe
+    /// either.
     #[test]
     #[ignore = "child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref"]
     fn zz_tensor_to_desc_null_child() {

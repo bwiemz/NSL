@@ -1075,8 +1075,8 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
     // NslTensor::from_ptr — that call materializes a `&mut NslTensor`
     // from the raw integer, and forming a reference from a null
     // pointer is instant UB under Rust's reference-creation rules
-    // (the debug_assert! on the magic field reads the struct AFTER
-    // the reference is formed, and is elided in release). v4 is a
+    // (`from_ptr` now checks the handle before forming one, but a
+    // null still has to be answered here rather than aborted). v4 is a
     // public `#[no_mangle] extern "C"` boundary, so direct FFI
     // callers (C ABI, tests, third-party wrappers) can pass 0 here.
     if tokens_ptr == 0 || logits_ptr == 0 {

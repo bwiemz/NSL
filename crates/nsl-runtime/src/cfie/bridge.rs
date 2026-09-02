@@ -129,8 +129,10 @@ pub extern "C" fn nsl_cfie_tensor_to_tokens(tensor_ptr: i64, out_ptr: i64, cap: 
     if tensor_ptr == 0 || cap < 0 {
         return -1;
     }
-    // Raw read + magic check (NOT NslTensor::from_ptr — its debug_assert
-    // would abort a debug build on garbage instead of refusing).
+    // Raw read + magic check, deliberately NOT `NslTensor::from_ptr_ref`:
+    // this entry point's documented contract is to REFUSE a stale or
+    // non-tensor handle with -1, where the accessor would abort. One of the
+    // few places where tolerating a bad handle is the specified behaviour.
     let t = unsafe { &*(tensor_ptr as *const NslTensor) };
     if t.magic != TENSOR_MAGIC {
         return -1;
@@ -268,7 +270,7 @@ mod tests {
         // Bad magic (freed tensor poisons the magic to TENSOR_FREED — a
         // stale pointer must refuse, not read).
         {
-            let t = unsafe { &mut *(tptr as *mut NslTensor) };
+            let t = NslTensor::from_ptr(tptr);
             let live = t.magic;
             t.magic = 0x0000DEAD;
             assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4), -1);
@@ -277,14 +279,14 @@ mod tests {
         // Non-f64 dtype (the encode ABI is f64; refuse f32 rather than
         // silently reinterpret the bytes).
         {
-            let t = unsafe { &mut *(tptr as *mut NslTensor) };
+            let t = NslTensor::from_ptr(tptr);
             t.dtype = 1;
             assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4), -1);
             t.dtype = 0;
         }
         // Non-1-D.
         {
-            let t = unsafe { &mut *(tptr as *mut NslTensor) };
+            let t = NslTensor::from_ptr(tptr);
             t.ndim = 2;
             assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4), -1);
             t.ndim = 1;

@@ -134,7 +134,7 @@ pub fn dequantize_fp8(fp8_value: f64, scale: f64) -> f64 {
 /// result into training arithmetic, so that case refuses loudly instead of
 /// guessing.
 fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
-    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(tensor_ptr);
     if t.dtype != 0 && t.dtype != 1 {
         eprintln!(
             "nsl: {ctx}: unsupported dtype {} — the fp8 host path reads only f32 (1) and f64 (0)",
@@ -160,7 +160,7 @@ fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
         !t.is_contiguous() || (t.ndim == 1 && t.len > 1 && unsafe { *t.strides } != 1);
     if flat_read_unsafe {
         let contig = crate::tensor::nsl_tensor_contiguous(tensor_ptr);
-        let c = unsafe { &*(contig as *const NslTensor) };
+        let c = NslTensor::from_ptr_ref(contig);
         if c.device != 0 {
             let cpu = crate::tensor::nsl_tensor_to_device(contig, 0);
             crate::tensor::nsl_tensor_free(contig);
@@ -183,9 +183,9 @@ fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
 /// on the same device as the input.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -> i64 {
-    let orig_device = unsafe { (*(tensor_ptr as *const NslTensor)).device };
+    let orig_device = NslTensor::from_ptr_ref(tensor_ptr).device;
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_cast");
-    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(src_ptr);
     let len = t.len as usize;
 
     // Read source data as f32 (default runtime dtype)
@@ -246,7 +246,7 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_compute_scale(tensor_ptr: i64, fp8_dtype: i64) -> f64 {
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_compute_scale");
-    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(src_ptr);
     let len = t.len as usize;
     let scale = if t.dtype == 1 {
         let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };

@@ -763,7 +763,7 @@ mod tests {
         let data = vec![1.0f32];
         let (_raw, tensor_ptr) = make_test_tensor_f32(&data, &[1]);
         {
-            let tensor = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+            let tensor = NslTensor::from_ptr(tensor_ptr);
             tensor.device = 1; // pretend CUDA; refused before any data deref
         }
         let err = nsl_tensor_to_dlpack_owned(tensor_ptr).unwrap_err();
@@ -772,7 +772,7 @@ mod tests {
             "the refusal must say WHY: {err}"
         );
         {
-            let tensor = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+            let tensor = NslTensor::from_ptr(tensor_ptr);
             tensor.device = 0;
         }
         crate::tensor::nsl_tensor_free(tensor_ptr);

@@ -258,9 +258,9 @@ fn nsl_tensor_scatter_add_deterministic_cpu(
     let output = crate::tensor::nsl_tensor_clone(input);
     if output == 0 { return 0; }
 
-    let idx_tensor = unsafe { &*(indices as *const crate::tensor::NslTensor) };
-    let src_tensor = unsafe { &*(src as *const crate::tensor::NslTensor) };
-    let out_tensor = unsafe { &mut *(output as *mut crate::tensor::NslTensor) };
+    let idx_tensor = crate::tensor::NslTensor::from_ptr_ref(indices);
+    let src_tensor = crate::tensor::NslTensor::from_ptr_ref(src);
+    let out_tensor = crate::tensor::NslTensor::from_ptr(output);
 
     let n = idx_tensor.len as usize;
     if n == 0 { return output; }

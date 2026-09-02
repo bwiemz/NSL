@@ -258,7 +258,7 @@ pub extern "C" fn nsl_arena_unbind_verify(result_tensor: i64) {
         v
     });
     if placed != 0 && result_tensor != 0 {
-        let t = unsafe { &*(result_tensor as *const crate::tensor::NslTensor) };
+        let t = crate::tensor::NslTensor::from_ptr_ref(result_tensor);
         if t.data as u64 != placed {
             MISPLACED.fetch_add(1, SeqCst);
             static SHOWN: AtomicUsize = AtomicUsize::new(0);

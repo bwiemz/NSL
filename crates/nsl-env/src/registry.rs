@@ -726,6 +726,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Test hook: miscount parameter <idx>'s gradient contributions on purpose (double or drop) so the grad-integrity failing arm is reachable."
     ),
     var!(
+        "NSL_HANDLE_GATE_SCENARIO",
+        Str,
+        "null | poisoned | garbage | freed | valid",
+        "unset (child returns)",
+        Test,
+        Test,
+        "Test harness only: names the bad tensor handle the re-exec'd child passes to a C-ABI op (every value but `valid` is expected to abort)."
+    ),
+    var!(
         "NSL_HOST_PROFILE",
         Bool,
         "1 only",

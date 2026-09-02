@@ -767,7 +767,7 @@ fn resolve_weight(model_handle: i64, name: &str) -> Result<(*const f32, i64), St
     }
     // The tensor lives in this crate; read its fields directly.  Loaded
     // safetensors weights are contiguous host f32.
-    let t = unsafe { &*(tptr as *const crate::tensor::NslTensor) };
+    let t = crate::tensor::NslTensor::from_ptr_ref(tptr);
     if t.data.is_null() || t.len <= 0 {
         return Err(name.to_string());
     }

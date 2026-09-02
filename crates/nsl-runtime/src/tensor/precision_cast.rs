@@ -57,7 +57,7 @@ use super::{
 /// yields a faithful copy. The source tensor is NOT consumed.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
-    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(src_ptr);
     // CFTP v6 Finding 2 (HIGH): the cast reads `t.data` LINEARLY for `len`
     // contiguous elements then overwrites the output strides with
     // `compute_strides(shape)` (always row-major contiguous). A non-contiguous
@@ -379,7 +379,7 @@ fn gpu_cast_and_publish(t: &NslTensor, _target_dtype: u16) -> i64 {
 /// `gpu_cast_and_publish` (which lowers to a PTX cast kernel). CPU tensors
 /// continue to take the host-staged path below — byte-identical to v6.
 fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
-    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(src_ptr);
     // CFTP v6 Finding 2 (HIGH) + Finding 4 (MEDIUM): the contiguity and
     // len/shape invariants are correctness preconditions for BOTH the CPU
     // host-staged path AND the v7 GPU PTX cast — keep them before any
@@ -475,8 +475,8 @@ fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
 /// match. Neither tensor is freed. v1: F32/FP16 only, CPU only.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
-    let dst = unsafe { &*(dst_ptr as *const NslTensor) };
-    let src = unsafe { &*(src_ptr as *const NslTensor) };
+    let dst = NslTensor::from_ptr_ref(dst_ptr);
+    let src = NslTensor::from_ptr_ref(src_ptr);
     // Mixed-device pairs have no meaning in the dequant→step→quant
     // envelope (both live where the parameters live) — refuse loudly.
     assert_eq!(
@@ -588,7 +588,7 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
 /// — a device=1 tensor backed by a host pointer that aborted mid-step.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64 {
-    let t = unsafe { &*(template_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(template_ptr);
     let dtype = dtype as u16;
     if t.device > 0 {
         return gpu_zeros_like_dtype(t, dtype);
@@ -693,8 +693,8 @@ fn zeros_like_dtype_body(t: &NslTensor, dtype: u16) -> i64 {
 /// scope sweep.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_ptr: i64) -> i64 {
-    let src = unsafe { &*(host_src_ptr as *const NslTensor) };
-    let template = unsafe { &*(device_template_ptr as *const NslTensor) };
+    let src = NslTensor::from_ptr_ref(host_src_ptr);
+    let template = NslTensor::from_ptr_ref(device_template_ptr);
     assert!(
         src.is_contiguous(),
         "nsl_tensor_cast_from_host: src must be contiguous (ndim={})",
@@ -783,8 +783,8 @@ pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_p
 /// `nsl_tensor_cast_into` + inline free.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast_to_host_into(host_dst_ptr: i64, device_src_ptr: i64) {
-    let dst = unsafe { &*(host_dst_ptr as *const NslTensor) };
-    let src = unsafe { &*(device_src_ptr as *const NslTensor) };
+    let dst = NslTensor::from_ptr_ref(host_dst_ptr);
+    let src = NslTensor::from_ptr_ref(device_src_ptr);
     assert!(
         dst.is_contiguous(),
         "nsl_tensor_cast_to_host_into: dst must be contiguous (ndim={})",
@@ -884,7 +884,7 @@ pub extern "C" fn nsl_tensor_cast_to_host_into(host_dst_ptr: i64, device_src_ptr
 /// persistent-state lifecycle as both parents.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_like_host_dtype(template_ptr: i64, dtype: i64) -> i64 {
-    let t = unsafe { &*(template_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(template_ptr);
     let dtype = dtype as u16;
     let elem_size: usize = match dtype {
         DTYPE_F32 => 4,
@@ -948,7 +948,7 @@ mod tests {
     }
 
     fn read_f32(ptr: i64) -> Vec<f32> {
-        let t = unsafe { &*(ptr as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(ptr);
         let len = t.len as usize;
         let d = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
         d.to_vec()
@@ -1053,7 +1053,7 @@ mod tests {
         let dst_data_after = unsafe { (*(dst as *const NslTensor)).data };
         assert_eq!(dst_data_before, dst_data_after, "dst buffer must not be reallocated");
 
-        let t = unsafe { &*(dst as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(dst);
         let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
         for (i, &v) in [1.0001_f32, 3.14159, -2.5].iter().enumerate() {
             assert_eq!(bits[i], f32_to_f16_bits(v), "elem {i} not quantized to match the primitive");
@@ -1077,7 +1077,7 @@ mod tests {
     fn zeros_like_dtype_matches_shape_sets_dtype_and_zeroes() {
         let template = f32_tensor(&[5.0, 6.0, 7.0, 8.0]); // shape [4]
         let z = nsl_tensor_zeros_like_dtype(template, DTYPE_FP16 as i64);
-        let t = unsafe { &*(z as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(z);
         assert_eq!(t.len, 4, "len matches template");
         assert_eq!(t.dtype, DTYPE_FP16, "dtype is FP16");
         let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 4) };
@@ -1114,7 +1114,7 @@ mod tests {
         ];
         let src = f32_tensor(&vals);
         let bf16 = nsl_tensor_to_bf16(src);
-        let t = unsafe { &*(bf16 as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(bf16);
         assert_eq!(t.dtype, DTYPE_BF16, "result must be tagged bf16");
         assert_eq!(t.len, vals.len() as i64);
         let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, vals.len()) };
@@ -1200,7 +1200,7 @@ mod tests {
                 );
             }
             // Cast also preserves shape + strides.
-            let t = unsafe { &*(bf16 as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(bf16);
             assert_eq!(t.len as usize, n, "len preserved (n={n})");
             assert_eq!(t.ndim, 1, "ndim preserved (n={n})");
             crate::tensor::nsl_tensor_free(src);
@@ -1260,7 +1260,7 @@ mod tests {
     fn zeros_like_dtype_bf16() {
         let template = f32_tensor(&[5.0, 6.0, 7.0]);
         let z = nsl_tensor_zeros_like_dtype(template, DTYPE_BF16 as i64);
-        let t = unsafe { &*(z as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(z);
         assert_eq!(t.dtype, DTYPE_BF16, "dtype is BF16");
         assert_eq!(t.len, 3);
         let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
@@ -1430,7 +1430,7 @@ mod tests {
         let src = Box::into_raw(t) as i64;
         // Should NOT panic — the contiguous, len==product(shape) input is valid.
         let bf16 = nsl_tensor_to_bf16(src);
-        let t = unsafe { &*(bf16 as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(bf16);
         assert_eq!(t.dtype, DTYPE_BF16);
         assert_eq!(t.len, 4);
         crate::tensor::nsl_tensor_free(src);
@@ -1451,7 +1451,7 @@ mod tests {
         let src = fp16_tensor(&vals);
         let template = f32_tensor(&[0.0; 3]); // CPU placement donor
         let work = nsl_tensor_cast_from_host(src, template);
-        let t = unsafe { &*(work as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(work);
         assert_eq!(t.dtype, DTYPE_F32, "working tensor must be F32");
         assert_eq!(t.device, 0, "CPU template keeps the working tensor on CPU");
         let got = read_f32(work);
@@ -1476,11 +1476,11 @@ mod tests {
         // observable (rc 2 -> 1) rather than an actual free.
         crate::tensor::nsl_tensor_retain(src);
         nsl_tensor_cast_to_host_into(dst, src);
-        let src_rc = unsafe { &*(src as *const NslTensor) }
+        let src_rc = NslTensor::from_ptr_ref(src)
             .refcount
             .load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(src_rc, 1, "cast_to_host_into must CONSUME src (one refcount drop)");
-        let t = unsafe { &*(dst as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(dst);
         let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
         for (i, &v) in [1.0001_f32, 3.14159, -2.5].iter().enumerate() {
             assert_eq!(bits[i], f32_to_f16_bits(v), "elem {i} not quantized to the primitive");
@@ -1496,7 +1496,7 @@ mod tests {
     fn zeros_like_host_dtype_cpu_template_delegates() {
         let template = f32_tensor(&[5.0, 6.0, 7.0]);
         let z = nsl_tensor_zeros_like_host_dtype(template, DTYPE_BF16 as i64);
-        let t = unsafe { &*(z as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(z);
         assert_eq!(t.dtype, DTYPE_BF16, "dtype is BF16");
         assert_eq!(t.device, 0, "host-resident");
         assert_eq!(t.len, 3);
@@ -1525,7 +1525,7 @@ mod tests {
             let cpu = f32_tensor(&[1.0; 8]);
             let gpu_t = crate::tensor::nsl_tensor_to_device(cpu, 1);
             let host_state = crate::tensor::nsl_tensor_zeros_like_host_f32(gpu_t);
-            let t = unsafe { &*(host_state as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(host_state);
             assert_eq!(t.device, 0, "state is host-resident");
             assert_eq!(t.dtype, DTYPE_F32);
             assert!(
@@ -1558,7 +1558,7 @@ mod tests {
             // rc 2 so the consuming free is observable, not destructive.
             crate::tensor::nsl_tensor_retain(dev);
             crate::tensor::nsl_tensor_copy_data_async(host, dev);
-            let rc_before = unsafe { &*(dev as *const NslTensor) }
+            let rc_before = NslTensor::from_ptr_ref(dev)
                 .refcount
                 .load(std::sync::atomic::Ordering::SeqCst);
             assert_eq!(
@@ -1566,7 +1566,7 @@ mod tests {
                 "async path must NOT free the staged tensor before the drain"
             );
             crate::tensor::nsl_offload_drain();
-            let rc_after = unsafe { &*(dev as *const NslTensor) }
+            let rc_after = NslTensor::from_ptr_ref(dev)
                 .refcount
                 .load(std::sync::atomic::Ordering::SeqCst);
             assert_eq!(rc_after, 1, "drain must perform the deferred free");
@@ -1588,7 +1588,7 @@ mod tests {
             let theta = crate::tensor::nsl_tensor_to_device(cpu, 1);
             // Pinned host FP16 state buffer (the P0.3 allocation path).
             let host = nsl_tensor_zeros_like_host_dtype(theta, DTYPE_FP16 as i64);
-            let ht = unsafe { &*(host as *const NslTensor) };
+            let ht = NslTensor::from_ptr_ref(host);
             assert_eq!(ht.dtype, DTYPE_FP16);
             {
                 let bits = unsafe { std::slice::from_raw_parts_mut(ht.data as *mut u16, 4) };
@@ -1598,7 +1598,7 @@ mod tests {
             }
             // Stage-in: host fp16 -> device f32.
             let work = nsl_tensor_cast_from_host(host, theta);
-            let wt = unsafe { &*(work as *const NslTensor) };
+            let wt = NslTensor::from_ptr_ref(work);
             assert!(wt.device > 0, "working tensor must be device-resident");
             assert_eq!(wt.dtype, DTYPE_F32);
             // Stage-out: device f32 -> host fp16 (consumes `work`).

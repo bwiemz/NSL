@@ -68,6 +68,11 @@ pub extern "C" fn nsl_optim_param_wd(
         return 0.0;
     }
     if exempt_non_rank2 != 0 && param != 0 {
+        // Raw read + magic conjunct, deliberately NOT `from_ptr_ref`: the
+        // fallthrough here is "if this is not a live tensor, do not exempt
+        // it — decay it", which the accessor would turn into an abort on
+        // a path that runs once per parameter per step.
+        //
         // SAFETY: `param` is a live NslTensor pointer from the optimizer's
         // parameter list; the caller holds it for the duration of the step.
         let t = unsafe { &*(param as *const NslTensor) };

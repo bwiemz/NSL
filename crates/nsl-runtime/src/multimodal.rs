@@ -55,7 +55,7 @@ unsafe fn f32_data(t: &NslTensor) -> &[f32] {
 
 /// Get mutable f32 data slice from tensor pointer.
 unsafe fn f32_data_mut(ptr: i64) -> &'static mut [f32] {
-    let t = unsafe { &*(ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(ptr);
     unsafe { std::slice::from_raw_parts_mut(t.data as *mut f32, t.len as usize) }
 }
 
@@ -71,8 +71,8 @@ unsafe fn f32_data_mut(ptr: i64) -> &'static mut [f32] {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_patch_embed(img_ptr: i64, weight_ptr: i64, patch_size: i64) -> i64 {
     if img_ptr == 0 || weight_ptr == 0 || patch_size <= 0 { return 0; }
-    let img = unsafe { &*(img_ptr as *const NslTensor) };
-    let wt = unsafe { &*(weight_ptr as *const NslTensor) };
+    let img = NslTensor::from_ptr_ref(img_ptr);
+    let wt = NslTensor::from_ptr_ref(weight_ptr);
     let is = shape_vec(img);
     let ws = shape_vec(wt);
     if is.len() != 4 || ws.len() != 2 { return 0; }
@@ -134,7 +134,7 @@ pub extern "C" fn nsl_patch_embed(img_ptr: i64, weight_ptr: i64, patch_size: i64
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_image_resize(img_ptr: i64, target_h: i64, target_w: i64) -> i64 {
     if img_ptr == 0 || target_h <= 0 || target_w <= 0 { return 0; }
-    let img = unsafe { &*(img_ptr as *const NslTensor) };
+    let img = NslTensor::from_ptr_ref(img_ptr);
     let is = shape_vec(img);
     if is.len() != 4 { return 0; }
 
@@ -192,9 +192,9 @@ pub extern "C" fn nsl_image_resize(img_ptr: i64, target_h: i64, target_w: i64) -
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_image_normalize(img_ptr: i64, mean_ptr: i64, std_ptr: i64) -> i64 {
     if img_ptr == 0 || mean_ptr == 0 || std_ptr == 0 { return 0; }
-    let img = unsafe { &*(img_ptr as *const NslTensor) };
-    let mt = unsafe { &*(mean_ptr as *const NslTensor) };
-    let st = unsafe { &*(std_ptr as *const NslTensor) };
+    let img = NslTensor::from_ptr_ref(img_ptr);
+    let mt = NslTensor::from_ptr_ref(mean_ptr);
+    let st = NslTensor::from_ptr_ref(std_ptr);
     let is = shape_vec(img);
     if is.len() != 4 { return 0; }
 
@@ -235,9 +235,9 @@ pub extern "C" fn nsl_cross_attention(
     q_ptr: i64, k_ptr: i64, v_ptr: i64, num_heads: i64,
 ) -> i64 {
     if q_ptr == 0 || k_ptr == 0 || v_ptr == 0 || num_heads <= 0 { return 0; }
-    let qt = unsafe { &*(q_ptr as *const NslTensor) };
-    let kt = unsafe { &*(k_ptr as *const NslTensor) };
-    let vt = unsafe { &*(v_ptr as *const NslTensor) };
+    let qt = NslTensor::from_ptr_ref(q_ptr);
+    let kt = NslTensor::from_ptr_ref(k_ptr);
+    let vt = NslTensor::from_ptr_ref(v_ptr);
     let qs = shape_vec(qt);
     let ks = shape_vec(kt);
     if qs.len() != 3 || ks.len() != 3 { return 0; }
@@ -308,7 +308,7 @@ pub extern "C" fn nsl_cross_attention(
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_stft(audio_ptr: i64, n_fft: i64, hop_length: i64) -> i64 {
     if audio_ptr == 0 || n_fft <= 0 || hop_length <= 0 { return 0; }
-    let at = unsafe { &*(audio_ptr as *const NslTensor) };
+    let at = NslTensor::from_ptr_ref(audio_ptr);
     let as_ = shape_vec(at);
     if as_.len() != 2 { return 0; }
 
@@ -389,7 +389,7 @@ fn mel_spectrogram_impl(
     let stft_ptr = nsl_stft(audio_ptr, n_fft, hop_length);
     if stft_ptr == 0 { return 0; }
 
-    let st = unsafe { &*(stft_ptr as *const NslTensor) };
+    let st = NslTensor::from_ptr_ref(stft_ptr);
     let ss = shape_vec(st);
     let (b, nfreq, nframes) = (ss[0] as usize, ss[1] as usize, ss[2] as usize);
     let nm = n_mels as usize;
@@ -461,7 +461,7 @@ fn mel_spectrogram_impl(
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_audio_resample(audio_ptr: i64, orig_sr: i64, target_sr: i64) -> i64 {
     if audio_ptr == 0 || orig_sr <= 0 || target_sr <= 0 { return 0; }
-    let at = unsafe { &*(audio_ptr as *const NslTensor) };
+    let at = NslTensor::from_ptr_ref(audio_ptr);
     let as_ = shape_vec(at);
     if as_.len() != 2 { return 0; }
 
@@ -517,7 +517,7 @@ mod tests {
         let audio = alloc_f32_tensor(&[1, 512]);
         assert_ne!(audio, 0);
         {
-            let at = unsafe { &*(audio as *const NslTensor) };
+            let at = NslTensor::from_ptr_ref(audio);
             let ad = unsafe { f32_data_mut(audio) };
             for i in 0..at.len as usize {
                 ad[i] = (i as f32 * 0.7).sin();
@@ -564,7 +564,7 @@ mod tests {
     fn alloc_f32_tensor_basic() {
         let ptr = alloc_f32_tensor(&[2, 3]);
         assert_ne!(ptr, 0);
-        let t = unsafe { &*(ptr as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(ptr);
         assert_eq!(t.ndim, 2);
         assert_eq!(t.len, 6);
         assert_eq!(t.dtype, 1);

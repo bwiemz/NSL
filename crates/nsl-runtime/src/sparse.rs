@@ -119,7 +119,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
     let threshold = f64::from_bits(threshold_bits as u64);
 
     // Read dense tensor fields via raw pointer (NslTensor is pub(crate), same crate)
-    let tensor = unsafe { &*(dense_ptr as *const crate::tensor::NslTensor) };
+    let tensor = crate::tensor::NslTensor::from_ptr_ref(dense_ptr);
     if tensor.ndim != 2 { return 0; }
     let shape = unsafe { std::slice::from_raw_parts(tensor.shape, 2) };
     let rows = shape[0] as usize;
@@ -360,7 +360,7 @@ pub extern "C" fn nsl_sparse_density(sparse_ptr: i64) -> i64 {
 pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
     if sparse_ptr == 0 || dense_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
-    let dense = unsafe { &*(dense_ptr as *const crate::tensor::NslTensor) };
+    let dense = crate::tensor::NslTensor::from_ptr_ref(dense_ptr);
 
     if dense.ndim != 2 { return 0; }
     let d_shape = unsafe { std::slice::from_raw_parts(dense.shape, 2) };
@@ -868,7 +868,7 @@ pub extern "C" fn nsl_sparse_csc_to_coo(csc_ptr: i64) -> i64 {
 pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
     if sparse_ptr == 0 || vec_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
-    let vec_t = unsafe { &*(vec_ptr as *const crate::tensor::NslTensor) };
+    let vec_t = crate::tensor::NslTensor::from_ptr_ref(vec_ptr);
 
     let m = sparse.rows as usize;
     let k = sparse.cols as usize;
@@ -1317,7 +1317,7 @@ mod tests {
         let result = nsl_sparse_spmv(csr, vec_ptr);
         assert_ne!(result, 0);
 
-        let r = unsafe { &*(result as *const crate::tensor::NslTensor) };
+        let r = crate::tensor::NslTensor::from_ptr_ref(result);
         assert_eq!(r.len, 3);
         let out = unsafe { std::slice::from_raw_parts(r.data as *const f64, 3) };
         assert_eq!(out, &[1.0, 2.0, 3.0]);
@@ -1347,7 +1347,7 @@ mod tests {
 
         // Convert to dense and verify
         let dense = nsl_sparse_to_dense(result);
-        let d = unsafe { &*(dense as *const crate::tensor::NslTensor) };
+        let d = crate::tensor::NslTensor::from_ptr_ref(dense);
         let data = unsafe { std::slice::from_raw_parts(d.data as *const f64, 6) };
         assert_eq!(data[0], 4.0); // (0,0) = 1+3
         assert_eq!(data[4], 2.0); // (1,1) = 2
@@ -1375,7 +1375,7 @@ mod tests {
         assert_eq!(s.nnz, 2, "intersection should produce 2 non-zeros");
 
         let dense = nsl_sparse_to_dense(result);
-        let d = unsafe { &*(dense as *const crate::tensor::NslTensor) };
+        let d = crate::tensor::NslTensor::from_ptr_ref(dense);
         let data = unsafe { std::slice::from_raw_parts(d.data as *const f64, 4) };
         assert_eq!(data[0], 10.0); // 2*5
         assert_eq!(data[3], 24.0); // 4*6

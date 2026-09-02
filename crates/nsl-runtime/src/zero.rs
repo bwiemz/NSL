@@ -531,7 +531,7 @@ pub extern "C" fn nsl_zero_partition_bytes(params_list_ptr: i64, num_params: i64
     for (i, size) in sizes.iter_mut().enumerate().take(n) {
         let tensor_raw = unsafe { *list.data.add(i) };
         if tensor_raw != 0 {
-            let t = unsafe { &*(tensor_raw as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(tensor_raw);
             *size = t.data_byte_size() as u64;
         }
     }
@@ -931,7 +931,7 @@ fn reduce_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], inv_ws: f64) -> i
     let dev = crate::cuda::inner::alloc_managed(total_bytes);
     let mut off = 0usize;
     for b in bucket {
-        let t = unsafe { &*(b.raw as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(b.raw);
         crate::cuda::inner::memcpy_dtod(
             unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
             t.data as *const std::ffi::c_void,
@@ -954,7 +954,7 @@ fn reduce_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], inv_ws: f64) -> i
     ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut off = 0usize;
     for b in bucket {
-        let t = unsafe { &*(b.raw as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(b.raw);
         crate::cuda::inner::memcpy_dtod(
             t.data,
             unsafe { (dev as *const u8).add(off) } as *const std::ffi::c_void,
@@ -1142,7 +1142,7 @@ fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64
     for (r, seg) in segs.iter().enumerate() {
         let mut off = r * max_seg;
         for b in seg {
-            let t = unsafe { &*(b.raw as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(b.raw);
             crate::cuda::inner::memcpy_dtod(
                 unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
                 unsafe { (t.data as *const u8).add(b.off) } as *const std::ffi::c_void,
@@ -1178,7 +1178,7 @@ fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64
     }
     let mut off = 0usize;
     for b in &segs[my] {
-        let t = unsafe { &*(b.raw as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(b.raw);
         crate::cuda::inner::memcpy_dtod(
             unsafe { (t.data as *mut u8).add(b.off) } as *mut std::ffi::c_void,
             unsafe { (out as *const u8).add(off) } as *const std::ffi::c_void,
@@ -1245,7 +1245,7 @@ fn broadcast_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], owner: i32) ->
     let dev = crate::cuda::inner::alloc_managed(total_bytes);
     let mut off = 0usize;
     for b in bucket {
-        let t = unsafe { &*(b.raw as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(b.raw);
         crate::cuda::inner::memcpy_dtod(
             unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
             t.data as *const std::ffi::c_void,
@@ -1268,7 +1268,7 @@ fn broadcast_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], owner: i32) ->
     ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut off = 0usize;
     for b in bucket {
-        let t = unsafe { &*(b.raw as *const NslTensor) };
+        let t = NslTensor::from_ptr_ref(b.raw);
         crate::cuda::inner::memcpy_dtod(
             t.data,
             unsafe { (dev as *const u8).add(off) } as *const std::ffi::c_void,
@@ -1350,7 +1350,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
             if raw == 0 {
                 continue;
             }
-            let t = unsafe { &*(raw as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(raw);
             if t.device != 0 && !ctx.cuda_aware {
                 eprintln!(
                     "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs \
@@ -1452,11 +1452,10 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
             break;
         }
         let tensor_raw = unsafe { *list.data.add(i) };
-        let tensor_ptr = tensor_raw as *mut NslTensor;
-        if tensor_ptr.is_null() {
+        if tensor_raw == 0 {
             continue;
         }
-        let tensor = unsafe { &*tensor_ptr };
+        let tensor = NslTensor::from_ptr_ref(tensor_raw);
 
         // P4 item 14: GPU-resident SPMD requires the CUDA-aware backend.
         // Under the CPU-shm SimulatedBackend the old v1 refusal stands: N
@@ -1557,7 +1556,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         #[cfg(feature = "cuda")]
         {
             let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_raw, 0);
-            let cpu = unsafe { &*(cpu_ptr as *const NslTensor) };
+            let cpu = NslTensor::from_ptr_ref(cpu_ptr);
             let len = cpu.len as usize;
             // Convert to a host f32 staging buffer (unscaled), all-reduce
             // across ranks on the host bytes, THEN average and push back.
@@ -1688,7 +1687,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
             if raw == 0 {
                 continue;
             }
-            let t = unsafe { &*(raw as *const NslTensor) };
+            let t = NslTensor::from_ptr_ref(raw);
             let owner = ctx
                 .owner_of
                 .get(i)
@@ -1762,11 +1761,10 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
             break;
         }
         let tensor_raw = unsafe { *list.data.add(i) };
-        let tensor_ptr = tensor_raw as *mut NslTensor;
-        if tensor_ptr.is_null() {
+        if tensor_raw == 0 {
             continue;
         }
-        let tensor = unsafe { &*tensor_ptr };
+        let tensor = NslTensor::from_ptr_ref(tensor_raw);
         // P4 item 13: the broadcast root comes from the ownership PLAN. The
         // index-modulo fallback only covers a param the partitioner never saw
         // (it should not happen — partition runs before any sync).
@@ -1933,14 +1931,12 @@ pub extern "C" fn nsl_grad_accumulate_add(
     src_ptr: i64,
     num_elems: i64,
 ) -> i64 {
-    let dst_tensor = dst_ptr as *mut NslTensor;
-    let src_tensor = src_ptr as *const NslTensor;
-    if dst_tensor.is_null() || src_tensor.is_null() {
+    if dst_ptr == 0 || src_ptr == 0 {
         return -1;
     }
 
-    let dst = unsafe { &*dst_tensor };
-    let src = unsafe { &*src_tensor };
+    let dst = NslTensor::from_ptr_ref(dst_ptr);
+    let src = NslTensor::from_ptr_ref(src_ptr);
     let n = num_elems as usize;
 
     if dst.dtype > 1 || src.dtype > 1 {
@@ -2016,7 +2012,7 @@ pub extern "C" fn nsl_grad_accumulate_add(
     if migrated == 0 {
         return -1;
     }
-    let mig = unsafe { &*(migrated as *const NslTensor) };
+    let mig = NslTensor::from_ptr_ref(migrated);
     if mig.dtype != dst.dtype || mig.len != dst.len {
         eprintln!(
             "nsl: nsl_grad_accumulate_add: post-migration mismatch \
@@ -2041,12 +2037,11 @@ pub extern "C" fn nsl_grad_accumulate_add(
 /// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
-    let tensor_ptr = grad_ptr as *mut NslTensor;
-    if tensor_ptr.is_null() {
+    if grad_ptr == 0 {
         return -1;
     }
 
-    let tensor = unsafe { &*tensor_ptr };
+    let tensor = NslTensor::from_ptr_ref(grad_ptr);
     let n = num_elems as usize;
 
     let byte_width = match tensor.dtype {
@@ -2441,7 +2436,7 @@ pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
         );
         std::process::abort();
     }
-    let th = unsafe { &*(theta_ptr as *const crate::tensor::NslTensor) };
+    let th = crate::tensor::NslTensor::from_ptr_ref(theta_ptr);
     let (shard, elem_bytes) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|map| map.get(&theta_ptr)) else {
@@ -3064,7 +3059,7 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
     if raw == 0 {
         return 0; // null slot (already consumed) — nothing to reduce
     }
-    let t = unsafe { &*(raw as *const crate::tensor::NslTensor) };
+    let t = crate::tensor::NslTensor::from_ptr_ref(raw);
 
     // Item 11: an elementwise param's window gradient reduce_scatters into
     // its persistent grad slice — each rank receives only the averaged
@@ -3307,9 +3302,9 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
     bc1_inv: f64,
     bc2_inv: f64,
 ) -> i64 {
-    let th = unsafe { &*(theta_ptr as *const crate::tensor::NslTensor) };
-    let m = unsafe { &*(m_ptr as *const crate::tensor::NslTensor) };
-    let v = unsafe { &*(v_ptr as *const crate::tensor::NslTensor) };
+    let th = crate::tensor::NslTensor::from_ptr_ref(theta_ptr);
+    let m = crate::tensor::NslTensor::from_ptr_ref(m_ptr);
+    let v = crate::tensor::NslTensor::from_ptr_ref(v_ptr);
 
     let (shard, elem_bytes, grad_ptr) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
@@ -3602,9 +3597,9 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
-        let th = unsafe { &*(theta_ptr as *const crate::tensor::NslTensor) };
-        let m = unsafe { &*(m_ptr as *const crate::tensor::NslTensor) };
-        let v = unsafe { &*(v_ptr as *const crate::tensor::NslTensor) };
+        let th = crate::tensor::NslTensor::from_ptr_ref(theta_ptr);
+        let m = crate::tensor::NslTensor::from_ptr_ref(m_ptr);
+        let v = crate::tensor::NslTensor::from_ptr_ref(v_ptr);
 
         let (shard, elem_bytes, grad_ptr, slice_ptr, sr_idx) = {
             let tbl = ZERO3_TABLE.lock().unwrap();

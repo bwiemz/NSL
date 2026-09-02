@@ -454,7 +454,7 @@ pub extern "C" fn nsl_gptq_hessian_init(k: i64) -> i64 {
 /// Returns 0 on success.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_hessian_add_batch(input_ptr: i64) -> i64 {
-    let t = unsafe { &*(input_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(input_ptr);
     assert!(t.ndim >= 2, "calibration input must be 2D");
 
     let batch_size = unsafe { *t.shape } as usize;
@@ -546,7 +546,7 @@ pub extern "C" fn nsl_gptq_quantize(
     bits: i64,
 ) -> i64 {
     if weight_ptr == 0 { eprintln!("nsl_gptq_quantize: null weight tensor"); return 0; }
-    let t = unsafe { &*(weight_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(weight_ptr);
     assert!(t.ndim >= 2, "nsl_gptq_quantize requires 2D weight tensor (got {}D)", t.ndim);
     let len = t.len as usize;
 
@@ -564,7 +564,7 @@ pub extern "C" fn nsl_gptq_quantize(
     let hessian = if hessian_ptr == 0 {
         vec![1.0f64; k] // diagonal identity → RTN
     } else {
-        let h = unsafe { &*(hessian_ptr as *const NslTensor) };
+        let h = NslTensor::from_ptr_ref(hessian_ptr);
         let h_len = h.len as usize;
         if h.dtype == 1 {
             let raw = unsafe { std::slice::from_raw_parts(h.data as *const f32, h_len) };
@@ -597,7 +597,7 @@ pub extern "C" fn nsl_gptq_quantize_ext(
     block_size: i64,
     damp_percent_bits: i64,
 ) -> i64 {
-    let t = unsafe { &*(weight_ptr as *const NslTensor) };
+    let t = NslTensor::from_ptr_ref(weight_ptr);
     assert!(t.ndim >= 2);
     let len = t.len as usize;
 
@@ -617,7 +617,7 @@ pub extern "C" fn nsl_gptq_quantize_ext(
         for i in 0..k { h[i * k + i] = 1.0; }
         h
     } else {
-        let h = unsafe { &*(hessian_ptr as *const NslTensor) };
+        let h = NslTensor::from_ptr_ref(hessian_ptr);
         let h_len = h.len as usize;
         if h.dtype == 1 {
             let raw = unsafe { std::slice::from_raw_parts(h.data as *const f32, h_len) };
