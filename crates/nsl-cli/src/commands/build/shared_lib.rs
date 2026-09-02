@@ -333,7 +333,7 @@ fn run_build_shared_multi(
                     }
                 }
 
-                for (name, layout) in temp_compiler.types.struct_layouts.drain() {
+                for (name, layout) in std::mem::take(&mut temp_compiler.types.struct_layouts) {
                     imported_struct_layouts.insert(name, layout);
                 }
 

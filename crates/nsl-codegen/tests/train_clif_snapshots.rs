@@ -333,6 +333,72 @@ fn no_two_entries_produce_the_same_clif() {
     }
 }
 
+/// Struct constructors are declared and defined by walking
+/// `TypeRegistry::struct_layouts`, so its iteration order is their
+/// declaration order (`FuncId`, hence every `fn0 = u0:N` reference and the
+/// object's symbol order) and their definition order (the `function u0:N`
+/// header). While that map was a `HashMap`, six builds of
+/// `examples/m5_generic_instantiation_check.nsl` (four structs) gave five
+/// distinct object files (bugs.md 2026-09-02); it is a `BTreeMap` now, and
+/// the order is the name order.
+///
+/// Six structs declared out of name order: a walk in source order or in
+/// hash order (719 permutations of 720) fails on the first compile, so the
+/// two-compile agreement check above does not have to get lucky here.
+#[test]
+fn struct_ctors_are_defined_in_name_order() {
+    const SRC: &str = "\
+struct Zeta:
+    v: int
+
+struct Alpha:
+    v: int
+
+struct Mu:
+    v: int
+
+struct Beta:
+    v: int
+
+struct Omega:
+    v: int
+
+struct Gamma:
+    v: int
+
+fn main():
+    let z = Zeta(v = 1)
+    let a = Alpha(v = z.v)
+    let m = Mu(v = a.v)
+    let b = Beta(v = m.v)
+    let o = Omega(v = b.v)
+    let g = Gamma(v = o.v)
+    print(g.v)
+";
+    let expected: Vec<String> = ["Alpha", "Beta", "Gamma", "Mu", "Omega", "Zeta"]
+        .iter()
+        .map(|name| format!("struct ctor '{name}'"))
+        .collect();
+    let mut renders = Vec::new();
+    for run in 1..=3 {
+        let dumps = compile_capturing_ir("struct_ctor_order", SRC, &tape());
+        let ctors: Vec<&str> = dumps
+            .iter()
+            .map(|d| d.label.as_str())
+            .filter(|label| label.starts_with("struct ctor "))
+            .collect();
+        assert_eq!(
+            ctors, expected,
+            "compile {run}: struct constructors were not defined in name order"
+        );
+        renders.push(render(&dumps));
+    }
+    assert!(
+        renders.iter().all(|r| r == &renders[0]),
+        "three compiles of the same six-struct program emitted different CLIF"
+    );
+}
+
 snapshots! {
     // Both lowerings of each program.
     sgd_tape: "sgd", tape();
