@@ -17,7 +17,7 @@ pub unsafe extern "C" fn nsl_inspect_set_dir(path_ptr: *const u8, path_len: usiz
     if path_ptr.is_null() {
         return;
     }
-    let bytes = std::slice::from_raw_parts(path_ptr, path_len);
+    let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
     if let Ok(s) = std::str::from_utf8(bytes) {
         *INSPECT_DIR.lock().unwrap() = PathBuf::from(s);
     }
@@ -38,8 +38,8 @@ pub unsafe extern "C" fn nsl_inspect_record_stats(
     if stats_buf_ptr.is_null() || name_ptr.is_null() {
         return 1;
     }
-    let stats = std::slice::from_raw_parts(stats_buf_ptr, 6);
-    let name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
+    let stats = unsafe { std::slice::from_raw_parts(stats_buf_ptr, 6) };
+    let name = match std::str::from_utf8(unsafe { std::slice::from_raw_parts(name_ptr, name_len) }) {
         Ok(s) => s,
         Err(_) => return 2,
     };
@@ -69,7 +69,7 @@ pub unsafe extern "C" fn nsl_inspect_dump_full(
     if tensor_handle == 0 || name_ptr.is_null() {
         return 1;
     }
-    let name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
+    let name = match std::str::from_utf8(unsafe { std::slice::from_raw_parts(name_ptr, name_len) }) {
         Ok(s) => s,
         Err(_) => return 2,
     };
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn nsl_inspect_dump_full(
         let elem = crate::tensor::dtype_element_size(tensor.dtype);
         let byte_len = (tensor.len as usize).saturating_mul(elem);
         let mut v = vec![0u8; byte_len];
-        std::ptr::copy_nonoverlapping(tensor.data as *const u8, v.as_mut_ptr(), byte_len);
+        unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, v.as_mut_ptr(), byte_len) };
         v
     } else {
         // GPU path or null data: skip raw bytes, record an empty payload so the

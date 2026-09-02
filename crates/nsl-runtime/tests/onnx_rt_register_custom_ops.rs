@@ -73,7 +73,7 @@ unsafe extern "C" fn mock_create_custom_op_domain(
     out: *mut *mut OrtCustomOpDomain,
 ) -> *mut OrtStatus {
     // Non-null sentinel — never dereferenced.
-    *out = 1usize as *mut OrtCustomOpDomain;
+    unsafe { *out = 1usize as *mut OrtCustomOpDomain };
     std::ptr::null_mut()
 }
 
@@ -100,7 +100,7 @@ unsafe extern "C" fn mock_kc_get_input_count(
     _ctx: *const OrtKernelContext,
     out: *mut usize,
 ) -> *mut OrtStatus {
-    *out = 0;
+    unsafe { *out = 0 };
     std::ptr::null_mut()
 }
 
@@ -108,7 +108,7 @@ unsafe extern "C" fn mock_kc_get_output_count(
     _ctx: *const OrtKernelContext,
     out: *mut usize,
 ) -> *mut OrtStatus {
-    *out = 0;
+    unsafe { *out = 0 };
     std::ptr::null_mut()
 }
 
@@ -117,7 +117,7 @@ unsafe extern "C" fn mock_kc_get_input(
     _index: usize,
     out: *mut *const OrtValue,
 ) -> *mut OrtStatus {
-    *out = std::ptr::null();
+    unsafe { *out = std::ptr::null() };
     std::ptr::null_mut()
 }
 
@@ -128,7 +128,7 @@ unsafe extern "C" fn mock_kc_get_output(
     _dim_count: usize,
     out: *mut *mut OrtValue,
 ) -> *mut OrtStatus {
-    *out = std::ptr::null_mut();
+    unsafe { *out = std::ptr::null_mut() };
     std::ptr::null_mut()
 }
 
@@ -136,7 +136,7 @@ unsafe extern "C" fn mock_get_tensor_data(
     _value: *mut OrtValue,
     out: *mut *mut c_void,
 ) -> *mut OrtStatus {
-    *out = std::ptr::null_mut();
+    unsafe { *out = std::ptr::null_mut() };
     std::ptr::null_mut()
 }
 
@@ -144,7 +144,7 @@ unsafe extern "C" fn mock_get_tensor_type_and_shape(
     _value: *const OrtValue,
     out: *mut *mut OrtTensorTypeAndShapeInfo,
 ) -> *mut OrtStatus {
-    *out = std::ptr::null_mut();
+    unsafe { *out = std::ptr::null_mut() };
     std::ptr::null_mut()
 }
 
@@ -152,7 +152,7 @@ unsafe extern "C" fn mock_get_tensor_element_type(
     _info: *const OrtTensorTypeAndShapeInfo,
     out: *mut ONNXTensorElementDataType,
 ) -> *mut OrtStatus {
-    *out = ONNXTensorElementDataType::UNDEFINED;
+    unsafe { *out = ONNXTensorElementDataType::UNDEFINED };
     std::ptr::null_mut()
 }
 
@@ -160,7 +160,7 @@ unsafe extern "C" fn mock_get_dimensions_count(
     _info: *const OrtTensorTypeAndShapeInfo,
     out: *mut usize,
 ) -> *mut OrtStatus {
-    *out = 0;
+    unsafe { *out = 0 };
     std::ptr::null_mut()
 }
 
@@ -176,7 +176,7 @@ unsafe extern "C" fn mock_get_tensor_shape_element_count(
     _info: *const OrtTensorTypeAndShapeInfo,
     out: *mut usize,
 ) -> *mut OrtStatus {
-    *out = 0;
+    unsafe { *out = 0 };
     std::ptr::null_mut()
 }
 

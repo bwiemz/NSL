@@ -10,6 +10,9 @@ repository.workspace = true
 keywords = ["ml", "compiler", "tensor", "neural-network", "language"]
 categories = ["compilers", "science"]
 
+[lints]
+workspace = true
+
 [lib]
 name = "nsl_cli"
 path = "src/lib.rs"

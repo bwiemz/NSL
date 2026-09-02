@@ -46,17 +46,17 @@ pub unsafe extern "C" fn RegisterCustomOps(
     api_base: *const OrtApiBase,
 ) -> *mut OrtStatus {
     // --- Step 1: version-check via the version-stable OrtApiBase. ----------
-    let api_base_ref = match api_base.as_ref() {
+    let api_base_ref = match unsafe { api_base.as_ref() } {
         Some(b) => b,
         None => {
             return ort_make_status_static();
         }
     };
-    let api_ptr = (api_base_ref.GetApi)(EXPECTED_ORT_API_VERSION);
+    let api_ptr = unsafe { (api_base_ref.GetApi)(EXPECTED_ORT_API_VERSION) };
     if api_ptr.is_null() {
         return ort_make_status_static();
     }
-    let api: &OrtApi = &*api_ptr;
+    let api: &OrtApi = unsafe { &*api_ptr };
 
     // --- Step 2: enumerate NSL exports via Spec A's runtime FFIs. ---------
     //
@@ -72,8 +72,8 @@ pub unsafe extern "C" fn RegisterCustomOps(
     // If either symbol is missing (the common case for `cargo test` /
     // examples where no NSL `@export`s exist), we treat the export
     // table as empty and return success without registering a domain.
-    let get_num = registry::resolve_self_symbol(c"nsl_get_num_exports".as_ptr());
-    let get_name = registry::resolve_self_symbol(c"nsl_get_export_name".as_ptr());
+    let get_num = unsafe { registry::resolve_self_symbol(c"nsl_get_num_exports".as_ptr()) };
+    let get_name = unsafe { registry::resolve_self_symbol(c"nsl_get_export_name".as_ptr()) };
     if get_num == 0 || get_name == 0 {
         // No export table in this binary — nothing to register.
         return std::ptr::null_mut();
@@ -81,11 +81,11 @@ pub unsafe extern "C" fn RegisterCustomOps(
     // SAFETY: dlsym/GetProcAddress returned non-null pointers to symbols
     // codegen guarantees match these signatures.
     let nsl_get_num_exports: unsafe extern "C" fn() -> i64 =
-        std::mem::transmute::<usize, unsafe extern "C" fn() -> i64>(get_num);
+        unsafe { std::mem::transmute::<usize, unsafe extern "C" fn() -> i64>(get_num) };
     let nsl_get_export_name: unsafe extern "C" fn(i64) -> *const std::os::raw::c_char =
-        std::mem::transmute::<usize, unsafe extern "C" fn(i64) -> *const std::os::raw::c_char>(get_name);
+        unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(i64) -> *const std::os::raw::c_char>(get_name) };
 
-    let num_exports = nsl_get_num_exports();
+    let num_exports = unsafe { nsl_get_num_exports() };
     if num_exports == 0 {
         return std::ptr::null_mut();
     }
@@ -93,14 +93,14 @@ pub unsafe extern "C" fn RegisterCustomOps(
     // --- Step 3: create the `com.nsl` domain. -----------------------------
     let domain_name = c"com.nsl".as_ptr();
     let mut domain: *mut OrtCustomOpDomain = std::ptr::null_mut();
-    let status = (api.CreateCustomOpDomain)(domain_name, &mut domain);
+    let status = unsafe { (api.CreateCustomOpDomain)(domain_name, &mut domain) };
     if !status.is_null() {
         return status;
     }
 
     // --- Step 4: register one OrtCustomOp per export. ---------------------
     for idx in 0..num_exports {
-        let name_ptr = nsl_get_export_name(idx);
+        let name_ptr = unsafe { nsl_get_export_name(idx) };
         if name_ptr.is_null() {
             continue;
         }
@@ -110,14 +110,14 @@ pub unsafe extern "C" fn RegisterCustomOps(
             // guard against it for forward-compat.
             continue;
         }
-        let status = (api.CustomOpDomain_Add)(domain, custom_op);
+        let status = unsafe { (api.CustomOpDomain_Add)(domain, custom_op) };
         if !status.is_null() {
             return status;
         }
     }
 
     // --- Step 5: attach the domain to the session options. ----------------
-    (api.AddCustomOpDomain)(options, domain)
+    unsafe { (api.AddCustomOpDomain)(options, domain) }
 }
 
 /// Return a non-null `OrtStatus*` sentinel when no `OrtApi` is available.

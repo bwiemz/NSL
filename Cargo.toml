@@ -57,6 +57,26 @@ bytemuck = { version = "1", features = ["derive"] }
 # CLI (`--save-baseline`, `--baseline`, filters).
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
+# ── Workspace lints ───────────────────────────────────────────────────────────
+#
+# Every crate opts in with `[lints] workspace = true`. A level set here
+# reaches rustc as a `-D`/`-W` flag, so an in-source `#![allow]` still wins
+# over it — the table is the floor, not a ceiling. CI runs clippy with
+# `-D warnings` on the default features (every OS) and on the benches, so
+# anything set to `warn` here is a hard error on those lanes; the cuda lane
+# is a plain `cargo build --features cuda`, which only `deny` can break.
+# Only add a lint once every target it reaches is clean under
+# `cargo check --workspace --all-targets --all-features`.
+[workspace.lints.rust]
+# Inside an `unsafe fn`, each unsafe operation must sit in its own
+# `unsafe {}` block instead of borrowing the signature's blanket. That
+# makes the raw-pointer dereferences, FFI calls and `from_raw_parts`
+# reconstructions in the runtime visible one by one (roadmap C6). Edition
+# 2024 turns this lint on by default (at `warn`); taking it early, at
+# `deny`, means the edition bump (roadmap D4) will not have to wrap them
+# all at once.
+unsafe_op_in_unsafe_fn = "deny"
+
 # ── Build profiles ────────────────────────────────────────────────────────────
 #
 # Measured on the 9800X3D box, clean builds of `nsl` with `--features cuda`

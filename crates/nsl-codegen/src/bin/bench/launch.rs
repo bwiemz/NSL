@@ -100,23 +100,23 @@ pub unsafe fn time_kernel_launches(
     // --- Event pair: created once, reused across all iterations. ---
     let mut start_evt: sys::CUevent = std::ptr::null_mut();
     let mut stop_evt: sys::CUevent = std::ptr::null_mut();
-    let rc = sys::cuEventCreate(&mut start_evt, 0);
+    let rc = unsafe { sys::cuEventCreate(&mut start_evt, 0) };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(format!("cuEventCreate(start) rc={:?}: {}", rc, cu_error_string(rc)));
     }
-    let rc = sys::cuEventCreate(&mut stop_evt, 0);
+    let rc = unsafe { sys::cuEventCreate(&mut stop_evt, 0) };
     if rc != sys::CUresult::CUDA_SUCCESS {
-        let _ = sys::cuEventDestroy_v2(start_evt);
+        let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
         return Err(format!("cuEventCreate(stop) rc={:?}: {}", rc, cu_error_string(rc)));
     }
 
     // --- Per-iter timing loop. ---
     let mut times_ms: Vec<f32> = Vec::with_capacity(iterations as usize);
     for it in 0..iterations {
-        let rc = sys::cuEventRecord(start_evt, std::ptr::null_mut());
+        let rc = unsafe { sys::cuEventRecord(start_evt, std::ptr::null_mut()) };
         if rc != sys::CUresult::CUDA_SUCCESS {
-            let _ = sys::cuEventDestroy_v2(start_evt);
-            let _ = sys::cuEventDestroy_v2(stop_evt);
+            let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+            let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
             return Err(format!(
                 "cuEventRecord(start) iter={} rc={:?}: {}",
                 it,
@@ -124,18 +124,20 @@ pub unsafe fn time_kernel_launches(
                 cu_error_string(rc)
             ));
         }
-        let launch_rc = sys::cuLaunchKernel(
-            func,
-            grid.0, grid.1, grid.2,
-            block.0, block.1, block.2,
-            shmem_bytes,
-            std::ptr::null_mut(), // default stream
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        );
+        let launch_rc = unsafe {
+            sys::cuLaunchKernel(
+                func,
+                grid.0, grid.1, grid.2,
+                block.0, block.1, block.2,
+                shmem_bytes,
+                std::ptr::null_mut(), // default stream
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
         if launch_rc != sys::CUresult::CUDA_SUCCESS {
-            let _ = sys::cuEventDestroy_v2(start_evt);
-            let _ = sys::cuEventDestroy_v2(stop_evt);
+            let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+            let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
             return Err(format!(
                 "cuLaunchKernel iter={} rc={:?}: {}",
                 it,
@@ -143,10 +145,10 @@ pub unsafe fn time_kernel_launches(
                 cu_error_string(launch_rc)
             ));
         }
-        let rc = sys::cuEventRecord(stop_evt, std::ptr::null_mut());
+        let rc = unsafe { sys::cuEventRecord(stop_evt, std::ptr::null_mut()) };
         if rc != sys::CUresult::CUDA_SUCCESS {
-            let _ = sys::cuEventDestroy_v2(start_evt);
-            let _ = sys::cuEventDestroy_v2(stop_evt);
+            let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+            let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
             return Err(format!(
                 "cuEventRecord(stop) iter={} rc={:?}: {}",
                 it,
@@ -154,10 +156,10 @@ pub unsafe fn time_kernel_launches(
                 cu_error_string(rc)
             ));
         }
-        let rc = sys::cuEventSynchronize(stop_evt);
+        let rc = unsafe { sys::cuEventSynchronize(stop_evt) };
         if rc != sys::CUresult::CUDA_SUCCESS {
-            let _ = sys::cuEventDestroy_v2(start_evt);
-            let _ = sys::cuEventDestroy_v2(stop_evt);
+            let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+            let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
             return Err(format!(
                 "cuEventSynchronize iter={} rc={:?}: {}",
                 it,
@@ -166,10 +168,10 @@ pub unsafe fn time_kernel_launches(
             ));
         }
         let mut ms: f32 = 0.0;
-        let rc = sys::cuEventElapsedTime_v2(&mut ms, start_evt, stop_evt);
+        let rc = unsafe { sys::cuEventElapsedTime_v2(&mut ms, start_evt, stop_evt) };
         if rc != sys::CUresult::CUDA_SUCCESS {
-            let _ = sys::cuEventDestroy_v2(start_evt);
-            let _ = sys::cuEventDestroy_v2(stop_evt);
+            let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+            let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
             return Err(format!(
                 "cuEventElapsedTime iter={} rc={:?}: {}",
                 it,
@@ -180,8 +182,8 @@ pub unsafe fn time_kernel_launches(
         times_ms.push(ms);
     }
 
-    let _ = sys::cuEventDestroy_v2(start_evt);
-    let _ = sys::cuEventDestroy_v2(stop_evt);
+    let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+    let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
 
     // --- Median across iterations (sort + middle slot). ---
     // For even-iter counts we still pick the upper-middle (index n/2) as
@@ -199,11 +201,13 @@ pub unsafe fn time_kernel_launches(
     // with no further infrastructure work.
     let skip_ratio = if let Some((dev_ptr, byte_len)) = skip_decisions_buf {
         let mut host = vec![0u8; byte_len];
-        let rc = sys::cuMemcpyDtoH_v2(
-            host.as_mut_ptr() as *mut c_void,
-            dev_ptr,
-            byte_len,
-        );
+        let rc = unsafe {
+            sys::cuMemcpyDtoH_v2(
+                host.as_mut_ptr() as *mut c_void,
+                dev_ptr,
+                byte_len,
+            )
+        };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!(
                 "cuMemcpyDtoH(skip_decisions) rc={:?}: {}",
@@ -271,13 +275,17 @@ pub unsafe fn time_kernel_launches(
 /// Format a CUresult into a human-readable string via `cuGetErrorString`.
 /// Returns `<unknown>` on any failure of the introspection itself; never
 /// panics or allocates if the driver returns a null name.
-unsafe fn cu_error_string(rc: sys::CUresult) -> String {
+///
+/// Safe to call with any `rc`: `cuGetErrorString` rejects unknown codes
+/// with `CUDA_ERROR_INVALID_VALUE` and leaves `name` null, and the string
+/// it hands back is driver-static.
+fn cu_error_string(rc: sys::CUresult) -> String {
     let mut name: *const std::os::raw::c_char = std::ptr::null();
-    let _ = sys::cuGetErrorString(rc, &mut name);
+    let _ = unsafe { sys::cuGetErrorString(rc, &mut name) };
     if name.is_null() {
         "<unknown>".to_string()
     } else {
-        CStr::from_ptr(name).to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
     }
 }
 
@@ -302,15 +310,15 @@ pub unsafe fn run_fixture(
 ) -> Result<LaunchResult, String> {
     // -- Step 1: Ensure CUDA context is current on this thread. --
     let mut ctx: sys::CUcontext = std::ptr::null_mut();
-    let _ = sys::cuCtxGetCurrent(&mut ctx);
+    let _ = unsafe { sys::cuCtxGetCurrent(&mut ctx) };
     if ctx.is_null() {
-        let _ = sys::cuInit(0);
+        let _ = unsafe { sys::cuInit(0) };
         let mut dev: sys::CUdevice = 0;
-        let rc = sys::cuDeviceGet(&mut dev, 0);
+        let rc = unsafe { sys::cuDeviceGet(&mut dev, 0) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!("cuDeviceGet rc={:?}: {}", rc, cu_error_string(rc)));
         }
-        let rc = sys::cuDevicePrimaryCtxRetain(&mut ctx, dev);
+        let rc = unsafe { sys::cuDevicePrimaryCtxRetain(&mut ctx, dev) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!(
                 "cuDevicePrimaryCtxRetain rc={:?}: {}",
@@ -318,7 +326,7 @@ pub unsafe fn run_fixture(
                 cu_error_string(rc)
             ));
         }
-        let rc = sys::cuCtxSetCurrent(ctx);
+        let rc = unsafe { sys::cuCtxSetCurrent(ctx) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!("cuCtxSetCurrent rc={:?}: {}", rc, cu_error_string(rc)));
         }
@@ -378,13 +386,15 @@ pub unsafe fn run_fixture(
         info_log.as_ptr() as *mut c_void,
         info_log.len() as *mut c_void,
     ];
-    let rc = sys::cuModuleLoadDataEx(
-        &mut module,
-        ptx.as_ptr() as *const c_void,
-        options.len() as u32,
-        options.as_mut_ptr(),
-        option_values.as_mut_ptr(),
-    );
+    let rc = unsafe {
+        sys::cuModuleLoadDataEx(
+            &mut module,
+            ptx.as_ptr() as *const c_void,
+            options.len() as u32,
+            options.as_mut_ptr(),
+            option_values.as_mut_ptr(),
+        )
+    };
     if rc != sys::CUresult::CUDA_SUCCESS {
         let nul = err_log.iter().position(|&b| b == 0).unwrap_or(err_log.len());
         let log = String::from_utf8_lossy(&err_log[..nul]).trim().to_string();
@@ -400,14 +410,14 @@ pub unsafe fn run_fixture(
     let kernel_name = match CString::new(flash_attention_kernel_name_v2(&fixture.config)) {
         Ok(n) => n,
         Err(_) => {
-            let _ = sys::cuModuleUnload(module);
+            let _ = unsafe { sys::cuModuleUnload(module) };
             return Err("kernel name contains embedded NUL".into());
         }
     };
     let mut func: sys::CUfunction = std::ptr::null_mut();
-    let rc = sys::cuModuleGetFunction(&mut func, module, kernel_name.as_ptr());
+    let rc = unsafe { sys::cuModuleGetFunction(&mut func, module, kernel_name.as_ptr()) };
     if rc != sys::CUresult::CUDA_SUCCESS {
-        let _ = sys::cuModuleUnload(module);
+        let _ = unsafe { sys::cuModuleUnload(module) };
         return Err(format!(
             "cuModuleGetFunction({}) rc={:?}: {}",
             kernel_name.to_string_lossy(),
@@ -439,7 +449,7 @@ pub unsafe fn run_fixture(
     let alloc =
         |bytes: usize, allocations: &mut Vec<sys::CUdeviceptr>| -> Result<sys::CUdeviceptr, String> {
             let mut p: sys::CUdeviceptr = 0;
-            let rc = sys::cuMemAlloc_v2(&mut p, bytes);
+            let rc = unsafe { sys::cuMemAlloc_v2(&mut p, bytes) };
             if rc != sys::CUresult::CUDA_SUCCESS {
                 return Err(format!(
                     "cuMemAlloc_v2({} bytes) rc={:?}: {}",
@@ -453,17 +463,17 @@ pub unsafe fn run_fixture(
         };
 
     let q_dev = alloc(qkv_bytes_per, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     let k_dev = alloc(qkv_bytes_per, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     let v_dev = alloc(qkv_bytes_per, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     let out_dev = alloc(out_bytes, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     let lse_dev = alloc(lse_bytes, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     let seg_dev = alloc(seg_bytes_per_batch, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
 
     // Generate host inputs deterministically from `seed`. Q/K/V values
     // are small (~[-0.5, 0.5)) to keep softmax numerics calm; the actual
@@ -475,7 +485,7 @@ pub unsafe fn run_fixture(
     let seg_host = generate_segment_mask(fixture.seq_len, fixture.target_sparsity, seed);
 
     let h2d = |dst: sys::CUdeviceptr, src: *const c_void, n: usize| -> Result<(), String> {
-        let rc = sys::cuMemcpyHtoD_v2(dst, src, n);
+        let rc = unsafe { sys::cuMemcpyHtoD_v2(dst, src, n) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             Err(format!(
                 "cuMemcpyHtoD_v2({} bytes) rc={:?}: {}",
@@ -489,17 +499,17 @@ pub unsafe fn run_fixture(
     };
 
     h2d(q_dev, q_host.as_ptr() as *const c_void, qkv_bytes_per)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     h2d(k_dev, k_host.as_ptr() as *const c_void, qkv_bytes_per)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     h2d(v_dev, v_host.as_ptr() as *const c_void, qkv_bytes_per)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+        .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
     h2d(
         seg_dev,
         seg_host.as_ptr() as *const c_void,
         seg_bytes_per_batch,
     )
-    .map_err(|e| free_all_and(&allocations, module, e))?;
+    .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
 
     // Skip-decisions buffer (only on Tier-B-on). Shape per spec §4.3.1:
     // `[batch, head, num_q_tiles, num_kv_tiles] : u8`.
@@ -508,20 +518,22 @@ pub unsafe fn run_fixture(
         let num_kv = (fixture.seq_len).div_ceil(fixture.config.block_kv as u32) as usize;
         let n_slots = (fixture.batch as usize) * (heads as usize) * num_q * num_kv;
         let dev = alloc(n_slots, &mut allocations)
-            .map_err(|e| free_all_and(&allocations, module, e))?;
+            .map_err(|e| unsafe { free_all_and(&allocations, module, e) })?;
         // Zero the buffer so the readback sees 0 wherever the kernel
         // didn't write (e.g. before B1.5-3 wires the writeback).
-        let rc = sys::cuMemsetD8_v2(dev, 0, n_slots);
+        let rc = unsafe { sys::cuMemsetD8_v2(dev, 0, n_slots) };
         if rc != sys::CUresult::CUDA_SUCCESS {
-            return Err(free_all_and(
-                &allocations,
-                module,
-                format!(
-                    "cuMemsetD8_v2(skip_decisions) rc={:?}: {}",
-                    rc,
-                    cu_error_string(rc)
-                ),
-            ));
+            return Err(unsafe {
+                free_all_and(
+                    &allocations,
+                    module,
+                    format!(
+                        "cuMemsetD8_v2(skip_decisions) rc={:?}: {}",
+                        rc,
+                        cu_error_string(rc)
+                    ),
+                )
+            });
         }
         Some((dev, n_slots))
     } else {
@@ -571,11 +583,13 @@ pub unsafe fn run_fixture(
     };
     const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: sys::CUfunction_attribute =
         sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
-    let attr_rc = sys::cuFuncSetAttribute(
-        func,
-        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        shmem_bytes as i32,
-    );
+    let attr_rc = unsafe {
+        sys::cuFuncSetAttribute(
+            func,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shmem_bytes as i32,
+        )
+    };
     // Don't fail on attribute-set for INVALID_VALUE: this is benign for
     // kernels with no dynamic SMEM (the opt-in is a no-op there). Log
     // anyway so diagnostics surface when the size > cap.
@@ -692,15 +706,17 @@ pub unsafe fn run_fixture(
     let block = (128u32, 1u32, 1u32);
 
     // -- Step 9: Run the timed loop. --
-    let result = time_kernel_launches(
-        func,
-        &mut args,
-        grid,
-        block,
-        shmem_bytes,
-        iterations,
-        skip_decisions_buf,
-    );
+    let result = unsafe {
+        time_kernel_launches(
+            func,
+            &mut args,
+            grid,
+            block,
+            shmem_bytes,
+            iterations,
+            skip_decisions_buf,
+        )
+    };
 
     // -- Step 9b: M3-parity dump-output (B1.5-3). --
     // After the timed loop the `out` device buffer holds the last
@@ -712,11 +728,13 @@ pub unsafe fn run_fixture(
     if let Some(path) = dump_output {
         if result.is_ok() {
             let mut host_out = vec![0u8; out_bytes];
-            let rc = sys::cuMemcpyDtoH_v2(
-                host_out.as_mut_ptr() as *mut c_void,
-                out_dev,
-                out_bytes,
-            );
+            let rc = unsafe {
+                sys::cuMemcpyDtoH_v2(
+                    host_out.as_mut_ptr() as *mut c_void,
+                    out_dev,
+                    out_bytes,
+                )
+            };
             if rc != sys::CUresult::CUDA_SUCCESS {
                 let msg = format!(
                     "cuMemcpyDtoH(out for --dump-output) rc={:?}: {}",
@@ -724,17 +742,17 @@ pub unsafe fn run_fixture(
                     cu_error_string(rc)
                 );
                 for p in &allocations {
-                    let _ = sys::cuMemFree_v2(*p);
+                    let _ = unsafe { sys::cuMemFree_v2(*p) };
                 }
-                let _ = sys::cuModuleUnload(module);
+                let _ = unsafe { sys::cuModuleUnload(module) };
                 return Err(msg);
             }
             if let Err(e) = std::fs::write(path, &host_out) {
                 let msg = format!("failed to write --dump-output to {:?}: {}", path, e);
                 for p in &allocations {
-                    let _ = sys::cuMemFree_v2(*p);
+                    let _ = unsafe { sys::cuMemFree_v2(*p) };
                 }
-                let _ = sys::cuModuleUnload(module);
+                let _ = unsafe { sys::cuModuleUnload(module) };
                 return Err(msg);
             }
         }
@@ -742,9 +760,9 @@ pub unsafe fn run_fixture(
 
     // -- Step 10: Cleanup. --
     for p in &allocations {
-        let _ = sys::cuMemFree_v2(*p);
+        let _ = unsafe { sys::cuMemFree_v2(*p) };
     }
-    let _ = sys::cuModuleUnload(module);
+    let _ = unsafe { sys::cuModuleUnload(module) };
 
     result
 }
@@ -786,15 +804,15 @@ pub unsafe fn run_fixture_backward(
 ) -> Result<LaunchResult, String> {
     // -- Step B1: Ensure CUDA context is current on this thread. --
     let mut ctx: sys::CUcontext = std::ptr::null_mut();
-    let _ = sys::cuCtxGetCurrent(&mut ctx);
+    let _ = unsafe { sys::cuCtxGetCurrent(&mut ctx) };
     if ctx.is_null() {
-        let _ = sys::cuInit(0);
+        let _ = unsafe { sys::cuInit(0) };
         let mut dev: sys::CUdevice = 0;
-        let rc = sys::cuDeviceGet(&mut dev, 0);
+        let rc = unsafe { sys::cuDeviceGet(&mut dev, 0) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!("cuDeviceGet rc={:?}: {}", rc, cu_error_string(rc)));
         }
-        let rc = sys::cuDevicePrimaryCtxRetain(&mut ctx, dev);
+        let rc = unsafe { sys::cuDevicePrimaryCtxRetain(&mut ctx, dev) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!(
                 "cuDevicePrimaryCtxRetain rc={:?}: {}",
@@ -802,7 +820,7 @@ pub unsafe fn run_fixture_backward(
                 cu_error_string(rc)
             ));
         }
-        let rc = sys::cuCtxSetCurrent(ctx);
+        let rc = unsafe { sys::cuCtxSetCurrent(ctx) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!("cuCtxSetCurrent rc={:?}: {}", rc, cu_error_string(rc)));
         }
@@ -872,13 +890,15 @@ pub unsafe fn run_fixture_backward(
             info_log.as_ptr() as *mut c_void,
             info_log.len() as *mut c_void,
         ];
-        let rc = sys::cuModuleLoadDataEx(
-            &mut module,
-            ptx.as_ptr() as *const c_void,
-            options.len() as u32,
-            options.as_mut_ptr(),
-            option_values.as_mut_ptr(),
-        );
+        let rc = unsafe {
+            sys::cuModuleLoadDataEx(
+                &mut module,
+                ptx.as_ptr() as *const c_void,
+                options.len() as u32,
+                options.as_mut_ptr(),
+                option_values.as_mut_ptr(),
+            )
+        };
         if rc != sys::CUresult::CUDA_SUCCESS {
             let nul = err_log.iter().position(|&b| b == 0).unwrap_or(err_log.len());
             let log = String::from_utf8_lossy(&err_log[..nul]).trim().to_string();
@@ -895,7 +915,7 @@ pub unsafe fn run_fixture_backward(
     let bwd_module = match load_module(&bwd_ptx, "backward") {
         Ok(m) => m,
         Err(e) => {
-            let _ = sys::cuModuleUnload(fwd_module);
+            let _ = unsafe { sys::cuModuleUnload(fwd_module) };
             return Err(e);
         }
     };
@@ -904,8 +924,8 @@ pub unsafe fn run_fixture_backward(
     let fwd_kernel_name = match CString::new(flash_attention_kernel_name_v2(&fixture.config)) {
         Ok(n) => n,
         Err(_) => {
-            let _ = sys::cuModuleUnload(fwd_module);
-            let _ = sys::cuModuleUnload(bwd_module);
+            let _ = unsafe { sys::cuModuleUnload(fwd_module) };
+            let _ = unsafe { sys::cuModuleUnload(bwd_module) };
             return Err("forward kernel name contains embedded NUL".into());
         }
     };
@@ -914,16 +934,16 @@ pub unsafe fn run_fixture_backward(
     let bwd_kernel_name = match CString::new(bwd_kernel_name_str.clone()) {
         Ok(n) => n,
         Err(_) => {
-            let _ = sys::cuModuleUnload(fwd_module);
-            let _ = sys::cuModuleUnload(bwd_module);
+            let _ = unsafe { sys::cuModuleUnload(fwd_module) };
+            let _ = unsafe { sys::cuModuleUnload(bwd_module) };
             return Err("backward kernel name contains embedded NUL".into());
         }
     };
     let mut fwd_func: sys::CUfunction = std::ptr::null_mut();
-    let rc = sys::cuModuleGetFunction(&mut fwd_func, fwd_module, fwd_kernel_name.as_ptr());
+    let rc = unsafe { sys::cuModuleGetFunction(&mut fwd_func, fwd_module, fwd_kernel_name.as_ptr()) };
     if rc != sys::CUresult::CUDA_SUCCESS {
-        let _ = sys::cuModuleUnload(fwd_module);
-        let _ = sys::cuModuleUnload(bwd_module);
+        let _ = unsafe { sys::cuModuleUnload(fwd_module) };
+        let _ = unsafe { sys::cuModuleUnload(bwd_module) };
         return Err(format!(
             "cuModuleGetFunction(fwd, {}) rc={:?}: {}",
             fwd_kernel_name.to_string_lossy(),
@@ -932,10 +952,10 @@ pub unsafe fn run_fixture_backward(
         ));
     }
     let mut bwd_func: sys::CUfunction = std::ptr::null_mut();
-    let rc = sys::cuModuleGetFunction(&mut bwd_func, bwd_module, bwd_kernel_name.as_ptr());
+    let rc = unsafe { sys::cuModuleGetFunction(&mut bwd_func, bwd_module, bwd_kernel_name.as_ptr()) };
     if rc != sys::CUresult::CUDA_SUCCESS {
-        let _ = sys::cuModuleUnload(fwd_module);
-        let _ = sys::cuModuleUnload(bwd_module);
+        let _ = unsafe { sys::cuModuleUnload(fwd_module) };
+        let _ = unsafe { sys::cuModuleUnload(bwd_module) };
         return Err(format!(
             "cuModuleGetFunction(bwd, {}) rc={:?}: {}",
             bwd_kernel_name.to_string_lossy(),
@@ -972,7 +992,7 @@ pub unsafe fn run_fixture_backward(
     let alloc =
         |bytes: usize, allocations: &mut Vec<sys::CUdeviceptr>| -> Result<sys::CUdeviceptr, String> {
             let mut p: sys::CUdeviceptr = 0;
-            let rc = sys::cuMemAlloc_v2(&mut p, bytes);
+            let rc = unsafe { sys::cuMemAlloc_v2(&mut p, bytes) };
             if rc != sys::CUresult::CUDA_SUCCESS {
                 return Err(format!(
                     "cuMemAlloc_v2({} bytes) rc={:?}: {}",
@@ -990,7 +1010,7 @@ pub unsafe fn run_fixture_backward(
         let _ = sys::cuModuleUnload(bwd_module);
     };
     let cleanup_and = |allocs: &[sys::CUdeviceptr], err: String| -> String {
-        for p in allocs { let _ = sys::cuMemFree_v2(*p); }
+        for p in allocs { let _ = unsafe { sys::cuMemFree_v2(*p) }; }
         free_modules(fwd_module, bwd_module);
         err
     };
@@ -1042,7 +1062,7 @@ pub unsafe fn run_fixture_backward(
     let row_sum_host: Vec<f32> = vec![1.0; lse_elems];
 
     let h2d = |dst: sys::CUdeviceptr, src: *const c_void, n: usize| -> Result<(), String> {
-        let rc = sys::cuMemcpyHtoD_v2(dst, src, n);
+        let rc = unsafe { sys::cuMemcpyHtoD_v2(dst, src, n) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             Err(format!(
                 "cuMemcpyHtoD_v2({} bytes) rc={:?}: {}",
@@ -1070,11 +1090,11 @@ pub unsafe fn run_fixture_backward(
 
     // Zero the dQ/dK/dV outputs before the backward launch (matches the
     // runtime's `memset_d8(d_q, qkv_elems * 2)` pre-launch).
-    let _ = sys::cuMemsetD8_v2(out_dev, 0, out_bytes);
-    let _ = sys::cuMemsetD8_v2(lse_dev, 0, lse_bytes);
-    let _ = sys::cuMemsetD8_v2(dq_dev, 0, dq_bytes);
-    let _ = sys::cuMemsetD8_v2(dk_scratch_dev, 0, dkv_scratch_bytes);
-    let _ = sys::cuMemsetD8_v2(dv_scratch_dev, 0, dkv_scratch_bytes);
+    let _ = unsafe { sys::cuMemsetD8_v2(out_dev, 0, out_bytes) };
+    let _ = unsafe { sys::cuMemsetD8_v2(lse_dev, 0, lse_bytes) };
+    let _ = unsafe { sys::cuMemsetD8_v2(dq_dev, 0, dq_bytes) };
+    let _ = unsafe { sys::cuMemsetD8_v2(dk_scratch_dev, 0, dkv_scratch_bytes) };
+    let _ = unsafe { sys::cuMemsetD8_v2(dv_scratch_dev, 0, dkv_scratch_bytes) };
 
     // Tier B skip-decision buffer for the BACKWARD launch (writeback fires
     // inside `emit_skip_predicate` for both forward and backward; same slot
@@ -1086,7 +1106,7 @@ pub unsafe fn run_fixture_backward(
         let num_kv = (fixture.seq_len).div_ceil(fixture.config.block_kv as u32) as usize;
         let n_slots = (fixture.batch as usize) * (heads as usize) * num_q * num_kv;
         let dev = alloc(n_slots, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
-        let rc = sys::cuMemsetD8_v2(dev, 0, n_slots);
+        let rc = unsafe { sys::cuMemsetD8_v2(dev, 0, n_slots) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(cleanup_and(
                 &allocations,
@@ -1118,11 +1138,13 @@ pub unsafe fn run_fixture_backward(
     };
     const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: sys::CUfunction_attribute =
         sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
-    let _ = sys::cuFuncSetAttribute(
-        fwd_func,
-        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        fwd_shmem_bytes as i32,
-    );
+    let _ = unsafe {
+        sys::cuFuncSetAttribute(
+            fwd_func,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            fwd_shmem_bytes as i32,
+        )
+    };
 
     // -- Step B8: SMEM opt-in for backward. --
     let bwd_shmem_bytes_base = shared_mem_bytes_v2_backward_with_seqlen(
@@ -1142,11 +1164,13 @@ pub unsafe fn run_fixture_backward(
     } else {
         bwd_shmem_bytes_base
     };
-    let _ = sys::cuFuncSetAttribute(
-        bwd_func,
-        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        bwd_shmem_bytes as i32,
-    );
+    let _ = unsafe {
+        sys::cuFuncSetAttribute(
+            bwd_func,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            bwd_shmem_bytes as i32,
+        )
+    };
 
     // -- Step B9: Build forward kernel-args (37 slots + optional 38th). --
     // Mirrors the 37-slot list in `run_fixture`.
@@ -1239,22 +1263,24 @@ pub unsafe fn run_fixture_backward(
     // -- Step B10: Launch FORWARD (one shot, results consumed by backward). --
     let fwd_grid_x = fixture.seq_len.div_ceil(fixture.config.block_q as u32);
     let fwd_grid_y = fixture.batch * heads;
-    let rc = sys::cuLaunchKernel(
-        fwd_func,
-        fwd_grid_x, fwd_grid_y, 1,
-        128, 1, 1,
-        fwd_shmem_bytes,
-        std::ptr::null_mut(),
-        fwd_args.as_mut_ptr(),
-        std::ptr::null_mut(),
-    );
+    let rc = unsafe {
+        sys::cuLaunchKernel(
+            fwd_func,
+            fwd_grid_x, fwd_grid_y, 1,
+            128, 1, 1,
+            fwd_shmem_bytes,
+            std::ptr::null_mut(),
+            fwd_args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
             format!("cuLaunchKernel(forward) rc={:?}: {}", rc, cu_error_string(rc)),
         ));
     }
-    let rc = sys::cuCtxSynchronize();
+    let rc = unsafe { sys::cuCtxSynchronize() };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
@@ -1421,11 +1447,11 @@ pub unsafe fn run_fixture_backward(
 
     let mut start_evt: sys::CUevent = std::ptr::null_mut();
     let mut stop_evt: sys::CUevent = std::ptr::null_mut();
-    let _ = sys::cuEventCreate(&mut start_evt, 0);
-    let _ = sys::cuEventCreate(&mut stop_evt, 0);
+    let _ = unsafe { sys::cuEventCreate(&mut start_evt, 0) };
+    let _ = unsafe { sys::cuEventCreate(&mut stop_evt, 0) };
     let mut times_ms: Vec<f32> = Vec::with_capacity(iterations as usize);
     for _it in 0..iterations.max(1) {
-        let _ = sys::cuEventRecord(start_evt, std::ptr::null_mut());
+        let _ = unsafe { sys::cuEventRecord(start_evt, std::ptr::null_mut()) };
         let mut launch_rc = sys::CUresult::CUDA_SUCCESS;
         for q_block in 0..q_blocks_bwd {
             // Thread the q-block base into seq_lens_ptr slot via `bw_seq_lens`.
@@ -1435,23 +1461,25 @@ pub unsafe fn run_fixture_backward(
             // analysis can't see the read-through-ptr.
             bw_seq_lens = (q_block as u64) * (fixture.config.block_q as u64);
             let _ = std::hint::black_box(&bw_seq_lens);
-            let rc = sys::cuLaunchKernel(
-                bwd_func,
-                1, bwd_grid_y, 1,
-                128, 1, 1,
-                bwd_shmem_bytes,
-                std::ptr::null_mut(),
-                bwd_args.as_mut_ptr(),
-                std::ptr::null_mut(),
-            );
+            let rc = unsafe {
+                sys::cuLaunchKernel(
+                    bwd_func,
+                    1, bwd_grid_y, 1,
+                    128, 1, 1,
+                    bwd_shmem_bytes,
+                    std::ptr::null_mut(),
+                    bwd_args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
             if rc != sys::CUresult::CUDA_SUCCESS {
                 launch_rc = rc;
                 break;
             }
         }
         if launch_rc != sys::CUresult::CUDA_SUCCESS {
-            let _ = sys::cuEventDestroy_v2(start_evt);
-            let _ = sys::cuEventDestroy_v2(stop_evt);
+            let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+            let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
             return Err(cleanup_and(
                 &allocations,
                 format!(
@@ -1460,15 +1488,15 @@ pub unsafe fn run_fixture_backward(
                 ),
             ));
         }
-        let _ = sys::cuEventRecord(stop_evt, std::ptr::null_mut());
-        let _ = sys::cuEventSynchronize(stop_evt);
+        let _ = unsafe { sys::cuEventRecord(stop_evt, std::ptr::null_mut()) };
+        let _ = unsafe { sys::cuEventSynchronize(stop_evt) };
         let mut ms: f32 = 0.0;
-        let _ = sys::cuEventElapsedTime_v2(&mut ms, start_evt, stop_evt);
+        let _ = unsafe { sys::cuEventElapsedTime_v2(&mut ms, start_evt, stop_evt) };
         times_ms.push(ms);
     }
-    let _ = sys::cuEventDestroy_v2(start_evt);
-    let _ = sys::cuEventDestroy_v2(stop_evt);
-    let rc = sys::cuCtxSynchronize();
+    let _ = unsafe { sys::cuEventDestroy_v2(start_evt) };
+    let _ = unsafe { sys::cuEventDestroy_v2(stop_evt) };
+    let rc = unsafe { sys::cuCtxSynchronize() };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
@@ -1495,7 +1523,7 @@ pub unsafe fn run_fixture_backward(
     // because the leaked sub-ULP contributions round to zero (matching
     // the forward parity assertion which compares f16 `out` directly).
     let mut host_dq = vec![0u8; dq_bytes];
-    let rc = sys::cuMemcpyDtoH_v2(host_dq.as_mut_ptr() as *mut c_void, dq_dev, dq_bytes);
+    let rc = unsafe { sys::cuMemcpyDtoH_v2(host_dq.as_mut_ptr() as *mut c_void, dq_dev, dq_bytes) };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
@@ -1503,7 +1531,7 @@ pub unsafe fn run_fixture_backward(
         ));
     }
     let mut host_dk_f32_bytes = vec![0u8; dkv_scratch_bytes];
-    let rc = sys::cuMemcpyDtoH_v2(host_dk_f32_bytes.as_mut_ptr() as *mut c_void, dk_scratch_dev, dkv_scratch_bytes);
+    let rc = unsafe { sys::cuMemcpyDtoH_v2(host_dk_f32_bytes.as_mut_ptr() as *mut c_void, dk_scratch_dev, dkv_scratch_bytes) };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
@@ -1511,7 +1539,7 @@ pub unsafe fn run_fixture_backward(
         ));
     }
     let mut host_dv_f32_bytes = vec![0u8; dkv_scratch_bytes];
-    let rc = sys::cuMemcpyDtoH_v2(host_dv_f32_bytes.as_mut_ptr() as *mut c_void, dv_scratch_dev, dkv_scratch_bytes);
+    let rc = unsafe { sys::cuMemcpyDtoH_v2(host_dv_f32_bytes.as_mut_ptr() as *mut c_void, dv_scratch_dev, dkv_scratch_bytes) };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
@@ -1540,7 +1568,7 @@ pub unsafe fn run_fixture_backward(
     // -- Step B14: Optional skip-ratio readback from the backward writeback. --
     let skip_ratio = if let Some((dev_ptr, byte_len)) = skip_decisions_buf {
         let mut host = vec![0u8; byte_len];
-        let rc = sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut c_void, dev_ptr, byte_len);
+        let rc = unsafe { sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut c_void, dev_ptr, byte_len) };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(cleanup_and(
                 &allocations,
@@ -1556,7 +1584,7 @@ pub unsafe fn run_fixture_backward(
     };
 
     // -- Step B15: Cleanup. --
-    for p in &allocations { let _ = sys::cuMemFree_v2(*p); }
+    for p in &allocations { let _ = unsafe { sys::cuMemFree_v2(*p) }; }
     free_modules(fwd_module, bwd_module);
 
     Ok(LaunchResult { median_us, skip_ratio })
@@ -1646,9 +1674,9 @@ unsafe fn free_all_and(
     err_msg: String,
 ) -> String {
     for p in allocations {
-        let _ = sys::cuMemFree_v2(*p);
+        let _ = unsafe { sys::cuMemFree_v2(*p) };
     }
-    let _ = sys::cuModuleUnload(module);
+    let _ = unsafe { sys::cuModuleUnload(module) };
     err_msg
 }
 

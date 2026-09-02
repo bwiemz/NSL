@@ -218,7 +218,7 @@ impl KvCacheManager {
 /// `handle` must be a valid pointer returned by [`nsl_kv_cache_init`] or
 /// [`nsl_kv_cache_init_gpu`].
 unsafe fn from_handle(handle: i64) -> &'static Mutex<KvCacheManager> {
-    &*(handle as *const Mutex<KvCacheManager>)
+    unsafe { &*(handle as *const Mutex<KvCacheManager>) }
 }
 
 /// Create a new CPU-backed KV-cache manager and return an opaque handle.

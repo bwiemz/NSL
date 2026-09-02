@@ -7436,20 +7436,22 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations_into(
     batch: i64, heads: i64, seq: i64, head_dim: i64,
     out_ptr: i64,
 ) -> i64 {
-    let a = nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim);
+    let a = unsafe { nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim) };
     if out_ptr == 0 {
         // No slot to write into — free immediately to avoid leak and fail.
-        nsl_csha_free_backward_activations(a);
+        unsafe { nsl_csha_free_backward_activations(a) };
         return -1;
     }
     let slots = out_ptr as *mut i64;
     // SAFETY: caller guarantees at least 6 i64 slots.
-    slots.add(0).write(a.q_proj);
-    slots.add(1).write(a.k_proj);
-    slots.add(2).write(a.v_proj);
-    slots.add(3).write(a.row_max);
-    slots.add(4).write(a.row_sum);
-    slots.add(5).write(a.x_raw);
+    unsafe {
+        slots.add(0).write(a.q_proj);
+        slots.add(1).write(a.k_proj);
+        slots.add(2).write(a.v_proj);
+        slots.add(3).write(a.row_max);
+        slots.add(4).write(a.row_sum);
+        slots.add(5).write(a.x_raw);
+    }
     0
 }
 
@@ -7468,7 +7470,7 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations_from(
     let a = CshaBackwardActivations {
         q_proj, k_proj, v_proj, row_max, row_sum, x_raw,
     };
-    nsl_csha_free_backward_activations(a);
+    unsafe { nsl_csha_free_backward_activations(a) };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

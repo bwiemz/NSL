@@ -440,9 +440,9 @@ fn check_help_flag(state: &ArgState) {
 /// `name_ptr` must point to `name_len` valid UTF-8 bytes for the duration of
 /// the call.
 unsafe fn name_from_parts(name_ptr: i64, name_len: i64) -> String {
-    let slice = std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
+    let slice = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     // SAFETY: caller guarantees valid UTF-8
-    std::str::from_utf8_unchecked(slice).to_string()
+    unsafe { std::str::from_utf8_unchecked(slice) }.to_string()
 }
 
 /// Find `--<name> <value>` in args.  Returns (value, index_of_flag) on success.

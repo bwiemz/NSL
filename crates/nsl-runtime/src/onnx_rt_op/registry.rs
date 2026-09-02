@@ -157,7 +157,7 @@ unsafe extern "C" fn vtable_get_name(op: *const OrtCustomOp) -> *const c_char {
     // SAFETY: `op` comes back from `make_custom_op_for_export`, which set
     // `vtable` as the first field of `PerExportVtable`. Zero-offset cast.
     let entry = op as *const PerExportVtable;
-    (*entry).name_cstr.as_ptr()
+    unsafe { (*entry).name_cstr.as_ptr() }
 }
 
 unsafe extern "C" fn vtable_get_ep_type(_op: *const OrtCustomOp) -> *const c_char {
@@ -170,7 +170,7 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let raw_fn = (*entry).cached_dispatch_fn;
+    let raw_fn = unsafe { (*entry).cached_dispatch_fn };
     if raw_fn == 0 {
         // Symbol not found at registration time — return null kernel so ORT
         // rejects this op. (No status-returning variant in V1 — M62c migrates
@@ -180,7 +180,7 @@ unsafe extern "C" fn vtable_create_kernel(
     // SAFETY: `cached_dispatch_fn` was set by `resolve_self_symbol` to a
     // non-null pointer to a symbol codegen emitted with the `ExportFnPtr`
     // signature.
-    let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
+    let fn_ptr: ExportFnPtr = unsafe { std::mem::transmute::<usize, ExportFnPtr>(raw_fn) };
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
@@ -196,7 +196,7 @@ unsafe extern "C" fn vtable_create_kernel(
 
 unsafe extern "C" fn vtable_kernel_destroy(state: *mut c_void) {
     if !state.is_null() {
-        drop(Box::from_raw(state as *mut NslOrtKernelState));
+        drop(unsafe { Box::from_raw(state as *mut NslOrtKernelState) });
     }
 }
 
@@ -278,18 +278,18 @@ unsafe extern "C" fn vtable_create_kernel_v2(
     kernel_out: *mut *mut c_void,
 ) -> *mut OrtStatus {
     let entry = op as *const PerExportVtable;
-    let raw_fn = (*entry).cached_dispatch_fn;
+    let raw_fn = unsafe { (*entry).cached_dispatch_fn };
     if raw_fn == 0 {
         // Dispatch symbol not found — zero out *kernel_out so ORT sees a
         // null kernel (not uninitialized stack garbage) and return an error
         // status so ORT rejects this op cleanly.
         if !kernel_out.is_null() {
-            *kernel_out = std::ptr::null_mut();
+            unsafe { *kernel_out = std::ptr::null_mut() };
         }
         let msg = c"NSL: __nsl_dispatch symbol not found in shared library".as_ptr();
-        return ((*api).CreateStatus)(OrtErrorCode::ORT_INVALID_ARGUMENT, msg);
+        return unsafe { ((*api).CreateStatus)(OrtErrorCode::ORT_INVALID_ARGUMENT, msg) };
     }
-    let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
+    let fn_ptr: ExportFnPtr = unsafe { std::mem::transmute::<usize, ExportFnPtr>(raw_fn) };
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
@@ -298,7 +298,7 @@ unsafe extern "C" fn vtable_create_kernel_v2(
         // in the codegen-emitted typed wrapper without being a real model ptr.
         model_ptr: 1,
     });
-    *kernel_out = Box::into_raw(state) as *mut c_void;
+    unsafe { *kernel_out = Box::into_raw(state) as *mut c_void };
     std::ptr::null_mut()
 }
 
@@ -308,7 +308,7 @@ unsafe extern "C" fn vtable_kernel_compute_v2(
     context: *mut OrtKernelContext,
 ) -> *mut OrtStatus {
     if !op_kernel.is_null() {
-        nsl_ort_kernel_compute(op_kernel, context);
+        unsafe { nsl_ort_kernel_compute(op_kernel, context) };
     }
     std::ptr::null_mut()
 }
@@ -391,7 +391,7 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
         // RTLD_SELF (-3) searches only the calling library — works even when
         // ORT loaded us with RTLD_LOCAL.
         const RTLD_SELF: *mut c_void = (-3isize) as *mut c_void;
-        let p = dlsym(RTLD_SELF, name_ptr);
+        let p = unsafe { dlsym(RTLD_SELF, name_ptr) };
         p as usize
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -419,18 +419,18 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
             dli_sname: std::ptr::null(),
             dli_saddr: std::ptr::null_mut(),
         };
-        let ok = dladdr(resolve_self_symbol as *const c_void, &mut info);
+        let ok = unsafe { dladdr(resolve_self_symbol as *const c_void, &mut info) };
         if ok == 0 || info.dli_fname.is_null() {
             return 0;
         }
         // RTLD_LAZY=1, RTLD_NOLOAD=4 (glibc / musl).
         const RTLD_LAZY: i32 = 1;
         const RTLD_NOLOAD: i32 = 4;
-        let handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY);
+        let handle = unsafe { dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY) };
         if handle.is_null() {
             return 0;
         }
-        let p = dlsym(handle, name_ptr);
+        let p = unsafe { dlsym(handle, name_ptr) };
         p as usize
     }
     #[cfg(windows)]
@@ -454,16 +454,18 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
         // to live in our DLL. The `module_name` parameter is repurposed
         // (with the FROM_ADDRESS flag) to mean "find the module containing
         // this address".
-        let ok = GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            resolve_self_symbol as *const u16,
-            &mut module,
-        );
+        let ok = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                resolve_self_symbol as *const u16,
+                &mut module,
+            )
+        };
         if ok == 0 || module.is_null() {
             return 0;
         }
-        GetProcAddress(module, name_ptr) as usize
+        unsafe { GetProcAddress(module, name_ptr) as usize }
     }
     #[cfg(not(any(unix, windows)))]
     {

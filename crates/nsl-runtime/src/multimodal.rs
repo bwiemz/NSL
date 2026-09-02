@@ -50,13 +50,13 @@ fn alloc_f32_tensor(shape: &[i64]) -> i64 {
 
 /// Get f32 data slice from tensor.
 unsafe fn f32_data(t: &NslTensor) -> &[f32] {
-    std::slice::from_raw_parts(t.data as *const f32, t.len as usize)
+    unsafe { std::slice::from_raw_parts(t.data as *const f32, t.len as usize) }
 }
 
 /// Get mutable f32 data slice from tensor pointer.
 unsafe fn f32_data_mut(ptr: i64) -> &'static mut [f32] {
-    let t = &*(ptr as *const NslTensor);
-    std::slice::from_raw_parts_mut(t.data as *mut f32, t.len as usize)
+    let t = unsafe { &*(ptr as *const NslTensor) };
+    unsafe { std::slice::from_raw_parts_mut(t.data as *mut f32, t.len as usize) }
 }
 
 // ---------------------------------------------------------------------------

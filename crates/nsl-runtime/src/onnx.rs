@@ -89,16 +89,16 @@ unsafe fn tensor_raw_bytes(t: &NslTensor) -> (Vec<u8>, i32) {
     let len = t.len as usize;
     match t.dtype {
         DTYPE_F64 => {
-            let slice = std::slice::from_raw_parts(t.data as *const f64, len);
+            let slice = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
             (slice.iter().flat_map(|v| v.to_le_bytes()).collect(), DOUBLE)
         }
         DTYPE_F32 => {
-            let slice = std::slice::from_raw_parts(t.data as *const f32, len);
+            let slice = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
             (slice.iter().flat_map(|v| v.to_le_bytes()).collect(), FLOAT)
         }
         DTYPE_FP16 => {
             // ONNX FLOAT16 raw_data is the little-endian half bits verbatim.
-            let slice = std::slice::from_raw_parts(t.data as *const u16, len);
+            let slice = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
             (slice.iter().flat_map(|v| v.to_le_bytes()).collect(), FLOAT16)
         }
         d if d >= DTYPE_CUSTOM_START => panic!(

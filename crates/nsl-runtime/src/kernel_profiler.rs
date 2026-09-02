@@ -437,7 +437,7 @@ pub unsafe extern "C" fn nsl_kernel_profiler_flush(path_ptr: *const u8, path_len
     let path = if path_ptr.is_null() || path_len <= 0 {
         "kernel_profile.json".to_string()
     } else {
-        let bytes = std::slice::from_raw_parts(path_ptr, path_len as usize);
+        let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len as usize) };
         std::str::from_utf8(bytes).unwrap_or("kernel_profile.json").to_string()
     };
 

@@ -28,7 +28,7 @@ fn fnv1a(s: &[u8]) -> u64 {
 }
 
 unsafe fn as_cstr(ptr: i64) -> &'static CStr {
-    CStr::from_ptr(ptr as *const c_char)
+    unsafe { CStr::from_ptr(ptr as *const c_char) }
 }
 
 fn copy_cstr(s: &[u8]) -> *mut u8 {
@@ -49,22 +49,24 @@ impl NslDict {
         let new_buckets = checked_alloc((new_cap as usize) * std::mem::size_of::<*mut NslDictEntry>())
             as *mut *mut NslDictEntry;
         for i in 0..new_cap as usize {
-            *new_buckets.add(i) = std::ptr::null_mut();
+            unsafe { *new_buckets.add(i) = std::ptr::null_mut() };
         }
         for i in 0..self.num_buckets as usize {
-            let mut e = *self.buckets.add(i);
+            let mut e = unsafe { *self.buckets.add(i) };
             while !e.is_null() {
-                let next = (*e).next;
-                let key_bytes = CStr::from_ptr((*e).key as *const c_char).to_bytes();
-                let idx = (fnv1a(key_bytes) % new_cap as u64) as usize;
-                (*e).next = *new_buckets.add(idx);
-                *new_buckets.add(idx) = e;
-                e = next;
+                unsafe {
+                    let next = (*e).next;
+                    let key_bytes = CStr::from_ptr((*e).key as *const c_char).to_bytes();
+                    let idx = (fnv1a(key_bytes) % new_cap as u64) as usize;
+                    (*e).next = *new_buckets.add(idx);
+                    *new_buckets.add(idx) = e;
+                    e = next;
+                }
             }
         }
         // Free old buckets array (not entries — they've been re-linked into new_buckets)
         let old_size = (self.num_buckets as usize) * std::mem::size_of::<*mut NslDictEntry>();
-        crate::memory::checked_free(self.buckets as *mut u8, old_size);
+        unsafe { crate::memory::checked_free(self.buckets as *mut u8, old_size) };
         self.buckets = new_buckets;
         self.num_buckets = new_cap;
     }

@@ -209,7 +209,7 @@ pub extern "C" fn nsl_profiler_stop() {
 #[no_mangle]
 pub unsafe extern "C" fn nsl_profiler_dump(path_ptr: *const u8, path_len: i64) {
     let path_str = {
-        let slice = std::slice::from_raw_parts(path_ptr, path_len as usize);
+        let slice = unsafe { std::slice::from_raw_parts(path_ptr, path_len as usize) };
         std::str::from_utf8(slice).unwrap_or("memory_profile.json")
     };
 

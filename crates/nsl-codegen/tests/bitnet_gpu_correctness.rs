@@ -294,27 +294,27 @@ mod gpu {
     /// when no device is usable, so the tests can skip rather than fail.
     pub unsafe fn ensure_context() -> bool {
         let mut ctx: sys::CUcontext = std::ptr::null_mut();
-        if sys::cuCtxGetCurrent(&mut ctx) == sys::CUresult::CUDA_SUCCESS && !ctx.is_null() {
+        if unsafe { sys::cuCtxGetCurrent(&mut ctx) } == sys::CUresult::CUDA_SUCCESS && !ctx.is_null() {
             return true;
         }
-        if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
+        if unsafe { sys::cuInit(0) } != sys::CUresult::CUDA_SUCCESS {
             return false;
         }
         let mut dev: sys::CUdevice = 0;
-        if sys::cuDeviceGet(&mut dev, 0) != sys::CUresult::CUDA_SUCCESS {
+        if unsafe { sys::cuDeviceGet(&mut dev, 0) } != sys::CUresult::CUDA_SUCCESS {
             return false;
         }
-        if sys::cuDevicePrimaryCtxRetain(&mut ctx, dev) != sys::CUresult::CUDA_SUCCESS {
+        if unsafe { sys::cuDevicePrimaryCtxRetain(&mut ctx, dev) } != sys::CUresult::CUDA_SUCCESS {
             return false;
         }
-        sys::cuCtxSetCurrent(ctx) == sys::CUresult::CUDA_SUCCESS
+        unsafe { sys::cuCtxSetCurrent(ctx) == sys::CUresult::CUDA_SUCCESS }
     }
 
     /// True when the device reports at least `bytes` of free VRAM.
     pub unsafe fn has_free_vram(bytes: u64) -> bool {
         let mut free: usize = 0;
         let mut total: usize = 0;
-        if sys::cuMemGetInfo_v2(&mut free, &mut total) != sys::CUresult::CUDA_SUCCESS {
+        if unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) } != sys::CUresult::CUDA_SUCCESS {
             return false;
         }
         free as u64 >= bytes
@@ -332,13 +332,15 @@ mod gpu {
             err_log.as_mut_ptr() as *mut c_void,
             err_log.len() as *mut c_void,
         ];
-        let rc = sys::cuModuleLoadDataEx(
-            &mut module,
-            ptx_c.as_ptr() as *const c_void,
-            options.len() as u32,
-            options.as_mut_ptr(),
-            values.as_mut_ptr(),
-        );
+        let rc = unsafe {
+            sys::cuModuleLoadDataEx(
+                &mut module,
+                ptx_c.as_ptr() as *const c_void,
+                options.len() as u32,
+                options.as_mut_ptr(),
+                values.as_mut_ptr(),
+            )
+        };
         if rc != sys::CUresult::CUDA_SUCCESS {
             let nul = err_log.iter().position(|&b| b == 0).unwrap_or(err_log.len());
             return Err(format!(
@@ -362,10 +364,10 @@ mod gpu {
         block_n: u32,
         weight_scale: f32,
     ) -> Result<Vec<f32>, String> {
-        let module = load_module(ptx)?;
+        let module = unsafe { load_module(ptx) }?;
         let name_c = CString::new(kernel_name).map_err(|_| "bad kernel name".to_string())?;
         let mut func: sys::CUfunction = std::ptr::null_mut();
-        if sys::cuModuleGetFunction(&mut func, module, name_c.as_ptr())
+        if unsafe { sys::cuModuleGetFunction(&mut func, module, name_c.as_ptr()) }
             != sys::CUresult::CUDA_SUCCESS
         {
             return Err(format!("cuModuleGetFunction({kernel_name}) failed"));
@@ -389,15 +391,15 @@ mod gpu {
         let mut d_act: sys::CUdeviceptr = 0;
         let mut d_w: sys::CUdeviceptr = 0;
         let mut d_y: sys::CUdeviceptr = 0;
-        if sys::cuMemAlloc_v2(&mut d_act, act_bytes) != sys::CUresult::CUDA_SUCCESS
-            || sys::cuMemAlloc_v2(&mut d_w, w_bytes) != sys::CUresult::CUDA_SUCCESS
-            || sys::cuMemAlloc_v2(&mut d_y, y_bytes) != sys::CUresult::CUDA_SUCCESS
+        if unsafe { sys::cuMemAlloc_v2(&mut d_act, act_bytes) } != sys::CUresult::CUDA_SUCCESS
+            || unsafe { sys::cuMemAlloc_v2(&mut d_w, w_bytes) } != sys::CUresult::CUDA_SUCCESS
+            || unsafe { sys::cuMemAlloc_v2(&mut d_y, y_bytes) } != sys::CUresult::CUDA_SUCCESS
         {
             return Err("cuMemAlloc failed".to_string());
         }
-        sys::cuMemcpyHtoD_v2(d_act, acts_f16_bits.as_ptr() as *const c_void, act_bytes);
-        sys::cuMemcpyHtoD_v2(d_w, packed.as_ptr() as *const c_void, w_bytes);
-        sys::cuMemsetD8_v2(d_y, 0, y_bytes);
+        unsafe { sys::cuMemcpyHtoD_v2(d_act, acts_f16_bits.as_ptr() as *const c_void, act_bytes) };
+        unsafe { sys::cuMemcpyHtoD_v2(d_w, packed.as_ptr() as *const c_void, w_bytes) };
+        unsafe { sys::cuMemsetD8_v2(d_y, 0, y_bytes) };
 
         let mut p_act = d_act;
         let mut p_w = d_w;
@@ -411,24 +413,26 @@ mod gpu {
         ];
 
         let grid_y = out_dim.div_ceil(block_n);
-        let rc = sys::cuLaunchKernel(
-            func, rows, grid_y, 1, block_n, 1, 1, 0, std::ptr::null_mut(),
-            params.as_mut_ptr(), std::ptr::null_mut(),
-        );
+        let rc = unsafe {
+            sys::cuLaunchKernel(
+                func, rows, grid_y, 1, block_n, 1, 1, 0, std::ptr::null_mut(),
+                params.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!("cuLaunchKernel rc={rc:?}"));
         }
-        if sys::cuCtxSynchronize() != sys::CUresult::CUDA_SUCCESS {
+        if unsafe { sys::cuCtxSynchronize() } != sys::CUresult::CUDA_SUCCESS {
             return Err("cuCtxSynchronize failed (kernel faulted)".to_string());
         }
 
         let mut out_bits = vec![0u16; y_elems];
-        sys::cuMemcpyDtoH_v2(out_bits.as_mut_ptr() as *mut c_void, d_y, y_bytes);
+        unsafe { sys::cuMemcpyDtoH_v2(out_bits.as_mut_ptr() as *mut c_void, d_y, y_bytes) };
 
-        sys::cuMemFree_v2(d_act);
-        sys::cuMemFree_v2(d_w);
-        sys::cuMemFree_v2(d_y);
-        sys::cuModuleUnload(module);
+        unsafe { sys::cuMemFree_v2(d_act) };
+        unsafe { sys::cuMemFree_v2(d_w) };
+        unsafe { sys::cuMemFree_v2(d_y) };
+        unsafe { sys::cuModuleUnload(module) };
 
         Ok(out_bits
             .into_iter()

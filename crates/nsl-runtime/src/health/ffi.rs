@@ -29,7 +29,7 @@ pub unsafe extern "C" fn nsl_health_record_grad_norm(
     if path_ptr.is_null() {
         return;
     }
-    let bytes = std::slice::from_raw_parts(path_ptr, path_len);
+    let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
     if let Ok(path) = std::str::from_utf8(bytes) {
         COLLECTOR
             .lock()
@@ -50,7 +50,7 @@ pub unsafe extern "C" fn nsl_health_record_weight_norm(
     if path_ptr.is_null() {
         return;
     }
-    let bytes = std::slice::from_raw_parts(path_ptr, path_len);
+    let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
     if let Ok(path) = std::str::from_utf8(bytes) {
         COLLECTOR
             .lock()
@@ -79,7 +79,7 @@ pub unsafe extern "C" fn nsl_health_flush_snapshot(
         println!("{}", json);
         return 0;
     }
-    let bytes = std::slice::from_raw_parts(path_ptr, path_len);
+    let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
     let s = match std::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(_) => return 2,

@@ -169,8 +169,8 @@ pub unsafe extern "C" fn nsl_wrga_register_fused_ptx(
     if handle < 0 || ptx.is_null() || ptx_len <= 0 || kernel_name.is_null() || name_len <= 0 {
         return;
     }
-    let ptx_bytes = std::slice::from_raw_parts(ptx, ptx_len as usize);
-    let name_bytes = std::slice::from_raw_parts(kernel_name, name_len as usize);
+    let ptx_bytes = unsafe { std::slice::from_raw_parts(ptx, ptx_len as usize) };
+    let name_bytes = unsafe { std::slice::from_raw_parts(kernel_name, name_len as usize) };
     let ptx_str = match std::str::from_utf8(ptx_bytes) {
         Ok(s) => s.to_string(),
         Err(_) => return,
