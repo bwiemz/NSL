@@ -39,20 +39,21 @@ fn fixture_path() -> PathBuf {
 /// "test-hooks" in their features, and return the newest matching lib.
 /// If none is found we return `None` and let the linker use its own heuristic.
 fn find_test_hooks_runtime_lib() -> Option<PathBuf> {
-    // Walk from CARGO_MANIFEST_DIR up to find target/debug/deps.
-    let start = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut dir = start.clone();
-    for _ in 0..6 {
-        let fingerprints_dir = dir.join("target").join("debug").join(".fingerprint");
-        let deps_dir = dir.join("target").join("debug").join("deps");
-        if fingerprints_dir.is_dir() && deps_dir.is_dir() {
-            return find_test_hooks_lib_in(&fingerprints_dir, &deps_dir);
-        }
-        if !dir.pop() {
-            break;
-        }
+    // This test binary lives at `<target>/<profile>/deps/<name>-<hash>`, so
+    // the profile dir is two levels up from it. Deriving it from the
+    // executable rather than walking up from CARGO_MANIFEST_DIR for a
+    // literal `target/` keeps the lookup correct under CARGO_TARGET_DIR,
+    // where the old walk found nothing and silently handed the linker its
+    // own (feature-blind) heuristic.
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let fingerprints_dir = profile_dir.join(".fingerprint");
+    let deps_dir = profile_dir.join("deps");
+    if fingerprints_dir.is_dir() && deps_dir.is_dir() {
+        find_test_hooks_lib_in(&fingerprints_dir, &deps_dir)
+    } else {
+        None
     }
-    None
 }
 
 /// Return true iff the fingerprint JSON content has "test-hooks" in the
@@ -124,8 +125,7 @@ fn find_test_hooks_lib_in(fingerprints_dir: &Path, deps_dir: &Path) -> Option<Pa
     }
 
     // Return the most recently modified test-hooks lib.
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    candidates.into_iter().next().map(|(_, p)| p)
+    candidates.into_iter().max_by_key(|(mtime, _)| *mtime).map(|(_, p)| p)
 }
 
 /// Invoke `cargo run -p nsl-cli -- build --shared-lib [--source-ad] <fixture> -o <out>`
@@ -136,9 +136,10 @@ fn find_test_hooks_lib_in(fingerprints_dir: &Path, deps_dir: &Path) -> Option<Pa
 /// `cargo test` or as a standalone binary, and the correct feature flags are
 /// forwarded automatically.
 ///
-/// If a test-hooks runtime lib can be located in `target/debug/deps/`, it is
-/// passed via `NSL_RUNTIME_LIB_PATH_OVERRIDE` to ensure the linker inside
-/// the spawned nsl-cli process picks the right library.
+/// If a test-hooks runtime lib can be located in this test binary's
+/// `<profile>/deps/`, it is passed via `NSL_RUNTIME_LIB_PATH_OVERRIDE` to
+/// ensure the linker inside the spawned nsl-cli process picks the right
+/// library.
 fn build_fixture(source_ad: bool, out_dir: &Path) -> PathBuf {
     let fixture = fixture_path();
     let root = workspace_root();
@@ -188,12 +189,21 @@ fn build_fixture(source_ad: bool, out_dir: &Path) -> PathBuf {
     // linker.rs's find_feature_matched_runtime_lib only checks the CUDA
     // feature, so it can select the wrong lib when both test-hooks and
     // non-test-hooks builds coexist.
-    if let Some(lib_path) = find_test_hooks_runtime_lib() {
-        eprintln!(
-            "[fase_peak_memory] setting NSL_RUNTIME_LIB_PATH_OVERRIDE={}",
-            lib_path.display()
-        );
-        cmd.env("NSL_RUNTIME_LIB_PATH_OVERRIDE", &lib_path);
+    match find_test_hooks_runtime_lib() {
+        Some(lib_path) => {
+            eprintln!(
+                "[fase_peak_memory] setting NSL_RUNTIME_LIB_PATH_OVERRIDE={}",
+                lib_path.display()
+            );
+            cmd.env("NSL_RUNTIME_LIB_PATH_OVERRIDE", &lib_path);
+        }
+        None => eprintln!(
+            "[fase_peak_memory] no test-hooks runtime lib found next to {}; \
+             the linker's own (feature-blind) heuristic will pick the lib",
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown exe>".into())
+        ),
     }
 
     let output = cmd.output().expect("failed to spawn cargo run nsl-cli build");
