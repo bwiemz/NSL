@@ -1,0 +1,30 @@
+# Where INDENT / DEDENT / NEWLINE are synthesized.
+fn outer(x: int) -> int:
+    if x > 0:
+        let y = x * 2
+
+        # a comment-only or blank line emits a NEWLINE but no INDENT/DEDENT
+  # whatever its indentation, so the block is unaffected
+        return y
+    else:
+        return 0
+let after = outer(1)
+
+# Brackets suppress newlines until they close, whatever the indentation.
+let items = [
+    1,
+  2,
+        3,
+]
+let call = f(a,
+    b)
+
+# A backslash continues the line without a NEWLINE.
+let long = 1 + \
+    2 + \
+    3
+
+# Attribute lines are skipped by the lexer.
+#[cfg(test)]
+fn last():
+    pass_through()

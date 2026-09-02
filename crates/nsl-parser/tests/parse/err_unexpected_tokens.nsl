@@ -1,0 +1,10 @@
+# Statement-level junk, a missing colon, an unclosed bracket and a stray
+# closing paren; the parser must resynchronise after each.
+let a = 1
+) + 2
+if a > 0
+    print(a)
+let xs = [1, 2, 3
+let b = 2
+let c = a b
+let d = 3

@@ -1,0 +1,16 @@
+# Binding power and associativity of every binary and unary operator.
+let arith = a + b * c - d / e // f % g
+let pow_right = a ** b ** c
+let neg_pow = -a ** 2
+let matmul = a @ b @ c
+let compare = a < b and b <= c or not d == e
+let mixed = a + b == c * d
+let bits = a | b & c
+let ranges = 0..10
+let inclusive = 0..=n - 1
+let membership = x in items and y is none
+let piped = input |> embed |> norm(eps=1e-5) |> head
+let chained = a.b.c(1).d[2](3)
+let paren = (a + b) * c
+let unary_chain = not not -x
+let await_it = await fetch()

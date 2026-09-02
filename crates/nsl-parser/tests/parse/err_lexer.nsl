@@ -1,0 +1,7 @@
+# Lexer-level errors: an invalid character, an unterminated string and a
+# malformed number, each on its own line.
+let a = 1
+let b = a $ 2
+let c = "unterminated
+let d = 0x
+let e = 5

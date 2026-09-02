@@ -1,0 +1,4 @@
+# `mut` is a reserved keyword but `let mut` is not a declaration form.
+let mut counter = 0
+counter = counter + 1
+print(counter)

@@ -1,0 +1,169 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/imports.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: Import(
+                ImportStmt {
+                    path: [
+                        `nsl`,
+                        `math`,
+                    ],
+                    items: Module,
+                    alias: None,
+                    span: 2:1-3:1,
+                },
+            ),
+            span: 2:1-3:1,
+        },
+        Stmt {
+            kind: Import(
+                ImportStmt {
+                    path: [
+                        `nsl`,
+                        `math`,
+                    ],
+                    items: Module,
+                    alias: Some(`math`),
+                    span: 3:1-4:1,
+                },
+            ),
+            span: 3:1-4:1,
+        },
+        Stmt {
+            kind: Import(
+                ImportStmt {
+                    path: [
+                        `nsl`,
+                        `nn`,
+                    ],
+                    items: Named(
+                        [
+                            ImportItem {
+                                name: `Linear`,
+                                alias: None,
+                                span: 4:16-4:22,
+                            },
+                            ImportItem {
+                                name: `LayerNorm`,
+                                alias: None,
+                                span: 4:24-4:33,
+                            },
+                            ImportItem {
+                                name: `Dropout`,
+                                alias: None,
+                                span: 4:35-4:42,
+                            },
+                        ],
+                    ),
+                    alias: None,
+                    span: 4:1-5:1,
+                },
+            ),
+            span: 4:1-5:1,
+        },
+        Stmt {
+            kind: FromImport(
+                FromImportStmt {
+                    module_path: [
+                        `nsl`,
+                        `nn`,
+                        `losses`,
+                    ],
+                    items: Named(
+                        [
+                            ImportItem {
+                                name: `mse_loss`,
+                                alias: None,
+                                span: 5:27-5:35,
+                            },
+                        ],
+                    ),
+                    span: 5:1-6:1,
+                },
+            ),
+            span: 5:1-6:1,
+        },
+        Stmt {
+            kind: FromImport(
+                FromImportStmt {
+                    module_path: [
+                        `nsl`,
+                        `nn`,
+                        `losses`,
+                    ],
+                    items: Named(
+                        [
+                            ImportItem {
+                                name: `mse_loss`,
+                                alias: Some(`mse`),
+                                span: 6:27-6:42,
+                            },
+                            ImportItem {
+                                name: `cross_entropy`,
+                                alias: None,
+                                span: 6:44-6:57,
+                            },
+                        ],
+                    ),
+                    span: 6:1-7:1,
+                },
+            ),
+            span: 6:1-7:1,
+        },
+        Stmt {
+            kind: FromImport(
+                FromImportStmt {
+                    module_path: [
+                        `models`,
+                        `attention`,
+                    ],
+                    items: Glob,
+                    span: 7:1-8:1,
+                },
+            ),
+            span: 7:1-8:1,
+        },
+        Stmt {
+            kind: Import(
+                ImportStmt {
+                    path: [
+                        `nsl`,
+                        `quant`,
+                    ],
+                    items: Module,
+                    alias: None,
+                    span: 8:1-9:1,
+                },
+            ),
+            span: 8:1-9:1,
+        },
+        Stmt {
+            kind: FromImport(
+                FromImportStmt {
+                    module_path: [
+                        `nsl`,
+                        `train`,
+                    ],
+                    items: Named(
+                        [
+                            ImportItem {
+                                name: `step`,
+                                alias: None,
+                                span: 9:23-9:27,
+                            },
+                        ],
+                    ),
+                    span: 9:1-10:1,
+                },
+            ),
+            span: 9:1-10:1,
+        },
+    ],
+    span: 2:1-10:1,
+}

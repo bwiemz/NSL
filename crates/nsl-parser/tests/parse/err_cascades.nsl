@@ -1,0 +1,16 @@
+# Errors that are NOT confined to their line. An unclosed paren makes the
+# lexer suppress newlines until it closes, so `let c` is read as part of
+# the expression; a trailing binary operator continues onto the next line
+# and eats its `let`; a missing colon after a `fn` header leaves the body
+# unopened, so the statements after it nest inside. This pins what the
+# parser does today: `c` and `f` never reach the AST, and `g` is a
+# statement of `broken`.
+let a = 1
+let b = (2 + 3
+let c = 4
+let d = 5
+let e = 6 +
+let f = 7
+fn broken(x: int) -> int
+    return x
+let g = 8

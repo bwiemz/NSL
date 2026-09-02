@@ -1,0 +1,16 @@
+let a = "double"
+let b = 'single'
+let c = "esc \"q\" \n \t \\ end"
+let d = ""
+let e = """multi
+line
+  string"""
+let f = f"x = {x}"
+let g = f"{a + b} and {c}!"
+let h = f"braces {{literal}} {n}"
+let i = f'{outer(f"{inner}")}'
+let j = f"""tri {v}
+ple"""
+## a doc comment
+##   with leading spaces kept
+let k = "after ## is not a doc comment"

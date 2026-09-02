@@ -1,0 +1,628 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/model_block.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: ModelDef(
+                ModelDef {
+                    name: `Linear`,
+                    type_params: [],
+                    params: [],
+                    members: [
+                        LayerDecl {
+                            name: `w`,
+                            type_ann: TypeExpr {
+                                kind: Named(`Tensor`),
+                                span: 3:8-3:14,
+                            },
+                            init: Some(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`ones`),
+                                            span: 3:17-3:21,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: ListLiteral(
+                                                        [
+                                                            Expr {
+                                                                kind: IntLiteral(2),
+                                                                span: 3:23-3:24,
+                                                            },
+                                                            Expr {
+                                                                kind: IntLiteral(1),
+                                                                span: 3:26-3:27,
+                                                            },
+                                                        ],
+                                                    ),
+                                                    span: 3:22-3:28,
+                                                },
+                                                span: 3:22-3:28,
+                                            },
+                                        ],
+                                    },
+                                    span: 3:17-3:29,
+                                },
+                            ),
+                            decorators: [],
+                            span: 3:5-4:1,
+                        },
+                        Method(
+                            FnDef {
+                                name: `forward`,
+                                type_params: [],
+                                effect_params: [],
+                                params: [
+                                    Param {
+                                        name: `self`,
+                                        type_ann: None,
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 5:16-5:20,
+                                    },
+                                    Param {
+                                        name: `x`,
+                                        type_ann: Some(
+                                            TypeExpr {
+                                                kind: Named(`Tensor`),
+                                                span: 5:25-5:31,
+                                            },
+                                        ),
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 5:22-5:31,
+                                    },
+                                ],
+                                return_type: Some(
+                                    TypeExpr {
+                                        kind: Named(`Tensor`),
+                                        span: 5:36-5:42,
+                                    },
+                                ),
+                                return_effect: None,
+                                body: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Return(
+                                                Some(
+                                                    Expr {
+                                                        kind: BinaryOp {
+                                                            left: Expr {
+                                                                kind: Ident(`x`),
+                                                                span: 6:16-6:17,
+                                                            },
+                                                            op: MatMul,
+                                                            right: Expr {
+                                                                kind: MemberAccess {
+                                                                    object: Expr {
+                                                                        kind: SelfRef,
+                                                                        span: 6:20-6:24,
+                                                                    },
+                                                                    member: `w`,
+                                                                },
+                                                                span: 6:20-6:26,
+                                                            },
+                                                        },
+                                                        span: 6:16-6:26,
+                                                    },
+                                                ),
+                                            ),
+                                            span: 6:9-6:26,
+                                        },
+                                    ],
+                                    span: 6:9-8:1,
+                                },
+                                is_async: false,
+                                span: 5:5-8:1,
+                            },
+                            [],
+                        ),
+                    ],
+                    span: 2:1-8:1,
+                },
+            ),
+            span: 2:1-8:1,
+        },
+        Stmt {
+            kind: ModelDef(
+                ModelDef {
+                    name: `TinyModel`,
+                    type_params: [],
+                    params: [
+                        Param {
+                            name: `dim`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 8:22-8:25,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 8:17-8:25,
+                        },
+                        Param {
+                            name: `hidden`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 8:35-8:38,
+                                },
+                            ),
+                            default: Some(
+                                Expr {
+                                    kind: IntLiteral(64),
+                                    span: 8:41-8:43,
+                                },
+                            ),
+                            is_variadic: false,
+                            span: 8:27-8:43,
+                        },
+                    ],
+                    members: [
+                        LayerDecl {
+                            name: `w1`,
+                            type_ann: TypeExpr {
+                                kind: Named(`Tensor`),
+                                span: 9:9-9:15,
+                            },
+                            init: Some(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`randn`),
+                                            span: 9:18-9:23,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: ListLiteral(
+                                                        [
+                                                            Expr {
+                                                                kind: Ident(`dim`),
+                                                                span: 9:25-9:28,
+                                                            },
+                                                            Expr {
+                                                                kind: Ident(`hidden`),
+                                                                span: 9:30-9:36,
+                                                            },
+                                                        ],
+                                                    ),
+                                                    span: 9:24-9:37,
+                                                },
+                                                span: 9:24-9:37,
+                                            },
+                                        ],
+                                    },
+                                    span: 9:18-9:38,
+                                },
+                            ),
+                            decorators: [],
+                            span: 9:5-10:1,
+                        },
+                        LayerDecl {
+                            name: `b1`,
+                            type_ann: TypeExpr {
+                                kind: Named(`Tensor`),
+                                span: 10:9-10:15,
+                            },
+                            init: Some(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`zeros`),
+                                            span: 10:18-10:23,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: ListLiteral(
+                                                        [
+                                                            Expr {
+                                                                kind: Ident(`hidden`),
+                                                                span: 10:25-10:31,
+                                                            },
+                                                        ],
+                                                    ),
+                                                    span: 10:24-10:32,
+                                                },
+                                                span: 10:24-10:32,
+                                            },
+                                        ],
+                                    },
+                                    span: 10:18-10:33,
+                                },
+                            ),
+                            decorators: [],
+                            span: 10:5-11:1,
+                        },
+                        LayerDecl {
+                            name: `depth`,
+                            type_ann: TypeExpr {
+                                kind: Named(`int`),
+                                span: 13:12-13:15,
+                            },
+                            init: Some(
+                                Expr {
+                                    kind: IntLiteral(0),
+                                    span: 13:18-13:19,
+                                },
+                            ),
+                            decorators: [
+                                Decorator {
+                                    name: [
+                                        `speculative`,
+                                    ],
+                                    args: Some(
+                                        [
+                                            Arg {
+                                                name: Some(`num_tokens`),
+                                                value: Expr {
+                                                    kind: IntLiteral(4),
+                                                    span: 12:29-12:30,
+                                                },
+                                                span: 12:18-12:30,
+                                            },
+                                        ],
+                                    ),
+                                    span: 12:5-12:31,
+                                },
+                            ],
+                            span: 13:5-14:1,
+                        },
+                        Method(
+                            FnDef {
+                                name: `forward`,
+                                type_params: [],
+                                effect_params: [],
+                                params: [
+                                    Param {
+                                        name: `self`,
+                                        type_ann: None,
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 15:16-15:20,
+                                    },
+                                    Param {
+                                        name: `x`,
+                                        type_ann: Some(
+                                            TypeExpr {
+                                                kind: Named(`Tensor`),
+                                                span: 15:25-15:31,
+                                            },
+                                        ),
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 15:22-15:31,
+                                    },
+                                ],
+                                return_type: Some(
+                                    TypeExpr {
+                                        kind: Named(`Tensor`),
+                                        span: 15:36-15:42,
+                                    },
+                                ),
+                                return_effect: None,
+                                body: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: VarDecl {
+                                                is_const: false,
+                                                pattern: Pattern {
+                                                    kind: Ident(`h`),
+                                                    span: 16:13-16:14,
+                                                },
+                                                type_ann: None,
+                                                value: Some(
+                                                    Expr {
+                                                        kind: Call {
+                                                            callee: Expr {
+                                                                kind: Ident(`gelu`),
+                                                                span: 16:17-16:21,
+                                                            },
+                                                            args: [
+                                                                Arg {
+                                                                    name: None,
+                                                                    value: Expr {
+                                                                        kind: Call {
+                                                                            callee: Expr {
+                                                                                kind: Ident(`bias_add`),
+                                                                                span: 16:22-16:30,
+                                                                            },
+                                                                            args: [
+                                                                                Arg {
+                                                                                    name: None,
+                                                                                    value: Expr {
+                                                                                        kind: BinaryOp {
+                                                                                            left: Expr {
+                                                                                                kind: Ident(`x`),
+                                                                                                span: 16:31-16:32,
+                                                                                            },
+                                                                                            op: MatMul,
+                                                                                            right: Expr {
+                                                                                                kind: MemberAccess {
+                                                                                                    object: Expr {
+                                                                                                        kind: SelfRef,
+                                                                                                        span: 16:35-16:39,
+                                                                                                    },
+                                                                                                    member: `w1`,
+                                                                                                },
+                                                                                                span: 16:35-16:42,
+                                                                                            },
+                                                                                        },
+                                                                                        span: 16:31-16:42,
+                                                                                    },
+                                                                                    span: 16:31-16:42,
+                                                                                },
+                                                                                Arg {
+                                                                                    name: None,
+                                                                                    value: Expr {
+                                                                                        kind: MemberAccess {
+                                                                                            object: Expr {
+                                                                                                kind: SelfRef,
+                                                                                                span: 16:44-16:48,
+                                                                                            },
+                                                                                            member: `b1`,
+                                                                                        },
+                                                                                        span: 16:44-16:51,
+                                                                                    },
+                                                                                    span: 16:44-16:51,
+                                                                                },
+                                                                            ],
+                                                                        },
+                                                                        span: 16:22-16:52,
+                                                                    },
+                                                                    span: 16:22-16:52,
+                                                                },
+                                                            ],
+                                                        },
+                                                        span: 16:17-16:53,
+                                                    },
+                                                ),
+                                            },
+                                            span: 16:9-16:53,
+                                        },
+                                        Stmt {
+                                            kind: Return(
+                                                Some(
+                                                    Expr {
+                                                        kind: Ident(`h`),
+                                                        span: 17:16-17:17,
+                                                    },
+                                                ),
+                                            ),
+                                            span: 17:9-17:17,
+                                        },
+                                    ],
+                                    span: 16:9-19:5,
+                                },
+                                is_async: false,
+                                span: 15:5-19:5,
+                            },
+                            [],
+                        ),
+                        Method(
+                            FnDef {
+                                name: `loss`,
+                                type_params: [],
+                                effect_params: [],
+                                params: [
+                                    Param {
+                                        name: `self`,
+                                        type_ann: None,
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 19:13-19:17,
+                                    },
+                                    Param {
+                                        name: `x`,
+                                        type_ann: Some(
+                                            TypeExpr {
+                                                kind: Named(`Tensor`),
+                                                span: 19:22-19:28,
+                                            },
+                                        ),
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 19:19-19:28,
+                                    },
+                                    Param {
+                                        name: `y`,
+                                        type_ann: Some(
+                                            TypeExpr {
+                                                kind: Named(`Tensor`),
+                                                span: 19:33-19:39,
+                                            },
+                                        ),
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 19:30-19:39,
+                                    },
+                                ],
+                                return_type: Some(
+                                    TypeExpr {
+                                        kind: Named(`Tensor`),
+                                        span: 19:44-19:50,
+                                    },
+                                ),
+                                return_effect: None,
+                                body: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Return(
+                                                Some(
+                                                    Expr {
+                                                        kind: Call {
+                                                            callee: Expr {
+                                                                kind: Ident(`mse`),
+                                                                span: 20:16-20:19,
+                                                            },
+                                                            args: [
+                                                                Arg {
+                                                                    name: None,
+                                                                    value: Expr {
+                                                                        kind: Call {
+                                                                            callee: Expr {
+                                                                                kind: MemberAccess {
+                                                                                    object: Expr {
+                                                                                        kind: SelfRef,
+                                                                                        span: 20:20-20:24,
+                                                                                    },
+                                                                                    member: `forward`,
+                                                                                },
+                                                                                span: 20:20-20:32,
+                                                                            },
+                                                                            args: [
+                                                                                Arg {
+                                                                                    name: None,
+                                                                                    value: Expr {
+                                                                                        kind: Ident(`x`),
+                                                                                        span: 20:33-20:34,
+                                                                                    },
+                                                                                    span: 20:33-20:34,
+                                                                                },
+                                                                            ],
+                                                                        },
+                                                                        span: 20:20-20:35,
+                                                                    },
+                                                                    span: 20:20-20:35,
+                                                                },
+                                                                Arg {
+                                                                    name: None,
+                                                                    value: Expr {
+                                                                        kind: Ident(`y`),
+                                                                        span: 20:37-20:38,
+                                                                    },
+                                                                    span: 20:37-20:38,
+                                                                },
+                                                            ],
+                                                        },
+                                                        span: 20:16-20:39,
+                                                    },
+                                                ),
+                                            ),
+                                            span: 20:9-20:39,
+                                        },
+                                    ],
+                                    span: 20:9-22:1,
+                                },
+                                is_async: false,
+                                span: 19:5-22:1,
+                            },
+                            [],
+                        ),
+                    ],
+                    span: 8:1-22:1,
+                },
+            ),
+            span: 8:1-22:1,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`m`),
+                    span: 22:5-22:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`TinyModel`),
+                                span: 22:9-22:18,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: IntLiteral(32),
+                                        span: 22:19-22:21,
+                                    },
+                                    span: 22:19-22:21,
+                                },
+                            ],
+                        },
+                        span: 22:9-22:22,
+                    },
+                ),
+            },
+            span: 22:1-22:22,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`y`),
+                    span: 23:5-23:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: MemberAccess {
+                                    object: Expr {
+                                        kind: Ident(`m`),
+                                        span: 23:9-23:10,
+                                    },
+                                    member: `forward`,
+                                },
+                                span: 23:9-23:18,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: Call {
+                                            callee: Expr {
+                                                kind: Ident(`ones`),
+                                                span: 23:19-23:23,
+                                            },
+                                            args: [
+                                                Arg {
+                                                    name: None,
+                                                    value: Expr {
+                                                        kind: ListLiteral(
+                                                            [
+                                                                Expr {
+                                                                    kind: IntLiteral(4),
+                                                                    span: 23:25-23:26,
+                                                                },
+                                                                Expr {
+                                                                    kind: IntLiteral(32),
+                                                                    span: 23:28-23:30,
+                                                                },
+                                                            ],
+                                                        ),
+                                                        span: 23:24-23:31,
+                                                    },
+                                                    span: 23:24-23:31,
+                                                },
+                                            ],
+                                        },
+                                        span: 23:19-23:32,
+                                    },
+                                    span: 23:19-23:32,
+                                },
+                            ],
+                        },
+                        span: 23:9-23:33,
+                    },
+                ),
+            },
+            span: 23:1-23:33,
+        },
+    ],
+    span: 2:1-23:33,
+}

@@ -1,0 +1,22 @@
+## Doc comment on the module.
+# Line comment.
+
+## Doc comment on a function.
+fn documented(x: int) -> int:  # trailing comment
+    # comment inside a block
+    return x   # trailing
+
+
+let after_blank_lines = 1
+let multi_line_call = f(
+    1,
+    2,
+)
+let multi_line_list = [
+    1,
+    2,
+]
+let continued = 1 + \
+    2
+let s = """triple
+quoted"""

@@ -1,0 +1,27 @@
+# struct, enum and trait declarations, with generics and bounds.
+struct TrainConfig:
+    lr: f64 = 3e-4
+    batch_size: int = 32
+    epochs: int
+
+struct Box<T: Comparable<T>>:
+    value: T
+
+enum Activation:
+    ReLU
+    GELU
+    Custom((Tensor) -> Tensor)
+
+enum Shape:
+    Circle(f32)
+    Rect(f32, f32)
+
+trait Display:
+    fn render(self) -> str
+
+trait Named<T: Display>:
+    fn name(self) -> str:
+        return "named"
+
+let cfg = TrainConfig(lr=1e-4, epochs=5)
+let {lr, batch_size, ..rest} = cfg

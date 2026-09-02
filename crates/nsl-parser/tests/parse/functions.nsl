@@ -1,0 +1,27 @@
+# Function definitions: annotations, defaults, generics, visibility,
+# decorators, nested functions and lambdas.
+fn add(a: int, b: int) -> int:
+    return a + b
+
+fn sigmoid(x: f64):
+    return 1.0 / (1.0 + (-x).exp())
+
+fn identity<T>(value: T) -> T:
+    return value
+
+fn make(in_features: int, out_features: int, bias: bool = true) -> Linear:
+    return Linear(in_features, out_features, bias=bias)
+
+pub fn outer(x: int) -> int:
+    fn inner(y: int) -> int:
+        return y * 2
+    return inner(x)
+
+@export
+fn exported(a: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return a
+
+let double = |x| x * 2
+let add2 = |a, b| a + b
+let typed = |x: int, y| x + y
+let total = losses.reduce(|acc, x| acc + x, 0.0)

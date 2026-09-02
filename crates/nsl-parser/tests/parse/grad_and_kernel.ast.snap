@@ -1,0 +1,411 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/grad_and_kernel.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`w`),
+                    span: 2:5-2:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`ones`),
+                                span: 2:9-2:13,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: ListLiteral(
+                                            [
+                                                Expr {
+                                                    kind: IntLiteral(3),
+                                                    span: 2:15-2:16,
+                                                },
+                                            ],
+                                        ),
+                                        span: 2:14-2:17,
+                                    },
+                                    span: 2:14-2:17,
+                                },
+                            ],
+                        },
+                        span: 2:9-2:18,
+                    },
+                ),
+            },
+            span: 2:1-2:18,
+        },
+        Stmt {
+            kind: GradBlock(
+                GradBlock {
+                    outputs: Some(
+                        Pattern {
+                            kind: Tuple(
+                                [
+                                    Pattern {
+                                        kind: Ident(`loss`),
+                                        span: 3:6-3:10,
+                                    },
+                                    Pattern {
+                                        kind: Ident(`dw`),
+                                        span: 3:12-3:14,
+                                    },
+                                ],
+                            ),
+                            span: 3:5-3:15,
+                        },
+                    ),
+                    targets: Expr {
+                        kind: Ident(`w`),
+                        span: 3:23-3:24,
+                    },
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: VarDecl {
+                                    is_const: false,
+                                    pattern: Pattern {
+                                        kind: Ident(`out`),
+                                        span: 4:9-4:12,
+                                    },
+                                    type_ann: None,
+                                    value: Some(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: MemberAccess {
+                                                        object: Expr {
+                                                            kind: Paren(
+                                                                Expr {
+                                                                    kind: BinaryOp {
+                                                                        left: Expr {
+                                                                            kind: Ident(`w`),
+                                                                            span: 4:16-4:17,
+                                                                        },
+                                                                        op: Mul,
+                                                                        right: Expr {
+                                                                            kind: Ident(`w`),
+                                                                            span: 4:20-4:21,
+                                                                        },
+                                                                    },
+                                                                    span: 4:16-4:21,
+                                                                },
+                                                            ),
+                                                            span: 4:15-4:22,
+                                                        },
+                                                        member: `sum`,
+                                                    },
+                                                    span: 4:15-4:26,
+                                                },
+                                                args: [],
+                                            },
+                                            span: 4:15-4:28,
+                                        },
+                                    ),
+                                },
+                                span: 4:5-4:28,
+                            },
+                            Stmt {
+                                kind: Expr(
+                                    Expr {
+                                        kind: Ident(`out`),
+                                        span: 5:5-5:8,
+                                    },
+                                ),
+                                span: 5:5-5:8,
+                            },
+                        ],
+                        span: 4:5-7:1,
+                    },
+                    span: 3:1-7:1,
+                },
+            ),
+            span: 3:1-7:1,
+        },
+        Stmt {
+            kind: GradBlock(
+                GradBlock {
+                    outputs: None,
+                    targets: Expr {
+                        kind: Ident(`w`),
+                        span: 7:6-7:7,
+                    },
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: VarDecl {
+                                    is_const: false,
+                                    pattern: Pattern {
+                                        kind: Ident(`out`),
+                                        span: 8:9-8:12,
+                                    },
+                                    type_ann: None,
+                                    value: Some(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: MemberAccess {
+                                                        object: Expr {
+                                                            kind: Paren(
+                                                                Expr {
+                                                                    kind: BinaryOp {
+                                                                        left: Expr {
+                                                                            kind: Ident(`w`),
+                                                                            span: 8:16-8:17,
+                                                                        },
+                                                                        op: Mul,
+                                                                        right: Expr {
+                                                                            kind: FloatLiteral(2.0),
+                                                                            span: 8:20-8:23,
+                                                                        },
+                                                                    },
+                                                                    span: 8:16-8:23,
+                                                                },
+                                                            ),
+                                                            span: 8:15-8:24,
+                                                        },
+                                                        member: `sum`,
+                                                    },
+                                                    span: 8:15-8:28,
+                                                },
+                                                args: [],
+                                            },
+                                            span: 8:15-8:30,
+                                        },
+                                    ),
+                                },
+                                span: 8:5-8:30,
+                            },
+                        ],
+                        span: 8:5-10:1,
+                    },
+                    span: 7:1-10:1,
+                },
+            ),
+            span: 7:1-10:1,
+        },
+        Stmt {
+            kind: Decorated {
+                decorators: [
+                    Decorator {
+                        name: [
+                            `autotune`,
+                        ],
+                        args: Some(
+                            [
+                                Arg {
+                                    name: Some(`block_size`),
+                                    value: Expr {
+                                        kind: ListLiteral(
+                                            [
+                                                Expr {
+                                                    kind: IntLiteral(64),
+                                                    span: 10:23-10:25,
+                                                },
+                                                Expr {
+                                                    kind: IntLiteral(128),
+                                                    span: 10:27-10:30,
+                                                },
+                                                Expr {
+                                                    kind: IntLiteral(256),
+                                                    span: 10:32-10:35,
+                                                },
+                                            ],
+                                        ),
+                                        span: 10:22-10:36,
+                                    },
+                                    span: 10:11-10:36,
+                                },
+                            ],
+                        ),
+                        span: 10:1-10:37,
+                    },
+                ],
+                stmt: Stmt {
+                    kind: KernelDef(
+                        KernelDef {
+                            name: `simple_scale`,
+                            params: [
+                                Param {
+                                    name: `data`,
+                                    type_ann: Some(
+                                        TypeExpr {
+                                            kind: Named(`Tensor`),
+                                            span: 11:27-11:33,
+                                        },
+                                    ),
+                                    default: None,
+                                    is_variadic: false,
+                                    span: 11:21-11:33,
+                                },
+                                Param {
+                                    name: `scale`,
+                                    type_ann: Some(
+                                        TypeExpr {
+                                            kind: Named(`f32`),
+                                            span: 11:42-11:45,
+                                        },
+                                    ),
+                                    default: None,
+                                    is_variadic: false,
+                                    span: 11:35-11:45,
+                                },
+                            ],
+                            return_type: Some(
+                                TypeExpr {
+                                    kind: Named(`Tensor`),
+                                    span: 11:50-11:56,
+                                },
+                            ),
+                            body: Block {
+                                stmts: [
+                                    Stmt {
+                                        kind: VarDecl {
+                                            is_const: false,
+                                            pattern: Pattern {
+                                                kind: Ident(`tid`),
+                                                span: 12:9-12:12,
+                                            },
+                                            type_ann: None,
+                                            value: Some(
+                                                Expr {
+                                                    kind: Call {
+                                                        callee: Expr {
+                                                            kind: Ident(`thread_id`),
+                                                            span: 12:15-12:24,
+                                                        },
+                                                        args: [],
+                                                    },
+                                                    span: 12:15-12:26,
+                                                },
+                                            ),
+                                        },
+                                        span: 12:5-12:26,
+                                    },
+                                    Stmt {
+                                        kind: Assign {
+                                            target: Expr {
+                                                kind: Subscript {
+                                                    object: Expr {
+                                                        kind: Ident(`data`),
+                                                        span: 13:5-13:9,
+                                                    },
+                                                    index: Index(
+                                                        Expr {
+                                                            kind: Ident(`tid`),
+                                                            span: 13:10-13:13,
+                                                        },
+                                                    ),
+                                                },
+                                                span: 13:5-13:14,
+                                            },
+                                            op: Assign,
+                                            value: Expr {
+                                                kind: BinaryOp {
+                                                    left: Expr {
+                                                        kind: Subscript {
+                                                            object: Expr {
+                                                                kind: Ident(`data`),
+                                                                span: 13:17-13:21,
+                                                            },
+                                                            index: Index(
+                                                                Expr {
+                                                                    kind: Ident(`tid`),
+                                                                    span: 13:22-13:25,
+                                                                },
+                                                            ),
+                                                        },
+                                                        span: 13:17-13:26,
+                                                    },
+                                                    op: Mul,
+                                                    right: Expr {
+                                                        kind: Ident(`scale`),
+                                                        span: 13:29-13:34,
+                                                    },
+                                                },
+                                                span: 13:17-13:34,
+                                            },
+                                        },
+                                        span: 13:5-13:34,
+                                    },
+                                ],
+                                span: 12:5-15:1,
+                            },
+                            decorators: [],
+                            span: 11:1-15:1,
+                        },
+                    ),
+                    span: 11:1-15:1,
+                },
+            },
+            span: 10:1-15:1,
+        },
+        Stmt {
+            kind: KernelDef(
+                KernelDef {
+                    name: `plain`,
+                    params: [
+                        Param {
+                            name: `a`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`Tensor`),
+                                    span: 15:17-15:23,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 15:14-15:23,
+                        },
+                    ],
+                    return_type: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Assign {
+                                    target: Expr {
+                                        kind: Subscript {
+                                            object: Expr {
+                                                kind: Ident(`a`),
+                                                span: 16:5-16:6,
+                                            },
+                                            index: Index(
+                                                Expr {
+                                                    kind: IntLiteral(0),
+                                                    span: 16:7-16:8,
+                                                },
+                                            ),
+                                        },
+                                        span: 16:5-16:9,
+                                    },
+                                    op: Assign,
+                                    value: Expr {
+                                        kind: FloatLiteral(1.0),
+                                        span: 16:12-16:15,
+                                    },
+                                },
+                                span: 16:5-16:15,
+                            },
+                        ],
+                        span: 16:5-17:1,
+                    },
+                    decorators: [],
+                    span: 15:1-17:1,
+                },
+            ),
+            span: 15:1-17:1,
+        },
+    ],
+    span: 2:1-17:1,
+}

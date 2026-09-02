@@ -1,0 +1,12 @@
+# Three independent errors, each confined to its own line: junk after a
+# complete expression, a missing colon on an `if` header, and `let mut`.
+# Every statement around them must still reach the AST at top level, and
+# the `if` body must be attached to the `if`.
+let a = 1
+let b = a b
+let c = 3
+if c > 0
+    print(c)
+let d = 4
+let mut e = 5
+let f = 6

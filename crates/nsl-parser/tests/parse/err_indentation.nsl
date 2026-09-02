@@ -1,0 +1,9 @@
+# Indentation errors: a body that is not indented, and a dedent to a
+# column that never opened a block.
+fn f(x: int) -> int:
+return x
+
+if true:
+        print("deep")
+    print("shallow")
+let ok = 1

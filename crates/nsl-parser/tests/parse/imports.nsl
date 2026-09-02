@@ -1,0 +1,9 @@
+# import forms: dotted paths, aliases, braces, from-import, keyword segments.
+import nsl.math
+import nsl.math as math
+import nsl.nn.{Linear, LayerNorm, Dropout}
+from nsl.nn.losses import mse_loss
+from nsl.nn.losses import mse_loss as mse, cross_entropy
+from models.attention import *
+import nsl.quant
+from nsl.train import step

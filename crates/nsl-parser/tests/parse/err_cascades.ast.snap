@@ -1,0 +1,174 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/err_cascades.nsl
+---
+diagnostics: 7
+  parse error: expected ), found let
+    --> 10:1-10:4 expected )
+  parse error: expected newline or end of statement, found identifier
+    --> 10:5-10:6 here
+  parse error: expected newline or end of statement, found let
+    --> 12:1-12:4 here
+  parse error: expected expression, found let
+    --> 13:1-13:4 expected expression
+  parse error: expected newline or end of statement, found identifier
+    --> 13:5-13:6 here
+  parse error: expected :, found return
+    --> 15:5-15:11 expected :
+  parse error: expected INDENT, found identifier
+    --> 15:12-15:13 expected INDENT
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`a`),
+                    span: 8:5-8:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(1),
+                        span: 8:9-8:10,
+                    },
+                ),
+            },
+            span: 8:1-8:10,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`b`),
+                    span: 9:5-9:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Paren(
+                            Expr {
+                                kind: BinaryOp {
+                                    left: Expr {
+                                        kind: IntLiteral(2),
+                                        span: 9:10-9:11,
+                                    },
+                                    op: Add,
+                                    right: Expr {
+                                        kind: IntLiteral(3),
+                                        span: 9:14-9:15,
+                                    },
+                                },
+                                span: 9:10-9:15,
+                            },
+                        ),
+                        span: 9:9-10:4,
+                    },
+                ),
+            },
+            span: 9:1-10:4,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`d`),
+                    span: 11:5-11:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(5),
+                        span: 11:9-11:10,
+                    },
+                ),
+            },
+            span: 11:1-11:10,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`e`),
+                    span: 12:5-12:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: BinaryOp {
+                            left: Expr {
+                                kind: IntLiteral(6),
+                                span: 12:9-12:10,
+                            },
+                            op: Add,
+                            right: Expr {
+                                kind: Error,
+                                span: 13:1-13:4,
+                            },
+                        },
+                        span: 12:9-13:4,
+                    },
+                ),
+            },
+            span: 12:1-13:4,
+        },
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `broken`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `x`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 14:14-14:17,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 14:11-14:17,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`int`),
+                            span: 14:22-14:25,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: VarDecl {
+                                    is_const: false,
+                                    pattern: Pattern {
+                                        kind: Ident(`g`),
+                                        span: 16:5-16:6,
+                                    },
+                                    type_ann: None,
+                                    value: Some(
+                                        Expr {
+                                            kind: IntLiteral(8),
+                                            span: 16:9-16:10,
+                                        },
+                                    ),
+                                },
+                                span: 16:1-16:10,
+                            },
+                        ],
+                        span: 15:12-17:1,
+                    },
+                    is_async: false,
+                    span: 14:1-17:1,
+                },
+            ),
+            span: 14:1-17:1,
+        },
+    ],
+    span: 8:1-17:1,
+}

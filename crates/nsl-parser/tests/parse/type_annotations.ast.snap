@@ -1,0 +1,693 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/type_annotations.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`a`),
+                    span: 2:5-2:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Named(`int`),
+                        span: 2:8-2:11,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(1),
+                        span: 2:14-2:15,
+                    },
+                ),
+            },
+            span: 2:1-2:15,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`b`),
+                    span: 3:5-3:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Named(`f32`),
+                        span: 3:8-3:11,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: FloatLiteral(1.0),
+                        span: 3:14-3:17,
+                    },
+                ),
+            },
+            span: 3:1-3:17,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`c`),
+                    span: 4:5-4:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Named(`str`),
+                        span: 4:8-4:11,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: StringLiteral("s"),
+                        span: 4:14-4:17,
+                    },
+                ),
+            },
+            span: 4:1-4:17,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`d`),
+                    span: 5:5-5:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Named(`bool`),
+                        span: 5:8-5:12,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: BoolLiteral(true),
+                        span: 5:15-5:19,
+                    },
+                ),
+            },
+            span: 5:1-5:19,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`e`),
+                    span: 6:5-6:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Named(`Tensor`),
+                        span: 6:8-6:14,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`ones`),
+                                span: 6:17-6:21,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: ListLiteral(
+                                            [
+                                                Expr {
+                                                    kind: IntLiteral(2),
+                                                    span: 6:23-6:24,
+                                                },
+                                            ],
+                                        ),
+                                        span: 6:22-6:25,
+                                    },
+                                    span: 6:22-6:25,
+                                },
+                            ],
+                        },
+                        span: 6:17-6:26,
+                    },
+                ),
+            },
+            span: 6:1-6:26,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`f`),
+                    span: 7:5-7:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Tensor {
+                            shape: [
+                                Concrete(4),
+                            ],
+                            dtype: `f32`,
+                            device: None,
+                        },
+                        span: 7:8-7:24,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`ones`),
+                                span: 7:27-7:31,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: ListLiteral(
+                                            [
+                                                Expr {
+                                                    kind: IntLiteral(4),
+                                                    span: 7:33-7:34,
+                                                },
+                                            ],
+                                        ),
+                                        span: 7:32-7:35,
+                                    },
+                                    span: 7:32-7:35,
+                                },
+                            ],
+                        },
+                        span: 7:27-7:36,
+                    },
+                ),
+            },
+            span: 7:1-7:36,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`g`),
+                    span: 8:5-8:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Tensor {
+                            shape: [
+                                Symbolic(`B`),
+                                Symbolic(`S`),
+                                Symbolic(`D`),
+                            ],
+                            dtype: `bf16`,
+                            device: Some(Cuda(None)),
+                        },
+                        span: 8:8-8:37,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Ident(`x`),
+                        span: 8:40-8:41,
+                    },
+                ),
+            },
+            span: 8:1-8:41,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`h`),
+                    span: 9:5-9:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Tensor {
+                            shape: [
+                                Symbolic(`_`),
+                                Symbolic(`_`),
+                            ],
+                            dtype: `fp32`,
+                            device: None,
+                        },
+                        span: 9:8-9:28,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Ident(`y`),
+                        span: 9:31-9:32,
+                    },
+                ),
+            },
+            span: 9:1-9:32,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`i`),
+                    span: 10:5-10:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: FixedArray {
+                            element_type: TypeExpr {
+                                kind: Named(`int`),
+                                span: 10:9-10:12,
+                            },
+                            size: 2,
+                        },
+                        span: 10:8-10:16,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: ListLiteral(
+                            [
+                                Expr {
+                                    kind: IntLiteral(1),
+                                    span: 10:20-10:21,
+                                },
+                                Expr {
+                                    kind: IntLiteral(2),
+                                    span: 10:23-10:24,
+                                },
+                            ],
+                        ),
+                        span: 10:19-10:25,
+                    },
+                ),
+            },
+            span: 10:1-10:25,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`j`),
+                    span: 11:5-11:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Tuple(
+                            [
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 11:9-11:12,
+                                },
+                                TypeExpr {
+                                    kind: Named(`str`),
+                                    span: 11:14-11:17,
+                                },
+                            ],
+                        ),
+                        span: 11:8-11:18,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: TupleLiteral(
+                            [
+                                Expr {
+                                    kind: IntLiteral(1),
+                                    span: 11:22-11:23,
+                                },
+                                Expr {
+                                    kind: StringLiteral("a"),
+                                    span: 11:25-11:28,
+                                },
+                            ],
+                        ),
+                        span: 11:21-11:29,
+                    },
+                ),
+            },
+            span: 11:1-11:29,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`k`),
+                    span: 12:5-12:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Function {
+                            params: [
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 12:9-12:12,
+                                },
+                            ],
+                            ret: TypeExpr {
+                                kind: Named(`int`),
+                                span: 12:17-12:20,
+                            },
+                            effect: None,
+                        },
+                        span: 12:8-12:20,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Ident(`double`),
+                        span: 12:23-12:29,
+                    },
+                ),
+            },
+            span: 12:1-12:29,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`l`),
+                    span: 13:5-13:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Generic {
+                            name: `Option`,
+                            args: [
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 13:15-13:18,
+                                },
+                            ],
+                        },
+                        span: 13:8-13:19,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: NoneLiteral,
+                        span: 13:22-13:26,
+                    },
+                ),
+            },
+            span: 13:1-13:26,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`m`),
+                    span: 14:5-14:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Union(
+                            [
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 14:8-14:11,
+                                },
+                                TypeExpr {
+                                    kind: Named(`str`),
+                                    span: 14:14-14:17,
+                                },
+                            ],
+                        ),
+                        span: 14:8-14:17,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(1),
+                        span: 14:20-14:21,
+                    },
+                ),
+            },
+            span: 14:1-14:21,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`m2`),
+                    span: 15:5-15:7,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Borrow(
+                            TypeExpr {
+                                kind: Named(`Tensor`),
+                                span: 15:10-15:16,
+                            },
+                        ),
+                        span: 15:9-15:16,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Ident(`t`),
+                        span: 15:19-15:20,
+                    },
+                ),
+            },
+            span: 15:1-15:20,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`m3`),
+                    span: 16:5-16:7,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Named(`_`),
+                        span: 16:9-16:10,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(1),
+                        span: 16:13-16:14,
+                    },
+                ),
+            },
+            span: 16:1-16:14,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`m4`),
+                    span: 17:5-17:7,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Named(`Self`),
+                        span: 17:9-17:13,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Ident(`s`),
+                        span: 17:16-17:17,
+                    },
+                ),
+            },
+            span: 17:1-17:17,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`n`),
+                    span: 18:5-18:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Generic {
+                            name: `Map`,
+                            args: [
+                                TypeExpr {
+                                    kind: Named(`str`),
+                                    span: 18:12-18:15,
+                                },
+                                TypeExpr {
+                                    kind: FixedArray {
+                                        element_type: TypeExpr {
+                                            kind: Named(`f32`),
+                                            span: 18:18-18:21,
+                                        },
+                                        size: 4,
+                                    },
+                                    span: 18:17-18:25,
+                                },
+                            ],
+                        },
+                        span: 18:8-18:26,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: DictLiteral([]),
+                        span: 18:29-18:31,
+                    },
+                ),
+            },
+            span: 18:1-18:31,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`o`),
+                    span: 19:5-19:6,
+                },
+                type_ann: Some(
+                    TypeExpr {
+                        kind: Tensor {
+                            shape: [
+                                Named {
+                                    name: `batch`,
+                                    value: Int(32),
+                                },
+                                Concrete(16),
+                            ],
+                            dtype: `f32`,
+                            device: None,
+                        },
+                        span: 19:8-19:35,
+                    },
+                ),
+                value: Some(
+                    Expr {
+                        kind: Ident(`z`),
+                        span: 19:38-19:39,
+                    },
+                ),
+            },
+            span: 19:1-19:39,
+        },
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `typed`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `p`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Tensor {
+                                        shape: [
+                                            Symbolic(`N`),
+                                            Symbolic(`D`),
+                                        ],
+                                        dtype: `f32`,
+                                        device: None,
+                                    },
+                                    span: 21:13-21:32,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 21:10-21:32,
+                        },
+                        Param {
+                            name: `q`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Function {
+                                        params: [
+                                            TypeExpr {
+                                                kind: Named(`Tensor`),
+                                                span: 21:38-21:44,
+                                            },
+                                        ],
+                                        ret: TypeExpr {
+                                            kind: Named(`Tensor`),
+                                            span: 21:49-21:55,
+                                        },
+                                        effect: None,
+                                    },
+                                    span: 21:37-21:55,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 21:34-21:55,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Tuple(
+                                [
+                                    TypeExpr {
+                                        kind: Named(`Tensor`),
+                                        span: 21:61-21:67,
+                                    },
+                                    TypeExpr {
+                                        kind: Named(`int`),
+                                        span: 21:69-21:72,
+                                    },
+                                ],
+                            ),
+                            span: 21:60-21:73,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: TupleLiteral(
+                                                [
+                                                    Expr {
+                                                        kind: Call {
+                                                            callee: Expr {
+                                                                kind: Ident(`q`),
+                                                                span: 22:13-22:14,
+                                                            },
+                                                            args: [
+                                                                Arg {
+                                                                    name: None,
+                                                                    value: Expr {
+                                                                        kind: Ident(`p`),
+                                                                        span: 22:15-22:16,
+                                                                    },
+                                                                    span: 22:15-22:16,
+                                                                },
+                                                            ],
+                                                        },
+                                                        span: 22:13-22:17,
+                                                    },
+                                                    Expr {
+                                                        kind: IntLiteral(0),
+                                                        span: 22:19-22:20,
+                                                    },
+                                                ],
+                                            ),
+                                            span: 22:12-22:21,
+                                        },
+                                    ),
+                                ),
+                                span: 22:5-22:21,
+                            },
+                        ],
+                        span: 22:5-23:1,
+                    },
+                    is_async: false,
+                    span: 21:1-23:1,
+                },
+            ),
+            span: 21:1-23:1,
+        },
+    ],
+    span: 2:1-23:1,
+}

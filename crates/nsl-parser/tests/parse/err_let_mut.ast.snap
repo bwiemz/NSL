@@ -1,0 +1,76 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/err_let_mut.nsl
+---
+diagnostics: 2
+  parse error: expected pattern, found Mut
+    --> 2:5-2:8 expected pattern
+  parse error: expected newline or end of statement, found identifier
+    --> 2:9-2:16 here
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Wildcard,
+                    span: 2:5-2:8,
+                },
+                type_ann: None,
+                value: None,
+            },
+            span: 2:1-2:8,
+        },
+        Stmt {
+            kind: Assign {
+                target: Expr {
+                    kind: Ident(`counter`),
+                    span: 3:1-3:8,
+                },
+                op: Assign,
+                value: Expr {
+                    kind: BinaryOp {
+                        left: Expr {
+                            kind: Ident(`counter`),
+                            span: 3:11-3:18,
+                        },
+                        op: Add,
+                        right: Expr {
+                            kind: IntLiteral(1),
+                            span: 3:21-3:22,
+                        },
+                    },
+                    span: 3:11-3:22,
+                },
+            },
+            span: 3:1-3:22,
+        },
+        Stmt {
+            kind: Expr(
+                Expr {
+                    kind: Call {
+                        callee: Expr {
+                            kind: Ident(`print`),
+                            span: 4:1-4:6,
+                        },
+                        args: [
+                            Arg {
+                                name: None,
+                                value: Expr {
+                                    kind: Ident(`counter`),
+                                    span: 4:7-4:14,
+                                },
+                                span: 4:7-4:14,
+                            },
+                        ],
+                    },
+                    span: 4:1-4:15,
+                },
+            ),
+            span: 4:1-4:15,
+        },
+    ],
+    span: 2:1-4:15,
+}

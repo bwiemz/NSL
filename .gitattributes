@@ -15,6 +15,13 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 
+# Lexer and parser goldens (crates/nsl-{lexer,parser}/tests/) render token
+# spans and string-literal values of the .nsl fixtures next to them. A CRLF
+# checkout shifts every span after a comment by one column and puts a `\r`
+# inside triple-quoted strings and doc comments, so three goldens fail on
+# windows-latest unless the fixtures are pinned to LF like the snapshots.
+*.nsl text eol=lf
+
 # models/datasets/CORPUS_MANIFEST_v2.json pins a SHA-256 of the RAW BYTES of
 # each committed tokenizer, and corpus_manifest_gate.rs re-hashes the file on
 # disk to prove a retrained tokenizer cannot silently invalidate every bin

@@ -1,0 +1,308 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/quant_tokenizer_dataset.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: QuantBlock(
+                QuantBlock {
+                    kind: Static,
+                    name: `qm`,
+                    source: `m`,
+                    default_dtype: Some(Int4),
+                    default_granularity: Some(
+                        PerGroup(
+                            0,
+                            32,
+                        ),
+                    ),
+                    exclude: [
+                        "b*",
+                    ],
+                    calibration: None,
+                    span: 2:1-6:1,
+                },
+            ),
+            span: 2:1-6:1,
+        },
+        Stmt {
+            kind: TokenizerDef(
+                TokenizerDef {
+                    name: `tok`,
+                    config: [
+                        Arg {
+                            name: Some(`algorithm`),
+                            value: Expr {
+                                kind: Ident(`bpe`),
+                                span: 6:25-6:28,
+                            },
+                            span: 6:15-6:28,
+                        },
+                        Arg {
+                            name: Some(`vocab_size`),
+                            value: Expr {
+                                kind: IntLiteral(128),
+                                span: 6:41-6:44,
+                            },
+                            span: 6:30-6:44,
+                        },
+                    ],
+                    body: [
+                        Padding {
+                            entries: [
+                                KeyValueEntry {
+                                    key: `side`,
+                                    value: Expr {
+                                        kind: Ident(`left`),
+                                        span: 8:16-8:20,
+                                    },
+                                    span: 8:9-8:20,
+                                },
+                            ],
+                            span: 7:5-10:1,
+                        },
+                    ],
+                    span: 6:1-10:1,
+                },
+            ),
+            span: 6:1-10:1,
+        },
+        Stmt {
+            kind: DatasetDef(
+                DatasetDef {
+                    name: `demo`,
+                    source: Expr {
+                        kind: StringLiteral("demo"),
+                        span: 10:14-10:20,
+                    },
+                    body: [
+                        KeyValueEntry {
+                            key: `source`,
+                            value: Expr {
+                                kind: StringLiteral("data.bin"),
+                                span: 11:14-11:24,
+                            },
+                            span: 11:5-11:24,
+                        },
+                        KeyValueEntry {
+                            key: `batch_size`,
+                            value: Expr {
+                                kind: IntLiteral(8),
+                                span: 12:18-12:19,
+                            },
+                            span: 12:5-12:19,
+                        },
+                    ],
+                    span: 10:1-14:1,
+                },
+            ),
+            span: 10:1-14:1,
+        },
+        Stmt {
+            kind: DatatypeDef(
+                DatatypeDef {
+                    name: `Packed`,
+                    bits: Some(4),
+                    block_size: None,
+                    methods: [
+                        DatatypeMethod {
+                            kind: Pack,
+                            params: [
+                                Param {
+                                    name: `value`,
+                                    type_ann: Some(
+                                        TypeExpr {
+                                            kind: Named(`f32`),
+                                            span: 17:18-17:21,
+                                        },
+                                    ),
+                                    default: None,
+                                    is_variadic: false,
+                                    span: 17:11-17:21,
+                                },
+                            ],
+                            return_type: Some(
+                                TypeExpr {
+                                    kind: Named(`uint8`),
+                                    span: 17:26-17:31,
+                                },
+                            ),
+                            body: [
+                                Stmt {
+                                    kind: If {
+                                        condition: Expr {
+                                            kind: BinaryOp {
+                                                left: Expr {
+                                                    kind: Ident(`value`),
+                                                    span: 18:12-18:17,
+                                                },
+                                                op: Gt,
+                                                right: Expr {
+                                                    kind: FloatLiteral(0.0),
+                                                    span: 18:20-18:23,
+                                                },
+                                            },
+                                            span: 18:12-18:23,
+                                        },
+                                        then_block: Block {
+                                            stmts: [
+                                                Stmt {
+                                                    kind: Return(
+                                                        Some(
+                                                            Expr {
+                                                                kind: IntLiteral(1),
+                                                                span: 19:20-19:21,
+                                                            },
+                                                        ),
+                                                    ),
+                                                    span: 19:13-19:21,
+                                                },
+                                            ],
+                                            span: 19:13-20:9,
+                                        },
+                                        elif_clauses: [],
+                                        else_block: Some(
+                                            Block {
+                                                stmts: [
+                                                    Stmt {
+                                                        kind: Return(
+                                                            Some(
+                                                                Expr {
+                                                                    kind: IntLiteral(0),
+                                                                    span: 21:20-21:21,
+                                                                },
+                                                            ),
+                                                        ),
+                                                        span: 21:13-21:21,
+                                                    },
+                                                ],
+                                                span: 21:13-23:5,
+                                            },
+                                        ),
+                                    },
+                                    span: 18:9-23:5,
+                                },
+                            ],
+                            span: 17:5-23:5,
+                        },
+                        DatatypeMethod {
+                            kind: Unpack,
+                            params: [
+                                Param {
+                                    name: `packed`,
+                                    type_ann: Some(
+                                        TypeExpr {
+                                            kind: Named(`uint8`),
+                                            span: 23:21-23:26,
+                                        },
+                                    ),
+                                    default: None,
+                                    is_variadic: false,
+                                    span: 23:13-23:26,
+                                },
+                            ],
+                            return_type: Some(
+                                TypeExpr {
+                                    kind: Named(`f32`),
+                                    span: 23:31-23:34,
+                                },
+                            ),
+                            body: [
+                                Stmt {
+                                    kind: Return(
+                                        Some(
+                                            Expr {
+                                                kind: FloatLiteral(0.0),
+                                                span: 24:16-24:19,
+                                            },
+                                        ),
+                                    ),
+                                    span: 24:9-24:19,
+                                },
+                            ],
+                            span: 23:5-26:1,
+                        },
+                    ],
+                    ptx_blocks: [],
+                    span: 14:1-26:1,
+                },
+            ),
+            span: 14:1-26:1,
+        },
+        Stmt {
+            kind: ServeBlock(
+                ServeBlock {
+                    name: `Server`,
+                    config: [
+                        ServeConfigEntry {
+                            key: `max_batch`,
+                            type_ann: None,
+                            value: Expr {
+                                kind: IntLiteral(2),
+                                span: 27:16-27:17,
+                            },
+                            span: 27:5-28:1,
+                        },
+                    ],
+                    sub_blocks: [],
+                    endpoints: [
+                        EndpointDef {
+                            name: `generate`,
+                            params: [
+                                Param {
+                                    name: `prompt`,
+                                    type_ann: None,
+                                    default: None,
+                                    is_variadic: false,
+                                    span: 30:17-30:23,
+                                },
+                            ],
+                            return_type: None,
+                            body: Block {
+                                stmts: [
+                                    Stmt {
+                                        kind: VarDecl {
+                                            is_const: false,
+                                            pattern: Pattern {
+                                                kind: Ident(`x`),
+                                                span: 31:13-31:14,
+                                            },
+                                            type_ann: None,
+                                            value: Some(
+                                                Expr {
+                                                    kind: IntLiteral(0),
+                                                    span: 31:17-31:18,
+                                                },
+                                            ),
+                                        },
+                                        span: 31:9-31:18,
+                                    },
+                                    Stmt {
+                                        kind: Yield(
+                                            Some(
+                                                Expr {
+                                                    kind: Ident(`x`),
+                                                    span: 32:15-32:16,
+                                                },
+                                            ),
+                                        ),
+                                        span: 32:9-32:16,
+                                    },
+                                ],
+                                span: 31:9-33:1,
+                            },
+                            span: 30:5-33:1,
+                        },
+                    ],
+                    span: 26:1-33:1,
+                },
+            ),
+            span: 26:1-33:1,
+        },
+    ],
+    span: 2:1-33:1,
+}

@@ -1,0 +1,34 @@
+# if/elif/else, while, for, break/continue, return, if-expressions.
+if batch_size > 64:
+    print("large")
+elif batch_size > 16:
+    print("medium")
+else:
+    print("small")
+
+let loss = 1.0
+let epoch = 0
+while loss > 0.01:
+    loss = step(epoch)
+    epoch += 1
+    if epoch > 1000:
+        break
+    if epoch % 2 == 0:
+        continue
+
+for i in 0..10:
+    print(i)
+
+for (idx, name) in names.enumerate():
+    print(f"{idx}: {name}")
+
+fn early(x: int) -> int:
+    if x < 0:
+        return 0
+    return x
+
+let value = if true:
+    1
+else:
+    2
+

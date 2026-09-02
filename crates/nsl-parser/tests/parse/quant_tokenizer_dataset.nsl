@@ -1,0 +1,32 @@
+# The static declaration blocks: quant, tokenizer, dataset, datatype, serve.
+quant static qm from m:
+    default: int4, per_group(32)
+    exclude: ["b*"]
+
+tokenizer tok(algorithm=bpe, vocab_size=128):
+    padding:
+        side = left
+
+dataset demo("demo"):
+    source = "data.bin"
+    batch_size = 8
+
+datatype Packed:
+    bits: 4
+
+    @pack(value: f32) -> uint8:
+        if value > 0.0:
+            return 1
+        else:
+            return 0
+
+    @unpack(packed: uint8) -> f32:
+        return 0.0
+
+serve Server:
+    max_batch: 2
+
+    @endpoint
+    fn generate(prompt):
+        let x = 0
+        yield x

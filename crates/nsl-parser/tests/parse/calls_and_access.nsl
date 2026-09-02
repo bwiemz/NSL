@@ -1,0 +1,19 @@
+# Calls, keyword arguments, indexing, slicing, member access, comprehensions.
+let r = f()
+let s = f(1, 2)
+let t = f(x, dim=-1, keepdim=true)
+let u = obj.method(1).other()
+let first = xs[0]
+let last = xs[-1]
+let mid = xs[1:4]
+let head = xs[:2]
+let tail = xs[2:]
+let grid = m[0, 1]
+let squares = [x ** 2 for x in range(6)]
+let pairs = [x + y for x in a for y in b if x != y]
+let table = {"lr": 3e-4, "epochs": 10}
+let empty_dict = {}
+let empty_list = []
+let one = (1,)
+let unit = ()
+let this = self.weight

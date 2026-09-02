@@ -1,0 +1,11 @@
+# agent declarations: fields with initialisers and methods.
+agent Drafter:
+    kv_cache: KvCache = empty()
+    steps: int = 0
+
+    fn draft(self, p: Tensor) -> Tensor:
+        self.steps += 1
+        return p
+
+    async fn verify(self, p: Tensor) -> bool:
+        return true
