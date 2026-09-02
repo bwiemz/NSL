@@ -72,8 +72,11 @@ model Tiny:
 
 let m = Tiny()
 m.to(cuda)
-let x = ones([4, 2])
-let y = zeros([4, 2])
+# Inputs go to the device too: a host-resident train-step input with GPU
+# parameters is refused since acd2535c, because every op would otherwise
+# reconcile the WEIGHTS down to host f64.
+let x = ones([4, 2]).to(cuda)
+let y = zeros([4, 2]).to(cuda)
 
 print("BEFORE_w")
 print(sum(m.w))
