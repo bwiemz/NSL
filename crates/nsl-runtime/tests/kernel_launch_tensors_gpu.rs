@@ -99,7 +99,7 @@ fn get1(t: i64, i: i64) -> f64 {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn kernel_launch_tensors_vec_add_writes_correct_output() {
     if !cuda_available() {
         eprintln!("skipping: no usable CUDA GPU");

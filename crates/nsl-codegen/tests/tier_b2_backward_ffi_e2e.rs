@@ -188,7 +188,7 @@ fn tier_b2_backward_kernels_synthesize_clean() {
 /// closed under the same three-layer contract the docstring promises and so
 /// any future deepening of this pin has a clear home.
 #[test]
-#[ignore]
+#[ignore = "diagnostic: documentation stub that prints a pointer; the GPU band is tier_b2_full_backward_cpu_reference"]
 fn tier_b2_backward_ffi_numerical_band_pins_to_full_reference() {
     // The cycle-1 Phase 3 closure GPU numerical bands are gated by
     // `tier_b2_full_backward_cpu_reference::tier_b2_full_backward_sweep_*`.

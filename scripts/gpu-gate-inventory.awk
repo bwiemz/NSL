@@ -18,15 +18,16 @@
 #   broken        documented-broken / deferred   -> NEVER auto-run
 #   diagnostic    prints or sweeps; asserts      -> NEVER auto-run
 #                 nothing meaningful
-#   gpu-inferred  bare #[ignore] in a file that   -> RUN
-#                 is `feature = "cuda"`-gated
+#   gpu-inferred  bare #[ignore] in a file that   -> NOT run, REPORTED, and
+#                 is `feature = "cuda"`-gated        REFUSED by CI
+#                                                    (--check-reasons)
 #   cpu-stub      `#[cfg(not(feature = "cuda"))]` -> NEVER in the lane: the
 #                 placeholder for non-cuda builds    cuda-featured build the
 #                                                    lane uses compiles it OUT
 #   helper        a child process driven by       -> NEVER auto-run: standalone
 #                 another test via re-exec           invocation is meaningless
-#   unclassified  bare #[ignore], no reason, no   -> NOT run, but REPORTED
-#                 cuda gating
+#   unclassified  bare #[ignore], no reason, no   -> NOT run, REPORTED, and
+#                 cuda gating                        REFUSED by CI
 #
 # `unclassified` exists so that a gate can never be silently dropped from the
 # lane: anything the ruleset does not recognise shows up in the report as
@@ -35,11 +36,15 @@
 # GPU ("GPU required - c20 T1-followup lands the FFI plumbing" is a
 # known-broken gate, not a runnable one).
 #
-# `gpu-inferred` covers the 82 bare `#[ignore]` attributes whose author wrote
-# no reason. Every one of them lives in a file that either cfg-gates on the
-# cuda feature or does not — and the four non-cuda files were checked by hand
-# (a safetensors generator, a PTX dump, an FFI stub, a CPU diagnostic stub).
-# Callers pass -v cuda_gated=1 when the file mentions `feature = "cuda"`.
+# `gpu-inferred` used to cover the 82 bare `#[ignore]` attributes whose author
+# wrote no reason, on the guess that a cuda-gated file's unexplained ignore
+# wants a device. The guess was wrong for eight of the last 67: report-writing
+# timing probes and element dumps that the lane ran as certification gates.
+# Since 2026-09-01 every ignore in the tree carries a reason and
+# `gpu-cert.sh --check-reasons` refuses a new bare one (by class AND by an
+# empty reason column, so a name/path rule cannot excuse one), so the class
+# survives only as the label CI prints for the offending row. Callers still pass
+# -v cuda_gated=1 when the file mentions `feature = "cuda"`.
 #
 # NAME/PATH DENY RULES RUN FIRST, BEFORE the empty-reason inference. Review
 # finding F1: previously `r == ""` returned `gpu-inferred` immediately, so the

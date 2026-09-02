@@ -345,7 +345,7 @@ fn assert_tier_b_matches_base(name: &str, b: usize, h: usize, s: usize, seg: &[u
 /// Single document — the skip predicate can never fire. Any deviation here
 /// is an emission side effect, NOT skip logic.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b_no_skip_single_doc_s1024() {
     if !cuda_available() {
         return;
@@ -357,7 +357,7 @@ fn tier_b_no_skip_single_doc_s1024() {
 
 /// 192-token documents (tile-aligned boundaries) — the benchmark shape.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b_aligned_docs_s1024() {
     if !cuda_available() {
         return;
@@ -369,7 +369,7 @@ fn tier_b_aligned_docs_s1024() {
 
 /// 100-token documents (boundaries mid-tile).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b_unaligned_docs_s1024() {
     if !cuda_available() {
         return;
@@ -381,7 +381,7 @@ fn tier_b_unaligned_docs_s1024() {
 
 /// 40-token documents — high skip density.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b_many_short_docs_s1024() {
     if !cuda_available() {
         return;
@@ -394,7 +394,7 @@ fn tier_b_many_short_docs_s1024() {
 /// Benchmark shape: B=4, H=8, staggered per-row boundaries — exercises the
 /// per-batch-row launch loop with row-distinct range tables.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b_batch4_heads8_staggered_s1024() {
     if !cuda_available() {
         return;
@@ -406,7 +406,7 @@ fn tier_b_batch4_heads8_staggered_s1024() {
 
 /// Long-sequence spot check at s=4096 (deeper kv sweeps per q-tile).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b_aligned_docs_s4096() {
     if !cuda_available() {
         return;

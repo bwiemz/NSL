@@ -516,7 +516,7 @@ mod gpu {
     /// byte-identical Cranelift IR for the two dispatch paths; that
     /// is the load-bearing equivalence claim the suite makes today.
     #[test]
-    #[ignore]
+    #[ignore = "requires CUDA GPU; FFI determinism pin (same bytes twice), not a rounding-equivalence proof"]
     fn ffi_is_deterministic_under_fp16_dispatch() {
         if !cuda_available() {
             return;

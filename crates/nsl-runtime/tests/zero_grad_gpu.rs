@@ -120,7 +120,7 @@ fn read_gpu_f32_as_host_f32(ptr: i64) -> Vec<f32> {
 /// Also (e): the internal to_device_like migration is a same-device
 /// refcount++ that must be balanced by exactly one free.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_dst_gpu_src_accumulate_matches_cpu_reference() {
     if !cuda_available() {
         return;
@@ -160,7 +160,7 @@ fn gpu_dst_gpu_src_accumulate_matches_cpu_reference() {
 /// The src must be migrated (f64 -> GPU f32) and freed, leaving the
 /// caller's tensor untouched.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn gpu_dst_cpu_f64_src_accumulate() {
     if !cuda_available() {
         return;
@@ -202,7 +202,7 @@ fn gpu_dst_cpu_f64_src_accumulate() {
 /// readback (pre-fix: rc -1 and the buffer kept its stale values, so the
 /// next accumulation window started from the previous window's sum).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn grad_zero_gpu_clears_buffer() {
     if !cuda_available() {
         return;

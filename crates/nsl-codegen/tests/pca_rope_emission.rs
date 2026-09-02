@@ -485,7 +485,7 @@ fn backward_kernel_name_inherits_rope_reset_suffix() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "diagnostic: dumps the full rope_reset PTX to a temp file for inspection; asserts nothing"]
 fn dump_rope_reset_ptx() {
     let cfg = config_segment_masked_with_rope();
     let ptx = ptx_string(&cfg);

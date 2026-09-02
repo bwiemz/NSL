@@ -51,7 +51,7 @@ fn fixture_dir() -> PathBuf {
 ///
 /// Ignored by default — run with `-- --ignored` to regenerate.
 #[test]
-#[ignore]
+#[ignore = "generator: rewrites tests/fixtures/cpdt_precision_fp16_weights.safetensors; manual invocation only"]
 fn gen_cpdt_precision_fp16_weights() {
     use safetensors::tensor::{serialize, TensorView};
     use safetensors::Dtype;

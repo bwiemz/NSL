@@ -534,7 +534,7 @@ train(model = m, epochs = {n}):
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: WRGA B.3.2 per-op profiling bench at the prescribed shape; smoke asserts only (rc, profile present, fused markers launched), prints a table, no numerical gate"]
     fn b32_per_op_breakdown_prescribed_shape() {
         use assert_cmd::prelude::*;
         use tempfile::TempDir;

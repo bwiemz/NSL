@@ -393,7 +393,7 @@ fn run_fp16_numerical(b: usize, s: usize, v: usize, h: usize, vocab_tile: u32) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn fp16_forward_backward_at_v4096() {
     if !cuda_available() {
         return;
@@ -402,7 +402,7 @@ fn fp16_forward_backward_at_v4096() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn fp16_forward_backward_at_v8192_boundary() {
     if !cuda_available() {
         return;
@@ -428,7 +428,7 @@ fn fp16_forward_backward_at_v8192_boundary() {
 // reduction-time consumer are identical.
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn fp16_large_vocab_non_divisor_no_tail_zero_corruption() {
     if !cuda_available() {
         return;

@@ -255,7 +255,7 @@ mod tests {
     /// `--features cuda -- --include-ignored`.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore]
+    #[ignore = "requires CUDA GPU"]
     fn mmap_fallback_h2d_copies_bytes_to_device() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("nsl_test_gds_h2d_{}.bin", std::process::id()));

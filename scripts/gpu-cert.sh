@@ -26,6 +26,7 @@
 # Usage:
 #   scripts/gpu-cert.sh --list                  inventory as TSV, no build
 #   scripts/gpu-cert.sh --check-inventory       drift gate (GPU-free, for CI)
+#   scripts/gpu-cert.sh --check-reasons         no bare #[ignore] (GPU-free, CI)
 #   scripts/gpu-cert.sh --check-long-arms       timeout-override gate (GPU-free)
 #   scripts/gpu-cert.sh --write-manifest        refresh the committed manifest
 #   scripts/gpu-cert.sh --run [--tier TIER]     build + execute the lane
@@ -176,13 +177,20 @@ features_for_pkg() {
     printf '%s' "${out}"
 }
 
+# `gpu-inferred` is deliberately NOT a run class any more. Until every bare
+# `#[ignore]` was given a reason (2026-09-01) the lane ran them on the guess
+# that a cuda-gated file's unexplained ignore wants a device; that guess put
+# eight report-writing timing probes (WRGA B.3.2, CSHA element dumps) into the
+# certification sweep as if they were gates. A bare ignore is now refused by
+# --check-reasons, so the only way one reaches a sweep is on a branch that has
+# not passed CI — and there it is reported, not executed.
 classes_for_tier() {
     case "$1" in
-        gpu)       printf 'gpu\ngpu-inferred\n' ;;
+        gpu)       printf 'gpu\n' ;;
         toolchain) printf 'toolchain\n' ;;
         multiproc) printf 'multiproc\n' ;;
         isolate)   printf 'isolate\n' ;;
-        all)       printf 'gpu\ngpu-inferred\ntoolchain\nmultiproc\nisolate\n' ;;
+        all)       printf 'gpu\ntoolchain\nmultiproc\nisolate\n' ;;
         *) echo "gpu-cert: unknown tier '$1'" >&2; exit 2 ;;
     esac
 }
@@ -228,6 +236,36 @@ cmd_check_inventory() {
         exit 1
     fi
     echo "gpu-cert: inventory agrees with source ($(grep -cv '^#' "${MANIFEST}") gates)"
+}
+
+# Every #[ignore] must say why. The scanner classifies a bare `#[ignore]` by
+# guesswork — `gpu-inferred` if the file mentions the cuda feature anywhere,
+# `unclassified` otherwise — and both are wrong often enough to matter: the
+# inference ran timing probes as certification gates, and the fallback hid two
+# gates that never ran. Reasons are the classifier's input, so an unexplained
+# ignore is not a style problem, it is a gate with no defined behaviour.
+#
+# Scans the SOURCE, not the manifest, so it fails on the offending commit
+# even if the author also regenerated the manifest. Exempt: nothing — the
+# empty-reason test (column 4) catches a bare ignore even when a name/path
+# rule or a `cfg(not(cuda))` stack already gave it a harmless class, and the
+# class test catches a reason the ruleset does not recognise (`unclassified`).
+cmd_check_reasons() {
+    local rows
+    rows="$(inventory | awk -F'\t' '$3 == "gpu-inferred" || $3 == "unclassified" || $4 == ""')"
+    if [[ -n "${rows}" ]]; then
+        echo "gpu-cert: bare or unrecognised #[ignore] reason — every ignored test must carry one the classifier knows:" >&2
+        echo "" >&2
+        printf '%s\n' "${rows}" | awk -F'\t' '{ printf "  %s\t%s\t(%s)\t%s\n", $1, $2, $3, ($4 == "" ? "<no reason>" : "\"" $4 "\"") }' >&2
+        echo "" >&2
+        echo "Write #[ignore = \"...\"] using the vocabulary in scripts/gpu-gate-inventory.awk:" >&2
+        echo "  'requires CUDA GPU'   -> runs in the cert lane" >&2
+        echo "  'diagnostic: ...'     -> prints/sweeps, asserts nothing; never auto-run" >&2
+        echo "  'blocked: ...'        -> documented-broken; never auto-run" >&2
+        echo "then run: scripts/gpu-cert.sh --write-manifest" >&2
+        exit 1
+    fi
+    echo "gpu-cert: every #[ignore] carries a recognised reason ($(inventory | wc -l) gates)"
 }
 
 # ---------------------------------------------------------------------------
@@ -294,7 +332,7 @@ cmd_check_long_arms() {
     # is dead weight that reads as coverage.
     local runnable
     runnable="$(awk -F'\t' '
-        $3 ~ /^(gpu|gpu-inferred|toolchain|multiproc|isolate)$/ { print $1 }
+        $3 ~ /^(gpu|toolchain|multiproc|isolate)$/ { print $1 }
     ' "${MANIFEST}" | sort -u)"
 
     local n=0 lineno=0 file secs bad=0
@@ -673,7 +711,7 @@ cmd_run() {
     echo "gpu-cert: no unexpected failures"
 }
 
-usage() { sed -n '2,75p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # Bare invocation exits 2, not 0: a CI step that runs this with no argument
 # must not read as a green check that did nothing. Explicit --help still exits 0.
@@ -685,6 +723,7 @@ case "$1" in
     --list)            cmd_list ;;
     --write-manifest)  cmd_write_manifest ;;
     --check-inventory) cmd_check_inventory ;;
+    --check-reasons)   cmd_check_reasons ;;
     --check-long-arms) cmd_check_long_arms ;;
     --run)
         shift

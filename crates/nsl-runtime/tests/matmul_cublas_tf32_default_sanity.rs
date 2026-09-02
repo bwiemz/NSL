@@ -71,7 +71,7 @@ fn matmul_cublas_tf32_forced_equivalence() {
 
 /// Llama-scale — explicit opt-in.
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU; Llama-scale 4096^3 matmul, may exceed 60 s"]
 fn matmul_cublas_tf32_default_sanity_llama() {
     setup_env_default();
     helper::run_matmul_and_verify(4096, 4096, 4096, 5e-3, "tf32_default");

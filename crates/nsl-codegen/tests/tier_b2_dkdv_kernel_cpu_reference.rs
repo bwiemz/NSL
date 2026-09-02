@@ -118,7 +118,7 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
 // ============================================================================
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn tier_b2_dkdv_sweep_cpu_naive() {
     // Phase 3a regression gate — CpuNaive forward, hd=32/64/128.
     // Path-A schedule per spec §5.2: hd=128 uses bq=32; hd=32/64 use bq=64.
@@ -130,7 +130,7 @@ fn tier_b2_dkdv_sweep_cpu_naive() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU + nsl-test/cuda (FSource::B1Forward)"]
 fn tier_b2_dkdv_sweep_b1_forward() {
     // Phase 3a closure gate — B.1 GPU forward + adapter.
     // seq=32 (B.1 single-block precondition: launcher forces block_kv=32).

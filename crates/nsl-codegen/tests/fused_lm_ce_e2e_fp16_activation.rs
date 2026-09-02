@@ -464,7 +464,7 @@ mod gpu {
     ///
     /// Tolerance: forward loss rel_err <= 5e-3 (orchestrator spec).
     #[test]
-    #[ignore]
+    #[ignore = "requires CUDA GPU"]
     fn fp16_decorator_e2e_loss_matches_cpu_f64_reference() {
         if !cuda_available() {
             return;

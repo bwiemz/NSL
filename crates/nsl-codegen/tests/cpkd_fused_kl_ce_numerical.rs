@@ -75,7 +75,7 @@ fn f32_bits(v: f64) -> i64 {
 
 #[allow(clippy::too_many_lines)]
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
     if !cuda_available() {
         return;

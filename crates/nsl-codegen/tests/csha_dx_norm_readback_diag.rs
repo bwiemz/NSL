@@ -90,7 +90,7 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU; dx_norm readback gate (finite and non-zero, PR #83 H1)"]
 fn dx_norm_hbm_buffer_is_populated() {
     if !cuda_available() {
         eprintln!("[dx_norm diag] skipping — no CUDA");

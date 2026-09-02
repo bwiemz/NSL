@@ -6,10 +6,10 @@
 //! DSource::CpuNaive — the FAIL→PASS transition is what proves the utility
 //! localizes correctly.
 //!
-//! Manual run (no GPU required at this stub level; real GPU comparison wires
-//! during PR validation):
-//!     cargo test -p nsl-test --test diagnostic_mode_localizes_d_bug \
-//!         --features cuda -- --ignored --nocapture
+//! CPU-only at this stub level (the D comparison is CpuNaive against a scaled
+//! copy of itself), so it runs with the ordinary test suite; the real GPU
+//! comparison wires during PR validation. It carried a bare `#[ignore]` until
+//! 2026-09-01 and had therefore never run in any lane.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §7.3
 
@@ -29,7 +29,6 @@ fn seed_inputs(batch: usize, heads: usize, seq: usize, hd: usize)
 }
 
 #[test]
-#[ignore]
 fn diagnostic_mode_swap_localizes_d_bug() {
     let (batch, heads, seq, hd) = (1usize, 1usize, 32usize, 32usize);
     let (d_o, o) = seed_inputs(batch, heads, seq, hd);
