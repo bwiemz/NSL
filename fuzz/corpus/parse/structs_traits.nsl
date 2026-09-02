@@ -1,0 +1,18 @@
+struct Point:
+    x: f64
+    y: f64 = 0.0
+
+trait Show:
+    fn show(self) -> str
+
+trait Named<T: Show>:
+    fn name(self) -> str:
+        return "named"
+
+fn norm(p: Point) -> f64:
+    return (p.x ** 2 + p.y ** 2) ** 0.5
+
+let p = Point(x=1.0, y=2.0)
+let d = {"a": 1, "b": [1, 2, 3]}
+let t = (1,)
+let u = ()

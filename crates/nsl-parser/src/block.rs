@@ -670,8 +670,7 @@ pub fn parse_tokenizer_def_stmt(p: &mut Parser) -> Stmt {
                     nsl_errors::Diagnostic::error("expected key = value entry")
                         .with_label(p.current_span(), "invalid tokenizer entry"),
                 );
-                p.synchronize();
-                p.eat(&TokenKind::Newline);
+                p.skip_to_next_line();
                 continue;
             }
             let entry = parse_key_value_entry(p);
@@ -705,18 +704,6 @@ pub fn parse_tokenizer_def_stmt(p: &mut Parser) -> Stmt {
             }
         }
         rules
-    }
-
-    fn skip_unknown_tokenizer_section(p: &mut Parser) {
-        if p.eat(&TokenKind::Newline) {
-            p.skip_newlines();
-            if p.at(&TokenKind::Indent) {
-                let _ = p.parse_block();
-                return;
-            }
-        }
-        p.synchronize();
-        p.eat(&TokenKind::Newline);
     }
 
     let start = p.current_span();
@@ -798,7 +785,9 @@ pub fn parse_tokenizer_def_stmt(p: &mut Parser) -> Stmt {
                         ))
                         .with_label(section_span, "unexpected tokenizer section"),
                     );
-                    skip_unknown_tokenizer_section(p);
+                    // Whatever the section holds — the rest of its line
+                    // or an indented body — is dropped unparsed.
+                    p.skip_to_next_line();
                 }
             }
             continue;
@@ -808,8 +797,7 @@ pub fn parse_tokenizer_def_stmt(p: &mut Parser) -> Stmt {
             nsl_errors::Diagnostic::error("expected tokenizer section")
                 .with_label(p.current_span(), "invalid tokenizer body entry"),
         );
-        p.synchronize();
-        p.eat(&TokenKind::Newline);
+        p.skip_to_next_line();
     }
     p.eat(&TokenKind::Dedent);
 
@@ -852,8 +840,7 @@ pub fn parse_dataset_def_stmt(p: &mut Parser) -> Stmt {
                 nsl_errors::Diagnostic::error("expected dataset field assignment")
                     .with_label(p.current_span(), "invalid dataset body entry"),
             );
-            p.synchronize();
-            p.eat(&TokenKind::Newline);
+            p.skip_to_next_line();
             continue;
         }
 

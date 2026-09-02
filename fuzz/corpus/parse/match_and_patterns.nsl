@@ -1,0 +1,15 @@
+enum Shape:
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+
+fn area(s: Shape) -> f64:
+    match s:
+        case Shape.Circle(r):
+            return 3.14 * r ** 2
+        case Shape.Rect(w, h) if w > 0:
+            return w * h
+        case Shape.Rect(_, _) | Shape.Empty:
+            return 0.0
+        case _:
+            return -1.0

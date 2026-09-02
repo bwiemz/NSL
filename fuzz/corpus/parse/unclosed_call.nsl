@@ -1,0 +1,4 @@
+# An unclosed call: the parser reaches the end of the input inside the
+# argument list. It used to step past the Eof token onto a sentinel whose
+# span is in file 0, and panic merging it with a span of this file.
+let x = f(

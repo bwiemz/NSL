@@ -1,0 +1,17 @@
+let x = 3
+if x > 2:
+    print("big")
+elif x == 2:
+    print("two")
+else:
+    print("small")
+while x > 0:
+    x -= 1
+    if x == 1:
+        break
+    continue
+for i in 0..10:
+    let y = -i
+    if i % 2 == 0:
+        y = i
+let squares = [i * i for i in 0..5 if i > 0]

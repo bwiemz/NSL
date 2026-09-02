@@ -7,7 +7,31 @@ use crate::expr::{parse_args, parse_expr};
 use crate::parser::Parser;
 
 /// Parse a single statement.
+///
+/// Every statement — top-level, in a block, in a `train:`/`distill:` body,
+/// in a `datatype` method, behind `pub`/`priv` — comes through here, so
+/// this is where statement nesting is counted; `parse_block` counts the
+/// blocks between statements, and the two together bound every
+/// statement-level recursion.
 pub fn parse_stmt(p: &mut Parser) -> Stmt {
+    if !p.enter_nesting("statement") {
+        let span = p.current_span();
+        return Stmt {
+            kind: StmtKind::Expr(nsl_ast::expr::Expr {
+                kind: nsl_ast::expr::ExprKind::Error,
+                span,
+                id: p.next_node_id(),
+            }),
+            span,
+            id: p.next_node_id(),
+        };
+    }
+    let stmt = parse_stmt_nested(p);
+    p.leave_nesting();
+    stmt
+}
+
+fn parse_stmt_nested(p: &mut Parser) -> Stmt {
     // Handle decorators
     if p.at(&TokenKind::At) {
         return parse_decorated_stmt(p);

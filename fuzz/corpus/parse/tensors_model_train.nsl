@@ -1,0 +1,23 @@
+import nsl.nn as nn
+from nsl.optim import Adam
+
+let w: Tensor<[batch=32, 16], f32> = zeros([32, 16])
+let v: Tensor<[4, 2], f64, cuda> = ones([4, 2])
+
+model MLP:
+    l1: Linear = Linear(16, 32)
+    l2: Linear = Linear(32, 1)
+
+    fn forward(self, x: Tensor<[batch, 16], f32>) -> Tensor<[batch, 1], f32>:
+        return x |> self.l1 |> relu |> self.l2
+
+train(model=MLP(), epochs=3, precision=bf16):
+    optimizer = Adam(lr=1e-3, eps=1e-8)
+    loss = mse
+    let steps = 3 * 2
+
+let (l, dw) = grad(w):
+    sum(w * w)
+
+kernel add(a: Tensor, b: Tensor) -> Tensor:
+    return a + b

@@ -40,6 +40,6 @@ pub fn parse(tokens: &[Token], interner: &mut Interner) -> ParseResult {
 
     ParseResult {
         module: Module { stmts, span },
-        diagnostics: p.diagnostics,
+        diagnostics: p.finish(),
     }
 }

@@ -25,7 +25,22 @@ pub fn parse_pattern(p: &mut Parser) -> Pattern {
     pat
 }
 
+/// Every nested pattern (tuple, list, struct and enum payloads) comes back
+/// through here, so this is where pattern nesting is counted.
 fn parse_primary_pattern(p: &mut Parser) -> Pattern {
+    if !p.enter_nesting("pattern") {
+        return Pattern {
+            kind: PatternKind::Wildcard,
+            span: p.current_span(),
+            id: p.next_node_id(),
+        };
+    }
+    let pat = parse_primary_pattern_nested(p);
+    p.leave_nesting();
+    pat
+}
+
+fn parse_primary_pattern_nested(p: &mut Parser) -> Pattern {
     match p.peek().clone() {
         // Wildcard
         TokenKind::Underscore => {

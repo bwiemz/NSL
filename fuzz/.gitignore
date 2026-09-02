@@ -1,0 +1,9 @@
+# cargo-fuzz grows corpus/<target>/ with SHA-named inputs as it runs and
+# writes crash/timeout reproducers to artifacts/. Only the hand-written
+# seeds (corpus/<target>/*.nsl) are committed; a reproducer worth keeping
+# is copied into the corpus under a .nsl name.
+corpus/*/*
+!corpus/*/*.nsl
+artifacts/
+coverage/
+target/

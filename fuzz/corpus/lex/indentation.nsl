@@ -1,0 +1,14 @@
+fn outer(x: int) -> int:
+    if x > 0:
+        let y = x * 2
+
+        # comment at odd indent
+  # another
+        return y
+    else:
+        return f(x,
+            1)
+let z = [1,
+  2]
+let w = a + \
+    b
