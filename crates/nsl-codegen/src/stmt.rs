@@ -3291,23 +3291,26 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
     ) {
-        let locals: Vec<_> = state
-            .variables
-            .iter()
-            .filter(|(sym, _)| !state.param_symbols.contains(sym))
-            .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
+        // Name order: this sweep is a call per variable, and its order
+        // is the function's text (see `variables_in_name_order`).
+        let locals: Vec<_> = self
+            .variables_in_name_order(state)
+            .into_iter()
+            .filter(|sym| !state.param_symbols.contains(sym))
+            .filter(|sym| !state.non_owning_symbols.contains(sym))
             // Semantic-type filter: only tensor (or indeterminate) locals.
             // free_if_valid's pointer probes are NOT sufficient for plain
             // integers — a large 8-aligned int (e.g. a byte count from
             // gpu_peak_bytes()) passes the null/low/alignment checks and the
             // magic probe DEREFERENCES it, segfaulting on unmapped memory.
-            .filter(|(sym, _)| {
+            .filter(|sym| {
                 matches!(state.variable_types.get(sym),
                          Some(ty) if ty.is_tensor() || ty.is_indeterminate())
             })
-            .filter_map(|(_, (var, cl_type))| {
-                if *cl_type == cl_types::I64 {
-                    Some(*var)
+            .filter_map(|sym| {
+                let (var, cl_type) = state.variables[&sym];
+                if cl_type == cl_types::I64 {
+                    Some(var)
                 } else {
                     None
                 }
@@ -3329,14 +3332,15 @@ impl Compiler<'_> {
         // returned/passed/stored-into); see dict_lifetime.rs for the veto
         // rules. An unscanned body has an empty set: status quo, the dict
         // strands (leak, not crash).
-        let dict_locals: Vec<_> = state
-            .variables
-            .iter()
-            .filter(|(sym, _)| state.sweepable_dict_locals.contains(sym))
-            .filter(|(sym, _)| !state.param_symbols.contains(sym))
-            .filter_map(|(_, (var, cl_type))| {
-                if *cl_type == cl_types::I64 {
-                    Some(*var)
+        let dict_locals: Vec<_> = self
+            .variables_in_name_order(state)
+            .into_iter()
+            .filter(|sym| state.sweepable_dict_locals.contains(sym))
+            .filter(|sym| !state.param_symbols.contains(sym))
+            .filter_map(|sym| {
+                let (var, cl_type) = state.variables[&sym];
+                if cl_type == cl_types::I64 {
+                    Some(var)
                 } else {
                     None
                 }
@@ -8633,7 +8637,7 @@ sched={sched_s}",
             // preserves its pre-v10 conservative-fire behaviour on
             // unannotated `Tensor` params.  See
             // [`resolvable_tensor_rank`].
-            for &sym in state.variables.keys() {
+            for sym in self.variables_in_name_order(state) {
                 let rank = state
                     .variable_types
                     .get(&sym)
@@ -8848,25 +8852,36 @@ sched={sched_s}",
                 let mut primal_vars = crate::wengert_lower::VarMap::new();
                 // Build primal_vars from state.variables using both Symbol-based
                 // and name-based matching to handle cross-module Symbol mismatches.
-                let state_vars_by_name: std::collections::HashMap<String, Value> = state
-                    .variables
-                    .iter()
-                    .map(|(sym, (cvar, _))| {
-                        (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar))
+                // Both walks are in name order: `use_var` numbers a value per
+                // call, and walking either `HashMap` in its own order numbered
+                // `main` differently on every compile (see
+                // `variables_in_name_order`).
+                let state_vars_by_name: std::collections::HashMap<String, Value> = self
+                    .variables_in_name_order(state)
+                    .into_iter()
+                    .map(|sym| {
+                        let (cvar, _) = state.variables[&sym];
+                        (self.resolve_sym(sym).to_string(), builder.use_var(cvar))
                     })
                     .collect();
 
                 // First pass: map symbol_var_map entries via Symbol match or name fallback
-                for (sym, vid) in extractor.symbol_var_map() {
-                    if primal_vars.contains_key(vid) {
+                let mut symbol_vars: Vec<(nsl_ast::Symbol, crate::wengert::VarId)> = extractor
+                    .symbol_var_map()
+                    .iter()
+                    .map(|(sym, vid)| (*sym, *vid))
+                    .collect();
+                symbol_vars.sort_by_key(|&(sym, vid)| (vid, self.resolve_sym(sym)));
+                for (sym, vid) in symbol_vars {
+                    if primal_vars.contains_key(&vid) {
                         continue;
                     }
-                    if let Some(&(cvar, _)) = state.variables.get(sym) {
-                        primal_vars.insert(*vid, builder.use_var(cvar));
+                    if let Some(&(cvar, _)) = state.variables.get(&sym) {
+                        primal_vars.insert(vid, builder.use_var(cvar));
                     } else {
-                        let name = self.resolve_sym(*sym).to_string();
+                        let name = self.resolve_sym(sym).to_string();
                         if let Some(&val) = state_vars_by_name.get(&name) {
-                            primal_vars.insert(*vid, val);
+                            primal_vars.insert(vid, val);
                         }
                     }
                 }
@@ -17136,21 +17151,25 @@ sched={sched_s}",
         let current_blk = state.current_block.unwrap_or(batch_body_block);
         if !is_block_filled(builder, current_blk) {
             let zero = builder.ins().iconst(cl_types::I64, 0);
-            let step_tensor_vars: Vec<_> = state
-                .variables
-                .iter()
-                .filter(|(sym, _)| !vars_before_step.contains(sym))
+            // Name order, not `HashMap` order: each `use_var` below numbers
+            // a value, and this sweep is the last thing in `main` that
+            // reads the step's variables (see `variables_in_name_order`).
+            let step_tensor_vars: Vec<_> = self
+                .variables_in_name_order(state)
+                .into_iter()
+                .filter(|sym| !vars_before_step.contains(sym))
                 // Borrow aliases (e.g. `let alias = m.w`, DataLoader handles)
                 // don't own their tensor — freeing them here would free the
                 // model weight itself and use-after-free the next step.
-                .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
-                .filter(|(sym, _)| !state.borrowed_batch_symbols.contains(sym))
-                .filter_map(|(sym, (var, _))| {
-                    let sem_ty = state.variable_types.get(sym);
+                .filter(|sym| !state.non_owning_symbols.contains(sym))
+                .filter(|sym| !state.borrowed_batch_symbols.contains(sym))
+                .filter_map(|sym| {
+                    let (var, _) = state.variables[&sym];
+                    let sem_ty = state.variable_types.get(&sym);
                     let is_tensor = sem_ty.map(|t| t.is_tensor()).unwrap_or(false);
                     let is_unknown = sem_ty.map(|t| t.is_indeterminate()).unwrap_or(true);
                     if is_tensor || is_unknown {
-                        Some((*var, is_tensor))
+                        Some((var, is_tensor))
                     } else {
                         None
                     }
@@ -18836,7 +18855,7 @@ sched={sched_s}",
         extractor.set_synth_member_names(self.synth_member_names.clone());
         self.register_source_ad_model_instances(&mut extractor, state);
 
-        for &sym in state.variables.keys() {
+        for sym in self.variables_in_name_order(state) {
             extractor.register_input(sym);
         }
 
@@ -18895,23 +18914,35 @@ sched={sched_s}",
             return Ok(None);
         };
 
-        let state_vars_by_name: std::collections::HashMap<String, Value> = state
-            .variables
-            .iter()
-            .map(|(sym, (cvar, _))| (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar)))
+        // Both walks in name order, as in the train block's source-AD
+        // arm: `use_var` numbers a value per call (see
+        // `variables_in_name_order`).
+        let state_vars_by_name: std::collections::HashMap<String, Value> = self
+            .variables_in_name_order(state)
+            .into_iter()
+            .map(|sym| {
+                let (cvar, _) = state.variables[&sym];
+                (self.resolve_sym(sym).to_string(), builder.use_var(cvar))
+            })
             .collect();
         let mut primal_vars = crate::wengert_lower::VarMap::new();
 
-        for (sym, vid) in extractor.symbol_var_map() {
-            if primal_vars.contains_key(vid) {
+        let mut symbol_vars: Vec<(nsl_ast::Symbol, crate::wengert::VarId)> = extractor
+            .symbol_var_map()
+            .iter()
+            .map(|(sym, vid)| (*sym, *vid))
+            .collect();
+        symbol_vars.sort_by_key(|&(sym, vid)| (vid, self.resolve_sym(sym)));
+        for (sym, vid) in symbol_vars {
+            if primal_vars.contains_key(&vid) {
                 continue;
             }
-            if let Some(&(cvar, _)) = state.variables.get(sym) {
-                primal_vars.insert(*vid, builder.use_var(cvar));
+            if let Some(&(cvar, _)) = state.variables.get(&sym) {
+                primal_vars.insert(vid, builder.use_var(cvar));
             } else {
-                let name = self.resolve_sym(*sym).to_string();
+                let name = self.resolve_sym(sym).to_string();
                 if let Some(&val) = state_vars_by_name.get(&name) {
-                    primal_vars.insert(*vid, val);
+                    primal_vars.insert(vid, val);
                 }
             }
         }
@@ -19082,11 +19113,31 @@ sched={sched_s}",
         extractor: &mut crate::source_ad::WengertExtractor<'_>,
         state: &FuncState,
     ) {
-        for &sym in state.variables.keys() {
+        for sym in self.variables_in_name_order(state) {
             if let Some(model_type_name) = self.resolve_source_ad_model_type_name(state, sym) {
                 extractor.register_model_instance(sym, &model_type_name);
             }
         }
+    }
+
+    /// The variables in scope, by name — the order for any walk over
+    /// `state.variables` that emits as it goes.
+    ///
+    /// `state.variables` is a `HashMap`; walking it in iteration order
+    /// while calling `use_var` (which numbers a value per call) or
+    /// emitting a call per entry laid `main` out differently from one
+    /// compile of the same program to the next — same instructions, but
+    /// the value numbers and the order of the cleanup frees moved, so no
+    /// two `--dump-ir` runs could be compared and the CLIF snapshot tests
+    /// (`tests/train_clif_snapshots.rs`) could not exist.
+    ///
+    /// One interner per compile makes the name injective over symbols
+    /// today; the symbol index breaks a tie should that ever change, so
+    /// the order never falls back to the map's.
+    pub(crate) fn variables_in_name_order(&self, state: &FuncState) -> Vec<nsl_ast::Symbol> {
+        let mut syms: Vec<nsl_ast::Symbol> = state.variables.keys().copied().collect();
+        syms.sort_by_key(|&sym| (self.resolve_sym(sym), string_interner::Symbol::to_usize(sym.0)));
+        syms
     }
 
     fn resolve_source_ad_model_type_name(
