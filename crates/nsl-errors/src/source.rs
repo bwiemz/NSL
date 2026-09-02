@@ -7,12 +7,27 @@ use crate::span::FileId;
 
 pub struct SourceMap {
     files: SimpleFiles<String, String>,
+    /// When set, [`emit_diagnostic`](Self::emit_diagnostic) renders nothing.
+    /// Diagnostics still reach the caller through the frontend's return
+    /// values (the module loader returns `Err` on an error-level one), so
+    /// this drops only the stderr rendering — for callers that drive the
+    /// frontend many times over the same sources, such as the benches.
+    quiet: bool,
 }
 
 impl SourceMap {
     pub fn new() -> Self {
         Self {
             files: SimpleFiles::new(),
+            quiet: false,
+        }
+    }
+
+    /// A map whose [`emit_diagnostic`](Self::emit_diagnostic) is a no-op.
+    pub fn silent() -> Self {
+        Self {
+            quiet: true,
+            ..Self::new()
         }
     }
 
@@ -22,6 +37,9 @@ impl SourceMap {
     }
 
     pub fn emit_diagnostic(&self, diag: &Diagnostic) {
+        if self.quiet {
+            return;
+        }
         let severity = match diag.level {
             Level::Error => codespan_reporting::diagnostic::Severity::Error,
             Level::Warning => codespan_reporting::diagnostic::Severity::Warning,

@@ -11,3 +11,10 @@ repository.workspace = true
 [dependencies]
 nsl-errors.workspace = true
 string-interner.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "lex"
+harness = false

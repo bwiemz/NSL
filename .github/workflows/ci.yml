@@ -116,6 +116,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # The criterion benches (scripts/bench.sh) are not built by anything
+      # else in this lane; a check keeps their sources from rotting against
+      # the frontend/runtime APIs without linking six workspace-sized
+      # binaries. Named one by one, NOT `--benches`: that flag also builds
+      # every lib in bench mode, i.e. with cfg(test), and the test modules
+      # carry ~100 clippy findings this lane has never gated on. Linux only:
+      # the benches are CPU-only and platform-free.
+      - name: Clippy (benches)
+        if: runner.os == 'Linux'
+        run: >-
+          cargo clippy
+          -p nsl-lexer -p nsl-parser -p nsl-semantic -p nsl-cli -p nsl-codegen -p nsl-runtime
+          --bench lex --bench parse --bench analyze --bench frontend --bench compile --bench tape
+          -- -D warnings
+
       - name: E2E smoke tests (Linux/Windows)
         if: runner.os != 'macOS'
         run: cargo test -p nsl-cli --test e2e -- --test-threads=1

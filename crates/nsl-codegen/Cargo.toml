@@ -81,6 +81,7 @@ tempfile = "3"
 libloading = "0.8"
 assert_cmd = "2"
 nsl-test = { path = "../nsl-test" }
+criterion.workspace = true
 
 [[bin]]
 name = "cpdt_calibrate"
@@ -133,3 +134,9 @@ path = "tests/csha_cycle16_g16_2_g16_3_triage.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 required-features = ["cuda", "debug_kernel_instrumentation"]
+
+# Not to be confused with the `bench` BINARY above (the PCA Tier B GPU
+# harness): this is the criterion compile-latency bench, CPU-only.
+[[bench]]
+name = "compile"
+harness = false

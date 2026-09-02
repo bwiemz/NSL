@@ -12,3 +12,10 @@ repository.workspace = true
 nsl-errors.workspace = true
 nsl-lexer.workspace = true
 nsl-ast.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "parse"
+harness = false

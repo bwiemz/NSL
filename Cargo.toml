@@ -48,6 +48,12 @@ rand = "0.9"
 rand_chacha = "0.9"
 toml = "0.8"
 bytemuck = { version = "1", features = ["derive"] }
+# Benchmark harness (roadmap T3). Default features are off: `rayon` and
+# `plotters` (gnuplot-style HTML plots) are dead weight for a compare-against-
+# baseline workflow, and each one is a dependency tree the supply-chain gate
+# would have to vet for nothing. `cargo_bench_support` is the `cargo bench`
+# CLI (`--save-baseline`, `--baseline`, filters).
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 # ── Build profiles ────────────────────────────────────────────────────────────
 #

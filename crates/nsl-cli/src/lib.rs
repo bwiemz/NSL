@@ -10,3 +10,12 @@ pub mod profile;
 pub mod profile_render;
 pub mod shape_debug;
 pub mod wggo_explain;
+
+// The multi-module frontend: `loader::load_all_modules` (lex, parse, resolve
+// imports, analyze in dependency order with real imported types) and the two
+// modules it leans on. Exposed so benches/frontend.rs can drive the path
+// `nsl build` takes over a real recipe graph; the `nsl` binary keeps its own
+// `mod` declarations in main.rs.
+pub mod loader;
+pub mod mangling;
+pub mod resolver;
