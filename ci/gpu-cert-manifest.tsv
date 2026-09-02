@@ -2,6 +2,7 @@
 # Regenerate with: scripts/gpu-cert.sh --write-manifest
 # Columns: file<TAB>test<TAB>class<TAB>reason
 crates/nsl-cli/tests/autotune_measure_gate.rs	autotune_measures_and_compiles_consume_it_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/calibration_pipeline_integration.rs	build_with_calibration_data_emits_no_consumer_warning	broken	blocked: `nsl build` never runs the calibration harness — the no-consumer warning lives in `compile_and_calibrate` (e3ab23ad, 2026-05-10), which nothing in the workspace calls, and before that it was gated behind a `train` block; on the CLI path --calibration-data is validated and the harness never fires
 crates/nsl-cli/tests/ccr_checkpoint_activation_parity_gpu.rs	ccr_activation_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu_deterministic	gpu	requires CUDA GPU

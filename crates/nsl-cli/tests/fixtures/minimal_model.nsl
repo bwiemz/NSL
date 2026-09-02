@@ -1,0 +1,19 @@
+# Fixture for the calibration CLI tests (calibration_no_cargo.rs,
+# calibration_pipeline_integration.rs): the smallest program that `nsl build`
+# compiles AND links. It has no calibration consumer — no
+# `@quantize(dtype="awq4")`, no `@wggo_target`, no `train` block — so a
+# `--calibration-data` corpus has nothing to feed, and the build must
+# either say so or (today) succeed while saying nothing.
+
+model Counter(start: int):
+    value: int = start
+
+    fn get(self) -> int:
+        return self.value
+
+    fn increment(self):
+        self.value = self.value + 1
+
+let c = Counter(10)
+c.increment()
+print(c.get())
