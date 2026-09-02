@@ -129,9 +129,7 @@ static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 /// the pre-cache behavior). Same read-once discipline as the mode resolvers.
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("NSL_MATMUL_BF16_CAST_CACHE").ok().as_deref() != Some("0")
-    })
+    *ON.get_or_init(|| crate::matmul_config::config().cast_cache)
 }
 
 /// The fused AdamW step just moved (or is about to move — order within the

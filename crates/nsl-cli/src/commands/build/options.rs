@@ -41,6 +41,13 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             zero_stage,
             zero_elementwise,
             deterministic: _deterministic,
+            matmul_mode,
+            bf16_rounding,
+            bf16_min_ratio,
+            bf16_cast_cache,
+            bf16_lt,
+            bf16_lt_workspace_mib,
+            no_bf16_lt_tune,
             seed,
             dead_weight_threshold,
             sparse_threshold,
@@ -455,6 +462,22 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             };
 
             let mut compile_opts = nsl_codegen::CompileOptions {
+                // Matmul arithmetic, promoted from the NSL_MATMUL_BF16* family
+                // so it reaches the execution fingerprint. `.clamped()` applies
+                // the same bounds the runtime applies, so the fingerprint
+                // records the EFFECTIVE value rather than the raw one.
+                matmul: nsl_codegen::MatmulConfig {
+                    mode: nsl_codegen::MatmulMode::parse(&matmul_mode)
+                        .unwrap_or(nsl_codegen::MatmulMode::Tf32),
+                    bf16_rounding: nsl_codegen::Bf16Rounding::parse(&bf16_rounding)
+                        .unwrap_or(nsl_codegen::Bf16Rounding::Rne),
+                    bf16_min_ratio,
+                    bf16_cast_cache,
+                    bf16_lt,
+                    bf16_lt_workspace_mib,
+                    bf16_lt_tune: !no_bf16_lt_tune,
+                }
+                .clamped(),
                 no_autotune,
                 autotune_fresh,
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size

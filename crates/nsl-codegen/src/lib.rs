@@ -1110,6 +1110,130 @@ impl Default for CheckpointStride {
     }
 }
 
+/// Which arithmetic the high-intensity GEMMs perform.
+///
+/// This was five environment variables until 2026-09-02. They were invisible
+/// to the execution fingerprint, which meant a checkpoint could not tell you
+/// which arithmetic produced it -- and two chain legs were written up as f32
+/// while running bf16 because a copied driver carried a stale `NSL_MATMUL_BF16`
+/// and nothing read the banner back. Worse, the fingerprint's `dtype` key is
+/// the MODEL dtype and defaults to `bf16` unconditionally, so a sidecar said
+/// `dtype=bf16` for a run whose GEMMs were TF32. Making these compile options
+/// puts them in the fingerprint, where a resume can refuse on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatmulMode {
+    /// TF32 tensor cores. The historical default.
+    #[default]
+    Tf32,
+    /// Cast high-intensity GEMM operands to bf16 storage; accumulate in f32.
+    Bf16,
+    /// Full f32, no tensor-core reduced precision.
+    F32,
+}
+
+impl MatmulMode {
+    /// Closed vocabulary for the fingerprint. Never a `Debug` rendering: a
+    /// renamed variant would silently change every checkpoint's fingerprint.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatmulMode::Tf32 => "tf32",
+            MatmulMode::Bf16 => "bf16",
+            MatmulMode::F32 => "f32",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "tf32" => Some(MatmulMode::Tf32),
+            "bf16" => Some(MatmulMode::Bf16),
+            "f32" => Some(MatmulMode::F32),
+            _ => None,
+        }
+    }
+}
+
+/// Rounding for the bf16 operand cast. SR re-dithers per launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bf16Rounding {
+    /// Round-to-nearest-even. Ensemble-unbiased, but its per-weight error is a
+    /// STANDING bias rather than noise (PR #540).
+    #[default]
+    Rne,
+    /// Stochastic rounding: a fresh dither per launch. Blocks graph capture and
+    /// is incompatible with the cast cache, whose whole premise is reuse.
+    Sr,
+}
+
+impl Bf16Rounding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Bf16Rounding::Rne => "rne",
+            Bf16Rounding::Sr => "sr",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "rne" => Some(Bf16Rounding::Rne),
+            "sr" => Some(Bf16Rounding::Sr),
+            _ => None,
+        }
+    }
+}
+
+/// The matmul arithmetic configuration, promoted from environment variables to
+/// first-class compile options so the execution fingerprint can carry it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatmulConfig {
+    pub mode: MatmulMode,
+    pub bf16_rounding: Bf16Rounding,
+    /// Minimum arithmetic intensity `mnk/(a+b elements)` for a GEMM to take the
+    /// bf16 path. ARITHMETIC: it decides WHICH matmuls are reduced precision,
+    /// so two runs differing only here compute different things.
+    pub bf16_min_ratio: f64,
+    /// Cache the weight operand's bf16 cast across GEMMs. Bit-preserving by
+    /// INVARIANT (four staleness classes, see `bf16_cast_cache.rs`), so this is
+    /// a placement-class key -- but it costs ~2 GiB of pinned VRAM at 1B, and a
+    /// resume that turns it on can OOM where the original run did not.
+    pub bf16_cast_cache: bool,
+    /// Issue bf16-storage GEMMs through cuBLASLt heuristics.
+    pub bf16_lt: bool,
+    /// Workspace cap handed to the Lt heuristic. ARITHMETIC: the cap filters
+    /// candidate kernels, so a smaller value excludes split-k and wide-tile
+    /// algorithms and changes the reduction order.
+    pub bf16_lt_workspace_mib: u32,
+    /// Timed first-use plan selection. ARITHMETIC-ADJACENT and the reason the
+    /// Lt keys cannot promise bit identity on their own: a timed winner depends
+    /// on live machine state, so plan choice is not reproducible across
+    /// processes unless `--deterministic` disables the tune.
+    pub bf16_lt_tune: bool,
+}
+
+impl Default for MatmulConfig {
+    fn default() -> Self {
+        Self {
+            mode: MatmulMode::Tf32,
+            bf16_rounding: Bf16Rounding::Rne,
+            bf16_min_ratio: 512.0,
+            bf16_cast_cache: false,
+            bf16_lt: false,
+            bf16_lt_workspace_mib: 64,
+            bf16_lt_tune: true,
+        }
+    }
+}
+
+impl MatmulConfig {
+    /// Clamp exactly as the runtime does, so a fingerprint records the
+    /// EFFECTIVE value. Fingerprinting a raw string that the runtime then
+    /// clamps would let two runs with identical arithmetic disagree.
+    pub fn clamped(mut self) -> Self {
+        self.bf16_lt_workspace_mib = self.bf16_lt_workspace_mib.min(4096);
+        if !(self.bf16_min_ratio.is_finite() && self.bf16_min_ratio >= 0.0) {
+            self.bf16_min_ratio = 512.0;
+        }
+        self
+    }
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1316,6 +1440,11 @@ pub struct CompileOptions {
     pub target_gpu: String,
     /// Dev Tools Phase 2: tensor dtype assumed by the profile walker.
     pub dtype: String,
+
+    /// Matmul arithmetic (mode, rounding, min-ratio, cast cache, Lt).
+    /// Promoted from the `NSL_MATMUL_BF16*` family so it reaches the
+    /// execution fingerprint; the env vars remain as a deprecated fallback.
+    pub matmul: MatmulConfig,
     /// Dev Tools Phase 2, Task 6: manifest output path.
     pub manifest_output_path: Option<std::path::PathBuf>,
     /// Dev Tools Phase 2, Task 6: source text for span line numbers.
@@ -1607,6 +1736,10 @@ impl CompileOptions {
                 }
             })
             .collect();
+        // Clamp before rendering: the runtime clamps the workspace and falls
+        // back on an unparseable ratio, so fingerprinting the raw values would
+        // let two runs with identical arithmetic disagree.
+        let mm = self.matmul.clamped();
         [
             format!("ad={}", if self.source_ad { "source" } else { "tape" }),
             format!("det={}", b(self.deterministic)),
@@ -1620,6 +1753,17 @@ impl CompileOptions {
             format!("muon_bns={}", b(self.muon_batch_ns)),
             format!("muon_resmom={}", b(self.muon_resident_momentum)),
             format!("lmhead={lmhead}"),
+            // --- matmul arithmetic (was the NSL_MATMUL_BF16* env family) ---
+            // `dtype` above is the MODEL dtype and defaults to bf16 whatever
+            // the GEMMs do, so it never carried this and reading it as though
+            // it did is the mistake these keys exist to prevent.
+            format!("mm={}", mm.mode.as_str()),
+            format!("mmround={}", mm.bf16_rounding.as_str()),
+            format!("mmratio={}", mm.bf16_min_ratio),
+            format!("mmlt={}", b(mm.bf16_lt)),
+            format!("mmltws={}", mm.bf16_lt_workspace_mib),
+            format!("mmlttune={}", b(mm.bf16_lt_tune)),
+            format!("mmcache={}", b(mm.bf16_cast_cache)),
             format!("arena={}", b(self.transient_arena)),
             format!("graphs={}", b(self.cuda_graphs)),
             format!("ckpt={ckpt}"),
@@ -1681,6 +1825,7 @@ impl Default for CompileOptions {
             profile_kernels: false,
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
+            matmul: MatmulConfig::default(),
             manifest_output_path: None,
             profile_source_text: None,
             profile_source_file_name: None,
@@ -2038,6 +2183,75 @@ mod calib_options_tests {
 #[cfg(test)]
 mod exec_fingerprint_tests {
     use super::*;
+
+
+    #[test]
+    fn the_matmul_mode_changes_the_fingerprint_but_dtype_does_not() {
+        // THE BUG THIS FEATURE EXISTS FOR. Two checkpoints taken on 2026-09-02
+        // -- one banner-verified TF32, one banner-verified BF16 -- both carry
+        // `dtype=bf16`, because `dtype` is the MODEL dtype and defaults to bf16
+        // whatever the GEMMs do. Anyone auditing a sidecar would read that as
+        // the precision. Pin both halves: `mm` separates them and `dtype` does
+        // not, so a future change that drops `mm` fails here rather than
+        // silently restoring the ambiguity.
+        let mut tf32 = CompileOptions::default();
+        tf32.matmul.mode = MatmulMode::Tf32;
+        let mut bf16 = CompileOptions::default();
+        bf16.matmul.mode = MatmulMode::Bf16;
+
+        let (a, b) = (tf32.exec_fingerprint(), bf16.exec_fingerprint());
+        assert!(a.contains("mm=tf32"), "{a}");
+        assert!(b.contains("mm=bf16"), "{b}");
+        assert_ne!(a, b, "the matmul mode must change the fingerprint");
+
+        // ...and the key that LOOKS like it covers this is identical in both.
+        let dt = |s: &str| {
+            s.split(',')
+                .find(|kv| kv.starts_with("dtype="))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            dt(&a),
+            dt(&b),
+            "`dtype` must NOT be read as the GEMM mode -- it is the model dtype"
+        );
+    }
+
+    #[test]
+    fn every_matmul_option_reaches_the_fingerprint() {
+        // A key that never changes is a key that guards nothing. Vary each
+        // option one at a time and require the rendering to move.
+        let base = CompileOptions::default();
+        let f0 = base.exec_fingerprint();
+        let mutate: Vec<(&str, fn(&mut CompileOptions))> = vec![
+            ("mode", |o| o.matmul.mode = MatmulMode::F32),
+            ("rounding", |o| o.matmul.bf16_rounding = Bf16Rounding::Sr),
+            ("min_ratio", |o| o.matmul.bf16_min_ratio = 256.0),
+            ("cast_cache", |o| o.matmul.bf16_cast_cache = true),
+            ("lt", |o| o.matmul.bf16_lt = true),
+            ("lt_workspace", |o| o.matmul.bf16_lt_workspace_mib = 128),
+            ("lt_tune", |o| o.matmul.bf16_lt_tune = false),
+        ];
+        for (name, f) in mutate {
+            let mut o = CompileOptions::default();
+            f(&mut o);
+            assert_ne!(o.exec_fingerprint(), f0, "changing {name} left the fingerprint identical");
+        }
+    }
+
+    #[test]
+    fn the_workspace_is_clamped_before_it_is_fingerprinted() {
+        // The runtime clamps to 4096 MiB. If the fingerprint recorded the raw
+        // value, two runs with IDENTICAL arithmetic (both clamped to 4096)
+        // would disagree and a resume would refuse for no reason.
+        let mut a = CompileOptions::default();
+        a.matmul.bf16_lt_workspace_mib = 99_999;
+        let mut b = CompileOptions::default();
+        b.matmul.bf16_lt_workspace_mib = 4096;
+        assert!(a.exec_fingerprint().contains("mmltws=4096"));
+        assert_eq!(a.exec_fingerprint(), b.exec_fingerprint());
+    }
 
     #[test]
     fn default_options_emit_every_key() {

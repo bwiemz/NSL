@@ -135,6 +135,38 @@ impl Compiler<'_> {
                 )?;
             }
 
+            // Item 4: install the matmul arithmetic alongside the fingerprint,
+            // from the SAME clamped compile options that were just rendered
+            // into it. Emitted unconditionally for the reason the fingerprint
+            // is: an absent call is indistinguishable from a build predating
+            // the feature, so a default build must still say so explicitly.
+            {
+                use crate::{Bf16Rounding, MatmulMode};
+                let mm = self.compile_options.matmul.clamped();
+                let mode = match mm.mode {
+                    MatmulMode::Tf32 => 0i64,
+                    MatmulMode::Bf16 => 1,
+                    MatmulMode::F32 => 2,
+                };
+                let round = match mm.bf16_rounding {
+                    Bf16Rounding::Rne => 0i64,
+                    Bf16Rounding::Sr => 1,
+                };
+                let b = |v: bool| if v { 1i64 } else { 0 };
+                let args = [
+                    builder.ins().iconst(cl_types::I64, mode),
+                    builder.ins().iconst(cl_types::I64, round),
+                    builder.ins().f64const(mm.bf16_min_ratio),
+                    builder.ins().iconst(cl_types::I64, b(mm.bf16_cast_cache)),
+                    builder.ins().iconst(cl_types::I64, b(mm.bf16_lt)),
+                    builder
+                        .ins()
+                        .iconst(cl_types::I64, mm.bf16_lt_workspace_mib as i64),
+                    builder.ins().iconst(cl_types::I64, b(mm.bf16_lt_tune)),
+                ];
+                self.compile_call_by_name(&mut builder, "nsl_set_matmul_config", &args)?;
+            }
+
             // M46: Set global deterministic mode flag + seed RNG at program
             // start. P0 certification: --seed overrides the historical 42
             // and also seeds NON-deterministic runs (distinct reproducible
