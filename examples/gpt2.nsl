@@ -24,7 +24,7 @@ const CONFIG = {
     dropout:       0.1,
     batch_size:    8,
     accumulate:    4,
-    lr:            6e - 4,
+    lr:            6e-4,
     warmup_steps:  2000,
     total_steps:   100000,
     weight_decay:  0.1,
@@ -44,7 +44,7 @@ model GPT2Block(d_model: int, n_heads: int, d_ff: int, dropout: f32):
     c_fc_proj: Linear = Linear(d_ff, d_model)
     mlp_drop: Dropout = Dropout(dropout)
     n_heads: int = n_heads
-    head_dim: int = d_model / / n_heads
+    head_dim: int = d_model // n_heads
 
     fn forward(self, x: Tensor < [batch, seq, d_model], bf16 > ) -> Tensor < [batch, seq, d_model], bf16 > :
         let h = self.ln1(x)

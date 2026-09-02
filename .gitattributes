@@ -20,6 +20,10 @@
 # checkout shifts every span after a comment by one column and puts a `\r`
 # inside triple-quoted strings and doc comments, so three goldens fail on
 # windows-latest unless the fixtures are pinned to LF like the snapshots.
+# The `nsl fmt` round-trip test (crates/nsl-cli/tests/fmt_roundtrip.rs)
+# needs the same: fmt normalises line endings inside a triple-quoted string
+# too, which on a CRLF checkout changes examples/m5_triple_fstring.nsl's
+# string value.
 *.nsl text eol=lf
 
 # models/datasets/CORPUS_MANIFEST_v2.json pins a SHA-256 of the RAW BYTES of

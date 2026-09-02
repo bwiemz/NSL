@@ -19,3 +19,7 @@ pub mod wggo_explain;
 pub mod loader;
 pub mod mangling;
 pub mod resolver;
+
+// `nsl fmt`'s text normalizer, exposed so tests/fmt_roundtrip.rs can run it
+// over the whole corpus without spawning the binary.
+pub mod formatter;

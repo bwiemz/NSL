@@ -73,7 +73,7 @@ model CodeForgeNano:
     lm_head_w: Tensor = randn([256, 64])
     lm_head_b: Tensor = zeros([256])
 
-    fn forward(self, x: Tensor) - > Tensor:
+    fn forward(self, x: Tensor) -> Tensor:
         # --- Embedding ---
         let h = embedding_lookup(self.embed_w, x)
 
