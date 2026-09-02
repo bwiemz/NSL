@@ -113,3 +113,8 @@ models/benchmarks/srbf16_logs/
 /campaign-resumeq/nondet/
 /campaign-resumeq/nd48/
 /campaign-resumeq/*.nohup
+
+# Fixtures rewritten at test time by ccr_periodic_stride_gate. Written beside
+# the source fixture rather than into target/, which does not exist under
+# CARGO_TARGET_DIR.
+crates/nsl-cli/tests/fixtures/*.generated.nsl

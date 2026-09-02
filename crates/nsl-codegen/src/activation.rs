@@ -286,6 +286,22 @@ pub static MANUAL_CONTRACTS: &[Contract] = &[
 /// from both the contract set and this list, so exclusion is a diff-visible
 /// decision (item-20 lesson: a registry must gate its own incompleteness).
 pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
+    // ---- matmul arithmetic (#583/#586) -------------------------------
+    // These select the ARITHMETIC the runtime performs; they activate no
+    // compiler pass, so there is no activation contract to write. They are
+    // not uncontracted in the sense of being unobserved: each one is
+    // rendered into the EXECUTION FINGERPRINT and classified for resume
+    // (`nsl-runtime/src/exec_fingerprint.rs`), and each is witnessed by the
+    // runtime's cuBLAS math-mode banner. That is a stronger check than an
+    // activation contract, and a different one -- it observes what the
+    // RUNTIME did, not which pass the compiler ran.
+    ("matmul-mode", "runtime GEMM arithmetic; witnessed by the cuBLAS math-mode banner and the `mm` fingerprint key, not by a pass"),
+    ("bf16-rounding", "runtime operand-cast rounding; fingerprint key `mmround`, witnessed by the SR banner line"),
+    ("bf16-min-ratio", "runtime bf16 eligibility threshold; fingerprint key `mmratio`"),
+    ("bf16-cast-cache", "runtime weight-cast cache; fingerprint key `mmcache` (placement class -- bit-preserving, warns on resume)"),
+    ("bf16-lt", "runtime cuBLASLt dispatch; fingerprint key `mmlt`"),
+    ("bf16-lt-workspace-mib", "runtime Lt workspace cap; fingerprint key `mmltws` (arithmetic class -- the cap filters kernel candidates)"),
+    ("no-bf16-lt-tune", "disables Lt timed plan selection; fingerprint key `mmlttune`"),
     ("file", "positional input path, not a feature request"),
     ("args", "positional program arguments forwarded to the compiled binary"),
     ("output", "artifact path plumbing"),
