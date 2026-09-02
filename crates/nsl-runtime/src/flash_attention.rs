@@ -768,9 +768,15 @@ pub extern "C" fn nsl_flash_attention(
 /// trivially contiguous: their stride is never used to address more than
 /// one element, so any value is layout-equivalent to the canonical one.
 fn is_canonical_row_major(t: &NslTensor) -> bool {
-    if t.ndim <= 1 {
-        return true;
-    }
+    // NO `ndim <= 1` SHORT-CIRCUIT. The doc above justifies leniency for dims
+    // of EXTENT <= 1, but a short-circuit on RANK is a different claim: a rank-1
+    // tensor of extent 4 with stride 2 has no extent-1 dim anywhere, and
+    // returning true for it is simply wrong. The loop below already implements
+    // the intended rule via its `dim > 1` guard, so rank 1 needs no special
+    // case -- and rank 0 exits the loop immediately, still true.
+    //
+    // This was the same blind spot `NslTensor::is_contiguous` carried until
+    // 2026-09-02 (see its doc comment).
     let ndim = t.ndim as usize;
     let mut expected = 1i64;
     for dd in (0..ndim).rev() {
