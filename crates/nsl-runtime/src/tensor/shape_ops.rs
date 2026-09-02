@@ -1265,19 +1265,10 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
     let t = NslTensor::from_ptr(tensor_ptr);
     let ndim = t.ndim as usize;
 
-    // Check if already contiguous: compare actual strides to expected row-major strides
-    let expected = NslTensor::compute_strides(t.shape, t.ndim);
-    let mut is_contiguous = true;
-    for i in 0..ndim {
-        if unsafe { *t.strides.add(i) != *expected.add(i) } {
-            is_contiguous = false;
-            break;
-        }
-    }
-    // Free the temp expected strides
-    unsafe { crate::memory::checked_free(expected as *mut u8, ndim * std::mem::size_of::<i64>()) };
-
-    if is_contiguous {
+    // Already row-major: nothing to materialize. (Checked in place — this
+    // runs twice per CPU elementwise op, and allocating the expected strides
+    // to compare them was two of that op's heap allocations.)
+    if t.strides_are_row_major() {
         // Already contiguous -- bump refcount, return same pointer
         t.refcount.fetch_add(1, Ordering::SeqCst);
         return tensor_ptr;
