@@ -253,7 +253,6 @@ pub struct FuncState {
     pub non_owning_symbols: HashSet<Symbol>,
     pub dataloader_symbols: HashSet<Symbol>,
     pub borrowed_batch_symbols: HashSet<Symbol>,
-    pub var_counter: usize,
     pub loop_stack: Vec<LoopContext>,
     pub current_block: Option<ir::Block>,
     /// Tensor temporary and cleanup tracking.
@@ -344,7 +343,6 @@ impl FuncState {
             non_owning_symbols: HashSet::new(),
             dataloader_symbols: HashSet::new(),
             borrowed_batch_symbols: HashSet::new(),
-            var_counter: 0,
             loop_stack: Vec::new(),
             current_block: None,
             cleanup: TensorCleanupState::new(),
@@ -363,13 +361,6 @@ impl FuncState {
             dict_loop_predeclared: HashSet::new(),
             self_resolution: SelfResolution::StructPointer,
         }
-    }
-
-    /// Allocate a new Cranelift Variable index.
-    pub fn new_variable(&mut self) -> Variable {
-        let var = Variable::from_u32(self.var_counter as u32);
-        self.var_counter += 1;
-        var
     }
 
     /// Open a binding scope for `live_fn_bindings`. Call at the start of

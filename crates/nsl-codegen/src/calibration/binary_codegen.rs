@@ -42,8 +42,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, StackSlotData, StackSlotKind,
-    UserFuncName,
+    types as cl_types, AbiParam, BlockArg, Function, InstBuilder, MemFlags, StackSlotData,
+    StackSlotKind, UserFuncName,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -366,7 +366,7 @@ fn emit_2d_max_abs_loop(
     b.append_block_param(col_header, cl_types::I32); // j
 
     let zero_i32 = b.ins().iconst(cl_types::I32, 0);
-    b.ins().jump(row_header, &[zero_i32]);
+    b.ins().jump(row_header, &[BlockArg::Value(zero_i32)]);
 
     // row_header: if i < rows → row_body else row_exit
     b.switch_to_block(row_header);
@@ -378,7 +378,7 @@ fn emit_2d_max_abs_loop(
     // row_body: jump to col_header(j=0)
     b.switch_to_block(row_body);
     b.seal_block(row_body);
-    b.ins().jump(col_header, &[zero_i32]);
+    b.ins().jump(col_header, &[BlockArg::Value(zero_i32)]);
 
     // col_header: if j < channels → col_body else col_exit
     b.switch_to_block(col_header);
@@ -413,13 +413,13 @@ fn emit_2d_max_abs_loop(
     b.ins().store(MemFlags::new(), new, run_addr, 0);
 
     let jp1 = b.ins().iadd_imm(j, 1);
-    b.ins().jump(col_header, &[jp1]);
+    b.ins().jump(col_header, &[BlockArg::Value(jp1)]);
 
     // col_exit: i++ → row_header
     b.switch_to_block(col_exit);
     b.seal_block(col_exit);
     let ip1 = b.ins().iadd_imm(i, 1);
-    b.ins().jump(row_header, &[ip1]);
+    b.ins().jump(row_header, &[BlockArg::Value(ip1)]);
 
     // seal the back-edge blocks now that all predecessors are known
     b.seal_block(row_header);
@@ -492,7 +492,7 @@ pub(crate) fn emit_per_head_dot_abs_accum(
     let soff_c        = b.ins().iconst(cl_types::I32, src_offset as i64);
 
     // Jump from caller into the outer loop.
-    b.ins().jump(head_header, &[zero_i32]);
+    b.ins().jump(head_header, &[BlockArg::Value(zero_i32)]);
 
     // ── head_header: if h < n_proj_heads → head_body else head_exit ────────
     b.switch_to_block(head_header);
@@ -503,7 +503,7 @@ pub(crate) fn emit_per_head_dot_abs_accum(
     // ── head_body: jump to elem_header(e=0) ────────────────────────────────
     b.switch_to_block(head_body);
     b.seal_block(head_body);
-    b.ins().jump(elem_header, &[zero_i32]);
+    b.ins().jump(elem_header, &[BlockArg::Value(zero_i32)]);
 
     // ── elem_header: if e < elements_per_head → elem_body else elem_exit ───
     b.switch_to_block(elem_header);
@@ -561,13 +561,13 @@ pub(crate) fn emit_per_head_dot_abs_accum(
 
     // e++ → elem_header
     let ep1 = b.ins().iadd_imm(e, 1);
-    b.ins().jump(elem_header, &[ep1]);
+    b.ins().jump(elem_header, &[BlockArg::Value(ep1)]);
 
     // ── elem_exit: h++ → head_header ────────────────────────────────────────
     b.switch_to_block(elem_exit);
     b.seal_block(elem_exit);
     let hp1 = b.ins().iadd_imm(h, 1);
-    b.ins().jump(head_header, &[hp1]);
+    b.ins().jump(head_header, &[BlockArg::Value(hp1)]);
 
     // Seal back-edge blocks now that all predecessors are known.
     b.seal_block(head_header);
@@ -2763,7 +2763,7 @@ pub fn emit_calibration_scaffolding_object(
             b.ins().brif(
                 batches_ok,
                 load_model,
-                &[batches_ptr, argv2_addr],
+                &[BlockArg::Value(batches_ptr), BlockArg::Value(argv2_addr)],
                 data_null,
                 &[],
             );
@@ -2867,7 +2867,7 @@ pub fn emit_calibration_scaffolding_object(
             b.ins().brif(
                 model_ok,
                 model_ready,
-                &[lm_batches, lm_sidecar_ptr, model_ptr],
+                &[BlockArg::Value(lm_batches), BlockArg::Value(lm_sidecar_ptr), BlockArg::Value(model_ptr)],
                 model_null,
                 &[],
             );
@@ -2895,7 +2895,7 @@ pub fn emit_calibration_scaffolding_object(
             b.ins().store(MemFlags::new(), mr_model_ptr, model_ptr_addr, 0);
             b.ins().store(MemFlags::new(), weight_ptrs, weight_ptrs_addr, 0);
             b.ins().store(MemFlags::new(), num_weights, num_weights_addr, 0);
-            b.ins().jump(loop_header, &[mr_batches, mr_sidecar_ptr, zero_i64]);
+            b.ins().jump(loop_header, &[BlockArg::Value(mr_batches), BlockArg::Value(mr_sidecar_ptr), BlockArg::Value(zero_i64)]);
 
             b.switch_to_block(loop_header);
             let lh_batches = b.block_params(loop_header)[0];
@@ -2906,7 +2906,7 @@ pub fn emit_calibration_scaffolding_object(
             let count_call = b.ins().call(calib_count_ref, &[lh_batches]);
             let count = b.inst_results(count_call)[0];
             let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
-            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_batches, lh_sidecar_ptr]);
+            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[BlockArg::Value(lh_batches), BlockArg::Value(lh_sidecar_ptr)]);
 
             b.switch_to_block(loop_body);
             b.seal_block(loop_body);
@@ -3229,7 +3229,7 @@ pub fn emit_calibration_scaffolding_object(
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
             let i_next = b.ins().iadd(i_cur, one_i64);
-            b.ins().jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
+            b.ins().jump(loop_header, &[BlockArg::Value(lh_batches), BlockArg::Value(lh_sidecar_ptr), BlockArg::Value(i_next)]);
 
             b.seal_block(loop_header);
 
@@ -3237,7 +3237,7 @@ pub fn emit_calibration_scaffolding_object(
             b.seal_block(loop_exit);
             let le_batches = b.block_params(loop_exit)[0];
             let le_sidecar_ptr = b.block_params(loop_exit)[1];
-            b.ins().jump(finalize, &[le_batches, le_sidecar_ptr]);
+            b.ins().jump(finalize, &[BlockArg::Value(le_batches), BlockArg::Value(le_sidecar_ptr)]);
 
             b.switch_to_block(finalize);
             b.seal_block(finalize);
@@ -3925,7 +3925,7 @@ fn emit_and_link_calibration_binary(
             let zero_i64 = b.ins().iconst(cl_types::I64, 0);
             b.ins().brif(
                 batches_ok,
-                loop_header, &[batches_ptr, sidecar_path_ptr, zero_i64],
+                loop_header, &[BlockArg::Value(batches_ptr), BlockArg::Value(sidecar_path_ptr), BlockArg::Value(zero_i64)],
                 data_null, &[],
             );
 
@@ -3946,7 +3946,7 @@ fn emit_and_link_calibration_binary(
             let count = b.inst_results(count_call)[0];
 
             let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
-            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_sidecar_ptr]);
+            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[BlockArg::Value(lh_sidecar_ptr)]);
 
             // loop_body: call nsl_calibration_batch_at + plan-driven 2D max-abs loops
             b.switch_to_block(loop_body);
@@ -3990,7 +3990,7 @@ fn emit_and_link_calibration_binary(
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
             let i_next = b.ins().iadd(i_cur, one_i64);
-            b.ins().jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
+            b.ins().jump(loop_header, &[BlockArg::Value(lh_batches), BlockArg::Value(lh_sidecar_ptr), BlockArg::Value(i_next)]);
 
             b.seal_block(loop_header);
 
@@ -3998,7 +3998,7 @@ fn emit_and_link_calibration_binary(
             b.switch_to_block(loop_exit);
             b.seal_block(loop_exit);
             let le_sidecar_ptr = b.block_params(loop_exit)[0];
-            b.ins().jump(finalize, &[le_sidecar_ptr]);
+            b.ins().jump(finalize, &[BlockArg::Value(le_sidecar_ptr)]);
 
             // ── Step 5: finalize — build descriptor array, call nsl_awq_write_sidecar ──
             b.switch_to_block(finalize);

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{Linkage, Module};
 
@@ -165,7 +165,7 @@ impl Compiler<'_> {
 
             reaching_loader_sets.push(state.dataloader_symbols.clone());
             reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
-            builder.ins().jump(merge_block, &[then_val]);
+            builder.ins().jump(merge_block, &[BlockArg::Value(then_val)]);
         } else {
             state.cleanup.tensor_temporaries.truncate(temp_base_len);
             state
@@ -239,7 +239,7 @@ impl Compiler<'_> {
 
             reaching_loader_sets.push(state.dataloader_symbols.clone());
             reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
-            builder.ins().jump(merge_block, &[else_val]);
+            builder.ins().jump(merge_block, &[BlockArg::Value(else_val)]);
         } else {
             state.cleanup.tensor_temporaries.truncate(temp_base_len);
             state

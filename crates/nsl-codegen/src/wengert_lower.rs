@@ -9,7 +9,7 @@ use crate::wengert::{
     type_for_op, CompareKind, ConvGradKind, PrimalOp, VarId, WengertList, WengertOp, WengertType,
 };
 use crate::CodegenError;
-use cranelift_codegen::ir::{condcodes::IntCC, types as cl_types, InstBuilder, Value};
+use cranelift_codegen::ir::{condcodes::IntCC, types as cl_types, BlockArg, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 use std::collections::HashMap;
@@ -870,7 +870,7 @@ fn emit_sdpa_fused_dispatch(
     let idx1 = builder.ins().iconst(cl_types::I64, 1);
     let fused_lse = call(compiler, builder, "nsl_list_get", &[list, idx1])?;
     let _ = call(compiler, builder, "nsl_list_free", &[list])?;
-    builder.ins().jump(join_block, &[fused_out, fused_lse]);
+    builder.ins().jump(join_block, &[BlockArg::Value(fused_out), BlockArg::Value(fused_lse)]);
 
     // Decline: the caller emits the decomposed chain here, then jumps to
     // join_block with [decomposed_result, 0] and seals it.
@@ -2426,7 +2426,7 @@ fn lower_single_op(
                     // when the decomposed fallback ran (backward then
                     // recomputes it, exactly as before Stage C).
                     let zero = builder.ins().iconst(cl_types::I64, 0);
-                    builder.ins().jump(join_block, &[result, zero]);
+                    builder.ins().jump(join_block, &[BlockArg::Value(result), BlockArg::Value(zero)]);
                     builder.seal_block(join_block);
                     builder.switch_to_block(join_block);
                     compiler
@@ -2539,7 +2539,7 @@ fn lower_single_op(
             match fused {
                 Some((join_block, out_param, lse_param)) => {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
-                    builder.ins().jump(join_block, &[result, zero]);
+                    builder.ins().jump(join_block, &[BlockArg::Value(result), BlockArg::Value(zero)]);
                     builder.seal_block(join_block);
                     builder.switch_to_block(join_block);
                     compiler

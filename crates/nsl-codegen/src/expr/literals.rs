@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, Value};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
@@ -318,14 +318,12 @@ impl Compiler<'_> {
         let list_len = builder.inst_results(call)[0];
 
         // Counter variable
-        let counter_var = state.new_variable();
-        builder.declare_var(counter_var, cl_types::I64);
+        let counter_var = builder.declare_var(cl_types::I64);
         let zero = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(counter_var, zero);
 
         // Element variable
-        let elem_var = state.new_variable();
-        builder.declare_var(elem_var, cl_types::I64);
+        let elem_var = builder.declare_var(cl_types::I64);
         builder.def_var(elem_var, zero);
         state.variables.insert(sym, (elem_var, cl_types::I64));
 
@@ -422,7 +420,7 @@ impl Compiler<'_> {
                 PatternKind::Wildcard => {
                     let arm_val =
                         self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
-                    builder.ins().jump(merge_block, &[arm_val]);
+                    builder.ins().jump(merge_block, &[BlockArg::Value(arm_val)]);
                     break;
                 }
                 PatternKind::Ident(sym) => {
@@ -439,7 +437,7 @@ impl Compiler<'_> {
                         state.current_block = Some(arm_block);
                         let arm_val =
                             self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
-                        builder.ins().jump(merge_block, &[arm_val]);
+                        builder.ins().jump(merge_block, &[BlockArg::Value(arm_val)]);
 
                         builder.switch_to_block(next_block);
                         builder.seal_block(next_block);
@@ -449,13 +447,12 @@ impl Compiler<'_> {
                         }
                     } else {
                         // Binding: bind subject to variable
-                        let var = state.new_variable();
-                        builder.declare_var(var, cl_types::I64);
+                        let var = builder.declare_var(cl_types::I64);
                         builder.def_var(var, subject_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
                         let arm_val =
                             self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
-                        builder.ins().jump(merge_block, &[arm_val]);
+                        builder.ins().jump(merge_block, &[BlockArg::Value(arm_val)]);
                         break;
                     }
                 }
@@ -476,7 +473,7 @@ impl Compiler<'_> {
                     state.current_block = Some(arm_block);
                     let arm_val =
                         self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
-                    builder.ins().jump(merge_block, &[arm_val]);
+                    builder.ins().jump(merge_block, &[BlockArg::Value(arm_val)]);
 
                     builder.switch_to_block(next_block);
                     builder.seal_block(next_block);
@@ -499,7 +496,7 @@ impl Compiler<'_> {
                         state.current_block = Some(arm_block);
                         let arm_val =
                             self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
-                        builder.ins().jump(merge_block, &[arm_val]);
+                        builder.ins().jump(merge_block, &[BlockArg::Value(arm_val)]);
 
                         builder.switch_to_block(next_block);
                         builder.seal_block(next_block);
@@ -526,7 +523,7 @@ impl Compiler<'_> {
             } else {
                 builder.ins().iconst(result_type, 0)
             };
-            builder.ins().jump(merge_block, &[default_val]);
+            builder.ins().jump(merge_block, &[BlockArg::Value(default_val)]);
         }
 
         builder.switch_to_block(merge_block);

@@ -207,8 +207,7 @@ impl Compiler<'_> {
             // Bind normal parameters
             for (i, (sym, cl_type)) in lambda.params.iter().enumerate() {
                 let param_val = builder.block_params(entry)[i];
-                let var = state.new_variable();
-                builder.declare_var(var, *cl_type);
+                let var = builder.declare_var(*cl_type);
                 builder.def_var(var, param_val);
                 state.variables.insert(*sym, (var, *cl_type));
             }
@@ -233,8 +232,7 @@ impl Compiler<'_> {
                 } else {
                     param_val
                 };
-                let var = state.new_variable();
-                builder.declare_var(var, *cl_type);
+                let var = builder.declare_var(*cl_type);
                 builder.def_var(var, bound);
                 state.variables.insert(*sym, (var, *cl_type));
             }
@@ -357,8 +355,7 @@ impl Compiler<'_> {
                 } else {
                     cl_types::I64
                 };
-                let var = state.new_variable();
-                builder.declare_var(var, cl_type);
+                let var = builder.declare_var(cl_type);
                 builder.def_var(var, param_val);
                 state.variables.insert(param.name, (var, cl_type));
                 state.param_symbols.insert(param.name);
@@ -405,8 +402,7 @@ impl Compiler<'_> {
                                 if let Some(init_expr) = init {
                                     let init_expr_clone = init_expr.clone();
                                     // Generate loop: for i in 0..arr_size, compile init, store at ptr+field_offset+i*8
-                                    let counter_var = state.new_variable();
-                                    builder.declare_var(counter_var, cl_types::I64);
+                                    let counter_var = builder.declare_var(cl_types::I64);
                                     let zero = builder.ins().iconst(cl_types::I64, 0);
                                     builder.def_var(counter_var, zero);
 
@@ -619,8 +615,7 @@ impl Compiler<'_> {
                             .find(|p| self.resolve_sym(p.name) == "self")
                             .map(|p| p.name)
                             .unwrap_or_else(|| fn_def.params[0].name);
-                        let self_var = state.new_variable();
-                        builder.declare_var(self_var, pointer_type());
+                        let self_var = builder.declare_var(pointer_type());
                         builder.def_var(self_var, self_val);
                         state.variables.insert(self_sym, (self_var, pointer_type()));
                         state.param_symbols.insert(self_sym);
@@ -638,8 +633,7 @@ impl Compiler<'_> {
                             } else {
                                 cl_types::I64
                             };
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_type);
+                            let var = builder.declare_var(cl_type);
                             builder.def_var(var, param_val);
                             state.variables.insert(param.name, (var, cl_type));
                             state.param_symbols.insert(param.name);
@@ -790,8 +784,7 @@ impl Compiler<'_> {
                         // not complain about an unused param.
                         let _num_weights_val = builder.block_params(entry)[1];
 
-                        let weight_ptrs_var = state.new_variable();
-                        builder.declare_var(weight_ptrs_var, cl_types::I64);
+                        let weight_ptrs_var = builder.declare_var(cl_types::I64);
                         builder.def_var(weight_ptrs_var, weight_ptrs_val);
 
                         state.self_resolution =
@@ -810,8 +803,7 @@ impl Compiler<'_> {
                             } else {
                                 cl_types::I64
                             };
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_type);
+                            let var = builder.declare_var(cl_type);
                             builder.def_var(var, param_val);
                             state.variables.insert(param.name, (var, cl_type));
                             state.param_symbols.insert(param.name);

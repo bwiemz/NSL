@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, Value};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
@@ -363,8 +363,8 @@ impl Compiler<'_> {
         builder.append_block_param(merge_block, cl_types::I8);
 
         match op {
-            BinOp::And => builder.ins().brif(lhs, rhs_block, &[], merge_block, &[lhs]),
-            BinOp::Or => builder.ins().brif(lhs, merge_block, &[lhs], rhs_block, &[]),
+            BinOp::And => builder.ins().brif(lhs, rhs_block, &[], merge_block, &[BlockArg::Value(lhs)]),
+            BinOp::Or => builder.ins().brif(lhs, merge_block, &[BlockArg::Value(lhs)], rhs_block, &[]),
             _ => unreachable!(),
         };
 
@@ -373,7 +373,7 @@ impl Compiler<'_> {
         state.current_block = Some(rhs_block);
         let rhs_raw = self.compile_expr(builder, state, right)?;
         let rhs = builder.ins().icmp_imm(IntCC::NotEqual, rhs_raw, 0);
-        builder.ins().jump(merge_block, &[rhs]);
+        builder.ins().jump(merge_block, &[BlockArg::Value(rhs)]);
 
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);

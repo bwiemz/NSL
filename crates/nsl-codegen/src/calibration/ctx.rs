@@ -492,7 +492,7 @@ mod tests {
 }
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types as cl_types, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{types as cl_types, BlockArg, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
 
 /// Emit Cranelift IR for: `for i in 0..len { buf[i] = max(buf[i], |src[i]|) }`.
@@ -520,7 +520,7 @@ pub(crate) fn emit_running_max_abs_f32(
     fb.append_block_param(header, cl_types::I32);
 
     let zero_i32 = fb.ins().iconst(cl_types::I32, 0);
-    fb.ins().jump(header, &[zero_i32]);
+    fb.ins().jump(header, &[BlockArg::Value(zero_i32)]);
 
     // header: if i < len goto body(i) else goto exit
     fb.switch_to_block(header);
@@ -543,7 +543,7 @@ pub(crate) fn emit_running_max_abs_f32(
     fb.ins().store(MemFlags::new(), new_val, buf_addr, 0);
     let one = fb.ins().iconst(cl_types::I32, 1);
     let i_next = fb.ins().iadd(i_cur, one);
-    fb.ins().jump(header, &[i_next]);
+    fb.ins().jump(header, &[BlockArg::Value(i_next)]);
 
     fb.seal_block(header);
     fb.switch_to_block(exit);

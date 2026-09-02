@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
@@ -202,7 +202,7 @@ impl Compiler<'_> {
                         builder.seal_block(null_blk);
                         state.current_block = Some(null_blk);
                         let null_tensor = builder.ins().iconst(cl_types::I64, 0);
-                        builder.ins().jump(merge_blk, &[null_tensor]);
+                        builder.ins().jump(merge_blk, &[BlockArg::Value(null_tensor)]);
 
                         builder.switch_to_block(deref_blk);
                         builder.seal_block(deref_blk);
@@ -213,7 +213,7 @@ impl Compiler<'_> {
                             table_ptr,
                             byte_off,
                         );
-                        builder.ins().jump(merge_blk, &[loaded]);
+                        builder.ins().jump(merge_blk, &[BlockArg::Value(loaded)]);
 
                         builder.switch_to_block(merge_blk);
                         builder.seal_block(merge_blk);

@@ -14,7 +14,7 @@
 //! module does not allocate.
 
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, Value};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 
 use crate::compiler::Compiler;
@@ -1188,7 +1188,7 @@ impl Compiler<'_> {
                 builder.append_block_param(merge_b, cl_types::I64);
                 // Resident: pass the device m (and the host v, unread on
                 // this route) straight through.
-                builder.ins().brif(resident, merge_b, &[s1, s2], stage_b, &[]);
+                builder.ins().brif(resident, merge_b, &[BlockArg::Value(s1), BlockArg::Value(s2)], stage_b, &[]);
 
                 builder.switch_to_block(stage_b);
                 builder.seal_block(stage_b);
@@ -1205,7 +1205,7 @@ impl Compiler<'_> {
                     ws1
                 };
                 self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_in])?;
-                builder.ins().jump(merge_b, &[ws1, ws2]);
+                builder.ins().jump(merge_b, &[BlockArg::Value(ws1), BlockArg::Value(ws2)]);
 
                 builder.switch_to_block(merge_b);
                 builder.seal_block(merge_b);
@@ -1546,12 +1546,10 @@ impl Compiler<'_> {
                 ));
             }
 
-            let pa_tot_var = state.new_variable();
-            builder.declare_var(pa_tot_var, cl_types::F64);
+            let pa_tot_var = builder.declare_var(cl_types::F64);
             let pa_zero = builder.ins().f64const(0.0);
             builder.def_var(pa_tot_var, pa_zero);
-            let pa_i_var = state.new_variable();
-            builder.declare_var(pa_i_var, cl_types::I64);
+            let pa_i_var = builder.declare_var(cl_types::I64);
             let pa_i_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(pa_i_var, pa_i_zero);
 
@@ -1599,8 +1597,7 @@ impl Compiler<'_> {
         };
 
         // ── 3. Unified per-param loop with mode dispatch ──
-        let opt_i_var = state.new_variable();
-        builder.declare_var(opt_i_var, cl_types::I64);
+        let opt_i_var = builder.declare_var(cl_types::I64);
         let opt_zero = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(opt_i_var, opt_zero);
 

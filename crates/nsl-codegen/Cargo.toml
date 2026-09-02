@@ -22,7 +22,6 @@ cranelift-frontend.workspace = true
 cranelift-module.workspace = true
 cranelift-object.workspace = true
 cranelift-native.workspace = true
-target-lexicon.workspace = true
 nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
 nsl-parser.workspace = true
 serde.workspace = true

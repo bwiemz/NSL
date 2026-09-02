@@ -88,8 +88,7 @@ pub(crate) fn emit_train_teardown(
     // Free optimizer state buffers (runtime lists of momentum/velocity tensors)
     // Runtime loop: free each tensor in state_list_1 and state_list_2
     {
-        let free_i_var = state.new_variable();
-        builder.declare_var(free_i_var, cl_types::I64);
+        let free_i_var = builder.declare_var(cl_types::I64);
         let f_zero = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(free_i_var, f_zero);
         let f_header = builder.create_block();
@@ -137,8 +136,7 @@ pub(crate) fn emit_train_teardown(
     if let Some(accum) = accum_list.filter(|_| csla_active) {
         c.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
     } else if let Some(accum) = accum_list {
-        let fa_i_var = state.new_variable();
-        builder.declare_var(fa_i_var, cl_types::I64);
+        let fa_i_var = builder.declare_var(cl_types::I64);
         let fa_z = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(fa_i_var, fa_z);
         let fa_hdr = builder.create_block();
@@ -178,8 +176,7 @@ pub(crate) fn emit_train_teardown(
     {
         let so = builder.use_var(saves_outer_var);
         let tail_len = c.compile_call_by_name(builder, "nsl_list_len", &[so])?;
-        let sw_i_var = state.new_variable();
-        builder.declare_var(sw_i_var, cl_types::I64);
+        let sw_i_var = builder.declare_var(cl_types::I64);
         let sw_z = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(sw_i_var, sw_z);
         let sw_hdr = builder.create_block();
@@ -216,8 +213,7 @@ pub(crate) fn emit_train_teardown(
         // DataLoader teardown never touches popped dicts.
         let dl = builder.use_var(dicts_var);
         let dl_len = c.compile_call_by_name(builder, "nsl_list_len", &[dl])?;
-        let dw_i_var = state.new_variable();
-        builder.declare_var(dw_i_var, cl_types::I64);
+        let dw_i_var = builder.declare_var(cl_types::I64);
         let dw_z = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(dw_i_var, dw_z);
         let dw_hdr = builder.create_block();

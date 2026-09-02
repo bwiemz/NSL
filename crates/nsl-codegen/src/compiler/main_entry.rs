@@ -161,8 +161,7 @@ impl Compiler<'_> {
                     let slab_ptr =
                         self.compile_call_by_name(&mut builder, "nsl_gpu_slab_init", &[total])?;
                     // Store slab_ptr in a variable for slab_offset calls
-                    let var = state.new_variable();
-                    builder.declare_var(var, cl_types::I64);
+                    let var = builder.declare_var(cl_types::I64);
                     builder.def_var(var, slab_ptr);
                     state.slab_ptr_var = Some(var);
                     Some(var)

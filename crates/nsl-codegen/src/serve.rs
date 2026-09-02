@@ -470,8 +470,7 @@ impl Compiler<'_> {
                     } else {
                         builder.ins().iconst(cl_types::I64, 0)
                     };
-                    let var = state.new_variable();
-                    builder.declare_var(var, cl_types::I64);
+                    let var = builder.declare_var(cl_types::I64);
                     builder.def_var(var, init_val);
                     state.variables.insert(param.name, (var, cl_types::I64));
                     state.param_symbols.insert(param.name);

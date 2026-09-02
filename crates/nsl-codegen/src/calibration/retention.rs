@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types as cl_types, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{types as cl_types, BlockArg, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
 
 use crate::calibration::observation::ProjectionRef;
@@ -41,7 +41,7 @@ pub fn emit_splice_memcpy(
     fb.append_block_param(header, cl_types::I64);
 
     let zero = fb.ins().iconst(cl_types::I64, 0);
-    fb.ins().jump(header, &[zero]);
+    fb.ins().jump(header, &[BlockArg::Value(zero)]);
 
     // header: if i < nbytes goto body else goto tail
     fb.switch_to_block(header);
@@ -59,7 +59,7 @@ pub fn emit_splice_memcpy(
     fb.ins().store(MemFlags::new(), b, dst_i, 0);
     let one = fb.ins().iconst(cl_types::I64, 1);
     let i2 = fb.ins().iadd(i, one);
-    fb.ins().jump(header, &[i2]);
+    fb.ins().jump(header, &[BlockArg::Value(i2)]);
 
     fb.seal_block(header);
     fb.switch_to_block(tail);
