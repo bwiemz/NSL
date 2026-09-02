@@ -18,10 +18,10 @@ use nsl_codegen::flash_attention_v2::synthesize_backward_with_tier_b;
 use nsl_codegen::pca_segment::SegmentResidency;
 
 fn find_ptxas() -> Option<String> {
-    if let Ok(p) = std::env::var("PTXAS") {
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
+    if let Ok(p) = std::env::var("PTXAS")
+        && std::path::Path::new(&p).exists()
+    {
+        return Some(p);
     }
     for name in ["ptxas", "ptxas.exe"] {
         if Command::new(name)

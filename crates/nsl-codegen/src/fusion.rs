@@ -595,19 +595,18 @@ fn collect_fusible_ops<'a, F>(
             ops.push("neg".to_string());
         }
         ExprKind::Call { callee, args } => {
-            if let ExprKind::Ident(name_sym) = &callee.kind {
-                if let Some(name) = resolve_name(*name_sym) {
-                    if is_fusible_op(&name) {
-                        if name == "clamp" && args.len() != 1 {
-                            inputs.push(expr);
-                            return;
-                        }
-                        if args.len() == 1 {
-                            collect_fusible_ops(&args[0].value, ops, inputs, resolve_name);
-                            ops.push(name);
-                            return;
-                        }
-                    }
+            if let ExprKind::Ident(name_sym) = &callee.kind
+                && let Some(name) = resolve_name(*name_sym)
+                && is_fusible_op(&name)
+            {
+                if name == "clamp" && args.len() != 1 {
+                    inputs.push(expr);
+                    return;
+                }
+                if args.len() == 1 {
+                    collect_fusible_ops(&args[0].value, ops, inputs, resolve_name);
+                    ops.push(name);
+                    return;
                 }
             }
             inputs.push(expr);

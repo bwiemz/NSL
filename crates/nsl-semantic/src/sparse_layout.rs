@@ -146,43 +146,43 @@ pub fn validate_layout_decorator(
     for arg in args {
         if let Some(name_sym) = arg.name {
             let aname = resolve_sym(name_sym);
-            if aname == "format" {
-                if let ExprKind::StringLiteral(ref s) = arg.value.kind {
-                    return match LayoutInfo::from_format_name(s) {
-                        Some(info) => Some(info),
-                        None => {
-                            diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "@layout: unknown format \"{}\". Valid: CSR, CSC, COO, BSR, DENSE",
-                                    s
-                                ))
-                                .with_label(arg.span, "unknown format"),
-                            );
-                            None
-                        }
-                    };
-                }
+            if aname == "format"
+                && let ExprKind::StringLiteral(ref s) = arg.value.kind
+            {
+                return match LayoutInfo::from_format_name(s) {
+                    Some(info) => Some(info),
+                    None => {
+                        diagnostics.push(
+                            Diagnostic::error(format!(
+                                "@layout: unknown format \"{}\". Valid: CSR, CSC, COO, BSR, DENSE",
+                                s
+                            ))
+                            .with_label(arg.span, "unknown format"),
+                        );
+                        None
+                    }
+                };
             }
         }
     }
 
     // Form 1: single string argument → predefined format macro
-    if args.len() == 1 {
-        if let ExprKind::StringLiteral(ref s) = args[0].value.kind {
-            return match LayoutInfo::from_format_name(s) {
-                Some(info) => Some(info),
-                None => {
-                    diagnostics.push(
-                        Diagnostic::error(format!(
-                            "@layout: unknown format \"{}\". Valid: CSR, CSC, COO, BSR, DENSE",
-                            s
-                        ))
-                        .with_label(args[0].span, "unknown format"),
-                    );
-                    None
-                }
-            };
-        }
+    if args.len() == 1
+        && let ExprKind::StringLiteral(ref s) = args[0].value.kind
+    {
+        return match LayoutInfo::from_format_name(s) {
+            Some(info) => Some(info),
+            None => {
+                diagnostics.push(
+                    Diagnostic::error(format!(
+                        "@layout: unknown format \"{}\". Valid: CSR, CSC, COO, BSR, DENSE",
+                        s
+                    ))
+                    .with_label(args[0].span, "unknown format"),
+                );
+                None
+            }
+        };
     }
 
     // Form 2: per-dimension level format identifiers

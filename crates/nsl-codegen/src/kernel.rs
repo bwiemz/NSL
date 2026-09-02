@@ -245,10 +245,10 @@ impl KernelCompiler {
     ) {
         match &mut expr.kind {
             ExprKind::Ident(sym) => {
-                if let Some(name) = interner.resolve(sym.0) {
-                    if let Some(&value) = constants.get(name) {
-                        expr.kind = ExprKind::IntLiteral(value);
-                    }
+                if let Some(name) = interner.resolve(sym.0)
+                    && let Some(&value) = constants.get(name)
+                {
+                    expr.kind = ExprKind::IntLiteral(value);
                 }
             }
             ExprKind::BinaryOp { left, right, .. } => {

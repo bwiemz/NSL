@@ -606,10 +606,10 @@ fn find_agent_method_fn_def(
             continue;
         }
         for member in &agent_def.members {
-            if let AgentMember::Method(fn_def, _) = member {
-                if fn_def.name == method_sym {
-                    return Some(fn_def);
-                }
+            if let AgentMember::Method(fn_def, _) = member
+                && fn_def.name == method_sym
+            {
+                return Some(fn_def);
             }
         }
     }
@@ -1068,11 +1068,12 @@ fn check_edge_devices(
     // E0607: both are CUDA with explicitly different IDs.
     if src.is_cuda() && dst_device.is_cuda() {
         // Only fire E0607 if both have explicit IDs AND they differ.
-        if let (SrcDevice::Cuda(Some(src_id)), SrcDevice::Cuda(Some(dst_id))) = (src, &dst_device) {
-            if src_id != dst_id {
-                diagnostics.push(
-                    Diagnostic::error(format!(
-                        "E0607: cross-GPU port connection not supported in v1\n\
+        if let (SrcDevice::Cuda(Some(src_id)), SrcDevice::Cuda(Some(dst_id))) = (src, &dst_device)
+            && src_id != dst_id
+        {
+            diagnostics.push(
+                Diagnostic::error(format!(
+                    "E0607: cross-GPU port connection not supported in v1\n\
                          \n\
                          requested: port connection from device={} to agent {}.{} (device={})\n\
                          expected:  both sides on the same GPU device ID (v1 constraint)\n\
@@ -1081,13 +1082,12 @@ fn check_edge_devices(
                          planned: cross-device communication via NCCL is scheduled for M30.\n\
                                   Until then, either colocate the agents on one GPU or use a\n\
                                   CPU intermediary agent (bearing the transfer cost).",
-                        src_str, agent_name, method_name, dst_str,
-                        src_str, param_name, dst_str,
-                    ))
-                    .with_label(span, "cross-GPU edge — M30 deferred"),
-                );
-                return;
-            }
+                    src_str, agent_name, method_name, dst_str,
+                    src_str, param_name, dst_str,
+                ))
+                .with_label(span, "cross-GPU edge — M30 deferred"),
+            );
+            return;
         }
         // Both CUDA but IDs are the same or one/both are unspecified — treat as same device.
         // Fall through: if both are Cuda(None), they compare equal above and we already returned.

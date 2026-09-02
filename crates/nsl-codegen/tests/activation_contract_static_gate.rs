@@ -57,12 +57,12 @@ fn parse_arg_structs() -> BTreeMap<&'static str, Vec<String>> {
                 cur = None;
                 continue;
             }
-            if let Some(rest) = t.strip_prefix("pub(crate) ") {
-                if let Some((field, _)) = rest.split_once(':') {
-                    out.entry(struct_name)
-                        .or_default()
-                        .push(field.trim().replace('_', "-"));
-                }
+            if let Some(rest) = t.strip_prefix("pub(crate) ")
+                && let Some((field, _)) = rest.split_once(':')
+            {
+                out.entry(struct_name)
+                    .or_default()
+                    .push(field.trim().replace('_', "-"));
             }
         }
     }
@@ -229,10 +229,10 @@ fn collect_rs(dir: &std::path::Path, out: &mut Vec<(PathBuf, String)>) {
         let p = e.unwrap().path();
         if p.is_dir() {
             collect_rs(&p, out);
-        } else if p.extension().map(|x| x == "rs").unwrap_or(false) {
-            if let Ok(s) = std::fs::read_to_string(&p) {
-                out.push((p, s));
-            }
+        } else if p.extension().map(|x| x == "rs").unwrap_or(false)
+            && let Ok(s) = std::fs::read_to_string(&p)
+        {
+            out.push((p, s));
         }
     }
 }

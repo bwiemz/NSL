@@ -130,10 +130,10 @@ fn var_decl_name_and_init<'a>(kind: &'a StmtKind, resolve: Resolve) -> Option<(S
         if !is_const {
             return None;
         }
-        if let PatternKind::Ident(sym) = &pattern.kind {
-            if let Some(init_expr) = value {
-                return Some((resolve(*sym), &init_expr.kind));
-            }
+        if let PatternKind::Ident(sym) = &pattern.kind
+            && let Some(init_expr) = value
+        {
+            return Some((resolve(*sym), &init_expr.kind));
         }
     }
     None
@@ -161,10 +161,10 @@ fn named_type(ty: &nsl_ast::types::TypeExpr, resolve: Resolve) -> Option<String>
 }
 
 fn as_call<'a>(expr: &'a Expr, resolve: Resolve) -> Option<(String, &'a [Arg])> {
-    if let ExprKind::Call { callee, args } = &expr.kind {
-        if let ExprKind::Ident(sym) = &callee.kind {
-            return Some((resolve(*sym), args.as_slice()));
-        }
+    if let ExprKind::Call { callee, args } = &expr.kind
+        && let ExprKind::Ident(sym) = &callee.kind
+    {
+        return Some((resolve(*sym), args.as_slice()));
     }
     None
 }
@@ -298,15 +298,15 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
     let block_arg_ctx = BindingCtx { params: HashMap::new(), consts: consts.clone() };
     let mut params = HashMap::new();
     for (i, param) in block_md.params.iter().enumerate() {
-        if let Some(arg) = block_args.get(i) {
-            if let Ok(v) = resolve_binding(
+        if let Some(arg) = block_args.get(i)
+            && let Ok(v) = resolve_binding(
                 &arg.value,
                 &block_arg_ctx,
                 resolve,
                 "block-param",
-            ) {
-                params.insert(resolve(param.name), v);
-            }
+            )
+        {
+            params.insert(resolve(param.name), v);
         }
     }
     let ctx = BindingCtx { params, consts };
@@ -320,13 +320,13 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
             continue;
         };
         let tname = named_type(type_ann, resolve);
-        if let Some(init_expr) = init {
-            if let Some((call_name, args)) = as_call(init_expr, resolve) {
-                if call_name == "GroupedQueryAttention" {
-                    attn = Some(args.to_vec());
-                } else if ffn_activation(&call_name).is_ok() {
-                    ffn = Some((call_name, args.to_vec()));
-                }
+        if let Some(init_expr) = init
+            && let Some((call_name, args)) = as_call(init_expr, resolve)
+        {
+            if call_name == "GroupedQueryAttention" {
+                attn = Some(args.to_vec());
+            } else if ffn_activation(&call_name).is_ok() {
+                ffn = Some((call_name, args.to_vec()));
             }
         }
         if let Some(t) = tname.as_deref().and_then(norm_type) {
@@ -435,11 +435,10 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
         };
         if crate::wggo_graph::infer_role(&resolve(*name))
             == crate::wggo_graph::LayerRole::Embedding
+            && let Some(shape) = first_int_list(init, 2)
         {
-            if let Some(shape) = first_int_list(init, 2) {
-                vocab = Some(shape[0] as u32);
-                break;
-            }
+            vocab = Some(shape[0] as u32);
+            break;
         }
     }
     let vocab = vocab.ok_or_else(|| {

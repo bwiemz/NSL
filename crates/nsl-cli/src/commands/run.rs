@@ -167,40 +167,40 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             // CSHA: validate the same way `nsl build --csha` does so an
             // unrecognised mode fails fast rather than silently disabling
             // the planner.
-            if let Some(ref m) = csha {
-                if nsl_codegen::csha::CshaMode::parse(m).is_none() {
-                    eprintln!(
-                        "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
-                        m
-                    );
-                    process::exit(1);
-                }
+            if let Some(ref m) = csha
+                && nsl_codegen::csha::CshaMode::parse(m).is_none()
+            {
+                eprintln!(
+                    "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
+                    m
+                );
+                process::exit(1);
             }
 
             // WGGO: validate the same way `nsl build --wggo` does (build's
             // options.rs) so an unrecognised mode / out-of-range prune fraction
             // / missing sidecar fails fast rather than silently no-op'ing. The
             // error strings are kept byte-identical to the build path.
-            if let Some(ref m) = wggo {
-                if nsl_codegen::wggo::WggoMode::parse(m).is_none() {
-                    eprintln!(
-                        "error: --wggo value '{}' is not one of full|greedy|off|auto",
-                        m
-                    );
-                    process::exit(1);
-                }
+            if let Some(ref m) = wggo
+                && nsl_codegen::wggo::WggoMode::parse(m).is_none()
+            {
+                eprintln!(
+                    "error: --wggo value '{}' is not one of full|greedy|off|auto",
+                    m
+                );
+                process::exit(1);
             }
             // wggo_importance is a typed CliWggoImportance enum; clap rejects
             // unknown values before we get here. The Grad variant requires a
             // calibration sidecar — enforced downstream at compile time.
-            if let Some(f) = wggo_prune_fraction {
-                if !(0.0..=0.9).contains(&f) {
-                    eprintln!(
-                        "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
-                        f
-                    );
-                    process::exit(1);
-                }
+            if let Some(f) = wggo_prune_fraction
+                && !(0.0..=0.9).contains(&f)
+            {
+                eprintln!(
+                    "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
+                    f
+                );
+                process::exit(1);
             }
             // --wggo-memory-budget: reject 0 loudly (an unparseable value is
             // already rejected by clap's u64 parse). The flag IMPLIES
@@ -219,14 +219,14 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             };
             let wggo_moment_precision =
                 wggo_moment_precision || wggo_memory_budget_bytes.is_some();
-            if let Some(ref p) = wggo_weights {
-                if !p.exists() {
-                    eprintln!(
-                        "error: --wggo-weights path does not exist: {}",
-                        p.display()
-                    );
-                    process::exit(1);
-                }
+            if let Some(ref p) = wggo_weights
+                && !p.exists()
+            {
+                eprintln!(
+                    "error: --wggo-weights path does not exist: {}",
+                    p.display()
+                );
+                process::exit(1);
             }
 
             // CPDT: mirror the `nsl build` setup so precision-adaptive
@@ -927,10 +927,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                                         &path,
                                         &mut last_mtime,
                                     )
+                                    && let Ok(mut r) = renderer.lock()
                                 {
-                                    if let Ok(mut r) = renderer.lock() {
-                                        r.render(&snap);
-                                    }
+                                    r.render(&snap);
                                 }
                                 std::thread::sleep(
                                     std::time::Duration::from_millis(250),

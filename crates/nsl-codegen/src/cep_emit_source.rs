@@ -147,15 +147,14 @@ fn find_int_const_init<'a>(
     name: &str,
 ) -> Option<&'a Expr> {
     for stmt in &module.stmts {
-        if let StmtKind::VarDecl { is_const: true, pattern, value: Some(init), .. } = &stmt.kind {
-            if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
-                if resolve(*sym) == name {
-                    if matches!(init.kind, ExprKind::IntLiteral(_)) {
-                        return Some(init);
-                    }
-                    return None;
-                }
+        if let StmtKind::VarDecl { is_const: true, pattern, value: Some(init), .. } = &stmt.kind
+            && let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind
+            && resolve(*sym) == name
+        {
+            if matches!(init.kind, ExprKind::IntLiteral(_)) {
+                return Some(init);
             }
+            return None;
         }
     }
     None

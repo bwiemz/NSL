@@ -224,14 +224,12 @@ fn fold_type(
                 propose(out, type_name, field_name, dims);
                 // `full([1], <const>)` config fields also carry a VALUE the
                 // model reads back at runtime (`int(self._n_heads.item())`).
-                if one_elem {
-                    if let Some(v) = full_scalar_value(init, env, interner) {
-                        // The runtime stores `full([1], v)` as f32 and
-                        // `item()` widens it back; fold the same round-trip
-                        // or a non-f32-representable constant would compare
-                        // unequal to what the program computes.
-                        propose_value(out, type_name, field_name, (v as f32) as f64);
-                    }
+                if one_elem && let Some(v) = full_scalar_value(init, env, interner) {
+                    // The runtime stores `full([1], v)` as f32 and
+                    // `item()` widens it back; fold the same round-trip
+                    // or a non-f32-representable constant would compare
+                    // unequal to what the program computes.
+                    propose_value(out, type_name, field_name, (v as f32) as f64);
                 }
             }
             continue;
@@ -245,14 +243,12 @@ fn fold_type(
                 fold_type(&child, &child_env, defs, interner, out, visiting);
             }
             None => {
-                if let ExprKind::Call { callee, .. } = &init.kind {
-                    if let ExprKind::Ident(sym) = &callee.kind {
-                        if let Some(name) = interner.resolve(sym.0) {
-                            if defs.contains_key(name) {
-                                out.poisoned_types.insert(name.to_string());
-                            }
-                        }
-                    }
+                if let ExprKind::Call { callee, .. } = &init.kind
+                    && let ExprKind::Ident(sym) = &callee.kind
+                    && let Some(name) = interner.resolve(sym.0)
+                    && defs.contains_key(name)
+                {
+                    out.poisoned_types.insert(name.to_string());
                 }
             }
         }

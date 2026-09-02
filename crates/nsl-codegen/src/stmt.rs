@@ -349,32 +349,31 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // On the weights-only path there is no plan to validate the WeightMap
     // against — `validate` iterates the plan's layers, so an empty plan would
     // vacuously pass; skipping is the same answer stated honestly.
-    if let (Some(wm), Some(plan_for_validation)) = (weight_map_ref, applied_plan) {
-        if compiler.cpdt_mode == CpdtMode::Full {
-            if let Err(e) = crate::cpdt_sensitivity::validate(wm, plan_for_validation) {
-                // KNOWN LIMIT: on the pre-plan offer (compile_train_block),
-                // `applied_plan` is the pre-pass's — a plan the fingerprint
-                // check has not yet accepted. A checkpoint that would
-                // validate against the fresh in-place replan can therefore
-                // die here on the stale one; say so, because a validation
-                // error that names the wrong plan generation sends the user
-                // at the wrong artifact.
-                let mut err = CodegenError::new(e.to_string()).with_note(
-                    "checked against the WGGO plan available at this point — \
+    if let (Some(wm), Some(plan_for_validation)) = (weight_map_ref, applied_plan)
+        && compiler.cpdt_mode == CpdtMode::Full
+        && let Err(e) = crate::cpdt_sensitivity::validate(wm, plan_for_validation)
+    {
+        // KNOWN LIMIT: on the pre-plan offer (compile_train_block),
+        // `applied_plan` is the pre-pass's — a plan the fingerprint
+        // check has not yet accepted. A checkpoint that would
+        // validate against the fresh in-place replan can therefore
+        // die here on the stale one; say so, because a validation
+        // error that names the wrong plan generation sends the user
+        // at the wrong artifact.
+        let mut err = CodegenError::new(e.to_string()).with_note(
+            "checked against the WGGO plan available at this point — \
                      the pre-pass offer when one exists; if the graph changed \
                      since the pre-pass, recompile so it regenerates",
-                );
-                if let Some(train) = train_block {
-                    // The header's `model = …`, not the whole block: the
-                    // refusal is about that model's weights.
-                    err = err.with_span(crate::wggo_prepass::model_arg_span(
-                        train,
-                        compiler.interner,
-                    ));
-                }
-                return Err(err);
-            }
+        );
+        if let Some(train) = train_block {
+            // The header's `model = …`, not the whole block: the
+            // refusal is about that model's weights.
+            err = err.with_span(crate::wggo_prepass::model_arg_span(
+                train,
+                compiler.interner,
+            ));
         }
+        return Err(err);
     }
 
     let input = CpdtInput {
@@ -429,54 +428,54 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // line. Tie the diagnostic to the mode that actually exercises the scorer.
     let precision_plan_built = compiler.cpdt_mode == CpdtMode::Full;
 
-    if weights_present && precision_plan_built {
-        if let Some(wm) = weight_map_ref {
-            let plan_nw = plan_map_noweights(wm, &precision_cfg);
-            let (agree_layers, total_layers, agree_params, total_params) =
-                compute_tier_agreement(&plan.precision, &plan_nw);
-            let layer_pct = if total_layers == 0 {
-                100.0
-            } else {
-                100.0 * agree_layers as f64 / total_layers as f64
-            };
-            let param_pct = if total_params == 0 {
-                100.0
-            } else {
-                100.0 * agree_params as f64 / total_params as f64
-            };
-            eprintln!(
-                "[cpdt] weight-aware tier agreement: {:.2}% ({}/{} layers, \
+    if weights_present && precision_plan_built
+        && let Some(wm) = weight_map_ref
+    {
+        let plan_nw = plan_map_noweights(wm, &precision_cfg);
+        let (agree_layers, total_layers, agree_params, total_params) =
+            compute_tier_agreement(&plan.precision, &plan_nw);
+        let layer_pct = if total_layers == 0 {
+            100.0
+        } else {
+            100.0 * agree_layers as f64 / total_layers as f64
+        };
+        let param_pct = if total_params == 0 {
+            100.0
+        } else {
+            100.0 * agree_params as f64 / total_params as f64
+        };
+        eprintln!(
+            "[cpdt] weight-aware tier agreement: {:.2}% ({}/{} layers, \
                  parameter-weighted {:.2}%)",
-                layer_pct, agree_layers, total_layers, param_pct,
-            );
-            if param_pct < 95.0 {
-                eprintln!(
-                    "warning: weight-aware tier agreement below 95% (parameter-weighted \
+            layer_pct, agree_layers, total_layers, param_pct,
+        );
+        if param_pct < 95.0 {
+            eprintln!(
+                "warning: weight-aware tier agreement below 95% (parameter-weighted \
                      {:.2}%). This may indicate that the calibration constants do not fit \
                      this weight distribution well. Phase 2's spectral factor + sidecar \
                      cache narrow this gap; see docs/superpowers/specs/\
                      2026-04-18-cpdt-weight-aware-phase2-stub.md.",
-                    param_pct
-                );
-            }
+                param_pct
+            );
+        }
 
-            if let Ok(val) = std::env::var("CPDT_CALIB_K") {
-                eprintln!(
-                    "warning: CPDT_CALIB_K={val} is set but ignored. Weights are present, \
+        if let Ok(val) = std::env::var("CPDT_CALIB_K") {
+            eprintln!(
+                "warning: CPDT_CALIB_K={val} is set but ignored. Weights are present, \
                      so the computed gradient_magnitude_est is authoritative. If CPDT_CALIB_K \
                      is vestigial in your shell, you can unset it to silence this warning."
-                );
-            }
+            );
         }
     }
 
     // Publish to the CLI-owned output slot (if any) so `nsl build` can
     // render the plan after compile returns without threading it through
     // every entry-point's return tuple.
-    if let Some(slot) = compiler.compile_options.cpdt.plan_out.as_ref() {
-        if let Ok(mut guard) = slot.lock() {
-            *guard = Some(plan.clone());
-        }
+    if let Some(slot) = compiler.compile_options.cpdt.plan_out.as_ref()
+        && let Ok(mut guard) = slot.lock()
+    {
+        *guard = Some(plan.clone());
     }
     compiler.bus.publish_cpdt_plan(plan);
     Ok(())
@@ -631,10 +630,10 @@ pub(crate) fn invoke_wrga_if_enabled(
             if matches {
                 placement.decorator_kind = Some(adapter_cfg.kind);
                 placement.alpha = adapter_cfg.alpha;
-                if let Some(r) = adapter_cfg.rank {
-                    if r > 0 {
-                        placement.suggested_rank = r as usize;
-                    }
+                if let Some(r) = adapter_cfg.rank
+                    && r > 0
+                {
+                    placement.suggested_rank = r as usize;
                 }
             }
         }
@@ -1181,13 +1180,12 @@ impl Compiler<'_> {
             return;
         };
 
-        if let ExprKind::Ident(source_sym) = &expr.kind {
-            if state.param_symbols.contains(source_sym)
-                || state.non_owning_symbols.contains(source_sym)
-            {
-                state.non_owning_symbols.insert(target_sym);
-                return;
-            }
+        if let ExprKind::Ident(source_sym) = &expr.kind
+            && (state.param_symbols.contains(source_sym)
+                || state.non_owning_symbols.contains(source_sym))
+        {
+            state.non_owning_symbols.insert(target_sym);
+            return;
         }
 
         // A non-Dict subscript hands out a BORROWED element: `compile_subscript`
@@ -1214,14 +1212,14 @@ impl Compiler<'_> {
         // non-owning makes the step-end cleanup skip it, makes ELTLS rebind
         // skip the old-value free, and makes assignment-inside-if materialize
         // a clone first (the established clone-on-mutate discipline).
-        if let ExprKind::MemberAccess { object, .. } = &expr.kind {
-            if matches!(
+        if let ExprKind::MemberAccess { object, .. } = &expr.kind
+            && matches!(
                 self.node_type(object.id),
                 nsl_semantic::types::Type::Model { .. }
-            ) {
-                state.non_owning_symbols.insert(target_sym);
-                return;
-            }
+            )
+        {
+            state.non_owning_symbols.insert(target_sym);
+            return;
         }
 
         state.non_owning_symbols.remove(&target_sym);
@@ -1601,10 +1599,10 @@ impl Compiler<'_> {
         state: &mut FuncState,
         stmt: &Stmt,
     ) -> Result<(), CodegenError> {
-        if let Some(block) = state.current_block {
-            if is_block_filled(builder, block) {
-                return Ok(());
-            }
+        if let Some(block) = state.current_block
+            && is_block_filled(builder, block)
+        {
+            return Ok(());
         }
 
         // Clear any stale lambda capture count from a previous statement
@@ -1623,13 +1621,13 @@ impl Compiler<'_> {
                 match &pattern.kind {
                     PatternKind::Ident(sym) => {
                         let sym = *sym;
-                        if let Some(expr) = value {
-                            if self.expr_is_borrowed_batch_handle(state, expr) {
-                                return Err(CodegenError::new(format!(
-                                    "cannot bind DataLoader batch handle '{}' directly; access batch fields instead",
-                                    self.resolve_sym(sym)
-                                )));
-                            }
+                        if let Some(expr) = value
+                            && self.expr_is_borrowed_batch_handle(state, expr)
+                        {
+                            return Err(CodegenError::new(format!(
+                                "cannot bind DataLoader batch handle '{}' directly; access batch fields instead",
+                                self.resolve_sym(sym)
+                            )));
                         }
                         let init_val = if let Some(expr) = value {
                             // M36: Check if this variable is slab-planned for zero-alloc
@@ -2197,18 +2195,16 @@ impl Compiler<'_> {
                 // per-program so the single-writer semantics are safe.
                 // See docs/superpowers/specs/2026-04-20-cpdt-weight-aware-opt-out-design.md.
                 for d in decorators {
-                    if d.name.len() == 1 && self.resolve_sym(d.name[0]) == "cpdt" {
-                        if let Some(args) = &d.args {
-                            for arg in args {
-                                if let Some(name_sym) = arg.name {
-                                    if self.resolve_sym(name_sym) == "weight_aware" {
-                                        if let nsl_ast::expr::ExprKind::BoolLiteral(b) =
-                                            arg.value.kind
-                                        {
-                                            self.cpdt_weight_aware = b;
-                                        }
-                                    }
-                                }
+                    if d.name.len() == 1 && self.resolve_sym(d.name[0]) == "cpdt"
+                        && let Some(args) = &d.args
+                    {
+                        for arg in args {
+                            if let Some(name_sym) = arg.name
+                                && self.resolve_sym(name_sym) == "weight_aware"
+                                && let nsl_ast::expr::ExprKind::BoolLiteral(b) =
+                                    arg.value.kind
+                            {
+                                self.cpdt_weight_aware = b;
                             }
                         }
                     }
@@ -2306,12 +2302,11 @@ impl Compiler<'_> {
                                     };
                                     if let Some((ops, _inputs)) =
                                         crate::fusion::analyze_fusible_chain(ret_expr, &resolve)
+                                        && ops.len() >= 2
                                     {
-                                        if ops.len() >= 2 {
-                                            self.fusion
-                                                .fused_fns
-                                                .insert(fname.clone(), (ops, num_params));
-                                        }
+                                        self.fusion
+                                            .fused_fns
+                                            .insert(fname.clone(), (ops, num_params));
                                     }
                                 }
                                 // Still compile the function normally as fallback (CPU or when
@@ -2325,12 +2320,11 @@ impl Compiler<'_> {
                                     for arg in dargs {
                                         if let Some(name_sym) = arg.name {
                                             let arg_name = self.resolve_sym(name_sym).to_string();
-                                            if arg_name == "start_rule" {
-                                                if let nsl_ast::expr::ExprKind::StringLiteral(s) =
+                                            if arg_name == "start_rule"
+                                                && let nsl_ast::expr::ExprKind::StringLiteral(s) =
                                                     &arg.value.kind
-                                                {
-                                                    start_rule = s.clone();
-                                                }
+                                            {
+                                                start_rule = s.clone();
                                             }
                                         } else if let nsl_ast::expr::ExprKind::StringLiteral(s) =
                                             &arg.value.kind
@@ -2356,16 +2350,15 @@ impl Compiler<'_> {
                 // target, emit @inspect hooks.  Only active when
                 // `compile_options.inspect_enabled` is true and the stmt
                 // is a `let x = ...`.
-                if self.compile_options.inspect_enabled {
-                    if let StmtKind::VarDecl { pattern, .. } = &stmt.kind {
-                        if let PatternKind::Ident(target_sym) = &pattern.kind {
-                            for d in decorators {
-                                if d.name.len() == 1
-                                    && self.resolve_sym(d.name[0]) == "inspect"
-                                {
-                                    self.emit_inspect_hook(builder, state, d, *target_sym)?;
-                                }
-                            }
+                if self.compile_options.inspect_enabled
+                    && let StmtKind::VarDecl { pattern, .. } = &stmt.kind
+                    && let PatternKind::Ident(target_sym) = &pattern.kind
+                {
+                    for d in decorators {
+                        if d.name.len() == 1
+                            && self.resolve_sym(d.name[0]) == "inspect"
+                        {
+                            self.emit_inspect_hook(builder, state, d, *target_sym)?;
                         }
                     }
                 }
@@ -2778,55 +2771,53 @@ impl Compiler<'_> {
                     // side-table slot rather than a struct field. Mirrors
                     // the read-through in `expr/access.rs`.
                     if crate::expr::access::is_synthesized_adapter_field_name(&member_name) {
-                        if matches!(op, AssignOp::Assign) {
-                            if let Some(layout) =
+                        if matches!(op, AssignOp::Assign)
+                            && let Some(layout) =
                                 self.types.struct_layouts.get(&model_name).cloned()
-                            {
-                                if let Some(slot_off) = layout.adapter_sidetable_offset {
-                                    let index = self
-                                        .adapter_field_index(&model_name, &member_name)
-                                        .ok_or_else(|| {
-                                            CodegenError::new(format!(
-                                                "synthesized adapter field '{member_name}' \
+                            && let Some(slot_off) = layout.adapter_sidetable_offset
+                        {
+                            let index = self
+                                .adapter_field_index(&model_name, &member_name)
+                                .ok_or_else(|| {
+                                    CodegenError::new(format!(
+                                        "synthesized adapter field '{member_name}' \
                                                  not found for model '{model_name}' in \
                                                  current WRGA plan"
-                                            ))
-                                        })?;
-                                    let table_ptr = builder.ins().load(
-                                        cl_types::I64,
-                                        cranelift_codegen::ir::MemFlagsData::trusted(),
-                                        obj_val,
-                                        slot_off as i32,
-                                    );
-                                    let byte_off = (index * 8) as i32;
-                                    // Free the existing tensor in the slot
-                                    // before overwriting (side-table owns
-                                    // the tensors it holds).
-                                    let old_ptr = builder.ins().load(
-                                        cl_types::I64,
-                                        cranelift_codegen::ir::MemFlagsData::trusted(),
-                                        table_ptr,
-                                        byte_off,
-                                    );
-                                    self.compile_call_by_name(
-                                        builder,
-                                        "nsl_tensor_free_if_valid",
-                                        &[old_ptr],
-                                    )?;
-                                    builder.ins().store(
-                                        cranelift_codegen::ir::MemFlagsData::trusted(),
-                                        new_val,
-                                        table_ptr,
-                                        byte_off,
-                                    );
-                                    // The side-table owns its tensors and
-                                    // frees the old slot on overwrite — a
-                                    // swept owned temp here became a later
-                                    // double free.
-                                    self.assign_container_store_tail(builder, state, new_val);
-                                    return Ok(());
-                                }
-                            }
+                                    ))
+                                })?;
+                            let table_ptr = builder.ins().load(
+                                cl_types::I64,
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
+                                obj_val,
+                                slot_off as i32,
+                            );
+                            let byte_off = (index * 8) as i32;
+                            // Free the existing tensor in the slot
+                            // before overwriting (side-table owns
+                            // the tensors it holds).
+                            let old_ptr = builder.ins().load(
+                                cl_types::I64,
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
+                                table_ptr,
+                                byte_off,
+                            );
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_free_if_valid",
+                                &[old_ptr],
+                            )?;
+                            builder.ins().store(
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
+                                new_val,
+                                table_ptr,
+                                byte_off,
+                            );
+                            // The side-table owns its tensors and
+                            // frees the old slot on overwrite — a
+                            // swept owned temp here became a later
+                            // double free.
+                            self.assign_container_store_tail(builder, state, new_val);
+                            return Ok(());
                         }
                         return Err(CodegenError::new(format!(
                             "compound-assign to synthesized adapter field \
@@ -3114,12 +3105,12 @@ impl Compiler<'_> {
                 !self.pattern_binds_sym(pattern, sym)
             }
             StmtKind::Assign { target, value, .. } => {
-                if let ExprKind::Ident(s) = &target.kind {
-                    if *s == sym {
-                        return self.loop_binding_rhs_is_owning(value)
-                            && matches!(self.node_type(value.id),
-                                        ty if ty.is_tensor() || ty.is_indeterminate());
-                    }
+                if let ExprKind::Ident(s) = &target.kind
+                    && *s == sym
+                {
+                    return self.loop_binding_rhs_is_owning(value)
+                        && matches!(self.node_type(value.id),
+                                    ty if ty.is_tensor() || ty.is_indeterminate());
                 }
                 true
             }
@@ -3252,10 +3243,10 @@ impl Compiler<'_> {
             }
         }
         // Don't emit frees into a filled block.
-        if let Some(block) = state.current_block {
-            if is_block_filled(builder, block) {
-                return;
-            }
+        if let Some(block) = state.current_block
+            && is_block_filled(builder, block)
+        {
+            return;
         }
         // Read the old value and free it via the safe variant that handles
         // null pointers, invalid magic, and non-tensor i64 values as no-ops.
@@ -3390,10 +3381,10 @@ impl Compiler<'_> {
                 continue;
             }
             // Emit nsl_tensor_free(temp) — but only if block is not already filled
-            if let Some(block) = state.current_block {
-                if is_block_filled(builder, block) {
-                    break;
-                }
+            if let Some(block) = state.current_block
+                && is_block_filled(builder, block)
+            {
+                break;
             }
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*temp]);
         }
@@ -3428,10 +3419,10 @@ impl Compiler<'_> {
             if *temp == keep {
                 continue;
             }
-            if let Some(block) = state.current_block {
-                if is_block_filled(builder, block) {
-                    break;
-                }
+            if let Some(block) = state.current_block
+                && is_block_filled(builder, block)
+            {
+                break;
             }
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*temp]);
         }
@@ -3452,10 +3443,10 @@ impl Compiler<'_> {
     ) {
         let held = std::mem::take(&mut state.cleanup.tape_held);
         for val in held {
-            if let Some(block) = state.current_block {
-                if is_block_filled(builder, block) {
-                    break;
-                }
+            if let Some(block) = state.current_block
+                && is_block_filled(builder, block)
+            {
+                break;
             }
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[val]);
             state.cleanup.expr_ownership.remove(&val);
@@ -3484,10 +3475,10 @@ impl Compiler<'_> {
             if Some(*val) == keep {
                 continue;
             }
-            if let Some(block) = state.current_block {
-                if is_block_filled(builder, block) {
-                    break;
-                }
+            if let Some(block) = state.current_block
+                && is_block_filled(builder, block)
+            {
+                break;
             }
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*val]);
         }
@@ -3503,10 +3494,10 @@ impl Compiler<'_> {
             // never a slice panic.
             let scope_start = scope_start.min(state.cleanup.tensor_temporaries.len());
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
-                if let Some(block) = state.current_block {
-                    if is_block_filled(builder, block) {
-                        break;
-                    }
+                if let Some(block) = state.current_block
+                    && is_block_filled(builder, block)
+                {
+                    break;
                 }
                 let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
             }
@@ -3519,10 +3510,10 @@ impl Compiler<'_> {
             // Clamp defensively — see emit_loop_scope_cleanup.
             let scope_start = scope_start.min(state.cleanup.tensor_temporaries.len());
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
-                if let Some(block) = state.current_block {
-                    if is_block_filled(builder, block) {
-                        break;
-                    }
+                if let Some(block) = state.current_block
+                    && is_block_filled(builder, block)
+                {
+                    break;
                 }
                 let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
             }
@@ -3536,10 +3527,10 @@ impl Compiler<'_> {
         state: &mut FuncState,
     ) {
         for &batch_var in state.cleanup.active_batch_vars.iter().rev() {
-            if let Some(block) = state.current_block {
-                if is_block_filled(builder, block) {
-                    break;
-                }
+            if let Some(block) = state.current_block
+                && is_block_filled(builder, block)
+            {
+                break;
             }
             let batch_ptr = builder.use_var(batch_var);
             let _ = self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_ptr]);
@@ -3548,10 +3539,10 @@ impl Compiler<'_> {
             let Some(batch_var) = loop_ctx.batch_var else {
                 continue;
             };
-            if let Some(block) = state.current_block {
-                if is_block_filled(builder, block) {
-                    break;
-                }
+            if let Some(block) = state.current_block
+                && is_block_filled(builder, block)
+            {
+                break;
             }
             let batch_ptr = builder.use_var(batch_var);
             let _ = self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_ptr]);
@@ -3568,10 +3559,10 @@ impl Compiler<'_> {
     ) {
         let loaders = std::mem::take(&mut state.cleanup.dataloader_vars);
         for dl in &loaders {
-            if let Some(block) = state.current_block {
-                if is_block_filled(builder, block) {
-                    break;
-                }
+            if let Some(block) = state.current_block
+                && is_block_filled(builder, block)
+            {
+                break;
             }
             let _ = self.compile_call_by_name(builder, "nsl_dataloader_stop", &[*dl]);
             let _ = self.compile_call_by_name(builder, "nsl_dataloader_free", &[*dl]);
@@ -4520,10 +4511,10 @@ impl Compiler<'_> {
                     }
                     state.pop_fn_binding_scope();
                     state.flags.conditional_depth -= 1;
-                    if let Some(block) = state.current_block {
-                        if !is_block_filled(builder, block) {
-                            builder.ins().jump(merge_block, &[]);
-                        }
+                    if let Some(block) = state.current_block
+                        && !is_block_filled(builder, block)
+                    {
+                        builder.ins().jump(merge_block, &[]);
                     }
                     break;
                 }
@@ -4574,10 +4565,10 @@ impl Compiler<'_> {
                         }
                         state.pop_fn_binding_scope();
                         state.flags.conditional_depth -= 1;
-                        if let Some(block) = state.current_block {
-                            if !is_block_filled(builder, block) {
-                                builder.ins().jump(merge_block, &[]);
-                            }
+                        if let Some(block) = state.current_block
+                            && !is_block_filled(builder, block)
+                        {
+                            builder.ins().jump(merge_block, &[]);
                         }
                         break;
                     }
@@ -4672,10 +4663,10 @@ impl Compiler<'_> {
         }
 
         // If we didn't break (no wildcard/binding), need to jump to merge from final else
-        if let Some(block) = state.current_block {
-            if block != merge_block && !is_block_filled(builder, block) {
-                builder.ins().jump(merge_block, &[]);
-            }
+        if let Some(block) = state.current_block
+            && block != merge_block && !is_block_filled(builder, block)
+        {
+            builder.ins().jump(merge_block, &[]);
         }
 
         builder.switch_to_block(merge_block);
@@ -4828,10 +4819,10 @@ impl Compiler<'_> {
         // Render the Distillation Build Report (facts collected during the
         // source-AD extraction inside the inner lowering). Stderr, CFIE
         // convention for in-codegen build reports.
-        if result.is_ok() {
-            if let Some(plan) = self.bus.take_cpkd_plan() {
-                eprint!("{}", plan.render_report());
-            }
+        if result.is_ok()
+            && let Some(plan) = self.bus.take_cpkd_plan()
+        {
+            eprint!("{}", plan.render_report());
         }
         result
     }
@@ -8058,11 +8049,11 @@ sched={sched_s}",
         self.inspect_train_step_var = Some(step_count_var);
 
         // ── 5a. Dev Tools Phase 4 Task 4: optional health flush-interval setter ──
-        if self.compile_options.health_monitor {
-            if let Some(n) = self.compile_options.health_flush_interval {
-                let n_val = builder.ins().iconst(cl_types::I64, n as i64);
-                self.compile_call_by_name(builder, "nsl_health_set_flush_interval", &[n_val])?;
-            }
+        if self.compile_options.health_monitor
+            && let Some(n) = self.compile_options.health_flush_interval
+        {
+            let n_val = builder.ins().iconst(cl_types::I64, n as i64);
+            self.compile_call_by_name(builder, "nsl_health_set_flush_interval", &[n_val])?;
         }
 
         // ── 5b. Allocate gradient accumulation buffers (if grad_accumulation_steps > 1) ──
@@ -8859,14 +8850,12 @@ sched={sched_s}",
                 }
                 // Second pass: map Input ops by name (catches inputs not in symbol_var_map)
                 for op in &extractor.wengert_list().ops {
-                    if let crate::wengert::PrimalOp::Input(name) = &op.op {
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                    if let crate::wengert::PrimalOp::Input(name) = &op.op
+                        && let std::collections::hash_map::Entry::Vacant(entry) =
                             primal_vars.entry(op.result)
-                        {
-                            if let Some(&val) = state_vars_by_name.get(name) {
-                                entry.insert(val);
-                            }
-                        }
+                        && let Some(&val) = state_vars_by_name.get(name)
+                    {
+                        entry.insert(val);
                     }
                 }
 
@@ -9195,133 +9184,134 @@ sched={sched_s}",
                 // shared borrow of `self.compile_options` across it would not
                 // borrow-check.
                 let wggo_mode = self.compile_options.wggo.mode.clone();
-                if let Some(mode_str) = wggo_mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
-                        // Milestone C: SCHEDULED, both arms of the pre-plan
-                        // match — on the fingerprint-match arm the pass body
-                        // never runs (recorded at KernelPrepass), but the
-                        // scheduler still retains the digest of the tape the
-                        // reused plan's positional indices will PRUNE, which
-                        // is exactly what the consumption-fork assert below
-                        // needs (TapeDigest and fingerprint_wengert are
-                        // different hashes, not interchangeable). The body is
-                        // widened through the publish: wggo_overrides
-                        // declares applied_implies_published Enforced and
-                        // Applied is recorded inside wggo::run, so a finish
-                        // directly after the planner call would refuse every
-                        // correct compile. The stale-mode-table refusal
-                        // returns THROUGH the closure (R is a Result).
-                        let sched = self.passes.scheduler();
-                        let scheduled = sched
-                            .schedule("WGGO", Some(extractor.wengert_list()), || {
-                        // Build AnalysisConfig from CLI overrides; clamp is
-                        // also applied in analyze(), but applying it here
-                        // keeps the --wggo-report line honest.
-                        let mut analysis_config =
-                            crate::wggo_weight_analysis::AnalysisConfig::default();
-                        if let Some(f) = self.compile_options.wggo.prune_fraction {
-                            analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
-                        }
-                        // Pass the weights path for magnitude-based scoring
-                        // (NullWeightProvider is used in run_on_wengert_with_weights
-                        // when weights_path is None, producing uniform scores).
-                        // compile_options is forwarded so build_scorer can wire the
-                        // GradientScorer appropriate for --wggo-importance + --calibration-data.
-                        // calibration_sidecar is populated by compile_and_calibrate's wrapper-
-                        // level firing BEFORE compile_main runs, ensuring it's available here
-                        // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
-                        // calibrate wrapper).
-                        let weights_path = self.compile_options.wggo.weights.as_deref();
-                        // WGGO-before-kernels: consume this block's pre-plan
-                        // when its graph fingerprint matches the extraction
-                        // we just did (the list codegen actually lowers, and
-                        // that wggo_prune may rewrite — indices must refer to
-                        // THIS graph). On mismatch, reject loudly and solve
-                        // in place; if the fresh plan then disagrees with the
-                        // pre-plan on any FASE-relevant decision AND a
-                        // per-param mode table was already emitted from the
-                        // pre-plan's overrides earlier in this function,
-                        // HARD-REFUSE (P0 item 1): executing the stale table
-                        // would train with FASE modes that do not match the
-                        // final plan every downstream consumer sees.
-                        let preplan = self
-                            .bus
-                            .wggo_preplans()
-                            .iter()
-                            .find(|p| p.train_block_stmt_id == train_block_stmt_id);
-                        let reused_plan = preplan.and_then(|pre| {
-                            let fp = crate::wggo_prepass::fingerprint_wengert(
-                                extractor.wengert_list(),
-                            );
-                            if fp == pre.graph_fingerprint {
-                                // Additive observability line (tests key off
-                                // it); the [wggo] summary itself still prints
-                                // below, identically to the in-place path.
-                                eprintln!(
-                                    "[wggo] consumed pre-solved plan \
+                if let Some(mode_str) = wggo_mode
+                    && mode_str != "off" && mode_str != "disable" && mode_str != "disabled"
+                {
+                    // Milestone C: SCHEDULED, both arms of the pre-plan
+                    // match — on the fingerprint-match arm the pass body
+                    // never runs (recorded at KernelPrepass), but the
+                    // scheduler still retains the digest of the tape the
+                    // reused plan's positional indices will PRUNE, which
+                    // is exactly what the consumption-fork assert below
+                    // needs (TapeDigest and fingerprint_wengert are
+                    // different hashes, not interchangeable). The body is
+                    // widened through the publish: wggo_overrides
+                    // declares applied_implies_published Enforced and
+                    // Applied is recorded inside wggo::run, so a finish
+                    // directly after the planner call would refuse every
+                    // correct compile. The stale-mode-table refusal
+                    // returns THROUGH the closure (R is a Result).
+                    let sched = self.passes.scheduler();
+                    let scheduled = sched
+                        .schedule("WGGO", Some(extractor.wengert_list()), || {
+                    // Build AnalysisConfig from CLI overrides; clamp is
+                    // also applied in analyze(), but applying it here
+                    // keeps the --wggo-report line honest.
+                    let mut analysis_config =
+                        crate::wggo_weight_analysis::AnalysisConfig::default();
+                    if let Some(f) = self.compile_options.wggo.prune_fraction {
+                        analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
+                    }
+                    // Pass the weights path for magnitude-based scoring
+                    // (NullWeightProvider is used in run_on_wengert_with_weights
+                    // when weights_path is None, producing uniform scores).
+                    // compile_options is forwarded so build_scorer can wire the
+                    // GradientScorer appropriate for --wggo-importance + --calibration-data.
+                    // calibration_sidecar is populated by compile_and_calibrate's wrapper-
+                    // level firing BEFORE compile_main runs, ensuring it's available here
+                    // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
+                    // calibrate wrapper).
+                    let weights_path = self.compile_options.wggo.weights.as_deref();
+                    // WGGO-before-kernels: consume this block's pre-plan
+                    // when its graph fingerprint matches the extraction
+                    // we just did (the list codegen actually lowers, and
+                    // that wggo_prune may rewrite — indices must refer to
+                    // THIS graph). On mismatch, reject loudly and solve
+                    // in place; if the fresh plan then disagrees with the
+                    // pre-plan on any FASE-relevant decision AND a
+                    // per-param mode table was already emitted from the
+                    // pre-plan's overrides earlier in this function,
+                    // HARD-REFUSE (P0 item 1): executing the stale table
+                    // would train with FASE modes that do not match the
+                    // final plan every downstream consumer sees.
+                    let preplan = self
+                        .bus
+                        .wggo_preplans()
+                        .iter()
+                        .find(|p| p.train_block_stmt_id == train_block_stmt_id);
+                    let reused_plan = preplan.and_then(|pre| {
+                        let fp = crate::wggo_prepass::fingerprint_wengert(
+                            extractor.wengert_list(),
+                        );
+                        if fp == pre.graph_fingerprint {
+                            // Additive observability line (tests key off
+                            // it); the [wggo] summary itself still prints
+                            // below, identically to the in-place path.
+                            eprintln!(
+                                "[wggo] consumed pre-solved plan \
                                      (graph fingerprint match)"
-                                );
-                                Some(pre.plan.clone())
-                            } else {
-                                eprintln!(
-                                    "[wggo] wggo-preplan-rejected \
+                            );
+                            Some(pre.plan.clone())
+                        } else {
+                            eprintln!(
+                                "[wggo] wggo-preplan-rejected \
                                      reason=graph_fingerprint_mismatch — replanning in place"
-                                );
-                                None
+                            );
+                            None
+                        }
+                    });
+                    let preplan_was_rejected =
+                        preplan.is_some() && reused_plan.is_none();
+                    wggo_preplan_offered = preplan.is_some();
+                    wggo_preplan_was_rejected = preplan_was_rejected;
+                    let plan = match reused_plan {
+                        Some(plan) => Some(plan),
+                        None => crate::wggo::run_on_wengert_with_weights(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            &mode_str,
+                            self.compile_options.world_size,
+                            weights_path,
+                            analysis_config,
+                            Some(&self.compile_options),
+                            self.features.packing_supported_in_module,
+                            // Campaign item 6: same doc-length stats the
+                            // pre-pass used (resolved in kernel synthesis),
+                            // so an in-place replan prices packing from the
+                            // real distribution too.
+                            self.features.dataset_packing_stats.clone(),
+                        )
+                        .map_err(|e| {
+                            e.with_span_if_unset(crate::wggo_prepass::model_arg_span(
+                                train,
+                                self.interner,
+                            ))
+                        })?,
+                    };
+                    // Test-only knob: simulate a rejected pre-plan whose
+                    // in-place replan diverges on FASE decisions, so the
+                    // refusal wiring is gate-testable without engineering
+                    // a real graph-fingerprint drift. Strict value match
+                    // ("1"), same convention as NSL_FASE_FUSED_OVERRIDE.
+                    let forced_stale = std::env::var("NSL_WGGO_FORCE_STALE_TABLE")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                    if preplan_was_rejected || forced_stale {
+                        let fase_diverged = match (preplan, plan.as_ref()) {
+                            (Some(pre), Some(fresh)) => {
+                                crate::wggo_overrides::fase_overrides_diverge(
+                                    &pre.overrides,
+                                    &crate::wggo_overrides::WggoOverrides::from_applied(
+                                        &fresh.applied,
+                                    ),
+                                )
                             }
-                        });
-                        let preplan_was_rejected =
-                            preplan.is_some() && reused_plan.is_none();
-                        wggo_preplan_offered = preplan.is_some();
-                        wggo_preplan_was_rejected = preplan_was_rejected;
-                        let plan = match reused_plan {
-                            Some(plan) => Some(plan),
-                            None => crate::wggo::run_on_wengert_with_weights(
-                                extractor.wengert_list(),
-                                &self.compile_options.target,
-                                &mode_str,
-                                self.compile_options.world_size,
-                                weights_path,
-                                analysis_config,
-                                Some(&self.compile_options),
-                                self.features.packing_supported_in_module,
-                                // Campaign item 6: same doc-length stats the
-                                // pre-pass used (resolved in kernel synthesis),
-                                // so an in-place replan prices packing from the
-                                // real distribution too.
-                                self.features.dataset_packing_stats.clone(),
-                            )
-                            .map_err(|e| {
-                                e.with_span_if_unset(crate::wggo_prepass::model_arg_span(
-                                    train,
-                                    self.interner,
-                                ))
-                            })?,
-                        };
-                        // Test-only knob: simulate a rejected pre-plan whose
-                        // in-place replan diverges on FASE decisions, so the
-                        // refusal wiring is gate-testable without engineering
-                        // a real graph-fingerprint drift. Strict value match
-                        // ("1"), same convention as NSL_FASE_FUSED_OVERRIDE.
-                        let forced_stale = std::env::var("NSL_WGGO_FORCE_STALE_TABLE")
-                            .map(|v| v == "1")
-                            .unwrap_or(false);
-                        if preplan_was_rejected || forced_stale {
-                            let fase_diverged = match (preplan, plan.as_ref()) {
-                                (Some(pre), Some(fresh)) => {
-                                    crate::wggo_overrides::fase_overrides_diverge(
-                                        &pre.overrides,
-                                        &crate::wggo_overrides::WggoOverrides::from_applied(
-                                            &fresh.applied,
-                                        ),
-                                    )
-                                }
-                                _ => false,
-                            } || forced_stale;
-                            if fase_diverged {
-                                if mode_table_base.is_some() {
-                                    return Err(CodegenError::new(
-                                        "the FASE per-param mode table for this train \
+                            _ => false,
+                        } || forced_stale;
+                        if fase_diverged {
+                            if mode_table_base.is_some() {
+                                return Err(CodegenError::new(
+                                    "the FASE per-param mode table for this train \
                                          block was emitted from a WGGO pre-plan whose \
                                          graph fingerprint no longer matches, and the \
                                          in-place replan DISAGREES on per-layer \
@@ -9331,191 +9321,190 @@ sched={sched_s}",
                                          Recompile so the pre-plan regenerates against \
                                          the current graph, or drop --wggo for this \
                                          block.",
-                                    ));
-                                }
-                                // No mode table was emitted (Passthrough /
-                                // FullBuffer-global / muon): nothing stale
-                                // executes — downstream consumers get the
-                                // fresh plan. Note it loudly anyway.
-                                eprintln!(
-                                    "[wggo] note: the rejected pre-plan and the \
+                                ));
+                            }
+                            // No mode table was emitted (Passthrough /
+                            // FullBuffer-global / muon): nothing stale
+                            // executes — downstream consumers get the
+                            // fresh plan. Note it loudly anyway.
+                            eprintln!(
+                                "[wggo] note: the rejected pre-plan and the \
                                      in-place replan disagree on fase_fused, but no \
                                      per-param FASE mode table was emitted for this \
                                      train block — the fresh plan governs all \
                                      downstream consumers"
-                                );
-                            }
+                            );
                         }
-                        if let Some(plan) = plan {
-                            if self.compile_options.wggo.report {
-                                eprintln!("{}", plan.render_report());
-                            } else {
-                                eprintln!("[wggo] {}", plan.summary());
-                            }
-                            // Prune consumer (diagnostic stub): WGGO's DP can
-                            // emit `CoarseDecision::Prune` for low-importance
-                            // layers, but no downstream codegen implements
-                            // the layer-to-residual-identity IR rewrite.
-                            // Surface the gap via the `[prune]` stderr
-                            // diagnostic matching the CSHA/WRGA/CPDT/FASE
-                            // pattern, so users and the future IR-rewrite
-                            // session can see the planner's intent instead
-                            // of the decision silently no-opping.  Empty
-                            // iterator when no layer is planned for pruning
-                            // (shipped-binary common case).
-                            for diag in crate::wggo_overrides::collect_prune_diagnostics(&plan.applied) {
-                                // Dispatch through `diag.reason` rather than
-                                // calling the reason-string helper directly,
-                                // so a future Prune-adjacent reason variant
-                                // automatically renders its own string and
-                                // this match statement surfaces the missing
-                                // case at compile time via a non-exhaustive
-                                // warning (or new arm) rather than silently
-                                // printing the wrong string.
-                                let reason_str: std::borrow::Cow<'static, str> = match &diag.reason {
-                                    crate::wggo_overrides::OverrideRejectReason::WholeBlockPruneNotImplemented => {
-                                        std::borrow::Cow::Borrowed(
-                                            crate::wggo_overrides::whole_block_prune_not_implemented_reason(),
-                                        )
-                                    }
-                                    other => std::borrow::Cow::Owned(format!("{:?}", other)),
-                                };
-                                eprintln!(
-                                    "[prune] layer:{} name={} wggo-override-rejected \
+                    }
+                    if let Some(plan) = plan {
+                        if self.compile_options.wggo.report {
+                            eprintln!("{}", plan.render_report());
+                        } else {
+                            eprintln!("[wggo] {}", plan.summary());
+                        }
+                        // Prune consumer (diagnostic stub): WGGO's DP can
+                        // emit `CoarseDecision::Prune` for low-importance
+                        // layers, but no downstream codegen implements
+                        // the layer-to-residual-identity IR rewrite.
+                        // Surface the gap via the `[prune]` stderr
+                        // diagnostic matching the CSHA/WRGA/CPDT/FASE
+                        // pattern, so users and the future IR-rewrite
+                        // session can see the planner's intent instead
+                        // of the decision silently no-opping.  Empty
+                        // iterator when no layer is planned for pruning
+                        // (shipped-binary common case).
+                        for diag in crate::wggo_overrides::collect_prune_diagnostics(&plan.applied) {
+                            // Dispatch through `diag.reason` rather than
+                            // calling the reason-string helper directly,
+                            // so a future Prune-adjacent reason variant
+                            // automatically renders its own string and
+                            // this match statement surfaces the missing
+                            // case at compile time via a non-exhaustive
+                            // warning (or new arm) rather than silently
+                            // printing the wrong string.
+                            let reason_str: std::borrow::Cow<'static, str> = match &diag.reason {
+                                crate::wggo_overrides::OverrideRejectReason::WholeBlockPruneNotImplemented => {
+                                    std::borrow::Cow::Borrowed(
+                                        crate::wggo_overrides::whole_block_prune_not_implemented_reason(),
+                                    )
+                                }
+                                other => std::borrow::Cow::Owned(format!("{:?}", other)),
+                            };
+                            eprintln!(
+                                "[prune] layer:{} name={} wggo-override-rejected \
                                      requested={} applied={} reason={}",
-                                    diag.layer_index,
-                                    diag.layer_name,
-                                    diag.requested,
-                                    diag.applied,
-                                    reason_str,
-                                );
-                            }
-                            // PCA packing consumption (errata E2 / audit gap #4):
-                            // validate the plan's per-layer packing_mode against
-                            // the attention kernels the module-scan emitter
-                            // actually synthesized (it ran before compile_main,
-                            // so the plan could not influence admission — the
-                            // ordering restructure that would let it is the
-                            // tracked follow-up). One `[pca] layer:N
-                            // wggo-override-consumed/rejected` line per layer,
-                            // matching the CSHA/WRGA/CPDT/FASE/prune pattern.
+                                diag.layer_index,
+                                diag.layer_name,
+                                diag.requested,
+                                diag.applied,
+                                reason_str,
+                            );
+                        }
+                        // PCA packing consumption (errata E2 / audit gap #4):
+                        // validate the plan's per-layer packing_mode against
+                        // the attention kernels the module-scan emitter
+                        // actually synthesized (it ran before compile_main,
+                        // so the plan could not influence admission — the
+                        // ordering restructure that would let it is the
+                        // tracked follow-up). One `[pca] layer:N
+                        // wggo-override-consumed/rejected` line per layer,
+                        // matching the CSHA/WRGA/CPDT/FASE/prune pattern.
+                        {
+                            use crate::wggo_overrides::{
+                                packing_mode_name, PackingKernelState, PackingVerdict,
+                            };
+                            let state = match self
+                                .kernels
+                                .flash_attention_context
+                                .as_ref()
+                                .and_then(|c| c.csha_training_config.as_ref())
                             {
-                                use crate::wggo_overrides::{
-                                    packing_mode_name, PackingKernelState, PackingVerdict,
-                                };
-                                let state = match self
-                                    .kernels
-                                    .flash_attention_context
-                                    .as_ref()
-                                    .and_then(|c| c.csha_training_config.as_ref())
-                                {
-                                    Some(cfg) if cfg.segment_masked => {
-                                        // Per-doc CTA replaces the Tier-B pair at
-                                        // emission (compiler/kernel.rs fork), so
-                                        // masked + no Tier-B IDs ⇔ per-doc active.
-                                        if self
-                                            .kernels
-                                            .flash_attention_context
-                                            .as_ref()
-                                            .is_some_and(|c| {
-                                                c.csha_with_saves_tier_b_on_ptx_id.is_some()
-                                            })
-                                        {
-                                            PackingKernelState::TierBMasked
-                                        } else {
-                                            PackingKernelState::PerDocCta
-                                        }
-                                    }
-                                    // No fused masked kernels — but a model
-                                    // that consumes the packed mask at the
-                                    // source level (Stage B masked SDPA)
-                                    // honors the plan's segment_id preference
-                                    // itself; only report a rejection when
-                                    // NEITHER channel exists.
-                                    // PCA Stage C: the packed builtin on a
-                                    // CUDA target upgrades the consumption
-                                    // channel to the fused segment-masked
-                                    // family (decline path = Stage B chain).
-                                    _ if self.features.packed_sdpa_in_module
-                                        && (self.compile_options.target == "cuda"
-                                            || self.compile_options.target.starts_with("sm_")) =>
+                                Some(cfg) if cfg.segment_masked => {
+                                    // Per-doc CTA replaces the Tier-B pair at
+                                    // emission (compiler/kernel.rs fork), so
+                                    // masked + no Tier-B IDs ⇔ per-doc active.
+                                    if self
+                                        .kernels
+                                        .flash_attention_context
+                                        .as_ref()
+                                        .is_some_and(|c| {
+                                            c.csha_with_saves_tier_b_on_ptx_id.is_some()
+                                        })
                                     {
-                                        PackingKernelState::FusedSegmentMasked
+                                        PackingKernelState::TierBMasked
+                                    } else {
+                                        PackingKernelState::PerDocCta
                                     }
-                                    _ if self.features.packing_supported_in_module => {
-                                        PackingKernelState::SourceMasked
-                                    }
-                                    _ => PackingKernelState::NoMaskedKernels,
-                                };
-                                for diag in crate::wggo_overrides::collect_packing_diagnostics(
-                                    &plan.applied,
-                                    state,
-                                ) {
-                                    match &diag.verdict {
-                                        PackingVerdict::Consumed { kernel } => eprintln!(
-                                            "[pca] layer:{} name={} wggo-override-consumed \
+                                }
+                                // No fused masked kernels — but a model
+                                // that consumes the packed mask at the
+                                // source level (Stage B masked SDPA)
+                                // honors the plan's segment_id preference
+                                // itself; only report a rejection when
+                                // NEITHER channel exists.
+                                // PCA Stage C: the packed builtin on a
+                                // CUDA target upgrades the consumption
+                                // channel to the fused segment-masked
+                                // family (decline path = Stage B chain).
+                                _ if self.features.packed_sdpa_in_module
+                                    && (self.compile_options.target == "cuda"
+                                        || self.compile_options.target.starts_with("sm_")) =>
+                                {
+                                    PackingKernelState::FusedSegmentMasked
+                                }
+                                _ if self.features.packing_supported_in_module => {
+                                    PackingKernelState::SourceMasked
+                                }
+                                _ => PackingKernelState::NoMaskedKernels,
+                            };
+                            for diag in crate::wggo_overrides::collect_packing_diagnostics(
+                                &plan.applied,
+                                state,
+                            ) {
+                                match &diag.verdict {
+                                    PackingVerdict::Consumed { kernel } => eprintln!(
+                                        "[pca] layer:{} name={} wggo-override-consumed \
                                              packing_mode={} -> {}",
+                                        diag.layer_index,
+                                        diag.layer_name,
+                                        packing_mode_name(diag.mode),
+                                        kernel,
+                                    ),
+                                    PackingVerdict::Rejected(reason) => {
+                                        // Space-free snake_case token, like every
+                                        // other consumer's reason string (the
+                                        // decision explainer splits on whitespace;
+                                        // `{:?}` of a struct variant would inject
+                                        // `{ mode: N }` tokens). The requested
+                                        // mode already rides in `requested=`.
+                                        let reason_token = match reason {
+                                            crate::wggo_overrides::OverrideRejectReason::PackingRequiresPackedDataset { .. } =>
+                                                "packing_requires_packed_dataset",
+                                            crate::wggo_overrides::OverrideRejectReason::PackingMaskingMandatoryForPackedDataset =>
+                                                "packing_masking_mandatory_for_packed_dataset",
+                                            other => {
+                                                debug_assert!(
+                                                    false,
+                                                    "non-packing reject reason in packing verdict: {other:?}"
+                                                );
+                                                "unexpected_packing_reject_reason"
+                                            }
+                                        };
+                                        eprintln!(
+                                            "[pca] layer:{} name={} wggo-override-rejected \
+                                                 requested={} applied={} reason={}",
                                             diag.layer_index,
                                             diag.layer_name,
                                             packing_mode_name(diag.mode),
-                                            kernel,
-                                        ),
-                                        PackingVerdict::Rejected(reason) => {
-                                            // Space-free snake_case token, like every
-                                            // other consumer's reason string (the
-                                            // decision explainer splits on whitespace;
-                                            // `{:?}` of a struct variant would inject
-                                            // `{ mode: N }` tokens). The requested
-                                            // mode already rides in `requested=`.
-                                            let reason_token = match reason {
-                                                crate::wggo_overrides::OverrideRejectReason::PackingRequiresPackedDataset { .. } =>
-                                                    "packing_requires_packed_dataset",
-                                                crate::wggo_overrides::OverrideRejectReason::PackingMaskingMandatoryForPackedDataset =>
-                                                    "packing_masking_mandatory_for_packed_dataset",
-                                                other => {
-                                                    debug_assert!(
-                                                        false,
-                                                        "non-packing reject reason in packing verdict: {other:?}"
-                                                    );
-                                                    "unexpected_packing_reject_reason"
-                                                }
-                                            };
-                                            eprintln!(
-                                                "[pca] layer:{} name={} wggo-override-rejected \
-                                                 requested={} applied={} reason={}",
-                                                diag.layer_index,
-                                                diag.layer_name,
-                                                packing_mode_name(diag.mode),
-                                                match state {
-                                                    PackingKernelState::NoMaskedKernels => "unmasked",
-                                                    PackingKernelState::SourceMasked =>
-                                                        "source_masked",
-                                                    PackingKernelState::FusedSegmentMasked =>
-                                                        "fused_segment_masked",
-                                                    PackingKernelState::TierBMasked =>
-                                                        "segment_masked",
-                                                    PackingKernelState::PerDocCta => "per_doc_cta",
-                                                },
-                                                reason_token,
-                                            );
-                                        }
+                                            match state {
+                                                PackingKernelState::NoMaskedKernels => "unmasked",
+                                                PackingKernelState::SourceMasked =>
+                                                    "source_masked",
+                                                PackingKernelState::FusedSegmentMasked =>
+                                                    "fused_segment_masked",
+                                                PackingKernelState::TierBMasked =>
+                                                    "segment_masked",
+                                                PackingKernelState::PerDocCta => "per_doc_cta",
+                                            },
+                                            reason_token,
+                                        );
                                     }
                                 }
                             }
-                            // Stash for all downstream consumers (CSHA, WRGA, ...).
-                            self.bus.publish_wggo_overrides(
-                                crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
-                            );
-                            Ok(Some(plan.applied))
-                        } else {
-                            Ok(None)
                         }
-                            })
-                            .map_err(CodegenError::new)?;
-                        wggo_applied = scheduled
-                            .finish(&self.bus)
-                            .map_err(CodegenError::new)??;
+                        // Stash for all downstream consumers (CSHA, WRGA, ...).
+                        self.bus.publish_wggo_overrides(
+                            crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
+                        );
+                        Ok(Some(plan.applied))
+                    } else {
+                        Ok(None)
                     }
+                        })
+                        .map_err(CodegenError::new)?;
+                    wggo_applied = scheduled
+                        .finish(&self.bus)
+                        .map_err(CodegenError::new)??;
                 }
 
                 // CSHA: Compiler-Synthesized Holistic Attention planner.
@@ -10104,23 +10093,23 @@ sched={sched_s}",
                     if !ok {
                         continue;
                     }
-                    if let Some(slot_off) = current_layout.adapter_sidetable_offset {
-                        if let Some(index) = self.adapter_field_index(&current_type_name, last) {
-                            let table_ptr = builder.ins().load(
-                                cl_types::I64,
-                                cranelift_codegen::ir::MemFlagsData::trusted(),
-                                current_ptr,
-                                slot_off as i32,
-                            );
-                            let byte_off = (index * 8) as i32;
-                            let tensor_ptr = builder.ins().load(
-                                cl_types::I64,
-                                cranelift_codegen::ir::MemFlagsData::trusted(),
-                                table_ptr,
-                                byte_off,
-                            );
-                            primal_vars.insert(*vid, tensor_ptr);
-                        }
+                    if let Some(slot_off) = current_layout.adapter_sidetable_offset
+                        && let Some(index) = self.adapter_field_index(&current_type_name, last)
+                    {
+                        let table_ptr = builder.ins().load(
+                            cl_types::I64,
+                            cranelift_codegen::ir::MemFlagsData::trusted(),
+                            current_ptr,
+                            slot_off as i32,
+                        );
+                        let byte_off = (index * 8) as i32;
+                        let tensor_ptr = builder.ins().load(
+                            cl_types::I64,
+                            cranelift_codegen::ir::MemFlagsData::trusted(),
+                            table_ptr,
+                            byte_off,
+                        );
+                        primal_vars.insert(*vid, tensor_ptr);
                     }
                 }
                 // Item 2 step 7: WRGA's plan is consumed HERE, several hundred
@@ -10466,15 +10455,15 @@ sched={sched_s}",
                     };
                     // Item 8: one coalescing note for the FINAL stride (the Auto
                     // search above ran plan() per candidate silently).
-                    if resolved_stride > 1 {
-                        if let Some(p) = &plan {
-                            eprintln!(
-                                "[ccr] periodic checkpointing: stride {resolved_stride} → \
+                    if resolved_stride > 1
+                        && let Some(p) = &plan
+                    {
+                        eprintln!(
+                            "[ccr] periodic checkpointing: stride {resolved_stride} → \
                                  {} CCR super-segment(s) (saving every {resolved_stride}th block \
                                  boundary, recomputing each span — bit-exact)",
-                                p.segments.len()
-                            );
-                        }
+                            p.segments.len()
+                        );
                     }
                     if let (Some(p), Some(dtype)) =
                         (&plan, self.compile_options.checkpoint_compress.as_deref())
@@ -11397,14 +11386,14 @@ sched={sched_s}",
                                 // Const-lattice ops (non-tensor results)
                                 // are not stalls; their state is invisible
                                 // to shape_elems by design.
-                                if let crate::wengert::PrimalOp::Passthrough(n) = &o.op {
-                                    if matches!(
+                                if let crate::wengert::PrimalOp::Passthrough(n) = &o.op
+                                    && matches!(
                                         n.as_str(),
                                         "shape" | "subscript" | "int" | "float" | "list"
                                             | "ndim" | "item"
-                                    ) {
-                                        continue;
-                                    }
+                                    )
+                                {
+                                    continue;
                                 }
                                 let ins: Vec<String> = o
                                     .inputs
@@ -13770,8 +13759,7 @@ sched={sched_s}",
             builder.def_var(should_step_var, true_val);
         }
 
-        if !fase_hook_active {
-        if let Some(accum) = accum_list {
+        if !fase_hook_active && let Some(accum) = accum_list {
             // When two_phase_clip is active, Phase A (in the optimizer block) handles
             // the final micro-batch's accumulation as part of the fused accumulate+sum_sq
             // pass.  Skip the standard accumulation loop on the final micro-batch to
@@ -13900,7 +13888,6 @@ sched={sched_s}",
                 builder.seal_block(join_block);
                 state.current_block = Some(join_block);
             }
-        }
         } // end if !fase_hook_active (per-micro-batch accumulation guard)
 
         // ── 7e3b. CSLA Stage-2: window backward phase ───────────────────
@@ -14062,10 +14049,10 @@ sched={sched_s}",
                     let mut seen = std::collections::HashSet::new();
                     for op in &pending.adjoint.ops[r.start..r.end] {
                         for &input in &op.inputs {
-                            if let Some(&si) = slot_of.get(&input) {
-                                if seen.insert(si) {
-                                    slot_seed_per_range[ri].push(si);
-                                }
+                            if let Some(&si) = slot_of.get(&input)
+                                && seen.insert(si)
+                            {
+                                slot_seed_per_range[ri].push(si);
                             }
                         }
                     }
@@ -14107,16 +14094,16 @@ sched={sched_s}",
                             continue;
                         }
                         let Some(&fo) = op.inputs.get(4) else { continue };
-                        if let Some(&pr) = produced_range.get(&fo) {
-                            if pr != ri {
-                                return Err(CodegenError::new(format!(
-                                    "--layerwise-accum: an SDPA backward extract in \
+                        if let Some(&pr) = produced_range.get(&fo)
+                            && pr != ri
+                        {
+                            return Err(CodegenError::new(format!(
+                                "--layerwise-accum: an SDPA backward extract in \
                                      replay range {ri} reads a forward clone from \
                                      range {pr} — the Value-keyed attention \
                                      side-bands cannot cross ranges. This adjoint \
                                      shape is unsupported; drop --layerwise-accum",
-                                )));
-                            }
+                            )));
                         }
                         if let Some(&prev) = fwdout_range.get(&fo) {
                             if prev != ri {
@@ -17285,22 +17272,22 @@ sched={sched_s}",
                 .and_then(|ft| ft.get(part))
                 .cloned();
 
-            if let Some(ref ft) = field_type {
-                if ft.starts_with('[') && ft.contains(';') {
-                    // FixedArray field: slots are stored inline in the parent struct.
-                    // DON'T load the field value — instead compute the address of the
-                    // array base region within the parent struct.
-                    let inner = ft.trim_start_matches('[').trim_end_matches(']');
-                    let elem_type = inner.split(';').next().unwrap_or("").trim();
+            if let Some(ref ft) = field_type
+                && ft.starts_with('[') && ft.contains(';')
+            {
+                // FixedArray field: slots are stored inline in the parent struct.
+                // DON'T load the field value — instead compute the address of the
+                // array base region within the parent struct.
+                let inner = ft.trim_start_matches('[').trim_end_matches(']');
+                let elem_type = inner.split(';').next().unwrap_or("").trim();
 
-                    // Set current_ptr to address of array base in parent struct
-                    current_ptr = builder.ins().iadd_imm_s(current_ptr, field.offset as i64);
-                    current_type_name = elem_type.to_string();
-                    current_layout = self.types.struct_layouts.get(elem_type)?.clone();
-                    // Next component should be a numeric index
-                    i += 1;
-                    continue;
-                }
+                // Set current_ptr to address of array base in parent struct
+                current_ptr = builder.ins().iadd_imm_s(current_ptr, field.offset as i64);
+                current_type_name = elem_type.to_string();
+                current_layout = self.types.struct_layouts.get(elem_type)?.clone();
+                // Next component should be a numeric index
+                i += 1;
+                continue;
             }
 
             // Regular field: load the value
@@ -18925,14 +18912,12 @@ sched={sched_s}",
         // own LHS symbol when argument extraction fails.
         let (resolved_sym, tensor_name) = {
             let mut s = target_sym;
-            if let Some(args) = &decorator.args {
-                if let Some(first) = args.first() {
-                    if first.name.is_none() {
-                        if let ExprKind::Ident(sym) = &first.value.kind {
-                            s = *sym;
-                        }
-                    }
-                }
+            if let Some(args) = &decorator.args
+                && let Some(first) = args.first()
+                && first.name.is_none()
+                && let ExprKind::Ident(sym) = &first.value.kind
+            {
+                s = *sym;
             }
             let name = self.resolve_sym(s).to_string();
             (s, name)
@@ -18951,10 +18936,10 @@ sched={sched_s}",
                 let kw = arg.name.map(|s| self.resolve_sym(s).to_string());
                 match kw.as_deref() {
                     Some("every") => {
-                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                            if *n > 0 {
-                                every_n = Some(*n);
-                            }
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind
+                            && *n > 0
+                        {
+                            every_n = Some(*n);
                         }
                     }
                     Some("condition") => {

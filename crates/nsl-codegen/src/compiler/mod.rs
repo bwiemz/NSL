@@ -1747,25 +1747,25 @@ impl<'a> Compiler<'a> {
 
         // M53: If --wcet-cpu is specified, validate the CPU model and emit an advisory note.
         // CPU WCET estimates are advisory — they use the CpuSpec database in gpu_specs.rs.
-        if let Some(ref cpu_name) = self.compile_options.wcet.cpu {
-            if !cpu_name.is_empty() {
-                match crate::gpu_specs::find_cpu(cpu_name) {
-                    Some(cpu) => {
-                        eprintln!(
-                            "[nsl] WCET CPU target: {} @ {} MHz, {:.0} GFLOPS/core (fp32), {} cores",
-                            cpu.name,
-                            cpu.base_clock_mhz,
-                            (cpu.fp32_flops_per_cycle as f64 * cpu.base_clock_mhz as f64) / 1000.0,
-                            cpu.num_cores,
-                        );
-                    }
-                    None => {
-                        eprintln!(
-                            "[nsl] warning: unknown --cpu '{}'. Known models: cortex-a78, x86-64-v4. \
+        if let Some(ref cpu_name) = self.compile_options.wcet.cpu
+            && !cpu_name.is_empty()
+        {
+            match crate::gpu_specs::find_cpu(cpu_name) {
+                Some(cpu) => {
+                    eprintln!(
+                        "[nsl] WCET CPU target: {} @ {} MHz, {:.0} GFLOPS/core (fp32), {} cores",
+                        cpu.name,
+                        cpu.base_clock_mhz,
+                        (cpu.fp32_flops_per_cycle as f64 * cpu.base_clock_mhz as f64) / 1000.0,
+                        cpu.num_cores,
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[nsl] warning: unknown --cpu '{}'. Known models: cortex-a78, x86-64-v4. \
                              CPU WCET will use GPU/FPGA estimates only.",
-                            cpu_name
-                        );
-                    }
+                        cpu_name
+                    );
                 }
             }
         }
@@ -2178,10 +2178,10 @@ impl<'a> Compiler<'a> {
         // M62: publish @export functions to the CLI-owned output slot so
         // `nsl build --shared-lib` can emit a matching C header without
         // threading the list through every entry-point's return tuple.
-        if let Some(slot) = self.compile_options.export_functions_out.as_ref() {
-            if let Ok(mut guard) = slot.lock() {
-                *guard = Some(self.features.export_functions.clone());
-            }
+        if let Some(slot) = self.compile_options.export_functions_out.as_ref()
+            && let Ok(mut guard) = slot.lock()
+        {
+            *guard = Some(self.features.export_functions.clone());
         }
         let product = self.module.finish();
         product

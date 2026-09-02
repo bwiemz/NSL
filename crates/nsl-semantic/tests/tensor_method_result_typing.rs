@@ -42,10 +42,10 @@ fn type_of_let_init(src: &str, name: &str) -> Type {
     // Find the initializer expression id BEFORE analysis moves the module.
     let mut init_id = None;
     for stmt in &parse_result.module.stmts {
-        if let StmtKind::VarDecl { pattern, value: Some(value), .. } = &stmt.kind {
-            if pattern_name(pattern, &interner).as_deref() == Some(name) {
-                init_id = Some(value.id);
-            }
+        if let StmtKind::VarDecl { pattern, value: Some(value), .. } = &stmt.kind
+            && pattern_name(pattern, &interner).as_deref() == Some(name)
+        {
+            init_id = Some(value.id);
         }
     }
     let init_id = init_id.unwrap_or_else(|| panic!("no `let {name} = ...` in snippet"));
@@ -150,15 +150,15 @@ fn the_gqa_expand_contiguous_reshape_chain_stays_tensor_typed_end_to_end() {
     let parse_result = nsl_parser::parse(&tokens, &mut interner);
     let mut chain_ids = Vec::new();
     for stmt in &parse_result.module.stmts {
-        if let StmtKind::VarDecl { pattern, value: Some(value), .. } = &stmt.kind {
-            if pattern_name(pattern, &interner).as_deref() == Some("k_exp") {
-                let mut cur: &Expr = value;
-                loop {
-                    chain_ids.push(cur.id);
-                    let ExprKind::Call { callee, .. } = &cur.kind else { break };
-                    let ExprKind::MemberAccess { object, .. } = &callee.kind else { break };
-                    cur = object;
-                }
+        if let StmtKind::VarDecl { pattern, value: Some(value), .. } = &stmt.kind
+            && pattern_name(pattern, &interner).as_deref() == Some("k_exp")
+        {
+            let mut cur: &Expr = value;
+            loop {
+                chain_ids.push(cur.id);
+                let ExprKind::Call { callee, .. } = &cur.kind else { break };
+                let ExprKind::MemberAccess { object, .. } = &callee.kind else { break };
+                cur = object;
             }
         }
     }

@@ -2103,10 +2103,10 @@ pub extern "C" fn nsl_grad_all_reduce(_grad_ptr: i64, _num_elems: i64) -> i64 {
     // Single-process: no-op (gradient is already the full gradient).
     // Multi-process would call all_reduce_sum on this single tensor.
     let guard = ZERO_CTX.lock().unwrap();
-    if let Some(ctx) = guard.as_ref() {
-        if ctx.world_size <= 1 {
-            return 0;
-        }
+    if let Some(ctx) = guard.as_ref()
+        && ctx.world_size <= 1
+    {
+        return 0;
     }
     0
 }
@@ -2983,10 +2983,10 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         // Data stays (authoritative replica); the state transition mirrors
         // the non-owner's so the NEXT gather broadcasts symmetrically.
         let mut tbl = ZERO3_TABLE.lock().unwrap();
-        if let Some(e) = tbl.as_mut().and_then(|m| m.get_mut(&tensor_ptr)) {
-            if e.state == ParameterResidency::GatheredTemporary {
-                e.state = ParameterResidency::ShardedResident;
-            }
+        if let Some(e) = tbl.as_mut().and_then(|m| m.get_mut(&tensor_ptr))
+            && e.state == ParameterResidency::GatheredTemporary
+        {
+            e.state = ParameterResidency::ShardedResident;
         }
         ZERO3_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
@@ -3005,27 +3005,27 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         // back), and the composed path must match plain SR, not plain
         // elementwise. A narrow here would also round the freshly-stepped
         // slice through f32 values the step never produced.
-        if let Some((slice_ptr, shard, elem_bytes, rank, sr)) = elem_info {
-            if !sr {
-                let off = rank * shard * elem_bytes;
-                unsafe {
-                    if t.device != 0 {
-                        #[cfg(feature = "cuda")]
-                        {
-                            crate::cuda::inner::ensure_context();
-                            crate::cuda::inner::memcpy_dtod(
-                                slice_ptr as *mut std::ffi::c_void,
-                                (t.data as *const u8).add(off) as *const std::ffi::c_void,
-                                shard * elem_bytes,
-                            );
-                        }
-                    } else {
-                        std::ptr::copy_nonoverlapping(
-                            (t.data as *const u8).add(off),
-                            slice_ptr as *mut u8,
+        if let Some((slice_ptr, shard, elem_bytes, rank, sr)) = elem_info
+            && !sr
+        {
+            let off = rank * shard * elem_bytes;
+            unsafe {
+                if t.device != 0 {
+                    #[cfg(feature = "cuda")]
+                    {
+                        crate::cuda::inner::ensure_context();
+                        crate::cuda::inner::memcpy_dtod(
+                            slice_ptr as *mut std::ffi::c_void,
+                            (t.data as *const u8).add(off) as *const std::ffi::c_void,
                             shard * elem_bytes,
                         );
                     }
+                } else {
+                    std::ptr::copy_nonoverlapping(
+                        (t.data as *const u8).add(off),
+                        slice_ptr as *mut u8,
+                        shard * elem_bytes,
+                    );
                 }
             }
         }

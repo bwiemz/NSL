@@ -949,10 +949,10 @@ fn loader_bindings_name_the_right_slice() {
             if t.starts_with("train(") && train_line.is_none() {
                 train_line = Some(i);
             }
-            if let Some(rest) = t.strip_prefix("for ") {
-                if let Some((_, tail)) = rest.split_once(" in ") {
-                    iterated.push((i, tail.trim().trim_end_matches(':').trim().to_string()));
-                }
+            if let Some(rest) = t.strip_prefix("for ")
+                && let Some((_, tail)) = rest.split_once(" in ")
+            {
+                iterated.push((i, tail.trim().trim_end_matches(':').trim().to_string()));
             }
             let Some(rest) = t.strip_prefix("let ") else {
                 continue;

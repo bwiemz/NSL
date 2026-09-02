@@ -8,14 +8,14 @@ pub fn lex_number(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Dia
     let first = cursor.peek().unwrap_or('0');
 
     // Check for hex, octal, binary prefixes
-    if first == '0' {
-        if let Some(next) = cursor.peek_at(1) {
-            match next {
-                'x' | 'X' => return lex_hex(cursor, start, diagnostics),
-                'o' | 'O' => return lex_octal(cursor, start, diagnostics),
-                'b' | 'B' => return lex_binary(cursor, start, diagnostics),
-                _ => {}
-            }
+    if first == '0'
+        && let Some(next) = cursor.peek_at(1)
+    {
+        match next {
+            'x' | 'X' => return lex_hex(cursor, start, diagnostics),
+            'o' | 'O' => return lex_octal(cursor, start, diagnostics),
+            'b' | 'B' => return lex_binary(cursor, start, diagnostics),
+            _ => {}
         }
     }
 

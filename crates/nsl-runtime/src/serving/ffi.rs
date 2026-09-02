@@ -136,26 +136,25 @@ pub extern "C" fn nsl_serve_apply_grammar(request_id: i64, logits_ptr: i64) -> i
     };
 
     // Find the request and apply its grammar mask
-    if let Some(req) = ctx.scheduler.active.iter().find(|r| r.id == request_id as u64) {
-        if let Some(ref grammar_state) = req.grammar_state {
-            if grammar_state.active {
-                // Lock GRAMMAR_CTX directly — avoid FFI wrapper's redundant lock in hot path
-                let grammar_guard = match crate::grammar::GRAMMAR_CTX.lock() {
-                    Ok(g) => g,
-                    Err(_) => return -1,
-                };
-                if let Some(ref grammar_ctx) = *grammar_guard {
-                    if logits_ptr != 0 {
-                        let logits = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                logits_ptr as *mut f32,
-                                grammar_ctx.fsm.vocab_size,
-                            )
-                        };
-                        grammar_ctx.fsm.apply_logit_mask(logits, grammar_state.current_state);
-                    }
-                }
-            }
+    if let Some(req) = ctx.scheduler.active.iter().find(|r| r.id == request_id as u64)
+        && let Some(ref grammar_state) = req.grammar_state
+        && grammar_state.active
+    {
+        // Lock GRAMMAR_CTX directly — avoid FFI wrapper's redundant lock in hot path
+        let grammar_guard = match crate::grammar::GRAMMAR_CTX.lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        if let Some(ref grammar_ctx) = *grammar_guard
+            && logits_ptr != 0
+        {
+            let logits = unsafe {
+                std::slice::from_raw_parts_mut(
+                    logits_ptr as *mut f32,
+                    grammar_ctx.fsm.vocab_size,
+                )
+            };
+            grammar_ctx.fsm.apply_logit_mask(logits, grammar_state.current_state);
         }
     }
     0
@@ -175,21 +174,20 @@ pub extern "C" fn nsl_serve_advance_grammar(request_id: i64, token_id: i64) -> i
         None => return -2,
     };
 
-    if let Some(req) = ctx.scheduler.active.iter_mut().find(|r| r.id == request_id as u64) {
-        if let Some(ref mut grammar_state) = req.grammar_state {
-            if grammar_state.active {
-                // Lock GRAMMAR_CTX directly — avoid FFI wrapper's redundant lock
-                let grammar_guard = match crate::grammar::GRAMMAR_CTX.lock() {
-                    Ok(g) => g,
-                    Err(_) => return -1,
-                };
-                if let Some(ref grammar_ctx) = *grammar_guard {
-                    if let Some(next) = grammar_ctx.fsm.step(grammar_state.current_state, token_id as u32) {
-                        grammar_state.current_state = next;
-                    } else {
-                        grammar_state.active = false;
-                    }
-                }
+    if let Some(req) = ctx.scheduler.active.iter_mut().find(|r| r.id == request_id as u64)
+        && let Some(ref mut grammar_state) = req.grammar_state
+        && grammar_state.active
+    {
+        // Lock GRAMMAR_CTX directly — avoid FFI wrapper's redundant lock
+        let grammar_guard = match crate::grammar::GRAMMAR_CTX.lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        if let Some(ref grammar_ctx) = *grammar_guard {
+            if let Some(next) = grammar_ctx.fsm.step(grammar_state.current_state, token_id as u32) {
+                grammar_state.current_state = next;
+            } else {
+                grammar_state.active = false;
             }
         }
     }

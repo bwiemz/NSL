@@ -165,10 +165,10 @@ mod tests {
         let b_seen = std::sync::Arc::new(std::sync::Mutex::new(false));
         let b_seen_clone = b_seen.clone();
         let _b = sched.register_agent(move |ports| {
-            if let Some(PortMessage::Struct(payload)) = ports.read_in("in") {
-                if payload.as_bytes() == &[1u8, 2, 3] {
-                    *b_seen_clone.lock().unwrap() = true;
-                }
+            if let Some(PortMessage::Struct(payload)) = ports.read_in("in")
+                && payload.as_bytes() == &[1u8, 2, 3]
+            {
+                *b_seen_clone.lock().unwrap() = true;
             }
         });
         sched.connect((a, "out"), (1, "in"));

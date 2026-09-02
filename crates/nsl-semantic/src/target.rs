@@ -18,20 +18,20 @@ pub fn validate_target_decorator(
     if let Some(ref args) = deco.args {
         for arg in args {
             // Positional args: target names
-            if arg.name.is_none() {
-                if let ExprKind::Ident(sym) = &arg.value.kind {
-                    let name = resolve_sym(*sym);
-                    let valid = ["cuda", "rocm", "metal", "webgpu"];
-                    if !valid.contains(&name.as_str()) {
-                        diagnostics.push(
-                            Diagnostic::error(format!(
-                                "unknown target '{name}', expected: cuda, rocm, metal, webgpu"
-                            ))
-                            .with_label(arg.value.span, "here"),
-                        );
-                    } else {
-                        targets.push(name);
-                    }
+            if arg.name.is_none()
+                && let ExprKind::Ident(sym) = &arg.value.kind
+            {
+                let name = resolve_sym(*sym);
+                let valid = ["cuda", "rocm", "metal", "webgpu"];
+                if !valid.contains(&name.as_str()) {
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "unknown target '{name}', expected: cuda, rocm, metal, webgpu"
+                        ))
+                        .with_label(arg.value.span, "here"),
+                    );
+                } else {
+                    targets.push(name);
                 }
             }
         }

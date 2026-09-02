@@ -469,10 +469,10 @@ pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
     g.pool_bytes = 0;
     g.draft_pool_base = 0;
     g.draft_pool_bytes = 0;
-    if let Ok(mut kv) = kv_slots_global().lock() {
-        if let Some(a) = kv.as_mut() {
-            a.attach_device_buffer(0, 0);
-        }
+    if let Ok(mut kv) = kv_slots_global().lock()
+        && let Some(a) = kv.as_mut()
+    {
+        a.attach_device_buffer(0, 0);
     }
     g.kernels.clear();
     g.finalized = false;

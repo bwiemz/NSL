@@ -129,13 +129,13 @@ fn collapse(shape: &[i64], src: &[i64], dst: &[i64]) -> Vec<Axis> {
         if size == 1 {
             continue;
         }
-        if let Some(last) = out.last_mut() {
-            if last.1 == s.saturating_mul(size) && last.2 == d.saturating_mul(size) {
-                last.0 *= size;
-                last.1 = s;
-                last.2 = d;
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && last.1 == s.saturating_mul(size) && last.2 == d.saturating_mul(size)
+        {
+            last.0 *= size;
+            last.1 = s;
+            last.2 = d;
+            continue;
         }
         out.push((size, s, d));
     }

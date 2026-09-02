@@ -284,12 +284,12 @@ fn render_error_block(out: &mut String, d: &Diagnostic, source: &str) {
 fn split_message(msg: &str) -> (String, String) {
     // If the message looks like "expected X, found Y" pull X out as Expected
     // and leave the rest as Cause. Otherwise use the whole message as Cause.
-    if let Some(rest) = msg.strip_prefix("expected ") {
-        if let Some(idx) = rest.find(", found ") {
-            let expected = rest[..idx].to_string();
-            let found = &rest[idx + ", found ".len()..];
-            return (expected, format!("found {found}"));
-        }
+    if let Some(rest) = msg.strip_prefix("expected ")
+        && let Some(idx) = rest.find(", found ")
+    {
+        let expected = rest[..idx].to_string();
+        let found = &rest[idx + ", found ".len()..];
+        return (expected, format!("found {found}"));
     }
     ("(see message)".to_string(), msg.to_string())
 }

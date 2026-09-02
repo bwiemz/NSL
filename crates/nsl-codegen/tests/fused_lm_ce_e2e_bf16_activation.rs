@@ -236,10 +236,10 @@ fn collect_calls(func: &Function) -> Vec<(u32, Vec<cranelift_codegen::ir::Value>
 
 fn iconst_value(func: &Function, v: cranelift_codegen::ir::Value) -> Option<i64> {
     let inst = func.dfg.value_def(v).inst()?;
-    if let InstructionData::UnaryImm { opcode, imm } = &func.dfg.insts[inst] {
-        if *opcode == cranelift_codegen::ir::Opcode::Iconst {
-            return Some(imm.bits());
-        }
+    if let InstructionData::UnaryImm { opcode, imm } = &func.dfg.insts[inst]
+        && *opcode == cranelift_codegen::ir::Opcode::Iconst
+    {
+        return Some(imm.bits());
     }
     None
 }

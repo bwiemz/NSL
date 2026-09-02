@@ -65,10 +65,10 @@ const NSL_PATH: &str = "crates/nsl-test/fixtures/v1_mlp.nsl";
 /// Returns `None` if the line is absent (unexpected; CLI contract violation).
 fn parse_total_cycles(stdout: &str) -> Option<u64> {
     for line in stdout.lines() {
-        if let Some(rest) = line.trim().strip_prefix("total_cycles=") {
-            if let Ok(n) = rest.trim().parse::<u64>() {
-                return Some(n);
-            }
+        if let Some(rest) = line.trim().strip_prefix("total_cycles=")
+            && let Ok(n) = rest.trim().parse::<u64>()
+        {
+            return Some(n);
         }
     }
     None

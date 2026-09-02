@@ -64,14 +64,14 @@ pub fn scan_source(text: &str) -> Vec<Read> {
             let rest = &text[arg_start..];
             let trimmed = rest.trim_start();
             let line = line_of(text, call);
-            if let Some(lit) = trimmed.strip_prefix('"') {
-                if let Some(end) = lit.find('"') {
-                    let name = &lit[..end];
-                    if name.starts_with("NSL_") {
-                        out.push(Read::Named { name: name.to_string(), line });
-                    }
-                    continue;
+            if let Some(lit) = trimmed.strip_prefix('"')
+                && let Some(end) = lit.find('"')
+            {
+                let name = &lit[..end];
+                if name.starts_with("NSL_") {
+                    out.push(Read::Named { name: name.to_string(), line });
                 }
+                continue;
             }
             // An expression: everything up to the `)` that closes the call.
             let expr = trimmed[..balanced_len(trimmed)].trim();

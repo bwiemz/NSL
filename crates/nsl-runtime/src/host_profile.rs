@@ -246,10 +246,10 @@ mod pcie_counter_drift {
                         // this counter would stay satisfied by seven panic
                         // messages after every real call site had moved away.
                         for needle in ["cuMemcpyHtoD", "cuMemcpyDtoH"] {
-                            if let Some(at) = l.find(needle) {
-                                if l[..at].matches('"').count() % 2 == 0 {
-                                    return true;
-                                }
+                            if let Some(at) = l.find(needle)
+                                && l[..at].matches('"').count() % 2 == 0
+                            {
+                                return true;
                             }
                         }
                         false

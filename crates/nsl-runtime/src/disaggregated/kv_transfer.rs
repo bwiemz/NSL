@@ -764,10 +764,10 @@ impl NvlinkBackend {
         #[cfg(feature = "cuda")]
         {
             // If cuda feature is enabled, try to check device count
-            if let Ok(count_str) = std::env::var("NSL_GPU_COUNT") {
-                if let Ok(count) = count_str.parse::<i32>() {
-                    return count >= 2;
-                }
+            if let Ok(count_str) = std::env::var("NSL_GPU_COUNT")
+                && let Ok(count) = count_str.parse::<i32>()
+            {
+                return count >= 2;
             }
             // Default: assume IPC is available if CUDA feature is compiled in
             true

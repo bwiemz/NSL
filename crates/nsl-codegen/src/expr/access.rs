@@ -60,31 +60,30 @@ impl Compiler<'_> {
         // self.<field> → load(weight_ptrs + idx*8)
         // Must fire before compile_expr(object) to avoid the bare-SelfRef error
         // that WeightPtrsArray mode emits for phantom `self`.
-        if matches!(object.kind, ExprKind::SelfRef) {
-            if let crate::context::SelfResolution::WeightPtrsArray { weight_ptrs_var } =
+        if matches!(object.kind, ExprKind::SelfRef)
+            && let crate::context::SelfResolution::WeightPtrsArray { weight_ptrs_var } =
                 state.self_resolution.clone()
-            {
-                let idx = self
-                    .weight_index_map
-                    .get(&expr.id)
-                    .copied()
-                    .ok_or_else(|| {
-                        CodegenError::new(format!(
-                            "@export method: self.{} missing weight-index annotation \
+        {
+            let idx = self
+                .weight_index_map
+                .get(&expr.id)
+                .copied()
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "@export method: self.{} missing weight-index annotation \
                              (semantic bug — expected in weight_index_map)",
-                            member_name
-                        ))
-                    })?;
-                let weight_ptrs = builder.use_var(weight_ptrs_var);
-                let offset_bytes = (idx as i64) * 8;
-                let tensor_ptr = builder.ins().load(
-                    cl_types::I64,
-                    MemFlagsData::trusted(),
-                    weight_ptrs,
-                    offset_bytes as i32,
-                );
-                return Ok(tensor_ptr);
-            }
+                        member_name
+                    ))
+                })?;
+            let weight_ptrs = builder.use_var(weight_ptrs_var);
+            let offset_bytes = (idx as i64) * 8;
+            let tensor_ptr = builder.ins().load(
+                cl_types::I64,
+                MemFlagsData::trusted(),
+                weight_ptrs,
+                offset_bytes as i32,
+            );
+            return Ok(tensor_ptr);
         }
 
         let obj_val = self.compile_expr(builder, state, object)?;
@@ -94,19 +93,18 @@ impl Compiler<'_> {
         // back to the current model context so the Type::Model branch
         // below fires and the side-table route-through happens.
         if matches!(obj_type, Type::Unknown)
-            && matches!(object.kind, ExprKind::SelfRef) {
-                if let Some(ref model_name) = self.current_method_model_name {
-                    if let Some(sym) = self.interner.get(model_name) {
-                        obj_type = Type::Model {
-                            name: nsl_ast::Symbol(sym),
-                            type_params: Vec::new(),
-                            type_args: Vec::new(),
-                            fields: Vec::new(),
-                            methods: Vec::new(),
-                        };
-                    }
-                }
-            }
+            && matches!(object.kind, ExprKind::SelfRef)
+            && let Some(ref model_name) = self.current_method_model_name
+            && let Some(sym) = self.interner.get(model_name)
+        {
+            obj_type = Type::Model {
+                name: nsl_ast::Symbol(sym),
+                type_params: Vec::new(),
+                type_args: Vec::new(),
+                fields: Vec::new(),
+                methods: Vec::new(),
+            };
+        }
 
         if let Type::Struct { name, .. } = &obj_type {
             let struct_name = self.resolve_sym(*name).to_string();
@@ -136,18 +134,16 @@ impl Compiler<'_> {
 
         if let Type::Model { name, .. } = &obj_type {
             let model_name = self.resolve_sym(*name).to_string();
-            if let Some(field_type_map) = self.models.model_field_types.get(&model_name).cloned() {
-                if let Some(array_marker) = field_type_map.get(&member_name).cloned() {
-                    if array_marker.starts_with('[') {
-                        if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
-                            for field in &layout.fields {
-                                if field.name == member_name {
-                                    let offset_val =
-                                        builder.ins().iconst(cl_types::I64, field.offset as i64);
-                                    return Ok(builder.ins().iadd(obj_val, offset_val));
-                                }
-                            }
-                        }
+            if let Some(field_type_map) = self.models.model_field_types.get(&model_name).cloned()
+                && let Some(array_marker) = field_type_map.get(&member_name).cloned()
+                && array_marker.starts_with('[')
+                && let Some(layout) = self.types.struct_layouts.get(&model_name).cloned()
+            {
+                for field in &layout.fields {
+                    if field.name == member_name {
+                        let offset_val =
+                            builder.ins().iconst(cl_types::I64, field.offset as i64);
+                        return Ok(builder.ins().iadd(obj_val, offset_val));
                     }
                 }
             }
@@ -159,75 +155,74 @@ impl Compiler<'_> {
             // match the insertion order used by the init pass, i.e. the
             // flattened `synthesized_fields` sequence across all sites
             // targeting this model in `bus.wrga_plan`.
-            if is_synthesized_adapter_field_name(&member_name) {
-                if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
-                    if let Some(slot_off) = layout.adapter_sidetable_offset {
-                        let index = self
-                            .adapter_field_index(&model_name, &member_name)
-                            .ok_or_else(|| {
-                                CodegenError::new(format!(
-                                    "synthesized adapter field '{member_name}' not found \
+            if is_synthesized_adapter_field_name(&member_name)
+                && let Some(layout) = self.types.struct_layouts.get(&model_name).cloned()
+                && let Some(slot_off) = layout.adapter_sidetable_offset
+            {
+                let index = self
+                    .adapter_field_index(&model_name, &member_name)
+                    .ok_or_else(|| {
+                        CodegenError::new(format!(
+                            "synthesized adapter field '{member_name}' not found \
                                      for model '{model_name}' in current WRGA plan"
-                                ))
-                            })?;
-                        let table_ptr = builder.ins().load(
-                            cl_types::I64,
-                            MemFlagsData::trusted(),
-                            obj_val,
-                            slot_off as i32,
-                        );
-                        let byte_off = (index * 8) as i32;
-                        // Guard the side-table base for null. The table is
-                        // materialized by `emit_adapter_init_sidetable`, which
-                        // runs ONLY inside a train block (`stmt.rs`). A
-                        // forward-only program that uses `@adapter` never
-                        // materializes it, so this slot is still 0 from
-                        // constructor zero-init — dereferencing it segfaults
-                        // (0xC0000005). Return a null tensor pointer (0) for the
-                        // unmaterialized case; the adapter FFI
-                        // (`nsl_adapter_fused_*_matmul`) detects null adapters
-                        // and falls back to the base `x @ W` forward. See
-                        // docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
-                        let deref_blk = builder.create_block();
-                        let null_blk = builder.create_block();
-                        let merge_blk = builder.create_block();
-                        builder.append_block_param(merge_blk, cl_types::I64);
-                        let base_is_null =
-                            builder.ins().icmp_imm_s(IntCC::Equal, table_ptr, 0);
-                        builder
-                            .ins()
-                            .brif(base_is_null, null_blk, &[], deref_blk, &[]);
+                        ))
+                    })?;
+                let table_ptr = builder.ins().load(
+                    cl_types::I64,
+                    MemFlagsData::trusted(),
+                    obj_val,
+                    slot_off as i32,
+                );
+                let byte_off = (index * 8) as i32;
+                // Guard the side-table base for null. The table is
+                // materialized by `emit_adapter_init_sidetable`, which
+                // runs ONLY inside a train block (`stmt.rs`). A
+                // forward-only program that uses `@adapter` never
+                // materializes it, so this slot is still 0 from
+                // constructor zero-init — dereferencing it segfaults
+                // (0xC0000005). Return a null tensor pointer (0) for the
+                // unmaterialized case; the adapter FFI
+                // (`nsl_adapter_fused_*_matmul`) detects null adapters
+                // and falls back to the base `x @ W` forward. See
+                // docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
+                let deref_blk = builder.create_block();
+                let null_blk = builder.create_block();
+                let merge_blk = builder.create_block();
+                builder.append_block_param(merge_blk, cl_types::I64);
+                let base_is_null =
+                    builder.ins().icmp_imm_s(IntCC::Equal, table_ptr, 0);
+                builder
+                    .ins()
+                    .brif(base_is_null, null_blk, &[], deref_blk, &[]);
 
-                        builder.switch_to_block(null_blk);
-                        builder.seal_block(null_blk);
-                        state.current_block = Some(null_blk);
-                        let null_tensor = builder.ins().iconst(cl_types::I64, 0);
-                        builder.ins().jump(merge_blk, &[BlockArg::Value(null_tensor)]);
+                builder.switch_to_block(null_blk);
+                builder.seal_block(null_blk);
+                state.current_block = Some(null_blk);
+                let null_tensor = builder.ins().iconst(cl_types::I64, 0);
+                builder.ins().jump(merge_blk, &[BlockArg::Value(null_tensor)]);
 
-                        builder.switch_to_block(deref_blk);
-                        builder.seal_block(deref_blk);
-                        state.current_block = Some(deref_blk);
-                        let loaded = builder.ins().load(
-                            cl_types::I64,
-                            MemFlagsData::trusted(),
-                            table_ptr,
-                            byte_off,
-                        );
-                        builder.ins().jump(merge_blk, &[BlockArg::Value(loaded)]);
+                builder.switch_to_block(deref_blk);
+                builder.seal_block(deref_blk);
+                state.current_block = Some(deref_blk);
+                let loaded = builder.ins().load(
+                    cl_types::I64,
+                    MemFlagsData::trusted(),
+                    table_ptr,
+                    byte_off,
+                );
+                builder.ins().jump(merge_blk, &[BlockArg::Value(loaded)]);
 
-                        builder.switch_to_block(merge_blk);
-                        builder.seal_block(merge_blk);
-                        // Keep `state.current_block` in sync with the builder's
-                        // insertion point so downstream tensor-cleanup emitters
-                        // (which gate on `current_block` + `is_block_filled`)
-                        // operate on the live merge block, not the now-filled
-                        // pre-branch block. Mirrors `compile_short_circuit` in
-                        // binary_ops.rs.
-                        state.current_block = Some(merge_blk);
-                        let tensor_ptr = builder.block_params(merge_blk)[0];
-                        return Ok(tensor_ptr);
-                    }
-                }
+                builder.switch_to_block(merge_blk);
+                builder.seal_block(merge_blk);
+                // Keep `state.current_block` in sync with the builder's
+                // insertion point so downstream tensor-cleanup emitters
+                // (which gate on `current_block` + `is_block_filled`)
+                // operate on the live merge block, not the now-filled
+                // pre-branch block. Mirrors `compile_short_circuit` in
+                // binary_ops.rs.
+                state.current_block = Some(merge_blk);
+                let tensor_ptr = builder.block_params(merge_blk)[0];
+                return Ok(tensor_ptr);
             }
 
             if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {

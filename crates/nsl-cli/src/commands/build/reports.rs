@@ -41,10 +41,10 @@ pub(super) fn capture_wrga_plan(
 ) {
     let Some(p) = plan else { return };
     let Some(slot) = ctx.plan_capture.as_ref() else { return };
-    if let Ok(mut guard) = slot.lock() {
-        if guard.is_none() {
-            *guard = Some(p.clone());
-        }
+    if let Ok(mut guard) = slot.lock()
+        && guard.is_none()
+    {
+        *guard = Some(p.clone());
     }
 }
 

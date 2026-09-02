@@ -630,10 +630,10 @@ fn try_join(
             }
             // A continuation must consume the flowing value in some slot
             // (the start op's operands are all external/imm).
-            if let Some(f) = flowing {
-                if op.inputs[0] != f && op.inputs[1] != f {
-                    return false;
-                }
+            if let Some(f) = flowing
+                && op.inputs[0] != f && op.inputs[1] != f
+            {
+                return false;
             }
             let Some(lhs) = resolve(op.inputs[0], false, chain) else {
                 return rollback(chain);

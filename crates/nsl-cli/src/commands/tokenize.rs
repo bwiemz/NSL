@@ -109,10 +109,10 @@ pub(crate) fn run_tokenize(
     };
 
     // Ensure output directory exists
-    if let Some(parent) = output.parent() {
-        if !parent.exists() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+    if let Some(parent) = output.parent()
+        && !parent.exists()
+    {
+        let _ = std::fs::create_dir_all(parent);
     }
 
     // Save tokenizer

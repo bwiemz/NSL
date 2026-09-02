@@ -191,41 +191,41 @@ fn inject_train_block_imports(
                 }
                 if let nsl_ast::block::TrainSection::Optimizer(expr) = section {
                     // Extract optimizer name from call expression: e.g. SGD(lr=0.01)
-                    if let ExprKind::Call { callee, .. } = &expr.kind {
-                        if let ExprKind::Ident(sym) = &callee.kind {
-                            let name = interner.resolve(sym.0).unwrap_or("").to_lowercase();
-                            let module_segments = match name.as_str() {
-                                "sgd" => Some(["nsl", "optim", "sgd"]),
-                                "adam" => Some(["nsl", "optim", "adam"]),
-                                "adamw" => Some(["nsl", "optim", "adamw"]),
-                                "lion" => Some(["nsl", "optim", "lion"]),
-                                "muon" => Some(["nsl", "optim", "muon"]),
-                                "soap" => Some(["nsl", "optim", "soap"]),
-                                _ => None,
+                    if let ExprKind::Call { callee, .. } = &expr.kind
+                        && let ExprKind::Ident(sym) = &callee.kind
+                    {
+                        let name = interner.resolve(sym.0).unwrap_or("").to_lowercase();
+                        let module_segments = match name.as_str() {
+                            "sgd" => Some(["nsl", "optim", "sgd"]),
+                            "adam" => Some(["nsl", "optim", "adam"]),
+                            "adamw" => Some(["nsl", "optim", "adamw"]),
+                            "lion" => Some(["nsl", "optim", "lion"]),
+                            "muon" => Some(["nsl", "optim", "muon"]),
+                            "soap" => Some(["nsl", "optim", "soap"]),
+                            _ => None,
+                        };
+
+                        if let Some(segments) = module_segments {
+                            let module_path: Vec<Symbol> = segments
+                                .iter()
+                                .map(|s| Symbol(interner.get_or_intern(s)))
+                                .collect();
+
+                            let dummy_span = nsl_ast::Span {
+                                file_id: nsl_errors::FileId(0),
+                                start: nsl_errors::BytePos(0),
+                                end: nsl_errors::BytePos(0),
                             };
 
-                            if let Some(segments) = module_segments {
-                                let module_path: Vec<Symbol> = segments
-                                    .iter()
-                                    .map(|s| Symbol(interner.get_or_intern(s)))
-                                    .collect();
-
-                                let dummy_span = nsl_ast::Span {
-                                    file_id: nsl_errors::FileId(0),
-                                    start: nsl_errors::BytePos(0),
-                                    end: nsl_errors::BytePos(0),
-                                };
-
-                                synthetic_stmts.push(Stmt {
-                                    kind: StmtKind::FromImport(FromImportStmt {
-                                        module_path,
-                                        items: ImportItems::Glob,
-                                        span: dummy_span,
-                                    }),
+                            synthetic_stmts.push(Stmt {
+                                kind: StmtKind::FromImport(FromImportStmt {
+                                    module_path,
+                                    items: ImportItems::Glob,
                                     span: dummy_span,
-                                    id: nsl_ast::NodeId::next(),
-                                });
-                            }
+                                }),
+                                span: dummy_span,
+                                id: nsl_ast::NodeId::next(),
+                            });
                         }
                     }
                 }
@@ -254,10 +254,10 @@ fn extract_exports(
             _ => None,
         };
 
-        if let Some(name) = sym {
-            if let Some((_scope_id, info)) = scopes.lookup(ScopeId::ROOT, name) {
-                exports.insert(name, info.ty.clone());
-            }
+        if let Some(name) = sym
+            && let Some((_scope_id, info)) = scopes.lookup(ScopeId::ROOT, name)
+        {
+            exports.insert(name, info.ty.clone());
         }
     }
 

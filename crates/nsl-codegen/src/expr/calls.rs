@@ -194,20 +194,19 @@ impl Compiler<'_> {
                             // `nsl_tensor_to_device` is a no-op when already on the target
                             // device, so insertion is safe-by-default for I64 tensor values.
                             let compiled_ty = builder.func.dfg.value_type(compiled);
-                            if compiled_ty == cl_types::I64 {
-                                if let Some(&(_, target_device)) =
+                            if compiled_ty == cl_types::I64
+                                && let Some(&(_, target_device)) =
                                     device_transfers.iter().find(|(idx, _)| *idx == call_arg_idx)
-                                {
-                                    let device_val =
-                                        builder.ins().iconst(cl_types::I64, target_device);
-                                    let transferred = self.compile_call_by_name(
-                                        builder,
-                                        "nsl_tensor_to_device",
-                                        &[compiled, device_val],
-                                    )?;
-                                    arg_vals.push(transferred);
-                                    continue;
-                                }
+                            {
+                                let device_val =
+                                    builder.ins().iconst(cl_types::I64, target_device);
+                                let transferred = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_to_device",
+                                    &[compiled, device_val],
+                                )?;
+                                arg_vals.push(transferred);
+                                continue;
                             }
                             arg_vals.push(compiled);
                         }
@@ -224,22 +223,22 @@ impl Compiler<'_> {
                 }
                 let result =
                     self.compile_tensor_method_call(builder, state, object, &member_name, args);
-                if matches!(obj_type, Type::Unknown) {
-                    if let Err(e) = result {
-                        // Generic (untyped) value whose method didn't resolve —
-                        // e.g. `.forward()` on a model passed as an untyped fn
-                        // parameter. Generic model-method dispatch is not yet
-                        // implemented, so refuse with the workaround named
-                        // (deferral-must-refuse) instead of the bare
-                        // "unknown tensor method" the tensor fallback produces.
-                        return Err(CodegenError::new(format!(
-                            "cannot dispatch '.{member_name}()' on a generic (untyped) \
+                if matches!(obj_type, Type::Unknown)
+                    && let Err(e) = result
+                {
+                    // Generic (untyped) value whose method didn't resolve —
+                    // e.g. `.forward()` on a model passed as an untyped fn
+                    // parameter. Generic model-method dispatch is not yet
+                    // implemented, so refuse with the workaround named
+                    // (deferral-must-refuse) instead of the bare
+                    // "unknown tensor method" the tensor fallback produces.
+                    return Err(CodegenError::new(format!(
+                        "cannot dispatch '.{member_name}()' on a generic (untyped) \
                              value here ({e}); generic model-method dispatch is not yet \
                              supported — call the method where the object's concrete \
                              model type is known (e.g. on the model variable itself), \
                              or annotate the parameter with a concrete type"
-                        )));
-                    }
+                    )));
                 }
                 return result;
             }
@@ -278,13 +277,12 @@ impl Compiler<'_> {
         // tensor local named `sum` keeps builtin dispatch exactly as
         // before (rerouting it through an integer-as-pointer jump would
         // be worse than the status quo in every way).
-        if let ExprKind::Ident(sym) = &callee.kind {
-            if state.live_fn_bindings.contains_key(sym)
-                && state.variables.contains_key(sym)
-                && matches!(self.node_type(callee.id), Type::Function { .. })
-            {
-                return self.compile_indirect_call(builder, state, callee, args);
-            }
+        if let ExprKind::Ident(sym) = &callee.kind
+            && state.live_fn_bindings.contains_key(sym)
+            && state.variables.contains_key(sym)
+            && matches!(self.node_type(callee.id), Type::Function { .. })
+        {
+            return self.compile_indirect_call(builder, state, callee, args);
         }
 
         // M39b: matmul rewrite dispatch — VmapTransformer records (NodeId → target_name)
@@ -326,72 +324,72 @@ impl Compiler<'_> {
         }
 
         // @fuse decorated function: emit fused elementwise kernel launch
-        if let Some((op_chain, num_inputs)) = self.fusion.fused_fns.get(&func_name).cloned() {
-            if !self.fusion.disabled && !state.flags.in_tape_region {
-                let op_refs: Vec<&str> = op_chain.iter().map(|s| s.as_str()).collect();
-                if let Some(kernel) = crate::fusion::try_synthesize_fused(&op_refs, num_inputs) {
-                    // Compile input arguments
-                    let mut compiled_args = Vec::new();
-                    for arg in args {
-                        compiled_args.push(self.compile_expr(builder, state, &arg.value)?);
+        if let Some((op_chain, num_inputs)) = self.fusion.fused_fns.get(&func_name).cloned()
+            && !self.fusion.disabled && !state.flags.in_tape_region
+        {
+            let op_refs: Vec<&str> = op_chain.iter().map(|s| s.as_str()).collect();
+            if let Some(kernel) = crate::fusion::try_synthesize_fused(&op_refs, num_inputs) {
+                // Compile input arguments
+                let mut compiled_args = Vec::new();
+                for arg in args {
+                    compiled_args.push(self.compile_expr(builder, state, &arg.value)?);
+                }
+
+                // Build op-codes list for nsl_fused_elementwise_N
+                let op_codes: Vec<i64> = op_chain
+                    .iter()
+                    .filter_map(|op| match op.as_str() {
+                        "add" => Some(0),
+                        "mul" => Some(1),
+                        "sub" => Some(2),
+                        "div" => Some(3),
+                        "relu" => Some(4),
+                        "sigmoid" => Some(5),
+                        "tanh" => Some(6),
+                        "neg" => Some(7),
+                        "exp" => Some(8),
+                        "log" => Some(9),
+                        "sqrt" => Some(10),
+                        "abs" => Some(11),
+                        "gelu" => Some(12),
+                        "silu" => Some(13),
+                        _ => None,
+                    })
+                    .collect();
+
+                if op_codes.len() == op_chain.len() && !compiled_args.is_empty() {
+                    let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                    for &code in &op_codes {
+                        let code_val = builder.ins().iconst(cl_types::I64, code);
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_list_push",
+                            &[ops_list, code_val],
+                        )?;
                     }
+                    let num_ops = builder.ins().iconst(cl_types::I64, op_codes.len() as i64);
 
-                    // Build op-codes list for nsl_fused_elementwise_N
-                    let op_codes: Vec<i64> = op_chain
-                        .iter()
-                        .filter_map(|op| match op.as_str() {
-                            "add" => Some(0),
-                            "mul" => Some(1),
-                            "sub" => Some(2),
-                            "div" => Some(3),
-                            "relu" => Some(4),
-                            "sigmoid" => Some(5),
-                            "tanh" => Some(6),
-                            "neg" => Some(7),
-                            "exp" => Some(8),
-                            "log" => Some(9),
-                            "sqrt" => Some(10),
-                            "abs" => Some(11),
-                            "gelu" => Some(12),
-                            "silu" => Some(13),
-                            _ => None,
-                        })
-                        .collect();
+                    let result = if compiled_args.len() >= 2 {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_fused_elementwise_2",
+                            &[compiled_args[0], compiled_args[1], ops_list, num_ops],
+                        )?
+                    } else {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_fused_elementwise_1",
+                            &[compiled_args[0], ops_list, num_ops],
+                        )?
+                    };
+                    self.compile_call_by_name(builder, "nsl_list_free", &[ops_list])?;
 
-                    if op_codes.len() == op_chain.len() && !compiled_args.is_empty() {
-                        let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-                        for &code in &op_codes {
-                            let code_val = builder.ins().iconst(cl_types::I64, code);
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_list_push",
-                                &[ops_list, code_val],
-                            )?;
-                        }
-                        let num_ops = builder.ins().iconst(cl_types::I64, op_codes.len() as i64);
-
-                        let result = if compiled_args.len() >= 2 {
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_fused_elementwise_2",
-                                &[compiled_args[0], compiled_args[1], ops_list, num_ops],
-                            )?
-                        } else {
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_fused_elementwise_1",
-                                &[compiled_args[0], ops_list, num_ops],
-                            )?
-                        };
-                        self.compile_call_by_name(builder, "nsl_list_free", &[ops_list])?;
-
-                        let _ = kernel; // PTX is synthesized but dispatch uses runtime fused ops
-                        return Ok(result);
-                    }
+                    let _ = kernel; // PTX is synthesized but dispatch uses runtime fused ops
+                    return Ok(result);
                 }
             }
-            // Fall through to normal call if fusion disabled or synthesis failed
         }
+        // Fall through to normal call if fusion disabled or synthesis failed
 
         // Dispatch-arm audit (2026-07-29): the checker resolves a call to
         // a registered fn (module-level user fn, imported stdlib fn,
@@ -422,20 +420,20 @@ impl Compiler<'_> {
         if func_name == "print" {
             return self.compile_print_call(builder, state, args);
         }
-        if func_name == "len" {
-            if let Some(arg) = args.first() {
-                let val = self.compile_expr(builder, state, &arg.value)?;
-                let arg_type = self.node_type(arg.value.id).clone();
-                let fn_name = if matches!(arg_type, Type::Dict(_, _)) {
-                    "nsl_dict_len"
-                } else {
-                    "nsl_list_len"
-                };
-                let fid = self.registry.runtime_fns[fn_name].0;
-                let fref = self.module.declare_func_in_func(fid, builder.func);
-                let call = builder.ins().call(fref, &[val]);
-                return Ok(builder.inst_results(call)[0]);
-            }
+        if func_name == "len"
+            && let Some(arg) = args.first()
+        {
+            let val = self.compile_expr(builder, state, &arg.value)?;
+            let arg_type = self.node_type(arg.value.id).clone();
+            let fn_name = if matches!(arg_type, Type::Dict(_, _)) {
+                "nsl_dict_len"
+            } else {
+                "nsl_list_len"
+            };
+            let fid = self.registry.runtime_fns[fn_name].0;
+            let fref = self.module.declare_func_in_func(fid, builder.func);
+            let call = builder.ins().call(fref, &[val]);
+            return Ok(builder.inst_results(call)[0]);
         }
         if func_name == "range" {
             return self.compile_range_call(builder, state, args);
@@ -1569,15 +1567,15 @@ impl Compiler<'_> {
                 // split this contract closes — refuse instead of letting the
                 // decorator quietly win.
                 let decorator_causal = fa_ctx.config.causal;
-                if let Some(site) = explicit_causal {
-                    if site != decorator_causal {
-                        return Err(CodegenError::new(format!(
-                            "scaled_dot_product_attention(causal = {site}) contradicts the \
+                if let Some(site) = explicit_causal
+                    && site != decorator_causal
+                {
+                    return Err(CodegenError::new(format!(
+                        "scaled_dot_product_attention(causal = {site}) contradicts the \
                              enclosing @flash_attention(causal = {decorator_causal}) \
                              decorator, whose value is baked into the synthesized kernel. \
                              Make them agree, or drop the decorator to take the naive path"
-                        )));
-                    }
+                    )));
                 }
                 return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
             }
@@ -1616,20 +1614,20 @@ impl Compiler<'_> {
             )
             .map(|(_, info)| info);
 
-            if let Some(cp_info) = cp_config {
-                if cp_info.ring_size >= 2 {
-                    eprintln!(
-                        "[nsl] warning: @context_parallel(ring_size={}) — single-device ring math is verified in the runtime (crates/nsl-runtime/src/context_parallel/attention.rs::run_ring_attention_full), but multi-device distribution (send/recv, NCCL) is deferred; forward runs correctly on this device without sharding K/V across ranks.",
-                        cp_info.ring_size
-                    );
-                }
-                // Fall through to the naive path below either way. Do NOT
-                // emit any ring-attention FFI chain — none exists at the
-                // runtime FFI boundary yet (the v2.22-era stubs were
-                // deleted in M34 v1). When real distribution lands, the
-                // fresh FFI shape gets wired in here and this branch
-                // stops falling through.
+            if let Some(cp_info) = cp_config
+                && cp_info.ring_size >= 2
+            {
+                eprintln!(
+                    "[nsl] warning: @context_parallel(ring_size={}) — single-device ring math is verified in the runtime (crates/nsl-runtime/src/context_parallel/attention.rs::run_ring_attention_full), but multi-device distribution (send/recv, NCCL) is deferred; forward runs correctly on this device without sharding K/V across ranks.",
+                    cp_info.ring_size
+                );
             }
+            // Fall through to the naive path below either way. Do NOT
+            // emit any ring-attention FFI chain — none exists at the
+            // runtime FFI boundary yet (the v2.22-era stubs were
+            // deleted in M34 v1). When real distribution lands, the
+            // fresh FFI shape gets wired in here and this branch
+            // stops falling through.
 
             // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
@@ -2115,13 +2113,13 @@ impl Compiler<'_> {
             // with no hint that orphan v4 biases also exist in the
             // bundle and would have activated with the right weight
             // pack.
-            if v4_dims.is_none() {
-                if let (Some(key), Some(weight_map)) =
+            if v4_dims.is_none()
+                && let (Some(key), Some(weight_map)) =
                     (lookup_key.as_ref(), self.features.weight_map.as_ref())
-                {
-                    if crate::moe::any_v4_bias_entry_present(weight_map, key) {
-                        return Err(crate::error::CodegenError::new(format!(
-                            "moe_dispatch_swiglu: WeightMap under '{key}' contains v4 bias \
+                && crate::moe::any_v4_bias_entry_present(weight_map, key)
+            {
+                return Err(crate::error::CodegenError::new(format!(
+                    "moe_dispatch_swiglu: WeightMap under '{key}' contains v4 bias \
                              entries (`experts.gate.bias` and/or `experts.up.bias` and/or \
                              `experts.down.bias`) BUT the v4 weight dimensions could not \
                              be resolved (missing or mis-shaped `experts.gate.weight` / \
@@ -2130,9 +2128,7 @@ impl Compiler<'_> {
                              because their parent projections are absent. Fix the bundle \
                              by adding the missing weight tensors (and re-running any \
                              auto-pack step), or remove the orphaned biases."
-                        )));
-                    }
-                }
+                )));
             }
 
             if let Some((hidden_dim, intermediate_dim)) = v4_dims {
@@ -2372,13 +2368,13 @@ impl Compiler<'_> {
             // "missing experts.up.weight" and never realizes their
             // bundle also has orphaned bias entries that would have
             // activated with the right weight pack.
-            if v3_dims.is_none() {
-                if let (Some(key), Some(weight_map)) =
+            if v3_dims.is_none()
+                && let (Some(key), Some(weight_map)) =
                     (lookup_key.as_ref(), self.features.weight_map.as_ref())
-                {
-                    if crate::moe::any_v3_bias_entry_present(weight_map, key) {
-                        return Err(crate::error::CodegenError::new(format!(
-                            "moe_dispatch_ffn: WeightMap under '{key}' contains v3 bias \
+                && crate::moe::any_v3_bias_entry_present(weight_map, key)
+            {
+                return Err(crate::error::CodegenError::new(format!(
+                    "moe_dispatch_ffn: WeightMap under '{key}' contains v3 bias \
                              entries (`experts.up.bias` and/or `experts.down.bias`) BUT \
                              the v3 weight dimensions could not be resolved (missing or \
                              mis-shaped `experts.up.weight` / `experts.down.weight`). \
@@ -2387,9 +2383,7 @@ impl Compiler<'_> {
                              the bundle by adding the missing weight tensors (and \
                              re-running any auto-pack step), or remove the orphaned \
                              biases."
-                        )));
-                    }
-                }
+                )));
             }
 
             if let Some((hidden_dim, intermediate_dim)) = v3_dims {
@@ -3176,13 +3170,13 @@ impl Compiler<'_> {
                 } else if let (Some(data_numel), Some(labels_numel)) = (
                     static_tensor_numel(&data_ty),
                     static_tensor_numel(&labels_ty),
-                ) {
-                    if data_numel != labels_numel {
-                        return Err(CodegenError::new(format!(
-                            "DataLoader(): data and labels must have the same number of elements ({} vs {})",
-                            data_numel, labels_numel
-                        )));
-                    }
+                )
+                    && data_numel != labels_numel
+                {
+                    return Err(CodegenError::new(format!(
+                        "DataLoader(): data and labels must have the same number of elements ({} vs {})",
+                        data_numel, labels_numel
+                    )));
                 }
             }
 

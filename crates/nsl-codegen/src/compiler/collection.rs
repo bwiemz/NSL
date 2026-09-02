@@ -353,46 +353,45 @@ impl Compiler<'_> {
                 decorators,
                 stmt: inner,
             } = &stmt.kind
+                && let StmtKind::ModelDef(md) = &inner.kind
             {
-                if let StmtKind::ModelDef(md) = &inner.kind {
-                    let model_name = self.resolve_sym(md.name).to_string();
-                    for deco in decorators {
-                        if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "quantize" {
-                            let mut dtype = "awq4".to_string();
-                            let mut group_size: i64 = 128;
-                            if let Some(ref args) = deco.args {
-                                for arg in args {
-                                    if let Some(ref name_sym) = arg.name {
-                                        let aname = self.resolve_sym(*name_sym).to_string();
-                                        match aname.as_str() {
-                                            "dtype" => {
-                                                if let nsl_ast::expr::ExprKind::StringLiteral(s) =
-                                                    &arg.value.kind
-                                                {
-                                                    dtype = s.clone();
-                                                }
+                let model_name = self.resolve_sym(md.name).to_string();
+                for deco in decorators {
+                    if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "quantize" {
+                        let mut dtype = "awq4".to_string();
+                        let mut group_size: i64 = 128;
+                        if let Some(ref args) = deco.args {
+                            for arg in args {
+                                if let Some(ref name_sym) = arg.name {
+                                    let aname = self.resolve_sym(*name_sym).to_string();
+                                    match aname.as_str() {
+                                        "dtype" => {
+                                            if let nsl_ast::expr::ExprKind::StringLiteral(s) =
+                                                &arg.value.kind
+                                            {
+                                                dtype = s.clone();
                                             }
-                                            "group_size" => {
-                                                if let nsl_ast::expr::ExprKind::IntLiteral(n) =
-                                                    &arg.value.kind
-                                                {
-                                                    group_size = *n;
-                                                }
-                                            }
-                                            _ => {}
                                         }
+                                        "group_size" => {
+                                            if let nsl_ast::expr::ExprKind::IntLiteral(n) =
+                                                &arg.value.kind
+                                            {
+                                                group_size = *n;
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
-                            eprintln!(
-                                "[nsl] M35: @quantize on model '{}' — dtype={}, group_size={}",
-                                model_name, dtype, group_size
-                            );
-                            self.features.quant_configs.insert(
-                                model_name.clone(),
-                                super::QuantConfig { dtype, group_size },
-                            );
                         }
+                        eprintln!(
+                            "[nsl] M35: @quantize on model '{}' — dtype={}, group_size={}",
+                            model_name, dtype, group_size
+                        );
+                        self.features.quant_configs.insert(
+                            model_name.clone(),
+                            super::QuantConfig { dtype, group_size },
+                        );
                     }
                 }
             }
@@ -443,51 +442,50 @@ impl Compiler<'_> {
                                 // would otherwise win uncontested and size
                                 // this one's params wrong.
                                 let mut derived_dims = false;
-                                if let Some(init_expr) = init {
-                                    if let Some(shape) =
+                                if let Some(init_expr) = init
+                                    && let Some(shape) =
                                         extract_shape_from_tensor_init(init_expr, &|s| {
                                             self.resolve_sym(s).to_string()
                                         })
-                                    {
-                                        if shape.len() == 2 {
-                                            let type_str = format!(
-                                                "Tensor<[{}, {}], f32>",
-                                                shape[0], shape[1]
-                                            );
-                                            self.models
-                                                .model_tensor_field_shapes
-                                                .entry(name.clone())
-                                                .or_default()
-                                                .insert(field_name.clone(), type_str);
-                                        }
-                                        // CFTP v10 (item 5): record rank for
-                                        // every derivable shape, not just
-                                        // rank-2, so the fused-LCE matcher
-                                        // can refuse rank-3+ model-field W
-                                        // operands (e.g. MoE expert stack
-                                        // `self.experts.weight: [D, V, H]`).
-                                        // Zero-rank means the initializer
-                                        // literal was empty — treat as
-                                        // unknown per resolvable_tensor_rank
-                                        // conventions.
-                                        if !shape.is_empty() {
-                                            self.models
-                                                .model_field_ranks
-                                                .entry(name.clone())
-                                                .or_default()
-                                                .insert(field_name.clone(), shape.len());
-                                            // Stage-2A: keep the FULL dims at
-                                            // every rank (the string map above
-                                            // is rank-2-only and formatted) —
-                                            // the transient-arena hint bridge
-                                            // sizes param gradients from these.
-                                            self.models
-                                                .model_field_dims
-                                                .entry(name.clone())
-                                                .or_default()
-                                                .insert(field_name.clone(), shape.clone());
-                                            derived_dims = true;
-                                        }
+                                {
+                                    if shape.len() == 2 {
+                                        let type_str = format!(
+                                            "Tensor<[{}, {}], f32>",
+                                            shape[0], shape[1]
+                                        );
+                                        self.models
+                                            .model_tensor_field_shapes
+                                            .entry(name.clone())
+                                            .or_default()
+                                            .insert(field_name.clone(), type_str);
+                                    }
+                                    // CFTP v10 (item 5): record rank for
+                                    // every derivable shape, not just
+                                    // rank-2, so the fused-LCE matcher
+                                    // can refuse rank-3+ model-field W
+                                    // operands (e.g. MoE expert stack
+                                    // `self.experts.weight: [D, V, H]`).
+                                    // Zero-rank means the initializer
+                                    // literal was empty — treat as
+                                    // unknown per resolvable_tensor_rank
+                                    // conventions.
+                                    if !shape.is_empty() {
+                                        self.models
+                                            .model_field_ranks
+                                            .entry(name.clone())
+                                            .or_default()
+                                            .insert(field_name.clone(), shape.len());
+                                        // Stage-2A: keep the FULL dims at
+                                        // every rank (the string map above
+                                        // is rank-2-only and formatted) —
+                                        // the transient-arena hint bridge
+                                        // sizes param gradients from these.
+                                        self.models
+                                            .model_field_dims
+                                            .entry(name.clone())
+                                            .or_default()
+                                            .insert(field_name.clone(), shape.clone());
+                                        derived_dims = true;
                                     }
                                 }
                                 if !derived_dims {
@@ -507,15 +505,14 @@ impl Compiler<'_> {
                         // known rank.
                         if let nsl_ast::types::TypeExprKind::Tensor { shape, .. } =
                             &type_ann.kind
+                            && !shape.is_empty()
                         {
-                            if !shape.is_empty() {
-                                self.models
-                                    .model_field_ranks
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .entry(field_name.clone())
-                                    .or_insert(shape.len());
-                            }
+                            self.models
+                                .model_field_ranks
+                                .entry(name.clone())
+                                .or_default()
+                                .entry(field_name.clone())
+                                .or_insert(shape.len());
                         }
 
                         // Check if this is a FixedArray type
@@ -585,16 +582,16 @@ impl Compiler<'_> {
                     {
                         for deco in decorators {
                             // M30: @shard decorator extraction
-                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "shard" {
-                                if let Some(info) = crate::tensor_parallel::extract_shard_decorator(
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "shard"
+                                && let Some(info) = crate::tensor_parallel::extract_shard_decorator(
                                     std::slice::from_ref(deco),
                                     &|sym| self.resolve_sym(sym),
-                                ) {
-                                    let model_name = self.resolve_sym(md.name).to_string();
-                                    let layer_name_str = self.resolve_sym(*field_sym).to_string();
-                                    let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.features.shard_configs.insert(layer_key, info);
-                                }
+                                )
+                            {
+                                let model_name = self.resolve_sym(md.name).to_string();
+                                let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                self.features.shard_configs.insert(layer_key, info);
                             }
                             // M32: @moe decorator extraction (+ v2.4 activation parse).
                             // Errors out of extract_moe_decorator are
@@ -659,20 +656,18 @@ impl Compiler<'_> {
                             // M34: @context_parallel decorator extraction
                             if deco.name.len() == 1
                                 && self.resolve_sym(deco.name[0]) == "context_parallel"
-                            {
-                                if let Some(info) =
+                                && let Some(info) =
                                     crate::context_parallel::extract_context_parallel_decorator(
                                         std::slice::from_ref(deco),
                                         &|sym| self.resolve_sym(sym),
                                     )
-                                {
-                                    let model_name = self.resolve_sym(md.name).to_string();
-                                    let layer_name_str = self.resolve_sym(*field_sym).to_string();
-                                    let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.features
-                                        .context_parallel_configs
-                                        .insert(layer_key, info);
-                                }
+                            {
+                                let model_name = self.resolve_sym(md.name).to_string();
+                                let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                self.features
+                                    .context_parallel_configs
+                                    .insert(layer_key, info);
                             }
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "paged_kv"
                             {
@@ -709,18 +704,16 @@ impl Compiler<'_> {
                             // M33: @speculative decorator extraction
                             if deco.name.len() == 1
                                 && self.resolve_sym(deco.name[0]) == "speculative"
-                            {
-                                if let Some(info) =
+                                && let Some(info) =
                                     crate::speculative::extract_speculative_decorator(
                                         std::slice::from_ref(deco),
                                         &|sym| self.resolve_sym(sym),
                                     )
-                                {
-                                    let model_name = self.resolve_sym(md.name).to_string();
-                                    let layer_name_str = self.resolve_sym(*field_sym).to_string();
-                                    let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.features.speculative_configs.insert(layer_key, info);
-                                }
+                            {
+                                let model_name = self.resolve_sym(md.name).to_string();
+                                let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                self.features.speculative_configs.insert(layer_key, info);
                             }
                             // M42: @kv_compress decorator extraction
                             if deco.name.len() == 1

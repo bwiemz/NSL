@@ -399,10 +399,10 @@ pub fn insert_adjoint_last_use_frees(
         }
         // Only Tensor-typed (or untyped-defaulting-to-tensor) results; the
         // lowering guard re-checks against the actual SSA value type.
-        if let Some(ty) = adjoint.var_types.get(var) {
-            if !matches!(ty, WengertType::Tensor) {
-                continue;
-            }
+        if let Some(ty) = adjoint.var_types.get(var)
+            && !matches!(ty, WengertType::Tensor)
+        {
+            continue;
         }
         let at = last_use.get(var).copied().unwrap_or(prod_idx).max(prod_idx);
         pending.push((at, *var));
@@ -589,15 +589,14 @@ fn plan_impl(
     let mut param_block: HashMap<VarId, String> = HashMap::new();
     let mut block_keys: Vec<String> = Vec::new();
     for op in &primal.ops {
-        if let PrimalOp::Param(name) = &op.op {
-            if let Some(key) = crate::wggo_graph::layer_prefix(name) {
-                if block_ordinal(&key).is_some() {
-                    if !block_keys.contains(&key) {
-                        block_keys.push(key.clone());
-                    }
-                    param_block.insert(op.result, key);
-                }
+        if let PrimalOp::Param(name) = &op.op
+            && let Some(key) = crate::wggo_graph::layer_prefix(name)
+            && block_ordinal(&key).is_some()
+        {
+            if !block_keys.contains(&key) {
+                block_keys.push(key.clone());
             }
+            param_block.insert(op.result, key);
         }
     }
     if block_keys.is_empty() {
@@ -666,13 +665,12 @@ fn plan_impl(
     let mut epilogue_start = primal.ops.len();
     'outer: for (idx, op) in primal.ops.iter().enumerate().skip(last_anchor + 1) {
         for input in &op.inputs {
-            if let Some(producer) = primal.find_producer(*input) {
-                if let PrimalOp::Param(name) = &producer.op {
-                    if crate::wggo_graph::layer_prefix(name).is_none() {
-                        epilogue_start = idx;
-                        break 'outer;
-                    }
-                }
+            if let Some(producer) = primal.find_producer(*input)
+                && let PrimalOp::Param(name) = &producer.op
+                && crate::wggo_graph::layer_prefix(name).is_none()
+            {
+                epilogue_start = idx;
+                break 'outer;
             }
         }
     }

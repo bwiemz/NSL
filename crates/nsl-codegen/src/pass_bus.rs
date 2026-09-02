@@ -1387,10 +1387,10 @@ pub(crate) fn dependency_order_violations_in(
             if c.order != OrderClaim::InvocationOrdered {
                 continue;
             }
-            if let (Some(pp), Some(cp)) = (pos(d.producer), pos(c.pass)) {
-                if cp < pp {
-                    v.push((d.producer, c.pass, d.channel));
-                }
+            if let (Some(pp), Some(cp)) = (pos(d.producer), pos(c.pass))
+                && cp < pp
+            {
+                v.push((d.producer, c.pass, d.channel));
             }
         }
     }

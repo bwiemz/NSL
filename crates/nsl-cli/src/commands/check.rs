@@ -263,14 +263,14 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             // block produce a `note:` instead of a report.
             if csha_report || csha.is_some() {
                 // Validate the mode string up front (matches Run/Build).
-                if let Some(ref m) = csha {
-                    if nsl_codegen::csha::CshaMode::parse(m).is_none() {
-                        eprintln!(
-                            "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
-                            m
-                        );
-                        process::exit(1);
-                    }
+                if let Some(ref m) = csha
+                    && nsl_codegen::csha::CshaMode::parse(m).is_none()
+                {
+                    eprintln!(
+                        "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
+                        m
+                    );
+                    process::exit(1);
                 }
                 let source = match std::fs::read_to_string(&file) {
                     Ok(s) => s,

@@ -205,33 +205,27 @@ impl ShapeAlgebraSolver {
         }
 
         // Strategy 5: Bound-derived equality (if both sides have singleton bounds [v, v])
-        if let (DimExpr::Sym(a), DimExpr::Sym(b)) = (&sl, &sr) {
-            if let (Some((Some(lo_a), Some(hi_a))), Some((Some(lo_b), Some(hi_b))))
+        if let (DimExpr::Sym(a), DimExpr::Sym(b)) = (&sl, &sr)
+            && let (Some((Some(lo_a), Some(hi_a))), Some((Some(lo_b), Some(hi_b))))
                 = (self.bounds.get(a), self.bounds.get(b))
-            {
-                if lo_a == hi_a && lo_b == hi_b && lo_a == lo_b {
-                    return Ok(());
-                }
-            }
+            && lo_a == hi_a && lo_b == hi_b && lo_a == lo_b
+        {
+            return Ok(());
         }
         // Also: symbol vs literal via bounds
-        if let DimExpr::Sym(s) = &sl {
-            if let DimExpr::Lit(v) = &sr {
-                if let Some((Some(lo), Some(hi))) = self.bounds.get(s) {
-                    if lo == hi && lo == v {
-                        return Ok(());
-                    }
-                }
-            }
+        if let DimExpr::Sym(s) = &sl
+            && let DimExpr::Lit(v) = &sr
+            && let Some((Some(lo), Some(hi))) = self.bounds.get(s)
+            && lo == hi && lo == v
+        {
+            return Ok(());
         }
-        if let DimExpr::Lit(v) = &sl {
-            if let DimExpr::Sym(s) = &sr {
-                if let Some((Some(lo), Some(hi))) = self.bounds.get(s) {
-                    if lo == hi && lo == v {
-                        return Ok(());
-                    }
-                }
-            }
+        if let DimExpr::Lit(v) = &sl
+            && let DimExpr::Sym(s) = &sr
+            && let Some((Some(lo), Some(hi))) = self.bounds.get(s)
+            && lo == hi && lo == v
+        {
+            return Ok(());
         }
 
         Err(ProofFailure {
@@ -285,18 +279,18 @@ impl ShapeAlgebraSolver {
                 }
             }
             // Strategy 2b: Singleton bound — if sym in [v, v], check v % divisor
-            if let Some((Some(lo), Some(hi))) = self.bounds.get(s) {
-                if lo == hi && lo % divisor == 0 {
-                    return Ok(());
-                }
+            if let Some((Some(lo), Some(hi))) = self.bounds.get(s)
+                && lo == hi && lo % divisor == 0
+            {
+                return Ok(());
             }
         }
 
         // Strategy 3: Product of terms — if a*b and b % divisor == 0, then a*b % divisor == 0
-        if let DimExpr::Mul(a, b) = expr {
-            if self.prove_divisible(a, divisor).is_ok() || self.prove_divisible(b, divisor).is_ok() {
-                return Ok(());
-            }
+        if let DimExpr::Mul(a, b) = expr
+            && (self.prove_divisible(a, divisor).is_ok() || self.prove_divisible(b, divisor).is_ok())
+        {
+            return Ok(());
         }
 
         Err(ProofFailure {
@@ -393,8 +387,10 @@ impl ShapeAlgebraSolver {
         }
 
         // Strategy 2: upper bound from bounds database
-        if let Some(ub) = self.upper_bound(expr) {
-            if ub <= value { return Ok(()); }
+        if let Some(ub) = self.upper_bound(expr)
+            && ub <= value
+        {
+            return Ok(());
         }
 
         // Strategy 3: Fourier-Motzkin for transitive bounds
@@ -421,8 +417,10 @@ impl ShapeAlgebraSolver {
             };
         }
 
-        if let Some(lb) = self.lower_bound(expr) {
-            if lb >= value { return Ok(()); }
+        if let Some(lb) = self.lower_bound(expr)
+            && lb >= value
+        {
+            return Ok(());
         }
 
         Err(ProofFailure {
@@ -651,24 +649,24 @@ impl ShapeAlgebraSolver {
         if target.coeffs.len() == 1 {
             let (&var, &t_coeff) = target.coeffs.iter().next().unwrap();
             for c in constraints {
-                if c.coeffs.len() == 1 {
-                    if let Some(&c_coeff) = c.coeffs.get(&var) {
-                        if c_coeff > 0 && t_coeff > 0 {
-                            // c_coeff * x + c.const <= 0  means  x <= -c.const/c_coeff
-                            // t_coeff * x + t.const <= 0  means  x <= -t.const/t_coeff
-                            // Implied when -c.const/c_coeff <= -t.const/t_coeff
-                            // i.e., c.const * t_coeff >= t.const * c_coeff (cross-multiply, both positive)
-                            if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
-                                return true;
-                            }
-                        } else if c_coeff < 0 && t_coeff < 0 {
-                            // -|c| * x + c.const <= 0  means  x >= c.const / |c|
-                            // Implied when c.const/|c| >= t.const/|t|
-                            // Cross-multiply (both negative, so flip): c.const * |t| <= t.const * |c|
-                            // With c_coeff, t_coeff both negative: c.const * t_coeff >= t.const * c_coeff
-                            if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
-                                return true;
-                            }
+                if c.coeffs.len() == 1
+                    && let Some(&c_coeff) = c.coeffs.get(&var)
+                {
+                    if c_coeff > 0 && t_coeff > 0 {
+                        // c_coeff * x + c.const <= 0  means  x <= -c.const/c_coeff
+                        // t_coeff * x + t.const <= 0  means  x <= -t.const/t_coeff
+                        // Implied when -c.const/c_coeff <= -t.const/t_coeff
+                        // i.e., c.const * t_coeff >= t.const * c_coeff (cross-multiply, both positive)
+                        if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
+                            return true;
+                        }
+                    } else if c_coeff < 0 && t_coeff < 0 {
+                        // -|c| * x + c.const <= 0  means  x >= c.const / |c|
+                        // Implied when c.const/|c| >= t.const/|t|
+                        // Cross-multiply (both negative, so flip): c.const * |t| <= t.const * |c|
+                        // With c_coeff, t_coeff both negative: c.const * t_coeff >= t.const * c_coeff
+                        if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
+                            return true;
                         }
                     }
                 }

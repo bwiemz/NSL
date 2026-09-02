@@ -921,10 +921,10 @@ mod imp {
                                 active.phase,
                                 active.seq.len()
                             );
-                            if streak == 1 {
-                                if let Some(prev) = &active.prev_seq {
-                                    log_first_divergence(id, prev, &active.seq);
-                                }
+                            if streak == 1
+                                && let Some(prev) = &active.prev_seq
+                            {
+                                log_first_divergence(id, prev, &active.seq);
                             }
                         }
                         if streak < STABLE_STREAK && rounds >= MAX_RECORD_ROUNDS {

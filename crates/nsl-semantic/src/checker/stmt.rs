@@ -114,16 +114,16 @@ impl<'a> TypeChecker<'a> {
                 }
                 if let Some(expr) = expr {
                     let ty = self.check_expr(expr);
-                    if let Some(expected) = &self.current_return_type {
-                        if !is_assignable(&ty, expected) {
-                            self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "return type mismatch: expected {}, got {}",
-                                    display_type(expected), display_type(&ty)
-                                ))
-                                .with_label(expr.span, "wrong type"),
-                            );
-                        }
+                    if let Some(expected) = &self.current_return_type
+                        && !is_assignable(&ty, expected)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "return type mismatch: expected {}, got {}",
+                                display_type(expected), display_type(&ty)
+                            ))
+                            .with_label(expr.span, "wrong type"),
+                        );
                     }
                 }
             }
@@ -153,19 +153,18 @@ impl<'a> TypeChecker<'a> {
                 let value_ty = self.check_expr(value);
 
                 // Check const violation
-                if let ExprKind::Ident(sym) = &target.kind {
-                    if let Some((_sid, info)) = self.scopes.lookup(self.current_scope, *sym) {
-                        if info.is_const {
-                            let name = self.resolve_name(*sym);
-                            self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "cannot assign to `{name}`: declared as const"
-                                ))
-                                .with_label(target.span, "const binding")
-                                .with_label(info.def_span, "declared here"),
-                            );
-                        }
-                    }
+                if let ExprKind::Ident(sym) = &target.kind
+                    && let Some((_sid, info)) = self.scopes.lookup(self.current_scope, *sym)
+                    && info.is_const
+                {
+                    let name = self.resolve_name(*sym);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "cannot assign to `{name}`: declared as const"
+                        ))
+                        .with_label(target.span, "const binding")
+                        .with_label(info.def_span, "declared here"),
+                    );
                 }
 
                 // Check type compatibility
@@ -473,10 +472,10 @@ impl<'a> TypeChecker<'a> {
                                     }
                                     _ => None,
                                 };
-                                if let Some(name) = model_name {
-                                    if !name.is_empty() {
-                                        self.csha_configs.push((name, cfg));
-                                    }
+                                if let Some(name) = model_name
+                                    && !name.is_empty()
+                                {
+                                    self.csha_configs.push((name, cfg));
                                 }
                                 // Silently drop on non-model / non-binding
                                 // targets: the validator already accepted the
@@ -700,19 +699,19 @@ impl<'a> TypeChecker<'a> {
                         }
 
                         // M46: @deterministic — register with effect checker for validation
-                        if dname == "deterministic" {
-                            if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
-                                self.effect_checker.mark_deterministic(&fn_name);
-                            }
+                        if dname == "deterministic"
+                            && let StmtKind::FnDef(fn_def) = &stmt.kind
+                        {
+                            let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                            self.effect_checker.mark_deterministic(&fn_name);
                         }
 
                         // M51: @pure — register with effect checker for validation
-                        if dname == "pure" {
-                            if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
-                                self.effect_checker.mark_pure(&fn_name);
-                            }
+                        if dname == "pure"
+                            && let StmtKind::FnDef(fn_def) = &stmt.kind
+                        {
+                            let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                            self.effect_checker.mark_pure(&fn_name);
                         }
 
                         // M51 + cycle-10 §5.3 (Task 3): @checkpoint —
@@ -735,135 +734,135 @@ impl<'a> TypeChecker<'a> {
                         //   `policy="custom"`
                         // - any other value               → ERROR (valid-list
                         //                                   diagnostic).
-                        if dname == "checkpoint" {
-                            if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                        if dname == "checkpoint"
+                            && let StmtKind::FnDef(fn_def) = &stmt.kind
+                        {
+                            let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
 
-                                // Walk deco.args for the optional `policy=` kwarg.
-                                let mut explicit_policy: Option<&str> = None;
-                                let mut policy_arg_span: Option<nsl_ast::Span> = None;
-                                let mut had_args = false;
-                                if let Some(ref args) = deco.args {
-                                    for arg in args {
-                                        had_args = true;
-                                        let Some(ref name_sym) = arg.name else {
-                                            self.diagnostics.push(
-                                                Diagnostic::error(
-                                                    "@checkpoint: positional arguments are not allowed".to_string(),
-                                                )
-                                                .with_label(arg.span, "expected `policy = \"...\"`")
-                                            );
-                                            continue;
-                                        };
-                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
-                                        if aname != "policy" {
-                                            self.diagnostics.push(
-                                                Diagnostic::error(format!(
-                                                    "@checkpoint: unknown argument '{aname}'"
-                                                ))
-                                                .with_label(arg.span, "unknown argument")
-                                            );
-                                            continue;
-                                        }
-                                        match &arg.value.kind {
-                                            ExprKind::StringLiteral(s) => {
-                                                explicit_policy = Some(match s.as_str() {
-                                                    "full" => "full",
-                                                    "none" => "none",
-                                                    "selective" => "selective",
-                                                    "selective_postnorm" => "selective_postnorm",
-                                                    "custom" => "custom",
-                                                    _ => "__invalid__",
-                                                });
-                                                // Stash the originally-typed string for diagnostics.
-                                                if explicit_policy == Some("__invalid__") {
-                                                    self.diagnostics.push(
-                                                        Diagnostic::error(format!(
-                                                            "@checkpoint policy must be one of: \"full\", \"none\", \"selective\" (refused), \"selective_postnorm\" (refused), \"custom\" (refused); got \"{s}\""
-                                                        ))
-                                                        .with_label(arg.span, "invalid policy value")
-                                                    );
-                                                }
-                                                policy_arg_span = Some(arg.span);
-                                            }
-                                            _ => {
+                            // Walk deco.args for the optional `policy=` kwarg.
+                            let mut explicit_policy: Option<&str> = None;
+                            let mut policy_arg_span: Option<nsl_ast::Span> = None;
+                            let mut had_args = false;
+                            if let Some(ref args) = deco.args {
+                                for arg in args {
+                                    had_args = true;
+                                    let Some(ref name_sym) = arg.name else {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(
+                                                "@checkpoint: positional arguments are not allowed".to_string(),
+                                            )
+                                            .with_label(arg.span, "expected `policy = \"...\"`")
+                                        );
+                                        continue;
+                                    };
+                                    let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                    if aname != "policy" {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "@checkpoint: unknown argument '{aname}'"
+                                            ))
+                                            .with_label(arg.span, "unknown argument")
+                                        );
+                                        continue;
+                                    }
+                                    match &arg.value.kind {
+                                        ExprKind::StringLiteral(s) => {
+                                            explicit_policy = Some(match s.as_str() {
+                                                "full" => "full",
+                                                "none" => "none",
+                                                "selective" => "selective",
+                                                "selective_postnorm" => "selective_postnorm",
+                                                "custom" => "custom",
+                                                _ => "__invalid__",
+                                            });
+                                            // Stash the originally-typed string for diagnostics.
+                                            if explicit_policy == Some("__invalid__") {
                                                 self.diagnostics.push(
-                                                    Diagnostic::error(
-                                                        "@checkpoint policy must be a string literal".to_string(),
-                                                    )
-                                                    .with_label(arg.span, "expected string literal")
+                                                    Diagnostic::error(format!(
+                                                        "@checkpoint policy must be one of: \"full\", \"none\", \"selective\" (refused), \"selective_postnorm\" (refused), \"custom\" (refused); got \"{s}\""
+                                                    ))
+                                                    .with_label(arg.span, "invalid policy value")
                                                 );
                                             }
+                                            policy_arg_span = Some(arg.span);
+                                        }
+                                        _ => {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(
+                                                    "@checkpoint policy must be a string literal".to_string(),
+                                                )
+                                                .with_label(arg.span, "expected string literal")
+                                            );
                                         }
                                     }
                                 }
+                            }
 
-                                match explicit_policy {
-                                    Some("full") => {
-                                        self.effect_checker.mark_checkpointed(&fn_name);
-                                        self.effect_checker.mark_checkpointed_with_policy(
-                                            &fn_name,
-                                            crate::effects::CheckpointPolicy::Full,
-                                        );
-                                    }
-                                    Some("none") => {
-                                        // M14 tape fallback continues; no codegen-side policy.
-                                        self.effect_checker.mark_checkpointed(&fn_name);
-                                    }
-                                    Some("selective") => {
-                                        // CCR P1.b: publish the Selective
-                                        // policy; the train-block CCR gate
-                                        // (stmt.rs) enables selective
-                                        // block-granular recompute. The
-                                        // CSHA prologue-stamping pass
-                                        // ignores this variant.
-                                        self.effect_checker.mark_checkpointed(&fn_name);
-                                        self.effect_checker.mark_checkpointed_with_policy(
-                                            &fn_name,
-                                            crate::effects::CheckpointPolicy::Selective,
-                                        );
-                                    }
-                                    Some("selective_postnorm") => {
-                                        self.diagnostics.push(
-                                            Diagnostic::error(
-                                                "@checkpoint(policy=\"selective_postnorm\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
-                                            )
-                                            .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
-                                        );
-                                    }
-                                    Some("custom") => {
-                                        self.diagnostics.push(
-                                            Diagnostic::error(
-                                                "@checkpoint(policy=\"custom\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
-                                            )
-                                            .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
-                                        );
-                                    }
-                                    Some("__invalid__") => {
-                                        // Diagnostic already pushed above.
-                                    }
-                                    Some(_) => unreachable!(),
-                                    None => {
-                                        // No `policy=` kwarg present (had_args may be true if
-                                        // other kwargs were tried — those already errored).
-                                        // Bare `@checkpoint` (no args at all) → R0 deprecation
-                                        // warning (once per source file) + treat as policy="none".
-                                        if !had_args {
-                                            let file_id = deco.span.file_id;
-                                            if self.effect_checker.emitted_checkpoint_deprecation.insert(file_id) {
-                                                self.diagnostics.push(
-                                                    Diagnostic::warning(
-                                                        "@checkpoint without policy= is deprecated; specify policy=\"full\" (shipped) or policy=\"none\" (no-op). Hard refusal in cycle 11.".to_string(),
-                                                    )
-                                                    .with_label(deco.span, "bare @checkpoint")
-                                                );
-                                            }
-                                            self.effect_checker.mark_checkpointed(&fn_name);
-                                        } else {
-                                            // had_args true but no valid policy= seen — caller
-                                            // already got an error per-arg. Still mark for R4.
-                                            self.effect_checker.mark_checkpointed(&fn_name);
+                            match explicit_policy {
+                                Some("full") => {
+                                    self.effect_checker.mark_checkpointed(&fn_name);
+                                    self.effect_checker.mark_checkpointed_with_policy(
+                                        &fn_name,
+                                        crate::effects::CheckpointPolicy::Full,
+                                    );
+                                }
+                                Some("none") => {
+                                    // M14 tape fallback continues; no codegen-side policy.
+                                    self.effect_checker.mark_checkpointed(&fn_name);
+                                }
+                                Some("selective") => {
+                                    // CCR P1.b: publish the Selective
+                                    // policy; the train-block CCR gate
+                                    // (stmt.rs) enables selective
+                                    // block-granular recompute. The
+                                    // CSHA prologue-stamping pass
+                                    // ignores this variant.
+                                    self.effect_checker.mark_checkpointed(&fn_name);
+                                    self.effect_checker.mark_checkpointed_with_policy(
+                                        &fn_name,
+                                        crate::effects::CheckpointPolicy::Selective,
+                                    );
+                                }
+                                Some("selective_postnorm") => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            "@checkpoint(policy=\"selective_postnorm\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
+                                        )
+                                        .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
+                                    );
+                                }
+                                Some("custom") => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            "@checkpoint(policy=\"custom\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
+                                        )
+                                        .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
+                                    );
+                                }
+                                Some("__invalid__") => {
+                                    // Diagnostic already pushed above.
+                                }
+                                Some(_) => unreachable!(),
+                                None => {
+                                    // No `policy=` kwarg present (had_args may be true if
+                                    // other kwargs were tried — those already errored).
+                                    // Bare `@checkpoint` (no args at all) → R0 deprecation
+                                    // warning (once per source file) + treat as policy="none".
+                                    if !had_args {
+                                        let file_id = deco.span.file_id;
+                                        if self.effect_checker.emitted_checkpoint_deprecation.insert(file_id) {
+                                            self.diagnostics.push(
+                                                Diagnostic::warning(
+                                                    "@checkpoint without policy= is deprecated; specify policy=\"full\" (shipped) or policy=\"none\" (no-op). Hard refusal in cycle 11.".to_string(),
+                                                )
+                                                .with_label(deco.span, "bare @checkpoint")
+                                            );
                                         }
+                                        self.effect_checker.mark_checkpointed(&fn_name);
+                                    } else {
+                                        // had_args true but no valid policy= seen — caller
+                                        // already got an error per-arg. Still mark for R4.
+                                        self.effect_checker.mark_checkpointed(&fn_name);
                                     }
                                 }
                             }
@@ -1087,13 +1086,13 @@ impl<'a> TypeChecker<'a> {
                                         .with_label(deco.span, "missing @flash_attention")
                                 );
                             }
-                            if let Some(ref args) = deco.args {
-                                if !args.is_empty() {
-                                    self.diagnostics.push(
-                                        Diagnostic::error("@tree_mask takes no arguments in v1 (bare decorator only)")
-                                            .with_label(deco.span, "unexpected arguments")
-                                    );
-                                }
+                            if let Some(ref args) = deco.args
+                                && !args.is_empty()
+                            {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@tree_mask takes no arguments in v1 (bare decorator only)")
+                                        .with_label(deco.span, "unexpected arguments")
+                                );
                             }
                         }
 
@@ -1408,16 +1407,16 @@ impl<'a> TypeChecker<'a> {
                 };
 
                 // Validate calibration data variable if present
-                if let Some(ref cal) = quant.calibration {
-                    if self.scopes.lookup(self.current_scope, cal.data).is_none() {
-                        let data_name = self.interner.resolve(cal.data.0).unwrap_or("<unknown>").to_string();
-                        self.diagnostics.push(
-                            Diagnostic::error(format!(
-                                "calibration data variable '{data_name}' is not defined"
-                            ))
-                            .with_label(quant.span, "undefined calibration data"),
-                        );
-                    }
+                if let Some(ref cal) = quant.calibration
+                    && self.scopes.lookup(self.current_scope, cal.data).is_none()
+                {
+                    let data_name = self.interner.resolve(cal.data.0).unwrap_or("<unknown>").to_string();
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "calibration data variable '{data_name}' is not defined"
+                        ))
+                        .with_label(quant.span, "undefined calibration data"),
+                    );
                 }
 
                 // Build quantized model type: clone fields, replace tensor types
@@ -1494,13 +1493,13 @@ impl<'a> TypeChecker<'a> {
                     );
                 }
 
-                if let Some(bs) = def.block_size {
-                    if bs == 0 {
-                        self.diagnostics.push(
-                            Diagnostic::error("block_size must be > 0")
-                                .with_label(def.span, "zero block_size"),
-                        );
-                    }
+                if let Some(bs) = def.block_size
+                    && bs == 0
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error("block_size must be > 0")
+                            .with_label(def.span, "zero block_size"),
+                    );
                 }
 
                 let id = DTYPE_CUSTOM_START + self.custom_datatypes.len() as u16;

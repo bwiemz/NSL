@@ -498,19 +498,19 @@ pub fn allocate_ranks(
         // dispatch and just check for hard-forbids.
         for s in spectral {
             let ov = overrides.and_then(|o| o.find_by_layer_containing(&s.name));
-            if let Some(ov) = ov {
-                if ov.adapter_rank == 0 {
-                    // Spectral would have placed r_min; that means it *would* have
-                    // placed, so emit a diagnostic.
-                    diags.push(OverrideDiagnostic {
-                        layer_index: ov.layer_index,
-                        layer_name: s.name.clone(),
-                        reason: OverrideRejectReason::RankForbiddenByWggo,
-                        requested: "0".to_string(),
-                        applied: "no_adapter".to_string(),
-                    });
-                    continue; // excluded
-                }
+            if let Some(ov) = ov
+                && ov.adapter_rank == 0
+            {
+                // Spectral would have placed r_min; that means it *would* have
+                // placed, so emit a diagnostic.
+                diags.push(OverrideDiagnostic {
+                    layer_index: ov.layer_index,
+                    layer_name: s.name.clone(),
+                    reason: OverrideRejectReason::RankForbiddenByWggo,
+                    requested: "0".to_string(),
+                    applied: "no_adapter".to_string(),
+                });
+                continue; // excluded
             }
             allocations.push(RankAllocation {
                 name: s.name.clone(),

@@ -153,10 +153,10 @@ fn read_values(body: &str, out: &mut BTreeSet<String>) {
                 }
             }
         }
-    } else if let Some(lit) = body.strip_prefix('"') {
-        if let Some(close) = lit.find('"') {
-            out.insert(lit[..close].to_string());
-        }
+    } else if let Some(lit) = body.strip_prefix('"')
+        && let Some(close) = lit.find('"')
+    {
+        out.insert(lit[..close].to_string());
     }
 }
 
@@ -1042,10 +1042,8 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut BTreeSet<String>, root: &st
         let path = entry.path();
         if path.is_dir() {
             collect_rs_files(&path, out, root);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            if path.starts_with(root) {
-                out.insert(repo_rel_key(&path, root));
-            }
+        } else if path.extension().is_some_and(|e| e == "rs") && path.starts_with(root) {
+            out.insert(repo_rel_key(&path, root));
         }
     }
 }

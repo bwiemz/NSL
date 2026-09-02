@@ -347,10 +347,10 @@ fn load_and_register_weights_if_needed(
     {
         let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
         for name in &names {
-            if let Some(entry) = wmap.get(name) {
-                if let Some(scale) = entry.compute_scale() {
-                    compiler.memory.weight_scales.insert(name.clone(), scale);
-                }
+            if let Some(entry) = wmap.get(name)
+                && let Some(scale) = entry.compute_scale()
+            {
+                compiler.memory.weight_scales.insert(name.clone(), scale);
             }
         }
         if !compiler.memory.weight_scales.is_empty() {
@@ -811,10 +811,10 @@ fn compile_returning_plan_impl(
                     eprintln!("[nsl] {}", report);
                 }
 
-                if let Some(budget) = options.vram_budget {
-                    if let Some(err_msg) = check_vram_budget(&plan, budget) {
-                        return Err(crate::error::CodegenError::new(err_msg));
-                    }
+                if let Some(budget) = options.vram_budget
+                    && let Some(err_msg) = check_vram_budget(&plan, budget)
+                {
+                    return Err(crate::error::CodegenError::new(err_msg));
                 }
 
                 // Build name → offset map for codegen

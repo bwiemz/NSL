@@ -172,10 +172,10 @@ impl HirModule {
     /// internal driver-uniqueness is the caller's responsibility, per the
     /// generate-loop "fresh genvar each iteration" Verilog semantics.)
     pub fn add_node(&mut self, node: HirNode) -> Result<(), HirBuilderError> {
-        if let Some(wid) = node.produces_wire() {
-            if !self.driven_wires.insert(wid) {
-                return Err(HirBuilderError::DuplicateDriver(wid, self.name.clone()));
-            }
+        if let Some(wid) = node.produces_wire()
+            && !self.driven_wires.insert(wid)
+        {
+            return Err(HirBuilderError::DuplicateDriver(wid, self.name.clone()));
         }
         self.bodies.push(node);
         Ok(())

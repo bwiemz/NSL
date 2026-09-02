@@ -93,46 +93,46 @@ pub fn emit(
     //     loaded entries for the first 16 global q-tiles — broken for any
     //     CTA with bid_x >= 16 and incorrect even for bid_x ∈ 0..15.
     //     Codified in `docs/superpowers/specs/2026-05-13-tier-b-b15-3-skip-ratio-investigation.md`.
-    if let Some((seq_len, residency)) = tier_b {
-        if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-            // PCA Tier B kvt-ordinal: derives the HBM kv-tile index from
-            // %k_start, which advances by HBM `config.block_kv` per outer
-            // iteration (mod.rs k_start += block_kv). Use the HBM-side
-            // stride here, NOT effective_block_kv (the sink slab does not
-            // add to HBM kv-tile stride). Byte-identical at num_sink_tokens==0.
-            let log2_bkv = (config.block_kv as u32).trailing_zeros();
-            let range_table_base =
-                crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
-                    config,
-                    crate::flash_attention_v2::smem_layout::Direction::Forward,
-                );
-            let skip_label = format!("KV_TILE_SKIP_TB_{q_tile_iter}");
-            // Wrap in a PTX lexical scope so the kvt-ordinal registers
-            // are local to this q_tile_iter (s_compute::emit is called
-            // once per q_iter; without the scope, ptxas would reject
-            // duplicate %rd_kvt_ord_TB / %r_kvt_ord_TB declarations).
-            ptx.push_str("    { // PCA Tier B per-q_iter scope\n");
-            ptx.push_str("    // PCA Tier B: derive kv-tile ordinal from %k_start\n");
-            ptx.push_str("    .reg .u64 %rd_kvt_ord_TB;\n");
-            ptx.push_str("    .reg .u32 %r_kvt_ord_TB;\n");
-            ptx.push_str(&format!(
-                "    shr.b64 %rd_kvt_ord_TB, %k_start, {log2_bkv};\n"
-            ));
-            ptx.push_str("    cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;\n");
-            crate::pca_tilerange::emit_skip_predicate(
-                ptx,
+    if let Some((seq_len, residency)) = tier_b
+        && crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+    {
+        // PCA Tier B kvt-ordinal: derives the HBM kv-tile index from
+        // %k_start, which advances by HBM `config.block_kv` per outer
+        // iteration (mod.rs k_start += block_kv). Use the HBM-side
+        // stride here, NOT effective_block_kv (the sink slab does not
+        // add to HBM kv-tile stride). Byte-identical at num_sink_tokens==0.
+        let log2_bkv = (config.block_kv as u32).trailing_zeros();
+        let range_table_base =
+            crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
                 config,
-                seq_len,
-                "%bid_x", // global q-tile index for THIS CTA (grid_x = num_q_tiles)
-                "%r_kvt_ord_TB",
-                range_table_base,
-                &skip_label,
-                // Forward FA-2: per-CTA q-tile fixed by %bid_x, q-iter
-                // Rust-unrolled, kv-tile is the PTX-runtime inner loop.
-                crate::pca_tilerange::IterationOrder::QOuter,
+                crate::flash_attention_v2::smem_layout::Direction::Forward,
             );
-            ptx.push_str("    } // end PCA Tier B per-q_iter scope\n");
-        }
+        let skip_label = format!("KV_TILE_SKIP_TB_{q_tile_iter}");
+        // Wrap in a PTX lexical scope so the kvt-ordinal registers
+        // are local to this q_tile_iter (s_compute::emit is called
+        // once per q_iter; without the scope, ptxas would reject
+        // duplicate %rd_kvt_ord_TB / %r_kvt_ord_TB declarations).
+        ptx.push_str("    { // PCA Tier B per-q_iter scope\n");
+        ptx.push_str("    // PCA Tier B: derive kv-tile ordinal from %k_start\n");
+        ptx.push_str("    .reg .u64 %rd_kvt_ord_TB;\n");
+        ptx.push_str("    .reg .u32 %r_kvt_ord_TB;\n");
+        ptx.push_str(&format!(
+            "    shr.b64 %rd_kvt_ord_TB, %k_start, {log2_bkv};\n"
+        ));
+        ptx.push_str("    cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;\n");
+        crate::pca_tilerange::emit_skip_predicate(
+            ptx,
+            config,
+            seq_len,
+            "%bid_x", // global q-tile index for THIS CTA (grid_x = num_q_tiles)
+            "%r_kvt_ord_TB",
+            range_table_base,
+            &skip_label,
+            // Forward FA-2: per-CTA q-tile fixed by %bid_x, q-iter
+            // Rust-unrolled, kv-tile is the PTX-runtime inner loop.
+            crate::pca_tilerange::IterationOrder::QOuter,
+        );
+        ptx.push_str("    } // end PCA Tier B per-q_iter scope\n");
     }
 
     // J-A5 direct_scale: snapshot %scale (the 1/sqrt(d_k) param loaded at

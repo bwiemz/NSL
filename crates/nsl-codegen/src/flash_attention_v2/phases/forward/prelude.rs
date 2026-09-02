@@ -539,21 +539,21 @@ pub fn emit_with_smem_override(
         // PCA Tier B range-table preamble (only when admitted).
         // Runs after bar.sync 0 so segment_ids SMEM values are visible to all threads.
         // The preamble builds per-tile min/max tables used by emit_skip_predicate.
-        if let Some((seq_len, residency)) = tier_b {
-            if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-                let range_table_base =
-                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
-                        config,
-                        crate::flash_attention_v2::smem_layout::Direction::Forward,
-                    );
-                crate::pca_tilerange::emit_range_table_preamble(
-                    ptx,
+        if let Some((seq_len, residency)) = tier_b
+            && crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+        {
+            let range_table_base =
+                crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
                     config,
-                    seq_len,
-                    "seg_smem",
-                    range_table_base,
+                    crate::flash_attention_v2::smem_layout::Direction::Forward,
                 );
-            }
+            crate::pca_tilerange::emit_range_table_preamble(
+                ptx,
+                config,
+                seq_len,
+                "seg_smem",
+                range_table_base,
+            );
         }
     }
 }

@@ -96,15 +96,15 @@ impl Compiler<'_> {
         let pipeline_fn_names: std::collections::HashSet<String> = stmts
             .iter()
             .filter_map(|s| {
-                if let StmtKind::Decorated { decorators, stmt } = &s.kind {
-                    if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                        let is_pipeline = decorators.iter().any(|d| {
-                            d.name.len() == 1
-                                && self.resolve_sym(d.name[0]) == "pipeline_agent"
-                        });
-                        if is_pipeline {
-                            return Some(self.resolve_sym(fn_def.name).to_string());
-                        }
+                if let StmtKind::Decorated { decorators, stmt } = &s.kind
+                    && let StmtKind::FnDef(fn_def) = &stmt.kind
+                {
+                    let is_pipeline = decorators.iter().any(|d| {
+                        d.name.len() == 1
+                            && self.resolve_sym(d.name[0]) == "pipeline_agent"
+                    });
+                    if is_pipeline {
+                        return Some(self.resolve_sym(fn_def.name).to_string());
                     }
                 }
                 None
@@ -490,13 +490,13 @@ impl Compiler<'_> {
             // synthesized name also happens to match a real field (it does
             // not in practice, so access returns null until the init pass is
             // wired). See DONE_WITH_CONCERNS in the B.2.1 Task 2 report.
-            if let Some(layout) = self.types.struct_layouts.get(&model_name) {
-                if let Some(slot_off) = layout.adapter_sidetable_offset {
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    builder
-                        .ins()
-                        .store(MemFlagsData::trusted(), zero, ptr, slot_off as i32);
-                }
+            if let Some(layout) = self.types.struct_layouts.get(&model_name)
+                && let Some(slot_off) = layout.adapter_sidetable_offset
+            {
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), zero, ptr, slot_off as i32);
             }
 
             // M25: Initialize paged KV cache if model has @paged_kv

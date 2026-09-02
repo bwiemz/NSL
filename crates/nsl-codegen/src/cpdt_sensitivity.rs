@@ -218,10 +218,10 @@ pub fn classify_layer_kind(name: &str, layer: Option<u32>, n_layers: u32) -> Lay
 
 pub fn layer_of(name: &str) -> Option<u32> {
     for prefix in ["blocks.", "layers.", "h."] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            if let Some(end) = rest.find('.') {
-                return rest[..end].parse::<u32>().ok();
-            }
+        if let Some(rest) = name.strip_prefix(prefix)
+            && let Some(end) = rest.find('.')
+        {
+            return rest[..end].parse::<u32>().ok();
         }
     }
     None

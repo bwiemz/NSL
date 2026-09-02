@@ -99,24 +99,22 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
     // Pre-rendered real-liveness timeline (render_text uses it in place of
     // the approximate renderer when the real path succeeded).
     let mut real_timeline_text: Option<String> = None;
-    if args.memory {
-        if let (Some(c), Some(w)) = (&captures, &real_wengert) {
-            if let Some(rt) =
-                nsl_codegen::profiling::real_timeline::build_training_timeline(
-                    w,
-                    &c.var_size_hints,
-                )
-            {
-                report.memory_timeline = Some(rt.entries.clone());
-                report.memory_timeline_approximate = Some(false);
-                report.memory_what_if = Some(rt.what_if.clone());
-                report.memory_peak_bytes = Some(rt.peak_bytes);
-                report.memory_unsized_vars = Some(rt.unsized_vars);
-                report.memory_total_vars = Some(rt.sized_vars + rt.unsized_vars);
-                real_timeline_text =
-                    Some(nsl_codegen::profiling::real_timeline::render(&rt, 48));
-            }
-        }
+    if args.memory
+        && let (Some(c), Some(w)) = (&captures, &real_wengert)
+        && let Some(rt) =
+            nsl_codegen::profiling::real_timeline::build_training_timeline(
+                w,
+                &c.var_size_hints,
+            )
+    {
+        report.memory_timeline = Some(rt.entries.clone());
+        report.memory_timeline_approximate = Some(false);
+        report.memory_what_if = Some(rt.what_if.clone());
+        report.memory_peak_bytes = Some(rt.peak_bytes);
+        report.memory_unsized_vars = Some(rt.unsized_vars);
+        report.memory_total_vars = Some(rt.sized_vars + rt.unsized_vars);
+        real_timeline_text =
+            Some(nsl_codegen::profiling::real_timeline::render(&rt, 48));
     }
 
     if args.memory && real_timeline_text.is_none() {

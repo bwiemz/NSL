@@ -193,22 +193,21 @@ impl Compiler<'_> {
                         if pname == "self" {
                             continue;
                         }
-                        if let Some(ref type_ann) = param.type_ann {
-                            if let TypeExprKind::Tensor {
+                        if let Some(ref type_ann) = param.type_ann
+                            && let TypeExprKind::Tensor {
                                 device: Some(dev), ..
                             } = &type_ann.kind
-                            {
-                                let target_device: i64 = match dev {
-                                    DeviceExpr::Cpu => 0,
-                                    DeviceExpr::Cuda(_) => 1,
-                                    // Metal/ROCm/NPU not yet modelled in Task 19 v1.
-                                    _ => {
-                                        call_arg_idx += 1;
-                                        continue;
-                                    }
-                                };
-                                device_transfers.push((call_arg_idx, target_device));
-                            }
+                        {
+                            let target_device: i64 = match dev {
+                                DeviceExpr::Cpu => 0,
+                                DeviceExpr::Cuda(_) => 1,
+                                // Metal/ROCm/NPU not yet modelled in Task 19 v1.
+                                _ => {
+                                    call_arg_idx += 1;
+                                    continue;
+                                }
+                            };
+                            device_transfers.push((call_arg_idx, target_device));
                         }
                         call_arg_idx += 1;
                     }
@@ -672,12 +671,11 @@ fn find_pipeline_agent_decorator_args(
     fn_def: &nsl_ast::decl::FnDef,
 ) -> Vec<Symbol> {
     for stmt in all_stmts {
-        if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind {
-            if let StmtKind::FnDef(fd) = &inner.kind {
-                if fd.name == fn_def.name {
-                    return extract_agents_from_decorators(compiler, decorators);
-                }
-            }
+        if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind
+            && let StmtKind::FnDef(fd) = &inner.kind
+            && fd.name == fn_def.name
+        {
+            return extract_agents_from_decorators(compiler, decorators);
         }
     }
     Vec::new()

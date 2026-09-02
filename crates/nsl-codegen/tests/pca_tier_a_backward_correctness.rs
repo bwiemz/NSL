@@ -219,10 +219,10 @@ fn flash_attention_forward_reference_with_stats(
         };
 
         for (j, score_slot) in scores.iter_mut().enumerate().take(j_max) {
-            if let Some(seg_i) = seg_i {
-                if seg_ids[j] != seg_i {
-                    continue;
-                }
+            if let Some(seg_i) = seg_i
+                && seg_ids[j] != seg_i
+            {
+                continue;
             }
             let kj = j * head_dim;
             let mut score = 0.0f32;

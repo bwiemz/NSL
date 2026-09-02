@@ -43,57 +43,57 @@ fn parse_expr_bp_nested(p: &mut Parser, min_bp: u8) -> Expr {
         }
 
         // Try pipe operator specially
-        if let TokenKind::Pipe = p.peek() {
-            if let Some((l_bp, r_bp)) = pratt::infix_binding_power(p.peek()) {
-                if l_bp < min_bp {
-                    break;
-                }
-                let start = lhs.span;
-                p.advance(); // consume |>
-                let rhs = parse_expr_bp(p, r_bp);
-                let span = start.merge(rhs.span);
-                lhs = Expr {
-                    kind: ExprKind::Pipe {
-                        left: Box::new(lhs),
-                        right: Box::new(rhs),
-                    },
-                    span,
-                    id: p.next_node_id(),
-                };
-                continue;
+        if let TokenKind::Pipe = p.peek()
+            && let Some((l_bp, r_bp)) = pratt::infix_binding_power(p.peek())
+        {
+            if l_bp < min_bp {
+                break;
             }
+            let start = lhs.span;
+            p.advance(); // consume |>
+            let rhs = parse_expr_bp(p, r_bp);
+            let span = start.merge(rhs.span);
+            lhs = Expr {
+                kind: ExprKind::Pipe {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                },
+                span,
+                id: p.next_node_id(),
+            };
+            continue;
         }
 
         // Try range operators
-        if matches!(p.peek(), TokenKind::DotDot | TokenKind::DotDotEq) {
-            if let Some((l_bp, r_bp)) = pratt::infix_binding_power(p.peek()) {
-                if l_bp < min_bp {
-                    break;
-                }
-                let start = lhs.span;
-                let inclusive = matches!(p.peek(), &TokenKind::DotDotEq);
-                p.advance();
-                // Range end is optional
-                let end = if can_start_expr(p.peek()) {
-                    Some(Box::new(parse_expr_bp(p, r_bp)))
-                } else {
-                    None
-                };
-                let span = end
-                    .as_ref()
-                    .map(|e| start.merge(e.span))
-                    .unwrap_or(start);
-                lhs = Expr {
-                    kind: ExprKind::Range {
-                        start: Some(Box::new(lhs)),
-                        end,
-                        inclusive,
-                    },
-                    span,
-                    id: p.next_node_id(),
-                };
-                continue;
+        if matches!(p.peek(), TokenKind::DotDot | TokenKind::DotDotEq)
+            && let Some((l_bp, r_bp)) = pratt::infix_binding_power(p.peek())
+        {
+            if l_bp < min_bp {
+                break;
             }
+            let start = lhs.span;
+            let inclusive = matches!(p.peek(), &TokenKind::DotDotEq);
+            p.advance();
+            // Range end is optional
+            let end = if can_start_expr(p.peek()) {
+                Some(Box::new(parse_expr_bp(p, r_bp)))
+            } else {
+                None
+            };
+            let span = end
+                .as_ref()
+                .map(|e| start.merge(e.span))
+                .unwrap_or(start);
+            lhs = Expr {
+                kind: ExprKind::Range {
+                    start: Some(Box::new(lhs)),
+                    end,
+                    inclusive,
+                },
+                span,
+                id: p.next_node_id(),
+            };
+            continue;
         }
 
         // Try infix
@@ -422,24 +422,24 @@ pub fn parse_args(p: &mut Parser) -> Vec<Arg> {
             }
             _ => None,
         };
-        if let Some(sym) = kwarg_sym {
-            if matches!(p.peek_at(1), &TokenKind::Eq) {
-                let name = sym;
-                p.advance(); // consume ident/keyword
-                p.advance(); // consume =
-                let value = parse_expr(p);
-                let span = start.merge(value.span);
-                args.push(Arg {
-                    name: Some(name.into()),
-                    value,
-                    span,
-                });
+        if let Some(sym) = kwarg_sym
+            && matches!(p.peek_at(1), &TokenKind::Eq)
+        {
+            let name = sym;
+            p.advance(); // consume ident/keyword
+            p.advance(); // consume =
+            let value = parse_expr(p);
+            let span = start.merge(value.span);
+            args.push(Arg {
+                name: Some(name.into()),
+                value,
+                span,
+            });
 
-                if !p.eat(&TokenKind::Comma) {
-                    break;
-                }
-                continue;
+            if !p.eat(&TokenKind::Comma) {
+                break;
             }
+            continue;
         }
 
         // Positional argument

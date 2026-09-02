@@ -188,13 +188,12 @@ impl Compiler<'_> {
                     // freed at consumption, enqueue it for post-statement cleanup.
                     // The actual nsl_tensor_free is emitted in free_linear_consumes()
                     // after the statement finishes using the value.
-                    if let Some(ref lowering) = state.ownership.lowering {
-                        if lowering.should_free_at_consumption(sym)
-                            && !state.param_symbols.contains(sym)
-                            && !state.non_owning_symbols.contains(sym)
-                        {
-                            state.ownership.linear_consume_pending.push(val);
-                        }
+                    if let Some(ref lowering) = state.ownership.lowering
+                        && lowering.should_free_at_consumption(sym)
+                        && !state.param_symbols.contains(sym)
+                        && !state.non_owning_symbols.contains(sym)
+                    {
+                        state.ownership.linear_consume_pending.push(val);
                     }
                     Ok(val)
                 } else {
@@ -461,10 +460,10 @@ impl Compiler<'_> {
         state: &FuncState,
         expr: &nsl_ast::expr::Expr,
     ) -> bool {
-        if let Some(ref lowering) = state.ownership.lowering {
-            if let nsl_ast::expr::ExprKind::Ident(sym) = &expr.kind {
-                return lowering.should_elide_refcount(sym);
-            }
+        if let Some(ref lowering) = state.ownership.lowering
+            && let nsl_ast::expr::ExprKind::Ident(sym) = &expr.kind
+        {
+            return lowering.should_elide_refcount(sym);
         }
         false
     }
@@ -680,11 +679,11 @@ impl Compiler<'_> {
         if self.expr_result_is_owned_temporary(expr) {
             return true;
         }
-        if let ExprKind::Call { callee, .. } = &expr.kind {
-            if let ExprKind::Ident(sym) = &callee.kind {
-                let name = self.resolve_sym(*sym);
-                return self.registry.functions.contains_key(name);
-            }
+        if let ExprKind::Call { callee, .. } = &expr.kind
+            && let ExprKind::Ident(sym) = &callee.kind
+        {
+            let name = self.resolve_sym(*sym);
+            return self.registry.functions.contains_key(name);
         }
         false
     }
@@ -703,12 +702,11 @@ impl Compiler<'_> {
     /// finding on 734c548e). Everything else genuinely falls through to
     /// tensor dispatch.
     fn indeterminate_receiver_takes_tensor_dispatch(&self, object: &Expr) -> bool {
-        if let ExprKind::Ident(sym) = &object.kind {
-            if self.models.model_var_types.contains_key(sym)
-                || self.models.agent_var_types.contains_key(sym)
-            {
-                return false;
-            }
+        if let ExprKind::Ident(sym) = &object.kind
+            && (self.models.model_var_types.contains_key(sym)
+                || self.models.agent_var_types.contains_key(sym))
+        {
+            return false;
         }
         true
     }
@@ -726,16 +724,16 @@ impl Compiler<'_> {
     /// corruption, so those keep the strict tensor-type requirement
     /// (leak-not-crash).
     fn expr_is_owning_tensor_method_call(&self, expr: &Expr) -> bool {
-        if let ExprKind::Call { callee, .. } = &expr.kind {
-            if let ExprKind::MemberAccess { object, member } = &callee.kind {
-                let obj_ty = self.node_type(object.id);
-                if obj_ty.is_tensor()
-                    || (obj_ty.is_indeterminate()
-                        && self.indeterminate_receiver_takes_tensor_dispatch(object))
-                {
-                    return tensor_method_returns_owned_ref(self.resolve_sym(*member))
-                        == Some(true);
-                }
+        if let ExprKind::Call { callee, .. } = &expr.kind
+            && let ExprKind::MemberAccess { object, member } = &callee.kind
+        {
+            let obj_ty = self.node_type(object.id);
+            if obj_ty.is_tensor()
+                || (obj_ty.is_indeterminate()
+                    && self.indeterminate_receiver_takes_tensor_dispatch(object))
+            {
+                return tensor_method_returns_owned_ref(self.resolve_sym(*member))
+                    == Some(true);
             }
         }
         false
@@ -818,28 +816,28 @@ impl Compiler<'_> {
         op_name: &str,
     ) -> String {
         // Only optimize when not recording autodiff tape
-        if !state.flags.in_tape_region {
-            if let nsl_ast::expr::ExprKind::Ident(sym) = &arg_expr.kind {
-                // M38b: Ownership lowering can prove exclusive access even when
-                // use-count heuristics cannot (e.g., multi-use linear binding
-                // where all but this use have already been consumed).
-                if let Some(ref lowering) = state.ownership.lowering {
-                    if lowering.should_use_inplace(sym) {
-                        let inplace = format!("nsl_tensor_{op_name}_inplace");
-                        if self.registry.functions.contains_key(&inplace) {
-                            return inplace;
-                        }
-                    }
+        if !state.flags.in_tape_region
+            && let nsl_ast::expr::ExprKind::Ident(sym) = &arg_expr.kind
+        {
+            // M38b: Ownership lowering can prove exclusive access even when
+            // use-count heuristics cannot (e.g., multi-use linear binding
+            // where all but this use have already been consumed).
+            if let Some(ref lowering) = state.ownership.lowering
+                && lowering.should_use_inplace(sym)
+            {
+                let inplace = format!("nsl_tensor_{op_name}_inplace");
+                if self.registry.functions.contains_key(&inplace) {
+                    return inplace;
                 }
-                // The use-count heuristic fallback that used to live here
-                // (`uc.is_single_use(sym)`) is removed: a textually single-use
-                // Ident is not proof of exclusive ownership — `sym` may be
-                // bound to a model field or another live alias whose owner
-                // is reachable elsewhere (see the identical-class fix in
-                // `expr/advanced.rs`'s `.clone()` handling and ad59b929).
-                // Only the ownership-lowering branch above, which proves the
-                // absence of borrows/sharing, may select the inplace variant.
             }
+            // The use-count heuristic fallback that used to live here
+            // (`uc.is_single_use(sym)`) is removed: a textually single-use
+            // Ident is not proof of exclusive ownership — `sym` may be
+            // bound to a model field or another live alias whose owner
+            // is reachable elsewhere (see the identical-class fix in
+            // `expr/advanced.rs`'s `.clone()` handling and ad59b929).
+            // Only the ownership-lowering branch above, which proves the
+            // absence of borrows/sharing, may select the inplace variant.
         }
         format!("nsl_tensor_{op_name}")
     }

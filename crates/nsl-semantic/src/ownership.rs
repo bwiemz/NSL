@@ -102,10 +102,10 @@ impl<'a> OwnershipChecker<'a> {
         };
         self.states.insert(sym, state);
         self.tensor_bindings.insert(sym, span);
-        if self.loop_depth > 0 {
-            if let Some(set) = self.loop_defined.last_mut() {
-                set.insert(sym, true);
-            }
+        if self.loop_depth > 0
+            && let Some(set) = self.loop_defined.last_mut()
+        {
+            set.insert(sym, true);
         }
     }
 
@@ -297,14 +297,13 @@ impl<'a> OwnershipChecker<'a> {
             let consumed_in_all = branches
                 .iter()
                 .all(|branch| branch.get(&sym).map(|s| s.is_consumed()).unwrap_or(false));
-            if consumed_in_all {
-                if let Some(OwnershipState::Consumed { at, by }) = branches
+            if consumed_in_all
+                && let Some(OwnershipState::Consumed { at, by }) = branches
                     .iter()
                     .find_map(|branch| branch.get(&sym))
-                {
-                    self.states
-                        .insert(sym, OwnershipState::Consumed { at: *at, by: by.clone() });
-                }
+            {
+                self.states
+                    .insert(sym, OwnershipState::Consumed { at: *at, by: by.clone() });
             }
         }
     }

@@ -292,350 +292,350 @@ impl AdjointGenerator {
 
         for op in primal.ops.iter().rev() {
             // T7.1: check CSHA backward dispatch before per-op AD.
-            if let Some(ref claims) = self.csha_claims {
-                if let Some(&chain_idx) = claims.op_to_chain.get(&op.id) {
-                    let mark = &claims.chain_marks[chain_idx];
-                    match csha_dispatch_for_op(mark, op.id) {
-                        CshaDispatchDecision::EmitFused => {
-                            // Gap D: real kernel-launch emission for the fused
-                            // backward.  See `PrimalOp::FusedCshaBackward` in
-                            // wengert.rs + its lowerer arm in wengert_lower.rs
-                            // for the mechanical details of the launch.
-                            //
-                            // Gap D.1 claim-site fix:
-                            //   - When the dispatch map was built with a
-                            //     Wengert list that contained the SDPA op
-                            //     (production path), the primary claim is
-                            //     the SDPA op itself — by the time the
-                            //     reverse walk hits it, `y_bar(SDPA_output)`
-                            //     is already populated by downstream ops
-                            //     (output projection, residual add, etc.),
-                            //     so we consume that as `dO`. The fused
-                            //     kernel's 7 outputs then land on the
-                            //     correct VarIds (q_out/k_out/v_out/wq/wk/
-                            //     wv/x_norm) via `mark.chain_varids`. The
-                            //     Q/K/V matmul ops + RMSNorm + RoPE ops in
-                            //     the same chain map to the same chain_idx
-                            //     and return `AlreadyEmitted` on subsequent
-                            //     reverse-walk visits, suppressing their
-                            //     per-op AD (no double-accumulation).
-                            //   - When `chain_varids` is absent (structural
-                            //     tests, open-coded attention, or a partial
-                            //     chain group), we fall back to the legacy
-                            //     best-effort routing that treats `op` as a
-                            //     matmul. This is the path the T7.x unit
-                            //     tests in ad_csha_reverse_walk_wiring.rs
-                            //     exercise.
-                            let mark_layer = mark.layer.clone();
-                            let mark_kind = mark.kind;
-                            let cfg = mark.config.clone().expect(
-                                "dispatcher accepted EmitFused with None config — \
+            if let Some(ref claims) = self.csha_claims
+                && let Some(&chain_idx) = claims.op_to_chain.get(&op.id)
+            {
+                let mark = &claims.chain_marks[chain_idx];
+                match csha_dispatch_for_op(mark, op.id) {
+                    CshaDispatchDecision::EmitFused => {
+                        // Gap D: real kernel-launch emission for the fused
+                        // backward.  See `PrimalOp::FusedCshaBackward` in
+                        // wengert.rs + its lowerer arm in wengert_lower.rs
+                        // for the mechanical details of the launch.
+                        //
+                        // Gap D.1 claim-site fix:
+                        //   - When the dispatch map was built with a
+                        //     Wengert list that contained the SDPA op
+                        //     (production path), the primary claim is
+                        //     the SDPA op itself — by the time the
+                        //     reverse walk hits it, `y_bar(SDPA_output)`
+                        //     is already populated by downstream ops
+                        //     (output projection, residual add, etc.),
+                        //     so we consume that as `dO`. The fused
+                        //     kernel's 7 outputs then land on the
+                        //     correct VarIds (q_out/k_out/v_out/wq/wk/
+                        //     wv/x_norm) via `mark.chain_varids`. The
+                        //     Q/K/V matmul ops + RMSNorm + RoPE ops in
+                        //     the same chain map to the same chain_idx
+                        //     and return `AlreadyEmitted` on subsequent
+                        //     reverse-walk visits, suppressing their
+                        //     per-op AD (no double-accumulation).
+                        //   - When `chain_varids` is absent (structural
+                        //     tests, open-coded attention, or a partial
+                        //     chain group), we fall back to the legacy
+                        //     best-effort routing that treats `op` as a
+                        //     matmul. This is the path the T7.x unit
+                        //     tests in ad_csha_reverse_walk_wiring.rs
+                        //     exercise.
+                        let mark_layer = mark.layer.clone();
+                        let mark_kind = mark.kind;
+                        let cfg = mark.config.clone().expect(
+                            "dispatcher accepted EmitFused with None config — \
                                  csha_dispatch_for_op contract violated",
-                            );
-                            let chain_varids = mark.chain_varids;
-                            let is_smoke = cfg.head_dim == 32
-                                && cfg.block_q == 32
-                                && cfg.block_kv == 32
-                                && cfg.csha.as_ref().is_some_and(|c| c.d_model == 32);
+                        );
+                        let chain_varids = mark.chain_varids;
+                        let is_smoke = cfg.head_dim == 32
+                            && cfg.block_q == 32
+                            && cfg.block_kv == 32
+                            && cfg.csha.as_ref().is_some_and(|c| c.d_model == 32);
 
-                            // One event per chain.
-                            if fused_event_emitted.insert(chain_idx) {
-                                self.csha_fused_events.push(CshaFusedBackwardEvent {
-                                    layer: mark_layer.clone(),
-                                    output_op_id: op.id,
-                                    head_dim: cfg.head_dim,
-                                    block_q: cfg.block_q,
-                                    block_kv: cfg.block_kv,
-                                    smoke_config: is_smoke,
-                                    // Gap I step K: flipped below if the
-                                    // chain has a trainable gamma.
-                                    dgamma_emitted: false,
-                                });
-                                let this_event_idx = self.csha_fused_events.len() - 1;
+                        // One event per chain.
+                        if fused_event_emitted.insert(chain_idx) {
+                            self.csha_fused_events.push(CshaFusedBackwardEvent {
+                                layer: mark_layer.clone(),
+                                output_op_id: op.id,
+                                head_dim: cfg.head_dim,
+                                block_q: cfg.block_q,
+                                block_kv: cfg.block_kv,
+                                smoke_config: is_smoke,
+                                // Gap I step K: flipped below if the
+                                // chain has a trainable gamma.
+                                dgamma_emitted: false,
+                            });
+                            let this_event_idx = self.csha_fused_events.len() - 1;
 
-                                eprintln!(
-                                    "[nsl] CSHA fused backward: emitting fused launch for \
+                            eprintln!(
+                                "[nsl] CSHA fused backward: emitting fused launch for \
                                      layer '{}' (hd={}, block_q/kv={}x{}, d_model={}, smoke={})",
-                                    mark_layer,
-                                    cfg.head_dim,
-                                    cfg.block_q,
-                                    cfg.block_kv,
-                                    cfg.csha.as_ref().map_or(0, |c| c.d_model),
-                                    is_smoke,
-                                );
+                                mark_layer,
+                                cfg.head_dim,
+                                cfg.block_q,
+                                cfg.block_kv,
+                                cfg.csha.as_ref().map_or(0, |c| c.d_model),
+                                is_smoke,
+                            );
 
-                                // Chain-key VarId: the op's result (the SDPA
-                                // output when chain_varids is present, or
-                                // the matmul/rope output in the legacy
-                                // path). All 7 extract ops share this as
-                                // their first input so they hit the same
-                                // cache entry at lowering time.
-                                let chain_key = op.result;
+                            // Chain-key VarId: the op's result (the SDPA
+                            // output when chain_varids is present, or
+                            // the matmul/rope output in the legacy
+                            // path). All 7 extract ops share this as
+                            // their first input so they hit the same
+                            // cache entry at lowering time.
+                            let chain_key = op.result;
 
-                                // dO (adjoint of the fused kernel's "output"
-                                // tensor) — the Gap D.1 routing:
-                                //   - With `chain_varids`: read y_bar of the
-                                //     SDPA output (already populated by
-                                //     downstream reverse-walk iterations).
-                                //   - Without: fall back to the current op's
-                                //     y_bar (legacy best-effort placeholder).
-                                let do_source_var = chain_varids
-                                    .as_ref()
-                                    .map(|v| v.sdpa_out_var)
-                                    .unwrap_or(op.result);
-                                let do_var = self.get_or_create_adjoint(do_source_var);
+                            // dO (adjoint of the fused kernel's "output"
+                            // tensor) — the Gap D.1 routing:
+                            //   - With `chain_varids`: read y_bar of the
+                            //     SDPA output (already populated by
+                            //     downstream reverse-walk iterations).
+                            //   - Without: fall back to the current op's
+                            //     y_bar (legacy best-effort placeholder).
+                            let do_source_var = chain_varids
+                                .as_ref()
+                                .map(|v| v.sdpa_out_var)
+                                .unwrap_or(op.result);
+                            let do_var = self.get_or_create_adjoint(do_source_var);
 
-                                // Launch-op inputs (Gap I.4): the lowerer's
-                                // `FusedCshaBackward` arm indexes:
-                                //
-                                //   [0]  chain_key  — cache key; NOT a
-                                //                    real tensor read
-                                //   [1]  do_ptr    — dO adjoint
-                                //   [2]  q_ptr     — SDPA op.inputs[0]
-                                //   [3]  k_ptr     — SDPA op.inputs[1]
-                                //   [4]  v_ptr     — SDPA op.inputs[2]
-                                //   [5]  x_ptr     — RMSNorm output (x_norm)
-                                //   [6]  wq_ptr    — Q projection weight
-                                //   [7]  wk_ptr    — K projection weight
-                                //   [8]  wv_ptr    — V projection weight
-                                //   [9]  norm_w_ptr — RMSNorm gamma (or null)
-                                //
-                                // Pre-Gap-I.4 the launch only carried 5
-                                // entries (chain_key, dO, q, k, v). The
-                                // lowerer's null-default branches left
-                                // wq/wk/wv/x/norm_weight at null, and the
-                                // backward PTX's per-weight null-guard
-                                // (csha_hooks_backward.rs:348-350) then
-                                // skipped `V2_BWD_DPROJ_{WQ,WK,WV}_LOOP`,
-                                // returning zero-filled dwq/dwk/dwv. This
-                                // is Gap I step J's fix: push the 5 extra
-                                // VarIds when chain_varids is populated,
-                                // so the kernel receives real device
-                                // pointers and weight gradients are no
-                                // longer zero.
-                                //
-                                // When `chain_varids` is None (legacy
-                                // per-chain marks, structural tests, or
-                                // floating chains without SDPA), stick
-                                // to the 5-entry shape so the lowerer's
-                                // null-default path kicks in — those
-                                // code paths don't populate CSHA saves
-                                // and can't safely launch the backward
-                                // kernel anyway.
-                                // Launch-op inputs contract (from the
-                                // doc block above): positions [2..5) carry
-                                // **only** q, k, v — the SDPA op's first
-                                // three tensor inputs. `op.inputs` can hold
-                                // more than 3 entries (scaled_dot_product_attention
-                                // has a 4th scalar `scale` VarId, and
-                                // optionally a 5th causal-flag VarId;
-                                // matmul chains have exactly 2). We clip
-                                // to 3 so the x_norm/wq/wk/wv/norm_w
-                                // pushes below land at the positions the
-                                // FusedCshaBackward lowerer reads
-                                // (inputs[5..10]). Passing SDPA's `scale`
-                                // scalar at inputs[5] would shift every
-                                // subsequent slot and make the lowerer
-                                // marshal a scalar as x_ptr, wq's
-                                // shape as norm_w_ptr, etc. — the exact
-                                // symptom seen in the device-placement
-                                // trace (a CU_MEMORYTYPE_DEVICE address
-                                // read from what should have been a
-                                // 4 KB f32 tensor but was interpreted as
-                                // a scale-bits i64 scalar handle).
-                                let mut launch_inputs = vec![chain_key, do_var];
-                                launch_inputs.extend(op.inputs.iter().copied().take(3));
-                                if let Some(v) = chain_varids.as_ref() {
-                                    launch_inputs.push(v.x_norm_var); // [5]
-                                    launch_inputs.push(v.wq_var); // [6]
-                                    launch_inputs.push(v.wk_var); // [7]
-                                    launch_inputs.push(v.wv_var); // [8]
-                                    // Null (VarId 0) when the RMSNorm
-                                    // has no trainable gamma param. The
-                                    // backward PTX null-guards on
-                                    // `csha_norm_weight_ptr`.
-                                    launch_inputs.push(v.norm_weight_var.unwrap_or(0)); // [9]
-                                }
-
-                                let launch_result = self.emit_op(
-                                    PrimalOp::FusedCshaBackward {
-                                        layer: mark_layer.clone(),
-                                    },
-                                    launch_inputs,
-                                );
-
-                                // Gap I.2 + M: each extract op now lists the
-                                // launch op's result VarId as its FIRST input
-                                // so `eliminate_dead_gradients`' worklist walk
-                                // (which traverses `op.inputs` back from
-                                // `needed_vars`) reaches the launch op via any
-                                // live extract. Without this, the launch's
-                                // result is referenced by nothing and the pass
-                                // prunes it — leaving the extracts to fail
-                                // with "no cache entry".
-                                //
-                                // The launch's Cranelift Value (inputs[0] in
-                                // the lowerer) is a placeholder zero tensor
-                                // and is not actually consumed; inputs[1] is
-                                // the `chain_key` used to look up the cache.
-                                let mut extract_results: [VarId; 8] = [0u32; 8];
-                                for component in 0u8..=7u8 {
-                                    let r = self.emit_op(
-                                        PrimalOp::CshaFusedBackwardExtract { component },
-                                        vec![launch_result, chain_key],
-                                    );
-                                    extract_results[component as usize] = r;
-                                }
-
-                                // Route the 8 outputs to the right VarIds.
-                                if let Some(v) = chain_varids {
-                                    // Gap D.1 primary routing (extended by
-                                    // Gap I.5 Option A): outputs land on the
-                                    // correct primal VarIds, so downstream
-                                    // accumulate_adjoint calls for the
-                                    // SUPPRESSED per-op backward
-                                    // (matmul/RMSNorm/RoPE) don't run and no
-                                    // double-accumulation occurs.
-                                    //   0 = dq      → q_out_var (Q matmul or RoPE-Q output)
-                                    //   1 = dk      → k_out_var
-                                    //   2 = dv      → v_out_var
-                                    //   3 = dwq     → wq_var
-                                    //   4 = dwk     → wk_var
-                                    //   5 = dwv     → wv_var
-                                    //   6 = dx_raw  → x_raw_var (pre-RMSNorm input)
-                                    //   7 = dx_norm → x_norm_var (RMSNorm output — dy_norm)
-                                    //
-                                    // Pre-Gap-I.5 Option A the routing sent
-                                    // extract[6] (dx_raw) to `x_norm_var`,
-                                    // which was semantically wrong but
-                                    // benign (nothing downstream read it).
-                                    // Now extract[6] goes to `x_raw_var`
-                                    // (correct — it's the gradient w.r.t.
-                                    // the pre-RMSNorm input) and the new
-                                    // extract[7] (dx_norm) goes to
-                                    // `x_norm_var` (correct — it's the
-                                    // gradient w.r.t. the RMSNorm output).
-                                    self.accumulate_adjoint(v.q_out_var, extract_results[0]);
-                                    self.accumulate_adjoint(v.k_out_var, extract_results[1]);
-                                    self.accumulate_adjoint(v.v_out_var, extract_results[2]);
-                                    self.accumulate_adjoint(v.wq_var, extract_results[3]);
-                                    self.accumulate_adjoint(v.wk_var, extract_results[4]);
-                                    self.accumulate_adjoint(v.wv_var, extract_results[5]);
-                                    // Route dx_raw to x_raw_var when known;
-                                    // fall back to x_norm_var (legacy
-                                    // routing) when the chain didn't
-                                    // resolve x_raw_var. This keeps the
-                                    // Gap D.1 contract for chains without a
-                                    // trainable RMSNorm (no x_raw_var
-                                    // resolution is performed in that case).
-                                    let x_raw_target =
-                                        v.x_raw_var.unwrap_or(v.x_norm_var);
-                                    self.accumulate_adjoint(x_raw_target, extract_results[6]);
-                                    self.accumulate_adjoint(v.x_norm_var, extract_results[7]);
-
-                                    // Gap I step K: standalone RMSNorm
-                                    // gamma gradient. The suppressed per-op
-                                    // backward for the RMSNorm op
-                                    // (`AlreadyEmitted`) would have
-                                    // emitted the RMSNorm gamma adjoint via
-                                    // `ad_rules.rs:~388`; we replicate
-                                    // that here so gamma receives a real
-                                    // gradient instead of cascade-skipping
-                                    // out of the lowered grad var set.
-                                    //
-                                    // Option B from the Gap I design
-                                    // doc § K: reuse the existing per-op
-                                    // AD lowering rather than adding an
-                                    // 8th kernel output. Zero PTX
-                                    // changes; zero new primal ops.
-                                    //
-                                    // Formula: `dgamma = reduce(y_bar * x / rms)`
-                                    // matches `RmsNormGammaBackward`'s
-                                    // lowering. Gap I.5 Option-A fix: now
-                                    // uses `extract_results[7]` (= dx_norm,
-                                    // the gradient w.r.t. the RMSNorm
-                                    // OUTPUT), which is exactly `dy_norm` —
-                                    // the semantically correct input for
-                                    // `RmsNormGammaBackward`'s `grad`
-                                    // argument. Previously extract[6]
-                                    // (dx_raw, post-dRMSNorm) was used,
-                                    // producing numerically incorrect
-                                    // dgamma values when the CSHA
-                                    // dispatcher claim fired on programs
-                                    // with trainable gamma.
-                                    if let (Some(gamma_var), Some(x_raw_var)) =
-                                        (v.norm_weight_var, v.x_raw_var)
-                                    {
-                                        let dgamma = self.lower_adjoint_expr(
-                                            AdjointExpr::RmsNormGammaBackward(
-                                                extract_results[7],
-                                                x_raw_var,
-                                                v.rmsnorm_eps,
-                                                gamma_var,
-                                            ),
-                                        );
-                                        self.accumulate_adjoint(gamma_var, dgamma);
-                                        if let Some(ev) =
-                                            self.csha_fused_events.get_mut(this_event_idx)
-                                        {
-                                            ev.dgamma_emitted = true;
-                                        }
-                                        eprintln!(
-                                            "[nsl] CSHA fused backward: emitted dgamma \
-                                             (NormGammaBackward) for layer '{}' → \
-                                             gamma VarId {} (x_raw VarId {}, eps={:e})",
-                                            mark_layer,
-                                            gamma_var,
-                                            x_raw_var,
-                                            v.rmsnorm_eps,
-                                        );
-                                    }
-                                } else {
-                                    // Legacy best-effort routing: treat `op`
-                                    // as a matmul. Wrong for RoPE/norm, but
-                                    // kept for the structural unit tests
-                                    // that don't construct a full SDPA op.
-                                    use crate::csha_boundary::ProjKind;
-                                    let (proj_component, weight_component) = match mark_kind {
-                                        Some(ProjKind::Q) => (0u8, 3u8),
-                                        Some(ProjKind::K) => (1u8, 4u8),
-                                        Some(ProjKind::V) => (2u8, 5u8),
-                                        None => (0u8, 3u8),
-                                    };
-                                    self.accumulate_adjoint(
-                                        op.result,
-                                        extract_results[proj_component as usize],
-                                    );
-                                    if let Some(&weight_vid) = op.inputs.get(1) {
-                                        self.accumulate_adjoint(
-                                            weight_vid,
-                                            extract_results[weight_component as usize],
-                                        );
-                                    }
-                                    if let Some(&x_vid) = op.inputs.first() {
-                                        self.accumulate_adjoint(x_vid, extract_results[6]);
-                                    }
-                                }
-
-                                // We emitted the fused launch + extracts;
-                                // skip per-op AD for this op (the fused
-                                // kernel's gradients already cover it).
-                                continue;
+                            // Launch-op inputs (Gap I.4): the lowerer's
+                            // `FusedCshaBackward` arm indexes:
+                            //
+                            //   [0]  chain_key  — cache key; NOT a
+                            //                    real tensor read
+                            //   [1]  do_ptr    — dO adjoint
+                            //   [2]  q_ptr     — SDPA op.inputs[0]
+                            //   [3]  k_ptr     — SDPA op.inputs[1]
+                            //   [4]  v_ptr     — SDPA op.inputs[2]
+                            //   [5]  x_ptr     — RMSNorm output (x_norm)
+                            //   [6]  wq_ptr    — Q projection weight
+                            //   [7]  wk_ptr    — K projection weight
+                            //   [8]  wv_ptr    — V projection weight
+                            //   [9]  norm_w_ptr — RMSNorm gamma (or null)
+                            //
+                            // Pre-Gap-I.4 the launch only carried 5
+                            // entries (chain_key, dO, q, k, v). The
+                            // lowerer's null-default branches left
+                            // wq/wk/wv/x/norm_weight at null, and the
+                            // backward PTX's per-weight null-guard
+                            // (csha_hooks_backward.rs:348-350) then
+                            // skipped `V2_BWD_DPROJ_{WQ,WK,WV}_LOOP`,
+                            // returning zero-filled dwq/dwk/dwv. This
+                            // is Gap I step J's fix: push the 5 extra
+                            // VarIds when chain_varids is populated,
+                            // so the kernel receives real device
+                            // pointers and weight gradients are no
+                            // longer zero.
+                            //
+                            // When `chain_varids` is None (legacy
+                            // per-chain marks, structural tests, or
+                            // floating chains without SDPA), stick
+                            // to the 5-entry shape so the lowerer's
+                            // null-default path kicks in — those
+                            // code paths don't populate CSHA saves
+                            // and can't safely launch the backward
+                            // kernel anyway.
+                            // Launch-op inputs contract (from the
+                            // doc block above): positions [2..5) carry
+                            // **only** q, k, v — the SDPA op's first
+                            // three tensor inputs. `op.inputs` can hold
+                            // more than 3 entries (scaled_dot_product_attention
+                            // has a 4th scalar `scale` VarId, and
+                            // optionally a 5th causal-flag VarId;
+                            // matmul chains have exactly 2). We clip
+                            // to 3 so the x_norm/wq/wk/wv/norm_w
+                            // pushes below land at the positions the
+                            // FusedCshaBackward lowerer reads
+                            // (inputs[5..10]). Passing SDPA's `scale`
+                            // scalar at inputs[5] would shift every
+                            // subsequent slot and make the lowerer
+                            // marshal a scalar as x_ptr, wq's
+                            // shape as norm_w_ptr, etc. — the exact
+                            // symptom seen in the device-placement
+                            // trace (a CU_MEMORYTYPE_DEVICE address
+                            // read from what should have been a
+                            // 4 KB f32 tensor but was interpreted as
+                            // a scale-bits i64 scalar handle).
+                            let mut launch_inputs = vec![chain_key, do_var];
+                            launch_inputs.extend(op.inputs.iter().copied().take(3));
+                            if let Some(v) = chain_varids.as_ref() {
+                                launch_inputs.push(v.x_norm_var); // [5]
+                                launch_inputs.push(v.wq_var); // [6]
+                                launch_inputs.push(v.wk_var); // [7]
+                                launch_inputs.push(v.wv_var); // [8]
+                                // Null (VarId 0) when the RMSNorm
+                                // has no trainable gamma param. The
+                                // backward PTX null-guards on
+                                // `csha_norm_weight_ptr`.
+                                launch_inputs.push(v.norm_weight_var.unwrap_or(0)); // [9]
                             }
 
-                            // Already emitted for this chain — skip per-op AD
-                            // so we don't double-accumulate.
+                            let launch_result = self.emit_op(
+                                PrimalOp::FusedCshaBackward {
+                                    layer: mark_layer.clone(),
+                                },
+                                launch_inputs,
+                            );
+
+                            // Gap I.2 + M: each extract op now lists the
+                            // launch op's result VarId as its FIRST input
+                            // so `eliminate_dead_gradients`' worklist walk
+                            // (which traverses `op.inputs` back from
+                            // `needed_vars`) reaches the launch op via any
+                            // live extract. Without this, the launch's
+                            // result is referenced by nothing and the pass
+                            // prunes it — leaving the extracts to fail
+                            // with "no cache entry".
+                            //
+                            // The launch's Cranelift Value (inputs[0] in
+                            // the lowerer) is a placeholder zero tensor
+                            // and is not actually consumed; inputs[1] is
+                            // the `chain_key` used to look up the cache.
+                            let mut extract_results: [VarId; 8] = [0u32; 8];
+                            for component in 0u8..=7u8 {
+                                let r = self.emit_op(
+                                    PrimalOp::CshaFusedBackwardExtract { component },
+                                    vec![launch_result, chain_key],
+                                );
+                                extract_results[component as usize] = r;
+                            }
+
+                            // Route the 8 outputs to the right VarIds.
+                            if let Some(v) = chain_varids {
+                                // Gap D.1 primary routing (extended by
+                                // Gap I.5 Option A): outputs land on the
+                                // correct primal VarIds, so downstream
+                                // accumulate_adjoint calls for the
+                                // SUPPRESSED per-op backward
+                                // (matmul/RMSNorm/RoPE) don't run and no
+                                // double-accumulation occurs.
+                                //   0 = dq      → q_out_var (Q matmul or RoPE-Q output)
+                                //   1 = dk      → k_out_var
+                                //   2 = dv      → v_out_var
+                                //   3 = dwq     → wq_var
+                                //   4 = dwk     → wk_var
+                                //   5 = dwv     → wv_var
+                                //   6 = dx_raw  → x_raw_var (pre-RMSNorm input)
+                                //   7 = dx_norm → x_norm_var (RMSNorm output — dy_norm)
+                                //
+                                // Pre-Gap-I.5 Option A the routing sent
+                                // extract[6] (dx_raw) to `x_norm_var`,
+                                // which was semantically wrong but
+                                // benign (nothing downstream read it).
+                                // Now extract[6] goes to `x_raw_var`
+                                // (correct — it's the gradient w.r.t.
+                                // the pre-RMSNorm input) and the new
+                                // extract[7] (dx_norm) goes to
+                                // `x_norm_var` (correct — it's the
+                                // gradient w.r.t. the RMSNorm output).
+                                self.accumulate_adjoint(v.q_out_var, extract_results[0]);
+                                self.accumulate_adjoint(v.k_out_var, extract_results[1]);
+                                self.accumulate_adjoint(v.v_out_var, extract_results[2]);
+                                self.accumulate_adjoint(v.wq_var, extract_results[3]);
+                                self.accumulate_adjoint(v.wk_var, extract_results[4]);
+                                self.accumulate_adjoint(v.wv_var, extract_results[5]);
+                                // Route dx_raw to x_raw_var when known;
+                                // fall back to x_norm_var (legacy
+                                // routing) when the chain didn't
+                                // resolve x_raw_var. This keeps the
+                                // Gap D.1 contract for chains without a
+                                // trainable RMSNorm (no x_raw_var
+                                // resolution is performed in that case).
+                                let x_raw_target =
+                                    v.x_raw_var.unwrap_or(v.x_norm_var);
+                                self.accumulate_adjoint(x_raw_target, extract_results[6]);
+                                self.accumulate_adjoint(v.x_norm_var, extract_results[7]);
+
+                                // Gap I step K: standalone RMSNorm
+                                // gamma gradient. The suppressed per-op
+                                // backward for the RMSNorm op
+                                // (`AlreadyEmitted`) would have
+                                // emitted the RMSNorm gamma adjoint via
+                                // `ad_rules.rs:~388`; we replicate
+                                // that here so gamma receives a real
+                                // gradient instead of cascade-skipping
+                                // out of the lowered grad var set.
+                                //
+                                // Option B from the Gap I design
+                                // doc § K: reuse the existing per-op
+                                // AD lowering rather than adding an
+                                // 8th kernel output. Zero PTX
+                                // changes; zero new primal ops.
+                                //
+                                // Formula: `dgamma = reduce(y_bar * x / rms)`
+                                // matches `RmsNormGammaBackward`'s
+                                // lowering. Gap I.5 Option-A fix: now
+                                // uses `extract_results[7]` (= dx_norm,
+                                // the gradient w.r.t. the RMSNorm
+                                // OUTPUT), which is exactly `dy_norm` —
+                                // the semantically correct input for
+                                // `RmsNormGammaBackward`'s `grad`
+                                // argument. Previously extract[6]
+                                // (dx_raw, post-dRMSNorm) was used,
+                                // producing numerically incorrect
+                                // dgamma values when the CSHA
+                                // dispatcher claim fired on programs
+                                // with trainable gamma.
+                                if let (Some(gamma_var), Some(x_raw_var)) =
+                                    (v.norm_weight_var, v.x_raw_var)
+                                {
+                                    let dgamma = self.lower_adjoint_expr(
+                                        AdjointExpr::RmsNormGammaBackward(
+                                            extract_results[7],
+                                            x_raw_var,
+                                            v.rmsnorm_eps,
+                                            gamma_var,
+                                        ),
+                                    );
+                                    self.accumulate_adjoint(gamma_var, dgamma);
+                                    if let Some(ev) =
+                                        self.csha_fused_events.get_mut(this_event_idx)
+                                    {
+                                        ev.dgamma_emitted = true;
+                                    }
+                                    eprintln!(
+                                        "[nsl] CSHA fused backward: emitted dgamma \
+                                             (NormGammaBackward) for layer '{}' → \
+                                             gamma VarId {} (x_raw VarId {}, eps={:e})",
+                                        mark_layer,
+                                        gamma_var,
+                                        x_raw_var,
+                                        v.rmsnorm_eps,
+                                    );
+                                }
+                            } else {
+                                // Legacy best-effort routing: treat `op`
+                                // as a matmul. Wrong for RoPE/norm, but
+                                // kept for the structural unit tests
+                                // that don't construct a full SDPA op.
+                                use crate::csha_boundary::ProjKind;
+                                let (proj_component, weight_component) = match mark_kind {
+                                    Some(ProjKind::Q) => (0u8, 3u8),
+                                    Some(ProjKind::K) => (1u8, 4u8),
+                                    Some(ProjKind::V) => (2u8, 5u8),
+                                    None => (0u8, 3u8),
+                                };
+                                self.accumulate_adjoint(
+                                    op.result,
+                                    extract_results[proj_component as usize],
+                                );
+                                if let Some(&weight_vid) = op.inputs.get(1) {
+                                    self.accumulate_adjoint(
+                                        weight_vid,
+                                        extract_results[weight_component as usize],
+                                    );
+                                }
+                                if let Some(&x_vid) = op.inputs.first() {
+                                    self.accumulate_adjoint(x_vid, extract_results[6]);
+                                }
+                            }
+
+                            // We emitted the fused launch + extracts;
+                            // skip per-op AD for this op (the fused
+                            // kernel's gradients already cover it).
                             continue;
                         }
-                        CshaDispatchDecision::AlreadyEmitted => {
-                            // The fused kernel already handles this op's gradient.
-                            // Skip per-op AD entirely.
-                            continue;
-                        }
-                        CshaDispatchDecision::Fallback { diagnostic } => {
-                            self.csha_diagnostics.push(diagnostic);
-                            // Fall through to per-op AD below.
-                        }
+
+                        // Already emitted for this chain — skip per-op AD
+                        // so we don't double-accumulate.
+                        continue;
+                    }
+                    CshaDispatchDecision::AlreadyEmitted => {
+                        // The fused kernel already handles this op's gradient.
+                        // Skip per-op AD entirely.
+                        continue;
+                    }
+                    CshaDispatchDecision::Fallback { diagnostic } => {
+                        self.csha_diagnostics.push(diagnostic);
+                        // Fall through to per-op AD below.
                     }
                 }
             }
@@ -1653,12 +1653,11 @@ pub fn fuse_rmsnorm_dx_residual(
     }
 
     let is_dx = |op: &crate::wengert::WengertOp| -> Option<String> {
-        if let PrimalOp::Passthrough(name) = &op.op {
-            if let Some(suffix) = name.strip_prefix("rmsnorm_dx_backward:") {
-                if op.inputs.len() == 3 {
-                    return Some(suffix.to_string());
-                }
-            }
+        if let PrimalOp::Passthrough(name) = &op.op
+            && let Some(suffix) = name.strip_prefix("rmsnorm_dx_backward:")
+            && op.inputs.len() == 3
+        {
+            return Some(suffix.to_string());
         }
         None
     };
@@ -3229,17 +3228,16 @@ impl<'a> WengertExtractor<'a> {
         // `ScaledDotProductAttention` (high-rank output) and `Conv2d`
         // (if/when it appears).  Refuse the substitution and fall
         // through to the composite path.
-        if let Some(bv) = bias_var {
-            if let Some(bias_producer) = self.list.find_producer(bv) {
-                if matches!(
-                    bias_producer.op,
-                    PrimalOp::Matmul | PrimalOp::ScaledDotProductAttention { .. }
-                ) {
-                    return Err(FusedLceDecline::BiasSlotIsHighRank {
-                        producer: describe_primal_op(&bias_producer.op),
-                    });
-                }
-            }
+        if let Some(bv) = bias_var
+            && let Some(bias_producer) = self.list.find_producer(bv)
+            && matches!(
+                bias_producer.op,
+                PrimalOp::Matmul | PrimalOp::ScaledDotProductAttention { .. }
+            )
+        {
+            return Err(FusedLceDecline::BiasSlotIsHighRank {
+                producer: describe_primal_op(&bias_producer.op),
+            });
         }
         if matmul_op.inputs.len() != 2 {
             return Err(FusedLceDecline::MatmulArity {
@@ -3317,10 +3315,10 @@ impl<'a> WengertExtractor<'a> {
         // Absent-key semantics: we can't PROVE non-2D, so we conservatively
         // fire — matching the pre-v10 behaviour for unannotated
         // `Tensor` params.
-        if let Some(&r) = self.known_ranks.get(&w_var) {
-            if r != 2 {
-                return Err(FusedLceDecline::WeightRankNot2 { rank: r });
-            }
+        if let Some(&r) = self.known_ranks.get(&w_var)
+            && r != 2
+        {
+            return Err(FusedLceDecline::WeightRankNot2 { rank: r });
         }
         Ok(FusedLceMatch {
             x_var,
@@ -3859,14 +3857,14 @@ impl<'a> WengertExtractor<'a> {
 
             // Assignment: x = expr (rebind variable to new value)
             StmtKind::Assign { target, op, value } => {
-                if let nsl_ast::operator::AssignOp::Assign = op {
-                    if let nsl_ast::expr::ExprKind::Ident(sym) = &target.kind {
-                        if let Some(var) = self.extract_expr(value) {
-                            self.symbol_to_var.insert(*sym, var);
-                            return true;
-                        }
-                        return false;
+                if let nsl_ast::operator::AssignOp::Assign = op
+                    && let nsl_ast::expr::ExprKind::Ident(sym) = &target.kind
+                {
+                    if let Some(var) = self.extract_expr(value) {
+                        self.symbol_to_var.insert(*sym, var);
+                        return true;
                     }
+                    return false;
                 }
                 true
             }
@@ -3932,19 +3930,19 @@ impl<'a> WengertExtractor<'a> {
                     self.interner.resolve(member.0).unwrap_or("?").to_string()
                 });
                 let member_name = member_name_owned.as_str();
-                if member_name == "shape" || member_name == "ndim" {
-                    if let Some(obj_var) = self.extract_expr(object) {
-                        let result = self.alloc_var();
-                        self.push_op(WengertOp {
-                            id: self.list.ops.len() as u32,
-                            result,
-                            op: PrimalOp::Passthrough(member_name.to_string()),
-                            inputs: vec![obj_var],
-                            saved_for_backward: false,
-                            checkpointed: false,
-                        });
-                        return Some(result);
-                    }
+                if (member_name == "shape" || member_name == "ndim")
+                    && let Some(obj_var) = self.extract_expr(object)
+                {
+                    let result = self.alloc_var();
+                    self.push_op(WengertOp {
+                        id: self.list.ops.len() as u32,
+                        result,
+                        op: PrimalOp::Passthrough(member_name.to_string()),
+                        inputs: vec![obj_var],
+                        saved_for_backward: false,
+                        checkpointed: false,
+                    });
+                    return Some(result);
                 }
 
                 // Resolve the object prefix to a string
@@ -4047,12 +4045,12 @@ impl<'a> WengertExtractor<'a> {
                     // that drift; the coupling is documented here so a
                     // future maintainer touching collection.rs:481 sees
                     // the dependency.
-                    if let Some(ref ft) = nested_field_type {
-                        if !ft.starts_with('[') {
-                            self.context_to_model_type
-                                .entry(compound.clone())
-                                .or_insert_with(|| ft.clone());
-                        }
+                    if let Some(ref ft) = nested_field_type
+                        && !ft.starts_with('[')
+                    {
+                        self.context_to_model_type
+                            .entry(compound.clone())
+                            .or_insert_with(|| ft.clone());
                     }
 
                     if is_model_param {
@@ -4432,28 +4430,28 @@ impl<'a> WengertExtractor<'a> {
                     }
 
                     // Case 3: self.method(args) — method call on self
-                    if let ExprKind::SelfRef = &object.kind {
-                        if let Some(ctx) = self.self_context.clone() {
-                            let model_type = self.context_to_model_type.get(&ctx).cloned();
-                            if let Some(model_type) = model_type {
-                                let fn_def = self
-                                    .model_method_bodies
-                                    .get(&model_type)
-                                    .and_then(|methods| methods.get(&method_name))
-                                    .cloned();
-                                if let Some(fn_def) = fn_def {
-                                    // Pre-extract args in caller's context
-                                    let extracted = self.pre_extract_args(&fn_def, args)?;
-                                    let saved_self = self.self_context.clone();
-                                    self.self_context = Some(ctx);
-                                    let result = self.inline_method_body(
-                                        &fn_def,
-                                        extracted,
-                                        Some(model_type.as_str()),
-                                    );
-                                    self.self_context = saved_self;
-                                    return result;
-                                }
+                    if let ExprKind::SelfRef = &object.kind
+                        && let Some(ctx) = self.self_context.clone()
+                    {
+                        let model_type = self.context_to_model_type.get(&ctx).cloned();
+                        if let Some(model_type) = model_type {
+                            let fn_def = self
+                                .model_method_bodies
+                                .get(&model_type)
+                                .and_then(|methods| methods.get(&method_name))
+                                .cloned();
+                            if let Some(fn_def) = fn_def {
+                                // Pre-extract args in caller's context
+                                let extracted = self.pre_extract_args(&fn_def, args)?;
+                                let saved_self = self.self_context.clone();
+                                self.self_context = Some(ctx);
+                                let result = self.inline_method_body(
+                                    &fn_def,
+                                    extracted,
+                                    Some(model_type.as_str()),
+                                );
+                                self.self_context = saved_self;
+                                return result;
                             }
                         }
                     }
@@ -4530,21 +4528,21 @@ impl<'a> WengertExtractor<'a> {
                             // scale (see the `dropout` arm), while the
                             // forward was reading the tensor. Folding both
                             // makes them agree by construction.
-                            if method_name == "item" && item_fold_enabled() {
-                                if let Some(v) = self.resolve_const_config_scalar(obj) {
-                                    let result = self.alloc_var();
-                                    self.known_scalar_values.insert(result, v);
-                                    self.const_config_vars.insert(result);
-                                    self.push_op(WengertOp {
-                                        id: self.list.ops.len() as u32,
-                                        result,
-                                        op: PrimalOp::Constant(v),
-                                        inputs: vec![],
-                                        saved_for_backward: false,
-                                        checkpointed: false,
-                                    });
-                                    return Some(result);
-                                }
+                            if method_name == "item" && item_fold_enabled()
+                                && let Some(v) = self.resolve_const_config_scalar(obj)
+                            {
+                                let result = self.alloc_var();
+                                self.known_scalar_values.insert(result, v);
+                                self.const_config_vars.insert(result);
+                                self.push_op(WengertOp {
+                                    id: self.list.ops.len() as u32,
+                                    result,
+                                    op: PrimalOp::Constant(v),
+                                    inputs: vec![],
+                                    saved_for_backward: false,
+                                    checkpointed: false,
+                                });
+                                return Some(result);
                             }
                             let mut inputs = vec![obj];
                             for arg in args {
@@ -4740,60 +4738,59 @@ impl<'a> WengertExtractor<'a> {
                         // Consistency with the distill loss: section — a
                         // divergent literal would make the build report lie.
                         let (loss_alpha, loss_temp) = self.distill_loss_alpha_temp;
-                        if let Some(la) = loss_alpha {
-                            if (la - alpha).abs() > 1e-12 {
-                                eprintln!(
-                                    "[source-ad] fused_kl_ce: call-site alpha {alpha} \
+                        if let Some(la) = loss_alpha
+                            && (la - alpha).abs() > 1e-12
+                        {
+                            eprintln!(
+                                "[source-ad] fused_kl_ce: call-site alpha {alpha} \
                                      != distill loss: section alpha {la}"
-                                );
-                                return None;
-                            }
+                            );
+                            return None;
                         }
-                        if let Some(lt) = loss_temp {
-                            if (lt - temperature).abs() > 1e-12 {
-                                eprintln!(
-                                    "[source-ad] fused_kl_ce: call-site temperature \
+                        if let Some(lt) = loss_temp
+                            && (lt - temperature).abs() > 1e-12
+                        {
+                            eprintln!(
+                                "[source-ad] fused_kl_ce: call-site temperature \
                                      {temperature} != distill loss: section temperature {lt}"
-                                );
-                                return None;
-                            }
+                            );
+                            return None;
                         }
-                        if let Some(cfg) = self.fused_kl_ce_config.as_ref() {
-                            if cfg.enabled {
-                                if let (Some(v), Some(hs), Some(ht), Some(b), Some(s)) = (
-                                    cfg.vocab_size,
-                                    cfg.student_hidden,
-                                    cfg.teacher_hidden,
-                                    cfg.batch_size,
-                                    cfg.seq_len,
-                                ) {
-                                    let vt = cfg.vocab_tile.unwrap_or(
-                                        crate::cpkd_fused_loss::FusedKlCeConfig::default()
-                                            .vocab_tile,
-                                    );
-                                    let seven: Vec<VarId> =
-                                        input_vars[0..7].to_vec();
-                                    self.push_op(WengertOp {
-                                        id: self.list.ops.len() as u32,
-                                        result,
-                                        op: PrimalOp::FusedKlCe {
-                                            vocab_size: v,
-                                            student_hidden: hs,
-                                            teacher_hidden: ht,
-                                            batch_size: b,
-                                            seq_len: s,
-                                            vocab_tile: vt,
-                                            ignore_index: -100,
-                                            alpha_bits: alpha.to_bits(),
-                                            temperature_bits: temperature.to_bits(),
-                                        },
-                                        inputs: seven,
-                                        saved_for_backward: false,
-                                        checkpointed: false,
-                                    });
-                                    return Some(result);
-                                }
-                            }
+                        if let Some(cfg) = self.fused_kl_ce_config.as_ref()
+                            && cfg.enabled
+                            && let (Some(v), Some(hs), Some(ht), Some(b), Some(s)) = (
+                                cfg.vocab_size,
+                                cfg.student_hidden,
+                                cfg.teacher_hidden,
+                                cfg.batch_size,
+                                cfg.seq_len,
+                            )
+                        {
+                            let vt = cfg.vocab_tile.unwrap_or(
+                                crate::cpkd_fused_loss::FusedKlCeConfig::default()
+                                    .vocab_tile,
+                            );
+                            let seven: Vec<VarId> =
+                                input_vars[0..7].to_vec();
+                            self.push_op(WengertOp {
+                                id: self.list.ops.len() as u32,
+                                result,
+                                op: PrimalOp::FusedKlCe {
+                                    vocab_size: v,
+                                    student_hidden: hs,
+                                    teacher_hidden: ht,
+                                    batch_size: b,
+                                    seq_len: s,
+                                    vocab_tile: vt,
+                                    ignore_index: -100,
+                                    alpha_bits: alpha.to_bits(),
+                                    temperature_bits: temperature.to_bits(),
+                                },
+                                inputs: seven,
+                                saved_for_backward: false,
+                                checkpointed: false,
+                            });
+                            return Some(result);
                         }
                         // Fall through: composite expansion via the stdlib
                         // `fused_kl_ce` body (tape AD — refused inside
@@ -4869,49 +4866,48 @@ impl<'a> WengertExtractor<'a> {
                                 }
                             }
                         }
-                        if let Some(cfg) = self.fused_ce_config.as_ref() {
-                            if cfg.enabled {
-                                if let (Some(v), Some(h), Some(b), Some(s)) = (
-                                    cfg.vocab_size,
-                                    cfg.hidden_size,
-                                    cfg.batch_size,
-                                    cfg.seq_len,
-                                ) {
-                                    let vt = cfg.vocab_tile.unwrap_or(
-                                        crate::fused_linear_ce::FusedLinearCEConfig::default().vocab_tile,
-                                    );
-                                    let is_large = v
-                                        > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
-                                    let four = vec![
-                                        input_vars[0], input_vars[1],
-                                        input_vars[2], input_vars[3],
-                                    ];
-                                    self.push_op(WengertOp {
-                                        id: self.list.ops.len() as u32,
-                                        result,
-                                        op: PrimalOp::FusedLinearCe {
-                                            vocab_size: v,
-                                            hidden_size: h,
-                                            batch_size: b,
-                                            seq_len: s,
-                                            vocab_tile: vt,
-                                            ignore_index: -100,
-                                            is_large,
-                                            // The explicit 4-arg call always
-                                            // has a real bias and a flat
-                                            // [rows, H] x by its stdlib
-                                            // signature contract.
-                                            has_bias: true,
-                                            x_rank3: false,
-                                        },
-                                        inputs: four,
-                                        saved_for_backward: false,
-                                        checkpointed: false,
-                                    });
-                                    self.fused_lce_substitutions += 1;
-                                    return Some(result);
-                                }
-                            }
+                        if let Some(cfg) = self.fused_ce_config.as_ref()
+                            && cfg.enabled
+                            && let (Some(v), Some(h), Some(b), Some(s)) = (
+                                cfg.vocab_size,
+                                cfg.hidden_size,
+                                cfg.batch_size,
+                                cfg.seq_len,
+                            )
+                        {
+                            let vt = cfg.vocab_tile.unwrap_or(
+                                crate::fused_linear_ce::FusedLinearCEConfig::default().vocab_tile,
+                            );
+                            let is_large = v
+                                > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+                            let four = vec![
+                                input_vars[0], input_vars[1],
+                                input_vars[2], input_vars[3],
+                            ];
+                            self.push_op(WengertOp {
+                                id: self.list.ops.len() as u32,
+                                result,
+                                op: PrimalOp::FusedLinearCe {
+                                    vocab_size: v,
+                                    hidden_size: h,
+                                    batch_size: b,
+                                    seq_len: s,
+                                    vocab_tile: vt,
+                                    ignore_index: -100,
+                                    is_large,
+                                    // The explicit 4-arg call always
+                                    // has a real bias and a flat
+                                    // [rows, H] x by its stdlib
+                                    // signature contract.
+                                    has_bias: true,
+                                    x_rank3: false,
+                                },
+                                inputs: four,
+                                saved_for_backward: false,
+                                checkpointed: false,
+                            });
+                            self.fused_lce_substitutions += 1;
+                            return Some(result);
                         }
                         // Fall through: composite expansion via the regular
                         // function-body lowering (stdlib `fused_linear_ce`
@@ -5740,10 +5736,10 @@ impl<'a> WengertExtractor<'a> {
             if !self.extract_if(elif_cond, elif_block, remaining_elifs, else_block) {
                 return false;
             }
-        } else if let Some(else_blk) = else_block {
-            if !self.extract_stmts(&else_blk.stmts) {
-                return false;
-            }
+        } else if let Some(else_blk) = else_block
+            && !self.extract_stmts(&else_blk.stmts)
+        {
+            return false;
         }
         // If no else block: variables retain their pre-branch values (identity)
 
@@ -6119,20 +6115,18 @@ impl<'a> WengertExtractor<'a> {
                 if let Some(obj_prefix) = self.resolve_member_access_prefix(object) {
                     let parent_model = self.context_to_model_type.get(&obj_prefix).cloned();
                     let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
-                    if let Some(parent) = parent_model {
-                        if let Some(field_ty) = self
+                    if let Some(parent) = parent_model
+                        && let Some(field_ty) = self
                             .model_field_types
                             .get(&parent)
                             .and_then(|fields| fields.get(&field_name))
                             .cloned()
-                        {
-                            if !field_ty.starts_with('[') {
-                                let compound = format!("{}.{}", obj_prefix, field_name);
-                                self.context_to_model_type
-                                    .entry(compound)
-                                    .or_insert(field_ty);
-                            }
-                        }
+                        && !field_ty.starts_with('[')
+                    {
+                        let compound = format!("{}.{}", obj_prefix, field_name);
+                        self.context_to_model_type
+                            .entry(compound)
+                            .or_insert(field_ty);
                     }
                 }
             }
@@ -6141,45 +6135,41 @@ impl<'a> WengertExtractor<'a> {
 
                 // Static-index subscript on a `[Model; N]` field:
                 // register the indexed compound -> element model type.
-                if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
-                    if let ExprKind::IntLiteral(i) = &idx_expr.kind {
-                        if *i >= 0 {
-                            if let Some(obj_prefix) = self.resolve_member_access_prefix(object) {
-                                if let Some((parent_pref, field_name)) =
-                                    obj_prefix.rsplit_once('.')
-                                {
-                                    let parent_model = self
-                                        .context_to_model_type
-                                        .get(parent_pref)
-                                        .cloned();
-                                    if let Some(field_ty) = parent_model
-                                        .as_ref()
-                                        .and_then(|pt| self.model_field_types.get(pt))
-                                        .and_then(|fields| fields.get(field_name))
-                                        .cloned()
-                                    {
-                                        // Same format coupling as the
-                                        // singular-Model arm above —
-                                        // recognises the
-                                        // `format!("[{};{}]", elem, n)`
-                                        // from
-                                        // `compiler/collection.rs::~481`.
-                                        // Any drift on either side breaks
-                                        // silently; keep these two
-                                        // recognizers in sync.
-                                        if field_ty.starts_with('[') && field_ty.contains(';') {
-                                            let inner = field_ty
-                                                .trim_start_matches('[')
-                                                .trim_end_matches(']');
-                                            if let Some(elem) = inner.split(';').next() {
-                                                let indexed_ctx = format!("{}.{}", obj_prefix, i);
-                                                self.context_to_model_type
-                                                    .entry(indexed_ctx)
-                                                    .or_insert_with(|| elem.trim().to_string());
-                                            }
-                                        }
-                                    }
-                                }
+                if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref()
+                    && let ExprKind::IntLiteral(i) = &idx_expr.kind
+                    && *i >= 0
+                    && let Some(obj_prefix) = self.resolve_member_access_prefix(object)
+                    && let Some((parent_pref, field_name)) =
+                        obj_prefix.rsplit_once('.')
+                {
+                    let parent_model = self
+                        .context_to_model_type
+                        .get(parent_pref)
+                        .cloned();
+                    if let Some(field_ty) = parent_model
+                        .as_ref()
+                        .and_then(|pt| self.model_field_types.get(pt))
+                        .and_then(|fields| fields.get(field_name))
+                        .cloned()
+                    {
+                        // Same format coupling as the
+                        // singular-Model arm above —
+                        // recognises the
+                        // `format!("[{};{}]", elem, n)`
+                        // from
+                        // `compiler/collection.rs::~481`.
+                        // Any drift on either side breaks
+                        // silently; keep these two
+                        // recognizers in sync.
+                        if field_ty.starts_with('[') && field_ty.contains(';') {
+                            let inner = field_ty
+                                .trim_start_matches('[')
+                                .trim_end_matches(']');
+                            if let Some(elem) = inner.split(';').next() {
+                                let indexed_ctx = format!("{}.{}", obj_prefix, i);
+                                self.context_to_model_type
+                                    .entry(indexed_ctx)
+                                    .or_insert_with(|| elem.trim().to_string());
                             }
                         }
                     }

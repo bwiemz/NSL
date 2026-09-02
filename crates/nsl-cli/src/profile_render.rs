@@ -681,33 +681,32 @@ fn render_memory_timeline(
         peak as f64 / (1024.0 * 1024.0)
     ));
     // Paper section 3.2 what-if lines ("With FASE: peak drops to ...").
-    if let Some(what_if) = &report.memory_what_if {
-        if !what_if.is_empty() {
-            s.push_str("<ul class=\"whatif\">\n");
-            for w in what_if {
-                s.push_str(&format!(
-                    "<li>{}: peak drops to {:.1} MB <span class=\"fine\">({})</span></li>\n",
-                    escape_html(&w.label),
-                    w.peak_bytes as f64 / (1024.0 * 1024.0),
-                    escape_html(&w.note),
-                ));
-            }
-            s.push_str("</ul>\n");
+    if let Some(what_if) = &report.memory_what_if
+        && !what_if.is_empty()
+    {
+        s.push_str("<ul class=\"whatif\">\n");
+        for w in what_if {
+            s.push_str(&format!(
+                "<li>{}: peak drops to {:.1} MB <span class=\"fine\">({})</span></li>\n",
+                escape_html(&w.label),
+                w.peak_bytes as f64 / (1024.0 * 1024.0),
+                escape_html(&w.note),
+            ));
         }
+        s.push_str("</ul>\n");
     }
     // Lower-bound honesty note: some vars had no concrete compile-time shape,
     // so their bytes are absent from the MB figures. Same contract as the
     // text renderer, which must never be dropped from the HTML deliverable.
     if let (Some(unsized_vars), Some(total_vars)) =
         (report.memory_unsized_vars, report.memory_total_vars)
+        && unsized_vars > 0
     {
-        if unsized_vars > 0 {
-            s.push_str(&format!(
-                "<div class=\"approx\">NOTE: {unsized_vars} of {total_vars} vars have no \
+        s.push_str(&format!(
+            "<div class=\"approx\">NOTE: {unsized_vars} of {total_vars} vars have no \
                  concrete compile-time shape; their bytes are NOT included &#8212; treat \
                  the MB figures as a lower bound.</div>\n",
-            ));
-        }
+        ));
     }
     s
 }

@@ -148,10 +148,10 @@ fn relocation_symbol_set(obj_bytes: &[u8]) -> HashSet<String> {
     let mut out = HashSet::new();
     for section in file.sections() {
         for (_, reloc) in section.relocations() {
-            if let object::RelocationTarget::Symbol(idx) = reloc.target() {
-                if let Some(name) = name_by_index.get(&idx) {
-                    out.insert(name.clone());
-                }
+            if let object::RelocationTarget::Symbol(idx) = reloc.target()
+                && let Some(name) = name_by_index.get(&idx)
+            {
+                out.insert(name.clone());
             }
         }
     }

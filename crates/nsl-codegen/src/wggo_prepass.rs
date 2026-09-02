@@ -335,15 +335,13 @@ fn stmts_contain_any_call(
             if self.found {
                 return;
             }
-            if let ExprKind::Call { callee, .. } = &expr.kind {
-                if let ExprKind::Ident(sym) = &callee.kind {
-                    if let Some(name) = self.interner.resolve(sym.0) {
-                        if self.names.contains(&name) {
-                            self.found = true;
-                            return;
-                        }
-                    }
-                }
+            if let ExprKind::Call { callee, .. } = &expr.kind
+                && let ExprKind::Ident(sym) = &callee.kind
+                && let Some(name) = self.interner.resolve(sym.0)
+                && self.names.contains(&name)
+            {
+                self.found = true;
+                return;
             }
             walk_expr(self, expr);
         }
@@ -426,10 +424,10 @@ fn walk_stmts(
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value, .. } => {
-                if let (PatternKind::Ident(sym), Some(init)) = (&pattern.kind, value) {
-                    if let Some(ty) = compiler.type_map.get(&init.id) {
-                        prefix_types.insert(*sym, ty.clone());
-                    }
+                if let (PatternKind::Ident(sym), Some(init)) = (&pattern.kind, value)
+                    && let Some(ty) = compiler.type_map.get(&init.id)
+                {
+                    prefix_types.insert(*sym, ty.clone());
                 }
             }
             StmtKind::TrainBlock(train) => {

@@ -19,10 +19,10 @@ use std::process::Command;
 
 /// Locate a C compiler: `$CC` first, then `cc`/`gcc`/`clang` on `PATH`.
 fn find_cc() -> Option<String> {
-    if let Ok(cc) = std::env::var("CC") {
-        if !cc.trim().is_empty() {
-            return Some(cc);
-        }
+    if let Ok(cc) = std::env::var("CC")
+        && !cc.trim().is_empty()
+    {
+        return Some(cc);
     }
     for candidate in ["cc", "gcc", "clang"] {
         // `<cc> --version` succeeds iff the compiler is present and runnable.

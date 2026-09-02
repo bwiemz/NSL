@@ -209,10 +209,10 @@ fn one_space_gaps(source: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
         }
         // An `FStringEnd` after trailing text shares the text's span, so
         // its start can precede the previous end; `get` refuses that.
-        if let Some(p) = prev_end {
-            if source.get(p..start) == Some(" ") {
-                gaps.push((p, start));
-            }
+        if let Some(p) = prev_end
+            && source.get(p..start) == Some(" ")
+        {
+            gaps.push((p, start));
         }
         prev_end = Some(end.max(start));
     }

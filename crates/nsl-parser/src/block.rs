@@ -1141,11 +1141,11 @@ fn parse_serve_config_entry(p: &mut Parser) -> nsl_ast::block::ServeConfigEntry 
 
     // Check if next is a type annotation followed by `=`
     let mut type_ann = None;
-    if let TokenKind::Ident(_) = p.peek().clone() {
-        if matches!(p.peek_at(1), &TokenKind::Eq) {
-            type_ann = Some(crate::types::parse_type(p));
-            p.expect(&TokenKind::Eq);
-        }
+    if let TokenKind::Ident(_) = p.peek().clone()
+        && matches!(p.peek_at(1), &TokenKind::Eq)
+    {
+        type_ann = Some(crate::types::parse_type(p));
+        p.expect(&TokenKind::Eq);
     }
 
     let value = parse_expr(p);

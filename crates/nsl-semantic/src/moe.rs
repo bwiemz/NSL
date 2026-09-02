@@ -183,13 +183,13 @@ pub fn validate_moe_decorator(
                     // line of the typo.
                     "weight_prefix" => {
                         if let ExprKind::StringLiteral(s) = &arg.value.kind {
-                            if !s.is_empty() {
-                                if let Some(msg) = validate_weight_prefix_shape(s) {
-                                    diagnostics.push(
-                                        Diagnostic::error(msg)
-                                            .with_label(arg.span, "malformed weight_prefix"),
-                                    );
-                                }
+                            if !s.is_empty()
+                                && let Some(msg) = validate_weight_prefix_shape(s)
+                            {
+                                diagnostics.push(
+                                    Diagnostic::error(msg)
+                                        .with_label(arg.span, "malformed weight_prefix"),
+                                );
                             }
                             // Empty-string itself stays codegen-rejected
                             // (the v2.7 ordering convention).
