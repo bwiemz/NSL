@@ -272,9 +272,9 @@ impl Compiler<'_> {
                 let prod = builder.ins().imul(q, rhs);
                 let rem = builder.ins().isub(lhs, prod);
                 // Check: remainder != 0 && (lhs ^ rhs) < 0
-                let rem_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, rem, 0);
+                let rem_nonzero = builder.ins().icmp_imm_s(IntCC::NotEqual, rem, 0);
                 let sign_bits = builder.ins().bxor(lhs, rhs);
-                let diff_sign = builder.ins().icmp_imm(IntCC::SignedLessThan, sign_bits, 0);
+                let diff_sign = builder.ins().icmp_imm_s(IntCC::SignedLessThan, sign_bits, 0);
                 let needs_adjust = builder.ins().band(rem_nonzero, diff_sign);
                 let one = builder.ins().iconst(cl_types::I64, 1);
                 let zero = builder.ins().iconst(cl_types::I64, 0);
@@ -294,9 +294,9 @@ impl Compiler<'_> {
                 // and operands have different signs.
                 self.compile_divmod_guard(builder, state, rhs)?;
                 let r = builder.ins().srem(lhs, rhs);
-                let rem_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, r, 0);
+                let rem_nonzero = builder.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
                 let sign_bits = builder.ins().bxor(lhs, rhs);
-                let diff_sign = builder.ins().icmp_imm(IntCC::SignedLessThan, sign_bits, 0);
+                let diff_sign = builder.ins().icmp_imm_s(IntCC::SignedLessThan, sign_bits, 0);
                 let needs_adjust = builder.ins().band(rem_nonzero, diff_sign);
                 let adjusted = builder.ins().iadd(r, rhs);
                 Ok(builder.ins().select(needs_adjust, adjusted, r))
@@ -356,7 +356,7 @@ impl Compiler<'_> {
     ) -> Result<Value, CodegenError> {
         let lhs_raw = self.compile_expr(builder, state, left)?;
         // Normalize to I8 boolean (handles I64 values from comparisons etc.)
-        let lhs = builder.ins().icmp_imm(IntCC::NotEqual, lhs_raw, 0);
+        let lhs = builder.ins().icmp_imm_s(IntCC::NotEqual, lhs_raw, 0);
 
         let rhs_block = builder.create_block();
         let merge_block = builder.create_block();
@@ -372,7 +372,7 @@ impl Compiler<'_> {
         builder.seal_block(rhs_block);
         state.current_block = Some(rhs_block);
         let rhs_raw = self.compile_expr(builder, state, right)?;
-        let rhs = builder.ins().icmp_imm(IntCC::NotEqual, rhs_raw, 0);
+        let rhs = builder.ins().icmp_imm_s(IntCC::NotEqual, rhs_raw, 0);
         builder.ins().jump(merge_block, &[BlockArg::Value(rhs)]);
 
         builder.switch_to_block(merge_block);
@@ -392,7 +392,7 @@ impl Compiler<'_> {
         let ok_block = builder.create_block();
         let trap_block = builder.create_block();
 
-        let is_zero = builder.ins().icmp_imm(IntCC::Equal, divisor, 0);
+        let is_zero = builder.ins().icmp_imm_s(IntCC::Equal, divisor, 0);
         builder.ins().brif(is_zero, trap_block, &[], ok_block, &[]);
 
         builder.switch_to_block(trap_block);

@@ -228,7 +228,7 @@ impl Compiler<'_> {
                 }
             }
 
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("fn '{name}'"), &ctx.func);

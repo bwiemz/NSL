@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData};
 use cranelift_frontend::{FunctionBuilder, Variable};
 use cranelift_module::Module;
 
@@ -2002,7 +2002,7 @@ impl Compiler<'_> {
                         if vt == cranelift_codegen::ir::types::F64 {
                             val = builder.ins().bitcast(
                                 cranelift_codegen::ir::types::I64,
-                                cranelift_codegen::ir::MemFlags::new(),
+                                cranelift_codegen::ir::MemFlagsData::new(),
                                 val,
                             );
                         }
@@ -2708,7 +2708,7 @@ impl Compiler<'_> {
                                 } else {
                                     let old_val = builder.ins().load(
                                         field.cl_type,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         obj_val,
                                         field.offset as i32,
                                     );
@@ -2741,7 +2741,7 @@ impl Compiler<'_> {
                                             let ok_blk = builder.create_block();
                                             let trap_blk = builder.create_block();
                                             let is_zero =
-                                                builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                                builder.ins().icmp_imm_s(IntCC::Equal, new_val, 0);
                                             builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
                                             builder.switch_to_block(trap_blk);
                                             builder.seal_block(trap_blk);
@@ -2757,7 +2757,7 @@ impl Compiler<'_> {
                                     }
                                 };
                                 builder.ins().store(
-                                    cranelift_codegen::ir::MemFlags::trusted(),
+                                    cranelift_codegen::ir::MemFlagsData::trusted(),
                                     final_val,
                                     obj_val,
                                     field.offset as i32,
@@ -2794,7 +2794,7 @@ impl Compiler<'_> {
                                         })?;
                                     let table_ptr = builder.ins().load(
                                         cl_types::I64,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         obj_val,
                                         slot_off as i32,
                                     );
@@ -2804,7 +2804,7 @@ impl Compiler<'_> {
                                     // the tensors it holds).
                                     let old_ptr = builder.ins().load(
                                         cl_types::I64,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         table_ptr,
                                         byte_off,
                                     );
@@ -2814,7 +2814,7 @@ impl Compiler<'_> {
                                         &[old_ptr],
                                     )?;
                                     builder.ins().store(
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         new_val,
                                         table_ptr,
                                         byte_off,
@@ -2841,7 +2841,7 @@ impl Compiler<'_> {
                                 } else {
                                     let old_val = builder.ins().load(
                                         field.cl_type,
-                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        cranelift_codegen::ir::MemFlagsData::trusted(),
                                         obj_val,
                                         field.offset as i32,
                                     );
@@ -2874,7 +2874,7 @@ impl Compiler<'_> {
                                             let ok_blk = builder.create_block();
                                             let trap_blk = builder.create_block();
                                             let is_zero =
-                                                builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                                builder.ins().icmp_imm_s(IntCC::Equal, new_val, 0);
                                             builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
                                             builder.switch_to_block(trap_blk);
                                             builder.seal_block(trap_blk);
@@ -2890,7 +2890,7 @@ impl Compiler<'_> {
                                     }
                                 };
                                 builder.ins().store(
-                                    cranelift_codegen::ir::MemFlags::trusted(),
+                                    cranelift_codegen::ir::MemFlagsData::trusted(),
                                     final_val,
                                     obj_val,
                                     field.offset as i32,
@@ -3871,7 +3871,7 @@ impl Compiler<'_> {
         // defensive, but a tracked `val` would otherwise be a
         // freed-then-read bug, not a leak).
         self.free_condition_temporaries(builder, state, expr_base, val);
-        let cond = builder.ins().icmp_imm(IntCC::NotEqual, val, 0);
+        let cond = builder.ins().icmp_imm_s(IntCC::NotEqual, val, 0);
         builder.ins().brif(cond, body_block, &[], exit_block, &[]);
 
         // Body: update pattern variable with current value, execute body
@@ -4236,7 +4236,7 @@ impl Compiler<'_> {
         let addr = builder.ins().iadd(base_val, elem_offset);
         let elem_ptr = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
+            .load(cl_types::I64, MemFlagsData::trusted(), addr, 0);
         builder.def_var(elem_var, elem_ptr);
 
         // Compile body statements
@@ -4396,7 +4396,7 @@ impl Compiler<'_> {
         let batch_ptr =
             self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_val])?;
         builder.def_var(batch_var, batch_ptr);
-        let is_null = builder.ins().icmp_imm(IntCC::Equal, batch_ptr, 0);
+        let is_null = builder.ins().icmp_imm_s(IntCC::Equal, batch_ptr, 0);
         builder
             .ins()
             .brif(is_null, exhausted_exit_block, &[], body_block, &[]);
@@ -5033,7 +5033,7 @@ impl Compiler<'_> {
 
         let slot0 = builder.ins().iconst(cl_types::I64, 0);
         let done = self.compile_call_by_name(builder, "nsl_list_get", &[latch, slot0])?;
-        let first_window = builder.ins().icmp_imm(IntCC::Equal, done, 0);
+        let first_window = builder.ins().icmp_imm_s(IntCC::Equal, done, 0);
         let fill_b = builder.create_block();
         let after_b = builder.create_block();
         builder.ins().brif(first_window, fill_b, &[], after_b, &[]);
@@ -5071,7 +5071,7 @@ impl Compiler<'_> {
                     // an AdamW-routed one still allocates only its share.
                     let routed =
                         self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
-                    let needs_v = builder.ins().icmp_imm(IntCC::Equal, routed, 0);
+                    let needs_v = builder.ins().icmp_imm_s(IntCC::Equal, routed, 0);
                     let alloc_b = builder.create_block();
                     let skip_b = builder.create_block();
                     let merge_b = builder.create_block();
@@ -7866,7 +7866,7 @@ impl Compiler<'_> {
                     // (`flag != 0 || rank != 2`) a fourth time.
                     let routed =
                         self.emit_muon_route_predicate(builder, route_list, idx, param_i)?;
-                    let needs_v = builder.ins().icmp_imm(IntCC::Equal, routed, 0);
+                    let needs_v = builder.ins().icmp_imm_s(IntCC::Equal, routed, 0);
                     let alloc_b = builder.create_block();
                     let skip_b = builder.create_block();
                     let merge_b = builder.create_block();
@@ -10061,7 +10061,7 @@ sched={sched_s}",
                         if let Ok(array_idx) = part.parse::<usize>() {
                             current_ptr = builder.ins().load(
                                 cl_types::I64,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 current_ptr,
                                 (array_idx * 8) as i32,
                             );
@@ -10073,7 +10073,7 @@ sched={sched_s}",
                             let offset = field.offset as i32;
                             let field_val = builder.ins().load(
                                 field.cl_type,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 current_ptr,
                                 offset,
                             );
@@ -10108,14 +10108,14 @@ sched={sched_s}",
                         if let Some(index) = self.adapter_field_index(&current_type_name, last) {
                             let table_ptr = builder.ins().load(
                                 cl_types::I64,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 current_ptr,
                                 slot_off as i32,
                             );
                             let byte_off = (index * 8) as i32;
                             let tensor_ptr = builder.ins().load(
                                 cl_types::I64,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 table_ptr,
                                 byte_off,
                             );
@@ -12702,7 +12702,7 @@ sched={sched_s}",
                         } else if vty == cl_types::F64 {
                             let bits = builder.ins().bitcast(
                                 cl_types::I64,
-                                MemFlags::new(),
+                                MemFlagsData::new(),
                                 val,
                             );
                             self.compile_call_by_name(builder, "nsl_list_push", &[inner, bits])?;
@@ -13387,7 +13387,7 @@ sched={sched_s}",
                     builder.switch_to_block(scan_exit);
                     builder.seal_block(scan_exit);
                     let match_count = builder.use_var(scan_match_count_var);
-                    let matched = builder.ins().icmp_imm(IntCC::NotEqual, match_count, 0);
+                    let matched = builder.ins().icmp_imm_s(IntCC::NotEqual, match_count, 0);
                     let missing_msg = format!(
                         "source AD gradient could not be aligned with runtime param list: {}",
                         param_name,
@@ -13595,8 +13595,8 @@ sched={sched_s}",
         }
 
         if self.compile_options.health_monitor {
-            use cranelift_codegen::ir::{types as cl_types, MemFlags};
-            let _ = MemFlags::trusted(); // keep import valid across cfgs
+            use cranelift_codegen::ir::{types as cl_types, MemFlagsData};
+            let _ = MemFlagsData::trusted(); // keep import valid across cfgs
 
             // Precompute step-gating flags shared by grad/weight/flush hooks.
             let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
@@ -14944,7 +14944,7 @@ sched={sched_s}",
                     let val = match kind {
                         CslaSlotKind::Raw { .. } => raw,
                         CslaSlotKind::F64Bits => {
-                            builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw)
+                            builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), raw)
                         }
                     };
                     seed.insert(*vid, val);
@@ -15780,7 +15780,7 @@ sched={sched_s}",
                         let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
                         builder.def_var(pa_tot_var, pa_tot_new);
                     }
-                    let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
+                    let pa_i_next = builder.ins().iadd_imm_s(pa_i, 1);
                     builder.def_var(pa_i_var, pa_i_next);
                     builder.ins().jump(pa_hdr, &[]);
 
@@ -15935,7 +15935,7 @@ sched={sched_s}",
                         builder.switch_to_block(pb_join);
                         builder.seal_block(pb_join);
                     }
-                    let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
+                    let pb_i_next = builder.ins().iadd_imm_s(pb_i, 1);
                     builder.def_var(pb_i_var, pb_i_next);
                     builder.ins().jump(pb_hdr, &[]);
 
@@ -16483,7 +16483,7 @@ sched={sched_s}",
 
         // 7h. Increment step count (after scheduler so step 0 uses the initial LR)
         let sc = builder.use_var(step_count_var);
-        let one_i64 = builder.ins().iadd_imm(sc, 1);
+        let one_i64 = builder.ins().iadd_imm_s(sc, 1);
         builder.def_var(step_count_var, one_i64);
 
         // Milestone B: periodic full-train-state checkpoint. Post-increment
@@ -16529,7 +16529,7 @@ sched={sched_s}",
             let epoch_now = if has_dataloader.is_some() {
                 epoch_ctr
             } else {
-                builder.ins().iadd_imm(epoch_ctr, 1)
+                builder.ins().iadd_imm_s(epoch_ctr, 1)
             };
             self.compile_call_by_name(
                 builder,
@@ -16990,7 +16990,7 @@ sched={sched_s}",
         let has_seg_block = builder.create_block();
         let no_seg_block = builder.create_block();
         let after_block = builder.create_block();
-        let has_seg_cond = builder.ins().icmp_imm(IntCC::NotEqual, has_seg, 0);
+        let has_seg_cond = builder.ins().icmp_imm_s(IntCC::NotEqual, has_seg, 0);
         builder
             .ins()
             .brif(has_seg_cond, has_seg_block, &[], no_seg_block, &[]);
@@ -17260,7 +17260,7 @@ sched={sched_s}",
                 // Each element is an i64 pointer at offset array_idx * 8.
                 let elem_ptr = builder.ins().load(
                     cl_types::I64,
-                    cranelift_codegen::ir::MemFlags::trusted(),
+                    cranelift_codegen::ir::MemFlagsData::trusted(),
                     current_ptr,
                     (array_idx * 8) as i32,
                 );
@@ -17294,7 +17294,7 @@ sched={sched_s}",
                     let elem_type = inner.split(';').next().unwrap_or("").trim();
 
                     // Set current_ptr to address of array base in parent struct
-                    current_ptr = builder.ins().iadd_imm(current_ptr, field.offset as i64);
+                    current_ptr = builder.ins().iadd_imm_s(current_ptr, field.offset as i64);
                     current_type_name = elem_type.to_string();
                     current_layout = self.types.struct_layouts.get(elem_type)?.clone();
                     // Next component should be a numeric index
@@ -17306,7 +17306,7 @@ sched={sched_s}",
             // Regular field: load the value
             let field_val = builder.ins().load(
                 field.cl_type,
-                cranelift_codegen::ir::MemFlags::trusted(),
+                cranelift_codegen::ir::MemFlagsData::trusted(),
                 current_ptr,
                 field.offset as i32,
             );
@@ -18669,7 +18669,7 @@ sched={sched_s}",
             let is_excluded = quant.exclude.iter().any(|pat| glob_match(pat, &field.name));
             let src_val = builder.ins().load(
                 field.cl_type,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 source_val,
                 field.offset as i32,
             );
@@ -18679,7 +18679,7 @@ sched={sched_s}",
                 let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[src_val])?;
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
+                    .store(MemFlagsData::trusted(), cloned, new_ptr, field.offset as i32);
             } else {
                 // For AWQ with a calibration sidecar, pre-scale the weight tensor using
                 // the per-input-channel activation statistics before quantizing.
@@ -18780,7 +18780,7 @@ sched={sched_s}",
                 }
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
+                    .store(MemFlagsData::trusted(), deq, new_ptr, field.offset as i32);
             }
         }
 

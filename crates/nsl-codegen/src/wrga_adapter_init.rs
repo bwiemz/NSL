@@ -28,7 +28,7 @@
 //! both iterate `synthesized_fields` in declared order.
 
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 
 use crate::compiler::Compiler;
@@ -157,7 +157,7 @@ pub(crate) fn emit_adapter_init_sidetable(
             })?;
         let ref_tensor_ptr = builder.ins().load(
             cl_types::I64,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             model_ptr,
             cranelift_codegen::ir::immediates::Offset32::new(field_layout.offset as i32),
         );
@@ -174,7 +174,7 @@ pub(crate) fn emit_adapter_init_sidetable(
             )?;
             let byte_off = (idx * 8) as i32;
             builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 placed_tensor,
                 table_ptr,
                 byte_off,
@@ -185,7 +185,7 @@ pub(crate) fn emit_adapter_init_sidetable(
 
     // 5. Store the table pointer into the model struct at the reserved slot.
     builder.ins().store(
-        MemFlags::trusted(),
+        MemFlagsData::trusted(),
         table_ptr,
         model_ptr,
         slot_off as i32,

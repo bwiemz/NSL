@@ -492,7 +492,7 @@ mod tests {
 }
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types as cl_types, BlockArg, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{types as cl_types, BlockArg, InstBuilder, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 
 /// Emit Cranelift IR for: `for i in 0..len { buf[i] = max(buf[i], |src[i]|) }`.
@@ -536,11 +536,11 @@ pub(crate) fn emit_running_max_abs_f32(
     let off64 = fb.ins().sextend(cl_types::I64, off32);
     let src_addr = fb.ins().iadd(src_ptr, off64);
     let buf_addr = fb.ins().iadd(buf_ptr, off64);
-    let src_val = fb.ins().load(cl_types::F32, MemFlags::new(), src_addr, 0);
+    let src_val = fb.ins().load(cl_types::F32, MemFlagsData::new(), src_addr, 0);
     let abs_val = fb.ins().fabs(src_val);
-    let buf_val = fb.ins().load(cl_types::F32, MemFlags::new(), buf_addr, 0);
+    let buf_val = fb.ins().load(cl_types::F32, MemFlagsData::new(), buf_addr, 0);
     let new_val = fb.ins().fmax(buf_val, abs_val);
-    fb.ins().store(MemFlags::new(), new_val, buf_addr, 0);
+    fb.ins().store(MemFlagsData::new(), new_val, buf_addr, 0);
     let one = fb.ins().iconst(cl_types::I32, 1);
     let i_next = fb.ins().iadd(i_cur, one);
     fb.ins().jump(header, &[BlockArg::Value(i_next)]);
@@ -579,7 +579,7 @@ mod ir_tests {
 
         emit_running_max_abs_f32(&mut fb, buf_ptr, src_ptr, len_val);
         fb.ins().return_(&[]);
-        fb.finalize();
+        fb.finalize(crate::calibration::host_frontend_config());
 
         // Verify the IR verifies.
         let flags = settings::Flags::new(settings::builder());

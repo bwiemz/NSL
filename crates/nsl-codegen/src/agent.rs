@@ -457,7 +457,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(format_args!("agent method '{mangled}'"), &ctx.func);
@@ -624,7 +624,7 @@ impl Compiler<'_> {
                 }
             }
 
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("@pipeline_agent fn '{fn_name}'"), &ctx.func);

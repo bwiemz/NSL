@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::{
-    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, Signature, UserFuncName,
+    types as cl_types, AbiParam, Function, InstBuilder, MemFlagsData, Signature, UserFuncName,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -842,7 +842,7 @@ impl Compiler<'_> {
                                 // Bitcast i64 → f64 for the value parameter
                                 let f64_val = builder.ins().bitcast(
                                     cl_types::F64,
-                                    MemFlags::new(),
+                                    MemFlagsData::new(),
                                     param_val,
                                 );
                                 let var = builder.declare_var(cl_types::F64);
@@ -888,7 +888,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(format_args!("dtype method '{fn_name}'"), &ctx.func);

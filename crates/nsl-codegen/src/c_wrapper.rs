@@ -91,7 +91,7 @@ pub fn build_c_abi_wrapper_signature(
 
 use crate::compiler::Compiler;
 use cranelift_codegen::ir::{
-    condcodes::IntCC, types as cw_types, AbiParam as CwAbiParam, Function, InstBuilder, MemFlags,
+    condcodes::IntCC, types as cw_types, AbiParam as CwAbiParam, Function, InstBuilder, MemFlagsData,
     Signature as CwSignature, UserFuncName,
 };
 use cranelift_codegen::Context;
@@ -271,7 +271,7 @@ pub fn emit_c_abi_wrapper(
                         let desc_ptr = if off == 0 {
                             items_ptr
                         } else {
-                            builder.ins().iadd_imm(items_ptr, off)
+                            builder.ins().iadd_imm_s(items_ptr, off)
                         };
                         let tensor =
                             call_desc_to_tensor(&mut builder, &mut compiler.module, desc_ptr)?;
@@ -331,7 +331,7 @@ pub fn emit_c_abi_wrapper(
                 let scalar_val = impl_rets[0];
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), scalar_val, ret_ptr, 0);
+                    .store(MemFlagsData::trusted(), scalar_val, ret_ptr, 0);
             }
             ExportTypeInfo::Tuple(elems) => {
                 // v1 scope mirrors tuple params: all elements must be tensors
@@ -380,7 +380,7 @@ pub fn emit_c_abi_wrapper(
                     let dst = if off == 0 {
                         rets_ptr
                     } else {
-                        builder.ins().iadd_imm(rets_ptr, off)
+                        builder.ins().iadd_imm_s(rets_ptr, off)
                     };
                     // NOTE: like the single-Tensor return above, the element
                     // NslTensor structs intentionally leak (~80 bytes each) —
@@ -394,7 +394,7 @@ pub fn emit_c_abi_wrapper(
                 let arity_out = builder.ins().iconst(cw_types::I32, elems.len() as i64);
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), arity_out, num_rets_ptr, 0);
+                    .store(MemFlagsData::trusted(), arity_out, num_rets_ptr, 0);
             }
         }
 
@@ -408,7 +408,7 @@ pub fn emit_c_abi_wrapper(
 
         let zero_ret = builder.ins().iconst(cw_types::I32, 0);
         builder.ins().return_(&[zero_ret]);
-        builder.finalize();
+        builder.finalize(compiler.module.target_config());
     }
 
     // The REAL body lands in the non-preemptible local sibling; internal
@@ -452,7 +452,7 @@ fn emit_export_forwarder(
         let call = fb.ins().call(local_ref, &args);
         let rets = fb.inst_results(call).to_vec();
         fb.ins().return_(&rets);
-        fb.finalize();
+        fb.finalize(compiler.module.target_config());
     }
     compiler
         .module
@@ -577,7 +577,7 @@ pub fn emit_c_abi_dispatch_wrapper(
             emit_set_error(&mut builder, &mut compiler.module, &msg)?;
             let neg_one = builder.ins().iconst(cw_types::I64, -1);
             builder.ins().return_(&[neg_one]);
-            builder.finalize();
+            builder.finalize(compiler.module.target_config());
 
             compiler
                 .module
@@ -646,7 +646,7 @@ pub fn emit_c_abi_dispatch_wrapper(
         for off in (0..NSL_TENSOR_DESC_SIZE).step_by(8) {
             builder
                 .ins()
-                .store(MemFlags::trusted(), zero_i64_init, scratch_ptr, off as i32);
+                .store(MemFlagsData::trusted(), zero_i64_init, scratch_ptr, off as i32);
         }
 
         // Call the LOCAL sibling, never the exported name: the exported
@@ -665,7 +665,7 @@ pub fn emit_c_abi_dispatch_wrapper(
             let desc_ptr = if off == 0 {
                 inputs_ptr
             } else {
-                builder.ins().iadd_imm(inputs_ptr, off)
+                builder.ins().iadd_imm_s(inputs_ptr, off)
             };
             typed_args.push(desc_ptr);
         }
@@ -721,7 +721,7 @@ pub fn emit_c_abi_dispatch_wrapper(
         let apply_rc = builder.inst_results(apply_call)[0];
         builder.ins().return_(&[apply_rc]);
 
-        builder.finalize();
+        builder.finalize(compiler.module.target_config());
     }
 
     compiler

@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
@@ -707,7 +707,7 @@ impl Compiler<'_> {
                 let zero = builder.ins().f64const(0.0);
                 builder.ins().fcmp(FloatCC::NotEqual, cond_val, zero)
             } else {
-                builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 0)
+                builder.ins().icmp_imm_s(IntCC::NotEqual, cond_val, 0)
             };
             let msg = if args.len() > 1 {
                 self.compile_nested_expr(builder, state, &args[1].value)?
@@ -2705,7 +2705,7 @@ impl Compiler<'_> {
             // Get num_draft_tokens from draft_tokens tensor length
             let draft_len = builder.ins().load(
                 cranelift_codegen::ir::types::I64,
-                cranelift_codegen::ir::MemFlags::trusted(),
+                cranelift_codegen::ir::MemFlagsData::trusted(),
                 draft_tokens,
                 cranelift_codegen::ir::immediates::Offset32::new(40), // NslTensor.len offset (magic:0 + pad:4 + data:8 + shape:16 + strides:24 + ndim:32 → len:40)
             );
@@ -2928,7 +2928,7 @@ impl Compiler<'_> {
                 )?;
                 let decode_blk = builder.create_block();
                 let merge_blk = builder.create_block();
-                let t_is_null = builder.ins().icmp_imm(IntCC::Equal, out_tensor, 0);
+                let t_is_null = builder.ins().icmp_imm_s(IntCC::Equal, out_tensor, 0);
                 builder.ins().brif(t_is_null, merge_blk, &[], decode_blk, &[]);
 
                 builder.switch_to_block(decode_blk);
@@ -3648,7 +3648,7 @@ impl Compiler<'_> {
                 // Load fn_ptr from offset 0
                 let fn_ptr = builder
                     .ins()
-                    .load(cl_types::I64, MemFlags::trusted(), closure_ptr, 0);
+                    .load(cl_types::I64, MemFlagsData::trusted(), closure_ptr, 0);
 
                 // Build signature: normal params + capture params (all I64)
                 let mut sig = self.module.make_signature();
@@ -3677,7 +3677,7 @@ impl Compiler<'_> {
                     let cap_val =
                         builder
                             .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), closure_ptr, offset);
+                            .load(cl_types::I64, MemFlagsData::trusted(), closure_ptr, offset);
                     arg_vals.push(cap_val);
                 }
 
@@ -3850,7 +3850,7 @@ impl Compiler<'_> {
 
             for (i, arg_val) in tensor_args.iter().enumerate() {
                 let offset = (i * 8) as i32;
-                builder.ins().stack_store(*arg_val, ss, offset);
+                builder.ins().stack_store(cl_types::I64, *arg_val, ss, offset);
             }
 
             let args_ptr = builder.ins().stack_addr(cl_types::I64, ss, 0);

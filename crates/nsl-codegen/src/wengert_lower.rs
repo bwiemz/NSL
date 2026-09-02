@@ -808,7 +808,7 @@ fn emit_sdpa_fused_dispatch(
     for variant in &variants {
         let is_hd = builder
             .ins()
-            .icmp_imm(IntCC::Equal, head_dim, variant.head_dim);
+            .icmp_imm_s(IntCC::Equal, head_dim, variant.head_dim);
         let base_ptx_gv = compiler
             .module
             .declare_data_in_func(variant.base_ptx, builder.func);
@@ -857,7 +857,7 @@ fn emit_sdpa_fused_dispatch(
     let out_param = builder.append_block_param(join_block, cl_types::I64);
     let lse_param = builder.append_block_param(join_block, cl_types::I64);
 
-    let took_fused = builder.ins().icmp_imm(IntCC::NotEqual, list, 0);
+    let took_fused = builder.ins().icmp_imm_s(IntCC::NotEqual, list, 0);
     builder
         .ins()
         .brif(took_fused, fused_block, &[], decomp_block, &[]);
@@ -1014,14 +1014,14 @@ fn emit_fused_forward_under_claim(
             let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_val);
             let scale_bits_i32 = builder.ins().bitcast(
                 cl_types::I32,
-                cranelift_codegen::ir::MemFlags::new(),
+                cranelift_codegen::ir::MemFlagsData::new(),
                 scale_f32,
             );
             builder.ins().uextend(cl_types::I64, scale_bits_i32)
         } else if scale_ty == cl_types::F32 {
             let scale_bits_i32 = builder.ins().bitcast(
                 cl_types::I32,
-                cranelift_codegen::ir::MemFlags::new(),
+                cranelift_codegen::ir::MemFlagsData::new(),
                 scale_val,
             );
             builder.ins().uextend(cl_types::I64, scale_bits_i32)
@@ -1039,7 +1039,7 @@ fn emit_fused_forward_under_claim(
             let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
             let scale_bits_i32 = builder.ins().bitcast(
                 cl_types::I32,
-                cranelift_codegen::ir::MemFlags::new(),
+                cranelift_codegen::ir::MemFlagsData::new(),
                 scale_f32,
             );
             builder.ins().uextend(cl_types::I64, scale_bits_i32)
@@ -1113,12 +1113,12 @@ fn emit_fused_forward_under_claim(
         "nsl_csha_alloc_backward_activations_into",
         &[batch, heads, seq_len, head_dim, saves_ptr],
     )?;
-    let q_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 0);
-    let k_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 8);
-    let v_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 16);
-    let row_max_v = builder.ins().stack_load(cl_types::I64, saves_slot, 24);
-    let row_sum_v = builder.ins().stack_load(cl_types::I64, saves_slot, 32);
-    let x_raw_v = builder.ins().stack_load(cl_types::I64, saves_slot, 40);
+    let q_proj_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 0);
+    let k_proj_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 8);
+    let v_proj_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 16);
+    let row_max_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 24);
+    let row_sum_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 32);
+    let x_raw_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 40);
 
     // --- 5. Resolve chain-side VarIds via `var_map`. ---
     let null = builder.ins().iconst(cl_types::I64, 0);
@@ -1318,7 +1318,7 @@ fn emit_fused_forward_under_claim(
         let trap_block = builder.create_block();
         let is_err = builder
             .ins()
-            .icmp_imm(IntCC::NotEqual, launch_rc, 0);
+            .icmp_imm_s(IntCC::NotEqual, launch_rc, 0);
         builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
         builder.switch_to_block(trap_block);
         builder.seal_block(trap_block);
@@ -2346,7 +2346,7 @@ fn lower_single_op(
                 let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_item);
                 let scale_bits_i32 = builder.ins().bitcast(
                     cl_types::I32,
-                    cranelift_codegen::ir::MemFlags::new(),
+                    cranelift_codegen::ir::MemFlagsData::new(),
                     scale_f32,
                 );
                 let scale_bits = builder.ins().uextend(cl_types::I64, scale_bits_i32);
@@ -2482,7 +2482,7 @@ fn lower_single_op(
             let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_item);
             let scale_bits_i32 = builder.ins().bitcast(
                 cl_types::I32,
-                cranelift_codegen::ir::MemFlags::new(),
+                cranelift_codegen::ir::MemFlagsData::new(),
                 scale_f32,
             );
             let scale_bits = builder.ins().uextend(cl_types::I64, scale_bits_i32);
@@ -2596,7 +2596,7 @@ fn lower_single_op(
                 let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_item);
                 let scale_bits_i32 = builder.ins().bitcast(
                     cl_types::I32,
-                    cranelift_codegen::ir::MemFlags::new(),
+                    cranelift_codegen::ir::MemFlagsData::new(),
                     scale_f32,
                 );
                 let scale_bits = builder.ins().uextend(cl_types::I64, scale_bits_i32);
@@ -2625,7 +2625,7 @@ fn lower_single_op(
                 let zero = builder.ins().iconst(cl_types::I64, 0);
                 let mut sel = [zero; 4];
                 for variant in &variants {
-                    let is_hd = builder.ins().icmp_imm(
+                    let is_hd = builder.ins().icmp_imm_s(
                         IntCC::Equal,
                         head_dim,
                         variant.head_dim,
@@ -2697,7 +2697,7 @@ fn lower_single_op(
                 let scale_f64 = builder.ins().fdiv(one_f64, hd_sqrt);
                 // Convert to f32 then reinterpret as i32 bits for scale_bits param
                 let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
-                let scale_bits_i32 = builder.ins().bitcast(cl_types::I32, cranelift_codegen::ir::MemFlags::new(), scale_f32);
+                let scale_bits_i32 = builder.ins().bitcast(cl_types::I32, cranelift_codegen::ir::MemFlagsData::new(), scale_f32);
                 let scale_bits = builder.ins().sextend(cl_types::I64, scale_bits_i32);
 
                 // Extract batch, heads, seq_len, head_dim from Q shape
@@ -2754,7 +2754,7 @@ fn lower_single_op(
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let mut sel = [zero; 4];
                     for variant in &variants {
-                        let is_hd = builder.ins().icmp_imm(
+                        let is_hd = builder.ins().icmp_imm_s(
                             IntCC::Equal,
                             head_dim,
                             variant.head_dim,
@@ -3032,7 +3032,7 @@ fn lower_single_op(
             let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
             let scale_bits_i32 = builder.ins().bitcast(
                 cl_types::I32,
-                cranelift_codegen::ir::MemFlags::new(),
+                cranelift_codegen::ir::MemFlagsData::new(),
                 scale_f32,
             );
             let scale_bits = builder.ins().sextend(cl_types::I64, scale_bits_i32);
@@ -4997,7 +4997,7 @@ fn lower_fused_linear_ce_backward_extract(
         let grad_f32 = builder.ins().fdemote(cl_types::F32, grad_f64);
         let grad_bits_i32 = builder.ins().bitcast(
             cl_types::I32,
-            cranelift_codegen::ir::MemFlags::new(),
+            cranelift_codegen::ir::MemFlagsData::new(),
             grad_f32,
         );
         let grad_bits = builder.ins().sextend(cl_types::I64, grad_bits_i32);
@@ -5468,7 +5468,7 @@ fn lower_fused_kl_ce_backward_extract(
         let grad_f32 = builder.ins().fdemote(cl_types::F32, grad_f64);
         let grad_bits_i32 = builder.ins().bitcast(
             cl_types::I32,
-            cranelift_codegen::ir::MemFlags::new(),
+            cranelift_codegen::ir::MemFlagsData::new(),
             grad_f32,
         );
         let grad_bits = builder.ins().sextend(cl_types::I64, grad_bits_i32);

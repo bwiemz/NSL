@@ -915,11 +915,11 @@ impl Compiler<'_> {
         deferred_block: cranelift_codegen::ir::Block,
         fullbuffer_block: cranelift_codegen::ir::Block,
     ) {
-        use cranelift_codegen::ir::{condcodes::IntCC, types as cl_types, InstBuilder, MemFlags};
+        use cranelift_codegen::ir::{condcodes::IntCC, types as cl_types, InstBuilder, MemFlagsData};
         let byte_addr = builder.ins().iadd(mode_table_base, gai);
         let mode = builder
             .ins()
-            .load(cl_types::I8, MemFlags::trusted(), byte_addr, 0);
+            .load(cl_types::I8, MemFlagsData::trusted(), byte_addr, 0);
         let one_i8 = builder.ins().iconst(cl_types::I8, 1);
         let is_deferred = builder.ins().icmp(IntCC::Equal, mode, one_i8);
         builder
@@ -1576,7 +1576,7 @@ impl Compiler<'_> {
             let pa_tot_cur = builder.use_var(pa_tot_var);
             let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
             builder.def_var(pa_tot_var, pa_tot_new);
-            let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
+            let pa_i_next = builder.ins().iadd_imm_s(pa_i, 1);
             builder.def_var(pa_i_var, pa_i_next);
             builder.ins().jump(pa_hdr, &[]);
             builder.switch_to_block(pa_exit);

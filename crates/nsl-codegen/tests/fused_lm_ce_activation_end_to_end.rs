@@ -233,7 +233,7 @@ fn lower_to_function(hint: Option<FusedCeDtypeHint>) -> Function {
             .copied()
             .expect("FusedLinearCe result VarId must be in var_map");
         builder.ins().return_(&[res]);
-        builder.finalize();
+        builder.finalize(compiler.module.target_config());
     }
     ctx.func
 }
@@ -348,7 +348,7 @@ fn lower_and_resolve(
         .expect("compile_wengert_ops must succeed under v5 activation");
         let res = lowered.var_map.get(&5).copied().expect("res Value");
         builder.ins().return_(&[res]);
-        builder.finalize();
+        builder.finalize(compiler.module.target_config());
     }
 
     // Resolve each target symbol name → its discriminator (`UserExternalName.index`)
@@ -687,7 +687,7 @@ fn lower_with_backward_and_resolve(
         );
         let res = lowered.var_map.get(&7).copied().expect("bwd-extract res Value");
         builder.ins().return_(&[res]);
-        builder.finalize();
+        builder.finalize(compiler.module.target_config());
     }
 
     let mut name_to_index: HashMap<String, u32> = HashMap::new();

@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types as cl_types, BlockArg, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{types as cl_types, BlockArg, InstBuilder, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 
 use crate::calibration::observation::ProjectionRef;
@@ -55,8 +55,8 @@ pub fn emit_splice_memcpy(
     fb.seal_block(body);
     let src_i = fb.ins().iadd(src_ptr, i);
     let dst_i = fb.ins().iadd(dst, i);
-    let b = fb.ins().load(cl_types::I8, MemFlags::new(), src_i, 0);
-    fb.ins().store(MemFlags::new(), b, dst_i, 0);
+    let b = fb.ins().load(cl_types::I8, MemFlagsData::new(), src_i, 0);
+    fb.ins().store(MemFlagsData::new(), b, dst_i, 0);
     let one = fb.ins().iconst(cl_types::I64, 1);
     let i2 = fb.ins().iadd(i, one);
     fb.ins().jump(header, &[BlockArg::Value(i2)]);
@@ -367,7 +367,7 @@ mod tests {
 
         emit_splice_memcpy(&mut fb, arena, 128, src, 64);
         fb.ins().return_(&[]);
-        fb.finalize();
+        fb.finalize(crate::calibration::host_frontend_config());
 
         cranelift_codegen::verifier::verify_function(&func, &flags)
             .expect("IR should verify");
@@ -410,7 +410,7 @@ mod tests {
 
         emit_splice_memcpy(&mut fb, arena, 0, src, 0);
         fb.ins().return_(&[]);
-        fb.finalize();
+        fb.finalize(crate::calibration::host_frontend_config());
 
         cranelift_codegen::verifier::verify_function(&func, &flags)
             .expect("zero-byte IR should verify");

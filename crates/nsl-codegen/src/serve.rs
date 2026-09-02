@@ -225,41 +225,43 @@ impl Compiler<'_> {
 
         builder
             .ins()
-            .stack_store(max_seq_len_val, slot, WORKER_MAX_SEQ_LEN_OFFSET);
+            .stack_store(cl_types::I64, max_seq_len_val, slot, WORKER_MAX_SEQ_LEN_OFFSET);
         builder
             .ins()
-            .stack_store(kv_blocks_val, slot, WORKER_KV_BLOCKS_OFFSET);
+            .stack_store(cl_types::I64, kv_blocks_val, slot, WORKER_KV_BLOCKS_OFFSET);
         builder
             .ins()
-            .stack_store(block_size_val, slot, WORKER_BLOCK_SIZE_OFFSET);
+            .stack_store(cl_types::I64, block_size_val, slot, WORKER_BLOCK_SIZE_OFFSET);
         builder
             .ins()
-            .stack_store(num_kv_heads_val, slot, WORKER_NUM_KV_HEADS_OFFSET);
+            .stack_store(cl_types::I64, num_kv_heads_val, slot, WORKER_NUM_KV_HEADS_OFFSET);
         builder
             .ins()
-            .stack_store(head_dim_val, slot, WORKER_HEAD_DIM_OFFSET);
+            .stack_store(cl_types::I64, head_dim_val, slot, WORKER_HEAD_DIM_OFFSET);
         builder
             .ins()
-            .stack_store(num_layers_val, slot, WORKER_NUM_LAYERS_OFFSET);
+            .stack_store(cl_types::I64, num_layers_val, slot, WORKER_NUM_LAYERS_OFFSET);
         builder
             .ins()
-            .stack_store(speculative_tokens_val, slot, WORKER_SPEC_TOKENS_OFFSET);
+            .stack_store(cl_types::I64, speculative_tokens_val, slot, WORKER_SPEC_TOKENS_OFFSET);
         builder
             .ins()
-            .stack_store(speculative_method_val, slot, WORKER_SPEC_METHOD_OFFSET);
+            .stack_store(cl_types::I64, speculative_method_val, slot, WORKER_SPEC_METHOD_OFFSET);
         builder.ins().stack_store(
+            cl_types::I64,
             speculative_tree_width_val,
             slot,
             WORKER_SPEC_TREE_WIDTH_OFFSET,
         );
         builder.ins().stack_store(
+            cl_types::I64,
             speculative_temp_bits_val,
             slot,
             WORKER_SPEC_TEMP_BITS_OFFSET,
         );
         builder
             .ins()
-            .stack_store(eos_val, slot, WORKER_EOS_TOKEN_OFFSET);
+            .stack_store(cl_types::I64, eos_val, slot, WORKER_EOS_TOKEN_OFFSET);
 
         slot
     }

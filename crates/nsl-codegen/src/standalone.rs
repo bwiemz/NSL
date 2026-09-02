@@ -5,7 +5,7 @@
 /// NSL program object.  Also contains `compile_standalone_main()` which generates
 /// the entry-point main() for standalone binaries (weight init + arg parser).
 use cranelift_codegen::ir::{
-    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, UserFuncName,
+    types as cl_types, AbiParam, Function, InstBuilder, MemFlagsData, UserFuncName,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -194,7 +194,7 @@ impl Compiler<'_> {
                 let size_ptr = builder.ins().symbol_value(cl_types::I64, size_gv);
                 let size_val = builder
                     .ins()
-                    .load(cl_types::I64, MemFlags::trusted(), size_ptr, 0);
+                    .load(cl_types::I64, MemFlagsData::trusted(), size_ptr, 0);
 
                 let embed_init_id = self.registry.runtime_fns["nsl_standalone_init_embedded"].0;
                 let embed_init_ref = self
@@ -242,7 +242,7 @@ impl Compiler<'_> {
                 builder.ins().return_(&[zero]);
             }
 
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("main (standalone)"), &ctx.func);

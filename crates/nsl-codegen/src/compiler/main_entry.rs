@@ -196,7 +196,7 @@ impl Compiler<'_> {
                 builder.ins().return_(&[zero]);
             }
 
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("main"), &ctx.func);
@@ -395,7 +395,7 @@ impl Compiler<'_> {
             let two = builder.ins().iconst(cl_types::I32, 2);
             builder.ins().return_(&[two]);
 
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("main (test dispatch)"), &ctx.func);

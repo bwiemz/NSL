@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{types as cl_types, Function, InstBuilder, MemFlags, UserFuncName};
+use cranelift_codegen::ir::{types as cl_types, Function, InstBuilder, MemFlagsData, UserFuncName};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::Module;
@@ -223,10 +223,10 @@ impl Compiler<'_> {
                 let bound = if *cl_type == cl_types::F64 {
                     builder
                         .ins()
-                        .bitcast(cl_types::F64, MemFlags::new(), param_val)
+                        .bitcast(cl_types::F64, MemFlagsData::new(), param_val)
                 } else if *cl_type == cl_types::F32 {
                     let bits32 = builder.ins().ireduce(cl_types::I32, param_val);
-                    builder.ins().bitcast(cl_types::F32, MemFlags::new(), bits32)
+                    builder.ins().bitcast(cl_types::F32, MemFlagsData::new(), bits32)
                 } else if cl_type.is_int() && *cl_type != cl_types::I64 {
                     builder.ins().ireduce(*cl_type, param_val)
                 } else {
@@ -264,7 +264,7 @@ impl Compiler<'_> {
                 };
                 builder.ins().return_(&[result]);
             }
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("lambda '{}'", lambda.name), &ctx.func);
@@ -307,11 +307,11 @@ impl Compiler<'_> {
                 let param_val = builder.block_params(entry)[i];
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), param_val, ptr, *offset as i32);
+                    .store(MemFlagsData::trusted(), param_val, ptr, *offset as i32);
             }
 
             builder.ins().return_(&[ptr]);
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("struct ctor '{name}'"), &ctx.func);
@@ -439,7 +439,7 @@ impl Compiler<'_> {
                                         builder.ins().iconst(cl_types::I64, field_offset as i64);
                                     let total_off = builder.ins().iadd(base_off, elem_byte_offset);
                                     let addr = builder.ins().iadd(ptr, total_off);
-                                    builder.ins().store(MemFlags::trusted(), init_val, addr, 0);
+                                    builder.ins().store(MemFlagsData::trusted(), init_val, addr, 0);
 
                                     let next_counter = builder.use_var(counter_var);
                                     let one = builder.ins().iconst(cl_types::I64, 1);
@@ -463,7 +463,7 @@ impl Compiler<'_> {
                                 let val = self.compile_expr(&mut builder, &mut state, init_expr)?;
                                 builder
                                     .ins()
-                                    .store(MemFlags::trusted(), val, ptr, *offset as i32);
+                                    .store(MemFlagsData::trusted(), val, ptr, *offset as i32);
                             } else {
                                 // Store zero for uninitialized fields
                                 let zero = if cl_type.is_float() {
@@ -473,7 +473,7 @@ impl Compiler<'_> {
                                 };
                                 builder
                                     .ins()
-                                    .store(MemFlags::trusted(), zero, ptr, *offset as i32);
+                                    .store(MemFlagsData::trusted(), zero, ptr, *offset as i32);
                             }
                         }
                     }
@@ -495,7 +495,7 @@ impl Compiler<'_> {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), zero, ptr, slot_off as i32);
+                        .store(MemFlagsData::trusted(), zero, ptr, slot_off as i32);
                 }
             }
 
@@ -537,7 +537,7 @@ impl Compiler<'_> {
             }
 
             builder.ins().return_(&[ptr]);
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
 
         self.record_ir(format_args!("model ctor '{model_name}'"), &ctx.func);
@@ -694,7 +694,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(format_args!("model method '{mangled}'"), &ctx.func);
@@ -845,7 +845,7 @@ impl Compiler<'_> {
                             }
                         }
 
-                        builder.finalize();
+                        builder.finalize(self.module.target_config());
                     }
 
                     self.record_ir(

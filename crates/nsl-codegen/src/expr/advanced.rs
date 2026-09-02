@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{Linkage, Module};
 
@@ -415,12 +415,12 @@ impl Compiler<'_> {
             // Store fn_ptr at offset 0
             builder
                 .ins()
-                .store(MemFlags::trusted(), addr, closure_ptr, 0);
+                .store(MemFlagsData::trusted(), addr, closure_ptr, 0);
             // Store num_captures at offset 8
             let num_cap = builder.ins().iconst(cl_types::I64, captures.len() as i64);
             builder
                 .ins()
-                .store(MemFlags::trusted(), num_cap, closure_ptr, 8);
+                .store(MemFlagsData::trusted(), num_cap, closure_ptr, 8);
             // Store each captured variable at offset 16 + i*8, normalized
             // to a raw I64 slot (floats as bit patterns, narrow ints
             // widened) — compile_lambda_body reverses this exactly. A
@@ -436,9 +436,9 @@ impl Compiler<'_> {
                 let val = builder.use_var(var);
                 let vty = builder.func.dfg.value_type(val);
                 let slot_val = if vty == cl_types::F64 {
-                    builder.ins().bitcast(cl_types::I64, MemFlags::new(), val)
+                    builder.ins().bitcast(cl_types::I64, MemFlagsData::new(), val)
                 } else if vty == cl_types::F32 {
-                    let bits32 = builder.ins().bitcast(cl_types::I32, MemFlags::new(), val);
+                    let bits32 = builder.ins().bitcast(cl_types::I32, MemFlagsData::new(), val);
                     builder.ins().uextend(cl_types::I64, bits32)
                 } else if vty.is_int() && vty != cl_types::I64 {
                     builder.ins().uextend(cl_types::I64, val)
@@ -448,7 +448,7 @@ impl Compiler<'_> {
                 let offset = (16 + i * 8) as i32;
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), slot_val, closure_ptr, offset);
+                    .store(MemFlagsData::trusted(), slot_val, closure_ptr, offset);
             }
 
             // NOTE: nsl_closure_free is now implemented in the runtime (memory.rs).
@@ -1128,7 +1128,7 @@ impl Compiler<'_> {
                             // Load model pointer from array slot: elem_ptr = *(base + i*8)
                             let elem_ptr = builder.ins().load(
                                 cl_types::I64,
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 array_base,
                                 cranelift_codegen::ir::immediates::Offset32::new((i * 8) as i32),
                             );
@@ -1140,7 +1140,7 @@ impl Compiler<'_> {
                 // Nested sub-model: load pointer from struct field, recurse
                 let sub_ptr = builder.ins().load(
                     cl_types::I64,
-                    cranelift_codegen::ir::MemFlags::trusted(),
+                    cranelift_codegen::ir::MemFlagsData::trusted(),
                     model_ptr,
                     cranelift_codegen::ir::immediates::Offset32::new(field.offset as i32),
                 );
@@ -1589,14 +1589,14 @@ impl Compiler<'_> {
                 let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_val);
                 let scale_bits_i32 = builder.ins().bitcast(
                     cl_types::I32,
-                    cranelift_codegen::ir::MemFlags::new(),
+                    cranelift_codegen::ir::MemFlagsData::new(),
                     scale_f32,
                 );
                 builder.ins().uextend(cl_types::I64, scale_bits_i32)
             } else if scale_ty == cl_types::F32 {
                 let scale_bits_i32 = builder.ins().bitcast(
                     cl_types::I32,
-                    cranelift_codegen::ir::MemFlags::new(),
+                    cranelift_codegen::ir::MemFlagsData::new(),
                     scale_val,
                 );
                 builder.ins().uextend(cl_types::I64, scale_bits_i32)
@@ -1778,12 +1778,12 @@ impl Compiler<'_> {
                 )?;
 
                 // Load the 6 device pointers out of the stack slot.
-                let q_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 0);
-                let k_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 8);
-                let v_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 16);
-                let row_max_v = builder.ins().stack_load(cl_types::I64, saves_slot, 24);
-                let row_sum_v = builder.ins().stack_load(cl_types::I64, saves_slot, 32);
-                let x_raw_v = builder.ins().stack_load(cl_types::I64, saves_slot, 40);
+                let q_proj_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 0);
+                let k_proj_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 8);
+                let v_proj_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 16);
+                let row_max_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 24);
+                let row_sum_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 32);
+                let x_raw_v = builder.ins().stack_load(cl_types::I64, cl_types::I64, saves_slot, 40);
 
                 // NOTE (save-buffer-leak fix, 2026-07-02): this site used to
                 // stash the six save pointers on `Compiler.csha_forward_saves`
@@ -1937,7 +1937,7 @@ impl Compiler<'_> {
                     let trap_block = builder.create_block();
                     let is_err = builder
                         .ins()
-                        .icmp_imm(IntCC::NotEqual, launch_rc, 0);
+                        .icmp_imm_s(IntCC::NotEqual, launch_rc, 0);
                     builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
                     builder.switch_to_block(trap_block);
                     builder.seal_block(trap_block);
@@ -2282,7 +2282,7 @@ impl Compiler<'_> {
 
             // offset 0: name_ptr
             builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 name_ptr,
                 meta_ptr,
                 cranelift_codegen::ir::immediates::Offset32::new(base),
@@ -2291,7 +2291,7 @@ impl Compiler<'_> {
             // offset 8: byte_offset into model struct
             let offset_val = builder.ins().iconst(cl_types::I64, *byte_offset as i64);
             builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 offset_val,
                 meta_ptr,
                 cranelift_codegen::ir::immediates::Offset32::new(base + 8),
@@ -2300,7 +2300,7 @@ impl Compiler<'_> {
             // offset 16: shape_ptr (0 for now)
             let zero = builder.ins().iconst(cl_types::I64, 0);
             builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 zero,
                 meta_ptr,
                 cranelift_codegen::ir::immediates::Offset32::new(base + 16),
@@ -2309,7 +2309,7 @@ impl Compiler<'_> {
             // offset 24: ndim (0 for now)
             let zero2 = builder.ins().iconst(cl_types::I64, 0);
             builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 zero2,
                 meta_ptr,
                 cranelift_codegen::ir::immediates::Offset32::new(base + 24),
@@ -2320,7 +2320,7 @@ impl Compiler<'_> {
                 .ins()
                 .iconst(cl_types::I64, if *transpose { 1 } else { 0 });
             builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 transpose_val,
                 meta_ptr,
                 cranelift_codegen::ir::immediates::Offset32::new(base + 32),
@@ -2976,7 +2976,7 @@ impl Compiler<'_> {
 
         // Get the data pointer as a Cranelift Value
         let data_ref = self.module.declare_data_in_func(data_id, builder.func);
-        let data_ptr = builder.ins().global_value(cl_types::I64, data_ref);
+        let data_ptr = builder.ins().symbol_value(cl_types::I64, data_ref);
 
         // Build shape list
         let shape_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -3146,13 +3146,13 @@ impl Compiler<'_> {
 
         // Get .rodata pointers as Cranelift Values
         let rp_ref = self.module.declare_data_in_func(rp_data_id, builder.func);
-        let rp_ptr = builder.ins().global_value(cl_types::I64, rp_ref);
+        let rp_ptr = builder.ins().symbol_value(cl_types::I64, rp_ref);
 
         let ci_ref = self.module.declare_data_in_func(ci_data_id, builder.func);
-        let ci_ptr = builder.ins().global_value(cl_types::I64, ci_ref);
+        let ci_ptr = builder.ins().symbol_value(cl_types::I64, ci_ref);
 
         let val_ref = self.module.declare_data_in_func(val_data_id, builder.func);
-        let val_ptr = builder.ins().global_value(cl_types::I64, val_ref);
+        let val_ptr = builder.ins().symbol_value(cl_types::I64, val_ref);
 
         // Emit constants for dimensions
         let nrows_val = builder.ins().iconst(cl_types::I64, csr.nrows as i64);
