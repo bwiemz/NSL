@@ -31,14 +31,29 @@ pub(crate) fn ones_from_shape(shape: &[i64], dtype: u16) -> i64 {
     result
 }
 
+/// A tensor shape as a tape node stores it. Inline up to four dims — every
+/// shape a training forward records ([batch, seq, heads, head_dim] is the
+/// widest) — so capturing one costs no heap allocation; a 5-D+ shape spills
+/// to the heap exactly as the `Vec` it replaced did. Four keeps the variant
+/// two words wider than a `Vec`, which leaves the `TapeOp` enum the same size
+/// (the `Fp8MatMul`/`FlashAttention` variants set it); six would grow every
+/// node. Derefs to `&[i64]`, which is all the backward consumers take.
+pub type TapeShape = smallvec::SmallVec<[i64; 4]>;
+
+/// Capture `t`'s shape for a tape node — a copy of `shape[..ndim]` into
+/// inline storage, no heap traffic for ≤ 4 dims.
+pub(crate) fn tape_shape(t: &NslTensor) -> TapeShape {
+    (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect()
+}
+
 /// Operations recorded on the tape during forward passes inside `grad` blocks.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub enum TapeOp {
-    Add { a: i64, b: i64, out: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
-    Sub { a: i64, b: i64, out: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
-    Mul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
-    Div { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
+    Add { a: i64, b: i64, out: i64, a_shape: TapeShape, b_shape: TapeShape },
+    Sub { a: i64, b: i64, out: i64, a_shape: TapeShape, b_shape: TapeShape },
+    Mul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: TapeShape, b_shape: TapeShape },
+    Div { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: TapeShape, b_shape: TapeShape },
     MatMul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64 },
     /// FP8 matmul with scale factors for E5M2 backward dispatch.
     /// Forward uses E4M3; backward re-quantizes to E5M2 and uses GPU MMA.
@@ -53,10 +68,10 @@ pub enum TapeOp {
     MulScalar { a: i64, scalar: f64, out: i64 },
     AddScalar { a: i64, out: i64 },
     Transpose { a: i64, out: i64, dim0: i64, dim1: i64 },
-    SumReduce { a: i64, out: i64, dim: i64, keepdim: bool, input_shape: Vec<i64> },
-    MeanReduce { a: i64, out: i64, dim: i64, keepdim: bool, num_elements: i64, input_shape: Vec<i64> },
-    ReduceMax { a: i64, out: i64, dim: i64, keepdim: bool, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
-    Gather { a: i64, out: i64, dim: i64, indices_ptr: i64, input_shape: Vec<i64> },
+    SumReduce { a: i64, out: i64, dim: i64, keepdim: bool, input_shape: TapeShape },
+    MeanReduce { a: i64, out: i64, dim: i64, keepdim: bool, num_elements: i64, input_shape: TapeShape },
+    ReduceMax { a: i64, out: i64, dim: i64, keepdim: bool, saved_argmax: Vec<usize>, input_shape: TapeShape },
+    Gather { a: i64, out: i64, dim: i64, indices_ptr: i64, input_shape: TapeShape },
     Exp { a: i64, out: i64, saved_out: i64 },
     Log { a: i64, out: i64, saved_a: i64 },
     Sqrt { a: i64, out: i64, saved_out: i64 },
@@ -71,23 +86,23 @@ pub enum TapeOp {
     Tanh { a: i64, out: i64, saved_out: i64 },
     Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
     LogSoftmax { a: i64, out: i64, saved_out: i64, dim: i64 },
-    Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
+    Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: TapeShape },
     /// Metadata-only relabel: backward reshapes the gradient back to the
     /// input's shape. Without this op every reshape between two recorded ops
     /// silently DISCONNECTED the tape (views get a fresh tape_id), which is
     /// how the Q/K/V-projection -> attention chain lost all its param grads.
-    Reshape { a: i64, out: i64, input_shape: Vec<i64> },
+    Reshape { a: i64, out: i64, input_shape: TapeShape },
     Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
     EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
     LayerNorm { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_mean: i64, saved_inv_std: i64, saved_weight: i64 },
     RMSNorm { input: i64, weight: i64, out: i64, saved_input: i64, saved_rms: i64, saved_weight: i64 },
     Dropout { a: i64, out: i64, saved_mask: i64, scale: f64 },
     Conv2d { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_weight: i64, stride_h: usize, stride_w: usize, pad_h: usize, pad_w: usize },
-    MaxPool2d { a: i64, out: i64, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
+    MaxPool2d { a: i64, out: i64, saved_argmax: Vec<usize>, input_shape: TapeShape },
     RotateHalf { a: i64, out: i64 },
     BiasAdd { tensor: i64, bias: i64, out: i64 },
-    Unsqueeze { input: i64, out: i64, input_shape: Vec<i64> },
-    Expand { input: i64, out: i64, original_shape: Vec<i64> },
+    Unsqueeze { input: i64, out: i64, input_shape: TapeShape },
+    Expand { input: i64, out: i64, original_shape: TapeShape },
     Stack { inputs: Vec<i64>, out: i64, dim: i64 },
     FlashAttention {
         q: i64, k: i64, v: i64,

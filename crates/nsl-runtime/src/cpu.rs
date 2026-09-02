@@ -3,11 +3,139 @@
 
 use std::ffi::c_void;
 
+use smallvec::{smallvec, SmallVec};
+
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 use crate::tensor::{
     bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, NslTensor, DTYPE_BF16,
     DTYPE_FP16,
 };
+
+/// How one elementwise op walks its (contiguous) operands: the broadcast
+/// output shape and, per output dim, the flat stride into each operand — 0 on
+/// a dim that operand broadcasts along. Inline for up to four dims, so
+/// planning an op allocates nothing. The three dtype paths each carried a
+/// copy of this logic that built five scratch `Vec`s per call and, per
+/// element, recomputed the trailing-dim products twice per dim (once for the
+/// `/`, once for the `%`) — O(len · ndim²) with a division in it, on a path
+/// whose whole point at small shapes is the fixed cost.
+struct BroadcastPlan {
+    out_shape: SmallVec<[i64; 4]>,
+    a_strides: SmallVec<[usize; 4]>,
+    b_strides: SmallVec<[usize; 4]>,
+    out_len: usize,
+    /// Both operands have exactly the output shape, so every operand index is
+    /// the output index and the walk is a flat loop.
+    same_shape: bool,
+}
+
+impl BroadcastPlan {
+    /// Right-align both shapes (NumPy rules) and derive the output. Aborts
+    /// with the established message on a dim that neither matches nor is 1;
+    /// `what` is the path's suffix in it (`""`, `" f16"`).
+    fn new(a: &NslTensor, b: &NslTensor, what: &str) -> Self {
+        let a_ndim = a.ndim as usize;
+        let b_ndim = b.ndim as usize;
+        let out_ndim = a_ndim.max(b_ndim);
+
+        let mut a_shape: SmallVec<[i64; 4]> = smallvec![1; out_ndim];
+        let mut b_shape: SmallVec<[i64; 4]> = smallvec![1; out_ndim];
+        for i in 0..a_ndim {
+            a_shape[out_ndim - a_ndim + i] = unsafe { *a.shape.add(i) };
+        }
+        for i in 0..b_ndim {
+            b_shape[out_ndim - b_ndim + i] = unsafe { *b.shape.add(i) };
+        }
+
+        let mut out_shape: SmallVec<[i64; 4]> = smallvec![0; out_ndim];
+        for i in 0..out_ndim {
+            let da = a_shape[i];
+            let db = b_shape[i];
+            out_shape[i] = if da == db {
+                da
+            } else if da == 1 {
+                db
+            } else if db == 1 {
+                da
+            } else {
+                eprintln!(
+                    "nsl: tensor shape mismatch in elementwise op{what} (dim {i}: {da} vs {db})\n  full a_shape={a_shape:?}\n  full b_shape={b_shape:?}"
+                );
+                std::process::abort();
+            };
+        }
+        let out_len = out_shape.iter().product::<i64>() as usize;
+
+        // Contiguous operand strides, zeroed where the operand broadcasts.
+        let operand_strides = |shape: &[i64]| -> SmallVec<[usize; 4]> {
+            let mut strides: SmallVec<[usize; 4]> = smallvec![0; out_ndim];
+            let mut s = 1usize;
+            for i in (0..out_ndim).rev() {
+                if shape[i] > 1 {
+                    strides[i] = s;
+                }
+                s *= shape[i] as usize;
+            }
+            strides
+        };
+        let a_strides = operand_strides(&a_shape);
+        let b_strides = operand_strides(&b_shape);
+        let same_shape = a_ndim == out_ndim && b_ndim == out_ndim && a_shape == out_shape && b_shape == out_shape;
+
+        BroadcastPlan { out_shape, a_strides, b_strides, out_len, same_shape }
+    }
+
+    fn out_ndim(&self) -> usize {
+        self.out_shape.len()
+    }
+
+    /// The output's shape and row-major strides, allocated as the result
+    /// tensor will own them.
+    fn alloc_out_shape_strides(&self) -> (*mut i64, *mut i64) {
+        let nd = self.out_ndim();
+        let shape = checked_alloc(nd * std::mem::size_of::<i64>()) as *mut i64;
+        for (i, &s) in self.out_shape.iter().enumerate() {
+            unsafe { *shape.add(i) = s };
+        }
+        let strides = NslTensor::compute_strides(shape, nd as i64);
+        (shape, strides)
+    }
+
+    /// Visit every output element in row-major order as
+    /// `visit(out_idx, a_idx, b_idx)`. An odometer over the output
+    /// coordinates: one add per operand per element and a carry when a dim
+    /// wraps, producing exactly the `(a_idx, b_idx)` that decomposing
+    /// `out_idx` by division would.
+    #[inline]
+    fn for_each(&self, mut visit: impl FnMut(usize, usize, usize)) {
+        if self.same_shape {
+            for i in 0..self.out_len {
+                visit(i, i, i);
+            }
+            return;
+        }
+        let nd = self.out_ndim();
+        let mut coord: SmallVec<[usize; 4]> = smallvec![0; nd];
+        let mut a_idx = 0usize;
+        let mut b_idx = 0usize;
+        for flat in 0..self.out_len {
+            visit(flat, a_idx, b_idx);
+            let mut d = nd;
+            while d > 0 {
+                d -= 1;
+                coord[d] += 1;
+                a_idx += self.a_strides[d];
+                b_idx += self.b_strides[d];
+                if coord[d] < self.out_shape[d] as usize {
+                    break;
+                }
+                a_idx -= self.a_strides[d] * coord[d];
+                b_idx -= self.b_strides[d] * coord[d];
+                coord[d] = 0;
+            }
+        }
+    }
+}
 
 /// Elementwise binary op with NumPy-style broadcasting (f64 path).
 pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64 {
@@ -50,71 +178,9 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         return tensor_elementwise_op_f32_impl(a_ptr, b_ptr, op_f32);
     }
 
-    let a_ndim = a.ndim as usize;
-    let b_ndim = b.ndim as usize;
-    let out_ndim = a_ndim.max(b_ndim);
-
-    // Build shapes right-aligned (NumPy broadcasting rules)
-    let mut a_shape = vec![1i64; out_ndim];
-    let mut b_shape = vec![1i64; out_ndim];
-    for i in 0..a_ndim {
-        a_shape[out_ndim - a_ndim + i] = unsafe { *a.shape.add(i) };
-    }
-    for i in 0..b_ndim {
-        b_shape[out_ndim - b_ndim + i] = unsafe { *b.shape.add(i) };
-    }
-
-    // Compute output shape
-    let mut out_shape_vec = vec![0i64; out_ndim];
-    for i in 0..out_ndim {
-        let da = a_shape[i];
-        let db = b_shape[i];
-        if da == db {
-            out_shape_vec[i] = da;
-        } else if da == 1 {
-            out_shape_vec[i] = db;
-        } else if db == 1 {
-            out_shape_vec[i] = da;
-        } else {
-            eprintln!(
-                "nsl: tensor shape mismatch in elementwise op (dim {}: {} vs {})\n  full a_shape={:?}\n  full b_shape={:?}",
-                i, da, db, a_shape, b_shape
-            );
-            std::process::abort();
-        }
-    }
-
-    let mut out_len: i64 = 1;
-    for &s in &out_shape_vec {
-        out_len *= s;
-    }
-
-    let shape = checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
-    for (i, &s) in out_shape_vec.iter().enumerate().take(out_ndim) {
-        unsafe { *shape.add(i) = s };
-    }
-    let strides = NslTensor::compute_strides(shape, out_ndim as i64);
-    let data = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-
-    // Compute strides for a and b (0 for broadcast dims)
-    let mut a_strides = vec![0i64; out_ndim];
-    let mut b_strides = vec![0i64; out_ndim];
-    {
-        let mut s = 1i64;
-        for i in (0..out_ndim).rev() {
-            if a_shape[i] > 1 {
-                a_strides[i] = s;
-            }
-            s *= a_shape[i];
-        }
-        s = 1;
-        for i in (0..out_ndim).rev() {
-            if b_shape[i] > 1 {
-                b_strides[i] = s;
-            }
-            s *= b_shape[i];
-        }
-    }
+    let plan = BroadcastPlan::new(a, b, "");
+    let (shape, strides) = plan.alloc_out_shape_strides();
+    let data = checked_alloc(plan.out_len * std::mem::size_of::<f64>()) as *mut f64;
 
     // Widen either input to f64. Handles f64/f32/f16/bf16/i32 — the f16 and
     // bf16 reads flow through the same bit-twiddling helpers as the f16/f32
@@ -138,44 +204,22 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         }
     };
 
-    // Iterate over output elements using multi-index
-    for flat in 0..out_len as usize {
-        let mut rem = flat;
-        let mut a_idx: usize = 0;
-        let mut b_idx: usize = 0;
-        for d in 0..out_ndim {
-            let coord = rem / {
-                let mut p = 1usize;
-                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
-                    p *= sv as usize;
-                }
-                p
-            };
-            rem %= {
-                let mut p = 1usize;
-                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
-                    p *= sv as usize;
-                }
-                p
-            };
-            a_idx += coord * a_strides[d] as usize;
-            b_idx += coord * b_strides[d] as usize;
-        }
-        unsafe { *data.add(flat) = op(read_a_f64(a_idx), read_b_f64(b_idx)) };
-    }
+    plan.for_each(|flat, a_idx, b_idx| unsafe {
+        *data.add(flat) = op(read_a_f64(a_idx), read_b_f64(b_idx));
+    });
 
     let result = Box::new(NslTensor::new(
         data as *mut c_void,
         shape,
         strides,
-        out_ndim as i64,
-        out_len,
+        plan.out_ndim() as i64,
+        plan.out_len as i64,
         0,
         0,
         1,
         0,
     ));
-    crate::math::track_alloc((out_len as usize) * std::mem::size_of::<f64>());
+    crate::math::track_alloc(plan.out_len * std::mem::size_of::<f64>());
     Box::into_raw(result) as i64
 }
 
@@ -184,71 +228,9 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
     let a = NslTensor::from_ptr(a_ptr);
     let b = NslTensor::from_ptr(b_ptr);
 
-    let a_ndim = a.ndim as usize;
-    let b_ndim = b.ndim as usize;
-    let out_ndim = a_ndim.max(b_ndim);
-
-    // Build shapes right-aligned (NumPy broadcasting rules)
-    let mut a_shape = vec![1i64; out_ndim];
-    let mut b_shape = vec![1i64; out_ndim];
-    for i in 0..a_ndim {
-        a_shape[out_ndim - a_ndim + i] = unsafe { *a.shape.add(i) };
-    }
-    for i in 0..b_ndim {
-        b_shape[out_ndim - b_ndim + i] = unsafe { *b.shape.add(i) };
-    }
-
-    // Compute output shape
-    let mut out_shape_vec = vec![0i64; out_ndim];
-    for i in 0..out_ndim {
-        let da = a_shape[i];
-        let db = b_shape[i];
-        if da == db {
-            out_shape_vec[i] = da;
-        } else if da == 1 {
-            out_shape_vec[i] = db;
-        } else if db == 1 {
-            out_shape_vec[i] = da;
-        } else {
-            eprintln!(
-                "nsl: tensor shape mismatch in elementwise op (dim {}: {} vs {})\n  full a_shape={:?}\n  full b_shape={:?}",
-                i, da, db, a_shape, b_shape
-            );
-            std::process::abort();
-        }
-    }
-
-    let mut out_len: i64 = 1;
-    for &s in &out_shape_vec {
-        out_len *= s;
-    }
-
-    let shape = checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
-    for (i, &s) in out_shape_vec.iter().enumerate().take(out_ndim) {
-        unsafe { *shape.add(i) = s };
-    }
-    let strides = NslTensor::compute_strides(shape, out_ndim as i64);
-    let data = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
-
-    // Compute strides for a and b (0 for broadcast dims)
-    let mut a_strides = vec![0i64; out_ndim];
-    let mut b_strides = vec![0i64; out_ndim];
-    {
-        let mut s = 1i64;
-        for i in (0..out_ndim).rev() {
-            if a_shape[i] > 1 {
-                a_strides[i] = s;
-            }
-            s *= a_shape[i];
-        }
-        s = 1;
-        for i in (0..out_ndim).rev() {
-            if b_shape[i] > 1 {
-                b_strides[i] = s;
-            }
-            s *= b_shape[i];
-        }
-    }
+    let plan = BroadcastPlan::new(a, b, "");
+    let (shape, strides) = plan.alloc_out_shape_strides();
+    let data = checked_alloc(plan.out_len * std::mem::size_of::<f32>()) as *mut f32;
 
     // Helper to read element as f32 regardless of source dtype.
     // Widens f16/bf16 inputs so SGD-style `f32_param - lr*f16_grad` flows
@@ -270,44 +252,22 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
         }
     };
 
-    // Iterate over output elements using multi-index
-    for flat in 0..out_len as usize {
-        let mut rem = flat;
-        let mut a_idx: usize = 0;
-        let mut b_idx: usize = 0;
-        for d in 0..out_ndim {
-            let coord = rem / {
-                let mut p = 1usize;
-                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
-                    p *= sv as usize;
-                }
-                p
-            };
-            rem %= {
-                let mut p = 1usize;
-                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
-                    p *= sv as usize;
-                }
-                p
-            };
-            a_idx += coord * a_strides[d] as usize;
-            b_idx += coord * b_strides[d] as usize;
-        }
-        unsafe { *data.add(flat) = op(read_a(a_idx), read_b(b_idx)) };
-    }
+    plan.for_each(|flat, a_idx, b_idx| unsafe {
+        *data.add(flat) = op(read_a(a_idx), read_b(b_idx));
+    });
 
     let result = Box::new(NslTensor::new(
         data as *mut c_void,
         shape,
         strides,
-        out_ndim as i64,
-        out_len,
+        plan.out_ndim() as i64,
+        plan.out_len as i64,
         0,
         1,
         1,
         0,
     ));
-    crate::math::track_alloc((out_len as usize) * std::mem::size_of::<f32>());
+    crate::math::track_alloc(plan.out_len * std::mem::size_of::<f32>());
     Box::into_raw(result) as i64
 }
 
@@ -332,68 +292,9 @@ pub(crate) fn tensor_elementwise_op_f16_impl(
     let a = NslTensor::from_ptr(a_ptr);
     let b = NslTensor::from_ptr(b_ptr);
 
-    let a_ndim = a.ndim as usize;
-    let b_ndim = b.ndim as usize;
-    let out_ndim = a_ndim.max(b_ndim);
-
-    let mut a_shape = vec![1i64; out_ndim];
-    let mut b_shape = vec![1i64; out_ndim];
-    for i in 0..a_ndim {
-        a_shape[out_ndim - a_ndim + i] = unsafe { *a.shape.add(i) };
-    }
-    for i in 0..b_ndim {
-        b_shape[out_ndim - b_ndim + i] = unsafe { *b.shape.add(i) };
-    }
-
-    let mut out_shape_vec = vec![0i64; out_ndim];
-    for i in 0..out_ndim {
-        let da = a_shape[i];
-        let db = b_shape[i];
-        if da == db {
-            out_shape_vec[i] = da;
-        } else if da == 1 {
-            out_shape_vec[i] = db;
-        } else if db == 1 {
-            out_shape_vec[i] = da;
-        } else {
-            eprintln!(
-                "nsl: tensor shape mismatch in elementwise op f16 (dim {}: {} vs {})\n  full a_shape={:?}\n  full b_shape={:?}",
-                i, da, db, a_shape, b_shape
-            );
-            std::process::abort();
-        }
-    }
-
-    let mut out_len: i64 = 1;
-    for &s in &out_shape_vec {
-        out_len *= s;
-    }
-
-    let shape = checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
-    for (i, &s) in out_shape_vec.iter().enumerate().take(out_ndim) {
-        unsafe { *shape.add(i) = s };
-    }
-    let strides = NslTensor::compute_strides(shape, out_ndim as i64);
-    let data = checked_alloc((out_len as usize) * std::mem::size_of::<u16>()) as *mut u16;
-
-    let mut a_strides = vec![0i64; out_ndim];
-    let mut b_strides = vec![0i64; out_ndim];
-    {
-        let mut s = 1i64;
-        for i in (0..out_ndim).rev() {
-            if a_shape[i] > 1 {
-                a_strides[i] = s;
-            }
-            s *= a_shape[i];
-        }
-        s = 1;
-        for i in (0..out_ndim).rev() {
-            if b_shape[i] > 1 {
-                b_strides[i] = s;
-            }
-            s *= b_shape[i];
-        }
-    }
+    let plan = BroadcastPlan::new(a, b, " f16");
+    let (shape, strides) = plan.alloc_out_shape_strides();
+    let data = checked_alloc(plan.out_len * std::mem::size_of::<u16>()) as *mut u16;
 
     // Helper to read element as f32 regardless of source dtype.
     // Accepts f16/bf16/f32/f64 inputs so elementwise `f16_grad op f32_param`
@@ -431,43 +332,22 @@ pub(crate) fn tensor_elementwise_op_f16_impl(
         }
     };
 
-    for flat in 0..out_len as usize {
-        let mut rem = flat;
-        let mut a_idx: usize = 0;
-        let mut b_idx: usize = 0;
-        for d in 0..out_ndim {
-            let coord = rem / {
-                let mut p = 1usize;
-                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
-                    p *= sv as usize;
-                }
-                p
-            };
-            rem %= {
-                let mut p = 1usize;
-                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
-                    p *= sv as usize;
-                }
-                p
-            };
-            a_idx += coord * a_strides[d] as usize;
-            b_idx += coord * b_strides[d] as usize;
-        }
-        unsafe { *data.add(flat) = narrow(op(read_a(a_idx), read_b(b_idx))) };
-    }
+    plan.for_each(|flat, a_idx, b_idx| unsafe {
+        *data.add(flat) = narrow(op(read_a(a_idx), read_b(b_idx)));
+    });
 
     let result = Box::new(NslTensor::new(
         data as *mut c_void,
         shape,
         strides,
-        out_ndim as i64,
-        out_len,
+        plan.out_ndim() as i64,
+        plan.out_len as i64,
         0,
         out_dtype,
         1,
         0,
     ));
-    crate::math::track_alloc((out_len as usize) * std::mem::size_of::<u16>());
+    crate::math::track_alloc(plan.out_len * std::mem::size_of::<u16>());
     Box::into_raw(result) as i64
 }
 
@@ -904,6 +784,87 @@ pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u16) -> i6
         0,
     ));
     Box::into_raw(tensor) as i64
+}
+
+#[cfg(test)]
+mod broadcast_plan_tests {
+    use super::*;
+    use crate::tensor::nsl_tensor_free;
+
+    /// The index mapping the plan's odometer produces must be the one the
+    /// per-element division decomposition produced (the reference below is
+    /// that algorithm), for every broadcast pattern — same shape (the flat
+    /// path), trailing/leading broadcast, rank-0 operands, a 5-D pair that
+    /// spills the inline capacity, and a zero-length output.
+    #[test]
+    fn odometer_matches_division_decomposition() {
+        let cases: &[(&[i64], &[i64])] = &[
+            (&[2, 3], &[2, 3]),
+            (&[2, 3], &[3]),
+            (&[2, 1], &[1, 3]),
+            (&[4, 1, 3], &[2, 1]),
+            (&[], &[2, 2]),
+            (&[2, 2], &[]),
+            (&[], &[]),
+            (&[2, 1, 3, 1, 2], &[1, 4, 1, 5, 1]),
+            (&[0, 3], &[3]),
+            (&[7], &[1]),
+        ];
+        for &(sa, sb) in cases {
+            let a = create_tensor_with_shape_rs_dtype(sa, 0);
+            let b = create_tensor_with_shape_rs_dtype(sb, 0);
+            let plan = BroadcastPlan::new(NslTensor::from_ptr(a), NslTensor::from_ptr(b), "");
+            let nd = plan.out_ndim();
+
+            let mut got = Vec::new();
+            plan.for_each(|flat, ai, bi| got.push((flat, ai, bi)));
+
+            let mut want = Vec::new();
+            for flat in 0..plan.out_len {
+                let mut rem = flat;
+                let (mut ai, mut bi) = (0usize, 0usize);
+                for d in 0..nd {
+                    let trailing: usize = plan.out_shape[d + 1..].iter().map(|&s| s as usize).product();
+                    let coord = rem / trailing;
+                    rem %= trailing;
+                    ai += coord * plan.a_strides[d];
+                    bi += coord * plan.b_strides[d];
+                }
+                want.push((flat, ai, bi));
+            }
+            assert_eq!(got, want, "a={sa:?} b={sb:?}");
+            assert_eq!(got.len(), plan.out_len, "a={sa:?} b={sb:?}");
+            assert_eq!(plan.same_shape, sa == sb, "a={sa:?} b={sb:?}");
+            nsl_tensor_free(a);
+            nsl_tensor_free(b);
+        }
+    }
+
+    /// End to end through the f64 path: a [2, 3] + [3] broadcast lands each
+    /// row's element on the right `b`, and the output is a fresh row-major
+    /// tensor of the broadcast shape.
+    #[test]
+    fn elementwise_broadcast_values() {
+        let a = create_tensor_with_shape_rs_dtype(&[2, 3], 0);
+        let b = create_tensor_with_shape_rs_dtype(&[3], 0);
+        let (ta, tb) = (NslTensor::from_ptr(a), NslTensor::from_ptr(b));
+        for i in 0..6 {
+            unsafe { *ta.data_f64().add(i) = i as f64 };
+        }
+        for j in 0..3 {
+            unsafe { *tb.data_f64().add(j) = 10.0 * (j + 1) as f64 };
+        }
+        let out = tensor_elementwise_op(a, b, |x, y| x + y);
+        let t = NslTensor::from_ptr(out);
+        assert_eq!(t.ndim, 2);
+        assert_eq!(unsafe { std::slice::from_raw_parts(t.shape, 2) }, &[2, 3]);
+        assert_eq!(unsafe { std::slice::from_raw_parts(t.strides, 2) }, &[3, 1]);
+        let got: Vec<f64> = (0..6).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(got, vec![10.0, 21.0, 32.0, 13.0, 24.0, 35.0]);
+        nsl_tensor_free(out);
+        nsl_tensor_free(b);
+        nsl_tensor_free(a);
+    }
 }
 
 #[cfg(test)]

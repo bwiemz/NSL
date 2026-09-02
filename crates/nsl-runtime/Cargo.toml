@@ -28,6 +28,11 @@ rand = "0.9"
 # training checkpoints resumable (item 8). Same version rand pulls in, so
 # this adds no new crate to the build graph.
 rand_chacha = "0.9"
+# Inline-capacity shape vectors for the autodiff tape (`TapeShape`): a tape
+# node stores its operands' shapes, and a `Vec` per shape was one heap
+# allocation per recorded shape on every elementwise op. Already in the build
+# graph via cranelift; no new crate.
+smallvec = "1"
 cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cublaslt", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 safetensors = { version = "0.4" }
 hf-hub = { version = "0.3", optional = true }

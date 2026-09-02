@@ -1477,6 +1477,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "tokenizers",
 ]

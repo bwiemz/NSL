@@ -823,6 +823,28 @@ impl NslTensor {
         true
     }
 
+    /// Whether `strides` are exactly what `compute_strides(shape)` would
+    /// produce — the test `nsl_tensor_contiguous` makes before deciding a
+    /// tensor can be handed back as-is. Unlike `is_contiguous` this has no
+    /// `ndim <= 1` shortcut: a 1-D tensor with stride 2 (a column of a
+    /// transposed view, a stepped slice) is NOT row-major and must be
+    /// copied, and this is the one place that decision feeds a flat-indexed
+    /// kernel. Compares in place; the old check allocated the expected
+    /// strides just to read them once and free them.
+    pub(crate) fn strides_are_row_major(&self) -> bool {
+        let ndim = self.ndim as usize;
+        let mut expected = 1_i64;
+        for d in (0..ndim).rev() {
+            unsafe {
+                if *self.strides.add(d) != expected {
+                    return false;
+                }
+                expected *= *self.shape.add(d);
+            }
+        }
+        true
+    }
+
     /// Create a new contiguous (row-major) copy of this tensor.
     pub(crate) fn make_contiguous(ptr: i64) -> i64 {
         let tensor = NslTensor::from_ptr(ptr);
@@ -3339,9 +3361,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         // established metadata-only relabel — backward passes the gradient
         // through unchanged.
         if autodiff::is_recording() {
-            let t = NslTensor::from_ptr(tensor_ptr);
-            let input_shape: Vec<i64> =
-                (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect();
+            let input_shape = autodiff::tape_shape(NslTensor::from_ptr(tensor_ptr));
             autodiff::maybe_record(autodiff::TapeOp::Reshape {
                 a: tensor_ptr,
                 out,
@@ -3756,7 +3776,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
                 let saved_argmax: Vec<usize> = argmax_vec.iter().map(|&x| x as usize).collect();
                 autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
                     a: input_ptr, out: result, saved_argmax,
-                    input_shape: vec![n, c, h, w],
+                    input_shape: autodiff::TapeShape::from_slice(&[n, c, h, w]),
                 });
             }
             return result;
@@ -3845,7 +3865,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
         NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
             a: input_ptr, out: result_ptr, saved_argmax: argmax_indices,
-            input_shape: vec![n as i64, c as i64, h as i64, w as i64],
+            input_shape: autodiff::TapeShape::from_slice(&[n as i64, c as i64, h as i64, w as i64]),
         });
     }
 
@@ -5392,6 +5412,52 @@ mod tests {
 
         nsl_tensor_free(reshaped);
         nsl_tensor_free(transposed);
+        nsl_tensor_free(t);
+    }
+
+    /// `strides_are_row_major` is the in-place replacement for the
+    /// allocate-compare-free check `nsl_tensor_contiguous` used to make, so
+    /// it must agree with `compute_strides` exactly — including the 1-D
+    /// case `is_contiguous` short-circuits: a stride-2 column view of a
+    /// [4, 2] tensor is NOT row-major, and `contiguous()` must copy it.
+    #[test]
+    fn strides_are_row_major_matches_compute_strides_including_1d() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 4);
+        crate::list::nsl_list_push(shape_list, 2);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tv = NslTensor::from_ptr(t);
+        for i in 0..8 {
+            unsafe { *tv.data_f64().add(i) = i as f64 };
+        }
+        assert!(tv.strides_are_row_major(), "a fresh [4, 2] tensor is row-major");
+
+        let tr = nsl_tensor_transpose(t, 0, 1);
+        assert!(!NslTensor::from_ptr(tr).strides_are_row_major(), "transposed [2, 4] has strides [1, 2]");
+
+        // Column 0 as a 1-D view: shape [4], stride 2. `is_contiguous` says
+        // yes (its `ndim <= 1` shortcut); the row-major test must say no,
+        // and `nsl_tensor_contiguous` must materialize [0, 2, 4, 6].
+        let col = NslTensor::new_view_i64(t, &[4], &[2], 1, 4);
+        let cv = NslTensor::from_ptr(col);
+        assert!(cv.is_contiguous(), "precondition: is_contiguous short-circuits 1-D");
+        assert!(!cv.strides_are_row_major(), "a stride-2 1-D view is not row-major");
+        let c = shape_ops::nsl_tensor_contiguous(col);
+        assert_ne!(c, col, "a non-row-major view must be copied, not handed back");
+        let cvc = NslTensor::from_ptr(c);
+        assert!(cvc.strides_are_row_major());
+        for (i, want) in [0.0, 2.0, 4.0, 6.0].into_iter().enumerate() {
+            assert_eq!(unsafe { *cvc.data_f64().add(i) }, want, "element {i}");
+        }
+
+        // A row-major tensor comes back as itself with one more reference.
+        let same = shape_ops::nsl_tensor_contiguous(t);
+        assert_eq!(same, t);
+        nsl_tensor_free(same);
+
+        nsl_tensor_free(c);
+        nsl_tensor_free(col);
+        nsl_tensor_free(tr);
         nsl_tensor_free(t);
     }
 

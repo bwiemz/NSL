@@ -205,8 +205,7 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     // disconnects at every reshape between two recorded ops — grads never
     // reach anything upstream. Backward reshapes the grad to input_shape.
     if autodiff::is_recording() {
-        let input_shape: Vec<i64> =
-            (0..tensor.ndim as usize).map(|i| unsafe { *tensor.shape.add(i) }).collect();
+        let input_shape = autodiff::tape_shape(tensor);
         autodiff::maybe_record(autodiff::TapeOp::Reshape {
             a: tensor_ptr,
             out: result,
@@ -333,9 +332,7 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
 
     // Autodiff tape (preserve existing behavior)
     if crate::autodiff::is_recording() {
-        let input_shape = unsafe {
-            std::slice::from_raw_parts(tensor.shape, ndim)
-        }.to_vec();
+        let input_shape = autodiff::tape_shape(tensor);
         autodiff::maybe_record(autodiff::TapeOp::Unsqueeze {
             input: tensor_ptr,
             out: out_ptr,
@@ -687,9 +684,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
-        let original_shape = unsafe {
-            std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize)
-        }.to_vec();
+        let original_shape = autodiff::tape_shape(tensor);
         autodiff::maybe_record(autodiff::TapeOp::Expand {
             input: tensor_ptr,
             out: out_ptr,
@@ -750,7 +745,6 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
     if t.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            let ndim = t.ndim as usize;
             let d = if dim < 0 { (t.ndim + dim) as usize } else { dim as usize };
             let s = if start < 0 { (unsafe { *t.shape.add(d) } + start) as usize } else { start as usize };
             let dim_size = unsafe { *t.shape.add(d) };
@@ -783,8 +777,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
             // Tape record on the GPU arm — mirrors the CPU record site
             // (identity-only fields, normalized start, raw dim).
             if autodiff::is_recording() {
-                let input_shape: Vec<i64> =
-                    (0..ndim).map(|i| unsafe { *t.shape.add(i) }).collect();
+                let input_shape = autodiff::tape_shape(t);
                 autodiff::maybe_record(autodiff::TapeOp::Slice {
                     a: tensor_ptr,
                     out: result,
@@ -846,10 +839,6 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         unsafe { copy_preserved_dtype_element(tensor, in_offset, data, flat) };
     }
 
-    let input_shape: Vec<i64> = (0..ndim)
-        .map(|i| unsafe { *tensor.shape.add(i) })
-        .collect();
-
     let out = Box::new(NslTensor::new(
         data,
         out_shape,
@@ -864,6 +853,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
+        let input_shape = autodiff::tape_shape(tensor);
         autodiff::maybe_record(autodiff::TapeOp::Slice {
             a: tensor_ptr,
             out: out_ptr,
@@ -1277,19 +1267,10 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
     let t = NslTensor::from_ptr(tensor_ptr);
     let ndim = t.ndim as usize;
 
-    // Check if already contiguous: compare actual strides to expected row-major strides
-    let expected = NslTensor::compute_strides(t.shape, t.ndim);
-    let mut is_contiguous = true;
-    for i in 0..ndim {
-        if unsafe { *t.strides.add(i) != *expected.add(i) } {
-            is_contiguous = false;
-            break;
-        }
-    }
-    // Free the temp expected strides
-    unsafe { crate::memory::checked_free(expected as *mut u8, ndim * std::mem::size_of::<i64>()) };
-
-    if is_contiguous {
+    // Already row-major: nothing to materialize. (Checked in place — this
+    // runs twice per CPU elementwise op, and allocating the expected strides
+    // to compare them was two of that op's heap allocations.)
+    if t.strides_are_row_major() {
         // Already contiguous -- bump refcount, return same pointer
         t.refcount.fetch_add(1, Ordering::SeqCst);
         return tensor_ptr;
@@ -1308,8 +1289,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
     // dropout arm in tensor/mod.rs for the precedent).
     let record_relabel = |out: i64| {
         if autodiff::is_recording() {
-            let input_shape: Vec<i64> =
-                (0..ndim).map(|i| unsafe { *t.shape.add(i) }).collect();
+            let input_shape = autodiff::tape_shape(t);
             autodiff::maybe_record(autodiff::TapeOp::Reshape {
                 a: tensor_ptr,
                 out,
