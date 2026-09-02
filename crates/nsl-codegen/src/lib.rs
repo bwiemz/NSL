@@ -97,6 +97,7 @@ pub mod stdlib_loader;
 pub mod stmt;
 pub mod stmt_csla;
 pub mod stmt_fase;
+pub mod stmt_train;
 pub mod types;
 pub mod use_count;
 
@@ -296,7 +297,7 @@ pub mod core {
         agent, builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
         error, expr, ffi_ownership, func, grammar_compiler, linker, ownership,
         ownership_expr, schema_convert, standalone, stdlib_loader, stmt, stmt_csla,
-        stmt_fase, types, use_count,
+        stmt_fase, stmt_train, types, use_count,
     };
 }
 
