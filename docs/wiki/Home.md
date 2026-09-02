@@ -46,6 +46,7 @@ Then pick a milestone from [Roadmap](Roadmap.md) or an open issue.
 ## If you get stuck
 
 - Acronyms: [Glossary](Glossary.md)
+- `NSL_*` knobs: [Environment-Variables](Environment-Variables.md) (generated; `nsl env current` shows what your shell has set)
 - PR / commit conventions: [`CONTRIBUTING.md`](../../CONTRIBUTING.md)
 - Design artifacts: `docs/plans/`, `docs/superpowers/specs/`, `docs/research/`, `docs/summaries/` (mostly local-only per `.gitignore`; ask in issues)
 - Memory files: agent-private (`~/.claude/projects/`). Not intended for PR flow.

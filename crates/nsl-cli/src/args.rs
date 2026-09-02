@@ -268,6 +268,46 @@ pub(crate) enum Cli {
         /// Path to a `.ptx` file (NSL- or ptxas-generated).
         file: PathBuf,
     },
+
+    /// The `NSL_*` environment variables the toolchain reads: list the
+    /// registry, or show which are set in the current environment.
+    Env {
+        #[command(subcommand)]
+        cmd: EnvCmd,
+    },
+}
+
+/// `nsl env` subcommands (roadmap A5: the env-var registry in `nsl-env`).
+#[derive(clap::Subcommand)]
+pub(crate) enum EnvCmd {
+    /// Print the registry: every variable with its kind, default, tier and doc.
+    List {
+        /// Only this tier: behavior, perf, safety, platform, diagnostic, test.
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// Emit the Markdown page that docs/wiki/Environment-Variables.md is
+        /// generated from (always the whole registry).
+        #[arg(long, conflicts_with_all = ["json", "tier"])]
+        markdown: bool,
+
+        /// Emit a JSON array instead of the text table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show the NSL_* variables set in this environment and their values,
+    /// registered ones first; an NSL_* variable that is set but not in the
+    /// registry is flagged (and makes the exit code 1 with --strict).
+    Current {
+        /// Exit 1 if any set NSL_* variable is not registered.
+        #[arg(long)]
+        strict: bool,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// M55: ZK subcommands.

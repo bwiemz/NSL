@@ -1365,6 +1365,7 @@ dependencies = [
  "memmap2",
  "nsl-ast",
  "nsl-codegen",
+ "nsl-env",
  "nsl-errors",
  "nsl-lexer",
  "nsl-parser",
@@ -1416,6 +1417,10 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "nsl-env"
+version = "0.9.0"
 
 [[package]]
 name = "nsl-errors"

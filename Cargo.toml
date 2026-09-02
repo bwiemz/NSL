@@ -11,6 +11,7 @@ members = [
     "crates/nsl-cli",
     "crates/nsl-test",
     "crates/nsl-abi",
+    "crates/nsl-env",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ nsl-ast = { path = "crates/nsl-ast" }
 nsl-parser = { path = "crates/nsl-parser" }
 nsl-semantic = { path = "crates/nsl-semantic" }
 nsl-codegen = { path = "crates/nsl-codegen" }
+nsl-env = { path = "crates/nsl-env" }
 
 codespan-reporting = "0.11"
 clap = { version = "4", features = ["derive"] }

@@ -148,5 +148,8 @@ fn main_inner() {
         Cli::PtxMetadata { file } => {
             commands::ptx_metadata::run(&file);
         }
+        Cli::Env { cmd } => {
+            commands::env::run(cmd);
+        }
     }
 }
