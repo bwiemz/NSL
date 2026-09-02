@@ -39,7 +39,6 @@
 //! recorded as the INPUTS to kernel selection, not as a bit-identity promise.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 /// 0 = tf32, 1 = bf16, 2 = f32. Matches `nsl_codegen::MatmulMode`.
 pub const MODE_TF32: i64 = 0;
@@ -67,7 +66,9 @@ impl Default for MatmulConfig {
             mode: MODE_TF32,
             rounding: ROUND_RNE,
             min_ratio: 512.0,
-            cast_cache: false,
+            // ON, as it was before #583. The pre-#583 read was
+            // `var != Some("0")`, which is TRUE when the variable is unset.
+            cast_cache: true,
             lt: false,
             lt_workspace_mib: 64,
             lt_tune: true,
@@ -114,37 +115,28 @@ pub extern "C" fn nsl_set_matmul_config(
     0
 }
 
-/// One deprecation notice per variable, on the first read that falls back.
-fn warn_env_once(var: &str, flag: &str) {
-    static SEEN: OnceLock<std::sync::Mutex<Vec<&'static str>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    let mut g = seen.lock().unwrap();
-    let leaked: &'static str = Box::leak(var.to_string().into_boxed_str());
-    if g.iter().any(|v| *v == var) {
-        return;
-    }
-    g.push(leaked);
-    eprintln!(
-        "[nsl-matmul] DEPRECATED: {var} is read as a fallback because this \
-         program was built without {flag}. Environment values do NOT reach the \
-         execution fingerprint, so a checkpoint written under them cannot say \
-         which arithmetic produced it and a resume cannot refuse a silent \
-         switch. Rebuild with {flag}."
-    );
-}
-
-fn env_flag(var: &str, flag: &str, on_is: &str) -> bool {
-    match std::env::var(var) {
-        Ok(v) => {
-            warn_env_once(var, flag);
-            v == on_is
-        }
-        Err(_) => false,
-    }
-}
-
-/// The effective configuration: compiled values if codegen set them, otherwise
-/// the deprecated environment fallback, otherwise the defaults.
+/// The effective configuration.
+///
+/// # Why there is no environment fallback here any more
+///
+/// #583 put one here and it was wrong twice over.
+///
+///  * **It was unreachable.** Codegen emits `nsl_set_matmul_config`
+///    unconditionally, so `SET` is always true for a compiled NSL program and
+///    the fallback never ran. `NSL_MATMUL_BF16=1` silently produced TF32 --
+///    the exact mislabeled-arm failure the feature exists to prevent.
+///  * **Where it DID run** (a C host or a test driving the runtime directly) it
+///    ran per call. `config()` is called inside math-mode selection, i.e. per
+///    GEMM, and the fallback did seven `std::env::var` lookups and leaked a
+///    `String` on every one of them.
+///
+/// The environment is now resolved ONCE, at CLI parse time, into
+/// `CompileOptions::matmul` (see `nsl_codegen::MatmulConfig::with_env_fallback`).
+/// That is strictly better than the #583 design: an env-driven run now reaches
+/// the execution fingerprint too, instead of being invisible to it.
+///
+/// So this function is a pure read of process-global state with no I/O, which
+/// is what a per-GEMM call has to be.
 pub fn config() -> MatmulConfig {
     if SET.load(Ordering::SeqCst) {
         return MatmulConfig {
@@ -157,52 +149,7 @@ pub fn config() -> MatmulConfig {
             lt_tune: LT_TUNE.load(Ordering::SeqCst),
         };
     }
-    let d = MatmulConfig::default();
-    MatmulConfig {
-        mode: if env_flag("NSL_MATMUL_BF16", "--matmul-mode bf16", "1") {
-            MODE_BF16
-        } else {
-            d.mode
-        },
-        rounding: match std::env::var("NSL_MATMUL_BF16_ROUND") {
-            Ok(v) => {
-                warn_env_once("NSL_MATMUL_BF16_ROUND", "--bf16-rounding");
-                if v == "sr" { ROUND_SR } else { ROUND_RNE }
-            }
-            Err(_) => d.rounding,
-        },
-        min_ratio: match std::env::var("NSL_MATMUL_BF16_MIN_RATIO") {
-            Ok(v) => {
-                warn_env_once("NSL_MATMUL_BF16_MIN_RATIO", "--bf16-min-ratio");
-                v.parse::<f64>().ok().filter(|r| r.is_finite() && *r >= 0.0).unwrap_or(d.min_ratio)
-            }
-            Err(_) => d.min_ratio,
-        },
-        // Historically ON unless explicitly "0"; preserved so a script that
-        // never set it keeps its behaviour.
-        cast_cache: match std::env::var("NSL_MATMUL_BF16_CAST_CACHE") {
-            Ok(v) => {
-                warn_env_once("NSL_MATMUL_BF16_CAST_CACHE", "--bf16-cast-cache");
-                v != "0"
-            }
-            Err(_) => d.cast_cache,
-        },
-        lt: env_flag("NSL_MATMUL_BF16_LT", "--bf16-lt", "1"),
-        lt_workspace_mib: match std::env::var("NSL_MATMUL_BF16_LT_WORKSPACE_MIB") {
-            Ok(v) => {
-                warn_env_once("NSL_MATMUL_BF16_LT_WORKSPACE_MIB", "--bf16-lt-workspace-mib");
-                v.parse::<u32>().unwrap_or(d.lt_workspace_mib).min(4096)
-            }
-            Err(_) => d.lt_workspace_mib,
-        },
-        lt_tune: match std::env::var("NSL_MATMUL_BF16_LT_TUNE") {
-            Ok(v) => {
-                warn_env_once("NSL_MATMUL_BF16_LT_TUNE", "--bf16-lt-tune");
-                v != "0"
-            }
-            Err(_) => d.lt_tune,
-        },
-    }
+    MatmulConfig::default()
 }
 
 #[cfg(test)]
