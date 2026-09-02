@@ -893,12 +893,7 @@ impl Compiler<'_> {
                         builder.finalize();
                     }
 
-                    if self.dump_ir {
-                        eprintln!(
-                            "--- IR: dtype method '{fn_name}' ---\n{}",
-                            ctx.func.display()
-                        );
-                    }
+                    self.record_ir(format_args!("dtype method '{fn_name}'"), &ctx.func);
 
                     self.module
                         .define_function(func_id, &mut ctx)

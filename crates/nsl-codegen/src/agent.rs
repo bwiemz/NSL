@@ -462,12 +462,7 @@ impl Compiler<'_> {
                         builder.finalize();
                     }
 
-                    if self.dump_ir {
-                        eprintln!(
-                            "--- IR: agent method '{mangled}' ---\n{}",
-                            ctx.func.display()
-                        );
-                    }
+                    self.record_ir(format_args!("agent method '{mangled}'"), &ctx.func);
 
                     self.module
                         .define_function(func_id, &mut ctx)
@@ -636,12 +631,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!(
-                "--- IR: @pipeline_agent fn '{fn_name}' ---\n{}",
-                ctx.func.display()
-            );
-        }
+        self.record_ir(format_args!("@pipeline_agent fn '{fn_name}'"), &ctx.func);
 
         // `agent_var_types` entries must be removed regardless of whether
         // `define_function` succeeds — entries are pipeline-fn-scoped, not

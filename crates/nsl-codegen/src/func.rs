@@ -232,9 +232,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!("--- IR: fn '{}' ---\n{}", name, ctx.func.display());
-        }
+        self.record_ir(format_args!("fn '{name}'"), &ctx.func);
 
         self.module
             .define_function(func_id, &mut ctx)

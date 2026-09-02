@@ -1,0 +1,20 @@
+# The smallest train block: one matmul, one activation, one SGD step.
+# Compiled with tape AD (`sgd_tape`) and source AD (`sgd_source_ad`).
+
+model Net:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.w
+        return silu(h)
+
+let m = Net()
+let x = ones([2, 2])
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 1.0)
+    step(batch):
+        let out = m.forward(x)
+        let loss = sum(out)
+
+print(sum(m.w))

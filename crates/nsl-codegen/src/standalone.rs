@@ -245,9 +245,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!("--- IR: main (standalone) ---\n{}", ctx.func.display());
-        }
+        self.record_ir(format_args!("main (standalone)"), &ctx.func);
 
         self.module
             .define_function(main_id, &mut ctx)

@@ -1533,9 +1533,88 @@ pub fn compile_entry_returning_plan(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
+    compile_entry_impl(
+        ast,
+        interner,
+        type_map,
+        imported_fns,
+        imported_struct_layouts,
+        imported_model_names,
+        imported_enum_variants,
+        imported_enum_defs,
+        imported_model_method_bodies,
+        imported_model_field_types,
+        dump_ir,
+        options,
+        None,
+    )
+}
+
+/// [`compile_entry_returning_plan`] with every function's final CLIF — what
+/// `--dump-ir` prints — returned in-process, in definition order.
+///
+/// The dumps come back ALONGSIDE the compile result, like
+/// [`compile_with_profile_captures`]: a compile that fails after some
+/// functions were defined still yields those, which is what a test pinning
+/// them wants to see. Nothing is printed.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_entry_capturing_ir(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    imported_fns: &[(String, String, Signature)],
+    imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
+    imported_enum_variants: HashMap<String, i64>,
+    imported_enum_defs: HashMap<String, Vec<(String, i64)>>,
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    imported_model_field_types: HashMap<String, HashMap<String, String>>,
+    options: &crate::CompileOptions,
+) -> (
+    Vec<crate::ir_capture::IrDump>,
+    Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError>,
+) {
+    let slot: crate::ir_capture::IrCaptureSlot =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let result = compile_entry_impl(
+        ast,
+        interner,
+        type_map,
+        imported_fns,
+        imported_struct_layouts,
+        imported_model_names,
+        imported_enum_variants,
+        imported_enum_defs,
+        imported_model_method_bodies,
+        imported_model_field_types,
+        false,
+        options,
+        Some(slot.clone()),
+    );
+    let dumps = std::mem::take(&mut *slot.borrow_mut());
+    (dumps, result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_entry_impl(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    imported_fns: &[(String, String, Signature)],
+    imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
+    imported_enum_variants: HashMap<String, i64>,
+    imported_enum_defs: HashMap<String, Vec<(String, i64)>>,
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    imported_model_field_types: HashMap<String, HashMap<String, String>>,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+    ir_capture: Option<crate::ir_capture::IrCaptureSlot>,
+) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
     install_per_compile_program_facts(&mut compiler, ast, interner, type_map)?;
     compiler.dump_ir = dump_ir;
+    compiler.ir_capture = ir_capture;
 
     // Milestone A: log the entry module's decorators for post-compile
     // reconciliation — entry module only; imported modules' decorators are

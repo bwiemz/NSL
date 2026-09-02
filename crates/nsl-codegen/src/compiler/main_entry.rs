@@ -200,9 +200,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!("--- IR: main ---\n{}", ctx.func.display());
-        }
+        self.record_ir(format_args!("main"), &ctx.func);
 
         self.module
             .define_function(main_id, &mut ctx)
@@ -401,9 +399,7 @@ impl Compiler<'_> {
             builder.finalize();
         }
 
-        if self.dump_ir {
-            eprintln!("--- IR: main (test dispatch) ---\n{}", ctx.func.display());
-        }
+        self.record_ir(format_args!("main (test dispatch)"), &ctx.func);
 
         self.module
             .define_function(main_id, &mut ctx)

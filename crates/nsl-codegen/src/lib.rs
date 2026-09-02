@@ -177,6 +177,8 @@ pub mod fusion;
 pub mod activation;
 pub mod fusion_report;
 pub mod inspect;
+/// What `--dump-ir` prints, kept in-process for the CLIF snapshot tests.
+pub mod ir_capture;
 pub mod memory_planner;
 /// Item 2 step 4: the typed inter-pass channels, and their traffic.
 pub mod pass_bus;
@@ -397,7 +399,8 @@ pub mod test_helpers;
 
 pub use compiler::{
     compile, compile_entry, compile_module, compile_module_with_imports,
-    compile_entry_returning_plan, compile_module_with_imports_returning_plan,
+    compile_entry_capturing_ir, compile_entry_returning_plan,
+    compile_module_with_imports_returning_plan,
     compile_returning_plan, compile_returning_splice_count_for_tests,
     compile_standalone, compile_standalone_returning_plan,
     compile_test, compile_with_profile_captures, compile_with_zk_info,
