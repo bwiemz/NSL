@@ -703,7 +703,7 @@ mod tests {
                 (n.clone(), TensorView::new(Dtype::F32, s.clone(), d).unwrap())
             })
             .collect();
-        let bytes = safetensors::tensor::serialize(&views, &None).unwrap();
+        let bytes = safetensors::tensor::serialize(&views, None).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
 

@@ -2527,7 +2527,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("layer.weight".to_string(), good);
         map.insert("quant.blob".to_string(), bad);
-        let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
+        let serialized = safetensors::tensor::serialize(map, None).unwrap();
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&serialized).unwrap();

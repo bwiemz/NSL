@@ -27,7 +27,7 @@ use nsl_runtime::tensor::{
     test_read_tensor_f64,
 };
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::sync::Mutex;
 
 /// Shape matrix from spec §3 (10 entries).  Exposed as a slice so both
@@ -95,7 +95,7 @@ fn seed_for_shape(m: usize, n: usize, k: usize) -> u64 {
 fn fill_random(data: &mut [f32], seed: u64) {
     let mut rng = StdRng::seed_from_u64(seed);
     for x in data.iter_mut() {
-        *x = rng.gen_range(-1.0_f32..1.0_f32);
+        *x = rng.random_range(-1.0_f32..1.0_f32);
     }
 }
 

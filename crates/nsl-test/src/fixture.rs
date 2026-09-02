@@ -99,11 +99,11 @@ pub enum FixtureError {
     #[error("bad magic: expected NSLF, got {0:?}")]
     BadMagic([u8; 4]),
     #[error(
-        "unsupported fixture format version {0}; this nsl-cli expects format version {}",
-        FORMAT_VERSION
+        "unsupported fixture format version {0}; this nsl-cli expects format version {expected}",
+        expected = FORMAT_VERSION
     )]
     UnsupportedFormatVersion(u32),
-    #[error("rank {0} exceeds MAX_RANK={}", MAX_RANK)]
+    #[error("rank {0} exceeds MAX_RANK={max}", max = MAX_RANK)]
     RankTooLarge(u32),
     #[error("hash mismatch: expected {expected}, got {got}")]
     HashMismatch { expected: String, got: String },
@@ -119,8 +119,8 @@ pub enum FixtureError {
 
 /// Compute the SHA-256 hash of bytes, hex-encoded.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let h = Sha256::digest(bytes);
-    format!("{:x}", h)
+    // sha2 0.11's output array does not implement `LowerHex`.
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Verify the bytes match the expected hex hash.

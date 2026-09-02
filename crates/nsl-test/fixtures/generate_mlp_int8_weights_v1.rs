@@ -7,7 +7,7 @@
 //!   b1:     i32 in [-2^20, 2^20]
 //!   b2:     i64 in [-2^30, 2^30]
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
@@ -70,7 +70,7 @@ fn i64_to_bytes(v: &[i64]) -> Vec<u8> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn build_manifest_toml(hash_hex: &str) -> String {

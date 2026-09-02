@@ -403,7 +403,7 @@ pub fn write_sliced_weights(
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
         views.push((name.clone(), v));
     }
-    let bytes = safetensors::serialize(views, &None)
+    let bytes = safetensors::serialize(views, None)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     std::fs::write(path, bytes)
 }

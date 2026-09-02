@@ -46,7 +46,7 @@ fn manifest() -> serde_json::Value {
 fn sha256_hex(path: &std::path::Path) -> String {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    format!("{:x}", Sha256::digest(&bytes))
+    Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[test]

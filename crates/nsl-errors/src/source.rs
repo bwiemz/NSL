@@ -91,7 +91,10 @@ impl SourceMap {
         };
         let writer = StandardStream::stderr(choice);
         let config = term::Config::default();
-        let _ = term::emit(&mut writer.lock(), &config, &self.files, &cs_diag);
+        // codespan-reporting 0.13: the old `term::emit` is deprecated AND
+        // renders through a plain writer (no colour at all); the termcolor
+        // stream is a `WriteStyle`, and this entry point keeps the styling.
+        let _ = term::emit_to_write_style(&mut writer.lock(), &config, &self.files, &cs_diag);
     }
 }
 

@@ -109,7 +109,7 @@ fn write_v4_safetensors(
         views.insert("Block.experts.down.bias".to_string(), v);
     }
 
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&bytes).unwrap();
 }

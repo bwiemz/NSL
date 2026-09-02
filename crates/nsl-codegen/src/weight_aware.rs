@@ -1097,7 +1097,7 @@ mod tests {
                 .unwrap();
         let mut map = StdHashMap::new();
         map.insert(name.to_string(), view);
-        let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
+        let serialized = safetensors::tensor::serialize(&map, None).unwrap();
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&serialized).unwrap();
@@ -1127,7 +1127,7 @@ mod tests {
             })
             .collect();
 
-        let serialized = safetensors::tensor::serialize(&views, &None).unwrap();
+        let serialized = safetensors::tensor::serialize(&views, None).unwrap();
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&serialized).unwrap();
         tmp.into_temp_path()

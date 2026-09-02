@@ -95,10 +95,10 @@ impl Fp8ReferenceMatmul {
 
 pub fn seeded_input(len: usize, seed: u64) -> Vec<f32> {
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     let mut rng = StdRng::seed_from_u64(seed);
-    (0..len).map(|_| rng.gen_range(-1.0_f32..1.0)).collect()
+    (0..len).map(|_| rng.random_range(-1.0_f32..1.0)).collect()
 }
 
 pub const FIXTURE_SHAPES: &[(usize, usize, usize)] = &[

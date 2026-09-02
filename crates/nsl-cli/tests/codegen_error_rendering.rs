@@ -154,7 +154,7 @@ fn a_wrong_cpdt_checkpoint_is_a_rendered_refusal_with_the_plan_caveat_as_a_note(
             )
         })
         .collect();
-    fs::write(&wrong, serialize(&views, &None).unwrap()).unwrap();
+    fs::write(&wrong, serialize(&views, None).unwrap()).unwrap();
 
     let fixture = workspace_root().join("crates/nsl-codegen/tests/fixtures/cpdt_precision_fp16.nsl");
     let mut cmd = Command::cargo_bin("nsl").unwrap();

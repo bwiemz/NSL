@@ -6,7 +6,7 @@
 //!
 //! See spec §6.5 for the fixture-vs-stimuli design distinction.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 const STIMULI_SEED: u64 = 0xDEADBEEF;

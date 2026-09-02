@@ -328,7 +328,7 @@ fn write_toy_safetensors(m: &ToyModel, dir: &std::path::Path) -> PathBuf {
             (name.clone(), view)
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(&data, &None).expect("safetensors serialize");
+    let serialized = safetensors::tensor::serialize(&data, None).expect("safetensors serialize");
     let path = dir.join("model.safetensors");
     std::fs::write(&path, &serialized).expect("write safetensors");
     path

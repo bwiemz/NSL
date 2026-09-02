@@ -114,7 +114,7 @@ pub(crate) fn convert_nslm_to_safetensors(input_path: &std::path::Path, output_p
         })
         .collect::<Result<HashMap<_, _>, String>>()?;
 
-    let serialized = safetensors::tensor::serialize(&st_data, &None)
+    let serialized = safetensors::tensor::serialize(&st_data, None)
         .map_err(|e| format!("safetensors serialize error: {}", e))?;
 
     std::fs::write(output_path, &serialized)

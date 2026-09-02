@@ -47,7 +47,7 @@ fn write_unrelated_safetensors(path: &Path) {
     let mut views: HashMap<String, TensorView<'_>> = HashMap::new();
     let view = TensorView::new(Dtype::F32, vec![1], bytes.as_slice()).unwrap();
     views.insert("unrelated.weight".to_string(), view);
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&bytes).unwrap();
 }

@@ -34,20 +34,20 @@ nsl-semantic = { path = "crates/nsl-semantic" }
 nsl-codegen = { path = "crates/nsl-codegen" }
 nsl-env = { path = "crates/nsl-env" }
 
-codespan-reporting = "0.11"
+codespan-reporting = "0.13"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-string-interner = "0.17"
+string-interner = "0.20"
 
 cranelift-codegen = "0.135"
 cranelift-frontend = "0.135"
 cranelift-module = "0.135"
 cranelift-object = "0.135"
 cranelift-native = "0.135"
-rand = "0.9"
-rand_chacha = "0.9"
-toml = "0.8"
+rand = "0.10"
+rand_chacha = "0.10"
+toml = "1.1"
 bytemuck = { version = "1", features = ["derive"] }
 # Benchmark harness (roadmap T3). Default features are off: `rayon` and
 # `plotters` (gnuplot-style HTML plots) are dead weight for a compare-against-

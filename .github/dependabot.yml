@@ -27,6 +27,16 @@ updates:
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "ort"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # hf-hub 1.0 is an async rewrite (reqwest + tokio, +114 crates incl.
+      # aws-lc-sys/cmake) with no `api::sync` module; the runtime's one call
+      # site stays on 0.4 with the `ureq` backend. A 1.0 migration is a
+      # decision, not a bump (why Dependabot's #558 was superseded by hand).
+      - dependency-name: "hf-hub"
+        update-types: ["version-update:semver-major"]
+      # object must track what cranelift-object pins (^0.39 at 0.135); it
+      # moves with the D2 Cranelift migrations, not on its own.
+      - dependency-name: "object"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     labels: ["dependencies"]
 
   - package-ecosystem: "github-actions"

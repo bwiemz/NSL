@@ -169,7 +169,7 @@ fn write_hf_safetensors(
         }
     }
 
-    let bytes = serialize(&views, &None).unwrap();
+    let bytes = serialize(&views, None).unwrap();
     let mut f = fs::File::create(path).unwrap();
     f.write_all(&bytes).unwrap();
 }

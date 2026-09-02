@@ -175,7 +175,7 @@ fn write_matching_weights() -> PathBuf {
         "w".to_string(),
         TensorView::new(Dtype::F32, vec![4, 4], &bytes).unwrap(),
     );
-    let serialized = serialize(&views, &None).unwrap();
+    let serialized = serialize(&views, None).unwrap();
     let out = std::env::temp_dir().join(format!(
         "nsl_offload_precision_composition_{}.safetensors",
         std::process::id()

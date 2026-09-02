@@ -176,7 +176,7 @@ pub extern "C" fn nsl_hf_load(
 ) -> i64 {
     #[cfg(feature = "interop")]
     {
-        use hf_hub::api::sync::Api;
+        use hf_hub::api::sync::ApiBuilder;
 
         let repo_id = unsafe {
             let slice =
@@ -187,8 +187,12 @@ pub extern "C" fn nsl_hf_load(
             })
         };
 
-        // Build the hf-hub API client and download model.safetensors
-        let api = Api::new().unwrap_or_else(|e| {
+        // Build the hf-hub API client and download model.safetensors.
+        // `from_env`, not `Api::new()`: hf-hub 0.4 moved the `HF_HOME` lookup
+        // out of `Cache::default()` (0.3 read it there), so `Api::new()` now
+        // ignores the variable — wrong cache directory, wrong token file.
+        // `from_env` reads `HF_HOME` and `HF_ENDPOINT`.
+        let api = ApiBuilder::from_env().build().unwrap_or_else(|e| {
             eprintln!("[nsl] hf_load: failed to create hf-hub Api: {}", e);
             std::process::abort();
         });

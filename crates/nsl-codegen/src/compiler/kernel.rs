@@ -481,8 +481,8 @@ impl Compiler<'_> {
             let mut h = Sha256::new();
             h.update(&ast_bytes);
             eprintln!(
-                "[autotune] key inputs for '{kernel_name}': ast_sha={:x} params={tuning_params:?} device={}",
-                h.finalize(),
+                "[autotune] key inputs for '{kernel_name}': ast_sha={} params={tuning_params:?} device={}",
+                crate::autotune::hex(&h.finalize()),
                 device.describe(),
             );
         }
