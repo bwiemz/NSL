@@ -1,10 +1,30 @@
+## Loss functions for training and distillation.
+##
+## `mse_loss` / `l1_loss` / `bce_loss` are elementwise regressions;
+## `cross_entropy` is the classification loss the language-modeling head
+## uses, and honours -100 as an ignore index. `fused_linear_ce` and
+## `fused_kl_ce` are the fusible forms — written as ordinary composites
+## so they run anywhere, and recognised by codegen inside a decorated
+## `train`/`distill` block so the logits are never materialised.
+
+## Mean squared error between `pred` and `target`, averaged over every
+## element. Both tensors must broadcast to a common shape.
 fn mse_loss(pred: Tensor, target: Tensor) -> Tensor:
     let diff = pred - target
     return mean(diff * diff)
 
+## Mean absolute error between `pred` and `target`, averaged over every
+## element. Less sensitive to outliers than `mse_loss`.
 fn l1_loss(pred: Tensor, target: Tensor) -> Tensor:
     return mean(abs(pred - target))
 
+## Softmax cross-entropy over `logits` `[N, C]` against integer class
+## `targets` `[N]`, averaged over the valid positions.
+##
+## Targets of -100 are the ignore index: they are masked out of both the
+## numerator and the count, so padded positions in a packed batch do not
+## dilute the loss. Computed through `log_softmax`, so it is stable for
+## logits far from zero.
 fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     let safe_targets = clamp(targets, 0.0, 2147483647.0)
     let log_probs = log_softmax(logits, 1)
@@ -14,66 +34,61 @@ fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     let num_valid = sum(valid_mask) + 0.00000001
     return sum(masked_nll) / num_valid
 
+## Binary cross-entropy between probabilities `pred` and targets in
+## `[0, 1]`. `pred` is clamped away from 0 and 1 before the log, so a
+## saturated prediction costs a large finite loss rather than infinity.
 fn bce_loss(pred: Tensor, target: Tensor) -> Tensor:
     let clamped = clamp(pred, 0.0000001, 0.9999999)
     return neg(mean(target * log(clamped) + (1.0 - target) * log(1.0 - clamped)))
 
-# CFTP §4.4 G3 (Sprint 2): fused linear + cross-entropy.
-#
-# Single user-facing API for the language-modeling head:
-#
-#   loss = fused_linear_ce(x, W, bias, targets)
-#         ≡ cross_entropy(x @ W^T + bias, targets)
-#
-# Sprint 2 (this commit): lowers to the composite path explicitly so the
-# function is available even without the fused kernel. The body is
-# structurally identical to what an LM head writes by hand, which keeps
-# AD + ignore-index (-100) semantics drop-in compatible with the
-# existing stdlib cross_entropy.
-#
-# Sprint 2.5 (deferred): when codegen sees this call inside a `train`
-# block decorated with `@fused_lm_ce(enabled = true)`, the
-# Compiler.fused_ce_configs slot (already populated by Sprint 2)
-# instructs source-AD to short-circuit the matmul + cross_entropy
-# composite to a direct nsl_fused_linear_ce_forward / _backward FFI
-# launch. The substitution site is marked in
-# crates/nsl-codegen/src/wengert_lower.rs near PrimalOp::CrossEntropyLoss.
-#
-# Input shape contract (matches the v1 fused kernel's FFI):
-#   x:       [B*S, H]   f32
-#   W:       [V,   H]   f32  (row-major; transposed at use-site below)
-#   bias:    [V]        f32
-#   targets: [B*S]      i64  (with -100 = ignore_index)
-#
-# Returns: scalar loss tensor (mean over valid positions).
+# Implementation note (CFTP 4.4 G3): the substitution site is in
+# crates/nsl-codegen/src/wengert_lower.rs near PrimalOp::CrossEntropyLoss,
+# driven by Compiler.fused_ce_configs.
+## Fused linear + cross-entropy: the language-modeling head as one call.
+##
+##     loss = fused_linear_ce(x, W, bias, targets)
+##           = cross_entropy(x @ W^T + bias, targets)
+##
+## Shapes, matching the fused kernel's FFI:
+##
+##     x:       [B*S, H]  f32   hidden states
+##     W:       [V,   H]  f32   LM head, row-major (transposed here)
+##     bias:    [V]       f32
+##     targets: [B*S]     i64   -100 = ignore index
+##
+## Returns a scalar loss, the mean over valid positions. Written as the
+## explicit composite so it runs anywhere; inside a `train` block
+## decorated with `@fused_lm_ce(enabled = true)`, source-AD substitutes a
+## kernel that never materialises the `[B*S, V]` logits. The two paths are
+## the same function to the caller, including ignore-index semantics.
 fn fused_linear_ce(x: Tensor, W: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
     # Transpose W from [V, H] to [H, V] so x @ W_t yields [B*S, V] logits.
     let W_t = W.transpose(0, 1)
     let logits = x @ W_t + bias
     return cross_entropy(logits, targets)
 
-# CPKD: fused KL-CE knowledge-distillation loss.
-#
-#   loss = alpha * CE(student_logits, targets)
-#        + (1 - alpha) * T^2 * KL(softmax(teacher/T) || softmax(student/T))
-#
-# Composite reference path: available everywhere (tape AD). Inside a
-# `distill` block decorated with `@fused_kl_ce(enabled = true, ...)`,
-# source-AD recognises this call and short-circuits to the fused GPU
-# kernel (nsl_fused_kl_ce_forward / _backward) that never materializes
-# either [rows, V] logit tensor in HBM. alpha/temperature must be numeric
-# literals at the call site in v1 (compile-time kernel constants).
-#
-# Input shape contract (matches the v1 fused kernel's FFI):
-#   x_s:     [rows, HS]  f32   student hidden states
-#   W_s:     [V,    HS]  f32   student LM head (row-major)
-#   bias_s:  [V]         f32
-#   x_t:     [rows, HT]  f32   teacher hidden states (frozen)
-#   W_t:     [V,    HT]  f32   teacher LM head (frozen)
-#   bias_t:  [V]         f32
-#   targets: [rows]      i64   (-100 = ignore_index)
-#
-# Returns: scalar loss tensor (mean over valid positions).
+## Fused KL-CE distillation loss: hard-label CE plus a soft KL term.
+##
+##     loss = alpha * CE(student_logits, targets)
+##          + (1 - alpha) * T^2 * KL(softmax(teacher/T) || softmax(student/T))
+##
+## Shapes, matching the fused kernel's FFI:
+##
+##     x_s:     [rows, HS]  f32   student hidden states
+##     W_s:     [V,    HS]  f32   student LM head, row-major
+##     bias_s:  [V]         f32
+##     x_t:     [rows, HT]  f32   teacher hidden states (frozen)
+##     W_t:     [V,    HT]  f32   teacher LM head (frozen)
+##     bias_t:  [V]         f32
+##     targets: [rows]      i64   -100 = ignore index
+##
+## Returns a scalar loss, the mean over valid rows. The `T^2` factor keeps
+## the soft-target gradient scale independent of the temperature. Inside a
+## `distill` block decorated with `@fused_kl_ce(enabled = true, ...)`,
+## source-AD substitutes a kernel that materialises neither `[rows, V]`
+## logit tensor; `alpha` and `temperature` must then be numeric literals
+## at the call site, because the kernel takes them as compile-time
+## constants.
 fn fused_kl_ce(x_s: Tensor, W_s: Tensor, bias_s: Tensor, x_t: Tensor, W_t: Tensor, bias_t: Tensor, targets: Tensor, alpha: float, temperature: float) -> Tensor:
     let s_logits = x_s @ W_s.transpose(0, 1) + bias_s
     let t_logits = x_t @ W_t.transpose(0, 1) + bias_t

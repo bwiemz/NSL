@@ -1,17 +1,33 @@
+## Named wrappers over the activation builtins.
+##
+## Each function here is a one-line forward to a compiler builtin of the
+## same shape. They exist so an activation can be passed by name and
+## imported like any other library item; calling the builtin directly is
+## equivalent and is what the compiler sees either way.
+
+## Rectified linear unit: `max(x, 0)`, elementwise.
 fn relu_act(x: Tensor) -> Tensor:
     return relu(x)
 
+## Gaussian Error Linear Unit, the activation used by the transformer MLP
+## in `nsl.nn.layers`.
 fn gelu_act(x: Tensor) -> Tensor:
     return gelu(x)
 
+## Sigmoid Linear Unit (also called swish): `x * sigmoid(x)`.
 fn silu_act(x: Tensor) -> Tensor:
     return silu(x)
 
+## Logistic sigmoid, elementwise, into `(0, 1)`.
 fn sigmoid_act(x: Tensor) -> Tensor:
     return sigmoid(x)
 
+## Hyperbolic tangent, elementwise, into `(-1, 1)`.
 fn tanh_act(x: Tensor) -> Tensor:
     return tanh(x)
 
+## Softmax along `dim`: exponentiate and normalise so that dimension sums
+## to 1. For a loss, prefer `nsl.nn.losses.cross_entropy`, which is
+## numerically stabler than softmax followed by a log.
 fn softmax_act(x: Tensor, dim: int) -> Tensor:
     return softmax(x, dim)

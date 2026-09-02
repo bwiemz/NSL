@@ -1,6 +1,12 @@
-# NSL Standard Library — nsl.math
-# Basic math utility functions
+## Scalar helpers that NSL does not provide as builtins.
+##
+## The builtins cover tensor math; these are the `float` -> `float`
+## utilities a training script reaches for when computing a schedule or
+## clamping a hyper-parameter.
 
+## Constrain `x` to `[lo, hi]`. Returns `lo` when `x < lo` and `hi` when
+## `x > hi`; `x` is returned unchanged in between. No check that
+## `lo <= hi` — with the bounds reversed the result is `hi`.
 fn clamp(x: float, lo: float, hi: float) -> float:
     if x < lo:
         return lo
@@ -8,9 +14,12 @@ fn clamp(x: float, lo: float, hi: float) -> float:
         return hi
     return x
 
+## Linear interpolation: `a` at `t = 0`, `b` at `t = 1`. `t` outside
+## `[0, 1]` extrapolates rather than clamping.
 fn lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
+## The sign of `x` as -1.0, 0.0 or 1.0. Exactly 0.0 maps to 0.0.
 fn sign(x: float) -> float:
     if x > 0.0:
         return 1.0
@@ -18,11 +27,15 @@ fn sign(x: float) -> float:
         return - 1.0
     return 0.0
 
+## The larger of `a` and `b`. Named `max_val` because `max` is a tensor
+## builtin.
 fn max_val(a: float, b: float) -> float:
     if a > b:
         return a
     return b
 
+## The smaller of `a` and `b`. Named `min_val` because `min` is a tensor
+## builtin.
 fn min_val(a: float, b: float) -> float:
     if a < b:
         return a

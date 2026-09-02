@@ -1,20 +1,32 @@
+## Tokenizer handles.
+##
+## A tokenizer is referred to by an integer handle rather than a value,
+## so it can be created once and shared across a dataset pipeline.
+
 # NSL Tokenizer stdlib wrappers
 # These wrap runtime builtins for import convenience
 
+## Create a byte-level tokenizer (256 vocabulary entries, no training
+## needed) and return its handle.
 fn create_byte_tokenizer() -> int:
     return byte_tokenizer_new()
 
+## Encode `text` to a tensor of token ids using tokenizer `tok`.
 fn encode(tok: int, text: str) -> Tensor:
     return tokenizer_encode(tok, text)
 
+## Decode a tensor of token `ids` back to text using tokenizer `tok`.
 fn decode(tok: int, ids: Tensor) -> str:
     return tokenizer_decode(tok, ids)
 
+## The number of entries in `tok`'s vocabulary.
 fn vocab_size(tok: int) -> int:
     return tokenizer_vocab_size(tok)
 
+## Serialize tokenizer `tok` to `path`.
 fn save(tok: int, path: str):
     tokenizer_save(tok, path)
 
+## Load a tokenizer from `path` and return its handle.
 fn load(path: str) -> int:
     return tokenizer_load(path)

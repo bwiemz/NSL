@@ -1,3 +1,8 @@
+## Learned absolute position embeddings.
+
+## Learned absolute position embeddings, added to the token embeddings.
+## For rotary positions — what the GQA attention here uses — see
+## `nsl.nn.rope`.
 model PositionalEmbedding(max_seq: int, dim: int):
     pe: Tensor = randn([max_seq, dim])
 

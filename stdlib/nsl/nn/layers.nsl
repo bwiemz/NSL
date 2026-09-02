@@ -1,3 +1,10 @@
+## The dense building blocks: projection, embedding table, and the
+## position-wise MLP.
+
+## An affine projection: `y = x W^T + b`.
+##
+## `w` is `[out_features, in_features]` and transposed at use, matching
+## the row-major LM-head convention used throughout the stdlib.
 model Linear(in_features: int, out_features: int):
     w: Tensor = randn([out_features, in_features])
     b: Tensor = zeros([out_features])
@@ -5,12 +12,17 @@ model Linear(in_features: int, out_features: int):
     fn forward(self, x: Tensor) -> Tensor:
         return bias_add(x @ self.w.transpose(0, 1), self.b)
 
+## A lookup table of `vocab_size` rows of width `embed_dim`, indexed by
+## integer token ids.
 model Embedding(vocab_size: int, embed_dim: int):
     weight: Tensor = randn([vocab_size, embed_dim])
 
     fn forward(self, indices: Tensor) -> Tensor:
         return embedding_lookup(self.weight, indices)
 
+## Two-layer feed-forward block with a GELU between them — the
+## transformer position-wise MLP. `hidden` is conventionally 4x
+## `in_features`.
 model MLP(in_features: int, hidden: int, out_features: int):
     w1: Tensor = randn([hidden, in_features])
     b1: Tensor = zeros([hidden])

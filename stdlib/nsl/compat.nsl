@@ -13,5 +13,7 @@
 #
 # This module exists for documentation and future wrapper utilities.
 
+## The compatibility-shim revision. Bumped when the shims below change
+## shape, so a program can branch on it.
 fn compat_version() -> int:
     return 1

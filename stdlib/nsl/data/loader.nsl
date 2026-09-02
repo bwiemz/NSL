@@ -47,5 +47,6 @@
 #       Note: causal attention mask is generated inside the model's GQA layer
 #       via causal_mask(seq_len), not in the DataLoader.
 
+## The dataset-shim revision, bumped when the loader contract changes.
 fn data_version() -> int:
     return 1

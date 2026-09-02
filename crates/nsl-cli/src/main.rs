@@ -11,6 +11,7 @@ mod pipeline;
 mod mangling;
 mod resolver;
 mod standalone;
+mod stdlib_reference;
 
 use std::process;
 
@@ -155,6 +156,22 @@ fn main_inner() {
         Cli::Doc { cmd: DocCmd::Cli } => {
             use clap::CommandFactory as _;
             print!("{}", cli_reference::render_markdown(&Cli::command()));
+        }
+        Cli::Doc { cmd: DocCmd::Stdlib } => {
+            let Some(root) = resolver::stdlib_roots().into_iter().next() else {
+                eprintln!(
+                    "nsl doc stdlib: no stdlib directory found (looked at $NSL_STDLIB, \
+                     <exe>/stdlib, and the toolchain layout)"
+                );
+                std::process::exit(1);
+            };
+            match stdlib_reference::render_markdown(&root) {
+                Ok(md) => print!("{md}"),
+                Err(e) => {
+                    eprintln!("nsl doc stdlib: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

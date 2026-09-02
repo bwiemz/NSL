@@ -27,6 +27,17 @@
 # muon_orthogonalize_fast (same math, no .item() device sync, device-
 # resident norm, materialized transposes); this NSL version is kept as the
 # pinned reference the gate tests compare against.
+## Approximate the semi-orthogonal factor `UV^T` of `g`'s SVD by a
+## quintic Newton-Schulz iteration of `ns_steps` steps.
+##
+## The coefficients are Jordan et al.'s slope-maximizing tuning, so
+## singular values converge into a band around 1 rather than exactly
+## 1. A tall input is orthogonalized through its transpose, keeping
+## the Gram matrix at the smaller dimension.
+##
+## This is the pinned REFERENCE implementation the gates compare
+## against; `muon_step` calls the runtime primitive instead, which is
+## the same math without the per-iteration device sync.
 fn muon_orthogonalize(g: Tensor, ns_steps: float) -> Tensor:
     let s = g.shape
     let rows = s[0]
@@ -51,6 +62,19 @@ fn muon_orthogonalize(g: Tensor, ns_steps: float) -> Tensor:
 # ~0.02 while AdamW on the embedding/head wants ~3e-4. Codegen threads
 # adamw_lr = lr x fixed ratio (ratio 1.0 when the train block leaves the
 # knob unset, preserving the original single-lr behavior bit-for-bit).
+## One Muon step on `param`, in place, with mixed AdamW routing.
+##
+## `adamw_route` selects the update per parameter: the orthogonalized-
+## momentum step applies only to rank-2 hidden weight matrices, while
+## embeddings, the LM head and anything whose runtime rank is not 2
+## (biases, norms, scalars) take a standard AdamW step. Codegen sets
+## the flag from parameter roles, so a caller does not classify by
+## hand.
+##
+## `m` is the Muon momentum buffer on the Muon route and AdamW's first
+## moment otherwise; `v` is allocated only for AdamW-routed parameters
+## and is not read on the Muon route. The Newton-Schulz iteration runs
+## in the tensor's native dtype — there is no bf16 shortcut.
 fn muon_step(param: Tensor, gradient: Tensor, m: Tensor, v: Tensor, adamw_route: float, lr: float, adamw_lr: float, momentum: float, beta1: float, beta2: float, eps: float, weight_decay: float, nesterov: bool, ns_steps: float, t: float):
     let s = param.shape
     if adamw_route > 0.5 or len(s) != 2:

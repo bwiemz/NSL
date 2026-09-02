@@ -1,23 +1,46 @@
+## Learning-rate schedules: `(base_lr, step, ...) -> lr`.
+##
+## Each is a pure function of the step number, so a schedule can be
+## evaluated anywhere without carrying optimizer state, and two
+## schedules can be compared by plotting them.
+
+## A flat schedule: `base_lr` at every step. The null control for a
+## schedule comparison.
 fn constant_lr(base_lr: float, step: float) -> float:
     return base_lr
 
+## Staircase decay: multiply by `gamma` every `step_size` steps.
 fn step_lr(base_lr: float, step: float, step_size: float, gamma: float) -> float:
     return base_lr * gamma ** floor(step / step_size)
 
+## Smooth exponential decay: `base_lr * gamma**step`, per step (not per
+## epoch), so `gamma` is typically very close to 1.
 fn exponential_lr(base_lr: float, step: float, gamma: float) -> float:
     return base_lr * gamma ** step
 
+## Straight line from `base_lr` at step 0 to `base_lr * end_factor` at
+## `total_steps`, then flat.
 fn linear_decay(base_lr: float, step: float, total_steps: float, end_factor: float) -> float:
     if step >= total_steps:
         return base_lr * end_factor
     let progress = step / total_steps
     return base_lr * (1.0 - progress * (1.0 - end_factor))
 
+## Cosine curve from `base_lr` down to `eta_min` over `t_max` steps,
+## flat at `eta_min` afterwards. No warmup — see `warmup_cosine`.
 fn cosine_anneal(base_lr: float, step: float, t_max: float, eta_min: float) -> float:
     if step >= t_max:
         return eta_min
     return eta_min + (base_lr - eta_min) * 0.5 * (1.0 + cos(3.14159265358979323846 * step / t_max))
 
+## Linear warmup for `warmup_steps`, then cosine decay to `min_lr` at
+## `total_steps`. The schedule production recipes use.
+##
+## `total_steps` is the horizon the cosine is shaped to, NOT a step
+## cap: a run stopped at a fraction of it has only travelled that
+## fraction of the curve, so a schedule copied from a long run into a
+## short one holds the rate near its peak throughout. Size
+## `total_steps` to the run you are actually doing.
 fn warmup_cosine(base_lr: float, step: float, warmup_steps: float, total_steps: float, min_lr: float) -> float:
     if step < warmup_steps:
         if warmup_steps > 0.0:
@@ -28,8 +51,10 @@ fn warmup_cosine(base_lr: float, step: float, warmup_steps: float, total_steps: 
     let progress = (step - warmup_steps) / (total_steps - warmup_steps)
     if progress >= 1.0:
         return min_lr
-    return min_lr + (base_lr - min_lr) * 0.5 * (1.0 + cos(3.14159265358979323846358979323846 * progress))
+    return min_lr + (base_lr - min_lr) * 0.5 * (1.0 + cos(3.14159265358979323846 * progress))
 
+## One-cycle (Smith, 2018): linear rise from `base_lr` to `max_lr` over
+## the first `pct_start` of `total_steps`, then a cosine fall to zero.
 fn one_cycle(base_lr: float, step: float, max_lr: float, total_steps: float, pct_start: float) -> float:
     let warmup_end = total_steps * pct_start
     if step < warmup_end:

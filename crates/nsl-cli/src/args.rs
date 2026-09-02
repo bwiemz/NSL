@@ -276,7 +276,7 @@ pub(crate) enum Cli {
         cmd: EnvCmd,
     },
 
-    /// Generated reference documentation: the CLI reference page.
+    /// Generated reference documentation: the CLI and standard-library reference pages.
     Doc {
         #[command(subcommand)]
         cmd: DocCmd,
@@ -291,6 +291,11 @@ pub(crate) enum DocCmd {
     /// generated from: every subcommand with its positionals and flags,
     /// in the words of `nsl <command> --help`.
     Cli,
+    /// Emit the Markdown standard-library reference that
+    /// docs/wiki/Stdlib-Reference.md is generated from: every module in
+    /// `stdlib/` with its functions and models, signatures from the parser
+    /// and descriptions from `##` doc comments.
+    Stdlib,
 }
 
 /// `nsl env` subcommands (roadmap A5: the env-var registry in `nsl-env`).

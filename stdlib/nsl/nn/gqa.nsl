@@ -19,6 +19,18 @@ from nsl.nn.rope import RotaryEmbedding
 # (attention `wo` here, FFN `w_down` in the model files); scaling only one
 # leaves half the residual contributions un-damped, which shows up as
 # early-training instability at depth.
+## Grouped-query attention with rotary positions — the attention the
+## production models use.
+##
+## `n_kv_heads` key/value heads are shared across `n_heads` query heads,
+## which cuts the KV cache by `n_heads / n_kv_heads` at inference.
+## Projections are Xavier-initialised and the output projection is
+## additionally scaled by `1/sqrt(2 * n_layers)` so residual variance
+## does not grow with depth.
+##
+## `forward` takes a dense `[batch, seq, d_model]` batch. `forward_packed`
+## takes a packed batch with `segment_ids` and `position_ids`, so several
+## documents share a row without attending across the boundary.
 model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float, max_seq_len: int, rope_theta: float, n_layers: int):
     # Store dims as tensor fields for method access
     _d_model: Tensor = full([1], float(d_model))

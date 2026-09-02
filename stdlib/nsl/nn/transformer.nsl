@@ -1,7 +1,11 @@
+## A single transformer block.
+
 from nsl.nn.layers import Linear, MLP
 from nsl.nn.norms import LayerNorm
 from nsl.nn.attention import Attention
 
+## One pre-norm transformer block: attention and MLP, each wrapped in a
+## normalisation and a residual connection.
 model TransformerBlock(dim: int, num_heads: int):
     norm1: LayerNorm = LayerNorm(dim)
     attn: Attention = Attention(dim, num_heads)
