@@ -37,7 +37,8 @@ fn run_build_shared_single(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, options.linear_types_enabled);
+    let (source_map, interner, parse_result, analysis) =
+        crate::pipeline::frontend_with_source_map(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so they take effect on the
     // shared-library build path, and fail fast if --wrga-report is combined
@@ -75,10 +76,7 @@ fn run_build_shared_single(
         options,
     ) {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("codegen error: {e}");
-            process::exit(1);
-        }
+        Err(e) => crate::pipeline::exit_on_codegen_error(&source_map, &e, None),
     };
 
     emit_wrga_report(&wrga_plan, wrga_report, &options.wrga_check);
@@ -293,10 +291,7 @@ fn run_build_shared_multi(
                     &nsl_codegen::CompileOptions::default(),
                 ) {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("codegen error: {e}");
-                        process::exit(1);
-                    }
+                    Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
                 };
 
                 for stmt in &dep_data.ast.stmts {
@@ -314,12 +309,18 @@ fn run_build_shared_multi(
                 }
 
                 if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
-                    eprintln!("codegen error: {e}");
-                    process::exit(1);
+                    crate::pipeline::exit_on_codegen_error(
+                        &source_map,
+                        &e,
+                        Some(&format!("collecting structs from '{}'", dep_path.display())),
+                    );
                 }
                 if let Err(e) = temp_compiler.collect_models(&dep_data.ast.stmts) {
-                    eprintln!("codegen error: {e}");
-                    process::exit(1);
+                    crate::pipeline::exit_on_codegen_error(
+                        &source_map,
+                        &e,
+                        Some(&format!("collecting models from '{}'", dep_path.display())),
+                    );
                 }
 
                 let model_sigs = temp_compiler.build_model_signatures(&dep_data.ast.stmts);
@@ -450,10 +451,7 @@ fn run_build_shared_multi(
                     entry_wrga_plan = plan;
                     bytes
                 }
-                Err(e) => {
-                    eprintln!("codegen error in '{}': {e}", path.display());
-                    process::exit(1);
-                }
+                Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, path),
             }
         } else {
             // Only the entry module's object may define the export-table
@@ -473,10 +471,7 @@ fn run_build_shared_multi(
                 &import_options,
             ) {
                 Ok(bytes) => bytes,
-                Err(e) => {
-                    eprintln!("codegen error in '{}': {e}", path.display());
-                    process::exit(1);
-                }
+                Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, path),
             }
         };
 

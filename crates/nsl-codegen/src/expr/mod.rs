@@ -133,7 +133,21 @@ pub(crate) fn tensor_method_returns_owned_ref(method: &str) -> Option<bool> {
 }
 
 impl Compiler<'_> {
+    /// Compile one expression. An error raised beneath it leaves here
+    /// pointing at the innermost expression that was being compiled (see
+    /// `compile_stmt`; `CodegenError::with_span_if_unset` keeps the first
+    /// span attached on the way out).
     pub fn compile_expr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        expr: &Expr,
+    ) -> Result<Value, CodegenError> {
+        self.compile_expr_dispatch(builder, state, expr)
+            .map_err(|e| e.with_span_if_unset(expr.span))
+    }
+
+    fn compile_expr_dispatch(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,

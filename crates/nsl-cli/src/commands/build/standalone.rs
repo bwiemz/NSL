@@ -36,7 +36,8 @@ pub(crate) fn run_build_standalone(
 
     // 4. Run frontend (lex, parse, semantic analysis)
     let file_pb = file.to_path_buf();
-    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(&file_pb, options.linear_types_enabled);
+    let (source_map, interner, parse_result, analysis) =
+        crate::pipeline::frontend_with_source_map(&file_pb, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the standalone build path.
@@ -94,10 +95,8 @@ pub(crate) fn run_build_standalone(
         options,
     );
     emit_wrga_report(&wrga_plan, wrga_report, &options.wrga_check);
-    let obj_bytes = bytes_res.unwrap_or_else(|e| {
-        eprintln!("codegen error: {e}");
-        process::exit(1);
-    });
+    let obj_bytes = bytes_res
+        .unwrap_or_else(|e| crate::pipeline::exit_on_codegen_error(&source_map, &e, None));
 
     // 7. Write main object file
     let temp_dir = std::env::temp_dir().join(format!("nsl_standalone_{}", std::process::id()));

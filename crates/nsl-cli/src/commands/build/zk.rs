@@ -20,7 +20,8 @@ pub(crate) fn run_build_zk(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, options.linear_types_enabled);
+    let (source_map, interner, parse_result, analysis) =
+        crate::pipeline::frontend_with_source_map(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the ZK build path.
@@ -60,10 +61,7 @@ pub(crate) fn run_build_zk(
 
     let obj_bytes = match bytes_res {
         Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("codegen error: {e}");
-            process::exit(1);
-        }
+        Err(e) => crate::pipeline::exit_on_codegen_error(&source_map, &e, None),
     };
 
     // M55c: Write ZK proof files alongside the binary

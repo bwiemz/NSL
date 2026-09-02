@@ -94,7 +94,8 @@ fn run_build_single(
     wrga_report: Option<&std::path::Path>,
     entry: nsl_codegen::pass_registry::Subcommand,
 ) {
-    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, options.linear_types_enabled);
+    let (source_map, interner, parse_result, analysis) =
+        crate::pipeline::frontend_with_source_map(file, options.linear_types_enabled);
 
     // Task 3 (B.1): fail fast if --wrga-report is used without --source-ad
     // when decorators are present — the old silent-notice behaviour was
@@ -142,11 +143,8 @@ fn run_build_single(
                 "note: --nan-analysis: {} warning(s) detected",
                 analyzer.diagnostics.len()
             );
-            let mut sm = nsl_errors::SourceMap::new();
-            let src = std::fs::read_to_string(file).unwrap_or_default();
-            sm.add_file(file.display().to_string(), src);
             for diag in &analyzer.diagnostics {
-                sm.emit_diagnostic(diag);
+                source_map.emit_diagnostic(diag);
             }
         }
     }
@@ -160,10 +158,7 @@ fn run_build_single(
         options,
     ) {
         Ok((bytes, plan)) => (bytes, plan),
-        Err(e) => {
-            eprintln!("codegen error: {e}");
-            process::exit(1);
-        }
+        Err(e) => crate::pipeline::exit_on_codegen_error(&source_map, &e, None),
     };
 
     // Milestone A: reconcile requested surfaces against the disposition log
@@ -326,10 +321,7 @@ fn run_build_multi(
                 // Build function signatures and struct layouts using a temporary compiler
                 let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("codegen error: {e}");
-                        process::exit(1);
-                    }
+                    Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
                 };
 
                 for stmt in &dep_data.ast.stmts {
@@ -350,12 +342,18 @@ fn run_build_multi(
 
                 // Extract struct layouts from dependency (structs first, then models which may reference structs)
                 if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
-                    eprintln!("codegen error collecting structs from '{}': {e}", dep_path.display());
-                    process::exit(1);
+                    crate::pipeline::exit_on_codegen_error(
+                        &source_map,
+                        &e,
+                        Some(&format!("collecting structs from '{}'", dep_path.display())),
+                    );
                 }
                 if let Err(e) = temp_compiler.collect_models(&dep_data.ast.stmts) {
-                    eprintln!("codegen error collecting models from '{}': {e}", dep_path.display());
-                    process::exit(1);
+                    crate::pipeline::exit_on_codegen_error(
+                        &source_map,
+                        &e,
+                        Some(&format!("collecting models from '{}'", dep_path.display())),
+                    );
                 }
 
                 // Import model constructor and method signatures
@@ -487,10 +485,7 @@ fn run_build_multi(
                     entry_wrga_plan = plan;
                     bytes
                 }
-                Err(e) => {
-                    eprintln!("codegen error in '{}': {e}", path.display());
-                    process::exit(1);
-                }
+                Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, path),
             }
         } else {
             // Library module: export all functions.
@@ -523,10 +518,7 @@ fn run_build_multi(
                     let dep_data = &graph.modules[dep_path];
                     let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
                         Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("codegen error: {e}");
-                            process::exit(1);
-                        }
+                        Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
                     };
 
                     for stmt in &dep_data.ast.stmts {
@@ -544,12 +536,18 @@ fn run_build_multi(
                     }
 
                     if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
-                        eprintln!("codegen error: {e}");
-                        process::exit(1);
+                        crate::pipeline::exit_on_codegen_error(
+                            &source_map,
+                            &e,
+                            Some(&format!("collecting structs from '{}'", dep_path.display())),
+                        );
                     }
                     if let Err(e) = temp_compiler.collect_models(&dep_data.ast.stmts) {
-                        eprintln!("codegen error: {e}");
-                        process::exit(1);
+                        crate::pipeline::exit_on_codegen_error(
+                            &source_map,
+                            &e,
+                            Some(&format!("collecting models from '{}'", dep_path.display())),
+                        );
                     }
 
                     let model_sigs = temp_compiler.build_model_signatures(&dep_data.ast.stmts);
@@ -617,10 +615,7 @@ fn run_build_multi(
                 options,
             ) {
                 Ok(bytes) => bytes,
-                Err(e) => {
-                    eprintln!("codegen error in '{}': {e}", path.display());
-                    process::exit(1);
-                }
+                Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, path),
             }
         };
 

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::process;
 
 pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
-    let (interner, parse_result, analysis) = crate::pipeline::frontend(file);
+    let (source_map, interner, parse_result, analysis) =
+        crate::pipeline::frontend_with_source_map(file, false);
 
     // Compile in test mode — produces a binary with test-dispatch main()
     let (obj_bytes, test_fns) = match nsl_codegen::compile_test(
@@ -17,10 +18,7 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
         &nsl_codegen::CompileOptions::default(),
     ) {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("codegen error: {e}");
-            process::exit(1);
-        }
+        Err(e) => crate::pipeline::exit_on_codegen_error(&source_map, &e, None),
     };
 
     // Apply filter
