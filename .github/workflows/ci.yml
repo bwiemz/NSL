@@ -57,7 +57,7 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -86,7 +86,7 @@ jobs:
           echo "after:"; df -h / | tail -1
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -147,7 +147,7 @@ jobs:
     name: M62b Spec C — ONNX RT integration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@stable
@@ -159,7 +159,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -193,7 +193,7 @@ jobs:
             --test onnx_rt_register_custom_ops
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -220,10 +220,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -245,7 +245,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -262,7 +262,7 @@ jobs:
           yosys -V
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -302,7 +302,7 @@ jobs:
     name: CUDA feature — compile + GPU-free tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@stable
@@ -310,7 +310,7 @@ jobs:
           toolchain: 1.95.0
 
       - name: Install CUDA toolkit (nvcc, ptxas, cudart stubs, cuBLAS)
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
           # Must be >= 13.2. cuda/mod.rs constructs a CUmemLocation with the
@@ -327,7 +327,7 @@ jobs:
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -421,7 +421,7 @@ jobs:
     name: Version agreement (Cargo == spec / README / CLI)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check version strings agree with Cargo [workspace.package].version
         run: ./scripts/check-version-agreement.sh
 
@@ -473,7 +473,7 @@ jobs:
     name: Documentation agreement (docs == tree)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check documentation claims agree with the repository
         run: ./scripts/check-doc-agreement.sh
 
@@ -492,7 +492,7 @@ jobs:
     name: GPU gate inventory (manifest == tree)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check the GPU gate manifest agrees with the source
         run: ./scripts/gpu-cert.sh --check-inventory
       - name: "Check every #[ignore] carries a reason"
