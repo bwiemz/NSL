@@ -13,6 +13,7 @@ pub(crate) mod cep;
 pub(crate) mod check;
 pub(crate) mod convert;
 pub(crate) mod cpkd_design;
+pub(crate) mod env;
 pub(crate) mod fmt;
 pub(crate) mod fpga;
 pub(crate) mod init;
