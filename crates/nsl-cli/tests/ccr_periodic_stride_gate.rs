@@ -35,11 +35,25 @@ fn run(rewrite_gpu: bool, cuda: bool, extra: &[&str]) -> Run {
         assert!(src.contains("# GPU_PLACEMENT"));
         src = src.replace("# GPU_PLACEMENT", "m.to(cuda)");
     }
-    let tmp = root.join(format!(
-        "target/ccr_periodic_{}.nsl",
+    // Write the rewritten fixture beside the ORIGINAL, not into `target/`.
+    //
+    // `<repo>/target/` only exists when the build happens to use the default
+    // target directory. Under CARGO_TARGET_DIR -- which the GPU certification
+    // lane sets, and which any developer with a shared target dir sets -- the
+    // path does not exist and `fs::write` fails with a bare NotFound. That
+    // surfaced as five red gates in the cert sweep and in `cargo test
+    // --workspace`, attributed to CCR stride behaviour rather than to a
+    // missing directory. A test must not pass or fail based on where the
+    // caller happened to point their build output.
+    //
+    // The fixtures directory is guaranteed to exist (the source fixture was
+    // just read from it) and is gitignored for this pattern.
+    let tmp = src_path.with_file_name(format!(
+        "ccr_periodic_{}.generated.nsl",
         if cuda { "gpu" } else { "cpu" }
     ));
-    std::fs::write(&tmp, &src).expect("write temp fixture");
+    std::fs::write(&tmp, &src)
+        .unwrap_or_else(|e| panic!("write temp fixture to {}: {e}", tmp.display()));
 
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-q"]);
