@@ -1,3 +1,11 @@
+## Reference multi-head self-attention.
+
+## Multi-head self-attention with a causal mask.
+##
+## The reference formulation, written out in NSL: project to Q/K/V,
+## split into `num_heads` heads, scaled dot-product with a causal mask,
+## then recombine and project out. `nsl.nn.gqa` is the production form —
+## grouped-query, rotary, and fusible to a flash-attention kernel.
 model Attention(dim: int, num_heads: int):
     q_proj: Tensor = randn([dim, dim])
     k_proj: Tensor = randn([dim, dim])

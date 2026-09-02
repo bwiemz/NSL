@@ -16,6 +16,11 @@
 from nsl.inference.sampling import sample_top_k
 
 @no_grad
+## Autoregressive generation: extend `prompt` by up to `max_tokens`,
+## sampling each step from `lm`'s logits with `temperature` and `top_k`
+## (`top_k = 1` is greedy decoding).
+##
+## `lm` is any model whose `forward` maps a token tensor to logits.
 fn generate(lm, prompt: Tensor, max_tokens: int, temperature: float, top_k: int) -> Tensor:
     let tokens = prompt
     for i in range(max_tokens):

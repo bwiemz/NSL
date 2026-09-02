@@ -1,6 +1,11 @@
+## Token sampling strategies for generation.
+
 # NeuralScript Inference Sampling Module
 # Provides top-k, top-p (nucleus), and greedy sampling strategies.
 
+## Sample one token from the `k` highest-probability logits, after
+## dividing by `temperature`. Lower temperature concentrates the
+## distribution; `k = 1` is greedy.
 fn sample_top_k(logits: Tensor, k: int, temperature: float) -> Tensor:
     let scaled = logits / temperature
     let result = topk(scaled, k)
@@ -10,6 +15,9 @@ fn sample_top_k(logits: Tensor, k: int, temperature: float) -> Tensor:
     let sampled = multinomial(probs, 1)
     return gather(indices, -1, sampled)
 
+## Nucleus sampling: sample from the smallest set of tokens whose
+## probabilities sum to at least `p`, after dividing by `temperature`.
+## Unlike top-k the candidate set resizes with the model's confidence.
 fn sample_top_p(logits: Tensor, p: float, temperature: float) -> Tensor:
     let scaled = logits / temperature
     let probs = softmax(scaled, -1)
@@ -24,5 +32,6 @@ fn sample_top_p(logits: Tensor, p: float, temperature: float) -> Tensor:
     let sampled = multinomial(filtered, 1)
     return gather(indices, -1, sampled)
 
+## Take the single highest-probability token. Deterministic.
 fn sample_greedy(logits: Tensor) -> Tensor:
     return argmax(logits, -1)

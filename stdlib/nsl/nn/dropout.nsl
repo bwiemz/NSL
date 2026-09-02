@@ -1,3 +1,7 @@
+## Dropout regularisation.
+
+## Zeroes each element with probability `p` during training and rescales
+## the survivors so the expected activation is unchanged.
 model Dropout(p: float):
     prob: float = p
 

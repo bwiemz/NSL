@@ -1,3 +1,5 @@
+## Rotary position embeddings.
+
 # Rotary frequency table: `emb[p, :] = concat(p * inv_freq, p * inv_freq)`
 # for p in [0, max_seq_len), i.e. the [max_seq_len, dim] argument that cos/sin
 # are taken over.
@@ -7,6 +9,12 @@
 # struct is still being built) — so the cached tables below and `inv_freq`
 # must each derive the frequencies from the constructor arguments. Keeping
 # that derivation in one place is the point of the function.
+## Build the `[max_seq_len, dim]` rotary frequency table that `cos`/`sin`
+## are taken over: row `p` is `concat(p * inv_freq, p * inv_freq)`.
+##
+## A free function rather than a method because a model field
+## initializer cannot reference a sibling field, and both cached tables
+## plus `inv_freq` need the same derivation.
 fn rope_freq_table(dim: int, max_seq_len: int, theta: float) -> Tensor:
     let inv_freq = exp(arange(0.0, float(dim), 2.0) * (-1.0 * log(theta) / float(dim)))
     let half_d = dim // 2
@@ -16,6 +24,17 @@ fn rope_freq_table(dim: int, max_seq_len: int, theta: float) -> Tensor:
     let tensors = [freqs, freqs]
     return tensor_cat(tensors, 1)
 
+## Rotary position embeddings (RoPE), applied to Q and K.
+##
+## `cos`/`sin` are precomputed over the whole `[max_seq_len, dim]` grid
+## at construction and gathered per call, rather than rebuilt on every
+## attention layer. Consequently `seq_len` must not exceed
+## `max_seq_len`: the bound is enforced at the gather, which aborts
+## naming the offending index.
+##
+## The `_`-prefixed fields are derived constants, not parameters — the
+## prefix keeps them out of the trainable set, so they take no gradient,
+## no optimizer moments and no weight decay.
 model RotaryEmbedding(dim: int, max_seq_len: int, theta: float):
     # Precompute inverse frequencies: theta^(-2i/d) for i in [0, dim/2)
     # Using exp(-log(theta) * indices / dim) since ** is scalar-only.

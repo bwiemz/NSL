@@ -1,5 +1,9 @@
+## Console input.
+
 # nsl.io — Input/output utilities
 
+## Print `prompt` and read one line from standard input, without the
+## trailing newline.
 fn input(prompt: str) -> str:
     print(prompt)
     return read_line()

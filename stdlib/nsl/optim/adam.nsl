@@ -1,3 +1,14 @@
+## Adam (Kingma & Ba, 2015), with weight decay applied as the coupled
+## L2 form. For the decoupled form — usually what you want for a
+## transformer — use `nsl.optim.adamw`.
+##
+## The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
+## codegen and updated in place through `copy_data`, so the step writes
+## through its arguments and returns nothing.
+
+## One Adam step on `param`, in place. `m` and `v` are the first and
+## second moment buffers, bias-corrected with `t` (the 1-based step
+## number).
 fn adam_step(param: Tensor, gradient: Tensor, m: Tensor, v: Tensor, lr: float, beta1: float, beta2: float, eps: float, weight_decay: float, t: float):
     copy_data(m, beta1 * m + (1.0 - beta1) * gradient)
     copy_data(v, beta2 * v + (1.0 - beta2) * gradient * gradient)

@@ -1,3 +1,16 @@
+## Stochastic gradient descent with momentum, dampening, decoupled weight
+## decay and optional Nesterov lookahead.
+##
+## The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
+## codegen and updated in place through `copy_data`, so the step writes
+## through its arguments and returns nothing.
+
+## One SGD step on `param`, in place.
+##
+## `velocity` carries the momentum buffer. `dampening` scales the
+## incoming gradient's contribution to it; `nesterov` applies the
+## lookahead form, which uses the gradient plus the *updated* velocity
+## rather than the velocity alone.
 fn sgd_step(param: Tensor, gradient: Tensor, velocity: Tensor, lr: float, momentum: float, dampening: float, weight_decay: float, nesterov: bool):
     copy_data(velocity, momentum * velocity + (1.0 - dampening) * gradient)
     let update = velocity

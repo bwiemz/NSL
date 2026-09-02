@@ -30,6 +30,10 @@
 #   @wrga(mode=auto, adapter=GatedLoRA, target=h100)
 #   let m = NSLCoder.load("pretrained.nslm", weights="model.safetensors")
 
+## The marker base a custom WRGA adapter conceptually attaches to.
+##
+## Importing it is the intent marker; the WRGA compiler pass keys off
+## the `@wrga(adapter = <Name>, ...)` decorator, not off this type.
 model WrgaAdapter():
     fn forward(self, x: Tensor) -> Tensor:
         return x

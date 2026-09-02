@@ -1,3 +1,7 @@
+## Normalisation layers.
+
+## Layer normalisation over the last dimension, with a learned scale and
+## shift. `eps` guards the variance under the square root.
 model LayerNorm(dim: int):
     weight: Tensor = ones([dim])
     bias: Tensor = zeros([dim])
@@ -6,6 +10,8 @@ model LayerNorm(dim: int):
     fn forward(self, x: Tensor) -> Tensor:
         return layernorm(x, self.weight, self.bias, self.eps)
 
+## Root-mean-square normalisation: LayerNorm without the mean
+## subtraction or the bias. Cheaper, and what modern LLMs use.
 model RMSNorm(dim: int):
     weight: Tensor = ones([dim])
     eps: float = 0.00001
