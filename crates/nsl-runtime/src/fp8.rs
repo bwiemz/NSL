@@ -146,18 +146,16 @@ fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
     if t.len == 0 {
         return (tensor_ptr, false);
     }
-    // `is_contiguous()` is the runtime-wide predicate, but it returns true
-    // for EVERY rank-<=1 tensor regardless of strides, so a 1-D expand view
-    // ([N] with stride 0 over a 1-element buffer) would pass straight
-    // through to the flat read — an OOB read, the exact hazard this guard
-    // exists to close. The rank-1 stride is checked explicitly here;
-    // `nsl_tensor_contiguous` compares strides directly (not via
-    // `is_contiguous`) and its GPU path is a stride-walking kernel, so it
-    // materializes such views correctly on both devices. It must run BEFORE
-    // any D2H transfer: `nsl_tensor_to_device` shares the blind predicate
-    // and would flat-copy the same OOB range out of device memory.
-    let flat_read_unsafe =
-        !t.is_contiguous() || (t.ndim == 1 && t.len > 1 && unsafe { *t.strides } != 1);
+    // `is_contiguous()` is the runtime-wide predicate and it now covers rank 1
+    // correctly, so the open-coded stride check this line used to carry is
+    // gone. It was here because the predicate short-circuited `ndim <= 1` to
+    // true, letting a 1-D expand view ([N] with stride 0 over a one-element
+    // buffer) reach the flat read -- one valid element and N-1 bytes of
+    // adjacent heap. Patching it here only ever protected THIS call site;
+    // `nsl_tensor_to_device` shared the same blind predicate. The predicate
+    // itself was fixed on 2026-09-02, which closes all of them at once.
+    // This must still run BEFORE any D2H transfer.
+    let flat_read_unsafe = !t.is_contiguous();
     if flat_read_unsafe {
         let contig = crate::tensor::nsl_tensor_contiguous(tensor_ptr);
         let c = NslTensor::from_ptr_ref(contig);

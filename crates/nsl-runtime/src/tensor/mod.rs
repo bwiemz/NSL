@@ -890,8 +890,28 @@ impl NslTensor {
     }
 
     /// Returns true if the tensor has a contiguous row-major memory layout.
+    ///
+    /// # The rank-1 blind spot, closed 2026-09-02
+    ///
+    /// This used to short-circuit `ndim <= 1` to `true`, which is FALSE for
+    /// every strided rank-1 view. `nsl_tensor_expand` legally produces a `[N]`
+    /// tensor with stride 0 over a one-element buffer; the old predicate called
+    /// it contiguous, so any caller taking the "just flat-copy it" path read one
+    /// valid element and `N-1` bytes of adjacent heap. A 1-D slice with stride 2
+    /// is the same hazard without the out-of-bounds part: the caller silently
+    /// reads the wrong elements.
+    ///
+    /// Two call sites had already open-coded the missing stride check
+    /// (`fp8.rs` and `nsl_tensor_download_gpu_to_cpu`). Patching consumers one
+    /// at a time cannot converge -- `nsl_tensor_to_device` shared the same blind
+    /// predicate and would flat-copy the same out-of-bounds range out of device
+    /// memory -- so the predicate itself is now correct and rank-1 goes through
+    /// exactly the same rule as every other rank.
+    ///
+    /// Rank 0 is still trivially contiguous: a scalar has no strides to be
+    /// wrong about, and the loop below would not execute anyway.
     pub(crate) fn is_contiguous(&self) -> bool {
-        if self.ndim <= 1 {
+        if self.ndim == 0 {
             return true;
         }
         let ndim = self.ndim as usize;
@@ -2667,7 +2687,9 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
         // dense allocation, so this is latent today; a strided in-place scale is
         // the real fix and is deliberately not attempted here. Until then, say
         // so instead of corrupting memory quietly.
-        if !tensor.is_contiguous() || (tensor.ndim == 1 && unsafe { *tensor.strides } != 1) {
+        // The `|| (ndim == 1 && strides[0] != 1)` clause that used to be here
+        // is redundant since the rank-1 fix: `is_contiguous()` covers it.
+        if !tensor.is_contiguous() {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -5508,9 +5530,60 @@ mod tests {
 
     /// `strides_are_row_major` is the in-place replacement for the
     /// allocate-compare-free check `nsl_tensor_contiguous` used to make, so
-    /// it must agree with `compute_strides` exactly — including the 1-D
-    /// case `is_contiguous` short-circuits: a stride-2 column view of a
-    /// [4, 2] tensor is NOT row-major, and `contiguous()` must copy it.
+    /// it must agree with `compute_strides` exactly -- including the 1-D case
+    /// `is_contiguous` USED to short-circuit: a stride-2 column view of a
+    /// [4, 2] tensor is NOT row-major, and `contiguous()` must copy it. Since
+    /// the rank-1 fix the two predicates agree there too.
+    /// The rank-1 blind spot, pinned at the predicate rather than at a caller.
+    ///
+    /// Until 2026-09-02 `is_contiguous()` short-circuited `ndim <= 1` to true.
+    /// Two call sites had open-coded the missing stride check; every other
+    /// caller was exposed. These cases are the ones that were silently wrong.
+    #[test]
+    fn rank1_strided_views_are_not_contiguous() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 4);
+        crate::list::nsl_list_push(shape_list, 2);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tv = NslTensor::from_ptr(t);
+        for i in 0..8 {
+            unsafe { *tv.data_f64().add(i) = i as f64 };
+        }
+
+        // A stride-2 1-D view: reads the wrong elements if treated as flat.
+        let col = NslTensor::new_view_i64(t, &[4], &[2], 1, 4);
+        assert!(!NslTensor::from_ptr(col).is_contiguous(), "stride 2 is not contiguous");
+
+        // A stride-0 1-D broadcast view: THE out-of-bounds case. One valid
+        // element, and a flat read of len 4 walks 3 elements off the end.
+        let bcast = NslTensor::new_view_i64(t, &[4], &[0], 1, 4);
+        assert!(!NslTensor::from_ptr(bcast).is_contiguous(), "stride 0 is not contiguous");
+
+        // Stride 1 is contiguous, and so is rank 0 -- the fix must not make
+        // everything non-contiguous, which would be a silent perf collapse
+        // that still passes every correctness test.
+        let ok = NslTensor::new_view_i64(t, &[4], &[1], 1, 4);
+        assert!(NslTensor::from_ptr(ok).is_contiguous(), "stride 1 IS contiguous");
+        assert!(tv.is_contiguous(), "a fresh row-major [4, 2] is still contiguous");
+
+        // And the correct predicate agrees with the fixed one on all of them,
+        // which is the invariant that was broken: two predicates for one
+        // question, disagreeing only at rank 1.
+        for (p, want) in [(col, false), (bcast, false), (ok, true)] {
+            let v = NslTensor::from_ptr(p);
+            assert_eq!(
+                v.is_contiguous(),
+                v.strides_are_row_major(),
+                "the two contiguity predicates must agree (expected {want})"
+            );
+        }
+
+        nsl_tensor_free(ok);
+        nsl_tensor_free(bcast);
+        nsl_tensor_free(col);
+        nsl_tensor_free(t);
+    }
+
     #[test]
     fn strides_are_row_major_matches_compute_strides_including_1d() {
         let shape_list = crate::list::nsl_list_new();
@@ -5526,12 +5599,17 @@ mod tests {
         let tr = nsl_tensor_transpose(t, 0, 1);
         assert!(!NslTensor::from_ptr(tr).strides_are_row_major(), "transposed [2, 4] has strides [1, 2]");
 
-        // Column 0 as a 1-D view: shape [4], stride 2. `is_contiguous` says
-        // yes (its `ndim <= 1` shortcut); the row-major test must say no,
-        // and `nsl_tensor_contiguous` must materialize [0, 2, 4, 6].
+        // Column 0 as a 1-D view: shape [4], stride 2. Both predicates must
+        // now say NO. Until 2026-09-02 `is_contiguous` said YES here -- its
+        // `ndim <= 1` shortcut -- and this line asserted that as a
+        // "precondition", which is how a known-wrong predicate stayed pinned
+        // by its own test suite. The two predicates agreeing is the fix.
         let col = NslTensor::new_view_i64(t, &[4], &[2], 1, 4);
         let cv = NslTensor::from_ptr(col);
-        assert!(cv.is_contiguous(), "precondition: is_contiguous short-circuits 1-D");
+        assert!(
+            !cv.is_contiguous(),
+            "a stride-2 1-D view is NOT contiguous (rank-1 blind spot, fixed 2026-09-02)"
+        );
         assert!(!cv.strides_are_row_major(), "a stride-2 1-D view is not row-major");
         let c = shape_ops::nsl_tensor_contiguous(col);
         assert_ne!(c, col, "a non-row-major view must be copied, not handed back");
