@@ -1,0 +1,742 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/functions.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `add`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `a`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 3:11-3:14,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 3:8-3:14,
+                        },
+                        Param {
+                            name: `b`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 3:19-3:22,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 3:16-3:22,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`int`),
+                            span: 3:27-3:30,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: BinaryOp {
+                                                left: Expr {
+                                                    kind: Ident(`a`),
+                                                    span: 4:12-4:13,
+                                                },
+                                                op: Add,
+                                                right: Expr {
+                                                    kind: Ident(`b`),
+                                                    span: 4:16-4:17,
+                                                },
+                                            },
+                                            span: 4:12-4:17,
+                                        },
+                                    ),
+                                ),
+                                span: 4:5-4:17,
+                            },
+                        ],
+                        span: 4:5-6:1,
+                    },
+                    is_async: false,
+                    span: 3:1-6:1,
+                },
+            ),
+            span: 3:1-6:1,
+        },
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `sigmoid`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `x`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`f64`),
+                                    span: 6:15-6:18,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 6:12-6:18,
+                        },
+                    ],
+                    return_type: None,
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: BinaryOp {
+                                                left: Expr {
+                                                    kind: FloatLiteral(1.0),
+                                                    span: 7:12-7:15,
+                                                },
+                                                op: Div,
+                                                right: Expr {
+                                                    kind: Paren(
+                                                        Expr {
+                                                            kind: BinaryOp {
+                                                                left: Expr {
+                                                                    kind: FloatLiteral(1.0),
+                                                                    span: 7:19-7:22,
+                                                                },
+                                                                op: Add,
+                                                                right: Expr {
+                                                                    kind: Call {
+                                                                        callee: Expr {
+                                                                            kind: MemberAccess {
+                                                                                object: Expr {
+                                                                                    kind: Paren(
+                                                                                        Expr {
+                                                                                            kind: UnaryOp {
+                                                                                                op: Neg,
+                                                                                                operand: Expr {
+                                                                                                    kind: Ident(`x`),
+                                                                                                    span: 7:27-7:28,
+                                                                                                },
+                                                                                            },
+                                                                                            span: 7:26-7:28,
+                                                                                        },
+                                                                                    ),
+                                                                                    span: 7:25-7:29,
+                                                                                },
+                                                                                member: `exp`,
+                                                                            },
+                                                                            span: 7:25-7:33,
+                                                                        },
+                                                                        args: [],
+                                                                    },
+                                                                    span: 7:25-7:35,
+                                                                },
+                                                            },
+                                                            span: 7:19-7:35,
+                                                        },
+                                                    ),
+                                                    span: 7:18-7:36,
+                                                },
+                                            },
+                                            span: 7:12-7:36,
+                                        },
+                                    ),
+                                ),
+                                span: 7:5-7:36,
+                            },
+                        ],
+                        span: 7:5-9:1,
+                    },
+                    is_async: false,
+                    span: 6:1-9:1,
+                },
+            ),
+            span: 6:1-9:1,
+        },
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `identity`,
+                    type_params: [
+                        TypeParam {
+                            name: `T`,
+                            bounds: [],
+                            span: 9:13-9:14,
+                        },
+                    ],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `value`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`T`),
+                                    span: 9:23-9:24,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 9:16-9:24,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`T`),
+                            span: 9:29-9:30,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: Ident(`value`),
+                                            span: 10:12-10:17,
+                                        },
+                                    ),
+                                ),
+                                span: 10:5-10:17,
+                            },
+                        ],
+                        span: 10:5-12:1,
+                    },
+                    is_async: false,
+                    span: 9:1-12:1,
+                },
+            ),
+            span: 9:1-12:1,
+        },
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `make`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `in_features`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 12:22-12:25,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 12:9-12:25,
+                        },
+                        Param {
+                            name: `out_features`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 12:41-12:44,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 12:27-12:44,
+                        },
+                        Param {
+                            name: `bias`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`bool`),
+                                    span: 12:52-12:56,
+                                },
+                            ),
+                            default: Some(
+                                Expr {
+                                    kind: BoolLiteral(true),
+                                    span: 12:59-12:63,
+                                },
+                            ),
+                            is_variadic: false,
+                            span: 12:46-12:63,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`Linear`),
+                            span: 12:68-12:74,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`Linear`),
+                                                    span: 13:12-13:18,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: Ident(`in_features`),
+                                                            span: 13:19-13:30,
+                                                        },
+                                                        span: 13:19-13:30,
+                                                    },
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: Ident(`out_features`),
+                                                            span: 13:32-13:44,
+                                                        },
+                                                        span: 13:32-13:44,
+                                                    },
+                                                    Arg {
+                                                        name: Some(`bias`),
+                                                        value: Expr {
+                                                            kind: Ident(`bias`),
+                                                            span: 13:51-13:55,
+                                                        },
+                                                        span: 13:46-13:55,
+                                                    },
+                                                ],
+                                            },
+                                            span: 13:12-13:56,
+                                        },
+                                    ),
+                                ),
+                                span: 13:5-13:56,
+                            },
+                        ],
+                        span: 13:5-15:1,
+                    },
+                    is_async: false,
+                    span: 12:1-15:1,
+                },
+            ),
+            span: 12:1-15:1,
+        },
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `outer`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `x`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 15:17-15:20,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 15:14-15:20,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`int`),
+                            span: 15:25-15:28,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: FnDef(
+                                    FnDef {
+                                        name: `inner`,
+                                        type_params: [],
+                                        effect_params: [],
+                                        params: [
+                                            Param {
+                                                name: `y`,
+                                                type_ann: Some(
+                                                    TypeExpr {
+                                                        kind: Named(`int`),
+                                                        span: 16:17-16:20,
+                                                    },
+                                                ),
+                                                default: None,
+                                                is_variadic: false,
+                                                span: 16:14-16:20,
+                                            },
+                                        ],
+                                        return_type: Some(
+                                            TypeExpr {
+                                                kind: Named(`int`),
+                                                span: 16:25-16:28,
+                                            },
+                                        ),
+                                        return_effect: None,
+                                        body: Block {
+                                            stmts: [
+                                                Stmt {
+                                                    kind: Return(
+                                                        Some(
+                                                            Expr {
+                                                                kind: BinaryOp {
+                                                                    left: Expr {
+                                                                        kind: Ident(`y`),
+                                                                        span: 17:16-17:17,
+                                                                    },
+                                                                    op: Mul,
+                                                                    right: Expr {
+                                                                        kind: IntLiteral(2),
+                                                                        span: 17:20-17:21,
+                                                                    },
+                                                                },
+                                                                span: 17:16-17:21,
+                                                            },
+                                                        ),
+                                                    ),
+                                                    span: 17:9-17:21,
+                                                },
+                                            ],
+                                            span: 17:9-18:5,
+                                        },
+                                        is_async: false,
+                                        span: 16:5-18:5,
+                                    },
+                                ),
+                                span: 16:5-18:5,
+                            },
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`inner`),
+                                                    span: 18:12-18:17,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: Ident(`x`),
+                                                            span: 18:18-18:19,
+                                                        },
+                                                        span: 18:18-18:19,
+                                                    },
+                                                ],
+                                            },
+                                            span: 18:12-18:20,
+                                        },
+                                    ),
+                                ),
+                                span: 18:5-18:20,
+                            },
+                        ],
+                        span: 16:5-20:1,
+                    },
+                    is_async: false,
+                    span: 15:5-20:1,
+                },
+            ),
+            span: 15:5-20:1,
+        },
+        Stmt {
+            kind: Decorated {
+                decorators: [
+                    Decorator {
+                        name: [
+                            `export`,
+                        ],
+                        args: None,
+                        span: 20:1-20:8,
+                    },
+                ],
+                stmt: Stmt {
+                    kind: FnDef(
+                        FnDef {
+                            name: `exported`,
+                            type_params: [],
+                            effect_params: [],
+                            params: [
+                                Param {
+                                    name: `a`,
+                                    type_ann: Some(
+                                        TypeExpr {
+                                            kind: Tensor {
+                                                shape: [
+                                                    Concrete(4),
+                                                ],
+                                                dtype: `f32`,
+                                                device: None,
+                                            },
+                                            span: 21:16-21:32,
+                                        },
+                                    ),
+                                    default: None,
+                                    is_variadic: false,
+                                    span: 21:13-21:32,
+                                },
+                            ],
+                            return_type: Some(
+                                TypeExpr {
+                                    kind: Tensor {
+                                        shape: [
+                                            Concrete(4),
+                                        ],
+                                        dtype: `f32`,
+                                        device: None,
+                                    },
+                                    span: 21:37-21:53,
+                                },
+                            ),
+                            return_effect: None,
+                            body: Block {
+                                stmts: [
+                                    Stmt {
+                                        kind: Return(
+                                            Some(
+                                                Expr {
+                                                    kind: Ident(`a`),
+                                                    span: 22:12-22:13,
+                                                },
+                                            ),
+                                        ),
+                                        span: 22:5-22:13,
+                                    },
+                                ],
+                                span: 22:5-24:1,
+                            },
+                            is_async: false,
+                            span: 21:1-24:1,
+                        },
+                    ),
+                    span: 21:1-24:1,
+                },
+            },
+            span: 20:1-24:1,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`double`),
+                    span: 24:5-24:11,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Lambda {
+                            params: [
+                                LambdaParam {
+                                    name: `x`,
+                                    type_ann: None,
+                                    span: 24:15-24:16,
+                                },
+                            ],
+                            body: Expr {
+                                kind: BinaryOp {
+                                    left: Expr {
+                                        kind: Ident(`x`),
+                                        span: 24:18-24:19,
+                                    },
+                                    op: Mul,
+                                    right: Expr {
+                                        kind: IntLiteral(2),
+                                        span: 24:22-24:23,
+                                    },
+                                },
+                                span: 24:18-24:23,
+                            },
+                        },
+                        span: 24:14-24:23,
+                    },
+                ),
+            },
+            span: 24:1-24:23,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`add2`),
+                    span: 25:5-25:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Lambda {
+                            params: [
+                                LambdaParam {
+                                    name: `a`,
+                                    type_ann: None,
+                                    span: 25:13-25:14,
+                                },
+                                LambdaParam {
+                                    name: `b`,
+                                    type_ann: None,
+                                    span: 25:16-25:17,
+                                },
+                            ],
+                            body: Expr {
+                                kind: BinaryOp {
+                                    left: Expr {
+                                        kind: Ident(`a`),
+                                        span: 25:19-25:20,
+                                    },
+                                    op: Add,
+                                    right: Expr {
+                                        kind: Ident(`b`),
+                                        span: 25:23-25:24,
+                                    },
+                                },
+                                span: 25:19-25:24,
+                            },
+                        },
+                        span: 25:12-25:24,
+                    },
+                ),
+            },
+            span: 25:1-25:24,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`typed`),
+                    span: 26:5-26:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Lambda {
+                            params: [
+                                LambdaParam {
+                                    name: `x`,
+                                    type_ann: Some(
+                                        TypeExpr {
+                                            kind: Named(`int`),
+                                            span: 26:17-26:20,
+                                        },
+                                    ),
+                                    span: 26:14-26:15,
+                                },
+                                LambdaParam {
+                                    name: `y`,
+                                    type_ann: None,
+                                    span: 26:22-26:23,
+                                },
+                            ],
+                            body: Expr {
+                                kind: BinaryOp {
+                                    left: Expr {
+                                        kind: Ident(`x`),
+                                        span: 26:25-26:26,
+                                    },
+                                    op: Add,
+                                    right: Expr {
+                                        kind: Ident(`y`),
+                                        span: 26:29-26:30,
+                                    },
+                                },
+                                span: 26:25-26:30,
+                            },
+                        },
+                        span: 26:13-26:30,
+                    },
+                ),
+            },
+            span: 26:1-26:30,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`total`),
+                    span: 27:5-27:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: MemberAccess {
+                                    object: Expr {
+                                        kind: Ident(`losses`),
+                                        span: 27:13-27:19,
+                                    },
+                                    member: `reduce`,
+                                },
+                                span: 27:13-27:26,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: Lambda {
+                                            params: [
+                                                LambdaParam {
+                                                    name: `acc`,
+                                                    type_ann: None,
+                                                    span: 27:28-27:31,
+                                                },
+                                                LambdaParam {
+                                                    name: `x`,
+                                                    type_ann: None,
+                                                    span: 27:33-27:34,
+                                                },
+                                            ],
+                                            body: Expr {
+                                                kind: BinaryOp {
+                                                    left: Expr {
+                                                        kind: Ident(`acc`),
+                                                        span: 27:36-27:39,
+                                                    },
+                                                    op: Add,
+                                                    right: Expr {
+                                                        kind: Ident(`x`),
+                                                        span: 27:42-27:43,
+                                                    },
+                                                },
+                                                span: 27:36-27:43,
+                                            },
+                                        },
+                                        span: 27:27-27:43,
+                                    },
+                                    span: 27:27-27:43,
+                                },
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: FloatLiteral(0.0),
+                                        span: 27:45-27:48,
+                                    },
+                                    span: 27:45-27:48,
+                                },
+                            ],
+                        },
+                        span: 27:13-27:49,
+                    },
+                ),
+            },
+            span: 27:1-27:49,
+        },
+    ],
+    span: 3:1-27:49,
+}

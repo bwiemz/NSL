@@ -1,0 +1,109 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/err_lexer.nsl
+---
+diagnostics: 6
+  lex error: unexpected character: '$'
+    --> 4:11-4:12 here
+  lex error: unterminated string literal
+    --> 5:9-5:22 string starts here
+  lex error: expected hex digits after '0x'
+    --> 6:9-6:11 here
+  parse error: expected newline or end of statement, found error: unexpected '$'
+    --> 4:11-4:12 here
+  parse error: expected expression, found error: unterminated string
+    --> 5:9-5:22 expected expression
+  parse error: expected expression, found error: invalid hex literal
+    --> 6:9-6:11 expected expression
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`a`),
+                    span: 3:5-3:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(1),
+                        span: 3:9-3:10,
+                    },
+                ),
+            },
+            span: 3:1-3:10,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`b`),
+                    span: 4:5-4:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Ident(`a`),
+                        span: 4:9-4:10,
+                    },
+                ),
+            },
+            span: 4:1-4:10,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`c`),
+                    span: 5:5-5:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Error,
+                        span: 5:9-5:22,
+                    },
+                ),
+            },
+            span: 5:1-5:22,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`d`),
+                    span: 6:5-6:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Error,
+                        span: 6:9-6:11,
+                    },
+                ),
+            },
+            span: 6:1-6:11,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`e`),
+                    span: 7:5-7:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(5),
+                        span: 7:9-7:10,
+                    },
+                ),
+            },
+            span: 7:1-7:10,
+        },
+    ],
+    span: 3:1-7:10,
+}

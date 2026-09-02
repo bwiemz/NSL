@@ -1,0 +1,17 @@
+# Variable declarations and every literal form the lexer produces.
+let x = 42
+let neg = -7
+let ratio = 3.14
+let small = 6e-4
+let big = 1_000_000
+let name = "NeuralScript"
+let single = 'quotes'
+let flag = true
+let nothing = none
+const MAX_SEQ: int = 2048
+let counter = 0
+counter = counter + 1
+counter += 2
+let (a, b, c) = (1, 2, 3)
+let items = [1, 2, 3]
+let greeting = f"hello {name}, x is {x + 1}"

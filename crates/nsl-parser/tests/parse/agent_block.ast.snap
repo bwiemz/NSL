@@ -1,0 +1,189 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/agent_block.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: AgentDef(
+                AgentDef {
+                    name: `Drafter`,
+                    type_params: [],
+                    params: [],
+                    members: [
+                        FieldDecl {
+                            name: `kv_cache`,
+                            type_ann: TypeExpr {
+                                kind: Named(`KvCache`),
+                                span: 3:15-3:22,
+                            },
+                            init: Some(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`empty`),
+                                            span: 3:25-3:30,
+                                        },
+                                        args: [],
+                                    },
+                                    span: 3:25-3:32,
+                                },
+                            ),
+                            decorators: [],
+                            span: 3:5-4:1,
+                        },
+                        FieldDecl {
+                            name: `steps`,
+                            type_ann: TypeExpr {
+                                kind: Named(`int`),
+                                span: 4:12-4:15,
+                            },
+                            init: Some(
+                                Expr {
+                                    kind: IntLiteral(0),
+                                    span: 4:18-4:19,
+                                },
+                            ),
+                            decorators: [],
+                            span: 4:5-5:1,
+                        },
+                        Method(
+                            FnDef {
+                                name: `draft`,
+                                type_params: [],
+                                effect_params: [],
+                                params: [
+                                    Param {
+                                        name: `self`,
+                                        type_ann: None,
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 6:14-6:18,
+                                    },
+                                    Param {
+                                        name: `p`,
+                                        type_ann: Some(
+                                            TypeExpr {
+                                                kind: Named(`Tensor`),
+                                                span: 6:23-6:29,
+                                            },
+                                        ),
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 6:20-6:29,
+                                    },
+                                ],
+                                return_type: Some(
+                                    TypeExpr {
+                                        kind: Named(`Tensor`),
+                                        span: 6:34-6:40,
+                                    },
+                                ),
+                                return_effect: None,
+                                body: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Assign {
+                                                target: Expr {
+                                                    kind: MemberAccess {
+                                                        object: Expr {
+                                                            kind: SelfRef,
+                                                            span: 7:9-7:13,
+                                                        },
+                                                        member: `steps`,
+                                                    },
+                                                    span: 7:9-7:19,
+                                                },
+                                                op: AddAssign,
+                                                value: Expr {
+                                                    kind: IntLiteral(1),
+                                                    span: 7:23-7:24,
+                                                },
+                                            },
+                                            span: 7:9-7:24,
+                                        },
+                                        Stmt {
+                                            kind: Return(
+                                                Some(
+                                                    Expr {
+                                                        kind: Ident(`p`),
+                                                        span: 8:16-8:17,
+                                                    },
+                                                ),
+                                            ),
+                                            span: 8:9-8:17,
+                                        },
+                                    ],
+                                    span: 7:9-10:5,
+                                },
+                                is_async: false,
+                                span: 6:5-10:5,
+                            },
+                            [],
+                        ),
+                        Method(
+                            FnDef {
+                                name: `verify`,
+                                type_params: [],
+                                effect_params: [],
+                                params: [
+                                    Param {
+                                        name: `self`,
+                                        type_ann: None,
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 10:21-10:25,
+                                    },
+                                    Param {
+                                        name: `p`,
+                                        type_ann: Some(
+                                            TypeExpr {
+                                                kind: Named(`Tensor`),
+                                                span: 10:30-10:36,
+                                            },
+                                        ),
+                                        default: None,
+                                        is_variadic: false,
+                                        span: 10:27-10:36,
+                                    },
+                                ],
+                                return_type: Some(
+                                    TypeExpr {
+                                        kind: Named(`bool`),
+                                        span: 10:41-10:45,
+                                    },
+                                ),
+                                return_effect: None,
+                                body: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Return(
+                                                Some(
+                                                    Expr {
+                                                        kind: BoolLiteral(true),
+                                                        span: 11:16-11:20,
+                                                    },
+                                                ),
+                                            ),
+                                            span: 11:9-11:20,
+                                        },
+                                    ],
+                                    span: 11:9-12:1,
+                                },
+                                is_async: true,
+                                span: 10:5-12:1,
+                            },
+                            [],
+                        ),
+                    ],
+                    span: 2:1-12:1,
+                },
+            ),
+            span: 2:1-12:1,
+        },
+    ],
+    span: 2:1-12:1,
+}

@@ -1,0 +1,16 @@
+# grad blocks (both spellings) and kernel definitions with decorators.
+let w = ones([3])
+let (loss, dw) = grad(w):
+    let out = (w * w).sum()
+    out
+
+grad(w):
+    let out = (w * 2.0).sum()
+
+@autotune(block_size=[64, 128, 256])
+kernel simple_scale(data: Tensor, scale: f32) -> Tensor:
+    let tid = thread_id()
+    data[tid] = data[tid] * scale
+
+kernel plain(a: Tensor):
+    a[0] = 1.0

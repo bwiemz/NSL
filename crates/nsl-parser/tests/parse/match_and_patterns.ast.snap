@@ -1,0 +1,773 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/match_and_patterns.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: Match {
+                subject: Expr {
+                    kind: Ident(`c`),
+                    span: 2:7-2:8,
+                },
+                arms: [
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Ident(`Red`),
+                            span: 3:10-3:13,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 4:9-4:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("red"),
+                                                            span: 4:15-4:20,
+                                                        },
+                                                        span: 4:15-4:20,
+                                                    },
+                                                ],
+                                            },
+                                            span: 4:9-4:21,
+                                        },
+                                    ),
+                                    span: 4:9-4:21,
+                                },
+                            ],
+                            span: 4:9-5:5,
+                        },
+                        span: 3:5-5:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Or(
+                                [
+                                    Pattern {
+                                        kind: Ident(`Green`),
+                                        span: 5:10-5:15,
+                                    },
+                                    Pattern {
+                                        kind: Ident(`Blue`),
+                                        span: 5:18-5:22,
+                                    },
+                                ],
+                            ),
+                            span: 5:10-5:22,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 6:9-6:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("not red"),
+                                                            span: 6:15-6:24,
+                                                        },
+                                                        span: 6:15-6:24,
+                                                    },
+                                                ],
+                                            },
+                                            span: 6:9-6:25,
+                                        },
+                                    ),
+                                    span: 6:9-6:25,
+                                },
+                            ],
+                            span: 6:9-7:5,
+                        },
+                        span: 5:5-7:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Ident(`_`),
+                            span: 7:10-7:11,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 8:9-8:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("other"),
+                                                            span: 8:15-8:22,
+                                                        },
+                                                        span: 8:15-8:22,
+                                                    },
+                                                ],
+                                            },
+                                            span: 8:9-8:23,
+                                        },
+                                    ),
+                                    span: 8:9-8:23,
+                                },
+                            ],
+                            span: 8:9-10:1,
+                        },
+                        span: 7:5-10:1,
+                    },
+                ],
+            },
+            span: 2:1-10:1,
+        },
+        Stmt {
+            kind: Match {
+                subject: Expr {
+                    kind: Ident(`score`),
+                    span: 10:7-10:12,
+                },
+                arms: [
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Literal(
+                                Expr {
+                                    kind: IntLiteral(100),
+                                    span: 11:10-11:13,
+                                },
+                            ),
+                            span: 11:10-11:13,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 12:9-12:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("perfect"),
+                                                            span: 12:15-12:24,
+                                                        },
+                                                        span: 12:15-12:24,
+                                                    },
+                                                ],
+                                            },
+                                            span: 12:9-12:25,
+                                        },
+                                    ),
+                                    span: 12:9-12:25,
+                                },
+                            ],
+                            span: 12:9-13:5,
+                        },
+                        span: 11:5-13:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Ident(`n`),
+                            span: 13:10-13:11,
+                        },
+                        guard: Some(
+                            Expr {
+                                kind: BinaryOp {
+                                    left: Expr {
+                                        kind: Ident(`n`),
+                                        span: 13:15-13:16,
+                                    },
+                                    op: Gt,
+                                    right: Expr {
+                                        kind: IntLiteral(50),
+                                        span: 13:19-13:21,
+                                    },
+                                },
+                                span: 13:15-13:21,
+                            },
+                        ),
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 14:9-14:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("pass"),
+                                                            span: 14:15-14:21,
+                                                        },
+                                                        span: 14:15-14:21,
+                                                    },
+                                                ],
+                                            },
+                                            span: 14:9-14:22,
+                                        },
+                                    ),
+                                    span: 14:9-14:22,
+                                },
+                            ],
+                            span: 14:9-15:5,
+                        },
+                        span: 13:5-15:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Literal(
+                                Expr {
+                                    kind: StringLiteral("text"),
+                                    span: 15:10-15:16,
+                                },
+                            ),
+                            span: 15:10-15:16,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 16:9-16:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("string"),
+                                                            span: 16:15-16:23,
+                                                        },
+                                                        span: 16:15-16:23,
+                                                    },
+                                                ],
+                                            },
+                                            span: 16:9-16:24,
+                                        },
+                                    ),
+                                    span: 16:9-16:24,
+                                },
+                            ],
+                            span: 16:9-17:5,
+                        },
+                        span: 15:5-17:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Tuple(
+                                [
+                                    Pattern {
+                                        kind: Ident(`a`),
+                                        span: 17:11-17:12,
+                                    },
+                                    Pattern {
+                                        kind: Ident(`b`),
+                                        span: 17:14-17:15,
+                                    },
+                                ],
+                            ),
+                            span: 17:10-17:16,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 18:9-18:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: BinaryOp {
+                                                                left: Expr {
+                                                                    kind: Ident(`a`),
+                                                                    span: 18:15-18:16,
+                                                                },
+                                                                op: Add,
+                                                                right: Expr {
+                                                                    kind: Ident(`b`),
+                                                                    span: 18:19-18:20,
+                                                                },
+                                                            },
+                                                            span: 18:15-18:20,
+                                                        },
+                                                        span: 18:15-18:20,
+                                                    },
+                                                ],
+                                            },
+                                            span: 18:9-18:21,
+                                        },
+                                    ),
+                                    span: 18:9-18:21,
+                                },
+                            ],
+                            span: 18:9-19:5,
+                        },
+                        span: 17:5-19:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Constructor {
+                                path: [
+                                    `Some`,
+                                ],
+                                args: [
+                                    Pattern {
+                                        kind: Ident(`x`),
+                                        span: 19:15-19:16,
+                                    },
+                                ],
+                            },
+                            span: 19:10-19:17,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 20:9-20:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: Ident(`x`),
+                                                            span: 20:15-20:16,
+                                                        },
+                                                        span: 20:15-20:16,
+                                                    },
+                                                ],
+                                            },
+                                            span: 20:9-20:17,
+                                        },
+                                    ),
+                                    span: 20:9-20:17,
+                                },
+                            ],
+                            span: 20:9-21:5,
+                        },
+                        span: 19:5-21:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: List(
+                                [
+                                    Pattern {
+                                        kind: Ident(`first`),
+                                        span: 21:11-21:16,
+                                    },
+                                    Pattern {
+                                        kind: Rest(Some(`rest`)),
+                                        span: 21:18-21:23,
+                                    },
+                                ],
+                            ),
+                            span: 21:10-21:24,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 22:9-22:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: Ident(`first`),
+                                                            span: 22:15-22:20,
+                                                        },
+                                                        span: 22:15-22:20,
+                                                    },
+                                                ],
+                                            },
+                                            span: 22:9-22:21,
+                                        },
+                                    ),
+                                    span: 22:9-22:21,
+                                },
+                            ],
+                            span: 22:9-23:5,
+                        },
+                        span: 21:5-23:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Struct {
+                                fields: [
+                                    FieldPattern {
+                                        name: `x`,
+                                        pattern: None,
+                                        span: 23:11-23:12,
+                                    },
+                                    FieldPattern {
+                                        name: `y`,
+                                        pattern: Some(
+                                            Pattern {
+                                                kind: Tuple(
+                                                    [
+                                                        Pattern {
+                                                            kind: Ident(`p`),
+                                                            span: 23:18-23:19,
+                                                        },
+                                                        Pattern {
+                                                            kind: Ident(`q`),
+                                                            span: 23:21-23:22,
+                                                        },
+                                                    ],
+                                                ),
+                                                span: 23:17-23:23,
+                                            },
+                                        ),
+                                        span: 23:14-23:23,
+                                    },
+                                ],
+                                rest: Some(`others`),
+                            },
+                            span: 23:10-23:34,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 24:9-24:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: BinaryOp {
+                                                                left: Expr {
+                                                                    kind: BinaryOp {
+                                                                        left: Expr {
+                                                                            kind: Ident(`x`),
+                                                                            span: 24:15-24:16,
+                                                                        },
+                                                                        op: Mul,
+                                                                        right: Expr {
+                                                                            kind: Ident(`p`),
+                                                                            span: 24:19-24:20,
+                                                                        },
+                                                                    },
+                                                                    span: 24:15-24:20,
+                                                                },
+                                                                op: Mul,
+                                                                right: Expr {
+                                                                    kind: Ident(`q`),
+                                                                    span: 24:23-24:24,
+                                                                },
+                                                            },
+                                                            span: 24:15-24:24,
+                                                        },
+                                                        span: 24:15-24:24,
+                                                    },
+                                                ],
+                                            },
+                                            span: 24:9-24:25,
+                                        },
+                                    ),
+                                    span: 24:9-24:25,
+                                },
+                            ],
+                            span: 24:9-25:5,
+                        },
+                        span: 23:5-25:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Constructor {
+                                path: [
+                                    `Shape`,
+                                    `Rect`,
+                                ],
+                                args: [
+                                    Pattern {
+                                        kind: Ident(`w`),
+                                        span: 25:21-25:22,
+                                    },
+                                    Pattern {
+                                        kind: Ident(`h`),
+                                        span: 25:24-25:25,
+                                    },
+                                ],
+                            },
+                            span: 25:10-25:26,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 26:9-26:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: BinaryOp {
+                                                                left: Expr {
+                                                                    kind: Ident(`w`),
+                                                                    span: 26:15-26:16,
+                                                                },
+                                                                op: Mul,
+                                                                right: Expr {
+                                                                    kind: Ident(`h`),
+                                                                    span: 26:19-26:20,
+                                                                },
+                                                            },
+                                                            span: 26:15-26:20,
+                                                        },
+                                                        span: 26:15-26:20,
+                                                    },
+                                                ],
+                                            },
+                                            span: 26:9-26:21,
+                                        },
+                                    ),
+                                    span: 26:9-26:21,
+                                },
+                            ],
+                            span: 26:9-27:5,
+                        },
+                        span: 25:5-27:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Literal(
+                                Expr {
+                                    kind: IntLiteral(-1),
+                                    span: 27:10-27:12,
+                                },
+                            ),
+                            span: 27:10-27:12,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 28:9-28:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("negative"),
+                                                            span: 28:15-28:25,
+                                                        },
+                                                        span: 28:15-28:25,
+                                                    },
+                                                ],
+                                            },
+                                            span: 28:9-28:26,
+                                        },
+                                    ),
+                                    span: 28:9-28:26,
+                                },
+                            ],
+                            span: 28:9-29:5,
+                        },
+                        span: 27:5-29:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Literal(
+                                Expr {
+                                    kind: NoneLiteral,
+                                    span: 29:10-29:14,
+                                },
+                            ),
+                            span: 29:10-29:14,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 30:9-30:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("none"),
+                                                            span: 30:15-30:21,
+                                                        },
+                                                        span: 30:15-30:21,
+                                                    },
+                                                ],
+                                            },
+                                            span: 30:9-30:22,
+                                        },
+                                    ),
+                                    span: 30:9-30:22,
+                                },
+                            ],
+                            span: 30:9-31:5,
+                        },
+                        span: 29:5-31:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Or(
+                                [
+                                    Pattern {
+                                        kind: Literal(
+                                            Expr {
+                                                kind: BoolLiteral(true),
+                                                span: 31:10-31:14,
+                                            },
+                                        ),
+                                        span: 31:10-31:14,
+                                    },
+                                    Pattern {
+                                        kind: Literal(
+                                            Expr {
+                                                kind: BoolLiteral(false),
+                                                span: 31:17-31:22,
+                                            },
+                                        ),
+                                        span: 31:17-31:22,
+                                    },
+                                ],
+                            ),
+                            span: 31:10-31:22,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 32:9-32:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("bool"),
+                                                            span: 32:15-32:21,
+                                                        },
+                                                        span: 32:15-32:21,
+                                                    },
+                                                ],
+                                            },
+                                            span: 32:9-32:22,
+                                        },
+                                    ),
+                                    span: 32:9-32:22,
+                                },
+                            ],
+                            span: 32:9-33:5,
+                        },
+                        span: 31:5-33:5,
+                    },
+                    MatchArm {
+                        pattern: Pattern {
+                            kind: Ident(`_`),
+                            span: 33:10-33:11,
+                        },
+                        guard: None,
+                        body: Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 34:9-34:14,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("else"),
+                                                            span: 34:15-34:21,
+                                                        },
+                                                        span: 34:15-34:21,
+                                                    },
+                                                ],
+                                            },
+                                            span: 34:9-34:22,
+                                        },
+                                    ),
+                                    span: 34:9-34:22,
+                                },
+                            ],
+                            span: 34:9-35:1,
+                        },
+                        span: 33:5-35:1,
+                    },
+                ],
+            },
+            span: 10:1-35:1,
+        },
+    ],
+    span: 2:1-35:1,
+}

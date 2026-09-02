@@ -1,0 +1,649 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/calls_and_access.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`r`),
+                    span: 2:5-2:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`f`),
+                                span: 2:9-2:10,
+                            },
+                            args: [],
+                        },
+                        span: 2:9-2:12,
+                    },
+                ),
+            },
+            span: 2:1-2:12,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`s`),
+                    span: 3:5-3:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`f`),
+                                span: 3:9-3:10,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: IntLiteral(1),
+                                        span: 3:11-3:12,
+                                    },
+                                    span: 3:11-3:12,
+                                },
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: IntLiteral(2),
+                                        span: 3:14-3:15,
+                                    },
+                                    span: 3:14-3:15,
+                                },
+                            ],
+                        },
+                        span: 3:9-3:16,
+                    },
+                ),
+            },
+            span: 3:1-3:16,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`t`),
+                    span: 4:5-4:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`f`),
+                                span: 4:9-4:10,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: Ident(`x`),
+                                        span: 4:11-4:12,
+                                    },
+                                    span: 4:11-4:12,
+                                },
+                                Arg {
+                                    name: Some(`dim`),
+                                    value: Expr {
+                                        kind: UnaryOp {
+                                            op: Neg,
+                                            operand: Expr {
+                                                kind: IntLiteral(1),
+                                                span: 4:19-4:20,
+                                            },
+                                        },
+                                        span: 4:18-4:20,
+                                    },
+                                    span: 4:14-4:20,
+                                },
+                                Arg {
+                                    name: Some(`keepdim`),
+                                    value: Expr {
+                                        kind: BoolLiteral(true),
+                                        span: 4:30-4:34,
+                                    },
+                                    span: 4:22-4:34,
+                                },
+                            ],
+                        },
+                        span: 4:9-4:35,
+                    },
+                ),
+            },
+            span: 4:1-4:35,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`u`),
+                    span: 5:5-5:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: MemberAccess {
+                                    object: Expr {
+                                        kind: Call {
+                                            callee: Expr {
+                                                kind: MemberAccess {
+                                                    object: Expr {
+                                                        kind: Ident(`obj`),
+                                                        span: 5:9-5:12,
+                                                    },
+                                                    member: `method`,
+                                                },
+                                                span: 5:9-5:19,
+                                            },
+                                            args: [
+                                                Arg {
+                                                    name: None,
+                                                    value: Expr {
+                                                        kind: IntLiteral(1),
+                                                        span: 5:20-5:21,
+                                                    },
+                                                    span: 5:20-5:21,
+                                                },
+                                            ],
+                                        },
+                                        span: 5:9-5:22,
+                                    },
+                                    member: `other`,
+                                },
+                                span: 5:9-5:28,
+                            },
+                            args: [],
+                        },
+                        span: 5:9-5:30,
+                    },
+                ),
+            },
+            span: 5:1-5:30,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`first`),
+                    span: 6:5-6:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Subscript {
+                            object: Expr {
+                                kind: Ident(`xs`),
+                                span: 6:13-6:15,
+                            },
+                            index: Index(
+                                Expr {
+                                    kind: IntLiteral(0),
+                                    span: 6:16-6:17,
+                                },
+                            ),
+                        },
+                        span: 6:13-6:18,
+                    },
+                ),
+            },
+            span: 6:1-6:18,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`last`),
+                    span: 7:5-7:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Subscript {
+                            object: Expr {
+                                kind: Ident(`xs`),
+                                span: 7:12-7:14,
+                            },
+                            index: Index(
+                                Expr {
+                                    kind: UnaryOp {
+                                        op: Neg,
+                                        operand: Expr {
+                                            kind: IntLiteral(1),
+                                            span: 7:16-7:17,
+                                        },
+                                    },
+                                    span: 7:15-7:17,
+                                },
+                            ),
+                        },
+                        span: 7:12-7:18,
+                    },
+                ),
+            },
+            span: 7:1-7:18,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`mid`),
+                    span: 8:5-8:8,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Subscript {
+                            object: Expr {
+                                kind: Ident(`xs`),
+                                span: 8:11-8:13,
+                            },
+                            index: Slice {
+                                lower: Some(
+                                    Expr {
+                                        kind: IntLiteral(1),
+                                        span: 8:14-8:15,
+                                    },
+                                ),
+                                upper: Some(
+                                    Expr {
+                                        kind: IntLiteral(4),
+                                        span: 8:16-8:17,
+                                    },
+                                ),
+                                step: None,
+                            },
+                        },
+                        span: 8:11-8:18,
+                    },
+                ),
+            },
+            span: 8:1-8:18,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`head`),
+                    span: 9:5-9:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Subscript {
+                            object: Expr {
+                                kind: Ident(`xs`),
+                                span: 9:12-9:14,
+                            },
+                            index: Slice {
+                                lower: None,
+                                upper: Some(
+                                    Expr {
+                                        kind: IntLiteral(2),
+                                        span: 9:16-9:17,
+                                    },
+                                ),
+                                step: None,
+                            },
+                        },
+                        span: 9:12-9:18,
+                    },
+                ),
+            },
+            span: 9:1-9:18,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`tail`),
+                    span: 10:5-10:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Subscript {
+                            object: Expr {
+                                kind: Ident(`xs`),
+                                span: 10:12-10:14,
+                            },
+                            index: Slice {
+                                lower: Some(
+                                    Expr {
+                                        kind: IntLiteral(2),
+                                        span: 10:15-10:16,
+                                    },
+                                ),
+                                upper: None,
+                                step: None,
+                            },
+                        },
+                        span: 10:12-10:18,
+                    },
+                ),
+            },
+            span: 10:1-10:18,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`grid`),
+                    span: 11:5-11:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Subscript {
+                            object: Expr {
+                                kind: Ident(`m`),
+                                span: 11:12-11:13,
+                            },
+                            index: MultiDim(
+                                [
+                                    Index(
+                                        Expr {
+                                            kind: IntLiteral(0),
+                                            span: 11:14-11:15,
+                                        },
+                                    ),
+                                    Index(
+                                        Expr {
+                                            kind: IntLiteral(1),
+                                            span: 11:17-11:18,
+                                        },
+                                    ),
+                                ],
+                            ),
+                        },
+                        span: 11:12-11:19,
+                    },
+                ),
+            },
+            span: 11:1-11:19,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`squares`),
+                    span: 12:5-12:12,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: ListComp {
+                            element: Expr {
+                                kind: BinaryOp {
+                                    left: Expr {
+                                        kind: Ident(`x`),
+                                        span: 12:16-12:17,
+                                    },
+                                    op: Pow,
+                                    right: Expr {
+                                        kind: IntLiteral(2),
+                                        span: 12:21-12:22,
+                                    },
+                                },
+                                span: 12:16-12:22,
+                            },
+                            generators: [
+                                CompGenerator {
+                                    pattern: Pattern {
+                                        kind: Ident(`x`),
+                                        span: 12:27-12:28,
+                                    },
+                                    iterable: Expr {
+                                        kind: Call {
+                                            callee: Expr {
+                                                kind: Ident(`range`),
+                                                span: 12:32-12:37,
+                                            },
+                                            args: [
+                                                Arg {
+                                                    name: None,
+                                                    value: Expr {
+                                                        kind: IntLiteral(6),
+                                                        span: 12:38-12:39,
+                                                    },
+                                                    span: 12:38-12:39,
+                                                },
+                                            ],
+                                        },
+                                        span: 12:32-12:40,
+                                    },
+                                    conditions: [],
+                                },
+                            ],
+                        },
+                        span: 12:15-12:41,
+                    },
+                ),
+            },
+            span: 12:1-12:41,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`pairs`),
+                    span: 13:5-13:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: ListComp {
+                            element: Expr {
+                                kind: BinaryOp {
+                                    left: Expr {
+                                        kind: Ident(`x`),
+                                        span: 13:14-13:15,
+                                    },
+                                    op: Add,
+                                    right: Expr {
+                                        kind: Ident(`y`),
+                                        span: 13:18-13:19,
+                                    },
+                                },
+                                span: 13:14-13:19,
+                            },
+                            generators: [
+                                CompGenerator {
+                                    pattern: Pattern {
+                                        kind: Ident(`x`),
+                                        span: 13:24-13:25,
+                                    },
+                                    iterable: Expr {
+                                        kind: Ident(`a`),
+                                        span: 13:29-13:30,
+                                    },
+                                    conditions: [],
+                                },
+                                CompGenerator {
+                                    pattern: Pattern {
+                                        kind: Ident(`y`),
+                                        span: 13:35-13:36,
+                                    },
+                                    iterable: Expr {
+                                        kind: Ident(`b`),
+                                        span: 13:40-13:41,
+                                    },
+                                    conditions: [
+                                        Expr {
+                                            kind: BinaryOp {
+                                                left: Expr {
+                                                    kind: Ident(`x`),
+                                                    span: 13:45-13:46,
+                                                },
+                                                op: NotEq,
+                                                right: Expr {
+                                                    kind: Ident(`y`),
+                                                    span: 13:50-13:51,
+                                                },
+                                            },
+                                            span: 13:45-13:51,
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                        span: 13:13-13:52,
+                    },
+                ),
+            },
+            span: 13:1-13:52,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`table`),
+                    span: 14:5-14:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: DictLiteral(
+                            [
+                                (
+                                    Expr {
+                                        kind: StringLiteral("lr"),
+                                        span: 14:14-14:18,
+                                    },
+                                    Expr {
+                                        kind: FloatLiteral(0.0003),
+                                        span: 14:20-14:24,
+                                    },
+                                ),
+                                (
+                                    Expr {
+                                        kind: StringLiteral("epochs"),
+                                        span: 14:26-14:34,
+                                    },
+                                    Expr {
+                                        kind: IntLiteral(10),
+                                        span: 14:36-14:38,
+                                    },
+                                ),
+                            ],
+                        ),
+                        span: 14:13-14:39,
+                    },
+                ),
+            },
+            span: 14:1-14:39,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`empty_dict`),
+                    span: 15:5-15:15,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: DictLiteral([]),
+                        span: 15:18-15:20,
+                    },
+                ),
+            },
+            span: 15:1-15:20,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`empty_list`),
+                    span: 16:5-16:15,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: ListLiteral([]),
+                        span: 16:18-16:20,
+                    },
+                ),
+            },
+            span: 16:1-16:20,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`one`),
+                    span: 17:5-17:8,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: TupleLiteral(
+                            [
+                                Expr {
+                                    kind: IntLiteral(1),
+                                    span: 17:12-17:13,
+                                },
+                            ],
+                        ),
+                        span: 17:11-17:15,
+                    },
+                ),
+            },
+            span: 17:1-17:15,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`unit`),
+                    span: 18:5-18:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: TupleLiteral([]),
+                        span: 18:12-18:14,
+                    },
+                ),
+            },
+            span: 18:1-18:14,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`this`),
+                    span: 19:5-19:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: MemberAccess {
+                            object: Expr {
+                                kind: SelfRef,
+                                span: 19:12-19:16,
+                            },
+                            member: `weight`,
+                        },
+                        span: 19:12-19:23,
+                    },
+                ),
+            },
+            span: 19:1-19:23,
+        },
+    ],
+    span: 2:1-19:23,
+}

@@ -1,0 +1,144 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/err_indentation.nsl
+---
+diagnostics: 2
+  lex error: dedent does not match any outer indentation level (got 4, stack: [0])
+    --> 8:5-8:5 invalid indentation
+  parse error: expected INDENT, found return
+    --> 4:1-4:7 expected INDENT
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `f`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `x`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 3:9-3:12,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 3:6-3:12,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`int`),
+                            span: 3:17-3:20,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Expr(
+                                    Expr {
+                                        kind: Ident(`x`),
+                                        span: 4:8-4:9,
+                                    },
+                                ),
+                                span: 4:8-4:9,
+                            },
+                            Stmt {
+                                kind: If {
+                                    condition: Expr {
+                                        kind: BoolLiteral(true),
+                                        span: 6:4-6:8,
+                                    },
+                                    then_block: Block {
+                                        stmts: [
+                                            Stmt {
+                                                kind: Expr(
+                                                    Expr {
+                                                        kind: Call {
+                                                            callee: Expr {
+                                                                kind: Ident(`print`),
+                                                                span: 7:9-7:14,
+                                                            },
+                                                            args: [
+                                                                Arg {
+                                                                    name: None,
+                                                                    value: Expr {
+                                                                        kind: StringLiteral("deep"),
+                                                                        span: 7:15-7:21,
+                                                                    },
+                                                                    span: 7:15-7:21,
+                                                                },
+                                                            ],
+                                                        },
+                                                        span: 7:9-7:22,
+                                                    },
+                                                ),
+                                                span: 7:9-7:22,
+                                            },
+                                            Stmt {
+                                                kind: Expr(
+                                                    Expr {
+                                                        kind: Call {
+                                                            callee: Expr {
+                                                                kind: Ident(`print`),
+                                                                span: 8:5-8:10,
+                                                            },
+                                                            args: [
+                                                                Arg {
+                                                                    name: None,
+                                                                    value: Expr {
+                                                                        kind: StringLiteral("shallow"),
+                                                                        span: 8:11-8:20,
+                                                                    },
+                                                                    span: 8:11-8:20,
+                                                                },
+                                                            ],
+                                                        },
+                                                        span: 8:5-8:21,
+                                                    },
+                                                ),
+                                                span: 8:5-8:21,
+                                            },
+                                            Stmt {
+                                                kind: VarDecl {
+                                                    is_const: false,
+                                                    pattern: Pattern {
+                                                        kind: Ident(`ok`),
+                                                        span: 9:5-9:7,
+                                                    },
+                                                    type_ann: None,
+                                                    value: Some(
+                                                        Expr {
+                                                            kind: IntLiteral(1),
+                                                            span: 9:10-9:11,
+                                                        },
+                                                    ),
+                                                },
+                                                span: 9:1-9:11,
+                                            },
+                                        ],
+                                        span: 7:9-10:1,
+                                    },
+                                    elif_clauses: [],
+                                    else_block: None,
+                                },
+                                span: 6:1-10:1,
+                            },
+                        ],
+                        span: 4:1-10:1,
+                    },
+                    is_async: false,
+                    span: 3:1-10:1,
+                },
+            ),
+            span: 3:1-10:1,
+        },
+    ],
+    span: 3:1-10:1,
+}

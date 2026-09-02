@@ -1,0 +1,12 @@
+let a = 1
+	let tab = 2
+let b = a ! 2
+let c = $
+let d = "open
+let e = 0x
+let f = 0b
+let g = 0o
+fn h():
+        let deep = 1
+    let shallow = 2
+let z = 3

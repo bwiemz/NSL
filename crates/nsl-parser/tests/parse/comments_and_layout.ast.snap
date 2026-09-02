@@ -1,0 +1,190 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/comments_and_layout.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `documented`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `x`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 5:18-5:21,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 5:15-5:21,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`int`),
+                            span: 5:26-5:29,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: Ident(`x`),
+                                            span: 7:12-7:13,
+                                        },
+                                    ),
+                                ),
+                                span: 7:5-7:13,
+                            },
+                        ],
+                        span: 7:5-10:1,
+                    },
+                    is_async: false,
+                    span: 5:1-10:1,
+                },
+            ),
+            span: 5:1-10:1,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`after_blank_lines`),
+                    span: 10:5-10:22,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(1),
+                        span: 10:25-10:26,
+                    },
+                ),
+            },
+            span: 10:1-10:26,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`multi_line_call`),
+                    span: 11:5-11:20,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Call {
+                            callee: Expr {
+                                kind: Ident(`f`),
+                                span: 11:23-11:24,
+                            },
+                            args: [
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: IntLiteral(1),
+                                        span: 12:5-12:6,
+                                    },
+                                    span: 12:5-12:6,
+                                },
+                                Arg {
+                                    name: None,
+                                    value: Expr {
+                                        kind: IntLiteral(2),
+                                        span: 13:5-13:6,
+                                    },
+                                    span: 13:5-13:6,
+                                },
+                            ],
+                        },
+                        span: 11:23-14:2,
+                    },
+                ),
+            },
+            span: 11:1-14:2,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`multi_line_list`),
+                    span: 15:5-15:20,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: ListLiteral(
+                            [
+                                Expr {
+                                    kind: IntLiteral(1),
+                                    span: 16:5-16:6,
+                                },
+                                Expr {
+                                    kind: IntLiteral(2),
+                                    span: 17:5-17:6,
+                                },
+                            ],
+                        ),
+                        span: 15:23-18:2,
+                    },
+                ),
+            },
+            span: 15:1-18:2,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`continued`),
+                    span: 19:5-19:14,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: BinaryOp {
+                            left: Expr {
+                                kind: IntLiteral(1),
+                                span: 19:17-19:18,
+                            },
+                            op: Add,
+                            right: Expr {
+                                kind: IntLiteral(2),
+                                span: 20:5-20:6,
+                            },
+                        },
+                        span: 19:17-20:6,
+                    },
+                ),
+            },
+            span: 19:1-20:6,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`s`),
+                    span: 21:5-21:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: StringLiteral("triple\nquoted"),
+                        span: 21:9-22:10,
+                    },
+                ),
+            },
+            span: 21:1-22:10,
+        },
+    ],
+    span: 5:1-22:10,
+}

@@ -1,0 +1,167 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/err_three_independent.nsl
+---
+diagnostics: 4
+  parse error: expected newline or end of statement, found identifier
+    --> 6:11-6:12 here
+  parse error: expected :, found newline
+    --> 8:9-9:1 expected :
+  parse error: expected pattern, found Mut
+    --> 11:5-11:8 expected pattern
+  parse error: expected newline or end of statement, found identifier
+    --> 11:9-11:10 here
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`a`),
+                    span: 5:5-5:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(1),
+                        span: 5:9-5:10,
+                    },
+                ),
+            },
+            span: 5:1-5:10,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`b`),
+                    span: 6:5-6:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: Ident(`a`),
+                        span: 6:9-6:10,
+                    },
+                ),
+            },
+            span: 6:1-6:10,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`c`),
+                    span: 7:5-7:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(3),
+                        span: 7:9-7:10,
+                    },
+                ),
+            },
+            span: 7:1-7:10,
+        },
+        Stmt {
+            kind: If {
+                condition: Expr {
+                    kind: BinaryOp {
+                        left: Expr {
+                            kind: Ident(`c`),
+                            span: 8:4-8:5,
+                        },
+                        op: Gt,
+                        right: Expr {
+                            kind: IntLiteral(0),
+                            span: 8:8-8:9,
+                        },
+                    },
+                    span: 8:4-8:9,
+                },
+                then_block: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`print`),
+                                            span: 9:5-9:10,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: Ident(`c`),
+                                                    span: 9:11-9:12,
+                                                },
+                                                span: 9:11-9:12,
+                                            },
+                                        ],
+                                    },
+                                    span: 9:5-9:13,
+                                },
+                            ),
+                            span: 9:5-9:13,
+                        },
+                    ],
+                    span: 9:5-10:1,
+                },
+                elif_clauses: [],
+                else_block: None,
+            },
+            span: 8:1-10:1,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`d`),
+                    span: 10:5-10:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(4),
+                        span: 10:9-10:10,
+                    },
+                ),
+            },
+            span: 10:1-10:10,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Wildcard,
+                    span: 11:5-11:8,
+                },
+                type_ann: None,
+                value: None,
+            },
+            span: 11:1-11:8,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`f`),
+                    span: 12:5-12:6,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(6),
+                        span: 12:9-12:10,
+                    },
+                ),
+            },
+            span: 12:1-12:10,
+        },
+    ],
+    span: 5:1-12:10,
+}

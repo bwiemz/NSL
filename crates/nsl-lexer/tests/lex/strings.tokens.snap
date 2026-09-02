@@ -1,0 +1,105 @@
+---
+source: crates/nsl-lexer/tests/goldens.rs
+input_file: crates/nsl-lexer/tests/lex/strings.nsl
+---
+diagnostics: none
+
+tokens:
+1:1-1:4      Let
+1:5-1:6      Ident(a)
+1:7-1:8      Eq
+1:9-1:17     StringLiteral("double")
+1:17-2:1     Newline
+2:1-2:4      Let
+2:5-2:6      Ident(b)
+2:7-2:8      Eq
+2:9-2:17     StringLiteral("single")
+2:17-3:1     Newline
+3:1-3:4      Let
+3:5-3:6      Ident(c)
+3:7-3:8      Eq
+3:9-3:33     StringLiteral("esc \"q\" \n \t \\ end")
+3:33-4:1     Newline
+4:1-4:4      Let
+4:5-4:6      Ident(d)
+4:7-4:8      Eq
+4:9-4:11     StringLiteral("")
+4:11-5:1     Newline
+5:1-5:4      Let
+5:5-5:6      Ident(e)
+5:7-5:8      Eq
+5:9-7:12     StringLiteral("multi\nline\n  string")
+7:12-8:1     Newline
+8:1-8:4      Let
+8:5-8:6      Ident(f)
+8:7-8:8      Eq
+8:9-8:11     FStringStart
+8:11-8:15    FStringText("x = ")
+8:15-8:16    FStringExprStart
+8:16-8:17    Ident(x)
+8:17-8:18    FStringExprEnd
+8:18-8:19    FStringEnd
+8:19-9:1     Newline
+9:1-9:4      Let
+9:5-9:6      Ident(g)
+9:7-9:8      Eq
+9:9-9:11     FStringStart
+9:11-9:12    FStringExprStart
+9:12-9:13    Ident(a)
+9:14-9:15    Plus
+9:16-9:17    Ident(b)
+9:17-9:18    FStringExprEnd
+9:18-9:23    FStringText(" and ")
+9:23-9:24    FStringExprStart
+9:24-9:25    Ident(c)
+9:25-9:26    FStringExprEnd
+9:26-9:28    FStringText("!")
+9:26-9:28    FStringEnd
+9:28-10:1    Newline
+10:1-10:4    Let
+10:5-10:6    Ident(h)
+10:7-10:8    Eq
+10:9-10:11   FStringStart
+10:11-10:30  FStringText("braces {literal} ")
+10:30-10:31  FStringExprStart
+10:31-10:32  Ident(n)
+10:32-10:33  FStringExprEnd
+10:33-10:34  FStringEnd
+10:34-11:1   Newline
+11:1-11:4    Let
+11:5-11:6    Ident(i)
+11:7-11:8    Eq
+11:9-11:11   FStringStart
+11:11-11:12  FStringExprStart
+11:12-11:17  Ident(outer)
+11:17-11:18  LeftParen
+11:18-11:20  FStringStart
+11:20-11:21  FStringExprStart
+11:21-11:26  Ident(inner)
+11:26-11:27  FStringExprEnd
+11:27-11:28  FStringEnd
+11:28-11:29  RightParen
+11:29-11:30  FStringExprEnd
+11:30-11:31  FStringEnd
+11:31-12:1   Newline
+12:1-12:4    Let
+12:5-12:6    Ident(j)
+12:7-12:8    Eq
+12:9-12:13   FStringStart
+12:13-12:17  FStringText("tri ")
+12:17-12:18  FStringExprStart
+12:18-12:19  Ident(v)
+12:19-12:20  FStringExprEnd
+12:20-13:7   FStringText("\nple")
+12:20-13:7   FStringEnd
+13:7-14:1    Newline
+14:1-14:17   DocComment("a doc comment")
+14:17-15:1   Newline
+15:1-15:30   DocComment("  with leading spaces kept")
+15:30-16:1   Newline
+16:1-16:4    Let
+16:5-16:6    Ident(k)
+16:7-16:8    Eq
+16:9-16:40   StringLiteral("after ## is not a doc comment")
+16:40-17:1   Newline
+17:1-17:1    Eof

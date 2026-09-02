@@ -1,0 +1,592 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/control_flow.nsl
+---
+diagnostics: none
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: If {
+                condition: Expr {
+                    kind: BinaryOp {
+                        left: Expr {
+                            kind: Ident(`batch_size`),
+                            span: 2:4-2:14,
+                        },
+                        op: Gt,
+                        right: Expr {
+                            kind: IntLiteral(64),
+                            span: 2:17-2:19,
+                        },
+                    },
+                    span: 2:4-2:19,
+                },
+                then_block: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`print`),
+                                            span: 3:5-3:10,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: StringLiteral("large"),
+                                                    span: 3:11-3:18,
+                                                },
+                                                span: 3:11-3:18,
+                                            },
+                                        ],
+                                    },
+                                    span: 3:5-3:19,
+                                },
+                            ),
+                            span: 3:5-3:19,
+                        },
+                    ],
+                    span: 3:5-4:1,
+                },
+                elif_clauses: [
+                    (
+                        Expr {
+                            kind: BinaryOp {
+                                left: Expr {
+                                    kind: Ident(`batch_size`),
+                                    span: 4:6-4:16,
+                                },
+                                op: Gt,
+                                right: Expr {
+                                    kind: IntLiteral(16),
+                                    span: 4:19-4:21,
+                                },
+                            },
+                            span: 4:6-4:21,
+                        },
+                        Block {
+                            stmts: [
+                                Stmt {
+                                    kind: Expr(
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Ident(`print`),
+                                                    span: 5:5-5:10,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        name: None,
+                                                        value: Expr {
+                                                            kind: StringLiteral("medium"),
+                                                            span: 5:11-5:19,
+                                                        },
+                                                        span: 5:11-5:19,
+                                                    },
+                                                ],
+                                            },
+                                            span: 5:5-5:20,
+                                        },
+                                    ),
+                                    span: 5:5-5:20,
+                                },
+                            ],
+                            span: 5:5-6:1,
+                        },
+                    ),
+                ],
+                else_block: Some(
+                    Block {
+                        stmts: [
+                            Stmt {
+                                kind: Expr(
+                                    Expr {
+                                        kind: Call {
+                                            callee: Expr {
+                                                kind: Ident(`print`),
+                                                span: 7:5-7:10,
+                                            },
+                                            args: [
+                                                Arg {
+                                                    name: None,
+                                                    value: Expr {
+                                                        kind: StringLiteral("small"),
+                                                        span: 7:11-7:18,
+                                                    },
+                                                    span: 7:11-7:18,
+                                                },
+                                            ],
+                                        },
+                                        span: 7:5-7:19,
+                                    },
+                                ),
+                                span: 7:5-7:19,
+                            },
+                        ],
+                        span: 7:5-9:1,
+                    },
+                ),
+            },
+            span: 2:1-9:1,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`loss`),
+                    span: 9:5-9:9,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: FloatLiteral(1.0),
+                        span: 9:12-9:15,
+                    },
+                ),
+            },
+            span: 9:1-9:15,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`epoch`),
+                    span: 10:5-10:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(0),
+                        span: 10:13-10:14,
+                    },
+                ),
+            },
+            span: 10:1-10:14,
+        },
+        Stmt {
+            kind: While {
+                condition: Expr {
+                    kind: BinaryOp {
+                        left: Expr {
+                            kind: Ident(`loss`),
+                            span: 11:7-11:11,
+                        },
+                        op: Gt,
+                        right: Expr {
+                            kind: FloatLiteral(0.01),
+                            span: 11:14-11:18,
+                        },
+                    },
+                    span: 11:7-11:18,
+                },
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Assign {
+                                target: Expr {
+                                    kind: Ident(`loss`),
+                                    span: 12:5-12:9,
+                                },
+                                op: Assign,
+                                value: Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`step`),
+                                            span: 12:12-12:16,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: Ident(`epoch`),
+                                                    span: 12:17-12:22,
+                                                },
+                                                span: 12:17-12:22,
+                                            },
+                                        ],
+                                    },
+                                    span: 12:12-12:23,
+                                },
+                            },
+                            span: 12:5-12:23,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                target: Expr {
+                                    kind: Ident(`epoch`),
+                                    span: 13:5-13:10,
+                                },
+                                op: AddAssign,
+                                value: Expr {
+                                    kind: IntLiteral(1),
+                                    span: 13:14-13:15,
+                                },
+                            },
+                            span: 13:5-13:15,
+                        },
+                        Stmt {
+                            kind: If {
+                                condition: Expr {
+                                    kind: BinaryOp {
+                                        left: Expr {
+                                            kind: Ident(`epoch`),
+                                            span: 14:8-14:13,
+                                        },
+                                        op: Gt,
+                                        right: Expr {
+                                            kind: IntLiteral(1000),
+                                            span: 14:16-14:20,
+                                        },
+                                    },
+                                    span: 14:8-14:20,
+                                },
+                                then_block: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Break,
+                                            span: 15:9-15:14,
+                                        },
+                                    ],
+                                    span: 15:9-16:5,
+                                },
+                                elif_clauses: [],
+                                else_block: None,
+                            },
+                            span: 14:5-16:5,
+                        },
+                        Stmt {
+                            kind: If {
+                                condition: Expr {
+                                    kind: BinaryOp {
+                                        left: Expr {
+                                            kind: BinaryOp {
+                                                left: Expr {
+                                                    kind: Ident(`epoch`),
+                                                    span: 16:8-16:13,
+                                                },
+                                                op: Mod,
+                                                right: Expr {
+                                                    kind: IntLiteral(2),
+                                                    span: 16:16-16:17,
+                                                },
+                                            },
+                                            span: 16:8-16:17,
+                                        },
+                                        op: Eq,
+                                        right: Expr {
+                                            kind: IntLiteral(0),
+                                            span: 16:21-16:22,
+                                        },
+                                    },
+                                    span: 16:8-16:22,
+                                },
+                                then_block: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Continue,
+                                            span: 17:9-17:17,
+                                        },
+                                    ],
+                                    span: 17:9-19:1,
+                                },
+                                elif_clauses: [],
+                                else_block: None,
+                            },
+                            span: 16:5-19:1,
+                        },
+                    ],
+                    span: 12:5-19:1,
+                },
+            },
+            span: 11:1-19:1,
+        },
+        Stmt {
+            kind: For {
+                pattern: Pattern {
+                    kind: Ident(`i`),
+                    span: 19:5-19:6,
+                },
+                iterable: Expr {
+                    kind: Range {
+                        start: Some(
+                            Expr {
+                                kind: IntLiteral(0),
+                                span: 19:10-19:11,
+                            },
+                        ),
+                        end: Some(
+                            Expr {
+                                kind: IntLiteral(10),
+                                span: 19:13-19:15,
+                            },
+                        ),
+                        inclusive: false,
+                    },
+                    span: 19:10-19:15,
+                },
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`print`),
+                                            span: 20:5-20:10,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: Ident(`i`),
+                                                    span: 20:11-20:12,
+                                                },
+                                                span: 20:11-20:12,
+                                            },
+                                        ],
+                                    },
+                                    span: 20:5-20:13,
+                                },
+                            ),
+                            span: 20:5-20:13,
+                        },
+                    ],
+                    span: 20:5-22:1,
+                },
+            },
+            span: 19:1-22:1,
+        },
+        Stmt {
+            kind: For {
+                pattern: Pattern {
+                    kind: Tuple(
+                        [
+                            Pattern {
+                                kind: Ident(`idx`),
+                                span: 22:6-22:9,
+                            },
+                            Pattern {
+                                kind: Ident(`name`),
+                                span: 22:11-22:15,
+                            },
+                        ],
+                    ),
+                    span: 22:5-22:16,
+                },
+                iterable: Expr {
+                    kind: Call {
+                        callee: Expr {
+                            kind: MemberAccess {
+                                object: Expr {
+                                    kind: Ident(`names`),
+                                    span: 22:20-22:25,
+                                },
+                                member: `enumerate`,
+                            },
+                            span: 22:20-22:35,
+                        },
+                        args: [],
+                    },
+                    span: 22:20-22:37,
+                },
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Ident(`print`),
+                                            span: 23:5-23:10,
+                                        },
+                                        args: [
+                                            Arg {
+                                                name: None,
+                                                value: Expr {
+                                                    kind: FString(
+                                                        [
+                                                            Expr(
+                                                                Expr {
+                                                                    kind: Ident(`idx`),
+                                                                    span: 23:14-23:17,
+                                                                },
+                                                            ),
+                                                            Text(": "),
+                                                            Expr(
+                                                                Expr {
+                                                                    kind: Ident(`name`),
+                                                                    span: 23:21-23:25,
+                                                                },
+                                                            ),
+                                                        ],
+                                                    ),
+                                                    span: 23:11-23:27,
+                                                },
+                                                span: 23:11-23:27,
+                                            },
+                                        ],
+                                    },
+                                    span: 23:5-23:28,
+                                },
+                            ),
+                            span: 23:5-23:28,
+                        },
+                    ],
+                    span: 23:5-25:1,
+                },
+            },
+            span: 22:1-25:1,
+        },
+        Stmt {
+            kind: FnDef(
+                FnDef {
+                    name: `early`,
+                    type_params: [],
+                    effect_params: [],
+                    params: [
+                        Param {
+                            name: `x`,
+                            type_ann: Some(
+                                TypeExpr {
+                                    kind: Named(`int`),
+                                    span: 25:13-25:16,
+                                },
+                            ),
+                            default: None,
+                            is_variadic: false,
+                            span: 25:10-25:16,
+                        },
+                    ],
+                    return_type: Some(
+                        TypeExpr {
+                            kind: Named(`int`),
+                            span: 25:21-25:24,
+                        },
+                    ),
+                    return_effect: None,
+                    body: Block {
+                        stmts: [
+                            Stmt {
+                                kind: If {
+                                    condition: Expr {
+                                        kind: BinaryOp {
+                                            left: Expr {
+                                                kind: Ident(`x`),
+                                                span: 26:8-26:9,
+                                            },
+                                            op: Lt,
+                                            right: Expr {
+                                                kind: IntLiteral(0),
+                                                span: 26:12-26:13,
+                                            },
+                                        },
+                                        span: 26:8-26:13,
+                                    },
+                                    then_block: Block {
+                                        stmts: [
+                                            Stmt {
+                                                kind: Return(
+                                                    Some(
+                                                        Expr {
+                                                            kind: IntLiteral(0),
+                                                            span: 27:16-27:17,
+                                                        },
+                                                    ),
+                                                ),
+                                                span: 27:9-27:17,
+                                            },
+                                        ],
+                                        span: 27:9-28:5,
+                                    },
+                                    elif_clauses: [],
+                                    else_block: None,
+                                },
+                                span: 26:5-28:5,
+                            },
+                            Stmt {
+                                kind: Return(
+                                    Some(
+                                        Expr {
+                                            kind: Ident(`x`),
+                                            span: 28:12-28:13,
+                                        },
+                                    ),
+                                ),
+                                span: 28:5-28:13,
+                            },
+                        ],
+                        span: 26:5-30:1,
+                    },
+                    is_async: false,
+                    span: 25:1-30:1,
+                },
+            ),
+            span: 25:1-30:1,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`value`),
+                    span: 30:5-30:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IfExpr {
+                            condition: Expr {
+                                kind: BoolLiteral(true),
+                                span: 30:16-30:20,
+                            },
+                            then_expr: Expr {
+                                kind: BlockExpr(
+                                    Block {
+                                        stmts: [
+                                            Stmt {
+                                                kind: Expr(
+                                                    Expr {
+                                                        kind: IntLiteral(1),
+                                                        span: 31:5-31:6,
+                                                    },
+                                                ),
+                                                span: 31:5-31:6,
+                                            },
+                                        ],
+                                        span: 31:5-32:1,
+                                    },
+                                ),
+                                span: 31:5-32:1,
+                            },
+                            else_expr: Expr {
+                                kind: BlockExpr(
+                                    Block {
+                                        stmts: [
+                                            Stmt {
+                                                kind: Expr(
+                                                    Expr {
+                                                        kind: IntLiteral(2),
+                                                        span: 33:5-33:6,
+                                                    },
+                                                ),
+                                                span: 33:5-33:6,
+                                            },
+                                        ],
+                                        span: 33:5-35:1,
+                                    },
+                                ),
+                                span: 33:5-35:1,
+                            },
+                        },
+                        span: 30:13-35:1,
+                    },
+                ),
+            },
+            span: 30:1-35:1,
+        },
+    ],
+    span: 2:1-35:1,
+}

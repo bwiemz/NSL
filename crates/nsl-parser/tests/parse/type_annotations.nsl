@@ -1,0 +1,22 @@
+# Every type-expression form in annotations.
+let a: int = 1
+let b: f32 = 1.0
+let c: str = "s"
+let d: bool = true
+let e: Tensor = ones([2])
+let f: Tensor<[4], f32> = ones([4])
+let g: Tensor<[B, S, D], bf16, cuda> = x
+let h: Tensor<[_, _], fp32> = y
+let i: [int; 2] = [1, 2]
+let j: (int, str) = (1, "a")
+let k: (int) -> int = double
+let l: Option<int> = none
+let m: int | str = 1
+let m2: &Tensor = t
+let m3: _ = 1
+let m4: Self = s
+let n: Map<str, [f32; 4]> = {}
+let o: Tensor<[batch=32, 16], f32> = z
+
+fn typed(p: Tensor<[N, D], f32>, q: (Tensor) -> Tensor) -> (Tensor, int):
+    return (q(p), 0)

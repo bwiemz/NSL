@@ -1,0 +1,34 @@
+# match statements and every pattern form.
+match c:
+    case Red:
+        print("red")
+    case Green | Blue:
+        print("not red")
+    case _:
+        print("other")
+
+match score:
+    case 100:
+        print("perfect")
+    case n if n > 50:
+        print("pass")
+    case "text":
+        print("string")
+    case (a, b):
+        print(a + b)
+    case Some(x):
+        print(x)
+    case [first, *rest]:
+        print(first)
+    case {x, y: (p, q), ..others}:
+        print(x * p * q)
+    case Shape.Rect(w, h):
+        print(w * h)
+    case -1:
+        print("negative")
+    case none:
+        print("none")
+    case true | false:
+        print("bool")
+    case _:
+        print("else")

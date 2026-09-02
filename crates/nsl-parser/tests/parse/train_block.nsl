@@ -1,0 +1,18 @@
+# train block: header arguments, optimizer/scheduler clauses, step, callbacks.
+from nsl.nn.losses import mse_loss
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 5, batch_size = 8):
+    optimizer: SGD(lr = 0.01, momentum = 0.9)
+    scheduler: cosine(warmup = 100)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+        on_epoch(epoch):
+            print(epoch)

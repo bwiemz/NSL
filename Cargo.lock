@@ -1435,6 +1435,7 @@ name = "nsl-lexer"
 version = "0.9.0"
 dependencies = [
  "criterion",
+ "insta",
  "nsl-errors",
  "string-interner",
 ]
@@ -1444,9 +1445,11 @@ name = "nsl-parser"
 version = "0.9.0"
 dependencies = [
  "criterion",
+ "insta",
  "nsl-ast",
  "nsl-errors",
  "nsl-lexer",
+ "regex",
 ]
 
 [[package]]

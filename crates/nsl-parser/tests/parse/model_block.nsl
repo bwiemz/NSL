@@ -1,0 +1,23 @@
+# model declarations: parameters, constructor arguments, decorators, methods.
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model TinyModel(dim: int, hidden: int = 64):
+    w1: Tensor = randn([dim, hidden])
+    b1: Tensor = zeros([hidden])
+
+    @speculative(num_tokens=4)
+    depth: int = 0
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = gelu(bias_add(x @ self.w1, self.b1))
+        return h
+
+    fn loss(self, x: Tensor, y: Tensor) -> Tensor:
+        return mse(self.forward(x), y)
+
+let m = TinyModel(32)
+let y = m.forward(ones([4, 32]))
