@@ -305,13 +305,35 @@ still fails the job. The cost is paid only by red runs, which now run to
 completion instead of aborting — one longer red run in exchange for not
 rediscovering the next failure a round-trip later.
 
-CI additionally runs two build-free agreement gates: `doc-agreement`
-(`scripts/check-doc-agreement.sh`) and `gpu-gate-inventory`
-(`scripts/gpu-cert.sh --check-inventory`). The latter cannot execute GPU
-tests, but it proves the gate manifest in `ci/gpu-cert-manifest.tsv` still
+CI additionally runs three build-free agreement gates: `doc-agreement`
+(`scripts/check-doc-agreement.sh`), `gpu-gate-inventory`
+(`scripts/gpu-cert.sh --check-inventory`) and `hand-ptx-freeze`
+(`scripts/hand-ptx-freeze.sh --check`). `gpu-gate-inventory` cannot execute
+GPU tests, but it proves the gate manifest in `ci/gpu-cert-manifest.tsv` still
 matches the source — so a gate cannot be renamed, deleted, or silently
 un-`#[ignore]`d without that showing up in the same commit. It carries its own
 anti-vacuity step that removes a gate and requires the check to go red.
+
+`hand-ptx-freeze` is the roadmap-A2 freeze on hand-written PTX: the set of
+source files that put PTX text into a string literal is written down in
+`ci/hand-ptx-manifest.txt`, and a PR that adds one fails. New kernels go
+through `KernelIR` (`kernel_ir.rs` → `backend_ptx.rs`); existing members may
+still be edited, since the gate is on the file set, not a line count.
+Membership is decided by `scripts/hand-ptx-scan.awk`, which matches PTX
+patterns against string-literal content only — `//` and `/* */` comments,
+`#[cfg(test)]` / `#[test]` items (including a test module's fixture
+constants), and anything under a `tests/` or `benches/` directory never
+count, so a test that asserts on KIR-generated PTX does not make its file a
+hand-PTX emitter, and a consumer that merely inspects PTX
+(`ptx.contains(".target sm_90")`) does not either. A PTX or CUDA source file
+under `crates/` (`.ptx`, `.cu`, `.cuh`, `.cubin`, `.fatbin` — the
+`include_str!` route around the scanner) is a member by definition. The job
+runs the scanner's `--self-test` (synthetic sources with known counts), then
+three anti-vacuity steps: it appends a PTX-emitting function to a non-member
+and requires the check to go red naming that file, appends a stale entry to
+the manifest and requires that to go red too, and drops a `.ptx` file into a
+crate and requires the same. `scripts/hand-ptx-freeze.sh --explain <file>`
+prints the lines that made a file a member.
 
 GPU tests must be run manually on a machine with a CUDA device before merging
 any kernel-level change: `scripts/gpu-cert.sh --run --tier gpu`.

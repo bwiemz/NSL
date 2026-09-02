@@ -177,10 +177,12 @@ analysis. Group them only alongside that analysis.
 
 CI jobs are cumulative — the Beta/Experimental rows run *in addition to* the
 Stable row on every PR (they are separate, blocking CI jobs, not nightly).
-Five drift gates also block every PR outside the tier table: `version-agreement`
+Six drift gates also block every PR outside the tier table: `version-agreement`
 (Cargo == spec/README/CLI/C API/python), `doc-agreement` (docs == tree),
-`gpu-gate-inventory` (cert-lane manifest == tree), and `python-interop` +
-`cuda-feature` (compile + GPU-free tests). GPU execution itself is certified by
+`gpu-gate-inventory` (cert-lane manifest == tree), `hand-ptx-freeze` (no file
+joins the hand-written-PTX set in `ci/hand-ptx-manifest.txt` — new kernels go
+through KernelIR), and `python-interop` + `cuda-feature` (compile + GPU-free
+tests). GPU execution itself is certified by
 the LOCAL lane (`scripts/gpu-tier.sh smoke|certify|endurance`, item 14) on the
 self-hosted box — GitHub runners have no GPU.
 Non-blocking entries are `continue-on-error` jobs or tests CI cannot run (no GPU

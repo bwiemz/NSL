@@ -578,3 +578,79 @@ jobs:
             exit 1
           fi
           echo "reason check correctly rejects a bare #[ignore]"
+
+  # ── Hand-written PTX freeze (roadmap item A2, step 1) ──────────────────
+  #
+  # Nearly every GPU kernel in the tree is PTX text pushed into a String by
+  # hand, with hand-numbered registers and nothing verifying it before ptxas.
+  # The migration to KernelIR is long; the freeze is immediate: the set of
+  # files that emit PTX by hand is written down in ci/hand-ptx-manifest.txt,
+  # and a PR that adds one fails here. Existing kernels may still be edited.
+  # Membership is decided by scripts/hand-ptx-scan.awk on string-literal
+  # content only, so comments, tests, and PTX parsers do not count. No
+  # toolchain; seconds.
+  hand-ptx-freeze:
+    name: Hand-PTX freeze (no new hand-written kernels)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scanner self-test
+        # Synthetic sources with known counts: emitters are counted, and the
+        # non-emitter shapes (comment, #[cfg(test)] assertion or fixture,
+        # prose, a parser's fragment) are not. This runs FIRST so that a scanner that
+        # silently stopped matching fails on its own evidence, not as
+        # phantom manifest drift.
+        run: ./scripts/hand-ptx-freeze.sh --self-test
+      - name: Check the hand-PTX file set is unchanged
+        run: ./scripts/hand-ptx-freeze.sh --check
+      - name: Prove the freeze is not vacuous
+        run: |
+          set -euo pipefail
+          # Turn a file that is NOT a member into an emitter and require a
+          # non-zero exit. The victim is the KIR builder, the one place a new
+          # kernel is supposed to be written — if this ever becomes a real
+          # member, pick another.
+          victim="crates/nsl-codegen/src/kernel_lower.rs"
+          if grep -qE "^${victim}([[:space:]]|\$)" ci/hand-ptx-manifest.txt; then
+            echo "victim ${victim} is already a member — update this step" >&2
+            exit 1
+          fi
+          cp "${victim}" /tmp/victim.bak
+          trap 'cp /tmp/victim.bak "${victim}"' EXIT
+          printf '\npub fn smuggled(ptx: &mut String) { ptx.push_str("    ld.global.f32 %%f1, [%%rd1];\\n"); }\n' >> "${victim}"
+          if ./scripts/hand-ptx-freeze.sh --check > /tmp/av.log 2>&1; then
+            echo "ANTI-VACUITY FAILURE: a new hand-PTX emitter left --check green" >&2
+            exit 1
+          fi
+          # Red for the right reason — a crash is also non-zero.
+          grep -q "NEW HAND-WRITTEN PTX" /tmp/av.log || { cat /tmp/av.log; exit 1; }
+          grep -q "^  ${victim}\$" /tmp/av.log || { cat /tmp/av.log; exit 1; }
+          echo "freeze correctly rejects a new hand-PTX emitter"
+      - name: Prove a stale entry is rejected
+        run: |
+          set -euo pipefail
+          # An entry for a file that no longer emits PTX must fail too, so a
+          # file cannot regain hand-PTX under an old blessing.
+          cp ci/hand-ptx-manifest.txt /tmp/manifest.bak
+          trap 'cp /tmp/manifest.bak ci/hand-ptx-manifest.txt' EXIT
+          echo "crates/nsl-codegen/src/kernel_ir.rs" >> ci/hand-ptx-manifest.txt
+          if ./scripts/hand-ptx-freeze.sh --check > /tmp/av.log 2>&1; then
+            echo "ANTI-VACUITY FAILURE: a stale manifest entry left --check green" >&2
+            exit 1
+          fi
+          grep -q "STALE MANIFEST" /tmp/av.log || { cat /tmp/av.log; exit 1; }
+          echo "freeze correctly rejects a stale manifest entry"
+      - name: Prove a PTX source file is rejected
+        run: |
+          set -euo pipefail
+          # include_str!("kernel.ptx") would route around the string scanner;
+          # a PTX/CUDA file under crates/ is a member by definition.
+          smuggled="crates/nsl-codegen/src/smuggled.ptx"
+          trap 'rm -f "${smuggled}"' EXIT
+          printf '.version 8.0\n.target sm_80\n' > "${smuggled}"
+          if ./scripts/hand-ptx-freeze.sh --check > /tmp/av.log 2>&1; then
+            echo "ANTI-VACUITY FAILURE: a .ptx file left --check green" >&2
+            exit 1
+          fi
+          grep -q "^  ${smuggled}\$" /tmp/av.log || { cat /tmp/av.log; exit 1; }
+          echo "freeze correctly rejects a PTX source file"
