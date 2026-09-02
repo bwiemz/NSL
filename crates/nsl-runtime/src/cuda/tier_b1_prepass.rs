@@ -23,7 +23,6 @@
 //! design rationale (PR #180 closed the codegen bugs; this file closes the
 //! caller-side pre-pass loop).
 
-#![allow(dead_code)]
 
 // ---------------------------------------------------------------------------
 // X pre-pass: RMSNorm + narrow + chunkify

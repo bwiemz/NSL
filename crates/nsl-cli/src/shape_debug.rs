@@ -411,5 +411,4 @@ fn dim_to_u64(d: &Dim) -> u64 {
 }
 
 // Unused FnDef import placeholder — the type is surfaced for downstream use.
-#[allow(dead_code)]
 fn _touch(_: &FnDef) {}

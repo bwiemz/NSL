@@ -102,7 +102,6 @@ impl FusedGatedLoraConfig {
 /// into `%scale_reg` at the kernel prolog, same for both adapter types.
 /// B.3 spec Risk #5: scale-as-param enables kernel dedup across sites
 /// with different alpha values.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FoldKind {
     /// LoRA: `main_accum += epi_final * %scale_reg`  (uniform scalar scale from param)
@@ -121,7 +120,6 @@ pub enum FoldKind {
 /// B.3.1 ships with `LastKIter` unconditionally; all shipped configs have
 /// `k_iters >= 1` for the epilogue path.  `PostLoop` is reserved for a
 /// potential future milestone that benchmarks load-phase alternatives.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateLoadPhase {
     /// Emit gate load + sigmoid at the end of the final main K-iteration,
@@ -136,7 +134,6 @@ pub enum GateLoadPhase {
 ///
 /// B.3.1 ships `FoldResultMask` unconditionally; `SentinelGate` is reserved
 /// for a future variant that stages gate through SMEM with a sentinel value.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PartialTileMask {
     /// Mask fold contribution with @%p_colN predicate; OOB gate reads
@@ -162,7 +159,6 @@ const MMA_K_U32: u32 = 16; // m16n8k16
 /// output coords, accumulator init, main K-loop, post-loop (x@A)@B MMA,
 /// f32→packed-f16 conversion for final MMA A-operand, store, ret) are
 /// identical between the two FoldKind variants.
-#[allow(dead_code)]
 fn emit_fused_adapter_kernel_body(
     ptx: &mut String,
     entry_name: &str,

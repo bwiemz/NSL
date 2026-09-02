@@ -458,14 +458,12 @@ static FP8_PTX_CACHE: OnceLock<Mutex<StdHashMap<Fp8KernelKey, String>>> = OnceLo
 
 /// Register a compiled FP8 PTX kernel in the cache.
 /// Called by codegen/CLI when compiling an FP8 matmul.
-#[allow(dead_code)]
 pub fn cache_fp8_ptx(k: usize, format: i64, ptx: String) {
     let cache = FP8_PTX_CACHE.get_or_init(|| Mutex::new(StdHashMap::new()));
     cache.lock().unwrap().insert((k, format), ptx);
 }
 
 /// Retrieve a cached FP8 PTX kernel, if available.
-#[allow(dead_code)]
 pub fn get_cached_fp8_ptx(k: usize, format: i64) -> Option<String> {
     let cache = FP8_PTX_CACHE.get_or_init(|| Mutex::new(StdHashMap::new()));
     cache.lock().unwrap().get(&(k, format)).cloned()

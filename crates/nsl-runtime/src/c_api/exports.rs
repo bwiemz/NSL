@@ -40,6 +40,10 @@ pub struct OwnershipFfis {
 /// Per-model export dispatch table. Owns the dlopen handle and the
 /// dlsym'd function pointers.
 pub struct ExportRegistry {
+    // LOAD-BEARING AND DELIBERATELY UNREAD: this owns the dlopen handle.
+    // Dropping it unloads the image, which dangles every function pointer in
+    // `table` and every signature pointer in `signatures`. It must outlive
+    // them, so it is a field and never a read.
     #[allow(dead_code)]
     library: libloading::Library,
     table: HashMap<CString, ExportFnPtr>,

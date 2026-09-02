@@ -77,6 +77,15 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # all at once.
 unsafe_op_in_unsafe_fn = "deny"
 
+# An unused item is either a mistake or a decision, and the difference has to
+# be written down (roadmap C6). Before this, 115 `#[allow(dead_code)]` — nine
+# of them module-wide `#![allow]` — made the two indistinguishable: a helper
+# whose last caller was deleted looked exactly like one held for a named
+# future task. Every remaining allow now says which configuration the item is
+# dead in (`not(test)`, `not(feature = "cuda")`, `not(target_os = "none")`) or
+# why it is kept, and a new one is a reviewable line rather than the default.
+dead_code = "deny"
+
 # ── Build profiles ────────────────────────────────────────────────────────────
 #
 # Measured on the 9800X3D box, clean builds of `nsl` with `--features cuda`

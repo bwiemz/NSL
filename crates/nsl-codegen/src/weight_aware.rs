@@ -641,6 +641,8 @@ pub struct FoldStats {
 /// The constant propagation pass.
 pub struct ConstantFolder<'a> {
     /// Weight map providing known weight values (used by future complex folding passes)
+    // Held for the folding passes that will read known weight values; the
+    // folder is constructed with it today and consults only `stats`.
     #[allow(dead_code)]
     weight_map: &'a WeightMap,
     /// Statistics for reporting

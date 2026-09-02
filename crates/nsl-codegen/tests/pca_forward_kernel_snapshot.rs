@@ -14,6 +14,11 @@
 //! `forward_kernel_segment_masked_causal_32_32_32` shows exactly what Tier B
 //! contributed (preamble + skip predicate + KV_TILE_SKIP_TB label).
 
+// Config builders for the snapshot matrix. Which ones are reachable depends
+// on the feature set — some tests here are `#[cfg(feature = "cuda")]` — and
+// the set is meant to cover the shape space, not just what one build asserts.
+#![allow(dead_code)]
+
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::{
     synthesize_flash_attention_ptx_v2, synthesize_flash_attention_ptx_v2_with_tier_b,

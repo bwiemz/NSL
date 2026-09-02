@@ -39,7 +39,9 @@ use crate::flash_attention::FlashAttentionConfig;
 /// runs so all warps participate in the fence.
 ///
 /// `%r_pdoc_len` must be set by `per_doc_prelude::emit` before this is called.
-#[allow(dead_code)] // provided for v2 use; v1 uses structural bound only
+// Provided for v2 use; v1 uses the structural bound only. `pub` in a `pub
+// module, so `dead_code` cannot see that it has no in-tree caller — this
+// comment is the only marker.
 pub fn emit_doc_len_q_load_guard(
     ptx: &mut String,
     _config: &FlashAttentionConfig,

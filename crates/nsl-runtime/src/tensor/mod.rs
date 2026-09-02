@@ -84,6 +84,10 @@ thread_local! {
 /// disabled) refcount-elision predicates. Kept — source-AD still emits the
 /// paired nsl_set_inplace_suppressed scopes, and any future compiler-proven
 /// in-place path must consult this guard again.
+// Deliberately unreferenced: its only consumers were the (permanently
+// disabled) refcount-elision predicates. Source-AD still emits the paired
+// `nsl_set_inplace_suppressed` scopes, so any future compiler-proven
+// in-place path must consult this guard again.
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn inplace_suppressed() -> bool {
@@ -628,6 +632,9 @@ impl NslTensor {
     /// Raw pointer to the tensor's u16 storage (bits) for f16/bf16 tensors.
     /// Callers must convert through `f16_bits_to_f32` / `bf16_bits_to_f32`
     /// (or the `half` crate if available) before doing math.
+    // The dtype-accessor family. `data_f32`/`data_f64` have callers; these
+    // three are the same contract for the remaining dtypes and are kept so the
+    // set is complete and each carries its own dtype assertion.
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn data_f16_bits(&self) -> *mut u16 {
@@ -639,12 +646,13 @@ impl NslTensor {
         self.data as *mut u16
     }
 
+    // same dtype-accessor family as `data_f16_bits` above
+    #[allow(dead_code)]
     /// Decode the tensor's raw storage into an owned `Vec<f64>` regardless of dtype.
     /// Handles f64, f32, f16, bf16, i32, and u16 token buffers. The returned vec
     /// always has exactly `self.len` elements in row-major order. Intended for
     /// callers (optimizers, CPU ops) that need to consume numeric values without
     /// hard-asserting a specific storage dtype.
-    #[allow(dead_code)]
     pub(crate) fn as_f64_owned(&self) -> Vec<f64> {
         let len = self.len as usize;
         let mut out = Vec::with_capacity(len);
@@ -693,6 +701,7 @@ impl NslTensor {
         out
     }
 
+    // same dtype-accessor family as `data_f16_bits` above
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn data_i32(&self) -> *mut i32 {
@@ -1068,7 +1077,9 @@ pub(crate) fn get_strides_vec(tensor: &NslTensor) -> Vec<usize> {
 }
 
 /// Helper: create a tensor with a given shape (Rust slice).
-#[allow(dead_code)]
+// exercised only by this crate's own unit tests; `#[cfg(test)]` code does
+// not silence the lint in the plain lib build
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn create_tensor_with_shape_rs(shape: &[i64]) -> i64 {
     crate::cpu::create_tensor_with_shape_rs(shape)
 }

@@ -27,6 +27,11 @@
 //! Per spec §5.2 (per-variant SASS baselines) + §6.3.1 (institutional
 //! baseline pattern).
 
+// Baseline checkers for the SASS variant matrix. Which ones a given build
+// asserts depends on the feature set and on which baselines exist on disk;
+// the set is meant to cover the matrix, not one build's subset.
+#![allow(dead_code)]
+
 mod sass_baseline_helpers;
 use sass_baseline_helpers::*;
 

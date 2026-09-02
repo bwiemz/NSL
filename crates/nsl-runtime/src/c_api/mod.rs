@@ -141,6 +141,9 @@ pub fn nsl_dtype_to_capi(nsl_dtype: u16) -> i32 {
 /// export dispatch table for `@export`-decorated functions.
 pub struct NslModel {
     /// Model version (for ABI compatibility).
+    // `version` is the ABI tag carried with the model and `weights_path` is
+    // kept for diagnostics; neither is consulted yet, but both are part of what
+    // a loaded model IS rather than of what one caller needs.
     #[allow(dead_code)]
     version: u32,
     /// Weight tensors loaded from safetensors/nslm file.
@@ -148,8 +151,9 @@ pub struct NslModel {
     weights: HashMap<String, i64>,
     /// Ordered list of weight tensor pointers (for positional access).
     weight_ptrs: Vec<i64>,
-    /// Path the weights were loaded from (for diagnostics).
+    // kept for diagnostics alongside `version` above
     #[allow(dead_code)]
+    /// Path the weights were loaded from (for diagnostics).
     weights_path: String,
     /// Dispatch table for `@export`ed functions. Populated eagerly at
     /// create time — either via runtime self-discovery in `nsl_model_create`
@@ -1486,7 +1490,6 @@ pub extern "C" fn nsl_model_get_weight(model_ptr: i64, name_ptr: i64, name_len: 
 // the second pair here is not part of the Gap I bundle — it is a
 // pre-existing compile fix needed to run this PR's tests. File a
 // separate cleanup PR if a hygiene pass for main is desired.
-#[allow(dead_code)]
 fn _gap_i_compile_note(model_ptr: i64) -> i64 {
     let _ = model_ptr;
     0

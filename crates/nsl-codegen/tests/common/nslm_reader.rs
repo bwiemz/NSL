@@ -1,5 +1,9 @@
 //! Minimal `.nslm` parser for integration tests.
 
+// A `tests/common/` module is included by several test binaries; each one
+// uses a different subset, so a helper unused by THIS binary is normal.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;

@@ -47,7 +47,6 @@ pub(crate) fn tape_shape(t: &NslTensor) -> TapeShape {
 }
 
 /// Operations recorded on the tape during forward passes inside `grad` blocks.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub enum TapeOp {
     Add { a: i64, b: i64, out: i64, a_shape: TapeShape, b_shape: TapeShape },
@@ -603,36 +602,6 @@ pub extern "C" fn nsl_tape_resume() {
             tape.pause_depth -= 1;
         }
     });
-}
-
-/// Call a function pointer with a variable number of i64 arguments (up to 8).
-/// Used by gradient checkpointing to re-execute the forward function during backward.
-#[allow(dead_code)]
-pub(crate) fn call_with_args(fn_ptr: usize, args: &[i64]) -> i64 {
-    debug_assert_eq!(std::mem::size_of::<usize>(), 8, "gradient checkpointing requires 64-bit target");
-    type Fn0 = extern "C" fn() -> i64;
-    type Fn1 = extern "C" fn(i64) -> i64;
-    type Fn2 = extern "C" fn(i64, i64) -> i64;
-    type Fn3 = extern "C" fn(i64, i64, i64) -> i64;
-    type Fn4 = extern "C" fn(i64, i64, i64, i64) -> i64;
-    type Fn5 = extern "C" fn(i64, i64, i64, i64, i64) -> i64;
-    type Fn6 = extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64;
-    type Fn7 = extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64;
-    type Fn8 = extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64;
-    unsafe {
-        match args.len() {
-            0 => std::mem::transmute::<usize, Fn0>(fn_ptr)(),
-            1 => std::mem::transmute::<usize, Fn1>(fn_ptr)(args[0]),
-            2 => std::mem::transmute::<usize, Fn2>(fn_ptr)(args[0], args[1]),
-            3 => std::mem::transmute::<usize, Fn3>(fn_ptr)(args[0], args[1], args[2]),
-            4 => std::mem::transmute::<usize, Fn4>(fn_ptr)(args[0], args[1], args[2], args[3]),
-            5 => std::mem::transmute::<usize, Fn5>(fn_ptr)(args[0], args[1], args[2], args[3], args[4]),
-            6 => std::mem::transmute::<usize, Fn6>(fn_ptr)(args[0], args[1], args[2], args[3], args[4], args[5]),
-            7 => std::mem::transmute::<usize, Fn7>(fn_ptr)(args[0], args[1], args[2], args[3], args[4], args[5], args[6]),
-            8 => std::mem::transmute::<usize, Fn8>(fn_ptr)(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]),
-            n => panic!("@checkpoint: function has {n} arguments (max supported: 8)"),
-        }
-    }
 }
 
 /// Record a gradient checkpoint on the tape.

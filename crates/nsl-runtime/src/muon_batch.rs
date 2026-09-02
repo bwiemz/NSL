@@ -87,7 +87,11 @@ struct GroupWs {
     /// Capacity in matrices.
     cap_k: usize,
     /// Oriented dims: rp = min(r,c), cp = max(r,c).
+    // Recorded when the batch is planned; the fused kernel reads the padded
+    // extents off the shapes instead.
+    #[allow(dead_code)]
     rp: usize,
+    #[allow(dead_code)]
     cp: usize,
     /// [cap_k, rp, cp] iterate + ping-pong buffer.
     y: u64,

@@ -19,7 +19,7 @@
 
 use serde::Serialize;
 
-use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
+use crate::gpu_specs::{default_gpu, find_gpu};
 use crate::error::CodegenError;
 use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::wengert::WengertList;
@@ -1225,12 +1225,6 @@ fn run_weight_analysis(
     }
 
     report
-}
-
-/// Extract `GpuSpec` for the named target or default.
-#[allow(dead_code)]
-fn resolve_gpu(name: &str) -> &'static GpuSpec {
-    find_gpu(name).unwrap_or_else(default_gpu)
 }
 
 /// Convenience: run WGGO on a Wengert list with default cluster/importance/

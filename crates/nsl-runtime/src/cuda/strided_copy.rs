@@ -31,7 +31,6 @@
 // planner's only consumers are `#[cfg(feature = "cuda")]`, so on a default
 // (cuda-less) build dead-code analysis sees this whole module as unused. Same
 // reason, same allow, as every sibling kernel module.
-#![allow(dead_code)]
 
 /// Smallest run length worth the per-run offset table. Below this the table
 /// approaches the size of the data itself and the generic kernel is fine.

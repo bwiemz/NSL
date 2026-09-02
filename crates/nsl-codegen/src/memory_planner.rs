@@ -391,8 +391,6 @@ pub fn intervals_overlap(a: &TensorAlloc, b: &TensorAlloc) -> bool {
 /// Adjacency-list interference graph for tensor allocations.
 pub struct InterferenceGraph {
     adj: Vec<HashSet<TensorAllocId>>,
-    #[allow(dead_code)]
-    num_tensors: usize,
 }
 
 impl InterferenceGraph {
@@ -422,10 +420,7 @@ impl InterferenceGraph {
             }
         }
 
-        Self {
-            adj,
-            num_tensors: n,
-        }
+        Self { adj }
     }
 
     /// Check if two tensors interfere.

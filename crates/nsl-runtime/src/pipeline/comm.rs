@@ -21,10 +21,8 @@ use crate::tensor::NslTensor;
 
 static PIPELINE_CTX: Mutex<Option<PipelineContext>> = Mutex::new(None);
 
-#[allow(dead_code)]
 struct PipelineContext {
     num_stages: usize,
-    num_micro_batches: usize,
     backend: SharedMemPipeline,
 }
 
@@ -252,7 +250,11 @@ pub extern "C" fn nsl_pipeline_init(
     schedule_type: i64,
     num_micro_batches: i64,
 ) -> i64 {
+    // Both are accepted for ABI stability and then discarded: the shared-mem
+    // backend schedules by stage, and nothing here consumes a micro-batch
+    // count. Stored in the context until now, where it was never read.
     let _ = schedule_type;
+    let _ = num_micro_batches;
     let mut guard = PIPELINE_CTX.lock().unwrap();
     if guard.is_some() {
         return -1;
@@ -260,7 +262,6 @@ pub extern "C" fn nsl_pipeline_init(
     let stages = num_stages as usize;
     *guard = Some(PipelineContext {
         num_stages: stages,
-        num_micro_batches: num_micro_batches as usize,
         backend: SharedMemPipeline::new(stages),
     });
     0
@@ -420,13 +421,6 @@ mod tests {
     fn reset_ctx() {
         let mut guard = PIPELINE_CTX.lock().unwrap();
         *guard = None;
-    }
-
-    /// Initialize pipeline for a test, ensuring clean state.
-    fn test_init(stages: usize, micro_batches: usize) {
-        reset_ctx();
-        let r = nsl_pipeline_init(stages as i64, 0, micro_batches as i64);
-        assert_eq!(r, 0, "pipeline init failed (ctx was not properly reset)");
     }
 
     #[test]

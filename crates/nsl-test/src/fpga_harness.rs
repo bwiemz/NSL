@@ -154,7 +154,10 @@ pub struct ClockedOutput {
 
 pub struct VerilatorHarness {
     sim_binary: PathBuf,
-    #[allow(dead_code)] // used at M57.1 when run() is wired to tap parsing
+    // used at M57.1 when run() is wired to tap parsing
+    // Held for M57.1, when `run()` is wired to tap parsing; the descriptor has
+    // to be captured at construction because that is where the harness knows it.
+    #[allow(dead_code)]
     tap_descriptor: TapDescriptor,
 }
 

@@ -19,6 +19,11 @@
 //!   cargo test --features cuda --test wrga_gatedlora_backward_trigger \
 //!       -- --ignored --nocapture
 
+// Every test in this file is `#[cfg(feature = "cuda")]`, so without that
+// feature the whole supporting cast — fixtures, trace parsing, statistics —
+// is unreachable by construction rather than by neglect.
+#![cfg_attr(not(feature = "cuda"), allow(dead_code))]
+
 use assert_cmd::prelude::*;
 use serde_json::Value;
 use std::fs;

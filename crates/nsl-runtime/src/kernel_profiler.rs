@@ -9,7 +9,9 @@ use std::time::Instant;
 
 /// A recorded kernel launch trace (event indices + metadata).
 pub(crate) struct KernelTrace {
-    #[allow(dead_code)] // used by flush_traces_gpu (cuda feature)
+    // used by flush_traces_gpu (cuda feature)
+    // read only by the CUDA-gated code paths
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub pool_idx: usize,
     pub name: String,
     pub grid: [u32; 3],
@@ -24,9 +26,13 @@ pub(crate) struct KernelProfiler {
     pub pool_cursor: Mutex<usize>,
     // GPU event pool and base event are stored as raw u64 handles
     // (CUevent is a pointer, stored as u64 for Send+Sync safety)
-    #[allow(dead_code)] // used when cuda feature enabled
+    // used when cuda feature enabled
+    // read only by the CUDA-gated code paths
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub event_pool: Mutex<Vec<(u64, u64)>>, // (start_event, stop_event) pairs
-    #[allow(dead_code)] // used when cuda feature enabled
+    // used when cuda feature enabled
+    // written and read only by the CUDA-gated event pool
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub gpu_base_event: Mutex<u64>,
 }
 
@@ -53,20 +59,26 @@ pub fn kernel_profiler_enabled() -> bool {
     KERNEL_PROFILER.enabled.load(Ordering::Relaxed)
 }
 
-#[allow(dead_code)] // used in cuda feature gate block
+// used in cuda feature gate block
+// the CUDA-gated pool init is the only consumer
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const EVENT_POOL_SIZE_DEFAULT: usize = 4096;
 
 /// Hard cap on the pool (mfu-fusion C1). Each slot is one cuEvent PAIR plus
 /// a trace entry; 65536 pairs comfortably covers several full micro-batches
 /// of the 1B recipe while bounding driver-object count if someone fat-fingers
 /// the env var.
-#[allow(dead_code)] // used in cuda feature gate block
+// used in cuda feature gate block
+// the CUDA-gated pool init is the only consumer
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const EVENT_POOL_SIZE_CAP: usize = 65536;
 
 /// `NSL_PROFILE_KERNELS_POOL` parse rule: default 4096 (unset, empty, or
 /// unparsable — a bad value must not silently change what a profiling run
 /// measures), capped at 65536. Split from the env read for direct testing.
-#[allow(dead_code)] // consumed by the cuda-gated pool init; kept unconditional so the CPU test suite pins the parse rule
+// Consumed by the cuda-gated pool init and by this module's own unit tests,
+// which pin the parse rule on a CPU box — dead only when neither applies.
+#[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
 fn parse_pool_size(v: Option<&str>) -> usize {
     v.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -77,7 +89,9 @@ fn parse_pool_size(v: Option<&str>) -> usize {
 /// Pool size for the cuEvent pairs, from `NSL_PROFILE_KERNELS_POOL`.
 /// Read once per process — the pool is allocated once, on the first
 /// profiled launch.
-#[allow(dead_code)] // used in cuda feature gate block
+// used in cuda feature gate block
+// called only by the CUDA-gated event-pool init
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn event_pool_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -241,7 +255,9 @@ extern "C" fn kernel_profiler_atexit() {
 /// `cuda::ensure_context()` before reaching this function — a
 /// contract the existing `kernel_launch` signature enforces by
 /// calling `ensure_context` at the top of the launch path.
-#[allow(dead_code)] // called from cuda/mod.rs kernel_launch
+// Called from `cuda/mod.rs` kernel_launch (cuda-gated) and from this
+// module's own unit tests — dead only when neither applies.
+#[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
 pub(crate) fn kernel_profiler_pop_events() -> Option<(u64, u64, usize)> {
     if !kernel_profiler_enabled() {
         return None;
@@ -278,7 +294,9 @@ pub(crate) fn kernel_profiler_pop_events() -> Option<(u64, u64, usize)> {
 /// Lock ordering note: this only locks pool_cursor then traces (not event_pool).
 /// This is safe because push_trace is only called after pop_events has already
 /// released its locks, and flush holds all locks exclusively during teardown.
-#[allow(dead_code)] // called from cuda/mod.rs kernel_launch
+// Called from `cuda/mod.rs` kernel_launch (cuda-gated) and from this
+// module's own unit tests — dead only when neither applies.
+#[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
 pub(crate) fn kernel_profiler_push_trace(name: &str, grid: [u32; 3], block: [u32; 3]) {
     let cursor = *KERNEL_PROFILER.pool_cursor.lock().unwrap();
     KERNEL_PROFILER.traces.lock().unwrap().push(KernelTrace {

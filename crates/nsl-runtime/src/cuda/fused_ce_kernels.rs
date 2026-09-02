@@ -10,7 +10,6 @@
 //! pointer and forward it here.
 
 // PTX launch helpers are only available when the `cuda` feature is present.
-#![allow(dead_code)]
 
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;

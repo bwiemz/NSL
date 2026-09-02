@@ -76,9 +76,9 @@ pub struct GradContext {
     /// are fresh wrappers created by `nsl_model_forward_grad` over the
     /// caller's NslTensorDesc data; freed by `Drop for GradContext`.
     /// Reserved for cross-thread backward (§5.4) and future serialization
-    /// (§6) — backward replays from `ops` and writes grads into the
-    /// caller's desc array, so this field is currently unread.
-    #[allow(dead_code)]
+    /// (§6). Backward replays from `ops` and writes grads into the caller's
+    /// desc array, so nothing reads these during backward — the teardown
+    /// path drains them to free the inputs.
     pub(crate) input_ptrs: Vec<i64>,
     /// Raw NslTensor* the forward returned. ctx-owned wrappers — same
     /// lifetime as input_ptrs.

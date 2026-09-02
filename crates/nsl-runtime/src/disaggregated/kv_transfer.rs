@@ -707,7 +707,8 @@ pub struct NvlinkBackend {
 }
 
 /// An NVLink transfer: the IPC handle + metadata needed to map remote GPU memory.
-#[allow(dead_code)]
+// read only by the CUDA IPC transfer path
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct NvlinkPendingTransfer {
     source_rank: i32,
     target_rank: i32,
@@ -778,6 +779,9 @@ impl NvlinkBackend {
         }
     }
 
+    // the IPC-handle export half of the GPU-direct path; nothing calls it yet
+    // (the receive side is equally scaffolding — see `RdmaMemoryRegion`)
+    #[allow(dead_code)]
     /// Export a GPU pointer as a CUDA IPC handle (64 bytes).
     /// Returns the handle bytes, or None if IPC export fails.
     #[cfg(feature = "cuda")]
@@ -789,6 +793,8 @@ impl NvlinkBackend {
         // The handle is a 64-byte opaque structure.
         let mut handle = [0u8; 64];
         unsafe extern "C" {
+            // driver import for `export_ipc_handle` above
+            #[allow(dead_code)]
             fn cuIpcGetMemHandle(handle: *mut u8, dptr: u64) -> u32;
         }
         let rc = unsafe { cuIpcGetMemHandle(handle.as_mut_ptr(), gpu_ptr as u64) };
@@ -1085,6 +1091,9 @@ pub struct RdmaBackend {
 }
 
 /// An RDMA memory region registration.
+// The RDMA backend is scaffolding: regions are registered and their keys
+// recorded, but no transfer path reads them back yet. Kept as the shape the
+// real implementation has to fill in.
 #[allow(dead_code)]
 struct RdmaMemoryRegion {
     addr: u64,
@@ -1096,6 +1105,8 @@ struct RdmaMemoryRegion {
 }
 
 /// Metadata for an RDMA transfer (exchanged out-of-band).
+// Remote addresses and sizes for an RDMA READ that nothing issues yet —
+// same scaffolding as `RdmaMemoryRegion` above.
 #[allow(dead_code)]
 struct RdmaPendingTransfer {
     source_rank: i32,
@@ -1206,6 +1217,9 @@ impl RdmaBackend {
     }
 
     /// Deregister a memory region.
+    // Nothing calls this, which means every region `register_memory` records
+    // is kept for the life of the process. Left in place as the hook for
+    // whoever wires up region teardown; deleting it would hide the gap.
     #[allow(dead_code)]
     fn deregister_memory(&self, addr: u64) {
         let mut regions = self.registered_regions.lock().unwrap();

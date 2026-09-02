@@ -1444,7 +1444,7 @@ impl Compiler<'_> {
     /// accumulation loop is skipped on the stepping batch), so this helper
     /// REFUSES that combination at compile time rather than emitting
     /// silently-wrong IR.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_unified_optim_step_dispatch(
         &mut self,
         builder: &mut cranelift_frontend::FunctionBuilder,
