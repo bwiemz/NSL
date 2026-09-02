@@ -2177,7 +2177,7 @@ impl Compiler<'_> {
                 // Kernels are compiled in the compile_kernels pass (before functions).
             }
 
-            StmtKind::QuantBlock(ref quant) => {
+            StmtKind::QuantBlock(quant) => {
                 self.compile_quant_block(builder, state, quant)?;
             }
 
@@ -10625,16 +10625,16 @@ sched={sched_s}",
                 // 6. Generate adjoint backward graph from the (possibly
                 //    pruned) primal list.
                 let start_var = extractor.next_var_id().max(ccr_fresh);
-                let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
+                let mut generator = crate::source_ad::AdjointGenerator::new(start_var);
                 // T7.1: thread CSHA backward claims into the generator so
                 // the reverse walk can route claimed ops through the fused
                 // backward dispatcher instead of per-op AD rules.
                 if let Some(claims) = self.bus.take_csha_backward_claims() {
-                    gen.set_csha_claims(claims);
+                    generator.set_csha_claims(claims);
                 }
                 // Item 9: opt-in fused RMSNorm input-gradient lowering.
-                gen.set_fuse_rmsnorm_backward(self.compile_options.fuse_rmsnorm_backward);
-                let mut adjoint = gen.generate(&effective_primal);
+                generator.set_fuse_rmsnorm_backward(self.compile_options.fuse_rmsnorm_backward);
+                let mut adjoint = generator.generate(&effective_primal);
                 // Item 9 profiling (`NSL_PROFILE_ADJOINT=1`): a launch-count
                 // histogram of the generated backward ops. Norm/activation
                 // adjoints decompose into many small bandwidth-bound ops
@@ -10664,9 +10664,9 @@ sched={sched_s}",
                 // compiler slot is cleared again right after the forward, so
                 // the ADJOINT lowering still never sees claims — the same
                 // invariant the old post-forward `take()` enforced.
-                self.bus.restore_csha_backward_claims(gen.take_csha_claims());
+                self.bus.restore_csha_backward_claims(generator.take_csha_claims());
                 // T7.1: surface any CSHA fallback diagnostics.
-                for diag in gen.csha_diagnostics() {
+                for diag in generator.csha_diagnostics() {
                     eprintln!("[nsl] {diag}");
                 }
 
@@ -10676,7 +10676,7 @@ sched={sched_s}",
                     adjoint.ops = crate::source_ad::eliminate_by_backward_live(
                         &adjoint.ops,
                         &plan.prune.backward_live,
-                        gen.adjoint_vars_map(),
+                        generator.adjoint_vars_map(),
                     );
                 }
 
@@ -10694,7 +10694,7 @@ sched={sched_s}",
                     named_params
                         .iter()
                         .filter(|(name, _)| self.is_trainable_param_name(name))
-                        .filter_map(|(_, vid)| gen.adjoint_of(*vid))
+                        .filter_map(|(_, vid)| generator.adjoint_of(*vid))
                         .collect()
                 };
                 if !adjoint_needed.is_empty() {
@@ -10852,7 +10852,7 @@ sched={sched_s}",
                         if !self.is_trainable_param_name(param_name) {
                             continue;
                         }
-                        if let Some(adj_vid) = gen.adjoint_of(*primal_vid) {
+                        if let Some(adj_vid) = generator.adjoint_of(*primal_vid) {
                             ccr_protect.insert(adj_vid);
                         }
                     }
@@ -11023,10 +11023,10 @@ sched={sched_s}",
                         // what a unique preimage certifies.
                         let mut preimage: std::collections::HashMap<crate::wengert::VarId, u32> =
                             Default::default();
-                        for a in gen.adjoint_vars_map().values() {
+                        for a in generator.adjoint_vars_map().values() {
                             *preimage.entry(*a).or_default() += 1;
                         }
-                        let mirrored: Vec<(crate::wengert::VarId, u64)> = gen
+                        let mirrored: Vec<(crate::wengert::VarId, u64)> = generator
                             .adjoint_vars_map()
                             .iter()
                             .filter(|(_, a)| preimage.get(a) == Some(&1))
@@ -11055,7 +11055,7 @@ sched={sched_s}",
                         .iter()
                         .map(|(_, v)| *v)
                         .collect();
-                    let mut tape_escaping: std::collections::HashSet<crate::wengert::VarId> = gen
+                    let mut tape_escaping: std::collections::HashSet<crate::wengert::VarId> = generator
                         .adjoint_vars_map()
                         .iter()
                         .filter(|(p, _)| param_vids.contains(p))
@@ -11163,10 +11163,10 @@ sched={sched_s}",
                             crate::wengert::VarId,
                             u32,
                         > = Default::default();
-                        for a in gen.adjoint_vars_map().values() {
+                        for a in generator.adjoint_vars_map().values() {
                             *preimage.entry(*a).or_default() += 1;
                         }
-                        gen.adjoint_vars_map()
+                        generator.adjoint_vars_map()
                             .iter()
                             .filter(|(_, a)| preimage.get(a) == Some(&1))
                             .map(|(p, a)| (*p, *a))
@@ -11620,7 +11620,7 @@ sched={sched_s}",
                                 Some(CslaParam {
                                     name: name.clone(),
                                     primal_vid: *primal_vid,
-                                    adj_vid: gen.adjoint_of(*primal_vid),
+                                    adj_vid: generator.adjoint_of(*primal_vid),
                                     accum_idx,
                                 })
                             })
@@ -12540,7 +12540,7 @@ sched={sched_s}",
                             // Not a tensor param — skip (scalar configs, etc.)
                             continue;
                         };
-                        let Some(adj_vid) = gen.adjoint_of(*primal_vid) else {
+                        let Some(adj_vid) = generator.adjoint_of(*primal_vid) else {
                             continue;
                         };
                         let Some(&primal_val) = full_vars.get(primal_vid) else {
@@ -13177,7 +13177,7 @@ sched={sched_s}",
                         if !self.is_trainable_param_name(param_name) {
                             continue;
                         }
-                        let Some(adj_vid) = gen.adjoint_of(*vid) else {
+                        let Some(adj_vid) = generator.adjoint_of(*vid) else {
                             continue;
                         };
                         if let Some(op) = adjoint.ops.iter().find(|op| op.result == adj_vid) {
@@ -13294,7 +13294,7 @@ sched={sched_s}",
                         grad_skipped_no_primal += 1;
                         continue;
                     };
-                    let Some(adj_vid) = gen.adjoint_of(*vid) else {
+                    let Some(adj_vid) = generator.adjoint_of(*vid) else {
                         eprintln!("[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
                         grad_skipped_no_adjoint += 1;
                         continue;
@@ -18323,10 +18323,10 @@ sched={sched_s}",
             self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[targets_val])?;
 
         let start_var = extractor.next_var_id();
-        let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
-        let mut adjoint = gen.generate(extractor.wengert_list());
+        let mut generator = crate::source_ad::AdjointGenerator::new(start_var);
+        let mut adjoint = generator.generate(extractor.wengert_list());
 
-        if let Some(target_adj_var) = gen.adjoint_of(target_var_id) {
+        if let Some(target_adj_var) = generator.adjoint_of(target_var_id) {
             let needed = std::collections::HashSet::from([target_adj_var]);
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
             // P5 item 20 slice B (bit-exact SwiGLU gate fusion; also applied

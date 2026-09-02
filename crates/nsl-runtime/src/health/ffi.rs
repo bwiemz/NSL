@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 static COLLECTOR: Lazy<Mutex<HealthCollector>> = Lazy::new(|| Mutex::new(HealthCollector::new()));
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_health_record_loss(value: f64, step: u64) {
     COLLECTOR.lock().unwrap().record_loss(step, value);
 }
@@ -19,7 +19,7 @@ pub extern "C" fn nsl_health_record_loss(value: f64, step: u64) {
 /// # Safety
 /// Caller must guarantee (path_ptr, path_len) refers to valid UTF-8 bytes
 /// they own for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_health_record_grad_norm(
     path_ptr: *const u8,
     path_len: usize,
@@ -40,7 +40,7 @@ pub unsafe extern "C" fn nsl_health_record_grad_norm(
 
 /// # Safety
 /// Same as `nsl_health_record_grad_norm`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_health_record_weight_norm(
     path_ptr: *const u8,
     path_len: usize,
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn nsl_health_record_weight_norm(
 /// Caller must guarantee (path_ptr, path_len) refers to valid UTF-8 bytes
 /// they own for the duration of the call, or path_ptr is null (prints JSON
 /// to stdout instead).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_health_flush_snapshot(
     path_ptr: *const u8,
     path_len: usize,
@@ -90,7 +90,7 @@ pub unsafe extern "C" fn nsl_health_flush_snapshot(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_health_set_flush_interval(n: u64) {
     COLLECTOR.lock().unwrap().set_flush_interval(n);
 }
@@ -99,17 +99,17 @@ pub extern "C" fn nsl_health_set_flush_interval(n: u64) {
 /// Powers the `loss` identifier in `@inspect` predicates — previously that
 /// identifier lowered to a compile-time 0.0 constant, so `condition="loss > x"`
 /// silently never fired.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_health_get_last_loss() -> f64 {
     COLLECTOR.lock().unwrap().last_loss().unwrap_or(0.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_health_get_loss_ema() -> f64 {
     COLLECTOR.lock().unwrap().snapshot().loss_ema.unwrap_or(0.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_health_get_loss_ema_slope() -> f64 {
     COLLECTOR
         .lock()
@@ -119,7 +119,7 @@ pub extern "C" fn nsl_health_get_loss_ema_slope() -> f64 {
         .unwrap_or(0.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_health_get_grad_norm_total() -> f64 {
     COLLECTOR
         .lock()
@@ -129,7 +129,7 @@ pub extern "C" fn nsl_health_get_grad_norm_total() -> f64 {
         .unwrap_or(0.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_health_get_nan_inf_count_window() -> i64 {
     COLLECTOR.lock().unwrap().snapshot().nan_inf_count_window as i64
 }

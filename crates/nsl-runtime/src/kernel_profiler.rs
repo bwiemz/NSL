@@ -36,7 +36,7 @@ unsafe impl Sync for KernelProfiler {}
 
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-extern "C" {
+unsafe extern "C" {
     fn atexit(f: extern "C" fn()) -> i32;
 }
 
@@ -97,7 +97,7 @@ fn event_pool_size() -> usize {
 /// resulting events silently produce 0 ms elapsed time from
 /// `cuEventElapsedTime_v2`, which was the "profiler reports zero
 /// durations" bug.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kernel_profiler_start() {
     KERNEL_PROFILER.enabled.store(true, Ordering::Relaxed);
 
@@ -183,7 +183,7 @@ pub(crate) fn ensure_event_pool_initialized() {
 }
 
 /// Disable recording. Does not free resources (flush does that).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kernel_profiler_stop() {
     KERNEL_PROFILER.enabled.store(false, Ordering::Relaxed);
 }
@@ -432,7 +432,7 @@ fn destroy_event_pool() {
 /// FFI flush entry point. Calls GPU path if available, CPU fallback otherwise.
 /// # Safety
 /// `path_ptr` must point to valid UTF-8 bytes of length `path_len`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_kernel_profiler_flush(path_ptr: *const u8, path_len: i64) {
     let path = if path_ptr.is_null() || path_len <= 0 {
         "kernel_profile.json".to_string()

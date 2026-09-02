@@ -219,7 +219,7 @@ fn last_error() -> String {
 #[cfg(unix)]
 fn lib_last_error(lib: &str) -> String {
     use std::os::raw::c_int;
-    extern "C" {
+    unsafe extern "C" {
         fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     }

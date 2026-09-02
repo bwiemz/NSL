@@ -394,10 +394,10 @@ pub fn walk_expr(v: &mut impl Visitor, expr: &Expr) {
         }
         ExprKind::ListComp { element, generators } => {
             v.visit_expr(element);
-            for gen in generators {
-                v.visit_pattern(&gen.pattern);
-                v.visit_expr(&gen.iterable);
-                for cond in &gen.conditions {
+            for generator in generators {
+                v.visit_pattern(&generator.pattern);
+                v.visit_expr(&generator.iterable);
+                for cond in &generator.conditions {
                     v.visit_expr(cond);
                 }
             }

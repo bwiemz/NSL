@@ -245,7 +245,7 @@ impl Drop for PrefetchPipeline {
 /// `batch_size`: samples per batch.
 /// `num_workers`: I/O threads.
 /// Returns: pipeline handle (pointer), or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_data_prefetch_create(
     prefetch_depth: i64,
     batch_size: i64,
@@ -263,7 +263,7 @@ pub extern "C" fn nsl_data_prefetch_create(
 }
 
 /// Destroy a prefetch pipeline.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_data_prefetch_destroy(handle: i64) -> i64 {
     if handle == 0 { return -1; }
     let pipeline = unsafe { Box::from_raw(handle as *mut PrefetchPipeline) };

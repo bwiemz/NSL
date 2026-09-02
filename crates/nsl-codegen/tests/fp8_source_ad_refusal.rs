@@ -144,7 +144,7 @@ fn ensure_stdlib_path() {
             .parent()
             .and_then(|p| p.parent())
             .expect("workspace root above crates/nsl-codegen");
-        std::env::set_var("NSL_STDLIB_PATH", workspace_root.join("stdlib"));
+        unsafe { std::env::set_var("NSL_STDLIB_PATH", workspace_root.join("stdlib")) };
     }
 }
 

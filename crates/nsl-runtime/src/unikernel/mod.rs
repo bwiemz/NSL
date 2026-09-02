@@ -276,7 +276,7 @@ pub fn parse_boot_config(json: &str) -> BootConfig {
 /// `config_json_len`: length of the JSON string
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_init(config_json_ptr: i64, config_json_len: i64) -> i64 {
     serial_init();
     serial_puts("[nsl] Unikernel runtime initializing...\n");
@@ -320,7 +320,7 @@ pub extern "C" fn nsl_unikernel_init(config_json_ptr: i64, config_json_len: i64)
 /// Allocate from the model memory pool.
 ///
 /// Returns physical address or 0 on failure.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_model_alloc(size: i64, align: i64) -> i64 {
     if let Ok(pool) = MODEL_POOL.lock() {
         pool.alloc(size as u64, align.max(1) as u64) as i64
@@ -330,7 +330,7 @@ pub extern "C" fn nsl_unikernel_model_alloc(size: i64, align: i64) -> i64 {
 }
 
 /// Allocate from the KV-cache memory pool.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_kv_alloc(size: i64, align: i64) -> i64 {
     if let Ok(pool) = KV_CACHE_POOL.lock() {
         pool.alloc(size as u64, align.max(1) as u64) as i64
@@ -341,7 +341,7 @@ pub extern "C" fn nsl_unikernel_kv_alloc(size: i64, align: i64) -> i64 {
 
 /// Get model pool usage stats.
 /// Returns (used_bytes << 32) | free_bytes, or -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_model_pool_stats() -> i64 {
     if let Ok(pool) = MODEL_POOL.lock() {
         let used = pool.used() as i64;
@@ -353,7 +353,7 @@ pub extern "C" fn nsl_unikernel_model_pool_stats() -> i64 {
 }
 
 /// Shut down the unikernel runtime.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_shutdown() -> i64 {
     serial_puts("[nsl] Unikernel shutting down\n");
 

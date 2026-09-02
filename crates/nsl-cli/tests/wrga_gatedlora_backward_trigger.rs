@@ -749,9 +749,9 @@ fn wrga_b32_fused_trigger_final() {
             cfg.name, cfg.batch, cfg.seq, cfg.dim, cfg.rank, cfg.alpha
         ));
 
-        let run = |gen: &dyn Fn(&Config, u64) -> String, name: &str| -> Result<f64, String> {
-            let t3 = run_fused_and_wall_ms(&gen(cfg, 3), &format!("{name}_n3"))?;
-            let t13 = run_fused_and_wall_ms(&gen(cfg, 13), &format!("{name}_n13"))?;
+        let run = |generator: &dyn Fn(&Config, u64) -> String, name: &str| -> Result<f64, String> {
+            let t3 = run_fused_and_wall_ms(&generator(cfg, 3), &format!("{name}_n3"))?;
+            let t13 = run_fused_and_wall_ms(&generator(cfg, 13), &format!("{name}_n13"))?;
             Ok((t13 - t3) / 10.0)
         };
 
@@ -853,9 +853,9 @@ fn wrga_b32_unfused_side_measurement() {
             cfg.name, cfg.batch, cfg.seq, cfg.dim, cfg.rank, cfg.alpha
         ));
 
-        let run = |gen: &dyn Fn(&Config, u64) -> String, name: &str| -> Result<f64, String> {
-            let t3 = run_unfused_and_wall_ms(&gen(cfg, 3), &format!("{name}_n3"))?;
-            let t13 = run_unfused_and_wall_ms(&gen(cfg, 13), &format!("{name}_n13"))?;
+        let run = |generator: &dyn Fn(&Config, u64) -> String, name: &str| -> Result<f64, String> {
+            let t3 = run_unfused_and_wall_ms(&generator(cfg, 3), &format!("{name}_n3"))?;
+            let t13 = run_unfused_and_wall_ms(&generator(cfg, 13), &format!("{name}_n13"))?;
             Ok((t13 - t3) / 10.0)
         };
 

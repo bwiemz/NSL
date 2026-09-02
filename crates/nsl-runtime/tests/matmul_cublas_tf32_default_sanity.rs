@@ -36,18 +36,18 @@ use common::matmul_equiv as helper;
 fn setup_env_default() {
     // Inherit Cargo-feature default — clear any lingering env overrides.
     // SAFETY: single-threaded init (see matmul_cublas_equivalence.rs doc).
-    std::env::remove_var("NSL_MATMUL_PEDANTIC");
-    std::env::remove_var("NSL_MATMUL_TF32");
-    std::env::remove_var("NSL_MATMUL_BF16");
+    unsafe { std::env::remove_var("NSL_MATMUL_PEDANTIC") };
+    unsafe { std::env::remove_var("NSL_MATMUL_TF32") };
+    unsafe { std::env::remove_var("NSL_MATMUL_BF16") };
 }
 
 fn setup_env_force_tf32() {
     // Force TF32 regardless of Cargo feature — the canonical way to
     // exercise the TF32 dispatch path in a CI matrix that may flip
     // `strict-matmul` on and off.
-    std::env::remove_var("NSL_MATMUL_PEDANTIC");
-    std::env::remove_var("NSL_MATMUL_BF16");
-    std::env::set_var("NSL_MATMUL_TF32", "1");
+    unsafe { std::env::remove_var("NSL_MATMUL_PEDANTIC") };
+    unsafe { std::env::remove_var("NSL_MATMUL_BF16") };
+    unsafe { std::env::set_var("NSL_MATMUL_TF32", "1") };
 }
 
 /// Inherits the Cargo-feature default math mode.  Under default

@@ -216,14 +216,14 @@ impl<'a> TypeChecker<'a> {
                 let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
                 let prev = self.current_scope;
                 self.current_scope = scope;
-                for gen in generators {
-                    let iter_ty = self.check_expr(&gen.iterable);
+                for generator in generators {
+                    let iter_ty = self.check_expr(&generator.iterable);
                     let elem_ty = match &iter_ty {
                         Type::List(e) => *e.clone(),
                         _ => Type::Unknown,
                     };
-                    self.declare_pattern(&gen.pattern, &elem_ty);
-                    for cond in &gen.conditions {
+                    self.declare_pattern(&generator.pattern, &elem_ty);
+                    for cond in &generator.conditions {
                         self.check_expr(cond);
                     }
                 }

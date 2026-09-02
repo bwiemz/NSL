@@ -50,7 +50,7 @@ fn ensure_collector<'a>(
 }
 
 #[cfg(not(feature = "cuda"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_profile_kernel_begin(kernel_id: u32) {
     let t = now_ns();
     let mut guard = COLLECTOR.lock().unwrap();
@@ -58,7 +58,7 @@ pub extern "C" fn nsl_profile_kernel_begin(kernel_id: u32) {
 }
 
 #[cfg(not(feature = "cuda"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_profile_kernel_end(kernel_id: u32) {
     let t = now_ns();
     let mut guard = COLLECTOR.lock().unwrap();
@@ -66,7 +66,7 @@ pub extern "C" fn nsl_profile_kernel_end(kernel_id: u32) {
 }
 
 #[cfg(feature = "cuda")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_profile_kernel_begin(kernel_id: u32) {
     let event = CUDA_CLOCK.checkout_event();
     if event != 0 {
@@ -85,7 +85,7 @@ pub extern "C" fn nsl_profile_kernel_begin(kernel_id: u32) {
 }
 
 #[cfg(feature = "cuda")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_profile_kernel_end(kernel_id: u32) {
     let event = CUDA_CLOCK.checkout_event();
     if event != 0 {
@@ -107,7 +107,7 @@ pub extern "C" fn nsl_profile_kernel_end(kernel_id: u32) {
 /// # Safety
 /// Caller must ensure `(path_ptr, path_len)` is a valid UTF-8 slice they own
 /// for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_profile_flush(path_ptr: *const u8, path_len: usize) -> i32 {
     if path_ptr.is_null() {
         return 1;

@@ -17,7 +17,7 @@ fn extract_msg(ptr: i64, len: i64) -> &'static str {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_assert(condition: i8, message: i64) {
     if condition == 0 {
         let msg = if message != 0 {
@@ -32,7 +32,7 @@ pub extern "C" fn nsl_assert(condition: i8, message: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_assert_eq_int(a: i64, b: i64, msg_ptr: i64, msg_len: i64) {
     if a != b {
         let msg = extract_msg(msg_ptr, msg_len);
@@ -41,7 +41,7 @@ pub extern "C" fn nsl_assert_eq_int(a: i64, b: i64, msg_ptr: i64, msg_len: i64) 
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_assert_eq_float(a: f64, b: f64, msg_ptr: i64, msg_len: i64) {
     if a != b {
         let msg = extract_msg(msg_ptr, msg_len);
@@ -50,7 +50,7 @@ pub extern "C" fn nsl_assert_eq_float(a: f64, b: f64, msg_ptr: i64, msg_len: i64
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_assert_close(
     a_ptr: i64,
     b_ptr: i64,
@@ -107,7 +107,7 @@ pub extern "C" fn nsl_assert_close(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_exit(code: i64) {
     std::process::exit(code as i32);
 }

@@ -145,7 +145,7 @@ pub fn profiler_utilization() -> f64 {
 /// Start the profiler, resetting all counters and events.
 ///
 /// `total_blocks` is the size of the block pool (used for utilization ratio).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_profiler_start(total_blocks: i64) {
     // Reset all counters.
     PROFILER.current_blocks.store(0, Ordering::Relaxed);
@@ -187,7 +187,7 @@ pub extern "C" fn nsl_profiler_start(total_blocks: i64) {
             }
         }
         // SAFETY: dump_on_exit is an extern "C" fn with the correct atexit signature.
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(callback: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -197,7 +197,7 @@ pub extern "C" fn nsl_profiler_start(total_blocks: i64) {
 }
 
 /// Stop the profiler.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_profiler_stop() {
     PROFILER.enabled.store(false, Ordering::Release);
 }
@@ -206,7 +206,7 @@ pub extern "C" fn nsl_profiler_stop() {
 ///
 /// # Safety
 /// `path_ptr` must point to `path_len` valid bytes of UTF-8 text.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_profiler_dump(path_ptr: *const u8, path_len: i64) {
     let path_str = {
         let slice = unsafe { std::slice::from_raw_parts(path_ptr, path_len as usize) };
@@ -263,7 +263,7 @@ pub unsafe extern "C" fn nsl_profiler_dump(path_ptr: *const u8, path_len: i64) {
 }
 
 /// Return the peak number of simultaneously-allocated blocks.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_profiler_peak() -> i64 {
     profiler_peak() as i64
 }

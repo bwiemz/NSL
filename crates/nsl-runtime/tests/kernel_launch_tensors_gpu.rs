@@ -22,7 +22,7 @@ use nsl_runtime::tensor::{
 // `nsl_kernel_launch_tensors` is `#[no_mangle] pub extern "C"` in nsl-runtime,
 // but the `cuda` module is `pub(crate)`, so link against the C symbol directly
 // (same pattern the tier_b GPU tests use for `nsl_kernel_launch`).
-extern "C" {
+unsafe extern "C" {
     fn nsl_kernel_launch_tensors(
         ptx_ptr: i64,
         name_ptr: i64,

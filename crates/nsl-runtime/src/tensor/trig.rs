@@ -9,7 +9,7 @@ use crate::memory::checked_alloc;
 
 use super::{NslTensor, nsl_tensor_contiguous, nsl_tensor_free};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -73,7 +73,7 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };

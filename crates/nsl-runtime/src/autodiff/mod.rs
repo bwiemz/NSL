@@ -266,7 +266,7 @@ pub fn test_drain_tape_and_params() -> (Vec<TapeOp>, Vec<i64>) {
 /// `pause_depth` or `ops` — call `test_drain_tape_and_params` first
 /// (or after) if a fully-clean state is required.
 #[cfg(feature = "test-hooks")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn test_set_recording(on: bool) {
     TAPE.with(|t| t.borrow_mut().recording = on);
 }
@@ -421,7 +421,7 @@ pub fn maybe_record(mut op: TapeOp) {
 
 /// Start recording operations on the tape.
 /// `param_list` is an i64 pointer to an NslList of tensor pointers that are parameters.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tape_start(param_list: i64) {
     // Pre-flight CUDA health check — surface any deferred errors before recording ops
     #[cfg(feature = "cuda")]
@@ -560,7 +560,7 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
 
 /// Stop recording and clean up saved tensor refcounts.
 /// This prevents memory leaks even if backward is never called.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tape_stop() {
     // Two phases: release refs/collect the deferred list under the borrow,
     // then free the deferred transients AFTER dropping it — a free can
@@ -587,7 +587,7 @@ pub extern "C" fn nsl_tape_stop() {
 }
 
 /// Pause recording (used by @no_grad). Increments pause depth.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tape_pause() {
     TAPE.with(|t| {
         t.borrow_mut().pause_depth += 1;
@@ -595,7 +595,7 @@ pub extern "C" fn nsl_tape_pause() {
 }
 
 /// Resume recording after a pause. Decrements pause depth.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tape_resume() {
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
@@ -643,7 +643,7 @@ pub(crate) fn call_with_args(fn_ptr: usize, args: &[i64]) -> i64 {
 /// `args_list`: NslList of all arguments (tensor ptrs and non-tensor i64 values)
 /// `tensor_mask`: bitmask where bit i indicates args_list[i] is a tensor pointer
 /// `output`: the output tensor pointer from the forward call
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_checkpoint_record(fn_ptr: i64, args_list: i64, tensor_mask: i64, output: i64) {
     if !is_recording() { return; }
 

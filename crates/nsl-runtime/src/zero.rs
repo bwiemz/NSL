@@ -174,7 +174,7 @@ pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64, u64, u64) {
 /// tensor). A null pointer (the non-owned placeholder) contributes nothing,
 /// so a mis-wired gate that noted non-owned slots would over-count and trip
 /// the G3 gate. Returns the running total (for tests/debug).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_note_optim_alloc(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed) as i64;
@@ -193,7 +193,7 @@ pub extern "C" fn nsl_zero_note_optim_alloc(tensor_ptr: i64) -> i64 {
 /// here means the moment allocation itself failed rather than that this rank
 /// legitimately skipped it — it still contributes nothing, matching its
 /// sibling's convention.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_note_replicated_optim_alloc(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return ZERO_REPL_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed) as i64;
@@ -330,7 +330,7 @@ fn make_sim_gpu_backend(
 /// exists in this build).
 /// Returns 0 on success, -1 already-initialized/invalid, -2 refused, -3
 /// missing shm path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
     let mut guard = ZERO_CTX.lock().unwrap();
     if guard.is_some() {
@@ -482,7 +482,7 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
 /// Partition parameters for ZeRO. Uses round-robin partitioning (index-blind
 /// fallback — codegen emits `nsl_zero_partition_bytes` instead).
 /// Returns the number of parameters this rank owns, or -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_partition(num_params: i64) -> i64 {
     let mut guard = ZERO_CTX.lock().unwrap();
     let Some(ctx) = guard.as_mut() else {
@@ -514,7 +514,7 @@ pub extern "C" fn nsl_zero_partition(num_params: i64) -> i64 {
 /// work and moment memory track ~1/N in BYTES, not tensor count. A null list
 /// slot contributes size 0 (still assigned an owner, for total coverage).
 /// Returns the number of parameters this rank owns, or -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_partition_bytes(params_list_ptr: i64, num_params: i64) -> i64 {
     let mut guard = ZERO_CTX.lock().unwrap();
     let Some(ctx) = guard.as_mut() else {
@@ -657,7 +657,7 @@ fn verify_plan_across_ranks(ctx: &ZeROContext, sizes: &[u64]) -> bool {
 
 /// Check if this rank owns the given parameter index.
 /// Returns 1 if owned, 0 if not, -1 if ZeRO not initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_owns_param(param_idx: i64) -> i64 {
     let guard = ZERO_CTX.lock().unwrap();
     let Some(ctx) = guard.as_ref() else {
@@ -699,7 +699,7 @@ pub extern "C" fn nsl_zero_owns_param(param_idx: i64) -> i64 {
 /// `--zero-stage` whose `nsl_zero_init` had failed would zero every
 /// accumulator, update nothing, and train silently forever. There is no
 /// configuration in which that is correct, so this aborts instead.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_owned_step_indices(accum_list: i64, num_params: i64) -> i64 {
     let n = num_params.max(0);
     // Snapshot ownership under the lock, then release it: the zero-fill below
@@ -1299,7 +1299,7 @@ fn broadcast_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], owner: i32) ->
 /// `grads_list_ptr`: pointer to an NslList of gradient tensors.
 /// `num_params`: number of gradient tensors in the list.
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) -> i64 {
     let guard = ZERO_CTX.lock().unwrap();
     let Some(ctx) = guard.as_ref() else {
@@ -1624,7 +1624,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
 /// are updated locally.
 ///
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_step() -> i64 {
     let guard = ZERO_CTX.lock().unwrap();
     let Some(ctx) = guard.as_ref() else {
@@ -1654,7 +1654,7 @@ pub extern "C" fn nsl_zero_step() -> i64 {
 /// list (identical collective sequence — the spin-barrier deadlocks
 /// otherwise). CPU f64/f32 broadcast in place; GPU f32 stages through the
 /// host. Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) -> i64 {
     let guard = ZERO_CTX.lock().unwrap();
     let Some(ctx) = guard.as_ref() else {
@@ -1896,7 +1896,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
 }
 
 /// Destroy ZeRO context. Returns 0 on success, -1 if not initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero_destroy() -> i64 {
     let mut guard = ZERO_CTX.lock().unwrap();
     if guard.is_none() {
@@ -1927,7 +1927,7 @@ pub extern "C" fn nsl_zero_destroy() -> i64 {
 /// both pointers to f64 blindly, which read out of bounds whenever `src`
 /// was narrower than 8 bytes per element.
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_accumulate_add(
     dst_ptr: i64,
     src_ptr: i64,
@@ -2039,7 +2039,7 @@ pub extern "C" fn nsl_grad_accumulate_add(
 /// on the param's device) are zeroed with a device memset, mirroring
 /// `nsl_tensor_zero_inplace`. Zeroing is dtype-agnostic byte clearing.
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
     let tensor_ptr = grad_ptr as *mut NslTensor;
     if tensor_ptr.is_null() {
@@ -2098,7 +2098,7 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
 /// a single-process all-reduce is the identity, and real multi-process
 /// NCCL collectives are M43b work (see nsl_zero_reduce_grads).
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_all_reduce(_grad_ptr: i64, _num_elems: i64) -> i64 {
     // Single-process: no-op (gradient is already the full gradient).
     // Multi-process would call all_reduce_sum on this single tensor.
@@ -2279,7 +2279,7 @@ static ZERO3_SR_ELEM_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static ZERO3_ELEM_MOMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Codegen calls this once per train block when `--zero-stage 3` is baked.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_enable() -> i64 {
     ZERO3_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut guard = ZERO3_TABLE.lock().unwrap();
@@ -2303,7 +2303,7 @@ pub(crate) fn zero3_active() -> bool {
 /// Map a parameter tensor pointer to its param-list index (owners come
 /// from the stage-1/2 partition). Emitted right after
 /// `nsl_zero_partition_bytes` for every param.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_note_param(tensor_ptr: i64, idx: i64) -> i64 {
     if tensor_ptr == 0 || idx < 0 {
         return -1;
@@ -2350,7 +2350,7 @@ pub extern "C" fn nsl_zero3_note_param(tensor_ptr: i64, idx: i64) -> i64 {
 /// tensor. The SR counter block is `idx` — the same value
 /// `nsl_sr_bf16_note_param` records for the mirror path, which is what makes
 /// a composed slice's dither stream identical to the baseline's.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64) -> i64 {
     let ws = {
         let guard = ZERO_CTX.lock().unwrap();
@@ -2432,7 +2432,7 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
 /// Returns a fresh 1-D `[shard]` tensor owned by the caller (codegen stores
 /// it in the moment list; the end-of-train free loop releases it through
 /// `nsl_tensor_free` like every other moment).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
     if theta_ptr == 0 {
         eprintln!(
@@ -2527,7 +2527,7 @@ pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
 
 /// Item 12 introspection (tests/diagnostics): residency of this rank's
 /// replica as the enum's i64 value; -1 = untracked pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_residency(tensor_ptr: i64) -> i64 {
     let guard = ZERO3_TABLE.lock().unwrap();
     guard
@@ -2538,11 +2538,11 @@ pub extern "C" fn nsl_zero3_residency(tensor_ptr: i64) -> i64 {
 }
 
 /// Gather / release counters (gate anti-vacuity probes).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_gather_count() -> i64 {
     ZERO3_GATHERS.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_release_count() -> i64 {
     ZERO3_RELEASES.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
@@ -3054,7 +3054,7 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
 /// point where source AD has just completed that layer's backward. Every
 /// rank calls this in the identical compile-time order (the spin-barrier
 /// invariant). The slot is the layer's m_partial accumulator tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
     let list = unsafe { &*(list_ptr as *const crate::list::NslList) };
     if idx < 0 || idx >= list.len {
@@ -3290,7 +3290,7 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
 /// full buffer whose other elements were dead weight on every rank.
 ///
 /// The scalar argument order mirrors `nsl_fase_fused_adamw_step` exactly.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_zero3_elem_adamw_step(
     theta_ptr: i64,
@@ -3582,7 +3582,7 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
 /// counter base. Re-adding it to the moment pointers would read a
 /// rank-1 shard's worth of bytes past the end of a `shard`-sized
 /// allocation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
     theta_ptr: i64,
@@ -3900,7 +3900,7 @@ pub(crate) fn zero3_is_registered(tensor_ptr: i64) -> bool {
 /// Teardown: leave every replica FULL and CURRENT (the model_save /
 /// eval-read end state, matching stages 1/2), then deactivate so
 /// subsequent code paths see plain tensors.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_teardown() -> i64 {
     if zero3_active() {
         zero3_gather_all();

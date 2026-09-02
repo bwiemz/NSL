@@ -59,7 +59,7 @@
 use nsl_runtime::nsl_cuda_init;
 
 // Entry points under test. All are `pub extern "C"` in the runtime.
-extern "C" {
+unsafe extern "C" {
     fn nsl_tensor_from_static(data_ptr: i64, shape_list: i64, dtype: i64) -> i64;
     fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i64;
     fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64;

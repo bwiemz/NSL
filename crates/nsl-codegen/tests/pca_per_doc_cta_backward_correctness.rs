@@ -40,7 +40,7 @@ use nsl_runtime::{
     nsl_test_cuda_h2d, nsl_test_cuda_d2h, nsl_test_cuda_jit_log,
 };
 
-extern "C" {
+unsafe extern "C" {
     fn nsl_kernel_launch(
         ptx_ptr: i64, name_ptr: i64,
         grid_x: i64, grid_y: i64, grid_z: i64,

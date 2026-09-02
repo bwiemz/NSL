@@ -1116,14 +1116,14 @@ mod tests {
     #[test]
     fn kill_switch_disables() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("NSL_FUSE_ELEMENTWISE_BWD", "0");
+        unsafe { std::env::set_var("NSL_FUSE_ELEMENTWISE_BWD", "0") };
         let mut ops = adjoint(vec![
             op(10, PrimalOp::Mul, vec![0, 1]),
             op(11, PrimalOp::Add, vec![10, 2]),
         ]);
         let needed: HashSet<VarId> = [11].into_iter().collect();
         let stats = run_backward_ew_fusion(&mut ops, &needed, &no_types());
-        std::env::remove_var("NSL_FUSE_ELEMENTWISE_BWD");
+        unsafe { std::env::remove_var("NSL_FUSE_ELEMENTWISE_BWD") };
         assert_eq!(stats.chains, 0);
         assert_eq!(ops.len(), 2);
     }

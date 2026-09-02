@@ -186,7 +186,7 @@ pub(crate) fn srbf16_active() -> bool {
 
 /// Emitted at train-block setup when `--param-dtype bf16-sr` is on.
 /// Idempotent and quiet on re-entry (the register belts run every step).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_enable() {
     if !SRBF16_ACTIVE.swap(true, Ordering::Relaxed) {
         eprintln!(
@@ -198,7 +198,7 @@ pub extern "C" fn nsl_sr_bf16_enable() {
 
 /// Emitted per parameter before its first weight-stream registration:
 /// assigns the stable SR counter block (`param_idx << SR_PARAM_SHIFT`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_note_param(tensor_ptr: i64, param_idx: i64) {
     let mut guard = SRBF16_PENDING_IDX.lock().unwrap();
     guard
@@ -206,12 +206,12 @@ pub extern "C" fn nsl_sr_bf16_note_param(tensor_ptr: i64, param_idx: i64) {
         .insert(tensor_ptr, param_idx as u64);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_step_count() -> i64 {
     SRBF16_STEPS.load(Ordering::Relaxed) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_registered_count() -> i64 {
     let guard = SRBF16_TABLE.lock().unwrap();
     guard.as_ref().map_or(0, |g| g.len() as i64)
@@ -425,7 +425,7 @@ pub(crate) fn srbf16_evict_all() {
 /// Train-block teardown: re-materialize every param as an ordinary owned
 /// f32 device tensor (post-training code — model_save, eval — sees plain
 /// tensors), report anti-vacuity counters, free the mirrors, drop the mode.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_teardown() {
     // Item 7: certification histograms ride the teardown so every SR run
     // that ends cleanly reports them (no-op unless NSL_SR_HIST=1).
@@ -553,7 +553,7 @@ fn sr_hist_record(before: &[u16], after: &[u16]) {
 }
 
 /// Print the histogram (teardown, and callable from gates).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_hist_report() {
     if !sr_hist_enabled() {
         return;
@@ -594,7 +594,7 @@ pub extern "C" fn nsl_sr_bf16_hist_report() {
 /// bc1/bc2 precomputed by codegen); adds `step` (the optimizer step counter
 /// the SR stream is keyed on). Seed comes from the global `--seed` store.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_step_adamw(
     theta_ptr: i64,
     m_ptr: i64,
@@ -734,7 +734,7 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
 /// `mp_scale` is deliberately ABSENT from this contract: the per-param SR
 /// entry has no clip fold, and a silent extra capability here would let the
 /// batched and per-param paths diverge under a future clip composition.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fase_fused_adamw_step_bf16sr_multi_idx(
     params_list: i64,
@@ -1035,7 +1035,7 @@ pub const SR_MUON_STATE_SALT: u64 = 0xA5A5_5A5A_C3C3_3C3C;
 /// Anti-vacuity counter: SR stores of the bf16 momentum.
 pub static MUON_STATE_SR_STORES: AtomicU64 = AtomicU64::new(0);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_muon_state_sr_count() -> i64 {
     MUON_STATE_SR_STORES.load(Ordering::Relaxed) as i64
 }
@@ -1047,7 +1047,7 @@ pub extern "C" fn nsl_muon_state_sr_count() -> i64 {
 /// nearest-rounding would drop it systematically, SR preserves it in
 /// expectation. Same mixer as the weight stream, decorrelated by
 /// `SR_MUON_STATE_SALT`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_muon_state_sr_store(
     src_f32_ptr: i64,
     dst_bf16_ptr: i64,

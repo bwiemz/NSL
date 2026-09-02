@@ -40,9 +40,9 @@ fn setup_env() {
     // `--features strict-matmul` both NSL_MATMUL vars unset still
     // resolves to Pedantic, which is fine for this test.
     // SAFETY: single-threaded init (see file doc-comment).
-    std::env::remove_var("NSL_MATMUL_TF32");
-    std::env::remove_var("NSL_MATMUL_BF16");
-    std::env::set_var("NSL_MATMUL_PEDANTIC", "1");
+    unsafe { std::env::remove_var("NSL_MATMUL_TF32") };
+    unsafe { std::env::remove_var("NSL_MATMUL_BF16") };
+    unsafe { std::env::set_var("NSL_MATMUL_PEDANTIC", "1") };
 }
 
 /// The full 10-shape matrix (sans Llama) under strict-f32 at 1e-5 rel.

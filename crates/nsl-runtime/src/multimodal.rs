@@ -68,7 +68,7 @@ unsafe fn f32_data_mut(ptr: i64) -> &'static mut [f32] {
 /// weight_ptr: [patch_dim, embed_dim] f32 tensor
 /// patch_size: patch height/width (square patches)
 /// Returns [B, num_patches, embed_dim] f32 tensor, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_patch_embed(img_ptr: i64, weight_ptr: i64, patch_size: i64) -> i64 {
     if img_ptr == 0 || weight_ptr == 0 || patch_size <= 0 { return 0; }
     let img = unsafe { &*(img_ptr as *const NslTensor) };
@@ -131,7 +131,7 @@ pub extern "C" fn nsl_patch_embed(img_ptr: i64, weight_ptr: i64, patch_size: i64
 // ---------------------------------------------------------------------------
 
 /// Bilinear interpolation resize: [B, C, H, W] -> [B, C, target_h, target_w].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_image_resize(img_ptr: i64, target_h: i64, target_w: i64) -> i64 {
     if img_ptr == 0 || target_h <= 0 || target_w <= 0 { return 0; }
     let img = unsafe { &*(img_ptr as *const NslTensor) };
@@ -189,7 +189,7 @@ pub extern "C" fn nsl_image_resize(img_ptr: i64, target_h: i64, target_w: i64) -
 
 /// Per-channel normalization: out = (img - mean) / std.
 /// img_ptr: [B, C, H, W], mean_ptr/std_ptr: [C] tensors.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_image_normalize(img_ptr: i64, mean_ptr: i64, std_ptr: i64) -> i64 {
     if img_ptr == 0 || mean_ptr == 0 || std_ptr == 0 { return 0; }
     let img = unsafe { &*(img_ptr as *const NslTensor) };
@@ -230,7 +230,7 @@ pub extern "C" fn nsl_image_normalize(img_ptr: i64, mean_ptr: i64, std_ptr: i64)
 /// q_ptr: [B, Sq, D], k_ptr: [B, Sk, D], v_ptr: [B, Sk, D]
 /// num_heads: number of attention heads (D must be divisible by num_heads)
 /// Returns [B, Sq, D].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cross_attention(
     q_ptr: i64, k_ptr: i64, v_ptr: i64, num_heads: i64,
 ) -> i64 {
@@ -305,7 +305,7 @@ pub extern "C" fn nsl_cross_attention(
 /// Short-time Fourier transform with Hann window.
 /// audio_ptr: [B, T] f32 tensor
 /// Returns [B, n_freq, n_frames, 2] (real + imag) or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_stft(audio_ptr: i64, n_fft: i64, hop_length: i64) -> i64 {
     if audio_ptr == 0 || n_fft <= 0 || hop_length <= 0 { return 0; }
     let at = unsafe { &*(audio_ptr as *const NslTensor) };
@@ -362,7 +362,7 @@ pub extern "C" fn nsl_stft(audio_ptr: i64, n_fft: i64, hop_length: i64) -> i64 {
 /// Assumes 16 kHz audio — the filterbank frequency grid is built against that
 /// rate. For any other rate use `nsl_mel_spectrogram_sr`, or the mel bins land
 /// at the wrong frequencies (silently, since the output shape is identical).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_mel_spectrogram(
     audio_ptr: i64, n_fft: i64, hop_length: i64, n_mels: i64,
 ) -> i64 {
@@ -372,7 +372,7 @@ pub extern "C" fn nsl_mel_spectrogram(
 /// Mel spectrogram with an explicit sample rate (Hz). Same output contract as
 /// `nsl_mel_spectrogram`; refuses (returns 0) on a non-positive sample rate,
 /// matching this file's error convention.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_mel_spectrogram_sr(
     audio_ptr: i64, n_fft: i64, hop_length: i64, n_mels: i64, sample_rate: i64,
 ) -> i64 {
@@ -458,7 +458,7 @@ fn mel_spectrogram_impl(
 // ---------------------------------------------------------------------------
 
 /// Linear interpolation audio resampling: [B, T] -> [B, T_new].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_audio_resample(audio_ptr: i64, orig_sr: i64, target_sr: i64) -> i64 {
     if audio_ptr == 0 || orig_sr <= 0 || target_sr <= 0 { return 0; }
     let at = unsafe { &*(audio_ptr as *const NslTensor) };

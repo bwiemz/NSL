@@ -54,7 +54,7 @@ thread_local! {
     static RNG: RefCell<ChaCha12Rng> = RefCell::new(ChaCha12Rng::seed_from_u64(0));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_manual_seed(seed: i64) {
     RNG.with(|r| {
         *r.borrow_mut() = ChaCha12Rng::seed_from_u64(seed as u64);
@@ -93,7 +93,7 @@ pub fn rng_restore(seed: [u8; 32], pos: u128) {
 /// Returns a dict with keys "values" and "indices" (both tensors).
 /// `dim` supports negative indexing. Output shape = input shape with `dim`
 /// replaced by `k`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
     // Host-side implementation: stage GPU inputs on the CPU and upload both
     // result tensors before the dict is built. The dict wraps two tensors,
@@ -232,7 +232,7 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
 /// Returns a tensor of sampled indices (as f64).
 /// For 1D input of shape [n], returns shape [num_samples].
 /// For 2D input of shape [batch, n], returns shape [batch, num_samples].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device != 0 {
@@ -318,7 +318,7 @@ pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i
 /// Returns the index of the maximum value along dimension `dim`.
 /// Output shape = input shape with dim d removed.
 /// For 1D input, returns shape [1].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device != 0 {
@@ -403,7 +403,7 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Cumulative sum along dimension `dim`. Output same shape as input.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cumsum(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device != 0 {
@@ -479,7 +479,7 @@ pub extern "C" fn nsl_tensor_cumsum(tensor_ptr: i64, dim: i64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Element-wise `< scalar` comparison. Returns 1.0 where true, 0.0 otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_lt_scalar(tensor_ptr: i64, scalar: f64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device != 0 {

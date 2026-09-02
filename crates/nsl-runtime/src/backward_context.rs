@@ -55,7 +55,7 @@ impl BackwardContext {
 /// Create a new backward context with the given number of saved tensor slots.
 /// Returns an opaque handle (i64). The handle must be passed to all subsequent
 /// save/load/free calls. Multiple contexts can exist concurrently.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_backward_ctx_new(num_slots: i64) -> i64 {
     let ctx = Box::new(BackwardContext::new(num_slots as usize));
     Box::into_raw(ctx) as i64
@@ -63,7 +63,7 @@ pub extern "C" fn nsl_backward_ctx_new(num_slots: i64) -> i64 {
 
 /// Save a tensor pointer in the given slot of the specified context.
 /// Returns 0 on success, -1 if handle is null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_backward_ctx_save(ctx_handle: i64, slot: i64, tensor_ptr: i64) -> i64 {
     if ctx_handle == 0 { return -1; }
     let ctx = unsafe { &mut *(ctx_handle as *mut BackwardContext) };
@@ -73,7 +73,7 @@ pub extern "C" fn nsl_backward_ctx_save(ctx_handle: i64, slot: i64, tensor_ptr: 
 
 /// Load a tensor pointer from the given slot of the specified context.
 /// Returns the tensor pointer, or 0 if slot is empty/invalid or handle is null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_backward_ctx_load(ctx_handle: i64, slot: i64) -> i64 {
     if ctx_handle == 0 { return 0; }
     let ctx = unsafe { &*(ctx_handle as *const BackwardContext) };
@@ -82,7 +82,7 @@ pub extern "C" fn nsl_backward_ctx_load(ctx_handle: i64, slot: i64) -> i64 {
 
 /// Destroy the backward context and free all saved references.
 /// Returns 0 on success, -1 if handle is null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_backward_ctx_free(ctx_handle: i64) -> i64 {
     if ctx_handle == 0 { return -1; }
     unsafe { drop(Box::from_raw(ctx_handle as *mut BackwardContext)); }

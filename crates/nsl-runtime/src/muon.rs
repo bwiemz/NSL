@@ -54,15 +54,14 @@ fn cpu_frobenius_scale(x_ptr: i64) -> i64 {
     let s = {
         let t = NslTensor::from_ptr(s_t);
         // 0-d/1-element reduction result in the tensor's native dtype.
-        let v = match t.dtype {
+        match t.dtype {
             0 => unsafe { *(t.data as *const f64) },
             1 => f64::from(unsafe { *(t.data as *const f32) }),
             other => {
                 eprintln!("nsl: muon_orthogonalize unsupported dtype {other}");
                 std::process::abort();
             }
-        };
-        v
+        }
     };
     nsl_tensor_free(s_t);
     drop(reduce);
@@ -77,7 +76,7 @@ fn cpu_frobenius_scale(x_ptr: i64) -> i64 {
 /// `ns_steps` arrives as f64 (the stdlib threads it as float) and must be a
 /// positive whole number — codegen validates the literal, this re-checks
 /// defensively.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_muon_orthogonalize(g_ptr: i64, ns_steps: f64) -> i64 {
     let g = NslTensor::from_ptr(g_ptr);
     if g.ndim != 2 {

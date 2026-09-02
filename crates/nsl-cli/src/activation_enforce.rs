@@ -66,7 +66,9 @@ fn requested_long_flags_from(args: impl Iterator<Item = String>) -> Vec<String> 
 /// spelling in the tree (review found three pasted copies).
 pub(crate) fn apply_allow_unknown_decorators(enabled: bool) {
     if enabled {
-        std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1");
+        // SAFETY: called from `check`/`run`/`build` argument handling, before
+        // any thread other than `nsl-main` exists (main is parked in `join`).
+        unsafe { std::env::set_var("NSL_ALLOW_UNKNOWN_DECORATORS", "1") };
     }
 }
 

@@ -242,7 +242,7 @@ static DISAGG_CTX: Mutex<Option<DisaggregatedRouter>> = Mutex::new(None);
 /// Read NSL_ROLE env var and return a role code.
 /// Returns: 0 = router, 1 = prefill, 2 = decode.
 /// Used by codegen for role dispatch branching (avoids string ops in Cranelift IR).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_get_role() -> i64 {
     match std::env::var("NSL_ROLE").as_deref() {
         Ok("router") => 0,
@@ -254,7 +254,7 @@ pub extern "C" fn nsl_disagg_get_role() -> i64 {
 
 /// Read NSL_LOCAL_RANK env var and return the rank.
 /// Returns the integer rank (default 0).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_get_rank() -> i64 {
     std::env::var("NSL_LOCAL_RANK")
         .ok()
@@ -271,7 +271,7 @@ pub extern "C" fn nsl_disagg_get_rank() -> i64 {
 /// - kv_blocks: KV blocks per decode worker
 ///
 /// Returns 0 on success, -1 if already initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_init(
     num_prefill: i64,
     num_decode: i64,
@@ -297,7 +297,7 @@ pub extern "C" fn nsl_disagg_init(
 }
 
 /// Enqueue a request to the router. Returns the request ID.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_enqueue() -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -311,7 +311,7 @@ pub extern "C" fn nsl_disagg_enqueue() -> i64 {
 }
 
 /// Select a prefill worker for the next request. Returns the worker rank, or -1 if none.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_select_prefill() -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -325,7 +325,7 @@ pub extern "C" fn nsl_disagg_select_prefill() -> i64 {
 }
 
 /// Select a decode worker. Returns the worker rank, or -1 if none.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_select_decode(kv_blocks_needed: i64) -> i64 {
     let guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -339,7 +339,7 @@ pub extern "C" fn nsl_disagg_select_decode(kv_blocks_needed: i64) -> i64 {
 }
 
 /// Mark a request as prefilling on the given worker.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_mark_prefilling(request_id: i64, prefill_rank: i64) -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -354,7 +354,7 @@ pub extern "C" fn nsl_disagg_mark_prefilling(request_id: i64, prefill_rank: i64)
 }
 
 /// Mark a request as decoding on the given worker, reserving kv_blocks_used blocks.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_mark_decoding(request_id: i64, decode_rank: i64, kv_blocks_used: i64) -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -369,7 +369,7 @@ pub extern "C" fn nsl_disagg_mark_decoding(request_id: i64, decode_rank: i64, kv
 }
 
 /// Record a generated token for a request.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_record_token(request_id: i64, _token_id: i64) -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -384,7 +384,7 @@ pub extern "C" fn nsl_disagg_record_token(request_id: i64, _token_id: i64) -> i6
 }
 
 /// Mark a request as complete.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_mark_complete(request_id: i64, total_tokens: i64) -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -399,7 +399,7 @@ pub extern "C" fn nsl_disagg_mark_complete(request_id: i64, total_tokens: i64) -
 }
 
 /// Returns the number of queued requests.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_queued_count() -> i64 {
     let guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -413,7 +413,7 @@ pub extern "C" fn nsl_disagg_queued_count() -> i64 {
 }
 
 /// Returns the number of active (in-flight) requests.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_active_count() -> i64 {
     let guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -427,7 +427,7 @@ pub extern "C" fn nsl_disagg_active_count() -> i64 {
 }
 
 /// Returns the number of completed requests.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_completed_count() -> i64 {
     let guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
@@ -441,7 +441,7 @@ pub extern "C" fn nsl_disagg_completed_count() -> i64 {
 }
 
 /// Destroy the disaggregated router context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_destroy() -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,

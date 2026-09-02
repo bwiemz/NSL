@@ -59,7 +59,7 @@ pub(crate) fn open_shm(path: &str) -> (*mut u8, usize) {
 /// - `NSL_TP_SHM_PATH`  — path to the shared-memory file (required when world_size > 1)
 ///
 /// Returns 0 on success, -1 if already initialised.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_init() -> i64 {
     let rank: i32 = std::env::var("NSL_LOCAL_RANK")
         .ok()
@@ -114,7 +114,7 @@ pub extern "C" fn nsl_tp_init() -> i64 {
 }
 
 /// Returns this process's tensor-parallel rank.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_rank() -> i64 {
     let guard = TP_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_tp_init not called");
@@ -122,7 +122,7 @@ pub extern "C" fn nsl_tp_rank() -> i64 {
 }
 
 /// Returns the tensor-parallel world size.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_world_size() -> i64 {
     let guard = TP_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_tp_init not called");
@@ -138,7 +138,7 @@ pub extern "C" fn nsl_tp_world_size() -> i64 {
 /// - `stream` — CUDA stream handle (0/null for CPU)
 ///
 /// Returns 0 on success, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_all_reduce_sum(
     sendbuf: i64,
     recvbuf: i64,
@@ -162,7 +162,7 @@ pub extern "C" fn nsl_tp_all_reduce_sum(
 ///
 /// Total elements in recvbuf = send_count * world_size.
 /// Returns 0 on success, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_all_gather(
     sendbuf: i64,
     recvbuf: i64,
@@ -185,7 +185,7 @@ pub extern "C" fn nsl_tp_all_gather(
 /// Broadcast `count` elements from `root_rank` to all ranks.
 ///
 /// Returns 0 on success, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_broadcast(
     buf: i64,
     count: i64,
@@ -208,7 +208,7 @@ pub extern "C" fn nsl_tp_broadcast(
 /// Block until all ranks have reached this point.
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_barrier() -> i64 {
     let guard = TP_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_tp_init not called");
@@ -218,7 +218,7 @@ pub extern "C" fn nsl_tp_barrier() -> i64 {
 /// Tear down the tensor-parallelism context and release resources.
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tp_destroy() -> i64 {
     let mut guard = TP_CTX.lock().unwrap();
     *guard = None;
@@ -243,10 +243,10 @@ mod tests {
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = TEST_LOCK.lock().unwrap();
         nsl_tp_destroy();
-        std::env::remove_var("NSL_LOCAL_RANK");
-        std::env::remove_var("NSL_WORLD_SIZE");
-        std::env::remove_var("NSL_SIMULATED_TP");
-        std::env::remove_var("NSL_TP_SHM_PATH");
+        unsafe { std::env::remove_var("NSL_LOCAL_RANK") };
+        unsafe { std::env::remove_var("NSL_WORLD_SIZE") };
+        unsafe { std::env::remove_var("NSL_SIMULATED_TP") };
+        unsafe { std::env::remove_var("NSL_TP_SHM_PATH") };
         guard
     }
 

@@ -194,7 +194,7 @@ pub mod muon_prof;
 /// Non-CUDA stub: `--muon-batch-ns` is a GPU perf opt-in; a CPU-only build
 /// reaching it is a hard precondition failure, not a silent fallback.
 #[cfg(not(feature = "cuda"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_muon_step_batch(
     _params: i64,
     _grads: i64,

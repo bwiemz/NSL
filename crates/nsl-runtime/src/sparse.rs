@@ -69,7 +69,7 @@ unsafe impl Sync for NslSparseTensor {}
 /// Create a COO sparse tensor from coordinate arrays.
 /// Copies the input arrays (takes ownership). Caller retains original arrays.
 /// Returns pointer to NslSparseTensor (as i64), or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_coo(
     rows_ptr: i64, cols_ptr: i64, vals_ptr: i64,
     num_rows: i64, num_cols: i64, nnz: i64,
@@ -113,7 +113,7 @@ pub extern "C" fn nsl_sparse_coo(
 /// format: 0=COO, 1=CSR
 /// threshold_bits: f64 bits — values with |v| < threshold are treated as zero
 /// Returns pointer to NslSparseTensor, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_bits: i64) -> i64 {
     if dense_ptr == 0 { return 0; }
     let threshold = f64::from_bits(threshold_bits as u64);
@@ -259,7 +259,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
 
 /// Convert a sparse tensor to dense NslTensor.
 /// Returns pointer to NslTensor (f64, 2D), or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
     if sparse_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
@@ -334,7 +334,7 @@ pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
 }
 
 /// Get the number of nonzero elements.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_nnz(sparse_ptr: i64) -> i64 {
     if sparse_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
@@ -343,7 +343,7 @@ pub extern "C" fn nsl_sparse_nnz(sparse_ptr: i64) -> i64 {
 
 /// Get the density (nnz / total_elements).
 /// Returns f64 bits as i64.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_density(sparse_ptr: i64) -> i64 {
     if sparse_ptr == 0 { return f64::to_bits(0.0) as i64; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
@@ -356,7 +356,7 @@ pub extern "C" fn nsl_sparse_density(sparse_ptr: i64) -> i64 {
 /// sparse_ptr: NslSparseTensor (COO or CSR)
 /// dense_ptr: NslTensor (2D, f64)
 /// Returns pointer to new NslTensor, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
     if sparse_ptr == 0 || dense_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
@@ -464,7 +464,7 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
 }
 
 /// Free a sparse tensor and its owned arrays.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_free(sparse_ptr: i64) -> i64 {
     if sparse_ptr == 0 { return 0; }
     let sparse = unsafe { Box::from_raw(sparse_ptr as *mut NslSparseTensor) };
@@ -510,7 +510,7 @@ pub extern "C" fn nsl_sparse_free(sparse_ptr: i64) -> i64 {
 
 /// Convert COO sparse tensor to CSR format.
 /// Returns new CSR NslSparseTensor pointer, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_coo_to_csr(coo_ptr: i64) -> i64 {
     if coo_ptr == 0 { return 0; }
     let coo = unsafe { &*(coo_ptr as *const NslSparseTensor) };
@@ -574,7 +574,7 @@ pub extern "C" fn nsl_sparse_coo_to_csr(coo_ptr: i64) -> i64 {
 
 /// Convert COO sparse tensor to CSC format.
 /// Returns new CSC NslSparseTensor pointer, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_coo_to_csc(coo_ptr: i64) -> i64 {
     if coo_ptr == 0 { return 0; }
     let coo = unsafe { &*(coo_ptr as *const NslSparseTensor) };
@@ -642,7 +642,7 @@ pub extern "C" fn nsl_sparse_coo_to_csc(coo_ptr: i64) -> i64 {
 /// Convert CSR sparse tensor to CSC format.
 /// CSR: row_ptr[rows+1], col_indices[nnz], values[nnz]
 /// CSC: col_ptr[cols+1], row_indices[nnz], values[nnz] (reordered)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_csr_to_csc(csr_ptr: i64) -> i64 {
     if csr_ptr == 0 { return 0; }
     let csr = unsafe { &*(csr_ptr as *const NslSparseTensor) };
@@ -716,7 +716,7 @@ pub extern "C" fn nsl_sparse_csr_to_csc(csr_ptr: i64) -> i64 {
 /// Convert CSC sparse tensor to CSR format.
 /// CSC: col_ptr[cols+1], row_indices[nnz], values[nnz]
 /// CSR: row_ptr[rows+1], col_indices[nnz], values[nnz] (reordered)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_csc_to_csr(csc_ptr: i64) -> i64 {
     if csc_ptr == 0 { return 0; }
     let csc = unsafe { &*(csc_ptr as *const NslSparseTensor) };
@@ -788,7 +788,7 @@ pub extern "C" fn nsl_sparse_csc_to_csr(csc_ptr: i64) -> i64 {
 }
 
 /// Convert CSR to COO format.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_csr_to_coo(csr_ptr: i64) -> i64 {
     if csr_ptr == 0 { return 0; }
     let csr = unsafe { &*(csr_ptr as *const NslSparseTensor) };
@@ -824,7 +824,7 @@ pub extern "C" fn nsl_sparse_csr_to_coo(csr_ptr: i64) -> i64 {
 }
 
 /// Convert CSC to COO format.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_csc_to_coo(csc_ptr: i64) -> i64 {
     if csc_ptr == 0 { return 0; }
     let csc = unsafe { &*(csc_ptr as *const NslSparseTensor) };
@@ -864,7 +864,7 @@ pub extern "C" fn nsl_sparse_csc_to_coo(csc_ptr: i64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// SpMV: CSR sparse matrix [M,K] × dense vector [K] → dense vector [M].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
     if sparse_ptr == 0 || vec_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
@@ -964,7 +964,7 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
 
 /// Element-wise sparse add: sparse [M,N] + sparse [M,N] → sparse [M,N] (COO output).
 /// Uses union merge: output has non-zeros where either input has non-zeros.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_add(a_ptr: i64, b_ptr: i64) -> i64 {
     if a_ptr == 0 || b_ptr == 0 { return 0; }
     let a = unsafe { &*(a_ptr as *const NslSparseTensor) };
@@ -1028,7 +1028,7 @@ pub extern "C" fn nsl_sparse_add(a_ptr: i64, b_ptr: i64) -> i64 {
 
 /// Element-wise sparse mul: sparse [M,N] * sparse [M,N] → sparse [M,N] (COO output).
 /// Uses intersection merge: output has non-zeros only where both have non-zeros.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_mul(a_ptr: i64, b_ptr: i64) -> i64 {
     if a_ptr == 0 || b_ptr == 0 { return 0; }
     let a = unsafe { &*(a_ptr as *const NslSparseTensor) };

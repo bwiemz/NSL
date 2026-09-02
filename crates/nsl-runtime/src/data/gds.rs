@@ -136,7 +136,7 @@ pub fn prefetch_hint(path: &Path, offset: u64, size: u64) {
         if let Ok(file) = std::fs::File::open(path) {
             unsafe {
                 // libc::posix_fadvise equivalent via direct C ABI call
-                extern "C" {
+                unsafe extern "C" {
                     fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
                 }
                 posix_fadvise(
@@ -161,7 +161,7 @@ pub fn prefetch_hint(path: &Path, offset: u64, size: u64) {
 /// `offset`: byte offset in file
 /// `size`: bytes to read
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_data_gds_read(
     path_ptr: i64,
     buf_ptr: i64,
@@ -184,7 +184,7 @@ pub extern "C" fn nsl_data_gds_read(
 }
 
 /// Check if GDS is available. Returns 1 if available, 0 if not.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_data_gds_available() -> i64 {
     if is_gds_available() { 1 } else { 0 }
 }

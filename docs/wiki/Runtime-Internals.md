@@ -168,7 +168,7 @@ pub const RELINQUISH_B: u8 = 0x02;
 A concrete example from [`crates/nsl-runtime/src/tensor/arithmetic.rs:29`](../../crates/nsl-runtime/src/tensor/arithmetic.rs#L29):
 
 ```rust
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64
 ```
 

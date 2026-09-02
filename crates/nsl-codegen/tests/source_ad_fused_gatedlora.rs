@@ -69,11 +69,11 @@ fn ad_rule_emits_all_five_input_adjoints() {
     // adjoint registered. This catches "AD rule forgot to accumulate
     // gradient for input N" (presence bug).
     let primal = build_fused_gatedlora_list();
-    let mut gen = AdjointGenerator::new(primal.ops.len() as VarId);
-    let _adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(primal.ops.len() as VarId);
+    let _adjoint = generator.generate(&primal);
 
     for input_var in 0..=4u32 {
-        let adj = gen.adjoint_of(input_var);
+        let adj = generator.adjoint_of(input_var);
         assert!(
             adj.is_some(),
             "FusedGatedLoraMatmul AD rule forgot to accumulate gradient \
@@ -98,12 +98,12 @@ fn ad_rule_produces_distinct_adjoints_per_input() {
     // rule reused one accumulator incorrectly (e.g. dgate and dx
     // sharing a node from a swapped broadcast axis).
     let primal = build_fused_gatedlora_list();
-    let mut gen = AdjointGenerator::new(primal.ops.len() as VarId);
-    let _adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(primal.ops.len() as VarId);
+    let _adjoint = generator.generate(&primal);
 
     let mut seen = std::collections::HashSet::new();
     for input_var in 0..=4u32 {
-        let adj = gen.adjoint_of(input_var).unwrap_or_else(|| {
+        let adj = generator.adjoint_of(input_var).unwrap_or_else(|| {
             panic!("adjoint missing for VarId {input_var} — presence bug");
         });
         assert!(
@@ -138,8 +138,8 @@ fn ad_rule_emits_reduce_sum_for_gate_not_matmul() {
     // `gatedlora_fused_backward_matches_unfused_reference` provides the
     // sufficiency check.
     let primal = build_fused_gatedlora_list();
-    let mut gen = AdjointGenerator::new(primal.ops.len() as VarId);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(primal.ops.len() as VarId);
+    let adjoint = generator.generate(&primal);
 
     let has_axis0_sum = adjoint
         .ops

@@ -157,7 +157,7 @@ pub(crate) struct GrammarContext {
 /// as a serialized buffer. In M44b, this will read from .rodata.
 ///
 /// Returns 0 on success, -1 if already initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_init(num_states: i64, vocab_size: i64, start_state: i64) -> i64 {
     let mut guard = GRAMMAR_CTX.lock().unwrap();
     if guard.is_some() {
@@ -180,7 +180,7 @@ pub extern "C" fn nsl_grammar_init(num_states: i64, vocab_size: i64, start_state
 
 /// Step the FSM: advance from current state with the given token.
 /// Returns the next state, or -1 if the token is invalid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_step(state: i64, token_id: i64) -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_grammar_init not called");
@@ -196,7 +196,7 @@ pub extern "C" fn nsl_grammar_step(state: i64, token_id: i64) -> i64 {
 /// `state`: current FSM state.
 ///
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_apply_mask(logits_ptr: i64, state: i64) -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_grammar_init not called");
@@ -214,7 +214,7 @@ pub extern "C" fn nsl_grammar_apply_mask(logits_ptr: i64, state: i64) -> i64 {
 
 /// Check if the current state is an accepting state.
 /// Returns 1 if accepting, 0 if not.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_is_accept(state: i64) -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_grammar_init not called");
@@ -226,7 +226,7 @@ pub extern "C" fn nsl_grammar_is_accept(state: i64) -> i64 {
 }
 
 /// Get the start state of the FSM.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_start_state() -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_grammar_init not called");
@@ -234,7 +234,7 @@ pub extern "C" fn nsl_grammar_start_state() -> i64 {
 }
 
 /// Destroy the grammar context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_destroy() -> i64 {
     let mut guard = GRAMMAR_CTX.lock().unwrap();
     *guard = None;

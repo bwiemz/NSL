@@ -102,14 +102,14 @@ impl LookaheadRunner {
 // ---------------------------------------------------------------------------
 
 /// Create a new LookaheadRunner. Returns pointer as i64.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_lookahead_init(ngram_size: i64, window: i64) -> i64 {
     let runner = Box::new(LookaheadRunner::new(ngram_size as usize, window as usize));
     Box::into_raw(runner) as i64
 }
 
 /// Seed the n-gram pool from prompt tokens.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_lookahead_seed(runner_ptr: i64, tokens_ptr: i64, num_tokens: i64) -> i64 {
     if runner_ptr == 0 || tokens_ptr == 0 { return -1; }
     let runner = unsafe { &mut *(runner_ptr as *mut LookaheadRunner) };
@@ -122,7 +122,7 @@ pub extern "C" fn nsl_lookahead_seed(runner_ptr: i64, tokens_ptr: i64, num_token
 
 /// Generate candidates from the current context.
 /// Writes candidates to `out_ptr` and returns the number written.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_lookahead_generate(
     runner_ptr: i64,
     context_ptr: i64,
@@ -145,7 +145,7 @@ pub extern "C" fn nsl_lookahead_generate(
 }
 
 /// Destroy a LookaheadRunner.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_lookahead_destroy(runner_ptr: i64) -> i64 {
     if runner_ptr == 0 { return 0; }
     unsafe { drop(Box::from_raw(runner_ptr as *mut LookaheadRunner)); }

@@ -232,7 +232,7 @@ fn pass_prunes_and_reports() {
     // Outcome records the prune.
     assert!(matches!(
         outcomes.as_slice(),
-        [MoePruneOutcome::Pruned { ref dead, n_live: 3, .. }] if dead == &vec![1]
+        [MoePruneOutcome::Pruned { dead, n_live: 3, .. }] if dead == &vec![1]
     ));
     // Router sliced to [D, 3]; experts sliced to [3, D*D].
     assert_eq!(wm.get("blocks.0.moe.router.weight").unwrap().shape, vec![D, 3]);

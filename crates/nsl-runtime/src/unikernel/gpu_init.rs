@@ -190,7 +190,7 @@ pub fn init_gpu_vfio() -> GpuInitResult {
     // We can directly call CUDA driver API functions.
     #[cfg(feature = "cuda")]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn cuInit(flags: u32) -> u32;
         }
         let rc = unsafe { cuInit(0) };
@@ -273,7 +273,7 @@ static GPU_STATE: Mutex<Option<GpuInitResult>> = Mutex::new(None);
 /// `strategy`: 0 = VFIO passthrough, 1 = direct register
 ///
 /// Returns 0 on success, -1 if no GPU found, -2 if init failed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_gpu_init(strategy: i64) -> i64 {
     let result = match strategy {
         0 => init_gpu_vfio(),
@@ -293,7 +293,7 @@ pub extern "C" fn nsl_unikernel_gpu_init(strategy: i64) -> i64 {
 /// Check if GPU is initialized.
 ///
 /// Returns 1 if GPU is ready, 0 otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_gpu_ready() -> i64 {
     if let Ok(guard) = GPU_STATE.lock() {
         if let Some(ref result) = *guard {
@@ -306,7 +306,7 @@ pub extern "C" fn nsl_unikernel_gpu_ready() -> i64 {
 /// Get the GPU PCI device ID (for diagnostics).
 ///
 /// Returns the device ID (u16) or 0 if no GPU.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_unikernel_gpu_device_id() -> i64 {
     if let Ok(guard) = GPU_STATE.lock() {
         if let Some(ref result) = *guard {

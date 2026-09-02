@@ -439,7 +439,7 @@ fn run_chunk(
 /// non-rank-2 params (and skips the ones this call owns). Eligible params
 /// that are not device-resident f32 are a loud precondition abort: the
 /// opt-in flag promises a GPU training run.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_muon_step_batch(
     params_list: i64,
     grads_list: i64,

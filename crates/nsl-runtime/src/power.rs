@@ -1,4 +1,4 @@
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pow_int(base: i64, exp: i64) -> i64 {
     if exp < 0 {
         // Integer base with negative exponent: result is always 0 in integer division
@@ -37,7 +37,7 @@ pub extern "C" fn nsl_pow_int(base: i64, exp: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pow_float(base: f64, exp: f64) -> f64 {
     base.powf(exp)
 }

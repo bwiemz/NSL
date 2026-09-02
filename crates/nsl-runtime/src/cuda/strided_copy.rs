@@ -581,7 +581,7 @@ pub(crate) static ARM_LAUNCHES: [std::sync::atomic::AtomicU64; 4] = [
 /// Test-only observability; the counters are plain relaxed adds on a path that
 /// already issues a kernel launch.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_test_strided_copy_arm_launches(arm: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {

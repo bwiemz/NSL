@@ -319,12 +319,12 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
         chain_marks: vec![mark],
     };
 
-    let mut gen = AdjointGenerator::new(10);
-    gen.set_csha_claims(claims);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(10);
+    generator.set_csha_claims(claims);
+    let adjoint = generator.generate(&primal);
 
     // Expect the event was recorded.
-    let events = gen.csha_fused_events();
+    let events = generator.csha_fused_events();
     assert_eq!(
         events.len(),
         1,
@@ -515,13 +515,13 @@ fn gap_i2_launch_op_survives_dead_grad_elim_in_generated_adjoint() {
         chain_marks: vec![mark],
     };
 
-    let mut gen = AdjointGenerator::new(10);
-    gen.set_csha_claims(claims);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(10);
+    generator.set_csha_claims(claims);
+    let adjoint = generator.generate(&primal);
 
     // The Param's adjoint VarId is the "needed" var that param-gradient
     // consumption would mark live. Look it up via the generator.
-    let param_adjoint = gen
+    let param_adjoint = generator
         .adjoint_of(1)
         .expect("Param 'wq' must have an adjoint after CSHA EmitFused routing");
 
@@ -810,9 +810,9 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
         chain_marks: vec![mark],
     };
 
-    let mut gen = AdjointGenerator::new(100);
-    gen.set_csha_claims(claims);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(100);
+    generator.set_csha_claims(claims);
+    let adjoint = generator.generate(&primal);
 
     // The fused launch op must be emitted exactly once.
     let launch_count = adjoint
@@ -830,7 +830,7 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
     //
     // Assertion: the adjoint map should contain entries for all 7
     // routed VarIds (Q/K/V outputs, 3 weights, x_norm).
-    let adj_map = gen.adjoint_vars_map();
+    let adj_map = generator.adjoint_vars_map();
     for vid in [4u32, 7, 9, 2, 5, 8, 1] {
         assert!(
             adj_map.contains_key(&vid),
@@ -864,7 +864,7 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
 
     // The fused kernel's output-proj event should have been recorded
     // against the SDPA op (id 10).
-    let events = gen.csha_fused_events();
+    let events = generator.csha_fused_events();
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].output_op_id, 10,
@@ -1159,9 +1159,9 @@ fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
         chain_marks: vec![mark],
     };
 
-    let mut gen = AdjointGenerator::new(200);
-    gen.set_csha_claims(claims);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(200);
+    generator.set_csha_claims(claims);
+    let adjoint = generator.generate(&primal);
 
     let launch = adjoint
         .ops
@@ -1291,9 +1291,9 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
         op_to_chain,
         chain_marks: vec![mark],
     };
-    let mut gen = AdjointGenerator::new(100);
-    gen.set_csha_claims(claims);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(100);
+    generator.set_csha_claims(claims);
+    let adjoint = generator.generate(&primal);
     let launch = adjoint
         .ops
         .iter()
@@ -1450,15 +1450,15 @@ fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
         chain_marks: vec![mark],
     };
 
-    let mut gen = AdjointGenerator::new(100);
-    gen.set_csha_claims(claims);
-    let _adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(100);
+    generator.set_csha_claims(claims);
+    let _adjoint = generator.generate(&primal);
 
     // Property 1: `adjoint_of(gamma_var)` must return Some. This is
     // EXACTLY what SGD's param loop in `stmt.rs:~4603` looks up to find
     // w_norm's gradient; if this returns None, w_norm never gets an
     // update and the end-to-end smoke prints `w_norm: delta=0.000`.
-    let gamma_adj = gen.adjoint_of(gamma_vid);
+    let gamma_adj = generator.adjoint_of(gamma_vid);
     assert!(
         gamma_adj.is_some(),
         "Gap I step K regression: `gen.adjoint_of({})` returned None \
@@ -1468,13 +1468,13 @@ fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
          RmsNormGammaBackward emission was skipped.  `named_param_vars` \
          map: {:?}",
         gamma_vid,
-        gen.adjoint_vars_map().keys().collect::<Vec<_>>()
+        generator.adjoint_vars_map().keys().collect::<Vec<_>>()
     );
 
     // Property 2: the event recorder should have flipped `dgamma_emitted`
     // to `true`. This is the independent "we took the dgamma path"
     // witness, separate from the adjoint map check above.
-    let events = gen.csha_fused_events();
+    let events = generator.csha_fused_events();
     assert_eq!(events.len(), 1, "one fused event expected");
     assert!(
         events[0].dgamma_emitted,

@@ -100,8 +100,8 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// not values), which is why the tests here also force the arm explicitly
 /// via `test_set_transpose_views` rather than trusting the coupling.
 fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-    std::env::set_var("NSL_MATMUL_TF32", "0");
-    std::env::set_var("NSL_MATMUL_BF16", "0");
+    unsafe { std::env::set_var("NSL_MATMUL_TF32", "0") };
+    unsafe { std::env::set_var("NSL_MATMUL_BF16", "0") };
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 

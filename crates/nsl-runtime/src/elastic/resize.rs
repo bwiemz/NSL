@@ -149,7 +149,7 @@ impl ElasticWorld {
 
 /// Trigger elastic resize after a rank failure.
 /// Returns new world_size, or -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_elastic_resize(
     _dead_rank: i64,
     _current_world_size: i64,

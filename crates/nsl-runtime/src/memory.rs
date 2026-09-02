@@ -8,7 +8,7 @@ thread_local! {
     static ALLOC_REGISTRY: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_alloc(size: i64) -> *mut u8 {
     if size <= 0 {
         return std::ptr::null_mut();
@@ -27,7 +27,7 @@ pub extern "C" fn nsl_alloc(size: i64) -> *mut u8 {
 
 // Safety: pointer was allocated by nsl_alloc; caller must not use it after free.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
@@ -48,7 +48,7 @@ pub extern "C" fn nsl_free(ptr: *mut u8) {
 ///
 /// Closure layout: { fn_ptr (8), num_captures (8), captures[] (8 each) }.
 /// Captured values are i64 copies (not owned pointers), so no recursive free needed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_closure_free(ptr: i64) {
     if ptr == 0 { return; }
     nsl_free(ptr as *mut u8);
@@ -161,7 +161,7 @@ pub mod peak {
 }
 
 #[cfg(feature = "test-hooks")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpu_peak_reset() {
     use std::sync::atomic::Ordering;
     peak::CURRENT_BYTES.store(0, Ordering::Relaxed);
@@ -169,7 +169,7 @@ pub extern "C" fn nsl_cpu_peak_reset() {
 }
 
 #[cfg(feature = "test-hooks")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpu_peak_bytes() -> i64 {
     use std::sync::atomic::Ordering;
     peak::PEAK_BYTES.load(Ordering::Relaxed) as i64

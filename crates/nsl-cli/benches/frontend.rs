@@ -49,7 +49,8 @@ fn bench_frontend(c: &mut Criterion) {
     let root = repo_root();
     // The resolver's first stdlib root. `cargo bench` runs with the crate
     // directory as cwd, so the cwd-relative fallback would miss.
-    std::env::set_var("NSL_STDLIB_PATH", root.join("stdlib"));
+    // SAFETY: bench setup on the only thread, before Criterion runs anything.
+    unsafe { std::env::set_var("NSL_STDLIB_PATH", root.join("stdlib")) };
 
     let mut group = c.benchmark_group("frontend");
 

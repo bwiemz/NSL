@@ -234,9 +234,9 @@ fn walk_expr(expr: &Expr, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
         ExprKind::BlockExpr(block) => walk_block(block, checker, type_map),
         ExprKind::ListComp { element, generators } => {
             walk_expr(element, checker, type_map);
-            for gen in generators {
-                walk_expr(&gen.iterable, checker, type_map);
-                for cond in &gen.conditions { walk_expr(cond, checker, type_map); }
+            for generator in generators {
+                walk_expr(&generator.iterable, checker, type_map);
+                for cond in &generator.conditions { walk_expr(cond, checker, type_map); }
             }
         }
         ExprKind::IfExpr { condition, then_expr, else_expr } => {

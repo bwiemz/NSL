@@ -95,7 +95,7 @@ pub fn mode() -> i64 {
     MODE.store(parsed, Ordering::Relaxed);
     if parsed > 0 && !REPORT_REGISTERED.swap(true, Ordering::Relaxed) {
         // Same piggyback-on-C-atexit pattern as args.rs's NSL_GPU_MEM_REPORT.
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -197,7 +197,7 @@ pub fn report() {
 }
 
 /// On-demand report FFI (callable from compiled code / tests).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_muon_prof_report() {
     report();
 }
@@ -215,7 +215,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_muon_prof_begin(region: i64) {
     if !enabled() {
         return;
@@ -229,7 +229,7 @@ pub extern "C" fn nsl_muon_prof_begin(region: i64) {
     OPEN.with(|s| s.borrow_mut().push((r, Instant::now())));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_muon_prof_end(region: i64) {
     if !enabled() {
         return;

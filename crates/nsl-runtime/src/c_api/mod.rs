@@ -316,7 +316,7 @@ fn free_captured(captured: &[i64], _model: &NslModel) {
 /// array), 2 = Alloc (capture-only). Called by the ownership entry points
 /// through a registry-dlsym'd pointer so the armed thread-local lives in the
 /// same image as the dispatch wrapper's runtime helpers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dispatch_ownership_arm(mode: i64, caps_ptr: i64, n_caps: i64) -> i64 {
     let armed = match mode {
         1 => {
@@ -346,7 +346,7 @@ pub extern "C" fn nsl_dispatch_ownership_arm(mode: i64, caps_ptr: i64, n_caps: i
 /// the impl tensors are ours to release — the legacy path leaks them) and
 /// the error epilogue of every armed dispatch. Idempotent: a second call
 /// finds the mode already taken.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dispatch_ownership_release(model_ptr: i64) -> i64 {
     let mode = DISPATCH_MODE.with(|m| m.borrow_mut().take());
     if let Some(mode) = mode {
@@ -370,7 +370,7 @@ pub extern "C" fn nsl_dispatch_ownership_release(model_ptr: i64) -> i64 {
 /// their deleters, every slot is nulled, and the error lands in THIS image's
 /// thread-local (a cross-image host reads it off the model library handle,
 /// exactly like the generated wrappers' refusals).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dispatch_ownership_finish_alloc(
     model_ptr: i64,
     name_ptr: i64,
@@ -506,7 +506,7 @@ pub const NSL_ABI_VERSION_MINOR: u32 = 1;
 /// Hosts can call this immediately after loading `libnsl_runtime` and compare
 /// against the `NSL_ABI_VERSION_*` macros emitted into the generated C header
 /// to detect runtime/header skew before making any other call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_abi_version() -> i64 {
     ((NSL_ABI_VERSION_MAJOR as i64) << 16) | (NSL_ABI_VERSION_MINOR as i64)
 }
@@ -517,7 +517,7 @@ pub extern "C" fn nsl_abi_version() -> i64 {
 
 /// Get the last error message. Returns a null-terminated C string pointer,
 /// or a pointer to an empty string if no error is set.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_get_last_error() -> i64 {
     LAST_ERROR.with(|e| {
         let borrow = e.borrow();
@@ -529,7 +529,7 @@ pub extern "C" fn nsl_get_last_error() -> i64 {
 }
 
 /// Clear the last error message.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_clear_error() -> i64 {
     LAST_ERROR.with(|e| *e.borrow_mut() = None);
     0
@@ -545,7 +545,7 @@ pub extern "C" fn nsl_clear_error() -> i64 {
 /// on Windows. The function pointer must be a symbol whose address lives
 /// inside the target shared object; any code address emitted into the
 /// library works.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dl_path_for_fn_addr(fn_addr: i64) -> i64 {
     if fn_addr == 0 {
         return 0;
@@ -570,7 +570,7 @@ pub extern "C" fn nsl_dl_path_for_fn_addr(fn_addr: i64) -> i64 {
         use std::ffi::OsString;
         use std::os::windows::ffi::OsStringExt;
         #[link(name = "kernel32")]
-        extern "system" {
+        unsafe extern "system" {
             fn GetModuleHandleExW(
                 flags: u32,
                 module_name: *const u16,
@@ -617,7 +617,7 @@ pub extern "C" fn nsl_dl_path_for_fn_addr(fn_addr: i64) -> i64 {
 /// Free a C string allocated by NSL runtime FFIs that return ownership
 /// (currently only `nsl_dl_path_for_fn_addr`). Safe to call with a NULL
 /// pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_free_cstr(ptr: i64) {
     if ptr == 0 {
         return;
@@ -633,7 +633,7 @@ pub extern "C" fn nsl_free_cstr(ptr: i64) {
 ///
 /// # Arguments
 /// * `msg_ptr` - A pointer (as i64) to a null-terminated C string, or 0 for no-op.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_set_error_cstr(msg_ptr: i64) {
     if msg_ptr == 0 {
         return;
@@ -665,7 +665,7 @@ pub extern "C" fn nsl_set_error_cstr(msg_ptr: i64) {
 /// `nsl_model_call` will then return -1 with an explanatory error.
 ///
 /// Returns a pointer (as i64) to the model handle, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_create(weights_path_ptr: i64) -> i64 {
     if weights_path_ptr == 0 {
         set_error("nsl_model_create: null weights path\0".to_string());
@@ -760,7 +760,7 @@ fn self_discover_export_registry() -> Option<crate::c_api::exports::ExportRegist
 ///
 /// Returns 0 on error (thread-local message set), or a model handle on
 /// success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_create_with_lib(
     weights_path_ptr: i64,
     lib_path_ptr: i64,
@@ -793,7 +793,7 @@ pub extern "C" fn nsl_model_create_with_lib(
 
 /// Number of registered exports. 0 if registry is None (legacy create
 /// path) or the library had no @export functions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_export_count(model_ptr: i64) -> i64 {
     if model_ptr == 0 {
         return 0;
@@ -811,7 +811,7 @@ pub extern "C" fn nsl_model_export_count(model_ptr: i64) -> i64 {
 /// sets the thread-local error if the name is not in the registry;
 /// otherwise invokes the cached function pointer with the supplied
 /// NslTensorDesc arrays and returns whatever the export returned.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_call(
     model_ptr: i64,
     name_ptr: i64,
@@ -919,7 +919,7 @@ fn resolve_export_fn(
 /// The impl result tensor is freed before returning: this path does NOT
 /// leak per call. Exports that return a model weight directly are handled
 /// (the weight is copied out and NOT freed).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_call_into(
     model_ptr: i64,
     name_ptr: i64,
@@ -998,7 +998,7 @@ pub extern "C" fn nsl_model_call_into(
 /// output has been released — unloading it first leaves dangling deleter
 /// pointers that the consumer's GC will call. nslpy keeps model libraries
 /// mapped for the process lifetime for exactly this reason.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_call_alloc(
     model_ptr: i64,
     name_ptr: i64,
@@ -1116,7 +1116,7 @@ fn model_call_alloc_core(
 /// shares its output core with. Inputs remain borrow-imported: the caller's
 /// producers keep ownership of input memory and NSL frees only its borrowed
 /// wrappers before returning.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_call_dlpack(
     model_ptr: i64,
     name_ptr: i64,
@@ -1240,7 +1240,7 @@ pub extern "C" fn nsl_model_call_dlpack(
 /// is null. The thread-local error is set on null inputs and on the
 /// "no registry" path; missing-name on a populated registry returns 0
 /// silently (the caller is presumed to be probing).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_lookup_function(model_ptr: i64, name_ptr: i64) -> i64 {
     if model_ptr == 0 || name_ptr == 0 {
         set_error("nsl_model_lookup_function: null pointer\0".to_string());
@@ -1281,7 +1281,7 @@ pub extern "C" fn nsl_model_lookup_function(model_ptr: i64, name_ptr: i64) -> i6
 /// Returns NULL and sets the thread-local error when: the model or name is
 /// null, the model has no export registry, the artifact predates the
 /// signature table (rebuild), or the name is not an export.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_get_export_signature(model_ptr: i64, name_ptr: i64) -> i64 {
     if model_ptr == 0 || name_ptr == 0 {
         set_error("nsl_model_get_export_signature: null model or name pointer\0".to_string());
@@ -1312,7 +1312,7 @@ pub extern "C" fn nsl_model_get_export_signature(model_ptr: i64, name_ptr: i64) 
 }
 
 /// Destroy a model instance and free its resources (including weight tensors).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_destroy(model_ptr: i64) -> i64 {
     if model_ptr == 0 {
         return 0;
@@ -1332,7 +1332,7 @@ pub extern "C" fn nsl_model_destroy(model_ptr: i64) -> i64 {
 /// ctypes callers while routing through the unified named-export dispatch.
 ///
 /// Returns 0 on success, -1 on error (message in thread-local).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_forward(
     model_ptr: i64,
     inputs_ptr: i64,
@@ -1372,7 +1372,7 @@ pub extern "C" fn nsl_model_forward(
 /// Returns 0 on success, -1 on error. On success each output slot holds an
 /// ownership-transferring `DLManagedTensor*` — see [`nsl_model_call_dlpack`]
 /// and [`nsl_model_call_alloc`] for the deleter contract.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_forward_dlpack(
     model_ptr: i64,
     inputs_ptr: i64,
@@ -1426,14 +1426,14 @@ pub extern "C" fn nsl_model_forward_dlpack(
 /// here returned "NSL 0.2.0" for seven releases (item 19, 2026-08-24): the
 /// string reached Python users via `NslModel.version` but was outside every
 /// version gate — the only test on it asserted `starts_with("NSL")`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_get_version() -> i64 {
     static VERSION: &[u8] = concat!("NSL ", env!("CARGO_PKG_VERSION"), "\0").as_bytes();
     VERSION.as_ptr() as i64
 }
 
 /// Get the number of weight tensors in the model.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_num_weights(model_ptr: i64) -> i64 {
     if model_ptr == 0 { return 0; }
     let model = unsafe { &*(model_ptr as *const NslModel) };
@@ -1442,7 +1442,7 @@ pub extern "C" fn nsl_model_num_weights(model_ptr: i64) -> i64 {
 
 /// Get the number of weight tensors — canonical name used by @export model-method wrappers.
 /// Alias for `nsl_model_num_weights`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_get_num_weights(model_ptr: i64) -> i64 {
     nsl_model_num_weights(model_ptr)
 }
@@ -1453,7 +1453,7 @@ pub extern "C" fn nsl_model_get_num_weights(model_ptr: i64) -> i64 {
 /// free it.  Returns 0 if `model_ptr` is null or the model has no weights.
 /// Used by `@export` model-method wrappers to thread weight pointers into the
 /// compiled impl function.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_get_weight_ptrs(model_ptr: i64) -> i64 {
     if model_ptr == 0 { return 0; }
     let model = unsafe { &*(model_ptr as *const NslModel) };
@@ -1464,7 +1464,7 @@ pub extern "C" fn nsl_model_get_weight_ptrs(model_ptr: i64) -> i64 {
 }
 
 /// Get a weight tensor by name. Returns NslTensor pointer or 0 if not found.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_get_weight(model_ptr: i64, name_ptr: i64, name_len: i64) -> i64 {
     if model_ptr == 0 || name_ptr == 0 { return 0; }
     let model = unsafe { &*(model_ptr as *const NslModel) };
@@ -1648,7 +1648,7 @@ pub fn desc_to_nsl_tensor_pub(desc: &NslTensorDesc) -> i64 {
 /// `@export` wrapper bodies. Takes an `NslTensorDesc*` as an i64 pointer
 /// and returns a newly-allocated `NslTensor*` (also as i64).
 /// The caller is responsible for freeing the result via `nsl_tensor_free`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_desc_to_tensor(desc_ptr: i64) -> i64 {
     if desc_ptr == 0 {
         return 0;
@@ -1668,7 +1668,7 @@ pub extern "C" fn nsl_desc_to_tensor(desc_ptr: i64) -> i64 {
 /// the pointer is recorded so the entry point can free or transfer the result
 /// after dispatch returns. Unarmed (legacy `nsl_model_call`, direct typed-
 /// symbol callers, grad-context forwards), behavior is unchanged.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_desc_ffi(tensor_ptr: i64, desc_ptr: i64) {
     if tensor_ptr == 0 || desc_ptr == 0 {
         return;
@@ -1701,7 +1701,7 @@ pub extern "C" fn nsl_tensor_to_desc_ffi(tensor_ptr: i64, desc_ptr: i64) {
 ///                 freshly written here).
 /// `dst_desc_ptr`: caller-supplied output desc whose `data` field holds a
 ///                 preallocated buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64) -> i64 {
     if src_desc_ptr == 0 || dst_desc_ptr == 0 {
         set_error("nsl_dispatch_apply_result: null desc pointer\0".to_string());
@@ -1985,7 +1985,7 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
 /// Ownership modes: `Into` capacity-checks (>= 8 bytes) against the armed
 /// slot; `Alloc` refuses — a scalar has no DLPack representation (use
 /// `nsl_model_call_into` or `nsl_model_call`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dispatch_apply_scalar_result(src_desc_ptr: i64, dst_desc_ptr: i64) -> i64 {
     if src_desc_ptr == 0 || dst_desc_ptr == 0 {
         set_error("nsl_dispatch_apply_scalar_result: null desc pointer\0".to_string());

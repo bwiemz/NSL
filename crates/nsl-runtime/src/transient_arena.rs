@@ -133,7 +133,7 @@ pub fn owns(ptr: *const c_void) -> bool {
 /// actual allocation adds a red zone per slot plus one trailing guard.
 /// Returns the base pointer, or 0 on failure (caller falls back to the
 /// caching allocator, which is always correct — just not address-stable).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
     if payload_bytes <= 0 || n_slots < 0 || active() {
         return 0;
@@ -178,7 +178,7 @@ pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
 
 /// Declare one slot's geometry (compiler-emitted right after a successful
 /// `nsl_arena_init`, once per placement, in dense-index order).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_declare_slot(payload_offset: i64, bytes: i64) {
     if !active() || payload_offset < 0 || bytes <= 0 {
         return;
@@ -194,7 +194,7 @@ pub extern "C" fn nsl_arena_declare_slot(payload_offset: i64, bytes: i64) {
 ///
 /// `slot_index` and `payload_offset` come from the compile-time plan;
 /// the payload sits after that slot's leading guard.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i64) {
     let base = ARENA_BASE.load(SeqCst);
     if base == 0 || bytes <= 0 || slot_index < 0 || payload_offset < 0 {
@@ -250,7 +250,7 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
 /// the planned address dies at op end; values are unaffected) but the
 /// stable-address claim for that slot is false, so it is counted and the
 /// teardown reports it — the p8 CUDA-graph gate is `misplaced == 0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_unbind_verify(result_tensor: i64) {
     let placed = PLACED_AT.with(|c| {
         let v = c.get();
@@ -274,7 +274,7 @@ pub extern "C" fn nsl_arena_unbind_verify(result_tensor: i64) {
 
 /// Disarm without placing. Emitted after an admitted op so a pin cannot leak
 /// into an unrelated allocation if the op took a path that did not allocate.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_unbind() {
     PIN.with(|p| {
         let (ptr, want, slot) = p.get();
@@ -348,7 +348,7 @@ fn debug_enabled() -> bool {
 ///
 /// O(arena) in device-to-host traffic, so this is a validation-mode call, not
 /// a per-step one. `nsl_arena_check_enabled` gates the compiler's emission.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_check() -> i64 {
     let base = ARENA_BASE.load(SeqCst);
     let size = ARENA_SIZE.load(SeqCst) as usize;
@@ -404,7 +404,7 @@ pub extern "C" fn nsl_arena_check() -> i64 {
 /// compiler placed anything. Gated by `NSL_ARENA_CHECK=1` because a full
 /// guard verification is O(arena) in device-to-host traffic — validation
 /// runs opt in; production steps pay one env-cached branch.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_check_step(step: i64) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ENABLED
@@ -421,7 +421,7 @@ pub extern "C" fn nsl_arena_check_step(step: i64) {
 /// Report and free. Prints the bind/placement reconciliation, which is the
 /// anti-vacuity check: an arena that placed nothing is indistinguishable from
 /// one that was never enabled, unless it says so.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_destroy() {
     // Final canary before the stats print, unconditionally: one D2H sweep
     // per RUN is noise, and it makes the teardown line's guard-failure
@@ -460,7 +460,7 @@ pub extern "C" fn nsl_arena_destroy() {
 
 /// `(binds, placements, guard_failures)` — for gates that need to prove the
 /// arena actually did something.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_stats(out_binds: *mut i64, out_placements: *mut i64,
                                   out_guard_failures: *mut i64) {
     unsafe {

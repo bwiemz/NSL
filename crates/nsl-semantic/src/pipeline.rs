@@ -53,7 +53,7 @@ pub fn validate_pipeline_decorator(
                         }
                     }
                     "schedule" => {
-                        if let ExprKind::StringLiteral(ref s) = &arg.value.kind {
+                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
                             match s.as_str() {
                                 "1f1b" | "gpipe" => {
                                     schedule = s.clone();

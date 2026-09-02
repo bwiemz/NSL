@@ -159,17 +159,17 @@ fn note_ws_d2h(bytes: usize) {
     WS_D2H_TRAFFIC_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
     WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_registered_count() -> i64 {
     WS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_ptr_moves() -> i64 {
     WS_PTR_MOVES.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
@@ -188,7 +188,7 @@ pub extern "C" fn nsl_weight_stream_ptr_moves() -> i64 {
 /// decision-time snapshot, so they stay valid after teardown clears the live
 /// plan). Unknown kinds return -1 rather than aborting: a probe must never
 /// kill a training run.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_stat(kind: i64) -> i64 {
     use std::sync::atomic::Ordering::Relaxed;
     let decided = WS_PLAN_TOTAL.load(Relaxed) != u64::MAX;
@@ -358,7 +358,7 @@ pub fn residency_summary() -> Option<String> {
 ///
 /// Aborts loudly on CPU tensors, views, or non-owning tensors — the
 /// codegen admission routes only plain owning device params here.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
@@ -471,7 +471,7 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
 /// Upload an evicted parameter's mirror back to a fresh device buffer.
 /// Idempotent when already resident. Aborts on an unregistered tensor —
 /// codegen must only stream registered params.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
@@ -547,7 +547,7 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
 /// the mirror (θ after its per-layer update; forward-side evictions are
 /// read-only and skip it), free the device buffer, null `t.data`.
 /// Idempotent when already evicted.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
     if tensor_ptr == 0 {
         return;
@@ -627,7 +627,7 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
 /// streamed forward re-uploads per layer instead, so codegen no longer
 /// emits it — kept as a runtime API for tooling and as the documented
 /// "make everything resident now" escape hatch.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_upload_all() {
     if crate::zero::zero3_active() {
         crate::zero::zero3_gather_all();
@@ -848,7 +848,7 @@ fn srbf16_pack_each(pw_list_ptr: i64, upload: bool) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
     if crate::zero::zero3_active() {
         zero3_pack_each(pw_list_ptr, true);
@@ -874,7 +874,7 @@ pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
 /// only hands out quiescent slots — a synchronous evict two-way-synced its
 /// DtoH, and an ASYNC one leaves the slot `wb_pending` (excluded from reuse)
 /// until its drain.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_prefetch_pack(pw_list_ptr: i64) {
     // ZeRO-3: the "prefetch" IS the gather, issued at the overlap point the
     // schedule chose (item 14's ordering); the later upload_pack for the
@@ -1000,7 +1000,7 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
 /// so every subsequent kernel that reads the pack is ordered after its HtoD.
 /// A no-op if the pack was uploaded synchronously (no pending event) or is not
 /// arena-resident. The pack's members share one slot; the event lives on it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_await_pack(pw_list_ptr: i64) {
     if crate::zero::zero3_active() {
         return; // zero3 gathers are synchronous — nothing to await
@@ -1088,7 +1088,7 @@ fn arena_take_pending_event(slot: usize) -> u64 {
 /// currently arena-resident are skipped (keeps the belt idempotent). All
 /// resident members must share one slot (codegen invariant — they were
 /// uploaded together).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64) {
     if crate::zero::zero3_active() {
         let _ = writeback;
@@ -1296,7 +1296,7 @@ fn drain_all_writebacks() {
 /// scatter is deferred to the next drain point. Semantically identical to
 /// `evict_pack(pw, 1)` — same bytes land in the same mirrors — only the
 /// timing differs, which the bit-exact gate proves.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
     if crate::zero::zero3_active() {
         zero3_pack_each(pw_list_ptr, false);
@@ -1455,7 +1455,7 @@ pub(crate) fn mirror_is_registered(tensor_ptr: i64) -> bool {
 /// `nsl_model_save` to materialize an evicted param from its mirror for the
 /// duration of the serialization read (Item 12: mid-loop model_save no
 /// longer crashes on a null data pointer).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_is_registered(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
@@ -1492,7 +1492,7 @@ pub extern "C" fn nsl_weight_stream_is_registered(tensor_ptr: i64) -> i64 {
 /// Idempotent: an already-evicted param is skipped by `evict`. Emitted only
 /// when a callback actually references the model, so the steady-state
 /// transfer arithmetic the gates assert is untouched.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_reevict_all(writeback: i64) {
     if crate::zero::zero3_active() {
         let _ = writeback;
@@ -1527,7 +1527,7 @@ pub extern "C" fn nsl_weight_stream_reevict_all(writeback: i64) {
 /// table drop). Emitted at train-block teardown so post-training code
 /// (model_save, eval) sees ordinary device tensors, and the pinned mirrors
 /// are released.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_weight_stream_teardown() {
     // Item 16×11: teardown is NOT first-match-wins the way register/upload
     // are. Under composed `bf16-sr x --zero-elementwise` BOTH backends are

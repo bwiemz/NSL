@@ -360,11 +360,11 @@ fn resolve_self_field_accesses_in_expr(
             resolve_self_field_accesses_in_expr(
                 element, interner, weight_fields, all_fields, diagnostics, weight_index_map,
             );
-            for gen in generators {
+            for generator in generators {
                 resolve_self_field_accesses_in_expr(
-                    &gen.iterable, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    &generator.iterable, interner, weight_fields, all_fields, diagnostics, weight_index_map,
                 );
-                for cond in &gen.conditions {
+                for cond in &generator.conditions {
                     resolve_self_field_accesses_in_expr(
                         cond, interner, weight_fields, all_fields, diagnostics, weight_index_map,
                     );
@@ -862,13 +862,13 @@ fn find_weight_access_in_expr(
         }
         ExprKind::ListComp { element, generators } => {
             find_weight_access_in_expr(element, suspects, has_self_param).or_else(|| {
-                for gen in generators {
+                for generator in generators {
                     if let Some(s) =
-                        find_weight_access_in_expr(&gen.iterable, suspects, has_self_param)
+                        find_weight_access_in_expr(&generator.iterable, suspects, has_self_param)
                     {
                         return Some(s);
                     }
-                    for cond in &gen.conditions {
+                    for cond in &generator.conditions {
                         if let Some(s) =
                             find_weight_access_in_expr(cond, suspects, has_self_param)
                         {

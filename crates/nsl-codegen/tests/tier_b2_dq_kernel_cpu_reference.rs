@@ -46,7 +46,7 @@ use nsl_test::diagnostic_mode::{
     compute_forward_for_test, generate_d_o, generate_forward_inputs, FSource,
 };
 
-extern "C" {
+unsafe extern "C" {
     fn nsl_kernel_launch(
         ptx_ptr: i64,
         name_ptr: i64,

@@ -61,7 +61,7 @@ pub const TRAJECTORY_KEYS: &[&str] =
 /// than one `train(...)`, and blocks execute sequentially, so the global is
 /// correct whenever this block's save/load runs. Null/invalid input leaves
 /// the previous value (checked and reported downstream, never guessed).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_set_train_config_record(ptr: i64, len: i64) -> i64 {
     if ptr == 0 || len <= 0 {
         return 0;

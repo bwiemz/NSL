@@ -3454,7 +3454,7 @@ fn lower_single_op(
         }
 
         // === Non-differentiable passthroughs ===
-        PrimalOp::Passthrough(ref name) => {
+        PrimalOp::Passthrough(name) => {
             match name.as_str() {
                 // CCR compressed saves (paper phases 5-6): spliced by
                 // ccr::append_compressed_saves / apply_to_adjoint AFTER

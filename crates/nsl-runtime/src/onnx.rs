@@ -317,7 +317,7 @@ pub fn build_onnx_model(graph: &TraceGraph) -> ModelProto {
 /// * `trace_ptr`  — raw pointer (i64) returned by `nsl_trace_stop()`
 /// * `path_ptr`   — pointer to UTF-8 bytes of the output path
 /// * `path_len`   — byte length of the path (not NUL-terminated)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_onnx_export(trace_ptr: i64, path_ptr: i64, path_len: i64) {
     if trace_ptr == 0 || path_ptr == 0 || path_len <= 0 {
         eprintln!("[NSL] nsl_onnx_export: invalid arguments");

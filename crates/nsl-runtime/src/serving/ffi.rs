@@ -13,7 +13,7 @@ struct ServeContext {
     _preemption: PreemptionManager,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_init(
     max_batch: i64,
     max_seq_len: i64,
@@ -38,7 +38,7 @@ pub extern "C" fn nsl_serve_init(
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_enqueue(
     prompt_ptr: i64,
     prompt_len: i64,
@@ -58,7 +58,7 @@ pub extern "C" fn nsl_serve_enqueue(
     ctx.scheduler.enqueue(tokens, max_tokens as usize, temperature, top_p) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_step() -> i64 {
     let mut guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_mut().expect("nsl_serve_init not called");
@@ -66,14 +66,14 @@ pub extern "C" fn nsl_serve_step() -> i64 {
     ctx.scheduler.active_count() as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_record_token(request_id: i64, token_id: i64) -> i64 {
     let mut guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_mut().expect("nsl_serve_init not called");
     if ctx.scheduler.record_token(request_id as RequestId, token_id) { 1 } else { 0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_drain_completed() -> i64 {
     let mut guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_mut().expect("nsl_serve_init not called");
@@ -82,21 +82,21 @@ pub extern "C" fn nsl_serve_drain_completed() -> i64 {
     (ctx.scheduler.completed.len() - before) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_has_work() -> i64 {
     let guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_serve_init not called");
     if ctx.scheduler.has_work() { 1 } else { 0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_completed_count() -> i64 {
     let guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_serve_init not called");
     ctx.scheduler.completed.len() as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_preempt(request_id: i64) -> i64 {
     let mut guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_mut().expect("nsl_serve_init not called");
@@ -108,7 +108,7 @@ pub extern "C" fn nsl_serve_preempt(request_id: i64) -> i64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_destroy() -> i64 {
     let mut guard = SERVE_CTX.lock().unwrap();
     *guard = None;
@@ -124,7 +124,7 @@ pub extern "C" fn nsl_serve_destroy() -> i64 {
 /// `request_id`: which request's grammar state to use.
 /// `logits_ptr`: pointer to mutable f32 array of vocab_size.
 /// Returns 0 on success/no-op, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_apply_grammar(request_id: i64, logits_ptr: i64) -> i64 {
     let guard = match SERVE_CTX.lock() {
         Ok(g) => g,
@@ -164,7 +164,7 @@ pub extern "C" fn nsl_serve_apply_grammar(request_id: i64, logits_ptr: i64) -> i
 /// Advance grammar state after a token is generated.
 /// Called after sampling to update the FSM state.
 /// Returns 0 on success/no-op, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_advance_grammar(request_id: i64, token_id: i64) -> i64 {
     let mut guard = match SERVE_CTX.lock() {
         Ok(g) => g,
@@ -199,7 +199,7 @@ pub extern "C" fn nsl_serve_advance_grammar(request_id: i64, token_id: i64) -> i
 /// Set grammar constraint on a request (called after enqueue).
 /// `start_state`: the FSM start state for this grammar.
 /// Returns 0 on success, -1 if request not found.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_serve_set_grammar(request_id: i64, start_state: i64) -> i64 {
     let mut guard = match SERVE_CTX.lock() {
         Ok(g) => g,

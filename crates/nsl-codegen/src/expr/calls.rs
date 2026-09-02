@@ -2812,7 +2812,7 @@ impl Compiler<'_> {
         // emission — the epilogue would need them re-plumbed through
         // FuncState for zero benefit (documented decision).
         if func_name == "generate" {
-            let Some(gen) = self.bus.cfie_serve_gen() else {
+            let Some(serve_gen) = self.bus.cfie_serve_gen() else {
                 // OUTSIDE a CFIE serve context there is no bound model to
                 // drive.  Refuse cleanly rather than enqueue into the dead
                 // M29 `nsl_serve_enqueue` path (the pre-Cycle-11 bug that
@@ -2829,17 +2829,17 @@ impl Compiler<'_> {
                     "generate() requires at least 2 arguments (target_model, prompt)",
                 ));
             }
-            let max_new_tokens = gen.max_new_tokens;
-            let eos_token_id = gen.eos_token_id;
-            let prompt_len = gen.prompt_len;
+            let max_new_tokens = serve_gen.max_new_tokens;
+            let eos_token_id = serve_gen.eos_token_id;
+            let prompt_len = serve_gen.prompt_len;
             // Cycle 12 wiring (Values are Copy; snapshot before the
             // mutable-borrow compiles below).
-            let prompt_len_val = gen.prompt_len_val;
-            let tok_handle = gen.tok_handle;
+            let prompt_len_val = serve_gen.prompt_len_val;
+            let tok_handle = serve_gen.tok_handle;
             // Cycle 13 (G15): Some(k) when a speculative draft model is
             // compiled into this binary — generate() then drives the
             // speculative decode loop instead of the plain one.
-            let speculative_k = gen.speculative_k;
+            let speculative_k = serve_gen.speculative_k;
 
             // target_model (arg 0) is accepted for source compatibility;
             // compile it so any side effects hold, but the value is unused

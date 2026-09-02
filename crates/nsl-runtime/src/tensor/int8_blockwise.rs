@@ -132,7 +132,7 @@ fn block_absmax(block: &[f32]) -> f32 {
 /// # Safety
 /// `src_ptr` must point to a valid F32 `NslTensor` on the CPU (`device == 0`),
 /// or be `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_quant_int8_blockwise(
     src_ptr: i64,
     stochastic: i64,
@@ -210,7 +210,7 @@ pub extern "C" fn nsl_tensor_quant_int8_blockwise(
 /// # Safety
 /// `src_ptr` must point to a valid INT8 `NslTensor` produced by
 /// `nsl_tensor_quant_int8_blockwise`, or be `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_dequant_int8_blockwise(src_ptr: i64) -> i64 {
     if src_ptr == 0 {
         return 0;

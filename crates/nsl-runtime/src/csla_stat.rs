@@ -13,14 +13,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub static CSLA_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Emitted at the head of every CSLA window-backward phase.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_csla_window_mark() {
     CSLA_WINDOW_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// In-process numeric getter (same family as `nsl_fase_fused_step_count`):
 /// lets gates assert the layerwise path actually fired without stderr scraping.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_csla_window_count() -> i64 {
     CSLA_WINDOW_COUNT.load(Ordering::Relaxed) as i64
 }
@@ -40,7 +40,7 @@ pub extern "C" fn nsl_csla_window_count() -> i64 {
 /// (assignment ties), shared `data_owner` (two views of one buffer), and
 /// byte-interval OVERLAP of the backing storage (offset views into one
 /// allocation — plain data-pointer equality misses those; review D1b-2).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_csla_assert_params_unaliased(list_ptr: i64) {
     if list_ptr == 0 {
         return;

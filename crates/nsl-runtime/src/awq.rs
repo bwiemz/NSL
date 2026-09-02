@@ -230,7 +230,7 @@ pub fn awq_matmul_cpu(input: &[f64], packed: &AwqPackedWeight, m: usize) -> Vec<
 // ---------------------------------------------------------------------------
 
 /// Quantize weight tensor to AWQ4 packed format.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_awq_quantize(
     weight_ptr: i64,
     group_size: i64,
@@ -257,7 +257,7 @@ pub extern "C" fn nsl_awq_quantize(
 }
 
 /// AWQ dequantize-in-GEMM matmul.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_awq_matmul(
     input_ptr: i64,
     packed_ptr: i64,
@@ -324,7 +324,7 @@ pub extern "C" fn nsl_awq_matmul(
 ///   * `alpha`       — exponent applied to each scale (typically 0.5)
 ///
 /// Returns 0 on error (null weight, shape mismatch).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_awq_pre_scale_weight(
     weight_ptr: i64,
     scales_ptr: i64,
@@ -410,7 +410,7 @@ fn make_f32_tensor(data: &[f32], shape: &[i64]) -> i64 {
 }
 
 /// Free an AWQ packed weight.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_awq_free(packed_ptr: i64) {
     if packed_ptr == 0 {
         return;
@@ -861,7 +861,7 @@ pub struct WggoLayerDescriptor {
 ///   3 = disk write or rename failed
 ///   4 = EmptyCalibration (both AWQ and WGGO descriptor counts are zero)
 ///   5 = UnknownVersion (a WggoLayerDescriptor.version != 1)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_calib_write_sidecar(
     sidecar_path_ptr: *const u8,
     sidecar_path_len: usize,
@@ -1039,7 +1039,7 @@ pub extern "C" fn nsl_calib_write_sidecar(
 /// `nsl_calib_write_sidecar` with empty WGGO arrays. Scheduled for
 /// deletion in milestone N+1; deletion gated by workspace-wide grep
 /// confirming no callers remain.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[deprecated(note = "use nsl_calib_write_sidecar")]
 pub extern "C" fn nsl_awq_write_sidecar(
     sidecar_path_ptr: *const u8,

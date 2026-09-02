@@ -245,7 +245,7 @@ pub(crate) mod inner {
                 }
                 // Register atexit handler for memory stats if NSL_MEMSTATS=1
                 if super::caching_allocator::memstats_enabled() {
-                    extern "C" {
+                    unsafe extern "C" {
                         fn atexit(callback: extern "C" fn()) -> i32;
                     }
                     extern "C" fn memstats_atexit() {
@@ -6241,7 +6241,7 @@ pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
 
 /// Initialize the CUDA runtime (device 0, primary context).
 /// Returns 0 on success. Aborts if CUDA feature is not compiled.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cuda_init() -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -6420,7 +6420,7 @@ pub const CUDA_SUPPORT_COMPILED: bool = cfg!(feature = "cuda");
 /// - `shared_mem_bytes`: bytes of dynamic shared memory per block
 ///
 /// Returns 0 (CUDA_SUCCESS) on success, non-zero CUDA error code on failure.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kernel_launch(
     ptx_ptr: i64,
     name_ptr: i64,
@@ -6470,7 +6470,7 @@ pub extern "C" fn nsl_kernel_launch(
 ///
 /// `args_ptr` points to an array of `num_args` NslTensor handles (each i64).
 /// Returns the `CUresult` code (0 on success).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kernel_launch_tensors(
     ptx_ptr: i64,
     name_ptr: i64,
@@ -9795,7 +9795,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
 /// (0 on non-CUDA builds). Test-only — production code paths go through
 /// the caching allocator.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_test_cuda_alloc(bytes: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -9820,7 +9820,7 @@ pub extern "C" fn nsl_test_cuda_alloc(bytes: i64) -> i64 {
 /// See the 2026-06-29 adversarial-verify workflow on the forward per-doc RoPE
 /// reset reimplementation for the discovery context.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_test_cuda_free(ptr: i64) {
     #[cfg(feature = "cuda")]
     {
@@ -9832,7 +9832,7 @@ pub extern "C" fn nsl_test_cuda_free(ptr: i64) {
 
 /// Copy `bytes` from host pointer `src` to device pointer `dst`.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_test_cuda_h2d(dst: i64, src: i64, bytes: i64) {
     #[cfg(feature = "cuda")]
     {
@@ -9851,7 +9851,7 @@ pub extern "C" fn nsl_test_cuda_h2d(dst: i64, src: i64, bytes: i64) {
 /// an empty string on success, or the error log (possibly with a generic
 /// prefix) on failure. Test-only.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_test_cuda_jit_log(ptx_ptr: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -9903,7 +9903,7 @@ pub extern "C" fn nsl_test_cuda_jit_log(ptx_ptr: i64) -> i64 {
 
 /// Copy `bytes` from device pointer `src` to host pointer `dst`.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_test_cuda_d2h(dst: i64, src: i64, bytes: i64) {
     #[cfg(feature = "cuda")]
     {
@@ -9946,13 +9946,13 @@ pub fn test_cuda_device_synchronize() {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(feature = "test-hooks", feature = "cuda"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn test_detect_sm_version() -> u32 {
     inner::detect_sm_version()
 }
 
 #[cfg(all(feature = "test-hooks", not(feature = "cuda")))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn test_detect_sm_version() -> u32 {
     0
 }

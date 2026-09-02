@@ -324,7 +324,7 @@ impl<'a> VmapTransformer<'a> {
         match &mut stmt.kind {
             StmtKind::VarDecl {
                 pattern,
-                value: Some(ref mut val),
+                value: Some(val),
                 ..
             } => {
                 // Transform the value expression
@@ -349,11 +349,11 @@ impl<'a> VmapTransformer<'a> {
                 self.transform_expr(value)?;
             }
 
-            StmtKind::Return(Some(ref mut expr)) => {
+            StmtKind::Return(Some(expr)) => {
                 self.transform_expr(expr)?;
             }
 
-            StmtKind::Expr(ref mut expr) => {
+            StmtKind::Expr(expr) => {
                 self.transform_expr(expr)?;
             }
 
@@ -370,7 +370,7 @@ impl<'a> VmapTransformer<'a> {
                     self.transform_expr(cond)?;
                     self.transform_block(block)?;
                 }
-                if let Some(ref mut eb) = else_block {
+                if let Some(eb) = else_block {
                     self.transform_block(eb)?;
                 }
             }
@@ -434,23 +434,23 @@ impl<'a> VmapTransformer<'a> {
                 self.transform_expr(object)?;
                 // index is SubscriptKind, not Expr — recurse into its variants
                 match index.as_mut() {
-                    SubscriptKind::Index(ref mut idx_expr) => {
+                    SubscriptKind::Index(idx_expr) => {
                         self.transform_expr(idx_expr)?;
                     }
                     SubscriptKind::Slice { lower, upper, step } => {
-                        if let Some(ref mut e) = lower {
+                        if let Some(e) = lower {
                             self.transform_expr(e)?;
                         }
-                        if let Some(ref mut e) = upper {
+                        if let Some(e) = upper {
                             self.transform_expr(e)?;
                         }
-                        if let Some(ref mut e) = step {
+                        if let Some(e) = step {
                             self.transform_expr(e)?;
                         }
                     }
-                    SubscriptKind::MultiDim(ref mut dims) => {
+                    SubscriptKind::MultiDim(dims) => {
                         for dim in dims {
-                            if let SubscriptKind::Index(ref mut e) = dim {
+                            if let SubscriptKind::Index(e) = dim {
                                 self.transform_expr(e)?;
                             }
                         }

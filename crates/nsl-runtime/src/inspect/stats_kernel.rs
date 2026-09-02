@@ -13,7 +13,7 @@ use crate::tensor::{NslTensor, DTYPE_F32, DTYPE_F64};
 /// # Safety
 /// `out_buf` must point to six writable `f64` slots. `t` must be a valid
 /// `NslTensor` handle (live magic marker) or zero.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_stats(t: i64, out_buf: *mut f64) -> i32 {
     if out_buf.is_null() {
         return 1;

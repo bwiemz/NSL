@@ -57,7 +57,7 @@ use crate::tensor::NslTensor;
 /// * `wd` — the configured `weight_decay`.
 ///
 /// Returns `wd` to decay, or `0.0` to exempt.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_optim_param_wd(
     param: i64,
     static_exempt: i64,

@@ -232,13 +232,11 @@ impl LayerDecision {
     pub fn to_head_count(&self, lut: &LayerCostLut) -> u64 {
         let h = self.active_heads() as u64;
         // Clamp to LUT axis domain.
-        let hi = lut
-            .axes_head_counts
+        lut.axes_head_counts
             .iter()
             .find(|&&x| x >= h)
             .copied()
-            .unwrap_or(*lut.axes_head_counts.last().unwrap_or(&h));
-        hi
+            .unwrap_or(*lut.axes_head_counts.last().unwrap_or(&h))
     }
 }
 

@@ -142,7 +142,7 @@ fn alloc_qtensor(
 // Memory management FFI
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_free(ptr: i64) {
     if ptr == 0 { return; }
     let qt = QuantizedTensor::from_ptr(ptr);
@@ -163,14 +163,14 @@ pub extern "C" fn nsl_qtensor_free(ptr: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_addref(ptr: i64) {
     if ptr == 0 { return; }
     let qt = QuantizedTensor::from_ptr(ptr);
     qt.refcount.fetch_add(1, Ordering::SeqCst);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_release(ptr: i64) {
     if ptr == 0 { return; }
     let qt = QuantizedTensor::from_ptr(ptr);
@@ -279,7 +279,7 @@ fn dequantize_val(q: u8, scale: f32, zp: u8) -> f64 {
 ///   group_size  - group size for per-group (ignored otherwise)
 ///
 /// Returns: pointer to QuantizedTensor as i64
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_quantize(
     tensor_ptr: i64,
     dtype: i64,
@@ -432,7 +432,7 @@ pub extern "C" fn nsl_qtensor_quantize(
 /// Dequantize a QuantizedTensor back to a full-precision NslTensor (f64).
 ///
 /// Returns: pointer to NslTensor as i64
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
     let qt = QuantizedTensor::from_ptr(qtensor_ptr);
     let ndim = qt.ndim;
@@ -543,7 +543,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
 /// Mixed-precision matmul: NslTensor (f64) @ QuantizedTensor -> NslTensor (f64).
 /// Dequantizes the quantized weight on-the-fly during matmul.
 /// qw must be 2D [K, N]. x must have last dim = K.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
     // Validate qw is 2D
     let qw = QuantizedTensor::from_ptr(qw_ptr);
@@ -589,14 +589,14 @@ pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Return the dtype of a QuantizedTensor (0 = INT8, 1 = INT4).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_dtype(qtensor_ptr: i64) -> i64 {
     QuantizedTensor::from_ptr(qtensor_ptr).dtype
 }
 
 /// Return the shape of a QuantizedTensor as a 1-D NslTensor of i64 values
 /// (stored as f64 for compatibility with NslTensor's f64 data).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
     let qt = QuantizedTensor::from_ptr(qtensor_ptr);
     let ndim = qt.ndim as usize;

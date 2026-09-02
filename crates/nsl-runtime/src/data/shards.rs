@@ -320,7 +320,7 @@ pub fn discover_shards(dir: &Path) -> io::Result<Vec<PathBuf>> {
 // ---------------------------------------------------------------------------
 
 /// Assign shards for a rank. Returns a packed i64 array: [num_shards, shard_0, shard_1, ...].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_data_assign_shards(
     rank: i64,
     world_size: i64,
@@ -341,7 +341,7 @@ pub extern "C" fn nsl_data_assign_shards(
 
 /// Free the buffer returned by nsl_data_assign_shards.
 /// `ptr`: pointer returned by nsl_data_assign_shards.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_data_free_shards(ptr: i64) -> i64 {
     if ptr == 0 { return -1; }
     let buf = ptr as *mut i64;

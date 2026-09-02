@@ -165,7 +165,7 @@ impl Drop for GradContext {
 /// `Drop for GradContext` frees the ctx-owned `input_ptrs` /
 /// `output_ptrs` wrappers. `param_ptrs` are borrowed from the model and
 /// are NOT freed here.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_context_destroy(ctx_ptr: i64) {
     if ctx_ptr == 0 {
         return;
@@ -217,7 +217,7 @@ pub extern "C" fn nsl_grad_context_destroy(ctx_ptr: i64) {
 /// is `recording = false`). A subsequent `forward_grad` on the same
 /// thread starts with a clean tape; `nsl_model_backward(ctx_a, ...)`
 /// replays from `ctx_a.ops` regardless of what the live tape holds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_forward_grad(
     model_ptr: i64,
     inputs_ptr: i64,
@@ -438,7 +438,7 @@ pub extern "C" fn nsl_model_forward_grad(
 ///
 /// On success returns 0; on null ctx or double-backward returns -1
 /// with a thread-local error message (§5.5).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_backward(
     ctx_ptr: i64,
     grad_outputs_ptr: i64,

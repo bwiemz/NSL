@@ -57,7 +57,7 @@ const PLACEMENT_KEYS: &[&str] = &["arena", "graphs", "ckpt", "offload"];
 /// `ptr` must point to `len` initialised bytes that stay valid for the call.
 /// Codegen passes a `.rodata` string constant, so this holds for the life of
 /// the process.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_set_exec_fingerprint(ptr: *const u8, len: i64) -> i64 {
     if ptr.is_null() || len <= 0 {
         return 0;

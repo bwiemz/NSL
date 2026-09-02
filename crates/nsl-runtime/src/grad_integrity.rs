@@ -386,7 +386,7 @@ fn finalize(agg: &mut Aggregate, step: StepAcc) {
 
 /// FullBuffer / composite path: scan the whole materialized grads list once,
 /// classify each parameter, and finalize the step.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_integrity_check(grads_list: i64, num_params: i64) {
     if grads_list == 0 || num_params <= 0 {
         return;
@@ -422,7 +422,7 @@ pub extern "C" fn nsl_grad_integrity_check(grads_list: i64, num_params: i64) {
 /// per-micro-batch baseline bracket, `grad_accumulation` for the CSLA
 /// window bracket. Pass 0 only if the emitter genuinely cannot know it;
 /// the report then observes the counts without judging them.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_integrity_step_begin(num_params: i64, expected_notes_per_param: i64) {
     if num_params <= 0 {
         return;
@@ -440,7 +440,7 @@ pub extern "C" fn nsl_grad_integrity_step_begin(num_params: i64, expected_notes_
 }
 
 /// FASE feed path: record one parameter's gradient by its index.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_integrity_note(grad_ptr: i64, param_idx: i64) {
     if param_idx < 0 {
         return;
@@ -482,7 +482,7 @@ pub extern "C" fn nsl_grad_integrity_note(grad_ptr: i64, param_idx: i64) {
 }
 
 /// FASE feed path: close and finalize the current step accumulator.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_integrity_step_end() {
     let mut state = STATE.lock().unwrap();
     if let Some(step) = state.cur.take() {
@@ -496,10 +496,10 @@ static ARM_ONCE: Once = Once::new();
 /// train setup when `--grad-integrity` is on, and also called from
 /// `nsl_args_init` when `NSL_GRAD_INTEGRITY=1`, so either path prints the
 /// snapshot and neither double-registers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_grad_integrity_arm() {
     ARM_ONCE.call_once(|| {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {

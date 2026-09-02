@@ -5,7 +5,7 @@
 //! The codegen declares every runtime function it emits calls to in
 //! `nsl-codegen/src/builtins.rs::RUNTIME_FUNCTIONS` — a table of *Cranelift*
 //! signatures `(name, &[param types], Option<ret type>)`. The runtime
-//! *implements* those functions as `#[no_mangle] extern "C" fn`s in
+//! *implements* those functions as `#[unsafe(no_mangle)] extern "C" fn`s in
 //! `nsl-runtime`. **The two are linked by symbol name only** — the Rust
 //! compiler never checks that the declared arity and types match the
 //! implementation. So a drift — a parameter added on one side but not the

@@ -139,7 +139,7 @@ pub fn drain_responses() -> Vec<RouterMessage> {
 /// `model_ptr`: opaque pointer to the compiled model
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -> i64 {
     let worker_role = match role {
         1 => WorkerRole::Prefill,
@@ -171,7 +171,7 @@ pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -
 /// `nsl_kv_serialize` before transferring to the decode worker.
 ///
 /// Returns 0 on success, -1 if the worker is not initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_worker_set_kv_cache(kv_cache_handle: i64) -> i64 {
     let mut guard = match WORKER_CTX.lock() {
         Ok(g) => g,
@@ -372,7 +372,7 @@ fn sample_argmax(logits_ptr: i64) -> i64 {
 /// `config_ptr`: pointer to WorkerConfig (0 = use defaults)
 ///
 /// Returns 0 on clean shutdown, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
     // Verify role and extract context
     let (rank, model_ptr, kv_cache_handle) = {
@@ -523,7 +523,7 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
 /// `config_ptr`: pointer to WorkerConfig (0 = use defaults)
 ///
 /// Returns 0 on clean shutdown, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
     // Verify role
     let (rank, model_ptr) = {
@@ -673,7 +673,7 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
 }
 
 /// Destroy the worker context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_disagg_worker_destroy() -> i64 {
     let mut guard = match WORKER_CTX.lock() {
         Ok(g) => g,

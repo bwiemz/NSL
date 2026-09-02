@@ -98,7 +98,7 @@ fn free_dict_impl(dict_ptr: i64, free_tensor_values: bool) {
     unsafe { drop(Box::from_raw(dict as *mut NslDict)) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_new() -> i64 {
     let num_buckets: i64 = 16;
     let buckets = checked_alloc((num_buckets as usize) * std::mem::size_of::<*mut NslDictEntry>())
@@ -116,7 +116,7 @@ pub extern "C" fn nsl_dict_new() -> i64 {
     Box::into_raw(dict) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_set_str(dict_ptr: i64, key: i64, value: i64) {
     let d = NslDict::from_ptr(dict_ptr);
     let key_bytes = unsafe { as_cstr(key) }.to_bytes();
@@ -152,7 +152,7 @@ pub extern "C" fn nsl_dict_set_str(dict_ptr: i64, key: i64, value: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_get_str(dict_ptr: i64, key: i64) -> i64 {
     let d = NslDict::from_ptr(dict_ptr);
     let key_bytes = unsafe { as_cstr(key) }.to_bytes();
@@ -173,12 +173,12 @@ pub extern "C" fn nsl_dict_get_str(dict_ptr: i64, key: i64) -> i64 {
     std::process::abort();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_len(dict_ptr: i64) -> i64 {
     NslDict::from_ptr(dict_ptr).len
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_contains(dict_ptr: i64, key: i64) -> i8 {
     let d = NslDict::from_ptr(dict_ptr);
     let key_bytes = unsafe { as_cstr(key) }.to_bytes();
@@ -197,7 +197,7 @@ pub extern "C" fn nsl_dict_contains(dict_ptr: i64, key: i64) -> i8 {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_keys(dict_ptr: i64) -> i64 {
     let d = NslDict::from_ptr(dict_ptr);
     let result = nsl_list_new();
@@ -213,14 +213,14 @@ pub extern "C" fn nsl_dict_keys(dict_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_free(dict_ptr: i64) {
     // Values are owned by the caller — dict only frees its own structure.
     // This matches nsl_list_free which also does not free elements.
     free_dict_impl(dict_ptr, false);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dict_free_tensor_values(dict_ptr: i64) {
     free_dict_impl(dict_ptr, true);
 }

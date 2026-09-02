@@ -159,7 +159,7 @@ fn debug_compile_and_return_plan_loads_stdlib_for_real_training_source() {
             .and_then(|p| p.parent())
             .expect("workspace root above crates/nsl-codegen");
         let stdlib = workspace_root.join("stdlib");
-        std::env::set_var("NSL_STDLIB_PATH", stdlib);
+        unsafe { std::env::set_var("NSL_STDLIB_PATH", stdlib) };
     }
 
     const SRC: &str = r#"

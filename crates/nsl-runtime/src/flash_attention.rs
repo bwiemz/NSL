@@ -50,7 +50,7 @@ pub static FLASH_BWD_DET_ROUTED: std::sync::atomic::AtomicU64 =
 
 /// In-process getter (same family as `nsl_fase_fused_step_count`): lets a gate
 /// assert the deterministic backward route fired without scraping stderr.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_flash_bwd_det_routed_count() -> i64 {
     FLASH_BWD_DET_ROUTED.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
@@ -58,7 +58,7 @@ pub extern "C" fn nsl_flash_bwd_det_routed_count() -> i64 {
 /// Test/diagnostic probe: number of successful fused-forward launches for
 /// `variant` (0 = base kernel, 1 = Tier-B tile-skip). Any other variant
 /// returns -1. Counts whole FFI calls, not per-batch-row kernel launches.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sdpa_fused_launch_count(variant: i64) -> i64 {
     match variant {
         0 | 1 => SDPA_FUSED_LAUNCH_COUNTS[variant as usize]
@@ -443,7 +443,7 @@ fn csha_bwd_f16_read_ptr(
 ///
 /// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_flash_attention(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
     out_ptr: i64,
@@ -1081,7 +1081,7 @@ fn reduce_expanded_kv_grads(
 /// entries (planner spec §4): the pair must agree, and Tier-B-on can only
 /// fire on the segment path (the runtime gate requires a non-null device
 /// segment pointer).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_sdpa_fused_forward(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -1820,7 +1820,7 @@ fn csha_tier_b1_prepass_substitute(
 ///
 /// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_flash_attention_csha(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
     out_ptr: i64,
@@ -2286,7 +2286,7 @@ pub extern "C" fn nsl_flash_attention_csha(
 ///
 /// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_csha_with_saves(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -2925,7 +2925,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
 ///
 /// All 12 pre-c19 call sites resolve here — see `csha_backward_ffi_hygiene`
 /// integration test for the allow-list.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_csha_backward(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -3946,7 +3946,7 @@ fn csha_backward_impl(
 /// on the first 54 slots; sentinel `0` on either trailing slot disables that
 /// half of the probe write (PTX `%p_probe_active = false` for the ds side).
 #[cfg(feature = "csha_cycle19_probe")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_csha_backward_probe(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -5385,7 +5385,7 @@ fn csha_dump_backward_buffers(
 ///
 /// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_flash_attention_quantized(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
     out_ptr: i64, scale_bits: i64,
@@ -5515,7 +5515,7 @@ pub extern "C" fn nsl_flash_attention_quantized(
 ///
 /// All params i64 for Cranelift ABI compatibility.
 /// Grid: (num_tokens, num_heads, ceil(head_dim/2))
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_rope_cache_write(
     k_projected_ptr: i64, v_projected_ptr: i64,
     cos_ptr: i64, sin_ptr: i64,
@@ -6713,7 +6713,7 @@ pub fn nsl_test_flash_attention_backward_blocks(
 ///
 /// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_backward(
     dout_ptr: i64,
@@ -7338,7 +7338,7 @@ pub struct CshaBackwardActivations {
 /// before the forward launch in training mode. All returned pointers
 /// are non-zero on success; a zero pointer indicates allocation failure.
 /// Caller must call `nsl_csha_free_backward_activations` to release.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
     batch: i64, heads: i64, seq: i64, head_dim: i64,
 ) -> CshaBackwardActivations {
@@ -7393,7 +7393,7 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
 /// instead — that would route the frees through the caching allocator, whose
 /// pooling reuse semantics differ from the raw `cuMemFree` these buffers need
 /// (raw free returns the VRAM to the driver; pooling keeps it resident).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_csha_free_backward_activations(
     a: CshaBackwardActivations,
 ) {
@@ -7431,7 +7431,7 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations(
 ///
 /// SAFETY: `out_ptr` must point to at least 48 bytes (6 × i64) of writable
 /// memory and be 8-byte aligned.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_csha_alloc_backward_activations_into(
     batch: i64, heads: i64, seq: i64, head_dim: i64,
     out_ptr: i64,
@@ -7462,7 +7462,7 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations_into(
 ///
 /// Safe to call with zero pointers — they are silently skipped, mirroring
 /// `nsl_csha_free_backward_activations`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_csha_free_backward_activations_from(
     q_proj: i64, k_proj: i64, v_proj: i64,
     row_max: i64, row_sum: i64, x_raw: i64,

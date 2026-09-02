@@ -152,7 +152,7 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
 ///
 /// `data_ptr` points to `.rodata` (lives for the process lifetime).
 /// `data_len` is the total byte length of the .nslweights blob.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_init_embedded(data_ptr: i64, data_len: i64) {
     if data_ptr <= 0 || data_len <= 0 {
         eprintln!(
@@ -183,7 +183,7 @@ pub extern "C" fn nsl_standalone_init_embedded(data_ptr: i64, data_len: i64) {
 ///   1. Same directory as the compiled binary path given by the caller
 ///   2. Next to the current executable (`std::env::current_exe`)
 ///   3. `$NSL_WEIGHTS_PATH` environment variable
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_path_len: i64) {
     if compiled_path_ptr <= 0 || compiled_path_len <= 0 {
         eprintln!(
@@ -272,7 +272,7 @@ pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_p
 }
 
 /// Returns 1 if the weight provider has been initialized, 0 otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_has_weights() -> i64 {
     if WEIGHT_PROVIDER.get().is_some() { 1 } else { 0 }
 }
@@ -489,7 +489,7 @@ fn register_param(state: &mut ArgState, name: &str, ty: &str, default: &str) {
 ///
 /// `argc` is the argument count; `argv` is a `*const *const u8` (array of
 /// NUL-terminated C strings) cast to i64.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_args_init(argc: i64, argv: i64) {
     let argv_ptr = argv as *const *const u8;
     let mut args: Vec<String> = Vec::with_capacity(argc as usize);
@@ -518,7 +518,7 @@ pub extern "C" fn nsl_standalone_args_init(argc: i64, argv: i64) {
 /// Check for --help/-h and warn about unrecognized arguments.
 ///
 /// Call this after all `nsl_standalone_arg_*` helpers have run.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_args_finish() {
     let mutex = arg_state_global();
     let state = mutex.lock().unwrap();
@@ -547,7 +547,7 @@ pub extern "C" fn nsl_standalone_args_finish() {
 ///
 /// Returns an NslString pointer (i64) via `nsl_str_from_rust`.
 /// Exits with usage if the argument is missing.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_arg_str(name_ptr: i64, name_len: i64) -> i64 {
     let name = unsafe { name_from_parts(name_ptr, name_len) };
     let mutex = arg_state_global();
@@ -573,7 +573,7 @@ pub extern "C" fn nsl_standalone_arg_str(name_ptr: i64, name_len: i64) -> i64 {
 /// Parse an optional `--<name> <value>` string argument with a default value.
 ///
 /// Returns an NslString pointer (i64).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_arg_str_default(
     name_ptr: i64,
     name_len: i64,
@@ -609,7 +609,7 @@ pub extern "C" fn nsl_standalone_arg_str_default(
 /// Parse a required `--<name> <value>` integer argument.
 ///
 /// Exits with usage if the argument is missing or cannot be parsed as i64.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_arg_int(name_ptr: i64, name_len: i64) -> i64 {
     let name = unsafe { name_from_parts(name_ptr, name_len) };
     let mutex = arg_state_global();
@@ -636,7 +636,7 @@ pub extern "C" fn nsl_standalone_arg_int(name_ptr: i64, name_len: i64) -> i64 {
 }
 
 /// Parse an optional `--<name> <value>` integer argument with a default value.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_arg_int_default(
     name_ptr: i64,
     name_len: i64,
@@ -667,7 +667,7 @@ pub extern "C" fn nsl_standalone_arg_int_default(
 ///
 /// Returns the f64 value's raw bits as i64 (use `f64::from_bits(result as u64)`
 /// on the receiving side).  Exits with usage if missing or unparseable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_arg_float(name_ptr: i64, name_len: i64) -> i64 {
     let name = unsafe { name_from_parts(name_ptr, name_len) };
     let mutex = arg_state_global();
@@ -697,7 +697,7 @@ pub extern "C" fn nsl_standalone_arg_float(name_ptr: i64, name_len: i64) -> i64 
 ///
 /// `default_bits` is the default f64 value encoded as its raw bits cast to i64
 /// (i.e., `f64::to_bits(default) as i64`).  Returns f64 bits as i64.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_arg_float_default(
     name_ptr: i64,
     name_len: i64,

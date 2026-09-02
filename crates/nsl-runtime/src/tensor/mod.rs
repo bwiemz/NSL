@@ -93,7 +93,7 @@ pub(crate) fn inplace_suppressed() -> bool {
 /// Enter (`on != 0`) or leave (`on == 0`) the in-place-suppression scope.
 /// Emitted by source-AD around its forward primal lowering. Paired inc/dec so
 /// nested grad blocks compose; the leave saturates at zero.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_set_inplace_suppressed(on: i64) {
     INPLACE_SUPPRESS_DEPTH.with(|c| {
         let d = c.get();
@@ -102,7 +102,7 @@ pub extern "C" fn nsl_set_inplace_suppressed(on: i64) {
 }
 
 /// Print FBIP statistics. Called at program exit when NSL_FBIP_TRACE=1.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fbip_report() {
     let reuse = FBIP_REUSE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let alloc = FBIP_ALLOC_COUNT.load(std::sync::atomic::Ordering::Relaxed);
@@ -127,7 +127,7 @@ thread_local! {
 
 /// Begin a new tensor scope. All tensors allocated after this call will be
 /// tracked and eligible for cleanup when `nsl_tensor_scope_end` is called.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scope_begin() {
     let list = Box::new(Vec::<i64>::with_capacity(256));
     TENSOR_SCOPE.with(|s| s.set(Box::into_raw(list)));
@@ -146,7 +146,7 @@ pub(crate) fn scope_track(tensor_ptr: i64) {
 
 /// End the current tensor scope. Frees all tracked tensors that have
 /// refcount == 1 (i.e., no one else holds a reference).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scope_end(keep: i64) {
     let list_ptr = TENSOR_SCOPE.with(|s| {
         let p = s.get();
@@ -186,12 +186,12 @@ thread_local! {
     static TRAINING_MODE: Cell<bool> = const { Cell::new(false) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_set_training_mode(mode: i8) {
     TRAINING_MODE.with(|t| t.set(mode != 0));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_is_training() -> i8 {
     TRAINING_MODE.with(|t| t.get() as i8)
 }
@@ -405,7 +405,7 @@ thread_local! {
 }
 
 /// Register a custom datatype. Called by codegen-generated init code at startup.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_register_custom_dtype(
     id: i64,
     name_ptr: i64,
@@ -447,7 +447,7 @@ pub extern "C" fn nsl_register_custom_dtype(
 }
 
 /// Called once after all registrations. Moves staging -> OnceLock.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_finalize_dtype_registry() {
     STAGING_REGISTRY.with(|r| {
         let entries = std::mem::take(&mut *r.borrow_mut());
@@ -971,7 +971,7 @@ pub(crate) fn create_tensor_with_shape_rs(shape: &[i64]) -> i64 {
 
 // === Element access ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let indices = NslList::from_ptr(indices_list);
@@ -1009,7 +1009,7 @@ pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
     tensor.read_scalar_as_f64(offset)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let indices = NslList::from_ptr(indices_list);
@@ -1049,7 +1049,7 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
 
 // === Scalar extraction ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.len != 1 {
@@ -1117,7 +1117,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
 
 // === Display ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
 
@@ -1197,7 +1197,7 @@ fn print_tensor_recursive(
 
 // === Memory ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         eprintln!("nsl: clone called on null tensor");
@@ -1250,7 +1250,7 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
 }
 
 /// Increment refcount (used by codegen to protect multi-use variables from runtime FBIP).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
     if tensor_ptr == 0 { return; }
     let tensor = NslTensor::from_ptr(tensor_ptr);
@@ -1264,7 +1264,7 @@ pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
 }
 
 /// Decrement refcount without freeing (paired with nsl_tensor_retain).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
     if tensor_ptr == 0 { return; }
     let tensor = NslTensor::from_ptr(tensor_ptr);
@@ -1300,7 +1300,7 @@ pub(crate) fn tensor_trace_on() -> bool {
     *ON
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
@@ -1413,7 +1413,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
 
 /// Safe version of nsl_tensor_free that probes the magic field before freeing.
 /// Used for Type::Unknown variables where we can't be sure the i64 is a tensor pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
     if ptr == 0 { return; }
     if (ptr as u64) < 0x10000 { return; }
@@ -1453,7 +1453,7 @@ pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
 ///
 /// The free itself is the refcount-decrementing `nsl_tensor_free_if_valid`, so
 /// any other holder (a tape lease, an alias) keeps the storage alive.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_free_transient(ptr: i64) {
     if crate::autodiff::is_recording() {
         // Deferred, not dropped: the tape holds bare pointers so the free
@@ -1472,20 +1472,20 @@ pub extern "C" fn nsl_tensor_free_transient(ptr: i64) {
 /// `nsl_tensor_free_if_valid`. A non-zero value indicates tensors escaping
 /// producer-site ownership tracking and being cleaned up by the runtime epilog
 /// sweep — the value should trend to zero as ELTLS rollout completes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_debug_epilog_free_count() -> u64 {
     NSL_DEBUG_EPILOG_FREE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// ELTLS instrumentation: reset the epilog free counter to zero.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_debug_epilog_free_reset() {
     NSL_DEBUG_EPILOG_FREE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Safe version of nsl_tensor_clone that returns the original i64 when the input
 /// is not a valid tensor pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_clone_if_valid(ptr: i64) -> i64 {
     if ptr == 0 {
         return 0;
@@ -1517,7 +1517,7 @@ pub extern "C" fn nsl_tensor_clone_if_valid(ptr: i64) -> i64 {
 /// convention used at other FFI entry points). Returns whatever raw value
 /// the `data` field holds otherwise — no validation, same risk class as
 /// `csha_tensor_data_ptr`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_data_ptr(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
@@ -1542,7 +1542,7 @@ pub(crate) fn evict_bf16_cast_image(t: &NslTensor) {
     let _ = t;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     if dst_ptr == 0 || src_ptr == 0 {
         eprintln!("nsl: copy_data called with null ptr (dst={}, src={})", dst_ptr, src_ptr);
@@ -1702,7 +1702,7 @@ pub(crate) fn offload_defer_free_device_buf(buf: *mut c_void) {
 /// `copy_data(dst, src); free(src)` with ONE call to this function, and
 /// emit `nsl_offload_drain()` once per optimizer step after the per-param
 /// loop exits.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_copy_data_async(dst_ptr: i64, src_ptr: i64) {
     #[cfg(feature = "cuda")]
     if dst_ptr != 0 && src_ptr != 0 && !offload_sync_forced() {
@@ -1746,7 +1746,7 @@ pub extern "C" fn nsl_tensor_copy_data_async(dst_ptr: i64, src_ptr: i64) {
 /// whose async DtoH was in flight. Emitted by codegen ONCE per optimizer
 /// step, after the per-parameter loop exits. Cheap no-op when nothing was
 /// enqueued (sync fallback path, CPU runs, non-offload builds).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_offload_drain() {
     #[cfg(feature = "cuda")]
     crate::cuda::inner::transfer_stream_synchronize();
@@ -1808,7 +1808,7 @@ pub(crate) fn alloc_host_state_buffer(bytes: usize) -> *mut u8 {
 /// (a) `to_device_like` staging is a plain memcpy and (b) the DtoH
 /// copy-back passes `nsl_tensor_copy_data`'s dtype-equality assert against
 /// the staged GPU f32 working tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
     let t = NslTensor::from_ptr(template_ptr);
     // CPU-resident template: offload is meaningless (state would sit next
@@ -1844,7 +1844,7 @@ pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
     NslTensor::publish(out)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
     evict_bf16_cast_image(dst);
@@ -2062,7 +2062,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device == 0 && !tensor.has_writable_storage() {
@@ -2092,7 +2092,7 @@ pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
 /// Used by FASE Deferred's two-phase gradient clip (Phase B) to apply
 /// the global clip factor to each parameter's `m_partial` without
 /// allocating a fresh tensor per parameter.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
     if tensor_ptr == 0 {
         return;
@@ -2182,7 +2182,7 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
 }
 
 /// Create a zeros tensor on a specific device.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
     if device == 0 {
         return nsl_tensor_zeros(shape_list);
@@ -2237,7 +2237,7 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
 /// f16 bits as f32 → garbage.  `dx` stays on the f32 helper because the
 /// kernel writes it as f32; this helper exists specifically for the 6
 /// f16-typed gradient outputs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_f16_on(shape_list: i64, device: i64) -> i64 {
     if device == 0 {
         return crate::tensor::creation::tensor_from_shape_list_f16(shape_list, 0.0);
@@ -2281,7 +2281,7 @@ pub extern "C" fn nsl_tensor_zeros_f16_on(shape_list: i64, device: i64) -> i64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let shape_list = nsl_list_new();
@@ -2296,7 +2296,7 @@ pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
 }
 
 /// Create a ones tensor with the same shape and device as the input tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
     let t = NslTensor::from_ptr(tensor_ptr);
     if t.device == 0 {
@@ -2354,7 +2354,7 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
 /// Supports both f32 and f64 dtypes.  GPU tensors are transferred to
 /// CPU for the reduction (mirrors `nsl_clip_grad_norm`).  Used by FASE
 /// Deferred's two-phase gradient clipping to compute the global L2 norm.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
     if tensor_ptr == 0 {
         return 0.0;
@@ -2436,7 +2436,7 @@ fn device_clip_admissible(t: &NslTensor) -> bool {
         && (t.ndim != 1 || unsafe { *t.strides } == 1)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     let list = NslList::from_ptr(grad_list_ptr);
     let num_grads = list.len as usize;
@@ -2634,7 +2634,7 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
 
 // === Embedding lookup ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     let weight = NslTensor::from_ptr(weight_ptr);
     let indices = NslTensor::from_ptr(indices_ptr);
@@ -2776,7 +2776,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 
 // === LayerNorm & RMSNorm (fused runtime primitives) ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_layernorm(
     input_ptr: i64, weight_ptr: i64, bias_ptr: i64, eps: f64,
 ) -> i64 {
@@ -2984,7 +2984,7 @@ pub extern "C" fn nsl_tensor_layernorm(
     out_ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) -> i64 {
     // GPU path: native fused RMSNorm kernel.
     {
@@ -3139,7 +3139,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 /// dgamma_j = sum_rows(dy_ij * x_ij / rms_i),  rms_i = sqrt(mean(x_i^2) + eps).
 /// GPU: two deterministic launches (see `gpu_rmsnorm_dgamma_backward_f32`).
 /// CPU: f64 reference with the same summation order.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_rmsnorm_dgamma_backward(
     dy_ptr: i64,
     x_ptr: i64,
@@ -3231,7 +3231,7 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
 /// Bit-exact with (dx then Add): the epilogue performs the same single
 /// rn-rounded add, and IEEE addition is commutative so either accumulate
 /// operand order matches. Mismatched `res` falls back to dx-then-add.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_rmsnorm_dx_backward_add(
     dy_ptr: i64,
     x_ptr: i64,
@@ -3275,7 +3275,7 @@ pub extern "C" fn nsl_rmsnorm_dx_backward_add(
     out
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_rmsnorm_dx_backward(
     dy_ptr: i64,
     x_ptr: i64,
@@ -3349,7 +3349,7 @@ pub extern "C" fn nsl_rmsnorm_dx_backward(
 
 // === Dropout ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i64 {
     if training == 0 || p == 0.0 {
         let out = nsl_tensor_clone(tensor_ptr);
@@ -3493,7 +3493,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 /// Contract: 0 < p < 1. Statically-known p=0 is elided at extraction and
 /// out-of-range p is refused at compile time, so a violation here is a
 /// compiler bug — abort loudly rather than train on a wrong scale.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
     if !(p > 0.0 && p < 1.0) {
         eprintln!(
@@ -3606,7 +3606,7 @@ pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
 
 // === Conv2d ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_conv2d(
     input_ptr: i64, weight_ptr: i64, bias_ptr: i64,
     stride_h: i64, stride_w: i64, pad_h: i64, pad_w: i64,
@@ -3751,7 +3751,7 @@ pub extern "C" fn nsl_tensor_conv2d(
 
 // === MaxPool2d ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_maxpool2d(
     input_ptr: i64, kernel_h: i64, kernel_w: i64, stride: i64, padding: i64,
 ) -> i64 {
@@ -3873,7 +3873,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
 }
 
 /// Add 1D bias to 2D tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let bias = NslTensor::from_ptr(bias_ptr);
@@ -3963,7 +3963,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 }
 
 /// Transfer a tensor to a different device.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i64 {
     debug_assert!(NslTensor::from_ptr(tensor_ptr).is_valid(), "nsl_tensor_to_device: invalid tensor");
     let t = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -4204,7 +4204,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
 /// (either `src` with incremented refcount if devices already match, or a
 /// device-migrated copy). Used by FASE Deferred to reconcile CPU tape-AD
 /// gradients with GPU-resident m_partial buffers before in-place accumulation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
     let r = unsafe { &*(ref_ptr as *const NslTensor) };
     nsl_tensor_to_device(src_ptr, r.device as i64)
@@ -4221,7 +4221,7 @@ pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
 /// A warning that does not gate is not a guard: refuse with the fix named.
 /// Scalars and int-typed index tensors (the batch-dict path hands the
 /// embedding host ids by design) are exempt; CPU-parameter models no-op.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_train_input_device_guard(input_ptr: i64, param_list_ptr: i64) {
     if input_ptr == 0 || param_list_ptr == 0 {
         return;
@@ -4251,7 +4251,7 @@ pub extern "C" fn nsl_train_input_device_guard(input_ptr: i64, param_list_ptr: i
 /// Prefetch a unified-memory tensor to a GPU device asynchronously.
 /// This starts the page migration before the GPU actually accesses the data,
 /// reducing first-access latency from page faults. No-op on CPU tensors.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_prefetch(tensor_ptr: i64, device: i64) {
     if tensor_ptr == 0 {
         return;
@@ -4281,7 +4281,7 @@ pub extern "C" fn nsl_tensor_prefetch(tensor_ptr: i64, device: i64) {
 /// Create a tensor whose data points to static .rodata memory (compile-time constant).
 /// The tensor has `owns_data = 0` — the data is never freed (it's embedded in the binary).
 /// Used by M52 weight constant folding to embed folded tensors.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_from_static(
     data_ptr: i64,
     shape_list: i64,
@@ -4308,7 +4308,7 @@ pub extern "C" fn nsl_tensor_from_static(
 /// Create a tensor whose data points into a pre-allocated slab.
 /// The tensor is marked `slab_managed = 1` so nsl_tensor_free skips data deallocation.
 /// `data_ptr` is the raw pointer (slab_base + offset), `shape_list` is a standard NslList.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_from_slab(
     data_ptr: i64,
     shape_list: i64,
@@ -4358,7 +4358,7 @@ pub extern "C" fn nsl_tensor_from_slab(
 /// If those `.item()` reads ever do matter, the fix is a cheap device-scalar
 /// read or a compiler-side config marker, not a shape test in the shared
 /// transfer routine.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i64) {
     if model_ptr == 0 || num_fields <= 0 { return; }
     for i in 0..num_fields as usize {
@@ -4417,7 +4417,7 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
 /// `num_fields`: number of i64-sized slots in the struct (total_size / 8)
 ///
 /// Returns an NslList of tensor pointers (only actual Param/Tensor fields).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_collect_model_params(model_ptr: i64, num_fields: i64) -> i64 {
     let result = crate::list::nsl_list_new();
     if model_ptr == 0 || num_fields <= 0 { return result; }
@@ -4494,7 +4494,7 @@ pub struct NslSliceDim {
     pub end: i64,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_set_element(
     tensor_ptr: i64, indices_ptr: i64, num_indices: i64, value: f64,
 ) {
@@ -4523,7 +4523,7 @@ pub extern "C" fn nsl_tensor_set_element(
     tensor.write_scalar_from_f64(offset, value);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_slice_assign(
     target_ptr: i64, src_ptr: i64, dims_ptr: i64, num_dims: i64,
 ) {
@@ -4639,7 +4639,7 @@ fn clone_shape(src: *mut i64, ndim: usize) -> *mut i64 {
     dst
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i64) -> i64 {
     let target_dtype_id = target_dtype_id as u16;
     let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -4731,7 +4731,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
     let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
 
@@ -6083,7 +6083,7 @@ mod tests {
 /// Debug: print gradient and parameter norms for the first N params.
 /// Called from codegen before the optimizer step loop.
 /// param_list, grads_list: NslList of tensor pointers. step: current global step.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_debug_train_step(
     param_list: i64,
     grads_list: i64,
@@ -6117,7 +6117,7 @@ pub extern "C" fn nsl_debug_train_step(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_l2_norm(t: i64) -> f64 {
     let tensor = NslTensor::from_ptr(t);
     tensor_l2_norm(tensor)
@@ -6158,7 +6158,7 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
 }
 
 /// Set GPU allocator pool to Persistent (for model weights, optimizer states).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_set_persistent_pool() {
     #[cfg(feature = "cuda")]
     crate::cuda::caching_allocator::set_alloc_pool(
@@ -6167,7 +6167,7 @@ pub extern "C" fn nsl_gpu_set_persistent_pool() {
 }
 
 /// Set GPU allocator pool to Transient (for forward/backward intermediates).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_set_transient_pool() {
     #[cfg(feature = "cuda")]
     crate::cuda::caching_allocator::set_alloc_pool(
@@ -6182,7 +6182,7 @@ pub extern "C" fn nsl_gpu_set_transient_pool() {
 /// Unknown values map to `other`. Purely observational — never affects
 /// allocator placement decisions (see `nsl_gpu_set_persistent_pool` for
 /// those).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_set_alloc_surface(tag: u8) {
     #[cfg(feature = "cuda")]
     crate::cuda::caching_allocator::set_alloc_surface(
@@ -6195,7 +6195,7 @@ pub extern "C" fn nsl_gpu_set_alloc_surface(tag: u8) {
 /// Get the current GPU allocator surface tag (see `nsl_gpu_set_alloc_surface`).
 /// Codegen brackets use get/set to restore the caller's surface, keeping
 /// nested regions safe. Always 0 in non-CUDA builds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_get_alloc_surface() -> u8 {
     #[cfg(feature = "cuda")]
     {
@@ -6210,7 +6210,7 @@ pub extern "C" fn nsl_gpu_get_alloc_surface() -> u8 {
 /// A1: set the stable `(op_id, tensor_id)` allocation identity for
 /// subsequent GPU allocations (arena / CUDA-graph attribution hook). No-op
 /// in non-CUDA builds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_set_alloc_identity(op_id: u32, tensor_id: u64) {
     #[cfg(feature = "cuda")]
     crate::cuda::caching_allocator::set_alloc_identity(op_id, tensor_id);
@@ -6219,7 +6219,7 @@ pub extern "C" fn nsl_gpu_set_alloc_identity(op_id: u32, tensor_id: u64) {
 }
 
 /// A1: clear the allocation identity set by `nsl_gpu_set_alloc_identity`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_clear_alloc_identity() {
     #[cfg(feature = "cuda")]
     crate::cuda::caching_allocator::clear_alloc_identity();
@@ -6229,7 +6229,7 @@ pub extern "C" fn nsl_gpu_clear_alloc_identity() {
 /// allocation mechanism (pooled + async + direct). This is the first
 /// in-process numeric VRAM-peak getter — regression gates and WGGO read it
 /// directly instead of scraping `NSL_MEMSTATS` stderr. `0` in non-CUDA builds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_peak_allocated_bytes() -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -6247,7 +6247,7 @@ pub extern "C" fn nsl_gpu_peak_allocated_bytes() -> i64 {
 /// A1: cumulative allocation-event count since the last
 /// `nsl_gpu_reset_mem_stats` (pooled + external). An unexpected jump between
 /// steps flags a per-step allocation the arena/liveness passes missed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_cumulative_alloc_count() -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -6265,7 +6265,7 @@ pub extern "C" fn nsl_gpu_cumulative_alloc_count() -> i64 {
 /// A1: this surface's bytes at the moment the global allocated peak was set
 /// — the per-surface decomposition of peak VRAM. Tag values match
 /// `SurfaceTag` (0=other … 7=attn_workspace). `0` in non-CUDA builds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_surface_at_peak_bytes(tag: u8) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -6282,7 +6282,7 @@ pub extern "C" fn nsl_gpu_surface_at_peak_bytes(tag: u8) -> i64 {
 }
 
 /// A1: this surface's own high-water mark in bytes. `0` in non-CUDA builds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_surface_peak_bytes(tag: u8) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -6301,7 +6301,7 @@ pub extern "C" fn nsl_gpu_surface_peak_bytes(tag: u8) -> i64 {
 /// A1: reset the peak high-water marks and cumulative allocation counters so
 /// a caller can measure a fresh region (e.g. one training step). Live bytes
 /// are preserved; peaks re-seed to the current live level.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_reset_mem_stats() {
     #[cfg(feature = "cuda")]
     crate::cuda::caching_allocator::CACHING_ALLOCATOR
@@ -6312,7 +6312,7 @@ pub extern "C" fn nsl_gpu_reset_mem_stats() {
 
 /// Release idle GPU memory back to the driver. Called after each training step
 /// to prevent the caching allocator from holding stale segments.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_drain_cache() {
     // Called once per training step, so this is the natural reporting interval.
     crate::host_profile::report_and_reset("step");
@@ -6358,7 +6358,7 @@ pub(crate) fn debug_track_gpu_free(bytes: usize) {
 }
 
 /// Debug: print GPU allocated block summary grouped by context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
     let all = std::env::var("NSL_DEBUG_MEM_ALL").ok().as_deref() == Some("1");
     if !all && step > 2 { return; } // default: only first 3 steps
@@ -6386,7 +6386,7 @@ pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
 /// snapshot taken under one allocator-lock window, so they cannot disagree.
 /// The generated step code calls this twice per step (start of step, after
 /// cleanup); the event stream's `seq` field keeps the two ordered.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
     let all = std::env::var("NSL_DEBUG_MEM_ALL").ok().as_deref() == Some("1");
     let stderr_on = all || step <= 5;

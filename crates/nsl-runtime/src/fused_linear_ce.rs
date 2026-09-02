@@ -193,7 +193,7 @@ static FUSED_LCE_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 5] = [
 /// Test/diagnostic probe: successful fused linear-CE launches for `kind`
 /// (0 = forward, 1 = forward_large, 2 = backward, 3 = forward_gemm,
 /// 4 = backward_gemm). Other kinds return -1.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_lce_launch_count(kind: i64) -> i64 {
     match kind {
         0..=4 => FUSED_LCE_LAUNCH_COUNTS[kind as usize]
@@ -401,7 +401,7 @@ fn check_hint_extents(
 /// Aborts rather than returning an error code: the codegen call sites
 /// discard these functions' return values, so a refusal that returns is a
 /// refusal nobody hears.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_lce_pin_hint_extents(
     x_tensor_ptr: i64,
     w_tensor_ptr: i64,
@@ -787,7 +787,7 @@ mod hint_extent_tests {
 /// the row-preserving flatten) would otherwise read past this staging
 /// buffer on device — garbage class indices or ILLEGAL_ADDRESS. Pass 0 to
 /// skip the check (no caller does today).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
     tensor_ptr: i64,
     expected_rows: i64,
@@ -903,7 +903,7 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
 }
 
 /// Free a buffer produced by [`nsl_fused_lce_targets_i64_alloc`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_lce_targets_i64_free(dev_ptr: i64) {
     #[cfg(feature = "cuda")]
     if dev_ptr != 0 {
@@ -916,7 +916,7 @@ pub extern "C" fn nsl_fused_lce_targets_i64_free(dev_ptr: i64) {
 
 /// Any value outside {0, 1, 2} is treated as F32 (defensive — preserves
 /// forward-compat with un-recompiled callers).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_forward(
     ptx_ptr: i64,
@@ -1024,7 +1024,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
 /// MUST allocate x/W/bias in HBM as fp16. `2` = Bf16 (Sprint v4-1) —
 /// same HBM layout as F16 (16-bit storage). `partials_ptr` stays f32-sized
 /// across all dtypes (`large_partials_bytes()` is dtype-independent).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_forward_large(
     ptx_ptr: i64,
@@ -1120,7 +1120,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
 /// `dw_out` / `dbias_out` stay f32 regardless of dtype_tag (PyTorch
 /// master-gradient convention — the kernel emits `red.global.add.f32`
 /// for cross-CTA accumulation).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_backward(
     ptx_ptr: i64,
@@ -1201,7 +1201,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
 /// the head like every other GEMM). `has_bias == 0` skips every bias read;
 /// `bias_ptr` may be 0 then. f32 only — 16-bit storage stays on the v1
 /// kernels. Rationale + measurements: cuda/fused_ce_kernels.rs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_forward_gemm(
     x_ptr: i64,
@@ -1254,7 +1254,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_gemm(
 /// `dbias [V]` must be ZEROED by the caller — chunks accumulate. dW/dbias
 /// remain atomic/GEMM-order nondeterministic like the v1 kernels; the
 /// backward scale is `grad_output / num_valid`, folded here on the host.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_backward_gemm(
     grad_output_bits: i64, // f32 bits packed into i64
@@ -1340,8 +1340,8 @@ mod v7_default_activation_tests {
         fn set(value: Option<&str>) -> Self {
             let prev = std::env::var_os("NSL_FUSED_LCE_REFUSE_NON_F32");
             match value {
-                Some(v) => std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v),
-                None => std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32"),
+                Some(v) => unsafe { std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v) },
+                None => unsafe { std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32") },
             }
             EnvGuard { prev }
         }
@@ -1349,8 +1349,8 @@ mod v7_default_activation_tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v),
-                None => std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32"),
+                Some(v) => unsafe { std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v) },
+                None => unsafe { std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32") },
             }
         }
     }

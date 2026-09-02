@@ -244,7 +244,7 @@ pub unsafe fn time_kernel_launches(
             let head: Vec<String> =
                 host.iter().take(128).map(|b| format!("{:02x}", b)).collect();
             eprintln!("[bench] first 128 bytes: {}", head.join(" "));
-            let first_nz = host.iter().enumerate().find(|(_, &b)| b != 0);
+            let first_nz = host.iter().enumerate().find(|&(_, &b)| b != 0);
             match first_nz {
                 Some((i, b)) => eprintln!(
                     "[bench] first non-zero byte at offset {} = 0x{:02x}",

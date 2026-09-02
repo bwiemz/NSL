@@ -24,7 +24,7 @@
 use nsl_runtime::nsl_cuda_init;
 
 // Cast FFIs under test (from precision_cast.rs).
-extern "C" {
+unsafe extern "C" {
     fn nsl_tensor_to_bf16(src_ptr: i64) -> i64;
     fn nsl_tensor_to_fp16(src_ptr: i64) -> i64;
     fn nsl_tensor_to_f32(src_ptr: i64) -> i64;
@@ -68,7 +68,7 @@ fn cuda_available() -> bool {
 // wraps a static (non-owning) buffer; we leak a heap-allocated f32 slice
 // so the buffer outlives the test (the resulting tensor has owns_data=0
 // and never frees `data`). The leaks are tiny and per-test.
-extern "C" {
+unsafe extern "C" {
     fn nsl_tensor_from_static(data_ptr: i64, shape_list: i64, dtype: i64) -> i64;
     fn nsl_list_new() -> i64;
     fn nsl_list_push(list_ptr: i64, value: i64);
@@ -272,7 +272,7 @@ fn gpu_to_f32_same_dtype_is_copy() {
 // primitives now dispatch to the CFTP-v7 PTX cast kernels; this test
 // simulates one full envelope step exactly as `stmt_fase.rs` emits it.
 
-extern "C" {
+unsafe extern "C" {
     fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64;
     fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64;
     fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64);
