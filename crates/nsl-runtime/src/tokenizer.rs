@@ -144,7 +144,7 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Create a byte-level tokenizer (each byte 0-255 is its own token).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_byte_tokenizer_new() -> i64 {
     store_tokenizer(TokenizerKind::Byte)
 }
@@ -158,7 +158,7 @@ pub extern "C" fn nsl_byte_tokenizer_new() -> i64 {
 ///   - `special_tokens_list`: pointer to an `NslList` of C string pointers
 ///
 /// Returns a tokenizer handle (i64).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_bpe_train(
     corpus_path_ptr: i64,
     vocab_size: i64,
@@ -224,7 +224,7 @@ pub extern "C" fn nsl_bpe_train(
 ///   - `path_ptr`: C string pointer to the JSON file path
 ///
 /// Returns a tokenizer handle (i64).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tokenizer_load(path_ptr: i64) -> i64 {
     let path = unsafe { cstr_to_str(path_ptr) };
     match Tokenizer::from_file(path) {
@@ -241,7 +241,7 @@ pub extern "C" fn nsl_tokenizer_load(path_ptr: i64) -> i64 {
 /// Arguments:
 ///   - `handle`: tokenizer handle
 ///   - `path_ptr`: C string pointer to the output file path
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tokenizer_save(handle: i64, path_ptr: i64) {
     let path = unsafe { cstr_to_str(path_ptr) };
     match get_tokenizer(handle) {
@@ -265,7 +265,7 @@ pub extern "C" fn nsl_tokenizer_save(handle: i64, path_ptr: i64) {
 ///   - `text_ptr`: C string pointer to the text to encode
 ///
 /// Returns a tensor pointer (i64) — shape [seq_len].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tokenizer_encode(handle: i64, text_ptr: i64) -> i64 {
     let text = unsafe { cstr_to_str(text_ptr) };
     match get_tokenizer(handle) {
@@ -294,7 +294,7 @@ pub extern "C" fn nsl_tokenizer_encode(handle: i64, text_ptr: i64) -> i64 {
 ///   - `tensor_ptr`: pointer to a 1-D NslTensor of token IDs (f64)
 ///
 /// Returns a C string pointer (i64). Caller should free with `nsl_string_free`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tokenizer_decode(handle: i64, tensor_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     match get_tokenizer(handle) {
@@ -329,7 +329,7 @@ pub extern "C" fn nsl_tokenizer_decode(handle: i64, tensor_ptr: i64) -> i64 {
 }
 
 /// Return the vocabulary size of the tokenizer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tokenizer_vocab_size(handle: i64) -> i64 {
     match get_tokenizer(handle) {
         TokenizerKind::Byte => 256,
@@ -353,7 +353,7 @@ pub extern "C" fn nsl_tokenizer_vocab_size(handle: i64) -> i64 {
 /// Returns a pointer to an `NslList` containing two tensors:
 ///   [0] = input_ids  (2-D tensor [batch, seq_len])
 ///   [1] = attention_mask (2-D tensor [batch, seq_len])
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tokenizer_encode_batch(
     handle: i64,
     texts_list: i64,

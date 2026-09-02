@@ -62,9 +62,9 @@ fn pin_environment() {
             .filter(|key| key.to_string_lossy().starts_with("NSL_"))
             .collect();
         for key in nsl_vars {
-            std::env::remove_var(key);
+            unsafe { std::env::remove_var(key) };
         }
-        std::env::set_var("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+        unsafe { std::env::set_var("NSL_STDLIB_PATH", workspace_root().join("stdlib")) };
     });
 }
 

@@ -1,22 +1,22 @@
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sqrt(x: f64) -> f64 { x.sqrt() }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_log(x: f64) -> f64 { x.ln() }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_exp(x: f64) -> f64 { x.exp() }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sin(x: f64) -> f64 { x.sin() }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cos(x: f64) -> f64 { x.cos() }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_abs_float(x: f64) -> f64 { x.abs() }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_abs_int(x: i64) -> i64 {
     x.checked_abs().unwrap_or_else(|| {
         eprintln!("nsl: integer overflow in abs({})", x);
@@ -24,23 +24,23 @@ pub extern "C" fn nsl_abs_int(x: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_min_int(a: i64, b: i64) -> i64 { a.min(b) }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_max_int(a: i64, b: i64) -> i64 { a.max(b) }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_min_float(a: f64, b: f64) -> f64 { a.min(b) }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_max_float(a: f64, b: f64) -> f64 { a.max(b) }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_floor(x: f64) -> f64 { x.floor() }
 
 /// High-resolution wall clock in seconds (monotonic).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_clock() -> f64 {
     use std::time::Instant;
     use std::sync::OnceLock;
@@ -60,7 +60,7 @@ pub extern "C" fn nsl_clock() -> f64 {
 /// pure-CPU run of a cuda-featured binary on a GPU-less machine (the lazy
 /// state init asserts on cuInit failure). On real GPU runs the first
 /// tensor op initialized the context long before the first timed step.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cuda_device_synchronize() {
     #[cfg(feature = "cuda")]
     {
@@ -73,14 +73,14 @@ pub extern "C" fn nsl_cuda_device_synchronize() {
 
 /// NSL_PHASE_TIMING: one line per micro-batch with the forward(+loss) and
 /// backward wall-clock seconds. Machine-parseable prefix `[phase]`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_phase_fwd_bwd_report(fwd_s: f64, bwd_s: f64) {
     println!("[phase] fwd={fwd_s:.6} bwd={bwd_s:.6}");
 }
 
 /// NSL_PHASE_TIMING: one line per OPTIMIZER step (accumulation boundaries
 /// only) with the optimizer wall-clock seconds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_phase_optim_report(opt_s: f64) {
     println!("[phase] opt={opt_s:.6}");
 }
@@ -100,7 +100,7 @@ pub fn track_alloc(bytes: usize) {
 }
 
 /// Reset allocation counters to zero.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_alloc_reset() -> i64 {
     ALLOC_COUNTER.store(0, Ordering::Relaxed);
     ALLOC_BYTES.store(0, Ordering::Relaxed);
@@ -108,13 +108,13 @@ pub extern "C" fn nsl_alloc_reset() -> i64 {
 }
 
 /// Get the number of tensor allocations since last reset.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_alloc_count() -> i64 {
     ALLOC_COUNTER.load(Ordering::Relaxed) as i64
 }
 
 /// Get the total bytes allocated since last reset.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_alloc_bytes() -> i64 {
     ALLOC_BYTES.load(Ordering::Relaxed) as i64
 }

@@ -4,7 +4,7 @@ use super::dispatch;
 use std::slice;
 
 /// Route tokens to experts via top-k gating.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_moe_route(
     router_logits_ptr: i64,
     total_tokens: i64,
@@ -50,7 +50,7 @@ pub extern "C" fn nsl_moe_route(
 }
 
 /// Scatter tokens into expert-sorted order.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_moe_scatter(
     tokens_ptr: i64,
     sorted_indices_ptr: i64,
@@ -81,7 +81,7 @@ pub extern "C" fn nsl_moe_scatter(
 }
 
 /// Batched expert GEMM (CPU fallback: loop over experts).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_expert_parallel_matmul(
     sorted_tokens_ptr: i64,
     expert_weights_ptr: i64,
@@ -137,7 +137,7 @@ pub extern "C" fn nsl_expert_parallel_matmul(
 }
 
 /// Gather expert outputs back to original token order.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_moe_gather(
     expert_outputs_ptr: i64,
     _expert_indices_ptr: i64,
@@ -178,7 +178,7 @@ pub extern "C" fn nsl_moe_gather(
 }
 
 /// Compute auxiliary load-balancing loss.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_moe_aux_loss(
     expert_weights_ptr: i64,
     expert_indices_ptr: i64,
@@ -208,7 +208,7 @@ pub extern "C" fn nsl_moe_aux_loss(
 }
 
 /// All-to-all token exchange for expert parallelism (stub).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_moe_all_to_all(
     _send_buf_ptr: i64,
     _recv_buf_ptr: i64,
@@ -242,7 +242,7 @@ pub extern "C" fn nsl_moe_all_to_all(
 /// Real per-expert FFN weights live in `nsl_moe_dispatch_full_v2` (+ v3/v4);
 /// this v1 identity skeleton is the documented M32 backward-compat fallback
 /// for non-CPDT builds (CPDT Full refuses it via the S4 hard error).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_moe_dispatch_full(
     tokens_ptr: i64,
     logits_ptr: i64,
@@ -404,7 +404,7 @@ pub extern "C" fn nsl_moe_dispatch_full(
 ///
 /// Deferrals (v2.next): bias, activation, down-proj, capacity overflow
 /// handling, GPU expert_parallel_matmul, FP16 experts.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_moe_dispatch_full_v2(
     tokens_ptr: i64,
     logits_ptr: i64,
@@ -660,7 +660,7 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
 /// family architectures explicitly omit bias on the gated FFN, so v4
 /// bias is lower-priority), capacity-overflow renorm, GPU
 /// expert_parallel_matmul, FP16/mixed-precision experts.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_moe_dispatch_full_v3(
     tokens_ptr: i64,
@@ -1049,7 +1049,7 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
 /// Deferrals (v2.next): capacity-overflow renorm, GPU
 /// expert_parallel_matmul, FP16/mixed-precision experts (relax F1
 /// upfront dtype refusal).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_moe_dispatch_full_v4(
     tokens_ptr: i64,

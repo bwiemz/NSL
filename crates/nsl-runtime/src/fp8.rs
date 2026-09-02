@@ -181,7 +181,7 @@ fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
 /// Cast a tensor to FP8 with given scale. If scale=0.0, auto-compute.
 /// Returns a new tensor pointer with FP8-quantized-then-dequantized values,
 /// on the same device as the input.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -> i64 {
     let orig_device = unsafe { (*(tensor_ptr as *const NslTensor)).device };
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_cast");
@@ -243,7 +243,7 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
 }
 
 /// Compute optimal scale factor for FP8 conversion.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_compute_scale(tensor_ptr: i64, fp8_dtype: i64) -> f64 {
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_compute_scale");
     let t = unsafe { &*(src_ptr as *const NslTensor) };
@@ -283,7 +283,7 @@ pub fn fp8_matmul_cpu(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec
 
 /// FP8 matmul FFI: both inputs are FP8-cast tensors. Output is f32 on CPU.
 /// scale_a and scale_b are passed but on CPU, scale is already applied at cast time.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_matmul(
     a_ptr: i64,
     b_ptr: i64,
@@ -300,7 +300,7 @@ pub extern "C" fn nsl_fp8_matmul(
 /// Called by codegen when @fp8_compute is used inside a grad() scope.
 /// Auto-retrieves scales from FP8_SCALES table and computes K from tensor shape.
 /// Same 2-arg signature as nsl_tensor_matmul for easy codegen swap.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_matmul_training(
     a_ptr: i64,
     b_ptr: i64,
@@ -406,14 +406,14 @@ pub fn calibrate_gradient_scale(tensor_ptr: i64) -> f32 {
 /// Input: f32/f64 tensor pointer, per-tensor scale.
 /// Output: new f32 tensor with E5M2-quantized-then-dequantized values (simulating precision loss).
 /// If scale is 0.0, auto-computes scale from data.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_quantize_e5m2(tensor_ptr: i64, scale: f64) -> i64 {
     nsl_fp8_cast(tensor_ptr, FP8_FORMAT_E5M2, scale)
 }
 
 /// Compute gradient scale for E5M2 backward quantization.
 /// Returns scale = amax / FP8E5M2_MAX. No EMA — fresh per step.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_gradient_scale(tensor_ptr: i64) -> f64 {
     calibrate_gradient_scale(tensor_ptr) as f64
 }
@@ -475,7 +475,7 @@ pub fn get_cached_fp8_ptx(k: usize, format: i64) -> Option<String> {
 
 /// FFI: Register compiled E5M2 backward PTX from codegen.
 /// k_dim: inner dimension, ptx_ptr: null-terminated C string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_cache_e5m2_ptx(k_dim: i64, ptx_ptr: i64) {
     let ptx_cstr = unsafe { std::ffi::CStr::from_ptr(ptx_ptr as *const std::ffi::c_char) };
     let ptx = ptx_cstr.to_string_lossy().into_owned();
@@ -538,7 +538,7 @@ impl Fp8CalibrationState {
 /// `tensor_ptr`: i64 pointer to an NslTensor (f32 data)
 /// `running_max_ptr`: i64 pointer to a scalar tensor holding the running max
 /// `momentum`: EMA decay factor (e.g., 0.999)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fp8_update_calibration(
     tensor_ptr: i64,
     running_max_ptr: i64,
@@ -735,7 +735,7 @@ pub fn quantize_mxfp8(data: &[f32], block_size: usize, fp8_format: i64) -> MxFp8
 /// The per-block E8M0 scale factors are computed internally and DROPPED at
 /// this boundary — only the dequantized data survives. (This comment used to
 /// claim an `nsl_mxfp8_get_scales` accessor; no such symbol has ever existed.)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_format: i64) -> i64 {
     let orig_device = NslTensor::from_ptr(tensor_ptr).device;
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_mxfp8_quantize");
@@ -917,7 +917,7 @@ pub fn dequantize_nvfp4(quantized: &NvFp4Quantized) -> Vec<f32> {
 }
 
 /// FFI: Quantize tensor with NVFP4 (E2M1) and optional Hadamard preprocessing.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_hadamard: i64) -> i64 {
     let orig_device = NslTensor::from_ptr(tensor_ptr).device;
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_nvfp4_quantize");

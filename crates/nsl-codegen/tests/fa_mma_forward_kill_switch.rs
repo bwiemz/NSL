@@ -30,15 +30,15 @@ fn sdpa_config() -> FlashAttentionConfig {
 #[test]
 fn kill_switch_restores_scalar_body() {
     let prior = std::env::var("NSL_FA_FWD_MMA").ok();
-    std::env::set_var("NSL_FA_FWD_MMA", "0");
+    unsafe { std::env::set_var("NSL_FA_FWD_MMA", "0") };
     let cfg = sdpa_config();
     let name = flash_attention_kernel_name_v2(&cfg);
     let mut bytes = synthesize_flash_attention_ptx_v2(&cfg);
     bytes.pop();
     let ptx = String::from_utf8(bytes).unwrap();
     match prior {
-        Some(v) => std::env::set_var("NSL_FA_FWD_MMA", v),
-        None => std::env::remove_var("NSL_FA_FWD_MMA"),
+        Some(v) => unsafe { std::env::set_var("NSL_FA_FWD_MMA", v) },
+        None => unsafe { std::env::remove_var("NSL_FA_FWD_MMA") },
     }
     assert_eq!(
         name, "flash_attn_p0_r0_hs_g1_c1_t0_q64_kv64_v2",

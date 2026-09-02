@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn worker_role_defaults() {
         // When NSL_ROLE is not set, default is Router
-        std::env::remove_var("NSL_ROLE");
+        unsafe { std::env::remove_var("NSL_ROLE") };
         assert_eq!(WorkerRole::from_env(), WorkerRole::Router);
     }
 

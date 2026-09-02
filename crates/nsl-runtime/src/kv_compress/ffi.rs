@@ -25,7 +25,7 @@ use super::h2o::H2OManager;
 /// - scheme: KvQuantScheme discriminant
 ///
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_quantize_and_store(
     raw_k: i64,
     raw_v: i64,
@@ -110,7 +110,7 @@ pub extern "C" fn nsl_kv_quantize_and_store(
 /// - scheme: KvQuantScheme discriminant (1-4)
 ///
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_dequantize_gpu(
     data_ptr: i64,
     out_ptr: i64,
@@ -225,7 +225,7 @@ static SW_CTX: Mutex<Option<SlidingWindowManager>> = Mutex::new(None);
 
 /// Initialize sliding window manager.
 /// Returns 0 on success, -1 if already initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_sliding_window_init(
     window: i64,
     sinks: i64,
@@ -245,7 +245,7 @@ pub extern "C" fn nsl_kv_sliding_window_init(
 
 /// Check sliding window eviction. Returns number of blocks to evict.
 /// Evicted block indices are written to `evict_out_ptr` if non-null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_sliding_window_check(
     _seq_id: i64,
     current_len: i64,
@@ -268,7 +268,7 @@ pub extern "C" fn nsl_kv_sliding_window_check(
 }
 
 /// Destroy sliding window manager.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_sliding_window_destroy() -> i64 {
     let mut guard = SW_CTX.lock().unwrap();
     *guard = None;
@@ -283,7 +283,7 @@ static H2O_CTX: Mutex<Option<H2OManager>> = Mutex::new(None);
 
 /// Initialize H2O manager.
 /// Returns 0 on success, -1 if already initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_h2o_init(budget: i64, sinks: i64, block_size: i64) -> i64 {
     let mut guard = H2O_CTX.lock().unwrap();
     if guard.is_some() {
@@ -300,7 +300,7 @@ pub extern "C" fn nsl_kv_h2o_init(budget: i64, sinks: i64, block_size: i64) -> i
 /// Accumulate attention scores for a sequence.
 /// scores_ptr: *const f32, [seq_len] averaged scores from latest decode step.
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_h2o_accumulate(
     seq_id: i64,
     scores_ptr: i64,
@@ -319,7 +319,7 @@ pub extern "C" fn nsl_kv_h2o_accumulate(
 }
 
 /// Check H2O eviction. Returns number of blocks to evict.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_h2o_check(
     seq_id: i64,
     current_len: i64,
@@ -342,7 +342,7 @@ pub extern "C" fn nsl_kv_h2o_check(
 }
 
 /// Remove sequence tracking from H2O manager.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_h2o_remove_sequence(seq_id: i64) -> i64 {
     let mut guard = H2O_CTX.lock().unwrap();
     let mgr = guard.as_mut().expect("nsl_kv_h2o_init not called");
@@ -351,7 +351,7 @@ pub extern "C" fn nsl_kv_h2o_remove_sequence(seq_id: i64) -> i64 {
 }
 
 /// Destroy H2O manager.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_h2o_destroy() -> i64 {
     let mut guard = H2O_CTX.lock().unwrap();
     *guard = None;
@@ -364,7 +364,7 @@ pub extern "C" fn nsl_kv_h2o_destroy() -> i64 {
 
 /// Get compression ratio for the active scheme.
 /// Returns the compression ratio as f64 bits (e.g., 2.0 for INT8 vs FP16).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_compress_ratio(scheme: i64) -> i64 {
     let qs = KvQuantScheme::from_i64(scheme);
     let ratio = 2.0 / qs.bytes_per_element(); // relative to FP16 baseline

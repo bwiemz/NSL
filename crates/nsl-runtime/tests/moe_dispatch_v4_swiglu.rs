@@ -17,7 +17,7 @@ use nsl_runtime::tensor::{
     nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_zeros_f16_on, nsl_tensor_zeros_on,
 };
 
-extern "C" {
+unsafe extern "C" {
     fn nsl_moe_dispatch_full_v4(
         tokens_ptr: i64,
         logits_ptr: i64,

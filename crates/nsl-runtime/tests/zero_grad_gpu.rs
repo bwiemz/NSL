@@ -22,7 +22,7 @@
 use nsl_runtime::nsl_cuda_init;
 
 // FFIs under test (zero.rs) plus tensor/list helpers (tensor/mod.rs, list.rs).
-extern "C" {
+unsafe extern "C" {
     fn nsl_grad_accumulate_add(dst_ptr: i64, src_ptr: i64, num_elems: i64) -> i64;
     fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64;
     fn nsl_zero_init(stage: i64, world_size: i64) -> i64;

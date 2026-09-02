@@ -71,7 +71,7 @@ use nsl_test::diagnostic_mode::{
     compute_forward_for_test, generate_d_o, generate_forward_inputs, FSource,
 };
 
-extern "C" {
+unsafe extern "C" {
     /// Production hybrid-backward FFI (53-param). See `nsl-runtime`
     /// `flash_attention.rs::nsl_flash_attention_csha_backward`.
     #[allow(clippy::too_many_arguments)]

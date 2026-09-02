@@ -10,19 +10,19 @@ use super::creation::create_scalar_tensor_dtype;
 use super::{get_strides_vec, nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
 
 /// Global sum reduction (backward compatible wrapper).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sum(tensor_ptr: i64) -> i64 {
     nsl_tensor_sum_dim(tensor_ptr, -1, 0)
 }
 
 /// Global mean reduction (backward compatible wrapper).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mean(tensor_ptr: i64) -> i64 {
     nsl_tensor_mean_dim(tensor_ptr, -1, 0)
 }
 
 /// Sum reduction along a dimension (dim=-1 means global).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
     // GPU dispatch: native GPU reduction kernels.
     {
@@ -176,7 +176,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
 }
 
 /// Mean reduction along a dimension (dim=-1 means global).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
     // GPU dispatch: use native GPU sum then divide by count.
     {
@@ -316,7 +316,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
 }
 
 /// Reduce max along a dimension.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
     // GPU dispatch: native GPU max reduction kernel.
     {
@@ -471,7 +471,7 @@ fn gather_dim_gpu_enabled() -> bool {
 }
 
 /// Gather along a dimension: output[b] = tensor[b, indices[b]] (for dim=1, 2D input).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64) -> i64 {
     // GPU dispatch: native GPU gather kernel (dim 0) or CPU-redirect (other dims).
     {
@@ -726,7 +726,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 }
 
 /// Softmax along a dimension.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
     // GPU dispatch: native GPU softmax kernel (last dim) or CPU-redirect (other dims)
     {

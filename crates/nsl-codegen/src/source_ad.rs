@@ -6625,11 +6625,11 @@ mod tests {
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         };
-        let mut gen = AdjointGenerator::new(10);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(10);
+        let adjoint = generator.generate(&primal);
         assert!(!adjoint.ops.is_empty());
-        assert!(gen.adjoint_of(0).is_some());
-        assert!(gen.adjoint_of(1).is_some());
+        assert!(generator.adjoint_of(0).is_some());
+        assert!(generator.adjoint_of(1).is_some());
     }
 
     #[test]
@@ -6644,10 +6644,10 @@ mod tests {
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         };
-        let mut gen = AdjointGenerator::new(10);
-        let _adjoint = gen.generate(&primal);
-        assert!(gen.adjoint_of(0).is_some());
-        assert!(gen.adjoint_of(1).is_some());
+        let mut generator = AdjointGenerator::new(10);
+        let _adjoint = generator.generate(&primal);
+        assert!(generator.adjoint_of(0).is_some());
+        assert!(generator.adjoint_of(1).is_some());
     }
 
     /// CPDT Part II activation: directly tests `lower_adjoint_expr` against
@@ -6659,11 +6659,11 @@ mod tests {
     /// op, but with the wrong target VarId.
     #[test]
     fn lower_adjoint_expr_mul_elementwise_uses_target_as_shape_anchor() {
-        let mut gen = AdjointGenerator::new(200);
+        let mut generator = AdjointGenerator::new(200);
         // grad=100, other=42, target=7 — chosen to be unambiguous in the
         // result inputs vector.
-        let _ = gen.lower_adjoint_expr(AdjointExpr::MulElementwise(100, 42, 7));
-        let ops = &gen.adjoint_ops;
+        let _ = generator.lower_adjoint_expr(AdjointExpr::MulElementwise(100, 42, 7));
+        let ops = &generator.adjoint_ops;
         assert_eq!(
             ops.len(),
             2,
@@ -6711,12 +6711,12 @@ mod tests {
             (ConvGradKind::Weight, 2, 1),
             (ConvGradKind::Bias, 1, 0),
         ] {
-            let mut gen = AdjointGenerator::new(200);
+            let mut generator = AdjointGenerator::new(200);
             // grad=100, input=5, weight=6 — distinct for an unambiguous inputs check.
-            let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+            let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
                 kind, 100, 5, 6, stride, padding,
             ));
-            let ops = &gen.adjoint_ops;
+            let ops = &generator.adjoint_ops;
             assert_eq!(
                 ops.len(),
                 2,
@@ -6763,10 +6763,10 @@ mod tests {
     #[test]
     fn conv2d_backward_siblings_share_one_materialize_call() {
         use crate::wengert::ConvGradKind;
-        let mut gen = AdjointGenerator::new(200);
+        let mut generator = AdjointGenerator::new(200);
         // Same grad=100/input=5/weight=6 for all three sibling gradients,
         // as apply_ad_rule produces for one Conv2d node with a bias.
-        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+        let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
             ConvGradKind::Input,
             100,
             5,
@@ -6774,7 +6774,7 @@ mod tests {
             1,
             0,
         ));
-        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+        let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
             ConvGradKind::Weight,
             100,
             5,
@@ -6782,7 +6782,7 @@ mod tests {
             1,
             0,
         ));
-        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+        let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
             ConvGradKind::Bias,
             100,
             5,
@@ -6791,7 +6791,7 @@ mod tests {
             0,
         ));
 
-        let materialize_ops: Vec<_> = gen
+        let materialize_ops: Vec<_> = generator
             .adjoint_ops
             .iter()
             .filter(|op| matches!(op.op, PrimalOp::MaterializeConvOutputGrad { .. }))
@@ -6806,7 +6806,7 @@ mod tests {
         );
         let materialized = materialize_ops[0].result;
 
-        let backward_ops: Vec<_> = gen
+        let backward_ops: Vec<_> = generator
             .adjoint_ops
             .iter()
             .filter(|op| matches!(op.op, PrimalOp::Conv2dBackward { .. }))
@@ -6833,18 +6833,18 @@ mod tests {
     #[test]
     fn conv2d_backward_distinct_geometry_shared_grad_does_not_collide() {
         use crate::wengert::ConvGradKind;
-        let mut gen = AdjointGenerator::new(300);
+        let mut generator = AdjointGenerator::new(300);
         // Node A: grad=100, input=5, weight=6. Node B: SAME grad=100, but
         // input=7, weight=8 (a differently shaped conv). Emit both siblings of
         // each node so the intra-node sharing path is also exercised.
         for kind in [ConvGradKind::Input, ConvGradKind::Weight] {
-            let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(kind, 100, 5, 6, 1, 0));
+            let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(kind, 100, 5, 6, 1, 0));
         }
         for kind in [ConvGradKind::Input, ConvGradKind::Weight] {
-            let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(kind, 100, 7, 8, 1, 0));
+            let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(kind, 100, 7, 8, 1, 0));
         }
 
-        let materialize_ops: Vec<_> = gen
+        let materialize_ops: Vec<_> = generator
             .adjoint_ops
             .iter()
             .filter(|op| matches!(op.op, PrimalOp::MaterializeConvOutputGrad { .. }))
@@ -6866,7 +6866,7 @@ mod tests {
         assert_ne!(mat_a, mat_b, "materialized grads must be distinct VarIds");
 
         // Node A's Conv2dBackward ops consume mat_a; node B's consume mat_b.
-        let bwd_inputs: Vec<u32> = gen
+        let bwd_inputs: Vec<u32> = generator
             .adjoint_ops
             .iter()
             .filter(|op| matches!(op.op, PrimalOp::Conv2dBackward { .. }))
@@ -6886,9 +6886,9 @@ mod tests {
     #[test]
     fn conv2d_backward_materialize_key_includes_stride_padding() {
         use crate::wengert::ConvGradKind;
-        let mut gen = AdjointGenerator::new(400);
+        let mut generator = AdjointGenerator::new(400);
         // Identical grad/input/weight VarIds; stride 1 vs 2.
-        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+        let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
             ConvGradKind::Input,
             100,
             5,
@@ -6896,7 +6896,7 @@ mod tests {
             1,
             0,
         ));
-        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+        let _ = generator.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
             ConvGradKind::Input,
             100,
             5,
@@ -6904,7 +6904,7 @@ mod tests {
             2,
             0,
         ));
-        let materialize_ops: Vec<_> = gen
+        let materialize_ops: Vec<_> = generator
             .adjoint_ops
             .iter()
             .filter(|op| matches!(op.op, PrimalOp::MaterializeConvOutputGrad { .. }))
@@ -6938,8 +6938,8 @@ mod tests {
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         };
-        let mut gen = AdjointGenerator::new(10);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(10);
+        let adjoint = generator.generate(&primal);
         let reduce_ops: Vec<_> = adjoint
             .ops
             .iter()
@@ -7611,15 +7611,15 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(10);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(10);
+        let adjoint = generator.generate(&primal);
 
         // The output (var 3) should have an adjoint
-        assert!(gen.adjoint_of(3).is_some(), "Output should have adjoint");
+        assert!(generator.adjoint_of(3).is_some(), "Output should have adjoint");
 
         // The param x (var 0) should have an adjoint (from Select true-branch)
         assert!(
-            gen.adjoint_of(0).is_some(),
+            generator.adjoint_of(0).is_some(),
             "Param x should have adjoint through Select"
         );
 
@@ -7652,8 +7652,8 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(10);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(10);
+        let adjoint = generator.generate(&primal);
 
         // Should have Constant(0.0) ops in the adjoint for the zero branches
         let zero_consts: Vec<_> = adjoint
@@ -7687,18 +7687,18 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(10);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(10);
+        let adjoint = generator.generate(&primal);
 
         // x should have adjoint (from both Mul and Neg, gated by Select)
-        assert!(gen.adjoint_of(0).is_some(), "x should have an adjoint");
+        assert!(generator.adjoint_of(0).is_some(), "x should have an adjoint");
         // The true result and false result should have adjoints
         assert!(
-            gen.adjoint_of(3).is_some(),
+            generator.adjoint_of(3).is_some(),
             "true-branch result (x*x) should have adjoint"
         );
         assert!(
-            gen.adjoint_of(4).is_some(),
+            generator.adjoint_of(4).is_some(),
             "false-branch result (-x) should have adjoint"
         );
 
@@ -7819,12 +7819,12 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(20);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(20);
+        let adjoint = generator.generate(&primal);
 
         // x (var 0) should have an adjoint — gradient propagates through both Select ops
         assert!(
-            gen.adjoint_of(0).is_some(),
+            generator.adjoint_of(0).is_some(),
             "x should have adjoint through nested Select"
         );
 
@@ -7923,11 +7923,11 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(20);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(20);
+        let adjoint = generator.generate(&primal);
 
         // x should have an adjoint
-        assert!(gen.adjoint_of(0).is_some(), "x should have adjoint");
+        assert!(generator.adjoint_of(0).is_some(), "x should have adjoint");
 
         // The backward pass should produce Select ops for conditional adjoint
         let adj_selects = adjoint
@@ -8029,8 +8029,8 @@ mod tests {
 
         // Generate adjoint
         let max_primal_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
-        let mut gen = AdjointGenerator::new(max_primal_var + 1);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(max_primal_var + 1);
+        let adjoint = generator.generate(&primal);
 
         // Verify the full pipeline works
         assert!(!adjoint.ops.is_empty(), "Adjoint list should not be empty");
@@ -8038,11 +8038,11 @@ mod tests {
         let x_var = primal
             .ops
             .iter()
-            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .find(|op| matches!(&op.op, PrimalOp::Param(n) if n == "x"))
             .map(|op| op.result)
             .unwrap();
         assert!(
-            gen.adjoint_of(x_var).is_some(),
+            generator.adjoint_of(x_var).is_some(),
             "Param x should have adjoint in relu"
         );
     }
@@ -8077,18 +8077,18 @@ mod tests {
         let primal = extractor.finalize().unwrap();
 
         let max_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
-        let mut gen = AdjointGenerator::new(max_var + 1);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(max_var + 1);
+        let adjoint = generator.generate(&primal);
 
         assert!(!adjoint.ops.is_empty());
         // Both branches contribute to the adjoint of x
         let x_var = primal
             .ops
             .iter()
-            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .find(|op| matches!(&op.op, PrimalOp::Param(n) if n == "x"))
             .map(|op| op.result)
             .unwrap();
-        assert!(gen.adjoint_of(x_var).is_some());
+        assert!(generator.adjoint_of(x_var).is_some());
     }
 
     // ---------------------------------------------------------------
@@ -8167,18 +8167,18 @@ mod tests {
 
         // Generate the adjoint
         let max_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
-        let mut gen = AdjointGenerator::new(max_var + 1);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(max_var + 1);
+        let adjoint = generator.generate(&primal);
 
         // x (the param) must have an adjoint
         let x_var = primal
             .ops
             .iter()
-            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .find(|op| matches!(&op.op, PrimalOp::Param(n) if n == "x"))
             .map(|op| op.result)
             .expect("x must be in primal");
         assert!(
-            gen.adjoint_of(x_var).is_some(),
+            generator.adjoint_of(x_var).is_some(),
             "Param x should have an adjoint in leaky ReLU"
         );
 
@@ -8247,12 +8247,12 @@ mod tests {
         };
 
         let max_var = 6;
-        let mut gen = AdjointGenerator::new(max_var + 1);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(max_var + 1);
+        let adjoint = generator.generate(&primal);
 
         // x must have an adjoint
         assert!(
-            gen.adjoint_of(0).is_some(),
+            generator.adjoint_of(0).is_some(),
             "x should have an adjoint through the nested clamp Select chain"
         );
 
@@ -8319,26 +8319,26 @@ mod tests {
         };
 
         let max_var = 7;
-        let mut gen = AdjointGenerator::new(max_var + 1);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(max_var + 1);
+        let adjoint = generator.generate(&primal);
 
         // Both a and b must have adjoints
         assert!(
-            gen.adjoint_of(1).is_some(),
+            generator.adjoint_of(1).is_some(),
             "Param a should have an adjoint"
         );
         assert!(
-            gen.adjoint_of(2).is_some(),
+            generator.adjoint_of(2).is_some(),
             "Param b should have an adjoint"
         );
 
         // The true-branch result and false-branch result should have adjoints
         assert!(
-            gen.adjoint_of(5).is_some(),
+            generator.adjoint_of(5).is_some(),
             "True-branch Mul result should have adjoint"
         );
         assert!(
-            gen.adjoint_of(6).is_some(),
+            generator.adjoint_of(6).is_some(),
             "False-branch Add result should have adjoint"
         );
 
@@ -8392,8 +8392,8 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(20);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(20);
+        let adjoint = generator.generate(&primal);
 
         // Structural: must not contain Input ops (tape-push markers)
         let has_tape_input = adjoint
@@ -8427,7 +8427,7 @@ mod tests {
         );
 
         // x must have an adjoint — the whole point of AD
-        assert!(gen.adjoint_of(0).is_some(), "x must have adjoint");
+        assert!(generator.adjoint_of(0).is_some(), "x must have adjoint");
     }
 
     #[test]
@@ -8450,8 +8450,8 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(20);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(20);
+        let adjoint = generator.generate(&primal);
 
         // No tape-style ops in the backward pass
         assert!(
@@ -8505,8 +8505,8 @@ mod tests {
             var_types: HashMap::new(),
         };
 
-        let mut gen = AdjointGenerator::new(20);
-        let adjoint = gen.generate(&primal);
+        let mut generator = AdjointGenerator::new(20);
+        let adjoint = generator.generate(&primal);
 
         // Count op types
         let tape_ops = adjoint
@@ -8545,7 +8545,7 @@ mod tests {
         );
 
         // x must have an adjoint
-        assert!(gen.adjoint_of(0).is_some(), "x must have an adjoint");
+        assert!(generator.adjoint_of(0).is_some(), "x must have an adjoint");
     }
 
     // -----------------------------------------------------------------

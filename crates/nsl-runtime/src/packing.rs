@@ -441,7 +441,7 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
 ///     embedding / CE lowering handle host tensors today.
 ///
 /// Returns 1 when at least one tensor moved, else 0.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_packed_batch_align_device(dict_ptr: i64, param_list_ptr: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -522,7 +522,7 @@ pub extern "C" fn nsl_packed_batch_align_device(dict_ptr: i64, param_list_ptr: i
 /// Refusals are loud (panic): this FFI is compiler-emitted on the packed
 /// attention decline path, so a malformed segment tensor here is a
 /// producer/compiler bug, not user input.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_packed_mask_from_segment_ids(seg_ptr: i64) -> i64 {
     assert!(
         seg_ptr != 0,
@@ -637,7 +637,7 @@ pub extern "C" fn nsl_packed_mask_from_segment_ids(seg_ptr: i64) -> i64 {
 /// With packing, efficiency approaches 1.0.
 ///
 /// `dl_ptr`: DataLoader handle. If 0 or no attention_mask available, returns 1.0.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_packing_efficiency(dl_ptr: i64) -> f64 {
     if dl_ptr == 0 {
         return 1.0;

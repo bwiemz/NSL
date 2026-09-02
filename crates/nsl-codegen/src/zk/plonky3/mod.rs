@@ -1301,8 +1301,8 @@ mod tests {
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
         // Generate witness
-        let mut gen = WitnessGenerator::new();
-        let witness = gen.generate(&ir, &inputs, &[]).unwrap();
+        let mut generator = WitnessGenerator::new();
+        let witness = generator.generate(&ir, &inputs, &[]).unwrap();
         assert_eq!(witness.get(Wire(2)), FieldElement::from_u64(42));
 
         // Prove
@@ -1343,8 +1343,8 @@ mod tests {
         let circuit = backend.compile(&ir, &config).unwrap();
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(10), FieldElement::from_u64(20)],
@@ -1379,8 +1379,8 @@ mod tests {
         let circuit = backend.compile(&ir, &config).unwrap();
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(&ir, &[FieldElement::from_u64(42)], &[])
             .unwrap();
         assert_eq!(witness.get(out), FieldElement::from_u64(142));
@@ -1400,8 +1400,8 @@ mod tests {
         let circuit = backend.compile(&ir, &config).unwrap();
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen.generate(&ir, &inputs, &[]).unwrap();
+        let mut generator = WitnessGenerator::new();
+        let witness = generator.generate(&ir, &inputs, &[]).unwrap();
 
         let mut proof = backend.prove(&pk, &witness).unwrap();
         vk.trace_commitment_root = proof.trace_commitment;
@@ -1471,8 +1471,8 @@ mod tests {
         });
         ir.set_public_inputs(vec![w0, w1]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(3), FieldElement::from_u64(5)],
@@ -1532,8 +1532,8 @@ mod tests {
         let circuit = backend.compile(&ir, &config).unwrap();
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(3), FieldElement::from_u64(4)],
@@ -1564,8 +1564,8 @@ mod tests {
         let circuit = backend.compile(&ir, &config).unwrap();
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(77), FieldElement::from_u64(77)],

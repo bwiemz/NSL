@@ -281,8 +281,8 @@ mod tests {
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w2]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(3), FieldElement::from_u64(7)],
@@ -306,8 +306,8 @@ mod tests {
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w2]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(6), FieldElement::from_u64(7)],
@@ -331,8 +331,8 @@ mod tests {
         ir.set_public_inputs(vec![w0]);
         ir.set_public_outputs(vec![out]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(&ir, &[FieldElement::from_u64(8)], &[])
             .unwrap();
         assert_eq!(witness.get(out), FieldElement::from_u64(50));
@@ -358,10 +358,10 @@ mod tests {
         ir.set_public_inputs(vec![a0, a1, b0, b1]);
         ir.set_public_outputs(vec![out]);
 
-        let mut gen = WitnessGenerator::new();
+        let mut generator = WitnessGenerator::new();
         // dot([2, 3], [4, 5]) = 2*4 + 3*5 = 8 + 15 = 23
         let inputs = [2u64, 3, 4, 5].map(FieldElement::from_u64);
-        let witness = gen.generate(&ir, &inputs, &[]).unwrap();
+        let witness = generator.generate(&ir, &inputs, &[]).unwrap();
         assert_eq!(witness.get(out), FieldElement::from_u64(23));
     }
 
@@ -388,16 +388,16 @@ mod tests {
         ir.set_public_inputs(vec![w0]);
         ir.set_public_outputs(vec![w1]);
 
-        let mut gen = WitnessGenerator::new();
+        let mut generator = WitnessGenerator::new();
 
         // relu(-5) = 0:  raw index for signed -5 in 8-bit two's complement is 251
         let neg5_idx = FieldElement::from_u64(251);
-        let witness = gen.generate(&ir, &[neg5_idx], &[]).unwrap();
+        let witness = generator.generate(&ir, &[neg5_idx], &[]).unwrap();
         assert_eq!(witness.get(w1), FieldElement::zero());
 
         // relu(5) = 5:  raw index for 5 is 5
         let pos5_idx = FieldElement::from_u64(5);
-        let witness2 = gen.generate(&ir, &[pos5_idx], &[]).unwrap();
+        let witness2 = generator.generate(&ir, &[pos5_idx], &[]).unwrap();
         assert_eq!(witness2.get(w1), FieldElement::from_u64(5));
     }
 
@@ -413,10 +413,10 @@ mod tests {
         ir.push(ZkInstruction::AssertEq { a: w0, b: w1 });
         ir.set_public_inputs(vec![w0, w1]);
 
-        let mut gen = WitnessGenerator::new();
+        let mut generator = WitnessGenerator::new();
         let v = FieldElement::from_u64(99);
         // Both wires get the same value — constraint satisfied.
-        gen.generate(&ir, &[v, v], &[]).unwrap();
+        generator.generate(&ir, &[v, v], &[]).unwrap();
     }
 
     #[test]
@@ -427,8 +427,8 @@ mod tests {
         ir.push(ZkInstruction::AssertEq { a: w0, b: w1 });
         ir.set_public_inputs(vec![w0, w1]);
 
-        let mut gen = WitnessGenerator::new();
-        let result = gen.generate(
+        let mut generator = WitnessGenerator::new();
+        let result = generator.generate(
             &ir,
             &[FieldElement::from_u64(1), FieldElement::from_u64(2)],
             &[],
@@ -459,8 +459,8 @@ mod tests {
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![out]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(4), FieldElement::from_u64(8)],
@@ -489,8 +489,8 @@ mod tests {
         ir.private_inputs.push(weight);
         ir.set_public_outputs(vec![out]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(5)], // public input
@@ -520,8 +520,8 @@ mod tests {
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w2, w3]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(10), FieldElement::from_u64(20)],
@@ -546,8 +546,8 @@ mod tests {
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![out]);
 
-        let mut gen = WitnessGenerator::new();
-        let witness = gen
+        let mut generator = WitnessGenerator::new();
+        let witness = generator
             .generate(
                 &ir,
                 &[FieldElement::from_u64(100), FieldElement::from_u64(200)],
@@ -572,9 +572,9 @@ mod tests {
         });
         ir.set_public_inputs(vec![w0]);
 
-        let mut gen = WitnessGenerator::new();
-        gen.generate(&ir, &[FieldElement::from_u64(7)], &[])
+        let mut generator = WitnessGenerator::new();
+        generator.generate(&ir, &[FieldElement::from_u64(7)], &[])
             .unwrap();
-        assert_eq!(gen.wire_value(w1), FieldElement::from_u64(14));
+        assert_eq!(generator.wire_value(w1), FieldElement::from_u64(14));
     }
 }

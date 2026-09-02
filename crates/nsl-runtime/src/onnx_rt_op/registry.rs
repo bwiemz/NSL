@@ -385,7 +385,7 @@ unsafe extern "C" fn vtable_release_alias_map(
 pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
     #[cfg(target_os = "macos")]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
         }
         // RTLD_SELF (-3) searches only the calling library — works even when
@@ -396,7 +396,7 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
             fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
             fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
@@ -435,7 +435,7 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
     }
     #[cfg(windows)]
     {
-        extern "system" {
+        unsafe extern "system" {
             fn GetModuleHandleExW(
                 flags: u32,
                 module_name: *const u16,

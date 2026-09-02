@@ -55,7 +55,7 @@ use super::{
 /// as `u16`; the f32->f16 conversion uses the crate's `f32_to_f16_bits`
 /// (which truncates the mantissa — see the module note). An F32->F32 cast
 /// yields a faithful copy. The source tensor is NOT consumed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     let t = unsafe { &*(src_ptr as *const NslTensor) };
     // CFTP v6 Finding 2 (HIGH): the cast reads `t.data` LINEARLY for `len`
@@ -156,7 +156,7 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
 /// source tensor is NOT consumed. v6 is CPU-only (the underlying
 /// `nsl_tensor_cast` is CPU-only); a device-side PTX cast kernel is deferred
 /// to v7. Supports F32/FP16/BF16 source dtypes (BF16->BF16 is a faithful copy).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_bf16(src_ptr: i64) -> i64 {
     cast_and_publish(src_ptr, DTYPE_BF16)
 }
@@ -164,7 +164,7 @@ pub extern "C" fn nsl_tensor_to_bf16(src_ptr: i64) -> i64 {
 /// CFTP v6 convenience: cast a tensor to FP16, returning a NEW owned tensor
 /// published into the scope sweep. See `nsl_tensor_to_bf16`. Uses the crate's
 /// `f32_to_f16_bits` primitive (truncating, not RTE — see module note).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_fp16(src_ptr: i64) -> i64 {
     cast_and_publish(src_ptr, DTYPE_FP16)
 }
@@ -172,7 +172,7 @@ pub extern "C" fn nsl_tensor_to_fp16(src_ptr: i64) -> i64 {
 /// CFTP v6 convenience: cast a tensor to F32, returning a NEW owned tensor
 /// published into the scope sweep. Needed for backward symmetry: if dx is
 /// emitted as BF16/FP16, the wengert tape may need an F32 widened copy.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_to_f32(src_ptr: i64) -> i64 {
     cast_and_publish(src_ptr, DTYPE_F32)
 }
@@ -473,7 +473,7 @@ fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
 /// `dst`'s existing buffer. `dst` keeps its identity (pointer/buffer), which
 /// preserves persistent optimizer-state identity across steps. `len` must
 /// match. Neither tensor is freed. v1: F32/FP16 only, CPU only.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
     let dst = unsafe { &*(dst_ptr as *const NslTensor) };
     let src = unsafe { &*(src_ptr as *const NslTensor) };
@@ -586,7 +586,7 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
 /// History preserved for the audit trail: pre-#367 this function silently
 /// allocated HOST memory but stamped the result `device = template.device`
 /// — a device=1 tensor backed by a host pointer that aborted mid-step.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64 {
     let t = unsafe { &*(template_ptr as *const NslTensor) };
     let dtype = dtype as u16;
@@ -691,7 +691,7 @@ fn zeros_like_dtype_body(t: &NslTensor, dtype: u16) -> i64 {
 /// FASE envelope frees the working tensor each step (via the consuming
 /// `nsl_tensor_cast_to_host_into`); `publish` would double-free at the
 /// scope sweep.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_ptr: i64) -> i64 {
     let src = unsafe { &*(host_src_ptr as *const NslTensor) };
     let template = unsafe { &*(device_template_ptr as *const NslTensor) };
@@ -781,7 +781,7 @@ pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_p
 /// pairs delegate to `nsl_tensor_copy_data_async` (no cast kernel).
 /// CPU src (GPU-less run): degrades to the co-resident CPU
 /// `nsl_tensor_cast_into` + inline free.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cast_to_host_into(host_dst_ptr: i64, device_src_ptr: i64) {
     let dst = unsafe { &*(host_dst_ptr as *const NslTensor) };
     let src = unsafe { &*(device_src_ptr as *const NslTensor) };
@@ -882,7 +882,7 @@ pub extern "C" fn nsl_tensor_cast_to_host_into(host_dst_ptr: i64, device_src_ptr
 /// exactly like precision-only (mirrors `nsl_tensor_zeros_like_host_f32`'s
 /// CPU delegation rationale). Ownership: `NslTensor::publish`, same
 /// persistent-state lifecycle as both parents.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros_like_host_dtype(template_ptr: i64, dtype: i64) -> i64 {
     let t = unsafe { &*(template_ptr as *const NslTensor) };
     let dtype = dtype as u16;

@@ -110,7 +110,7 @@ use nsl_runtime::{
 
 // `nsl_kernel_launch` is `#[no_mangle] pub extern "C"` in nsl-runtime but
 // not re-exported via the doc-hidden test seam. Declare the FFI here.
-extern "C" {
+unsafe extern "C" {
     fn nsl_kernel_launch(
         ptx_ptr: i64,
         name_ptr: i64,

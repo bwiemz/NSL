@@ -110,7 +110,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     }
     // Unconditional: `--collectives sim` must also override an inherited
     // NSL_COLLECTIVES from a parent environment (review L9).
-    std::env::set_var("NSL_COLLECTIVES", &collectives);
+    // SAFETY: single-threaded here — the process runs on `nsl-main` (main is
+    // parked in `join`) and this command's only other thread, the health
+    // poller, is spawned later.
+    unsafe { std::env::set_var("NSL_COLLECTIVES", &collectives) };
 
     // Meta-flag expansion (roadmap 3.3) — see the twin call in build/options.rs.
     let mut bundle = crate::meta_flags::PretrainBundle {

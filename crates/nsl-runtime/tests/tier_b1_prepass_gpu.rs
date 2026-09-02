@@ -26,7 +26,7 @@ use nsl_runtime::{
     nsl_test_cuda_h2d, CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
 };
 
-extern "C" {
+unsafe extern "C" {
     fn nsl_kernel_launch(
         ptx_ptr: i64,
         name_ptr: i64,

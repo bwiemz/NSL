@@ -37,7 +37,7 @@ pub static FASE_FUSED_STEP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// In-process numeric getter (same family as `nsl_gpu_peak_allocated_bytes`):
 /// lets gates assert the fused path actually fired without stderr scraping.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fase_fused_step_count() -> i64 {
     FASE_FUSED_STEP_COUNT.load(Ordering::Relaxed) as i64
 }
@@ -50,7 +50,7 @@ pub extern "C" fn nsl_fase_fused_step_count() -> i64 {
 /// steps.
 pub static FASE_BLK_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fase_blk_table_builds() -> i64 {
     FASE_BLK_TABLE_BUILDS.load(Ordering::Relaxed) as i64
 }
@@ -72,12 +72,12 @@ pub extern "C" fn nsl_fase_blk_table_builds() -> i64 {
 pub static FASE_MULTI_BATCHED_PARAMS: AtomicU64 = AtomicU64::new(0);
 pub static FASE_MULTI_FALLBACK_PARAMS: AtomicU64 = AtomicU64::new(0);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fase_multi_batched_params() -> i64 {
     FASE_MULTI_BATCHED_PARAMS.load(Ordering::Relaxed) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fase_multi_fallback_params() -> i64 {
     FASE_MULTI_FALLBACK_PARAMS.load(Ordering::Relaxed) as i64
 }
@@ -100,7 +100,7 @@ pub extern "C" fn nsl_fase_multi_fallback_params() -> i64 {
 /// uses — but it is NOT bit-identical to the per-tensor emission. Codegen
 /// gates the substitution on `NSL_FASE_BATCH_SUMSQ != "0"` (compile-time)
 /// so bisections can restore the old path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fase_sum_sq_list(mp_list: i64) -> f64 {
     let mps = crate::list::NslList::from_ptr(mp_list);
     let count = mps.len as usize;
@@ -132,7 +132,7 @@ pub extern "C" fn nsl_fase_sum_sq_list(mp_list: i64) -> f64 {
 /// working tensors take after the precision/offload envelopes resolve).
 /// Anything else is a loud precondition failure — codegen admission should
 /// have routed it to the interpreted path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fase_fused_adamw_step(
     theta_ptr: i64,
@@ -339,7 +339,7 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
 /// folding the two-phase-clip Phase B pre-scale into the same launch;
 /// pass 1.0 for the unclipped path (branched around in-kernel, so 1.0 is
 /// exactly the pre-mp_scale behaviour, bit for bit).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     params_list: i64,
@@ -388,7 +388,7 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
 /// bit-identical to the per-param loop it replaces (same kernel body, table
 /// addressing). The in-kernel m_partial zero is redundant under CSLA — the
 /// caller frees the group's accumulators right after — but harmless.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fase_fused_adamw_step_multi_idx(
     params_list: i64,

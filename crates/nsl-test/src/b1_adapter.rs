@@ -169,7 +169,7 @@ fn w_to_col_major_chunked_f16(w: &[f32], d_model: usize, hd: usize, chunk: usize
 }
 
 #[cfg(feature = "cuda")]
-extern "C" {
+unsafe extern "C" {
     fn nsl_kernel_launch(
         ptx_ptr: i64,
         name_ptr: i64,

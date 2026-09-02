@@ -118,20 +118,20 @@ impl PipelineBackend for SharedMemPipeline {
     }
 
     fn barrier(&self) -> i64 {
-        let gen = self.barrier_generation.load(Ordering::Acquire);
+        let generation = self.barrier_generation.load(Ordering::Acquire);
         let prev = self.barrier_count.fetch_add(1, Ordering::AcqRel);
 
         if prev + 1 == self.num_stages {
             // Last to arrive — reset counter, advance generation
             self.barrier_count.store(0, Ordering::Release);
-            self.barrier_generation.store(gen + 1, Ordering::Release);
+            self.barrier_generation.store(generation + 1, Ordering::Release);
             let (_lock, cv) = &*self.barrier_cv;
             cv.notify_all();
         } else {
             // Wait for generation to advance
             let (lock, cv) = &*self.barrier_cv;
             let mut guard = lock.lock().unwrap();
-            while self.barrier_generation.load(Ordering::Acquire) == gen {
+            while self.barrier_generation.load(Ordering::Acquire) == generation {
                 guard = cv.wait(guard).unwrap();
             }
         }
@@ -246,7 +246,7 @@ fn deserialize_tensor(buf: &[u8]) -> i64 {
 /// Initialize the pipeline communication context.
 /// `schedule_type`: 0 = 1F1B, 1 = GPipe.
 /// Returns 0 on success, -1 if already initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pipeline_init(
     num_stages: i64,
     schedule_type: i64,
@@ -272,7 +272,7 @@ pub extern "C" fn nsl_pipeline_init(
 /// `tag`: message tag (typically micro_batch_idx * 2 + direction).
 /// `stream`: CUDA stream handle (0 for CPU).
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pipeline_send(
     tensor_ptr: i64,
     dst_rank: i64,
@@ -303,7 +303,7 @@ pub extern "C" fn nsl_pipeline_send(
 /// `tag`: message tag matching what the sender used.
 ///
 /// Returns NslTensor* on success, 0 on failure.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pipeline_recv(
     _shape_ptr: i64,
     _ndim: i64,
@@ -338,7 +338,7 @@ pub extern "C" fn nsl_pipeline_recv(
 
 /// Send gradients to the previous pipeline stage.
 /// Same as `nsl_pipeline_send` but uses a different tag namespace.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pipeline_send_grad(
     grad_ptr: i64,
     dst_rank: i64,
@@ -352,7 +352,7 @@ pub extern "C" fn nsl_pipeline_send_grad(
 /// Receive gradients from the next pipeline stage.
 /// Same as `nsl_pipeline_recv` but uses a different tag namespace.
 /// `my_rank`: the receiver's own stage rank.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pipeline_recv_grad(
     shape_ptr: i64,
     ndim: i64,
@@ -365,7 +365,7 @@ pub extern "C" fn nsl_pipeline_recv_grad(
 }
 
 /// Pipeline barrier — synchronize all stages.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pipeline_barrier() -> i64 {
     let guard = PIPELINE_CTX.lock().unwrap();
     let ctx = match guard.as_ref() {
@@ -379,18 +379,18 @@ pub extern "C" fn nsl_pipeline_barrier() -> i64 {
     drop(guard);
 
     // Inline barrier to avoid holding PIPELINE_CTX lock
-    let gen = barrier_gen.load(Ordering::Acquire);
+    let generation = barrier_gen.load(Ordering::Acquire);
     let prev = barrier_count.fetch_add(1, Ordering::AcqRel);
 
     if prev + 1 == num_stages {
         barrier_count.store(0, Ordering::Release);
-        barrier_gen.store(gen + 1, Ordering::Release);
+        barrier_gen.store(generation + 1, Ordering::Release);
         let (_lock, cv) = &*barrier_cv;
         cv.notify_all();
     } else {
         let (lock, cv) = &*barrier_cv;
         let mut g = lock.lock().unwrap();
-        while barrier_gen.load(Ordering::Acquire) == gen {
+        while barrier_gen.load(Ordering::Acquire) == generation {
             g = cv.wait(g).unwrap();
         }
     }
@@ -399,7 +399,7 @@ pub extern "C" fn nsl_pipeline_barrier() -> i64 {
 
 /// Destroy the pipeline communication context.
 /// Returns 0 on success, -1 if not initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pipeline_destroy() -> i64 {
     let mut guard = PIPELINE_CTX.lock().unwrap();
     if guard.is_none() {

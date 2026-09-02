@@ -40,7 +40,7 @@ use vendored::*;
 ///    and register on the domain.
 /// 5. Attach the domain to the session options.
 #[cfg(feature = "onnx-rt-op")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn RegisterCustomOps(
     options: *mut OrtSessionOptions,
     api_base: *const OrtApiBase,

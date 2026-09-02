@@ -27,7 +27,7 @@ use crate::tensor::nsl_tensor_free;
 /// # Safety
 /// `tensor_ptr` must be a valid `*NslTensor` allocated by the NSL
 /// runtime, or `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpdt_allgather(
     tensor_ptr: i64,
     _group_size: i64,
@@ -51,7 +51,7 @@ pub extern "C" fn nsl_cpdt_allgather(
 ///
 /// # Safety
 /// See [`nsl_cpdt_allgather`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpdt_reducescatter(
     tensor_ptr: i64,
     _group_size: i64,
@@ -67,7 +67,7 @@ pub extern "C" fn nsl_cpdt_reducescatter(
 ///
 /// # Safety
 /// See [`nsl_cpdt_allgather`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpdt_allreduce(tensor_ptr: i64, _group_size: i64, _inter_node: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
@@ -81,7 +81,7 @@ pub extern "C" fn nsl_cpdt_allreduce(tensor_ptr: i64, _group_size: i64, _inter_n
 ///
 /// # Safety
 /// See [`nsl_cpdt_allgather`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpdt_alltoall(tensor_ptr: i64, _group_size: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
@@ -94,7 +94,7 @@ pub extern "C" fn nsl_cpdt_alltoall(tensor_ptr: i64, _group_size: i64) -> i64 {
 ///
 /// # Safety
 /// See [`nsl_cpdt_allgather`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpdt_allgather_add(
     shard_ptr: i64,
     residual_ptr: i64,
@@ -119,7 +119,7 @@ pub extern "C" fn nsl_cpdt_allgather_add(
 ///
 /// # Safety
 /// Pointer must be `0` or have been returned by one of these calls.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cpdt_result_free(tensor_ptr: i64) {
     if tensor_ptr != 0 {
         nsl_tensor_free(tensor_ptr);

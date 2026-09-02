@@ -34,7 +34,7 @@ unsafe fn copy_preserved_dtype_element(
 
 // === Shape query operations ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_shape(tensor_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let list = crate::list::nsl_list_new();
@@ -45,7 +45,7 @@ pub extern "C" fn nsl_tensor_shape(tensor_ptr: i64) -> i64 {
 }
 
 /// Return the size of a specific dimension of a tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_shape_dim(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
@@ -58,7 +58,7 @@ pub extern "C" fn nsl_tensor_shape_dim(tensor_ptr: i64, dim: i64) -> i64 {
 }
 
 /// Assert that tensor dimension `dim_index` equals `expected_value`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_assert_dim(tensor_ptr: i64, dim_index: i64, expected_value: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
@@ -89,7 +89,7 @@ pub extern "C" fn nsl_tensor_assert_dim(tensor_ptr: i64, dim_index: i64, expecte
 }
 
 /// Assert that a tensor dimension does not exceed an upper bound.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_assert_dim_bound(tensor_ptr: i64, dim_index: i64, upper_bound: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
@@ -121,7 +121,7 @@ pub extern "C" fn nsl_tensor_assert_dim_bound(tensor_ptr: i64, dim_index: i64, u
 /// `nsl_tensor_shape_dim`, which ABORTS on out-of-range — this variant
 /// exists so speculative dispatch code can probe rank-agnostically; a 0
 /// head_dim simply matches no fused variant and the decomposed path runs).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_dim_or_zero(tensor_ptr: i64, dim: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
@@ -135,23 +135,23 @@ pub extern "C" fn nsl_tensor_dim_or_zero(tensor_ptr: i64, dim: i64) -> i64 {
     unsafe { *t.shape.add(d as usize) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_ndim(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).ndim
 }
 
 /// Returns the total number of elements in the tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_len(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).len
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_get_dtype(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).dtype as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let new_shape_nsl = NslList::from_ptr(new_shape_list);
@@ -224,7 +224,7 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
 
@@ -284,7 +284,7 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
 }
 
 /// Insert a dimension of size 1 at position `dim`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
@@ -350,7 +350,7 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
 }
 
 /// Extract a hyperplane at `index` along `dim`, removing that dimension.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i64 {
     // GPU redirect: transfer to CPU, operate, transfer result back.
     let t = NslTensor::from_ptr(tensor_ptr);
@@ -435,7 +435,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
 }
 
 /// Stack a list of same-shape tensors along a NEW dimension at position `dim`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     let list = NslList::from_ptr(list_ptr);
     let num_tensors = list.len as usize;
@@ -601,7 +601,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
 /// Expanded dimensions get stride=0 so they read the same physical data.
 /// The result tensor does NOT own its data — it shares the source's buffer.
 /// The source tensor's refcount is bumped to keep it alive while the view exists.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let list = NslList::from_ptr(shape_list);
@@ -702,7 +702,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
 }
 
 /// Create a [seq_len, seq_len] causal attention mask.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
     let n = seq_len as usize;
     let len = seq_len * seq_len;
@@ -738,7 +738,7 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
 }
 
 /// Slice a tensor along a dimension: extract elements [start, end) along dim.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i64) -> i64 {
     // GPU: native on-device slice kernel (no CPU round-trip)
     let t = NslTensor::from_ptr(tensor_ptr);
@@ -867,7 +867,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
 }
 
 /// Concatenate a list of tensors along a dimension.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let list = NslList::from_ptr(tensor_list);
     let num_tensors = list.len as usize;
@@ -1068,7 +1068,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
 /// For each contiguous chunk of `last_dim` elements in the flattened data:
 ///   output[0..half] = -input[half..last_dim]   (negate second half)
 ///   output[half..last_dim] = input[0..half]     (copy first half)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
     let t_check = NslTensor::from_ptr(tensor_ptr);
     let result = if t_check.device > 0 {
@@ -1173,7 +1173,7 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
 /// ADJOINT-ONLY: emitted by codegen exclusively inside the source-AD
 /// backward. There is no tape rule for the fused form, so it refuses under
 /// an armed tape rather than silently dropping an edge (the #396 class).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_rotate_half_neg(tensor_ptr: i64) -> i64 {
     assert!(
         !crate::autodiff::is_recording(),
@@ -1262,7 +1262,7 @@ pub extern "C" fn nsl_tensor_rotate_half_neg(tensor_ptr: i64) -> i64 {
 /// pointer is returned with its refcount bumped (zero-copy fast path).
 /// Otherwise a new tensor is allocated with data copied element-by-element
 /// using multi-dimensional coordinate decomposition over the source strides.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
     let t = NslTensor::from_ptr(tensor_ptr);
     let ndim = t.ndim as usize;

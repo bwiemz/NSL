@@ -17,7 +17,7 @@ const SLAB_ALIGN: usize = 256;
 
 /// Allocate a contiguous memory slab (zeroed) with 256-byte alignment.
 /// Returns base pointer as i64.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_slab_alloc(size_bytes: i64) -> i64 {
     if size_bytes <= 0 {
         return 0;
@@ -34,7 +34,7 @@ pub extern "C" fn nsl_slab_alloc(size_bytes: i64) -> i64 {
 }
 
 /// Free a previously allocated CPU slab.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_slab_free(slab_ptr: i64, size_bytes: i64) {
     if slab_ptr == 0 || size_bytes <= 0 {
         return;
@@ -47,7 +47,7 @@ pub extern "C" fn nsl_slab_free(slab_ptr: i64, size_bytes: i64) {
 }
 
 /// Compute a pointer offset into the slab. Returns slab_ptr + offset.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_slab_offset(slab_ptr: i64, offset: i64) -> i64 {
     slab_ptr + offset
 }
@@ -66,7 +66,7 @@ static GPU_SLAB_SIZE: AtomicU64 = AtomicU64::new(0);
 /// Allocate the GPU memory slab. Called once at program start.
 /// `size_bytes` is the total slab size computed by the compile-time memory planner.
 /// Returns the slab base pointer as i64 (0 on failure).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
     if size_bytes <= 0 { return 0; }
     #[cfg(feature = "cuda")]
@@ -84,7 +84,7 @@ pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
 }
 
 /// Free the GPU memory slab. Called once at program exit.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_destroy() {
     let base = GPU_SLAB_BASE.swap(0, Ordering::SeqCst);
     if base == 0 { return; }
@@ -96,13 +96,13 @@ pub extern "C" fn nsl_gpu_slab_destroy() {
 }
 
 /// Returns 1 if a GPU slab is currently allocated, 0 otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_active() -> i64 {
     if GPU_SLAB_BASE.load(Ordering::SeqCst) != 0 { 1 } else { 0 }
 }
 
 /// Returns the GPU slab total size in bytes (for diagnostics). 0 if no slab.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_size() -> i64 {
     GPU_SLAB_SIZE.load(Ordering::SeqCst) as i64
 }

@@ -18,7 +18,7 @@ use std::slice;
 ///   temperature_bits:     f32::to_bits() as i64
 ///
 /// Returns: NslList* containing [draft_tokens_tensor, draft_logits_tensor]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_speculative_draft(
     draft_forward_fn_ptr: i64,
     last_token: i64,
@@ -54,7 +54,7 @@ pub extern "C" fn nsl_speculative_draft(
 
 /// Free the result buffer returned by nsl_speculative_draft.
 /// Also frees the tokens and logits tensors within.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_speculative_draft_result_free(result_ptr: i64) -> i64 {
     if result_ptr == 0 { return 0; }
     let out = result_ptr as *mut i64;
@@ -82,7 +82,7 @@ pub extern "C" fn nsl_speculative_draft_result_free(result_ptr: i64) -> i64 {
 ///   result_ptr:           *mut i64 — output buffer (must hold K+3 i64s)
 ///
 /// Returns: number of accepted tokens (including bonus if any)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_speculative_verify(
     draft_tokens_ptr: i64,
     draft_logits_ptr: i64,
@@ -161,7 +161,7 @@ pub extern "C" fn nsl_speculative_verify(
 ///   tree_width:           branching factor for tree-based methods (Medusa/Eagle2)
 ///
 /// Returns: NslTensor* [num_accepted] i64 — accepted token IDs
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_speculative_decode_step(
     draft_tokens_ptr: i64,
     draft_logits_ptr: i64,
@@ -263,7 +263,7 @@ pub extern "C" fn nsl_speculative_decode_step(
 ///                       [1+3*num_nodes..1+4*num_nodes] = DFS exit timestamps
 ///
 /// Returns: number of tree nodes, or 0 on failure
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_speculative_build_tree(
     draft_logits_ptr: i64,
     num_heads: i64,
@@ -334,7 +334,7 @@ pub extern "C" fn nsl_speculative_build_tree(
 /// `result_ptr`: output buffer for accepted token IDs (must hold at least tree_depth i64s)
 ///
 /// Returns number of accepted tokens written to result_ptr, or -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_speculative_verify_tree(
     verifier_logits_ptr: i64,
     _input_ids_ptr: i64,
@@ -444,7 +444,7 @@ pub extern "C" fn nsl_speculative_verify_tree(
 ///
 /// Note: requires paged KV-cache (M25) to be initialized. If not active,
 /// returns -1 (no-op — non-paged serving doesn't need branching).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_page_branch(page_table_handle: i64, parent_seq: i64) -> i64 {
     if page_table_handle == 0 {
         return -1;
@@ -465,7 +465,7 @@ pub extern "C" fn nsl_page_branch(page_table_handle: i64, parent_seq: i64) -> i6
 /// to the private copy.
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_page_cow_copy(
     page_table_handle: i64,
     _seq_id: i64,
@@ -480,7 +480,7 @@ pub extern "C" fn nsl_page_cow_copy(
 }
 
 /// FlashAttention with tree-structured causal mask.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tree_attention(
     _q_ptr: i64,
     _k_ptr: i64,
@@ -515,7 +515,7 @@ pub extern "C" fn nsl_tree_attention(
 /// was accepted — rejected branches' pages are freed here.
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_speculative_cleanup(page_table_handle: i64, seq_id: i64) -> i64 {
     if page_table_handle == 0 || seq_id <= 0 {
         return 0; // nothing to clean up

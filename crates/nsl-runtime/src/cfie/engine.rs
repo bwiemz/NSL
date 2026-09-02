@@ -193,7 +193,7 @@ fn engine() -> &'static Mutex<EngineState> {
 /// `ptx_ptr`/`name_ptr` must point to at least `ptx_len`/`name_len`
 /// readable bytes; the compiled serve prologue passes data-section
 /// addresses.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_cfie_register_kernel(
     kind: i64,
@@ -275,7 +275,7 @@ pub extern "C" fn nsl_cfie_register_kernel(
 /// `nsl_gpu_set_persistent_pool` uses for model weights — per-step
 /// transient drains never release it), zeroed with memset_d8(0), and
 /// recorded via `KvSlotAllocator::attach_device_buffer`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_pool_alloc(bytes: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -348,7 +348,7 @@ pub extern "C" fn nsl_cfie_kv_pool_alloc(bytes: i64) -> i64 {
 /// Returns the count (>= 0) of kernels resolved, or -1 (no CUDA
 /// build/GPU, zero registrations, or a driver load/lookup failure —
 /// diagnosed on stderr).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -436,7 +436,7 @@ pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
 /// register→finalize cycle can run.  CUmodules are left loaded
 /// (leak-by-design precedent: `cuda/mod.rs` `module_cache`).  Always
 /// returns 0.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
     let mut g = match engine().lock() {
         Ok(g) => g,
@@ -486,7 +486,7 @@ pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
 /// production launch path never needs it (the launch FFIs inject the
 /// base from the slot allocator's attach record).
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_pool_base() -> i64 {
     match engine().lock() {
         Ok(g) => g.pool_base as i64,
@@ -577,7 +577,7 @@ fn checked_host_f32_bytes(n_elems: i64) -> Option<usize> {
 ///
 /// # Safety
 /// `host_f32_ptr` must point to at least `n_elems` readable `f32`s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_upload_weight_f16(host_f32_ptr: i64, n_elems: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -643,7 +643,7 @@ pub extern "C" fn nsl_cfie_upload_weight_f16(host_f32_ptr: i64, n_elems: i64) ->
 ///
 /// # Safety
 /// `host_f32_ptr` must point to at least `n_elems` readable `f32`s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_upload_weight_f32(host_f32_ptr: i64, n_elems: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -691,7 +691,7 @@ pub extern "C" fn nsl_cfie_upload_weight_f32(host_f32_ptr: i64, n_elems: i64) ->
 /// `free_managed`) and clear the tracking list.  Returns 0 always
 /// (idempotent; safe with no CUDA / nothing uploaded).  Does NOT touch
 /// the KV pool or kernel registrations.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_weights_reset() -> i64 {
     let mut g = match engine().lock() {
         Ok(g) => g,
@@ -959,7 +959,7 @@ fn resolve_and_upload_model(
 /// on a non-cuda build.  A partial upload IS torn down on failure (the
 /// uploads are engine-tracked, and this refusal clears the whole binding
 /// via `nsl_cfie_weights_reset` so no half-bound state survives).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_cfie_bind_model(
     model_handle: i64,
@@ -1092,7 +1092,7 @@ pub extern "C" fn nsl_cfie_bind_model(
 /// # Safety
 /// `prompt_tokens_ptr` must point to `prompt_len` readable i64s;
 /// `out_tokens_ptr` to `out_cap` writable i64s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_cfie_generate(
     prompt_tokens_ptr: i64,
@@ -1284,7 +1284,7 @@ pub extern "C" fn nsl_cfie_generate(
 /// always returns 0.  Cycle 11 rebinds via `nsl_cfie_bind_model` after a
 /// weights reset; this FFI just drops the table records so a stale
 /// binding cannot drive `nsl_cfie_generate`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_generate_reset() -> i64 {
     let mut g = match engine().lock() {
         Ok(g) => g,
@@ -1336,7 +1336,7 @@ fn free_weight_allocs_from(g: &mut EngineState, start: usize) {
 /// records (the superseded device buffers stay in `weight_allocs` until
 /// `nsl_cfie_weights_reset` / destroy, matching bind_model's re-bind
 /// discipline).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_cfie_bind_draft_model(
     model_handle: i64,
@@ -1468,7 +1468,7 @@ pub extern "C" fn nsl_cfie_bind_draft_model(
 /// `nsl_cfie_speculative_generate`'s capacity probe bounds draft-KV
 /// writes by the TARGET capacity only.  The serve wiring bakes the
 /// same per-slot value into both DecodeBlockConfigs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_draft_pool_alloc(bytes: i64) -> i64 {
     if bytes <= 0 {
         return -1;
@@ -1503,7 +1503,7 @@ pub extern "C" fn nsl_cfie_draft_pool_alloc(bytes: i64) -> i64 {
 /// Mirrors `nsl_cfie_kv_pool_base` — GPU parity tests seed draft K/V
 /// rows through it; production launches inject the base internally.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_draft_pool_base() -> i64 {
     match engine().lock() {
         Ok(g) => g.draft_pool_base as i64,
@@ -1517,7 +1517,7 @@ pub extern "C" fn nsl_cfie_draft_pool_base() -> i64 {
 /// and are freed by `nsl_cfie_weights_reset` / `nsl_cfie_engine_destroy`;
 /// this drops the binding records so a stale draft cannot drive
 /// `nsl_cfie_speculative_generate`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_draft_reset() -> i64 {
     let mut g = match engine().lock() {
         Ok(g) => g,
@@ -1612,7 +1612,7 @@ fn launch(meta: &ResolvedKernel, args: &[*mut c_void]) -> i64 {
 /// Kind 0 — kernel params (cfie_decode_attention.rs, 6): q_ptr.u64,
 /// kv_base.u64 (INJECTED from the slot allocator), out_ptr.u64,
 /// layer_idx.u32, slot_idx.u32, seq_len.u32.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_decode_attn(
     q_ptr: i64,
     out_ptr: i64,
@@ -1657,7 +1657,7 @@ pub extern "C" fn nsl_cfie_launch_decode_attn(
 /// norm_w.u64, lm_head.u64, out_token.u64, rng_seed.u64,
 /// grammar_mask_ptr.u64 (INJECTED: the cuModuleGetGlobal address or 0),
 /// grammar_state.u32.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_fused_sample(
     hidden_ptr: i64,
     norm_w_ptr: i64,
@@ -1712,7 +1712,7 @@ pub extern "C" fn nsl_cfie_launch_fused_sample(
 /// x_out.u64, wq.u64, wk.u64, wv.u64, wo.u64, w_gate.u64, w_up.u64,
 /// w_down.u64, norm1_w.u64, norm2_w.u64, kv_base.u64 (INJECTED),
 /// layer_idx.u32, slot_idx.u32, pos.u32.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_cfie_launch_decode_block(
     x_in: i64,
@@ -1787,7 +1787,7 @@ pub extern "C" fn nsl_cfie_launch_decode_block(
 /// Kind 3 — kernel params (cfie_speculative_ptx.rs, 6): q.u64,
 /// kv_base.u64 (INJECTED), out.u64, layer_idx.u32, slot_idx.u32,
 /// seq_len.u32.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_spec_verify(
     q_ptr: i64,
     out_ptr: i64,
@@ -1831,7 +1831,7 @@ pub extern "C" fn nsl_cfie_launch_spec_verify(
 /// Kind 4 — kernel params (cfie_speculative_ptx.rs, 6, no injection):
 /// target_probs.u64, draft_probs.u64, draft_tokens.u64, rng_seed.u64,
 /// out_accepted.u64, out_correction_token.u64.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_spec_reject(
     target_probs_ptr: i64,
     draft_probs_ptr: i64,
@@ -1881,7 +1881,7 @@ pub extern "C" fn nsl_cfie_launch_spec_reject(
 /// (cfie_kv_quant_ptx.rs, 7): q.u64, kv_base.u64 (INJECTED), out.u64,
 /// slot_idx.u32, seq_len.u32, k_scale.f32, v_scale.f32 (each f32
 /// bit-punned from the low 32 bits of its i64 arg).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_quant_attn(
     layer_idx: i64,
     q_ptr: i64,
@@ -1947,7 +1947,7 @@ pub extern "C" fn nsl_cfie_launch_quant_attn(
 /// sequence).  Returns 0 ok; -1 not-finalized / kind missing / no draft
 /// binding / `layer_idx` out of range / negative pos / draft pool
 /// unallocated; else the positive CUresult.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_draft_block(
     x_in: i64,
     x_out: i64,
@@ -2040,7 +2040,7 @@ pub extern "C" fn nsl_cfie_launch_draft_block(
 /// the paper's temperature 0.0).  Sampler-family: no KV access, no pool
 /// needed.  Returns 0 ok; -1 not-finalized / kind missing / no draft
 /// binding; else the positive CUresult.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_draft_sample(
     hidden_ptr: i64,
     out_token_ptr: i64,
@@ -2094,7 +2094,7 @@ pub extern "C" fn nsl_cfie_launch_draft_sample(
 /// probs by design; this kernel exists so the kind-4 rejection kernel
 /// has target rows to compare against.  Returns 0 ok; -1 not-finalized /
 /// kind missing / no target binding; else the positive CUresult.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_launch_verify_probs(hidden_ptr: i64, out_probs_ptr: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -2157,7 +2157,7 @@ pub extern "C" fn nsl_cfie_launch_verify_probs(hidden_ptr: i64, out_probs_ptr: i
 /// `layer_weights_ptr` must point to `n_layers * 9` readable host
 /// `u64`s; all other pointers are opaque device addresses passed
 /// through to the kernels.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_cfie_decode_step(
     x_buf_a: i64,
@@ -2443,7 +2443,7 @@ fn target_verify_step(
 /// # Safety
 /// `prompt_tokens_ptr` must point to `prompt_len` readable i64s;
 /// `out_tokens_ptr` to `out_cap` writable i64s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_cfie_speculative_generate(
     prompt_tokens_ptr: i64,

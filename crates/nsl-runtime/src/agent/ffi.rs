@@ -19,7 +19,7 @@ use crate::agent::scheduler::ReactorScheduler;
 
 /// Construct a pool with `pool_size` contexts. Returns null on failure
 /// (e.g., size exceeds OS/GPU memory or v1 hard limit).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_agent_pool_new(
     pool_size: u64,
     _pipeline_fn_id: u64,
@@ -36,7 +36,7 @@ pub extern "C" fn nsl_agent_pool_new(
 }
 
 /// Destroy a pool created by `nsl_agent_pool_new`. No-op on null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_agent_pool_destroy(pool: *mut PipelineContextPool) {
     if pool.is_null() { return; }
     // SAFETY: pool was created via `Box::into_raw` and ownership is being
@@ -47,7 +47,7 @@ pub extern "C" fn nsl_agent_pool_destroy(pool: *mut PipelineContextPool) {
 /// Acquire a lease. Returns the lease's index (>=0), or:
 /// - `-1` if the pool is exhausted.
 /// - `-2` if `pool` is null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_agent_pool_acquire(
     pool: *mut PipelineContextPool,
     _timeout_ms: u64,
@@ -64,7 +64,7 @@ pub extern "C" fn nsl_agent_pool_acquire(
 
 /// Release a lease by its index (returned from `acquire`). No-op on null
 /// or negative index.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_agent_pool_release(
     pool: *mut PipelineContextPool,
     lease_id: i64,
@@ -77,7 +77,7 @@ pub extern "C" fn nsl_agent_pool_release(
 
 /// Run one logical-time step on the scheduler. Returns 0 on success.
 /// Returns 1 if `sched` is null (sentinel for v1; codegen should never pass null).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_agent_scheduler_step(sched: *mut ReactorScheduler) -> i32 {
     if sched.is_null() { return 1; }
     // SAFETY: sched is valid; the codegen owns the scheduler for the
@@ -92,7 +92,7 @@ pub extern "C" fn nsl_agent_scheduler_step(sched: *mut ReactorScheduler) -> i32 
 ///
 /// Ownership: this function takes ownership of `msg` (consumes the Box).
 /// The caller MUST NOT call `Box::from_raw(msg)` again after this returns.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_agent_mailbox_write(
     mb: *mut PortMailbox,
     msg: *mut PortMessage,
@@ -112,7 +112,7 @@ pub extern "C" fn nsl_agent_mailbox_write(
 /// empty or the pointer is null. The caller takes ownership of the
 /// returned `PortMessage` and is responsible for freeing it via
 /// `Box::from_raw`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_agent_mailbox_read(mb: *mut PortMailbox) -> *mut PortMessage {
     if mb.is_null() { return std::ptr::null_mut(); }
     // SAFETY: mb is a valid mailbox pointer.

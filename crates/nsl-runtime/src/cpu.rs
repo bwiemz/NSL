@@ -405,7 +405,7 @@ fn apply_fused_op_f32(op: i64, val: f32, rhs: f32) -> f32 {
 /// Example: relu(a + b) → ops=[ADD, RELU], num_binary=1
 ///   result[i] = relu(a[i] + b[i])
 /// Zero intermediate allocations — one output tensor, one loop.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_elementwise_2(
     a_ptr: i64,
     b_ptr: i64,
@@ -491,7 +491,7 @@ pub extern "C" fn nsl_fused_elementwise_2(
 
 /// Fused unary elementwise: applies chain of unary ops to a single input.
 /// Example: sigmoid(neg(x)) → ops=[NEG, SIGMOID]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_elementwise_1(
     a_ptr: i64,
     ops_ptr: i64,
@@ -560,7 +560,7 @@ pub extern "C" fn nsl_fused_elementwise_1(
 ///
 /// `epilogue_ops` is an NslList of op codes to apply after each output element.
 /// `bias_ptr` is 0 if no bias (pure matmul + activation).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_matmul_epilogue(
     a_ptr: i64,
     b_ptr: i64,

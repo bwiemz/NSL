@@ -16,7 +16,7 @@
 use nsl_runtime::list::{nsl_list_free, nsl_list_new, nsl_list_push};
 use nsl_runtime::tensor::{nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_zeros_on};
 
-extern "C" {
+unsafe extern "C" {
     fn nsl_moe_dispatch_full_v2(
         tokens_ptr: i64,
         logits_ptr: i64,

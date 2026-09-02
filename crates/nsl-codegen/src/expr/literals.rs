@@ -299,8 +299,8 @@ impl Compiler<'_> {
         level: usize,
         result_list: Value,
     ) -> Result<(), CodegenError> {
-        let gen = &generators[level];
-        let sym = match &gen.pattern.kind {
+        let generator = &generators[level];
+        let sym = match &generator.pattern.kind {
             PatternKind::Ident(sym) => *sym,
             _ => {
                 return Err(CodegenError::new(
@@ -309,7 +309,7 @@ impl Compiler<'_> {
             }
         };
 
-        let iter_val = self.compile_expr(builder, state, &gen.iterable)?;
+        let iter_val = self.compile_expr(builder, state, &generator.iterable)?;
 
         // Get list length
         let len_id = self.registry.runtime_fns["nsl_list_len"].0;
@@ -353,7 +353,7 @@ impl Compiler<'_> {
         let elem = builder.inst_results(call)[0];
         builder.def_var(elem_var, elem);
 
-        for cond_expr in &gen.conditions {
+        for cond_expr in &generator.conditions {
             let cond_val = self.compile_expr(builder, state, cond_expr)?;
             let next_check = builder.create_block();
             builder

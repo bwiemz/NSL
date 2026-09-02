@@ -16,7 +16,7 @@ members = [
 
 [workspace.package]
 version = "0.9.0"
-edition = "2021"
+edition = "2024"
 # The workspace crates are a toolchain, not a library set: path dependencies
 # carry no version, so none of them can be published as they stand.
 publish = false
@@ -64,8 +64,9 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # `-D warnings` on the default features (every OS) and on the benches, so
 # anything set to `warn` here is a hard error on those lanes; the cuda lane
 # is a plain `cargo build --features cuda`, which only `deny` can break.
-# Only add a lint once every target it reaches is clean under
-# `cargo check --workspace --all-targets --all-features`.
+# Only raise a lint once every target it reaches is clean under
+# `cargo check --workspace --all-targets --all-features`; an `allow` here is
+# a debt the comment beside it must date and name the follow-up for.
 [workspace.lints.rust]
 # Inside an `unsafe fn`, each unsafe operation must sit in its own
 # `unsafe {}` block instead of borrowing the signature's blanket. That
@@ -75,6 +76,14 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # `deny`, means the edition bump (roadmap D4) will not have to wrap them
 # all at once.
 unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Edition 2024 stabilised `let` chains, and clippy now reports every
+# `if … { if let … { … } }` nest as collapsible — 404 sites the day of the
+# flip (roadmap D4), all pre-existing. Collapsing them is a mechanical
+# rewrite that belongs in its own PR (D4 slice 2), not in the edition
+# flip; this `allow` goes with it.
+collapsible_if = "allow"
 
 # ── Build profiles ────────────────────────────────────────────────────────────
 #

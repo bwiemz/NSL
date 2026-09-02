@@ -52,8 +52,8 @@ fn cuda_available() -> bool {
 }
 
 fn pin_full_f32() {
-    std::env::set_var("NSL_MATMUL_TF32", "0");
-    std::env::set_var("NSL_MATMUL_BF16", "0");
+    unsafe { std::env::set_var("NSL_MATMUL_TF32", "0") };
+    unsafe { std::env::set_var("NSL_MATMUL_BF16", "0") };
 }
 
 fn alloc_upload_f32(host: &[f32]) -> i64 {

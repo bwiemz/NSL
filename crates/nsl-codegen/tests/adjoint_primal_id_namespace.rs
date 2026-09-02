@@ -141,8 +141,8 @@ fn adjoint_with_recompute_clones(
     segments: Vec<BlockSegment>,
 ) -> (WengertList, usize) {
     let mut fresh: VarId = primal.ops.iter().map(|o| o.result).max().unwrap_or(0) + 1;
-    let mut gen = AdjointGenerator::new(fresh);
-    let mut adjoint = gen.generate(primal);
+    let mut generator = AdjointGenerator::new(fresh);
+    let mut adjoint = generator.generate(primal);
     fresh = fresh
         .max(adjoint.ops.iter().map(|o| o.result).max().unwrap_or(0) + 1)
         .max(

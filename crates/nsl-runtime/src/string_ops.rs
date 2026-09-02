@@ -16,7 +16,7 @@ fn alloc_bytes(bytes: &[u8]) -> i64 {
     ptr as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_repeat(s: i64, n: i64) -> i64 {
     let bytes = unsafe { as_cstr(s) }.to_bytes();
     if n <= 0 || bytes.is_empty() {
@@ -26,7 +26,7 @@ pub extern "C" fn nsl_str_repeat(s: i64, n: i64) -> i64 {
     alloc_bytes(&repeated)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_eq(a: i64, b: i64) -> i64 {
     if a == b {
         return 1;
@@ -39,7 +39,7 @@ pub extern "C" fn nsl_str_eq(a: i64, b: i64) -> i64 {
     if sa == sb { 1 } else { 0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_slice(s: i64, lo: i64, hi: i64, step_val: i64) -> i64 {
     if s == 0 {
         return alloc_bytes(b"");

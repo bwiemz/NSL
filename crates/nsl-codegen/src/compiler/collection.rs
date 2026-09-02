@@ -191,9 +191,9 @@ impl Compiler<'_> {
                 generators,
             } => {
                 self.collect_strings_in_expr(element)?;
-                for gen in generators {
-                    self.collect_strings_in_expr(&gen.iterable)?;
-                    for cond in &gen.conditions {
+                for generator in generators {
+                    self.collect_strings_in_expr(&generator.iterable)?;
+                    for cond in &generator.conditions {
                         self.collect_strings_in_expr(cond)?;
                     }
                 }

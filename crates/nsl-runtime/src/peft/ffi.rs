@@ -35,7 +35,7 @@ use crate::tensor::nsl_tensor_free;
 /// # Safety
 /// All tensor pointers must be valid `*NslTensor` handles allocated by the
 /// NSL runtime, or `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_wrga_epilogue_fused_lora(
     main_result: i64,
     x: i64,
@@ -91,7 +91,7 @@ pub extern "C" fn nsl_wrga_epilogue_fused_lora(
 ///
 /// # Safety
 /// See [`nsl_wrga_epilogue_fused_lora`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_wrga_epilogue_fused_ia3(activation: i64, gamma: i64) -> i64 {
     if activation == 0 || gamma == 0 {
         return 0;
@@ -108,7 +108,7 @@ pub extern "C" fn nsl_wrga_epilogue_fused_ia3(activation: i64, gamma: i64) -> i6
 /// # Safety
 /// The pointer must either be `0` or have been returned by one of the
 /// `nsl_wrga_epilogue_*` functions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_wrga_result_free(tensor_ptr: i64) {
     if tensor_ptr != 0 {
         nsl_tensor_free(tensor_ptr);

@@ -182,9 +182,9 @@ fn count_expr(counts: &mut HashMap<Symbol, u32>, expr: &Expr) {
             generators,
         } => {
             count_expr(counts, element);
-            for gen in generators {
-                count_expr(counts, &gen.iterable);
-                for cond in &gen.conditions {
+            for generator in generators {
+                count_expr(counts, &generator.iterable);
+                for cond in &generator.conditions {
                     count_expr(counts, cond);
                 }
             }

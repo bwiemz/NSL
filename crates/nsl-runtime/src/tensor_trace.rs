@@ -301,7 +301,7 @@ fn has_nan_inf(stats: &TensorStats) -> bool {
 // All parameters are i64 to match the Cranelift calling convention.
 
 /// Initialize the trace recorder. Call once before any ops.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_init() -> i64 {
     RECORDER.with(|r| {
         let mut rec = r.lock().unwrap();
@@ -318,7 +318,7 @@ pub extern "C" fn nsl_trace_init() -> i64 {
 /// Record a single tensor operation.
 ///
 /// Returns 0 (continue) or 1 (NaN/Inf detected — break).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_record_op(
     op_type: i64,
     in0_ptr: i64,
@@ -367,7 +367,7 @@ pub extern "C" fn nsl_trace_record_op(
 }
 
 /// Increment suppress depth (`@no_trace` scope enter).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_suppress() -> i64 {
     RECORDER.with(|r| {
         let mut rec = r.lock().unwrap();
@@ -377,7 +377,7 @@ pub extern "C" fn nsl_trace_suppress() -> i64 {
 }
 
 /// Decrement suppress depth (`@no_trace` scope exit).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_unsuppress() -> i64 {
     RECORDER.with(|r| {
         let mut rec = r.lock().unwrap();
@@ -387,7 +387,7 @@ pub extern "C" fn nsl_trace_unsuppress() -> i64 {
 }
 
 /// Mark a breakpoint flag on the next recorded op.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_breakpoint() -> i64 {
     RECORDER.with(|r| {
         let mut rec = r.lock().unwrap();
@@ -397,7 +397,7 @@ pub extern "C" fn nsl_trace_breakpoint() -> i64 {
 }
 
 /// Flush recorded trace to `trace.nsltrace` in the current directory.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_flush() -> i64 {
     use std::io::Write;
 
@@ -453,7 +453,7 @@ pub extern "C" fn nsl_trace_flush() -> i64 {
 
 /// Called after each traced op when trace_ops is enabled.
 /// Prints a warning to stderr if nan_flag == 1 (NaN/Inf detected in output).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_nan_warning(nan_flag: i64, op_type: i64) -> i64 {
     if nan_flag == 1 {
         let op_name = match op_type {
@@ -479,7 +479,7 @@ pub extern "C" fn nsl_trace_nan_warning(nan_flag: i64, op_type: i64) -> i64 {
 }
 
 /// Destroy the trace recorder, freeing all buffered data.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_destroy() -> i64 {
     RECORDER.with(|r| {
         let mut rec = r.lock().unwrap();

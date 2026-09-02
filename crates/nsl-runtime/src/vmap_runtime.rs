@@ -11,7 +11,7 @@
 /// - batch_dim: which dimension is the batch dimension
 ///
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_vmap_check_batch(
     tensor_ptr: i64,
     expected_batch: i64,

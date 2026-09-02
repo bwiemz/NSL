@@ -91,12 +91,12 @@ fn cuda_available() -> bool {
 #[test]
 fn g14_e_cuda_available_honors_skip_env() {
     // SAFETY: env var manipulation; serial test by convention.
-    std::env::set_var("NSL_SKIP_CUDA_TESTS", "1");
+    unsafe { std::env::set_var("NSL_SKIP_CUDA_TESTS", "1") };
     assert!(
         !cuda_available(),
         "cuda_available must respect NSL_SKIP_CUDA_TESTS"
     );
-    std::env::remove_var("NSL_SKIP_CUDA_TESTS");
+    unsafe { std::env::remove_var("NSL_SKIP_CUDA_TESTS") };
 }
 
 /// max(|a[i] - b[i]|).

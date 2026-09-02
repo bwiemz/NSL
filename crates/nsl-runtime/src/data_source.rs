@@ -45,7 +45,7 @@ fn create_mmap_tensor(data: *mut c_void, len: i64, dtype: u16, owns_data: u8) ->
 /// Load a JSONL file, extracting a named field from each line as a string.
 ///
 /// Returns an NslList of NSL string pointers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_load_jsonl(
     path_ptr: i64,
     path_len: i64,
@@ -142,7 +142,7 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 ///
 /// `has_header`: 1 = skip first line, 0 = no header.
 /// Returns an NslList of NSL string pointers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_load_csv(
     path_ptr: i64,
     path_len: i64,
@@ -201,7 +201,7 @@ pub extern "C" fn nsl_load_csv(
 ///
 /// For f64 and f32, the tensor data points directly into the mmap region (zero-copy).
 /// For i32 and u16, values are converted to f64 and stored in a heap-allocated buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_load_mmap(path_ptr: i64, path_len: i64, dtype: i64) -> i64 {
     let path = unsafe { str_from_ptr_len(path_ptr, path_len) };
 

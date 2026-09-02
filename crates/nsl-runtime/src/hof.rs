@@ -8,7 +8,7 @@ type NslFn1 = extern "C" fn(i64) -> i64;
 /// Reading the full i64 in that case kept/produced garbage (a bool
 /// predicate's `!= 0` check saw stale upper bits). Masking is gated on
 /// the flag because an int-returning function's full 64 bits are valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_map(fn_ptr: i64, list_ptr: i64, ret_is_bool: i64) -> i64 {
     let func: NslFn1 = unsafe { std::mem::transmute(fn_ptr) };
     let src = NslList::from_ptr(list_ptr);
@@ -26,7 +26,7 @@ pub extern "C" fn nsl_map(fn_ptr: i64, list_ptr: i64, ret_is_bool: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_filter(fn_ptr: i64, list_ptr: i64, ret_is_bool: i64) -> i64 {
     let func: NslFn1 = unsafe { std::mem::transmute(fn_ptr) };
     let src = NslList::from_ptr(list_ptr);
@@ -46,7 +46,7 @@ pub extern "C" fn nsl_filter(fn_ptr: i64, list_ptr: i64, ret_is_bool: i64) -> i6
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_enumerate(list_ptr: i64) -> i64 {
     let src = NslList::from_ptr(list_ptr);
     let result = nsl_list_new();
@@ -59,7 +59,7 @@ pub extern "C" fn nsl_enumerate(list_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_zip(list_a: i64, list_b: i64) -> i64 {
     let a = NslList::from_ptr(list_a);
     let b = NslList::from_ptr(list_b);
@@ -74,7 +74,7 @@ pub extern "C" fn nsl_zip(list_a: i64, list_b: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sorted(list_ptr: i64) -> i64 {
     let src = NslList::from_ptr(list_ptr);
     let result = nsl_list_new();
@@ -90,7 +90,7 @@ pub extern "C" fn nsl_sorted(list_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_reversed(list_ptr: i64) -> i64 {
     let src = NslList::from_ptr(list_ptr);
     let result = nsl_list_new();

@@ -182,7 +182,7 @@ fn fault_injected_flags(idx: i64, flags: i64) -> i64 {
 /// registration belt may re-declare freely.
 ///
 /// Returns 0 on success, -1 on a rejected argument.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) -> i64 {
     if tensor_ptr == 0 || idx < 0 {
         return -1;
@@ -234,7 +234,7 @@ pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) 
 /// process is training something other than what was compiled and certified).
 ///
 /// Emitted after the registration belt, once per train block.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_param_plan_verify() -> i64 {
     let snapshot: Vec<(i64, Declared)> = {
         let guard = PLAN.lock().unwrap();
@@ -323,7 +323,7 @@ pub extern "C" fn nsl_param_plan_verify() -> i64 {
 ///
 /// Also rearms the once-per-block success report. Returns the number of
 /// entries dropped.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_param_plan_teardown() -> i64 {
     let mut guard = PLAN.lock().unwrap();
     let n = guard.as_ref().map_or(0, |m| m.len()) as i64;

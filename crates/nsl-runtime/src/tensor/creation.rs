@@ -177,22 +177,22 @@ pub(crate) fn create_scalar_tensor_dtype(value: f64, dtype: u16) -> i64 {
 
 // === Creation ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_zeros(shape_list: i64) -> i64 {
     tensor_from_shape_list(shape_list, 0.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_ones(shape_list: i64) -> i64 {
     tensor_from_shape_list(shape_list, 1.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_full(shape_list: i64, value: f64) -> i64 {
     tensor_from_shape_list(shape_list, value)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
     let ptr = tensor_from_shape_list(shape_list, 0.0);
     let tensor = NslTensor::from_ptr(ptr);
@@ -203,7 +203,7 @@ pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
     let ptr = tensor_from_shape_list(shape_list, 0.0);
     let tensor = NslTensor::from_ptr(ptr);
@@ -235,7 +235,7 @@ pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
     if step == 0.0 {
         eprintln!("nsl: tensor arange step cannot be zero");

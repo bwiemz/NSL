@@ -11,7 +11,7 @@ unsafe impl Send for ArgvPtr {}
 
 static ARGS: Mutex<(i32, ArgvPtr)> = Mutex::new((0, ArgvPtr(std::ptr::null())));
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     let mut args = ARGS.lock().unwrap();
     *args = (argc, ArgvPtr(argv as *const *const c_char));
@@ -31,7 +31,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // function (available on both glibc and MSVCRT/UCRT) so the report
     // fires after the compiled Cranelift `main` returns.
     if std::env::var("NSL_GPU_MEM_REPORT").is_ok() {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -52,7 +52,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // NSL_KERNEL_LAUNCH_COUNTER=1.  The counter is always live (cheap
     // atomic increment); the env var only gates the report.
     if events_on || std::env::var("NSL_KERNEL_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -65,7 +65,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // from CPU fallback so tests can assert the fused CUDA path actually
     // fired (not just the math came out right).
     if events_on || std::env::var("NSL_WRGA_GPU_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -78,7 +78,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // path actually fired (anti-vacuity), mirroring the WRGA counter pattern.
     // The counter is always live; the env var only gates the report.
     if events_on || std::env::var("NSL_FASE_FUSED_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -96,7 +96,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     if events_on
         || std::env::var("NSL_BF16_CAST_CACHE_COUNTER").ok().as_deref() == Some("1")
     {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -112,7 +112,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // would measure DFALT against DFALT and bank a null result as a delta.
     #[cfg(feature = "cuda")]
     if events_on || std::env::var("NSL_BF16_LT_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -126,7 +126,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // pre-pass misjudged must degrade to correct-but-slow, not abort), which
     // is exactly why the parity gate needs to see which path actually ran.
     if events_on || std::env::var("NSL_WGRAD_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -142,7 +142,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // report fn IS the atexit hook (it re-reads its own env var for the
     // human line, per the Item-17 pattern above).
     if events_on || std::env::var("NSL_FUSED_EW_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -155,7 +155,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // backward phase actually fired (anti-vacuity), same pattern as above.
     // D2b: weight-stream upload/evict counts, enabled when NSL_WS_COUNTER=1.
     if events_on || std::env::var("NSL_WS_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -164,7 +164,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     }
 
     if events_on || std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -179,7 +179,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     if let Ok(path) = std::env::var("NSL_WS_DECISION_JSON") {
         if !path.is_empty() {
             *WS_DECISION_JSON_PATH.lock().unwrap() = Some(path);
-            extern "C" {
+            unsafe extern "C" {
                 fn atexit(cb: extern "C" fn()) -> i32;
             }
             unsafe {
@@ -193,7 +193,7 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // replicated data a no-op reduce is otherwise invisible (identical
     // grads make sum/ws == g either way).
     if events_on || std::env::var("NSL_ZERO_COUNTER").ok().as_deref() == Some("1") {
-        extern "C" {
+        unsafe extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
         }
         unsafe {
@@ -545,7 +545,7 @@ extern "C" fn nsl_gpu_mem_report_atexit() {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_args() -> i64 {
     let args = ARGS.lock().unwrap();
     let (argc, ref argv_wrapper) = *args;

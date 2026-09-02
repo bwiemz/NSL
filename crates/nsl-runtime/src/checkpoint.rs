@@ -17,7 +17,7 @@ fn write_or_abort(file: &mut std::fs::File, buf: &[u8], context: &str) {
 /// path_ptr/path_len: string pointer and length for file path
 /// param_names_ptr: NslList of string pointers
 /// param_tensors_ptr: NslList of tensor pointers
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_save(
     path_ptr: i64,
     path_len: i64,
@@ -174,7 +174,7 @@ pub extern "C" fn nsl_model_save(
 }
 
 /// Load model parameters from .nslm binary format into existing tensors.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr: i64) {
     let tensors = NslList::from_ptr(param_tensors_ptr);
     if crate::weight_provider::try_load_from_provider(tensors) {
@@ -397,7 +397,7 @@ static RESUME_TRAIN_EPOCH: std::sync::atomic::AtomicI64 =
 
 /// The training epoch to start the epoch loop at — 0 unless a v2 checkpoint
 /// was just loaded.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_train_resume_epoch() -> i64 {
     RESUME_TRAIN_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -584,7 +584,7 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
 ///   loader-less checkpoint; mixing the two refuses at load.
 /// * **The RNG streams** — dropout masks on both CPU and GPU. Captured on the
 ///   training thread, which is where the sampling RNG's thread-local lives.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_train_checkpoint_save(
     path_ptr: i64,
@@ -796,7 +796,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
 /// unchanged with `checkpoint_load` — it then trains epochs 12..40. The
 /// alternative ("N more") makes an unedited re-run train 2N epochs and
 /// forces the author to hand-compute the remainder from a step counter.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_train_checkpoint_load(
     path_ptr: i64,

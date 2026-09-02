@@ -44,7 +44,7 @@ thread_local! {
 /// prevent stale state from leaking across steps (the train block
 /// codegen handles this by always calling set, both in the has-packing
 /// and no-packing branches).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_packing_metadata_set(segment_ids_ptr: i64, doc_starts_ptr: i64) {
     PACKING_METADATA.with(|c| c.set((segment_ids_ptr, doc_starts_ptr)));
 }
@@ -52,7 +52,7 @@ pub extern "C" fn nsl_packing_metadata_set(segment_ids_ptr: i64, doc_starts_ptr:
 /// Read the thread-local `segment_ids_ptr`. Returns 0 when uninitialized
 /// (no `set` has been called on this thread) — sentinel-0 takes the
 /// kernel's identity-mask path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_packing_metadata_get_segment_ids() -> i64 {
     PACKING_METADATA.with(|c| c.get().0)
 }
@@ -60,7 +60,7 @@ pub extern "C" fn nsl_packing_metadata_get_segment_ids() -> i64 {
 /// Read the thread-local `doc_starts_ptr`. Returns 0 when uninitialized
 /// — sentinel-0 takes the kernel's identity-position path (no RoPE
 /// reset).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_packing_metadata_get_doc_starts() -> i64 {
     PACKING_METADATA.with(|c| c.get().1)
 }
@@ -77,7 +77,7 @@ const WARN_AFTER_N_STEPS: u32 = 100;
 /// Warns ONCE if NO step in the first `WARN_AFTER_N_STEPS` had segment_ids —
 /// the "packing declared but the DataLoader never packs" footgun (spec §6.1).
 /// Does NOT warn on a single unpacked step (mixed-batch workloads are valid).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_pca_packing_mismatch_check(had_segments: i64) {
     if had_segments != 0 {
         SAW_SEGMENTS.store(true, Ordering::Relaxed);

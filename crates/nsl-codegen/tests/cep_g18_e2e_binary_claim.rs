@@ -64,14 +64,14 @@ fn canonical_fixture() -> PathBuf {
 
 fn ensure_stdlib_path() {
     if std::env::var("NSL_STDLIB_PATH").is_err() {
-        std::env::set_var("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+        unsafe { std::env::set_var("NSL_STDLIB_PATH", workspace_root().join("stdlib")) };
     }
 }
 
 /// Parse the canonical fixture and return its raw AST module plus a name
 /// resolver. CEP's recognizer walks the AST directly, so semantic analysis
 /// is not required for `extract_model_spec` / `apply_prune_delta_to_source`.
-fn parse_fixture(source: &str) -> (nsl_ast::Module, impl Fn(nsl_ast::Symbol) -> String) {
+fn parse_fixture(source: &str) -> (nsl_ast::Module, impl Fn(nsl_ast::Symbol) -> String + use<>) {
     let mut interner = nsl_lexer::Interner::new();
     let file_id = nsl_errors::FileId(0);
     let (tokens, lex_diags) = nsl_lexer::tokenize(source, file_id, &mut interner);

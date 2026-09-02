@@ -92,7 +92,7 @@ fn make_1d_f64_tensor(values: &[f64]) -> i64 {
 ///
 /// # Safety
 /// `tokens_ptr` must point to at least `count` readable i64s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_tokens_to_tensor(tokens_ptr: i64, count: i64) -> i64 {
     if tokens_ptr == 0 {
         return 0;
@@ -124,7 +124,7 @@ pub extern "C" fn nsl_cfie_tokens_to_tensor(tokens_ptr: i64, count: i64) -> i64 
 /// # Safety
 /// `tensor_ptr` must be a live `NslTensor*`; `out_ptr` must point to at
 /// least `min(len, cap)` writable i64s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_tensor_to_tokens(tensor_ptr: i64, out_ptr: i64, cap: i64) -> i64 {
     if tensor_ptr == 0 || cap < 0 {
         return -1;

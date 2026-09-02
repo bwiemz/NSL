@@ -23,8 +23,8 @@ fn roundtrip_prove_verify(dag: &ZkDag, input_values: &[FieldElement]) -> bool {
     let config = ZkConfig::default();
     let ir = lower_dag_to_zkir(dag, &config);
 
-    let mut gen = WitnessGenerator::new();
-    let witness = gen.generate(&ir, input_values, &[]).unwrap();
+    let mut generator = WitnessGenerator::new();
+    let witness = generator.generate(&ir, input_values, &[]).unwrap();
 
     // Use the folding backend with Mersenne-31 field.
     // Fold the whole-model IR as a single layer (small test DAGs don't
@@ -411,8 +411,8 @@ fn weight_private_mode_produces_valid_proof() {
     let ir = lower_dag_to_zkir(&dag, &config);
 
     let input_values = vec![FieldElement::from_u64(2), FieldElement::from_u64(4)];
-    let mut gen = WitnessGenerator::new();
-    let witness = gen.generate(&ir, &input_values, &[]).unwrap();
+    let mut generator = WitnessGenerator::new();
+    let witness = generator.generate(&ir, &input_values, &[]).unwrap();
 
     // Fold using Mersenne-31
     let layer_irs = lower_model_for_folding(&dag, &config);
@@ -460,8 +460,8 @@ fn wrong_outputs_rejected() {
     let ir = lower_dag_to_zkir(&dag, &config);
 
     let input_values = vec![FieldElement::from_u64(3), FieldElement::from_u64(7)];
-    let mut gen = WitnessGenerator::new();
-    let witness = gen.generate(&ir, &input_values, &[]).unwrap();
+    let mut generator = WitnessGenerator::new();
+    let witness = generator.generate(&ir, &input_values, &[]).unwrap();
 
     let layer_irs = lower_model_for_folding(&dag, &config);
     let mut prover = FoldingProver::<Mersenne31Field>::new(FoldingConfig::default());

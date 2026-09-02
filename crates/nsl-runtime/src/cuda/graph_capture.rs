@@ -1852,7 +1852,7 @@ mod imp {
 /// Arm opportunistic per-region CUDA graph capture (emitted at train-block
 /// start under `--cuda-graphs`). Refuses politely when an incompatible
 /// diagnostic mode is active.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cuda_graphs_enable(accum_window: i64) {
     #[cfg(feature = "cuda")]
     imp::enable(accum_window);
@@ -1861,7 +1861,7 @@ pub extern "C" fn nsl_cuda_graphs_enable(accum_window: i64) {
 }
 
 /// Begin a Wengert-lowering region (emitted by `compile_wengert_ops_range`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cuda_graph_region_begin(id: i64) {
     #[cfg(feature = "cuda")]
     imp::region_begin(id);
@@ -1870,7 +1870,7 @@ pub extern "C" fn nsl_cuda_graph_region_begin(id: i64) {
 }
 
 /// End a Wengert-lowering region.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cuda_graph_region_end(id: i64) {
     #[cfg(feature = "cuda")]
     imp::region_end(id);
@@ -1895,7 +1895,7 @@ pub fn cuda_graphs_armed() -> bool {
 }
 
 /// Print the capture/replay counter banner (emitted at train-block teardown).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cuda_graphs_report() {
     #[cfg(feature = "cuda")]
     imp::report();

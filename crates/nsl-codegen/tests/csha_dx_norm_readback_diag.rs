@@ -363,7 +363,7 @@ fn dx_norm_hbm_buffer_is_populated() {
         let locs: Vec<(usize, f32)> = dxn_host
             .iter()
             .enumerate()
-            .filter(|(_, &v)| v != 0.0)
+            .filter(|&(_, &v)| v != 0.0)
             .map(|(i, &v)| (i, v))
             .collect();
         eprintln!("[dx_norm diag] non-zero positions: {locs:?}");

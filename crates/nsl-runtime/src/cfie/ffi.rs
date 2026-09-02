@@ -23,7 +23,7 @@ fn global() -> &'static Mutex<RingBuffer> {
 ///
 /// # Safety
 /// Must be called *before* the persistent kernel launches.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_ring_init(capacity: i64) -> i64 {
     if capacity <= 0 {
         return -1;
@@ -42,7 +42,7 @@ pub extern "C" fn nsl_cfie_ring_init(capacity: i64) -> i64 {
 /// # Safety
 /// All pointer fields are interpreted as opaque `u64`s; the compiled
 /// kernel is responsible for validating them.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_ring_push(
     sequence_id: i64,
     prompt_ptr: i64,
@@ -77,7 +77,7 @@ pub extern "C" fn nsl_cfie_ring_push(
 ///
 /// # Safety
 /// Out-parameter pointers must reference valid `i64` storage.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_cfie_ring_pop(
     out_sequence_id: *mut i64,
     out_prompt_ptr: *mut i64,
@@ -118,7 +118,7 @@ pub unsafe extern "C" fn nsl_cfie_ring_pop(
 /// Current in-flight request count — diagnostic hook for host-side
 /// monitoring and tests.  (CLI surface today: `nsl build --cfie` /
 /// `--cfie-report`; a live-status subcommand is future work.)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_ring_len() -> i64 {
     match global().lock() {
         Ok(rb) => rb.len() as i64,
@@ -138,7 +138,7 @@ pub extern "C" fn nsl_cfie_ring_len() -> i64 {
 /// # Safety
 /// `table_ptr` must point to an array of at least
 /// `num_states * vocab_size` `u32`s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_cfie_grammar_transition(
     table_ptr: *const u32,
     num_states: i64,
@@ -289,7 +289,7 @@ fn slot_arg(v: i64) -> Option<u32> {
 /// startup by the CFIE-compiled binary from the compile-time
 /// `slot_count x per_slot_tokens` envelope; drops any prior state.
 /// Returns 0 on success, -1 on non-positive / out-of-range arguments.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_slots_init(slot_count: i64, per_slot_tokens: i64) -> i64 {
     if slot_count <= 0 || per_slot_tokens <= 0 {
         return -1;
@@ -315,7 +315,7 @@ pub extern "C" fn nsl_cfie_kv_slots_init(slot_count: i64, per_slot_tokens: i64) 
 /// Claim a slot for a new sequence.  Returns the slot id, or -1 when
 /// all slots are occupied or the allocator is uninitialized — the
 /// scheduler back-pressures the request ring on -1.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_slot_acquire() -> i64 {
     let mut g = match kv_slots_global().lock() {
         Ok(g) => g,
@@ -330,7 +330,7 @@ pub extern "C" fn nsl_cfie_kv_slot_acquire() -> i64 {
 /// Return a finished sequence's slot to the free-list.  Returns 1 on
 /// success, 0 when the slot is not active (double-release or bad id),
 /// -1 on internal error / uninitialized allocator.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_slot_release(slot: i64) -> i64 {
     let slot = match slot_arg(slot) {
         Some(s) => s,
@@ -357,7 +357,7 @@ pub extern "C" fn nsl_cfie_kv_slot_release(slot: i64) -> i64 {
 /// budget or the slot is inactive — the compiled decode loop checks
 /// this *before* writing KV entries, so a refusal never corrupts the
 /// buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_slot_advance(slot: i64, n_tokens: i64) -> i64 {
     let (slot, n) = match (slot_arg(slot), slot_arg(n_tokens)) {
         (Some(s), Some(n)) => (s, n),
@@ -376,7 +376,7 @@ pub extern "C" fn nsl_cfie_kv_slot_advance(slot: i64, n_tokens: i64) -> i64 {
 /// Un-append `n_tokens` after a speculative-decoding rejection,
 /// returning the new sequence length.  Returns -1 when `n_tokens`
 /// exceeds the current length or the slot is inactive.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_slot_rollback(slot: i64, n_tokens: i64) -> i64 {
     let (slot, n) = match (slot_arg(slot), slot_arg(n_tokens)) {
         (Some(s), Some(n)) => (s, n),
@@ -394,7 +394,7 @@ pub extern "C" fn nsl_cfie_kv_slot_rollback(slot: i64, n_tokens: i64) -> i64 {
 
 /// Number of currently active sequence slots — diagnostic hook for
 /// host-side monitoring and tests.  Returns -1 before init.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_slots_active() -> i64 {
     let g = match kv_slots_global().lock() {
         Ok(g) => g,
@@ -413,7 +413,7 @@ pub extern "C" fn nsl_cfie_kv_slots_active() -> i64 {
 /// success, -1 on negative `base`/`bytes` or uninitialized allocator.
 /// (Device VAs fit in the positive i64 range; a negative value here is
 /// a caller bug, not a pointer.)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_kv_attach_device(base: i64, bytes: i64) -> i64 {
     if base < 0 || bytes < 0 {
         return -1;

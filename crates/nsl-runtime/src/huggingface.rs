@@ -165,7 +165,7 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
 /// - `device`: 0 = CPU, 1+ = CUDA device ID
 ///
 /// Returns 0 on success, aborts on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_hf_load(
     model_ptr: i64,
     metadata_ptr: i64,

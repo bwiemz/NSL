@@ -184,27 +184,27 @@ impl HeartbeatMonitor {
 static HEARTBEAT_ITERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Start the heartbeat monitor. Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_heartbeat_start(_rank: i64, _world_size: i64, _timeout_ms: i64) -> i64 {
     HEARTBEAT_ITERATION.store(0, Ordering::Relaxed);
     0
 }
 
 /// Record a heartbeat tick (called each training iteration).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_heartbeat_tick() -> i64 {
     HEARTBEAT_ITERATION.fetch_add(1, Ordering::Relaxed);
     0
 }
 
 /// Stop the heartbeat monitor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_heartbeat_stop() -> i64 {
     0
 }
 
 /// Get the current iteration count.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_heartbeat_iteration() -> i64 {
     HEARTBEAT_ITERATION.load(Ordering::Relaxed) as i64
 }

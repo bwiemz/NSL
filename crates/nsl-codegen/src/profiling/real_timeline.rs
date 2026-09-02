@@ -76,8 +76,8 @@ pub fn build_training_timeline(
         .max()
         .unwrap_or(0)
         + 1;
-    let mut gen = AdjointGenerator::new(start_var);
-    let adjoint = gen.generate(primal);
+    let mut generator = AdjointGenerator::new(start_var);
+    let adjoint = generator.generate(primal);
 
     let n_fwd = primal.ops.len();
     let n_bwd = adjoint.ops.len();
@@ -91,7 +91,7 @@ pub fn build_training_timeline(
         .collect();
 
     // Parameter gradients: the adjoint counterparts of param vars.
-    let grad_vars: HashSet<VarId> = gen
+    let grad_vars: HashSet<VarId> = generator
         .adjoint_vars_map()
         .iter()
         .filter(|(pv, _)| param_vars.contains(pv))
@@ -100,7 +100,7 @@ pub fn build_training_timeline(
 
     // Adjoint vars have the shape of their primal counterpart.
     let mut sizes: HashMap<VarId, u64> = size_hints.clone();
-    for (pv, av) in gen.adjoint_vars_map() {
+    for (pv, av) in generator.adjoint_vars_map() {
         if let Some(&b) = size_hints.get(pv) {
             sizes.entry(*av).or_insert(b);
         }

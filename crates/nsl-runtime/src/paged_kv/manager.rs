@@ -227,7 +227,7 @@ unsafe fn from_handle(handle: i64) -> &'static Mutex<KvCacheManager> {
 /// M42 KV compression policy extracted from `@kv_compress` decorators at compile time.
 /// `compress_scheme == 0` means no compression (pass-through).  Non-zero values are
 /// stored on the manager for use by future compression-aware eviction logic.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_init(
     num_blocks: i64,
     block_size: i64,
@@ -264,7 +264,7 @@ pub extern "C" fn nsl_kv_cache_init(
 /// Falls back to CPU if the `cuda` feature is not enabled.
 ///
 /// See [`nsl_kv_cache_init`] for the meaning of the `compress_*` parameters.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_init_gpu(
     num_blocks: i64,
     block_size: i64,
@@ -309,7 +309,7 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
 }
 
 /// Allocate a new sequence and return its [`SeqId`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_alloc_seq(handle: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };
     let mut guard = mgr.lock().unwrap();
@@ -318,7 +318,7 @@ pub extern "C" fn nsl_kv_cache_alloc_seq(handle: i64) -> i64 {
 
 /// Append a token to a sequence. Returns `(block_id << 32) | offset` on
 /// success, or `-1` if the block pool is exhausted.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_append(handle: i64, seq_id: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };
     let mut guard = mgr.lock().unwrap();
@@ -332,7 +332,7 @@ pub extern "C" fn nsl_kv_cache_append(handle: i64, seq_id: i64) -> i64 {
 }
 
 /// Return the K-cache pointer for a given `(seq_id, block_id)`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_k_ptr(handle: i64, seq_id: i64, block_id: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };
     let guard = mgr.lock().unwrap();
@@ -341,7 +341,7 @@ pub extern "C" fn nsl_kv_cache_k_ptr(handle: i64, seq_id: i64, block_id: i64) ->
 }
 
 /// Return the V-cache pointer for a given `(seq_id, block_id)`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_v_ptr(handle: i64, seq_id: i64, block_id: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };
     let guard = mgr.lock().unwrap();
@@ -350,7 +350,7 @@ pub extern "C" fn nsl_kv_cache_v_ptr(handle: i64, seq_id: i64, block_id: i64) ->
 }
 
 /// Free all blocks for a sequence and remove its page table.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_free_seq(handle: i64, seq_id: i64) {
     let mgr = unsafe { from_handle(handle) };
     let mut guard = mgr.lock().unwrap();
@@ -358,7 +358,7 @@ pub extern "C" fn nsl_kv_cache_free_seq(handle: i64, seq_id: i64) {
 }
 
 /// Return the number of tokens appended to the given sequence.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_seq_len(handle: i64, seq_id: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };
     let guard = mgr.lock().unwrap();
@@ -375,7 +375,7 @@ pub extern "C" fn nsl_kv_cache_seq_len(handle: i64, seq_id: i64) -> i64 {
 /// satisfied.  The caller must use [`nsl_kv_cache_seq_num_blocks`] to
 /// determine the length, and must NOT store this pointer across calls that
 /// mutate the same sequence.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_seq_blocks(handle: i64, seq_id: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };
     let guard = mgr.lock().unwrap();
@@ -383,7 +383,7 @@ pub extern "C" fn nsl_kv_cache_seq_blocks(handle: i64, seq_id: i64) -> i64 {
 }
 
 /// Return the number of physical blocks allocated for the given sequence.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_seq_num_blocks(handle: i64, seq_id: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };
     let guard = mgr.lock().unwrap();
@@ -391,7 +391,7 @@ pub extern "C" fn nsl_kv_cache_seq_num_blocks(handle: i64, seq_id: i64) -> i64 {
 }
 
 /// Return the fraction of blocks currently in use, in `[0.0, 1.0]`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_utilization(handle: i64) -> f64 {
     let mgr = unsafe { from_handle(handle) };
     let guard = mgr.lock().unwrap();
@@ -403,7 +403,7 @@ pub extern "C" fn nsl_kv_cache_utilization(handle: i64) -> f64 {
 /// # Safety
 /// `handle` must be a valid pointer returned by [`nsl_kv_cache_init`] and
 /// must not be used after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_cache_destroy(handle: i64) {
     if handle == 0 {
         return;

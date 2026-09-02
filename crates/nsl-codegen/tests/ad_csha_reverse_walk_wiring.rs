@@ -124,9 +124,9 @@ fn fallback_chain_emits_per_op_adjoints_for_all_ops() {
     let primal = mixed_wengert();
     let claims = build_claims(over_budget_config());
 
-    let mut gen = AdjointGenerator::new(10);
-    gen.set_csha_claims(claims);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(10);
+    generator.set_csha_claims(claims);
+    let adjoint = generator.generate(&primal);
 
     // The fallback path should produce adjoints for ALL differentiable
     // ops: Add (2 adjoints), RoPE (1), Matmul (2), RMSNorm (1+).
@@ -139,7 +139,7 @@ fn fallback_chain_emits_per_op_adjoints_for_all_ops() {
     );
 
     // Diagnostics should contain the rejection reason.
-    let diags = gen.csha_diagnostics();
+    let diags = generator.csha_diagnostics();
     assert!(
         !diags.is_empty(),
         "fallback must record a diagnostic"
@@ -163,9 +163,9 @@ fn accepted_chain_falls_back_with_todo_stub() {
     let primal = mixed_wengert();
     let claims = build_claims(ok_config());
 
-    let mut gen = AdjointGenerator::new(10);
-    gen.set_csha_claims(claims);
-    let adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(10);
+    generator.set_csha_claims(claims);
+    let adjoint = generator.generate(&primal);
 
     // With the TODO stub, EmitFused resets backward_emitted and falls
     // through to per-op AD. So ALL ops still produce adjoints.
@@ -176,7 +176,7 @@ fn accepted_chain_falls_back_with_todo_stub() {
     );
 
     // No fallback diagnostics — the dispatcher accepted the chain.
-    let diags = gen.csha_diagnostics();
+    let diags = generator.csha_diagnostics();
     assert!(
         diags.is_empty(),
         "accepted chain should produce no fallback diagnostic, got {:?}",
@@ -190,18 +190,18 @@ fn accepted_chain_falls_back_with_todo_stub() {
 fn no_claims_produces_normal_adjoints() {
     let primal = mixed_wengert();
 
-    let mut gen = AdjointGenerator::new(10);
+    let mut generator = AdjointGenerator::new(10);
     // No set_csha_claims call.
-    let adjoint = gen.generate(&primal);
+    let adjoint = generator.generate(&primal);
 
     assert!(
         adjoint.ops.len() > 2,
         "unclaimed path must produce per-op adjoints, got {} ops",
         adjoint.ops.len()
     );
-    assert!(gen.csha_diagnostics().is_empty());
+    assert!(generator.csha_diagnostics().is_empty());
     // No claims → no fused-backward events either.
-    assert!(gen.csha_fused_events().is_empty());
+    assert!(generator.csha_fused_events().is_empty());
 }
 
 /// T7.2: smoke config (hd=32, seq=32, block_q=block_kv=32, d_model=32)
@@ -213,11 +213,11 @@ fn smoke_config_records_fused_event() {
     let primal = mixed_wengert();
     let claims = build_claims(ok_config()); // smoke config
 
-    let mut gen = AdjointGenerator::new(10);
-    gen.set_csha_claims(claims);
-    let _adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(10);
+    generator.set_csha_claims(claims);
+    let _adjoint = generator.generate(&primal);
 
-    let events = gen.csha_fused_events();
+    let events = generator.csha_fused_events();
     assert_eq!(
         events.len(),
         1,
@@ -267,11 +267,11 @@ fn non_smoke_config_records_event_with_scope_gate() {
     let primal = mixed_wengert();
     let claims = build_claims(hd64_ok_cfg);
 
-    let mut gen = AdjointGenerator::new(10);
-    gen.set_csha_claims(claims);
-    let _adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(10);
+    generator.set_csha_claims(claims);
+    let _adjoint = generator.generate(&primal);
 
-    let events = gen.csha_fused_events();
+    let events = generator.csha_fused_events();
     assert_eq!(events.len(), 1, "hd=64 chain should still record an event");
     let ev = &events[0];
     assert_eq!(ev.head_dim, 64);
@@ -283,7 +283,7 @@ fn non_smoke_config_records_event_with_scope_gate() {
     // Still no fallback diagnostics — the dispatcher accepted the chain;
     // the fallback is a scope-gate decision, not a validator rejection.
     assert!(
-        gen.csha_diagnostics().is_empty(),
+        generator.csha_diagnostics().is_empty(),
         "scope-gated fallback should not emit a rejection diagnostic"
     );
 }
@@ -295,18 +295,18 @@ fn fallback_chain_records_no_fused_event() {
     let primal = mixed_wengert();
     let claims = build_claims(over_budget_config());
 
-    let mut gen = AdjointGenerator::new(10);
-    gen.set_csha_claims(claims);
-    let _adjoint = gen.generate(&primal);
+    let mut generator = AdjointGenerator::new(10);
+    generator.set_csha_claims(claims);
+    let _adjoint = generator.generate(&primal);
 
     assert!(
-        gen.csha_fused_events().is_empty(),
+        generator.csha_fused_events().is_empty(),
         "validator-rejected chain must not record a fused event, got {:?}",
-        gen.csha_fused_events()
+        generator.csha_fused_events()
     );
     // The fallback diagnostic is the authoritative surface for this
     // case — events stay empty.
-    assert!(!gen.csha_diagnostics().is_empty());
+    assert!(!generator.csha_diagnostics().is_empty());
 }
 
 /// Gap I.1 regression: when the plan-level config carries fusion flags

@@ -290,7 +290,7 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
             .and_then(|p| p.parent())
             .expect("workspace root above crates/nsl-codegen");
         let stdlib = workspace_root.join("stdlib");
-        std::env::set_var("NSL_STDLIB_PATH", stdlib);
+        unsafe { std::env::set_var("NSL_STDLIB_PATH", stdlib) };
     }
 
     let obj = match compile_training_to_object(TOY_PRETRAIN_HD32_SRC) {

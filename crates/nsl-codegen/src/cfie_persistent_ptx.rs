@@ -1329,22 +1329,22 @@ mod tests {
         };
         let d = 8usize;
         let (hd, nh, nkv) = (4usize, 2usize, 1usize);
-        let gen = |n: usize, f: f32| -> Vec<f32> {
+        let generator = |n: usize, f: f32| -> Vec<f32> {
             (0..n).map(|i| ((i as f32) * f).sin() * 0.5).collect()
         };
-        let wq = gen(nh * hd * d, 0.31);
-        let wk = gen(nkv * hd * d, 0.47);
-        let wv = gen(nkv * hd * d, 0.59);
-        let wo = gen(d * nh * hd, 0.73);
+        let wq = generator(nh * hd * d, 0.31);
+        let wk = generator(nkv * hd * d, 0.47);
+        let wv = generator(nkv * hd * d, 0.59);
+        let wo = generator(d * nh * hd, 0.73);
         let zeros_g = vec![0.0f32; 16 * d];
         let zeros_d = vec![0.0f32; d * 16];
-        let n1 = gen(d, 0.83).iter().map(|v| v + 1.0).collect::<Vec<_>>();
+        let n1 = generator(d, 0.83).iter().map(|v| v + 1.0).collect::<Vec<_>>();
         let n2 = vec![1.0f32; d];
-        let x = gen(d, 1.13);
+        let x = generator(d, 1.13);
         // Two pre-existing tokens in the pool.
         let pos = 2u32;
-        let mut kk = gen(pos as usize * nkv * hd, 0.91);
-        let mut kv = gen(pos as usize * nkv * hd, 1.07);
+        let mut kk = generator(pos as usize * nkv * hd, 0.91);
+        let mut kv = generator(pos as usize * nkv * hd, 1.07);
 
         let out = cpu_reference(
             &cfg, &x, &wq, &wk, &wv, &wo, &zeros_g, &zeros_g, &zeros_d, &n1, &n2, &mut kk,

@@ -148,7 +148,7 @@ pub fn record_op(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Start tracing: set TRACING=true and initialise a fresh TraceGraph.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_start() {
     let mut guard = TRACE_GRAPH.lock().expect("TRACE_GRAPH mutex poisoned");
     *guard = Some(TraceGraph::new());
@@ -160,7 +160,7 @@ pub extern "C" fn nsl_trace_start() {
 /// Register a tensor pointer + name as a graph input.
 ///
 /// `name_ptr` must point to a valid NUL-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_register_input(tensor_ptr: i64, name_ptr: i64) {
     let name = unsafe {
         let raw = name_ptr as *const u8;
@@ -181,7 +181,7 @@ pub extern "C" fn nsl_trace_register_input(tensor_ptr: i64, name_ptr: i64) {
 /// Register a tensor pointer + name as a graph output.
 ///
 /// `name_ptr` must point to a valid NUL-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_register_output(tensor_ptr: i64, name_ptr: i64) {
     let name = unsafe {
         let raw = name_ptr as *const u8;
@@ -201,7 +201,7 @@ pub extern "C" fn nsl_trace_register_output(tensor_ptr: i64, name_ptr: i64) {
 
 /// Stop tracing: set TRACING=false, take the graph out of the Mutex, box it,
 /// and return its raw pointer as an i64.  Returns 0 if no trace was active.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_trace_stop() -> i64 {
     // Disable tracing first so concurrent calls stop recording.
     TRACING.store(false, Ordering::SeqCst);

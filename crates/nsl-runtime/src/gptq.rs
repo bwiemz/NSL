@@ -438,7 +438,7 @@ static HESSIAN_CTX: Mutex<Option<HessianAccumulator>> = Mutex::new(None);
 ///
 /// `k`: input dimension of the weight matrix being quantized.
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_hessian_init(k: i64) -> i64 {
     let mut guard = match HESSIAN_CTX.lock() {
         Ok(g) => g,
@@ -452,7 +452,7 @@ pub extern "C" fn nsl_gptq_hessian_init(k: i64) -> i64 {
 ///
 /// `input_ptr`: NslTensor* with shape [batch_size, K] — calibration inputs
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_hessian_add_batch(input_ptr: i64) -> i64 {
     let t = unsafe { &*(input_ptr as *const NslTensor) };
     assert!(t.ndim >= 2, "calibration input must be 2D");
@@ -485,7 +485,7 @@ pub extern "C" fn nsl_gptq_hessian_add_batch(input_ptr: i64) -> i64 {
 ///
 /// The accumulator is consumed — call nsl_gptq_hessian_init() again to start a new calibration.
 /// Returns an NslTensor* (as i64) containing the Hessian, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_hessian_finalize() -> i64 {
     let mut guard = match HESSIAN_CTX.lock() {
         Ok(g) => g,
@@ -538,7 +538,7 @@ pub extern "C" fn nsl_gptq_hessian_finalize() -> i64 {
 /// `bits`: quantization bits (4 or 8)
 ///
 /// Returns pointer to AwqPackedWeight.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_quantize(
     weight_ptr: i64,
     hessian_ptr: i64,
@@ -587,7 +587,7 @@ pub extern "C" fn nsl_gptq_quantize(
 /// `act_order`: 1 = enable activation order, 0 = sequential
 /// `block_size`: block size for blocked updates (0 = full column-wise)
 /// `damp_percent_bits`: f64 damping percent encoded as u64 bits
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_quantize_ext(
     weight_ptr: i64,
     hessian_ptr: i64,
@@ -642,7 +642,7 @@ pub extern "C" fn nsl_gptq_quantize_ext(
 }
 
 /// GPTQ dequant-matmul (same kernel as AWQ — packed format is identical).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_matmul(
     input_ptr: i64,
     packed_ptr: i64,
@@ -653,7 +653,7 @@ pub extern "C" fn nsl_gptq_matmul(
 }
 
 /// Free a GPTQ packed weight.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_gptq_free(packed_ptr: i64) {
     crate::awq::nsl_awq_free(packed_ptr);
 }

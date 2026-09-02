@@ -7,7 +7,7 @@ unsafe fn as_cstr(ptr: i64) -> &'static CStr {
     unsafe { CStr::from_ptr(ptr as *const c_char) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_read_file(path: i64) -> i64 {
     let path_str = unsafe { as_cstr(path) }.to_str().unwrap_or("");
     match std::fs::read(path_str) {
@@ -26,7 +26,7 @@ pub extern "C" fn nsl_read_file(path: i64) -> i64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_write_file(path: i64, content: i64) {
     let path_str = unsafe { as_cstr(path) }.to_str().unwrap_or("");
     let content_str = unsafe { as_cstr(content) }.to_str().unwrap_or("");
@@ -36,7 +36,7 @@ pub extern "C" fn nsl_write_file(path: i64, content: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_append_file(path: i64, content: i64) {
     use std::io::Write;
     let path_str = unsafe { as_cstr(path) }.to_str().unwrap_or("");
@@ -54,7 +54,7 @@ pub extern "C" fn nsl_append_file(path: i64, content: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_file_exists(path: i64) -> i8 {
     let path_str = unsafe { as_cstr(path) }.to_str().unwrap_or("");
     if std::path::Path::new(path_str).exists() { 1 } else { 0 }

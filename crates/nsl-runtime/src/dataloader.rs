@@ -681,7 +681,7 @@ fn build_simple_batch(
 /// `config_len` — byte length of config string
 ///
 /// Returns an opaque DataLoader handle (i64).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_create(
     data_tensor_ptr: i64,
     labels_tensor_ptr: i64,
@@ -695,7 +695,7 @@ pub extern "C" fn nsl_dataloader_create(
 }
 
 /// Start (or restart) the worker threads.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_start(dl_ptr: i64) {
     let dl = unsafe { &mut *(dl_ptr as *mut DataLoader) };
     dl.start_workers();
@@ -704,7 +704,7 @@ pub extern "C" fn nsl_dataloader_start(dl_ptr: i64) {
 /// Retrieve the next batch in deterministic order.
 ///
 /// Returns a dict pointer (i64) or 0 when the epoch is exhausted.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
     let dl = unsafe { &mut *(dl_ptr as *mut DataLoader) };
     let mut expected = dl.expected_batch_id.load(Ordering::Relaxed);
@@ -754,7 +754,7 @@ pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
 }
 
 /// Reset the dataloader for a new epoch: stop workers, clear state, restart.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_reset(dl_ptr: i64) {
     let dl = unsafe { &mut *(dl_ptr as *mut DataLoader) };
     dl.stop_workers();
@@ -804,7 +804,7 @@ pub extern "C" fn nsl_dataloader_reset(dl_ptr: i64) {
 /// This loader's current epoch counter (the key its permutation is derived
 /// from). Recorded in a training checkpoint; `0` for a null handle so the
 /// checkpoint writer can pass "no loader" without a branch.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_epoch(dl_ptr: i64) -> i64 {
     if dl_ptr == 0 {
         return 0;
@@ -820,7 +820,7 @@ pub extern "C" fn nsl_dataloader_epoch(dl_ptr: i64) -> i64 {
 /// batch, so the two diverge — and only the slot indexes the permutation.
 /// Called after `next_batch` returned the batch currently being trained on,
 /// it is already the correct resume point.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_slot(dl_ptr: i64) -> i64 {
     if dl_ptr == 0 {
         return 0;
@@ -832,7 +832,7 @@ pub extern "C" fn nsl_dataloader_slot(dl_ptr: i64) -> i64 {
 /// Delivery slots this loader yields per epoch. Used by the checkpoint writer
 /// to tell "part-way through epoch E" from "epoch E is finished", which are
 /// the same `(epoch, slot)` pair apart from this bound.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_total_batches(dl_ptr: i64) -> i64 {
     if dl_ptr == 0 {
         return 0;
@@ -842,7 +842,7 @@ pub extern "C" fn nsl_dataloader_total_batches(dl_ptr: i64) -> i64 {
 }
 
 /// Fingerprint of the corpus + loader geometry — see `identity_sig`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_identity(dl_ptr: i64) -> i64 {
     if dl_ptr == 0 {
         return 0;
@@ -853,7 +853,7 @@ pub extern "C" fn nsl_dataloader_identity(dl_ptr: i64) -> i64 {
 
 /// Arm a checkpoint resume: the next [`nsl_dataloader_reset`] pins `epoch` and
 /// starts at delivery `slot`. See `DataLoader::pending_resume`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_resume_to(dl_ptr: i64, epoch: i64, slot: i64) {
     if dl_ptr == 0 {
         return;
@@ -870,14 +870,14 @@ pub extern "C" fn nsl_dataloader_resume_to(dl_ptr: i64, epoch: i64, slot: i64) {
 }
 
 /// Stop all worker threads (without freeing the DataLoader).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_stop(dl_ptr: i64) {
     let dl = unsafe { &mut *(dl_ptr as *mut DataLoader) };
     dl.stop_workers();
 }
 
 /// Free the DataLoader and all resources.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dataloader_free(dl_ptr: i64) {
     if dl_ptr == 0 {
         return;

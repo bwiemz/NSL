@@ -1417,16 +1417,16 @@ fn emit_model_backward_bridge(
         std::collections::HashMap::new();
 
     let start_var = extractor.next_var_id();
-    let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
+    let mut generator = crate::source_ad::AdjointGenerator::new(start_var);
     // Generate adjoint before we need adjoint_of() — it consumes the primal list.
     // Capture the primal output VarId first so we can retrieve loss_seed_var_id
     // after generate() maps primal.output → loss_bar.
     let primal_output_var = extractor.wengert_list().output;
-    let adjoint = gen.generate(extractor.wengert_list());
+    let adjoint = generator.generate(extractor.wengert_list());
     // Spec §4.2: retrieve the loss seed VarId so the adjoint lowering can be
     // given the real upstream gradient (dy_handle = dL/dy = 2·y from the L2
     // wrapper) instead of the default Constant(1.0).
-    let loss_seed_vid = gen.loss_seed_var_id(primal_output_var);
+    let loss_seed_vid = generator.loss_seed_var_id(primal_output_var);
 
     for (compound_name, primal_vid) in extractor.named_param_var_ids() {
         // Strip "self." prefix to get bare field name.
@@ -1437,7 +1437,7 @@ fn emit_model_backward_bridge(
         let Some(&(offset, nbytes)) = field_to_arena.get(field_name) else {
             continue;
         };
-        let Some(adj_vid) = gen.adjoint_of(*primal_vid) else {
+        let Some(adj_vid) = generator.adjoint_of(*primal_vid) else {
             continue;
         };
         param_adj_set.insert(adj_vid);

@@ -15,7 +15,7 @@ impl NslList {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_new() -> i64 {
     let list = Box::new(NslList {
         data: checked_alloc((INITIAL_CAP as usize) * std::mem::size_of::<i64>()) as *mut i64,
@@ -25,7 +25,7 @@ pub extern "C" fn nsl_list_new() -> i64 {
     Box::into_raw(list) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_push(list_ptr: i64, value: i64) {
     let list = NslList::from_ptr(list_ptr);
     if list.len >= list.cap {
@@ -40,7 +40,7 @@ pub extern "C" fn nsl_list_push(list_ptr: i64, value: i64) {
     list.len += 1;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_get(list_ptr: i64, index: i64) -> i64 {
     let list = NslList::from_ptr(list_ptr);
     // Support negative indices: -1 is last element, -2 is second to last, etc.
@@ -55,13 +55,13 @@ pub extern "C" fn nsl_list_get(list_ptr: i64, index: i64) -> i64 {
     unsafe { *list.data.add(actual as usize) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_len(list_ptr: i64) -> i64 {
     let list = NslList::from_ptr(list_ptr);
     list.len
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_set(list_ptr: i64, index: i64, value: i64) {
     let list = NslList::from_ptr(list_ptr);
     let actual = if index < 0 { index + list.len } else { index };
@@ -77,7 +77,7 @@ pub extern "C" fn nsl_list_set(list_ptr: i64, index: i64, value: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_contains(list_ptr: i64, value: i64) -> i8 {
     let list = NslList::from_ptr(list_ptr);
     for i in 0..list.len {
@@ -88,7 +88,7 @@ pub extern "C" fn nsl_list_contains(list_ptr: i64, value: i64) -> i8 {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_slice(list_ptr: i64, lo: i64, hi: i64, step_val: i64) -> i64 {
     let list = NslList::from_ptr(list_ptr);
     let len = list.len;
@@ -136,7 +136,7 @@ pub extern "C" fn nsl_list_slice(list_ptr: i64, lo: i64, hi: i64, step_val: i64)
 
 /// Free an NslList and its backing data buffer.
 /// Does NOT free the elements — they are owned by whoever stored them.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_list_free(list_ptr: i64) {
     if list_ptr == 0 {
         return;

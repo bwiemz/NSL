@@ -1130,7 +1130,7 @@ fn materialize_conv_output_grad(
 /// grad_ptr's own var's cleanup each free the same allocation once, double
 /// freeing it. Retain in that case, mirroring `nsl_tensor_reduce_to_shape`'s
 /// identical identity-path retain.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_materialize_conv_output_grad(
     grad_ptr: i64,
     input_ptr: i64,
@@ -1180,7 +1180,7 @@ fn conv2d_backward_source_ad(
 }
 
 /// Conv2d input gradient (shape == input). See module note above.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_conv2d_input_backward(
     grad_ptr: i64,
     input_ptr: i64,
@@ -1198,7 +1198,7 @@ pub extern "C" fn nsl_conv2d_input_backward(
 }
 
 /// Conv2d weight gradient (shape == weight). See module note above.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_conv2d_weight_backward(
     grad_ptr: i64,
     input_ptr: i64,
@@ -1216,7 +1216,7 @@ pub extern "C" fn nsl_conv2d_weight_backward(
 }
 
 /// Conv2d bias gradient (shape == [C_out]). See module note above.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_conv2d_bias_backward(
     grad_ptr: i64,
     input_ptr: i64,
@@ -1270,7 +1270,7 @@ fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i
 
 /// Run backward pass. `loss_ptr` is the scalar loss tensor. `param_list` is an NslList of
 /// parameter tensor pointers. Returns an NslList of gradient tensors (one per param, same order).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     tape_backward_impl(loss_ptr, param_list, false)
 }
@@ -1281,7 +1281,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 /// fuzz harnesses, and external FFI callers keep the permissive entry above
 /// (asking for the gradient of an unused input is a legitimate zeros answer
 /// there).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tape_backward_train(loss_ptr: i64, param_list: i64) -> i64 {
     tape_backward_impl(loss_ptr, param_list, true)
 }
@@ -2110,7 +2110,7 @@ pub(crate) fn run_backward_core_strict(
 /// Debug training hook: print gradient checksums (sum of absolute values) per parameter.
 /// Detects NaN gradients, zero gradients, and misrouted gradient accumulation.
 /// Called when `--debug-training` is active.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
     let grads = NslList::from_ptr(grads_list);
     let n = num_params as usize;

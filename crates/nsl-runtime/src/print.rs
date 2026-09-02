@@ -1,12 +1,12 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_print_int(value: i64) {
     println!("{}", value);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_print_float(value: f64) {
     if value == value.floor() && value.abs() < 1e15 && value != 0.0 {
         // Integer-valued floats: print without decimal point (like C's %g)
@@ -19,7 +19,7 @@ pub extern "C" fn nsl_print_float(value: f64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_print_str(value: i64) {
     if value == 0 {
         println!("(null)");
@@ -33,7 +33,7 @@ pub extern "C" fn nsl_print_str(value: i64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_print_bool(value: i8) {
     if value != 0 {
         println!("true");

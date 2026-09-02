@@ -57,7 +57,7 @@ fn release_cpu_input(contig_ptr: i64, cpu_ptr: i64) {
 ///
 /// `cmp_kind`:
 ///   0 = Gt, 1 = GtEq, 2 = Lt, 3 = LtEq, 4 = Eq, 5 = NotEq
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i64 {
     let (a_contig, a_cpu, a_device) = prepare_cpu_input(a_ptr);
     let (b_contig, b_cpu, _b_device) = prepare_cpu_input(b_ptr);
@@ -190,7 +190,7 @@ fn compare_mixed(av: f64, bv: f64, cmp_kind: i64) -> bool {
 ///
 /// All three tensors must have the same shape. `cond` is read as the dtype of
 /// the condition tensor (0.0 = false, anything else = true).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64) -> i64 {
     let (cond_contig, cond_cpu, _cond_device) = prepare_cpu_input(cond_ptr);
     let (true_contig, true_cpu, true_device) = prepare_cpu_input(true_ptr);
@@ -266,7 +266,7 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
 /// Create a 0-dimensional scalar tensor holding a single value.
 /// `dtype`: 0 = f64, 1 = f32. Matches the graph's working precision to avoid
 /// silent precision loss in mixed-dtype backward computations.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scalar(val: f64, dtype: i64) -> i64 {
     let (data, dt): (*mut c_void, u16) = if dtype == 1 {
         let buf = checked_alloc(std::mem::size_of::<f32>()) as *mut f32;
@@ -298,7 +298,7 @@ pub extern "C" fn nsl_tensor_scalar(val: f64, dtype: i64) -> i64 {
 /// Zero-pad tensor along `dim` with `pad_before` zeros prepended and
 /// `pad_after` zeros appended.  The output shape is identical to the input
 /// except `shape[dim] += pad_before + pad_after`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_pad_zero(
     tensor_ptr: i64,
     dim: i64,
@@ -411,7 +411,7 @@ pub extern "C" fn nsl_tensor_pad_zero(
 /// `indices` shape: `[seq_len]` (integer values, read with `read_index`)
 /// Output shape: `[vocab_size, embed_dim]` where `vocab_size = max_index + 1`
 /// computed from the actual indices present.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i64) -> i64 {
     let _ = dim; // reserved for future generalisation
     let (src_contig, src_cpu, source_device) = prepare_cpu_input(src_ptr);
@@ -510,7 +510,7 @@ pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i6
 /// `weight` shape: `[vocab_size, embed_dim]` (used only for sizing the output)
 ///
 /// Returns: gradient w.r.t. weight, shape `[vocab_size, embed_dim]`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_embedding_backward(
     grad_ptr: i64,
     indices_ptr: i64,
@@ -680,7 +680,7 @@ pub extern "C" fn nsl_embedding_backward(
 ///
 /// Returns: `grad_output * (softmax(logits) - one_hot(targets)) / num_valid`
 /// for valid targets, and zero rows for ignored targets (< 0).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_cross_entropy_backward(
     grad_output_ptr: i64,
     logits_ptr: i64,
@@ -974,7 +974,7 @@ pub extern "C" fn nsl_cross_entropy_backward(
 /// value directly into the `mul_scalar` factor to sidestep
 /// `gpu_elementwise_binary`, which is element-count-matched and would
 /// silently misfire on a scalar × n-dim multiply.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_mse_backward(
     grad_output_ptr: i64,
     pred_ptr: i64,
@@ -1028,7 +1028,7 @@ pub extern "C" fn nsl_mse_backward(
 ///
 /// The computation runs on CPU then publishes back to the input device, same
 /// pattern as `nsl_cross_entropy_backward`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_l1_backward(
     grad_output_ptr: i64,
     pred_ptr: i64,
@@ -1160,7 +1160,7 @@ pub extern "C" fn nsl_l1_backward(
 /// Compute `log(softmax(x, dim))` using the log-sum-exp trick for stability.
 ///
 /// `result[i] = x[i] - logsumexp(x, dim)`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_logsoftmax(tensor_ptr: i64, dim: i64) -> i64 {
     // GPU dispatch: native GPU log_softmax kernel (last dim) or CPU-redirect (other dims)
     {
@@ -1320,7 +1320,7 @@ fn logsoftmax_base_offset(
 ///
 /// For a `[N, C, H, W]` tensor, output shape is `[N, C, H*kernel, W*kernel]`.
 /// For lower-rank tensors the last two dims are used similarly.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_repeat(tensor_ptr: i64, kernel: i64) -> i64 {
     let (t_contig, t_cpu, source_device) = prepare_cpu_input(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_cpu);
@@ -1438,7 +1438,7 @@ pub extern "C" fn nsl_tensor_repeat(tensor_ptr: i64, kernel: i64) -> i64 {
 ///
 /// This negates the second half, reversing the rotational encoding effect
 /// without re-applying the cos/sin (the caller handles that).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_rope_inverse(tensor_ptr: i64, dim: i64) -> i64 {
     let _ = dim; // dim is reserved; currently always operates on the last dim
     let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -1522,7 +1522,7 @@ pub extern "C" fn nsl_tensor_rope_inverse(tensor_ptr: i64, dim: i64) -> i64 {
 /// `input` shape [B, C, ...], `gamma` shape [C], `beta` shape [C].
 /// For each channel c: out[:, c, ...] = gamma[c] * (x[:, c, ...] - mean_c) / sqrt(var_c + eps) + beta[c]
 /// where mean_c and var_c are computed over the batch dimension.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_batchnorm(
     input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, eps: f64, _training: i64,
 ) -> i64 {
@@ -1642,7 +1642,7 @@ pub extern "C" fn nsl_tensor_batchnorm(
 
 /// AvgPool2d: average pooling over the last 2 spatial dimensions.
 /// Input shape: [B, C, H, W]. Output shape: [B, C, H/kernel, W/kernel].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_avgpool2d(
     input_ptr: i64, kernel_h: i64, kernel_w: i64, stride: i64, padding: i64,
 ) -> i64 {
@@ -2265,7 +2265,7 @@ mod tests {
 ///
 /// If grad and target already have the same shape, returns a clone of grad.
 /// Otherwise sums over leading dimensions until ndims match, then reshapes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> i64 {
     if grad_ptr == 0 || target_ptr == 0 {
         eprintln!("nsl_tensor_reduce_to_shape: null pointer (grad={}, target={})", grad_ptr, target_ptr);

@@ -427,7 +427,7 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
 /// Export an NslTensor as a DLManagedTensor pointer (zero-copy).
 ///
 /// Returns a pointer to the DLManagedTensor, or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dlpack_export(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
@@ -439,7 +439,7 @@ pub extern "C" fn nsl_dlpack_export(tensor_ptr: i64) -> i64 {
 /// Import a DLManagedTensor as an NslTensor pointer (zero-copy).
 ///
 /// Returns a pointer to a new NslTensor (with owns_data=0), or 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dlpack_import(dlpack_ptr: i64) -> i64 {
     if dlpack_ptr == 0 {
         return 0;
@@ -451,7 +451,7 @@ pub extern "C" fn nsl_dlpack_import(dlpack_ptr: i64) -> i64 {
 /// Free a DLManagedTensor that was created by nsl_dlpack_export.
 ///
 /// Calls the deleter callback on the managed tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_dlpack_free(dlpack_ptr: i64) {
     if dlpack_ptr == 0 {
         return;

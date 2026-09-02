@@ -11,7 +11,7 @@
 /// Called once per optimizer step from compiled FASE Deferred code.
 /// No unwinding: returns `f64::INFINITY` or `f64::NAN` for degenerate
 /// inputs rather than panicking (FFI boundary).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_bias_correction_inv(base: f64, step: i64) -> f64 {
     let exponent = step as f64;
     let denom = 1.0 - base.powf(exponent);

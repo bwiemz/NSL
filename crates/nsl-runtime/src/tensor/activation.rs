@@ -11,7 +11,7 @@ use super::{nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
 
 // === Element-wise math ops ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -105,7 +105,7 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -199,7 +199,7 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -293,7 +293,7 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -381,7 +381,7 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -468,7 +468,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -625,7 +625,7 @@ pub(crate) fn nsl_tensor_clamp_backward(
 
 // === Activation functions ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -727,7 +727,7 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -831,7 +831,7 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -942,7 +942,7 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
 /// fma-contraction; the CPU path computes the same order in f64/f32 (Rust emits
 /// no FMA for separate `*`/`+`). `grad` and `x` are made contiguous first, as the
 /// decomposed path's per-op kernels do.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     let xt = unsafe { &*(x_ptr as *const NslTensor) };
     let gt = unsafe { &*(grad_ptr as *const NslTensor) };
@@ -1053,7 +1053,7 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
 /// BIT-EXACT with it: t = grad*up rounds exactly like the standalone Mul
 /// kernel, then the identical silu-backward sequence runs on (t, x).
 /// Mismatched shape/device/dtype falls back to the decomposed pair.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_swiglu_gate_backward(
     grad_ptr: i64,
     up_ptr: i64,
@@ -1166,7 +1166,7 @@ pub extern "C" fn nsl_tensor_swiglu_gate_backward(
 /// ORDER with `.rn` on every op; the CPU path computes the same order in f64/f32
 /// (Rust emits no FMA for separate `*`/`-`). `grad` and `y` are made contiguous
 /// first, as the decomposed path's per-op kernels do.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
     let yt = unsafe { &*(y_ptr as *const NslTensor) };
     let gt = unsafe { &*(grad_ptr as *const NslTensor) };
@@ -1255,7 +1255,7 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
 /// (`TANH_BACKWARD_SRCAD_F32_PTX`) reproduces the exact operation ORDER with
 /// LOAD-BEARING `.rn` blocking the `y*y`→`1-y*y` fma-contraction; the CPU path
 /// computes the same order in f64/f32. `grad` and `y` are made contiguous first.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
     let yt = unsafe { &*(y_ptr as *const NslTensor) };
     let gt = unsafe { &*(grad_ptr as *const NslTensor) };
@@ -1399,7 +1399,7 @@ fn gelu_deriv_cpu(x_ptr: i64) -> i64 {
 /// pass (guard deliberately clear there), so the later `Mul(kx, 1−s)` read
 /// `σ(kx)` and the whole expression became `s·(1+s·(1−s))` — 0.625 instead of
 /// 0.5 at x=0. Fusing eliminates the temp; no aliasing exists inside one kernel.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     let xt = unsafe { &*(x_ptr as *const NslTensor) };
     let gt = unsafe { &*(grad_ptr as *const NslTensor) };
@@ -1493,7 +1493,7 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -1595,7 +1595,7 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
@@ -1697,7 +1697,7 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
 
 macro_rules! define_inplace_unary {
     ($name:ident, $op_f32:expr, $op_f64:expr, $ptx:expr, $kernel_name:literal) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn $name(ptr: i64) -> i64 {
             let t = unsafe { &mut *(ptr as *mut NslTensor) };
             // GPU path: dispatch to GPU kernel (device memory not CPU-accessible)
@@ -1746,7 +1746,7 @@ define_inplace_unary!(nsl_tensor_neg_inplace, |v: f32| -v, |v: f64| -v, crate::c
 define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } else if v < 0.0 { -1.0_f32 } else { 0.0_f32 }, |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }, crate::cuda::kernels::SIGN_F32_PTX, "nsl_sign_f32\0");
 
 /// GELU in-place.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
     let t = unsafe { &mut *(ptr as *mut NslTensor) };
     // GPU path: dispatch to GPU kernel
@@ -1783,7 +1783,7 @@ pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
 }
 
 /// SiLU in-place.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
     let t = unsafe { &mut *(ptr as *mut NslTensor) };
     // GPU path: dispatch to GPU kernel
@@ -1827,7 +1827,7 @@ pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Unconditional in-place add: left += right.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
     let left = unsafe { &*(left_ptr as *const NslTensor) };
     let right = unsafe { &*(right_ptr as *const NslTensor) };
@@ -1846,7 +1846,7 @@ pub extern "C" fn nsl_tensor_add_inplace_fbip(left_ptr: i64, right_ptr: i64) -> 
 }
 
 /// Unconditional in-place sub: left -= right.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sub_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
     let left = unsafe { &*(left_ptr as *const NslTensor) };
     let right = unsafe { &*(right_ptr as *const NslTensor) };
@@ -1865,7 +1865,7 @@ pub extern "C" fn nsl_tensor_sub_inplace_fbip(left_ptr: i64, right_ptr: i64) -> 
 }
 
 /// Unconditional in-place mul: left *= right.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mul_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
     let left = unsafe { &*(left_ptr as *const NslTensor) };
     let right = unsafe { &*(right_ptr as *const NslTensor) };
@@ -1884,7 +1884,7 @@ pub extern "C" fn nsl_tensor_mul_inplace_fbip(left_ptr: i64, right_ptr: i64) -> 
 }
 
 /// Unconditional in-place div: left /= right.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_div_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
     let left = unsafe { &*(left_ptr as *const NslTensor) };
     let right = unsafe { &*(right_ptr as *const NslTensor) };

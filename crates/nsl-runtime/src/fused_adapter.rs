@@ -158,7 +158,7 @@ fn fused_ptx_registry() -> &'static Mutex<HashMap<i64, FusedPtxEntry>> {
 /// `ptx` must point to `ptx_len` valid UTF-8 bytes (not required to be
 /// null-terminated).  `kernel_name` must point to `name_len` valid
 /// UTF-8 bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_wrga_register_fused_ptx(
     handle: i64,
     ptx: *const u8,
@@ -550,7 +550,7 @@ fn cpu_fallback_fused_ia3(x: i64, w: i64, ia3_scale: i64) -> i64 {
 ///
 /// # Safety
 /// All tensor pointers must be valid `*NslTensor` handles or `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_adapter_fused_lora_matmul(
     x: i64,
     w: i64,
@@ -590,7 +590,7 @@ pub extern "C" fn nsl_adapter_fused_lora_matmul(
 ///
 /// # Safety
 /// All tensor pointers must be valid `*NslTensor` handles or `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_adapter_fused_ia3_matmul(
     x: i64,
     w: i64,
@@ -853,7 +853,7 @@ fn try_cuda_launch_fused_gatedlora(
 ///
 /// # Safety
 /// All tensor pointers must be valid `*NslTensor` handles or `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_adapter_fused_gatedlora_matmul(
     x: i64,
     w: i64,

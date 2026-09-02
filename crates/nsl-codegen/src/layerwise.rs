@@ -489,7 +489,7 @@ mod tests {
         }
     }
 
-    fn elems_of(map: &[(&str, u64)]) -> impl Fn(&str) -> Option<u64> {
+    fn elems_of(map: &[(&str, u64)]) -> impl Fn(&str) -> Option<u64> + use<> {
         let m: HashMap<String, u64> = map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         move |name: &str| m.get(name).copied()
     }

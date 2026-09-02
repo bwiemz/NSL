@@ -34,7 +34,7 @@ static RNG_SEED_SET: AtomicBool = AtomicBool::new(false);
 
 /// Set global deterministic mode flag.
 /// Called from compiled main() when --deterministic is active.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_set_deterministic(mode: i64) -> i64 {
     DETERMINISTIC_MODE.store(mode != 0, Ordering::SeqCst);
     if mode != 0 {
@@ -50,7 +50,7 @@ pub fn is_deterministic() -> bool {
 
 /// Seed all RNG sources for reproducibility.
 /// Called from compiled main() when --deterministic and/or --seed is active.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_rng_seed(seed: i64) -> i64 {
     RNG_SEED.store(seed as u64, Ordering::SeqCst);
     RNG_SEED_SET.store(true, Ordering::SeqCst);
@@ -104,7 +104,7 @@ pub fn explicit_rng_seed() -> Option<u64> {
 /// that accumulate in fixed ascending order (no parallelism = bit-reproducible).
 ///
 /// NOTE: Signature matches nsl_tensor_sum_dim(tensor_ptr, dim, keepdim) = 3 params.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reduce_sum_deterministic(input: i64, dim: i64, keepdim: i64) -> i64 {
     let tensor = crate::tensor::NslTensor::from_ptr(input);
 
@@ -146,7 +146,7 @@ pub extern "C" fn nsl_tensor_reduce_sum_deterministic(input: i64, dim: i64, keep
 /// or delegates to CPU path (already deterministic) for CPU tensors.
 ///
 /// M46b: GPU tensors use the deterministic sum kernel then divide by element count.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, keepdim: i64) -> i64 {
     let tensor = crate::tensor::NslTensor::from_ptr(input);
 
@@ -206,7 +206,7 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
 /// GPU (M46b): transfer to CPU, run sort-based scatter_add, transfer back.
 /// A full GPU-native sort-based PTX kernel (bitonic sort + sequential accumulate)
 /// is deferred to M46c — the CPU fallback is correct and sufficient for now.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scatter_add_deterministic(
     input: i64,
     indices: i64,

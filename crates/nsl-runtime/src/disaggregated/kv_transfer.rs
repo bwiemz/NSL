@@ -788,7 +788,7 @@ impl NvlinkBackend {
         // cuIpcGetMemHandle(handle_ptr, device_ptr)
         // The handle is a 64-byte opaque structure.
         let mut handle = [0u8; 64];
-        extern "C" {
+        unsafe extern "C" {
             fn cuIpcGetMemHandle(handle: *mut u8, dptr: u64) -> u32;
         }
         let rc = unsafe { cuIpcGetMemHandle(handle.as_mut_ptr(), gpu_ptr as u64) };
@@ -803,7 +803,7 @@ impl NvlinkBackend {
     /// Returns the local GPU pointer, or null on failure.
     #[cfg(feature = "cuda")]
     fn import_ipc_handle(handle: &[u8; 64]) -> *mut c_void {
-        extern "C" {
+        unsafe extern "C" {
             fn cuIpcOpenMemHandle(dptr: *mut u64, handle: *const u8, flags: u32) -> u32;
         }
         let mut dptr: u64 = 0;
@@ -822,7 +822,7 @@ impl NvlinkBackend {
         if ptr.is_null() {
             return;
         }
-        extern "C" {
+        unsafe extern "C" {
             fn cuIpcCloseMemHandle(dptr: u64) -> u32;
         }
         unsafe { cuIpcCloseMemHandle(ptr as u64); }
@@ -1486,7 +1486,7 @@ struct KvTransferContext {
 /// `rank`: this worker's rank
 ///
 /// Returns 0 on success, -1 if already initialized.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_transfer_init(backend_id: i64, rank: i64) -> i64 {
     let mut guard = match KV_TRANSFER_CTX.lock() {
         Ok(g) => g,
@@ -1513,7 +1513,7 @@ pub extern "C" fn nsl_kv_transfer_init(backend_id: i64, rank: i64) -> i64 {
 /// entries_ptr to KvBlockTransferEntry array, k_data_ptr/v_data_ptr to KV tensors.
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_transfer_send(
     target_rank: i64,
     header_ptr: i64,
@@ -1558,7 +1558,7 @@ pub extern "C" fn nsl_kv_transfer_send(
 /// `k_data_out_ptr` / `v_data_out_ptr` must point to pre-allocated buffers.
 ///
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_transfer_recv(
     source_rank: i64,
     header_out_ptr: i64,
@@ -1588,7 +1588,7 @@ pub extern "C" fn nsl_kv_transfer_recv(
 }
 
 /// Destroy the KV transfer context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_transfer_destroy() -> i64 {
     let mut guard = match KV_TRANSFER_CTX.lock() {
         Ok(g) => g,
@@ -1610,7 +1610,7 @@ pub extern "C" fn nsl_kv_transfer_destroy() -> i64 {
 /// `k_data_out` / `v_data_out`: pointers to pre-allocated buffers
 ///
 /// Returns 0 on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_serialize(
     kv_cache_handle: i64,
     seq_id: i64,
@@ -1674,7 +1674,7 @@ pub extern "C" fn nsl_kv_serialize(
 /// `k_data` / `v_data`: pointers to received data buffers
 ///
 /// Returns the allocated seq_id on success, -1 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_kv_deserialize(
     kv_cache_handle: i64,
     header: i64,

@@ -35,8 +35,8 @@ use nsl_runtime::{nsl_cuda_init, nsl_test_cuda_d2h, nsl_test_cuda_h2d};
 /// order 1e0 or crash outright; TF32's ~1e-3 drift on the matmul gates would
 /// only spend headroom.
 fn pin_full_f32() {
-    std::env::set_var("NSL_MATMUL_TF32", "0");
-    std::env::set_var("NSL_MATMUL_BF16", "0");
+    unsafe { std::env::set_var("NSL_MATMUL_TF32", "0") };
+    unsafe { std::env::set_var("NSL_MATMUL_BF16", "0") };
 }
 
 fn cuda_available() -> bool {

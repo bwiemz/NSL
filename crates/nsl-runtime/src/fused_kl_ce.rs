@@ -42,7 +42,7 @@ fn f32_from_bits_i64(bits: i64) -> f32 {
 /// * `smem_bytes` — from `FusedKlCeConfig::shared_mem_bytes()`.
 ///
 /// Returns 0 on success, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_kl_ce_forward(
     ptx_ptr: i64,
@@ -134,7 +134,7 @@ pub extern "C" fn nsl_fused_kl_ce_forward(
 /// the kernel accumulates via `red.global.add.f32`).
 ///
 /// Returns 0 on success, negative on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_kl_ce_backward(
     ptx_ptr: i64,

@@ -90,12 +90,12 @@ pub static FUSED_EW_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 pub static FUSED_EW_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// In-process getters (same family as `nsl_wgrad_fused_count`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_ew_launch_count() -> i64 {
     FUSED_EW_LAUNCHES.load(Ordering::Relaxed) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_ew_fallback_count() -> i64 {
     FUSED_EW_FALLBACKS.load(Ordering::Relaxed) as i64
 }
@@ -104,7 +104,7 @@ pub extern "C" fn nsl_fused_ew_fallback_count() -> i64 {
 /// line, mirroring `nsl_wgrad_count_atexit` in `args.rs` exactly.
 /// Registered as an atexit hook from `nsl_args_init` (see args.rs); also
 /// exported so codegen-emitted teardown code can call it directly.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_ew_counters_report() {
     let launches = nsl_fused_ew_launch_count();
     let fallbacks = nsl_fused_ew_fallback_count();
@@ -406,7 +406,7 @@ fn replay_decomposed(steps: &[ChainStep], inputs: &[i64]) -> i64 {
 /// compile side and ignored here. The result is a fresh owned handle —
 /// never null on success (all failure modes either abort or degrade to the
 /// replay, which itself aborts rather than returning null).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)] // pinned FFI contract: fixed 6-slot handle arity
 pub extern "C" fn nsl_fused_ew_chain(
     ptx: *const u8,
@@ -500,7 +500,7 @@ pub extern "C" fn nsl_fused_ew_chain(
 /// ordinary binary FFI, bit-exact by construction.
 ///
 /// `opcode` uses the descriptor v1 byte values (Add=0, Sub=1, Mul=2, Div=3).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scalar_rhs(x: i64, s: f64, opcode: i64) -> i64 {
     assert!(
         !autodiff::is_recording(),

@@ -191,7 +191,7 @@ fn load_safetensors(path: &Path) -> Result<Batches, CalibDataError> {
 /// Load calibration data from a UTF-8 file path.
 /// Returns an owned `*mut Batches` on success, null on failure.
 /// Caller must eventually call `nsl_calibration_free`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_calibration_load(path_ptr: *const u8, path_len: usize) -> *mut Batches {
     if path_ptr.is_null() {
         return std::ptr::null_mut();
@@ -210,7 +210,7 @@ pub extern "C" fn nsl_calibration_load(path_ptr: *const u8, path_len: usize) -> 
 /// Borrow a pointer to the raw f32 bytes of batch `i`.
 /// Sets `*out_ptr` and `*out_len`; zeroes both if `i` is out of range or
 /// `batches` is null.  The pointer is valid as long as `batches` is alive.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_calibration_batch_at(
     batches: *mut Batches,
     i: usize,
@@ -236,7 +236,7 @@ pub extern "C" fn nsl_calibration_batch_at(
 }
 
 /// Return the number of batches in `batches` (0 if null).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_calibration_count(batches: *mut Batches) -> usize {
     if batches.is_null() {
         return 0;
@@ -245,7 +245,7 @@ pub extern "C" fn nsl_calibration_count(batches: *mut Batches) -> usize {
 }
 
 /// Free a `Batches` object previously returned by `nsl_calibration_load`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_calibration_free(batches: *mut Batches) {
     if !batches.is_null() {
         unsafe { drop(Box::from_raw(batches)) }

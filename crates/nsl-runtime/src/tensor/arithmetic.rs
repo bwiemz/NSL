@@ -25,7 +25,7 @@ fn reconcile_device(a: i64, b: i64) -> (i64, bool) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
@@ -169,7 +169,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
@@ -270,7 +270,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
@@ -386,7 +386,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
@@ -501,7 +501,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(a_ptr as *const NslTensor) };
@@ -619,7 +619,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
 
 // === Scalar-tensor ops ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::relinquish_a;
     let relinq_a = relinquish_a(flags);
@@ -750,7 +750,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::relinquish_a;
     let relinq_a = relinquish_a(flags);
@@ -890,7 +890,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
 /// backward. There is no `TapeOp::DivScalar`, so running this under an armed
 /// tape would silently drop the op from the graph (the #396 silent-drop
 /// class) — it refuses instead.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_div_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::relinquish_a;
     assert!(
@@ -1014,7 +1014,7 @@ pub extern "C" fn nsl_tensor_div_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
 /// Same template, contract, and adjoint-only refusal as
 /// [`nsl_tensor_div_scalar`] above; the GPU kernel's `sub.f32` is copied
 /// verbatim from `nsl_sub_f32`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::relinquish_a;
     assert!(
@@ -1146,7 +1146,7 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
 /// anything else (dtype/device/shape mismatch, or half precision, whose
 /// materialized-intermediate rounding a single kernel could not reproduce)
 /// falls back to the exact decomposed two-op path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f64) {
     let m = NslTensor::from_ptr(m_ptr);
     let g = NslTensor::from_ptr(g_ptr);
@@ -1249,12 +1249,12 @@ pub static WGRAD_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// In-process getters (same family as `nsl_fase_fused_step_count`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_wgrad_fused_count() -> i64 {
     WGRAD_FUSED_COUNT.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_wgrad_fallback_count() -> i64 {
     WGRAD_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
@@ -1266,7 +1266,7 @@ pub extern "C" fn nsl_wgrad_fallback_count() -> i64 {
 /// [`WGRAD_FUSED_COUNT`] / [`WGRAD_FALLBACK_COUNT`]). A parity gate that only
 /// checked "the numbers agree" would pass just as happily if every call had
 /// fallen back — testing the decomposed chain against itself.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: f64) {
     let m = NslTensor::from_ptr(m_ptr);
     let x = NslTensor::from_ptr(x_ptr);
@@ -1355,7 +1355,7 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
 /// CSR sparse matmul: C = A_sparse @ B_dense
 /// CSR arrays are passed as device pointers (uploaded by codegen from .rodata).
 /// Returns a new dense tensor C[nrows, N] where N is B's last dim.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_matmul(
     _row_ptrs_ptr: i64,
     _col_indices_ptr: i64,
@@ -1430,7 +1430,7 @@ pub extern "C" fn nsl_sparse_matmul(
 
 // === Matrix multiply ===
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);

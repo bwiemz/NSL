@@ -12,7 +12,7 @@ static INSPECT_DIR: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(PathBuf::from
 ///
 /// # Safety
 /// Caller guarantees `(path_ptr, path_len)` points to valid UTF-8 bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_inspect_set_dir(path_ptr: *const u8, path_len: usize) {
     if path_ptr.is_null() {
         return;
@@ -28,7 +28,7 @@ pub unsafe extern "C" fn nsl_inspect_set_dir(path_ptr: *const u8, path_len: usiz
 /// # Safety
 /// - `stats_buf_ptr` must point to 6 readable `f64` values.
 /// - `(name_ptr, name_len)` must be valid UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_inspect_record_stats(
     stats_buf_ptr: *const f64,
     step: u64,
@@ -59,7 +59,7 @@ pub unsafe extern "C" fn nsl_inspect_record_stats(
 /// # Safety
 /// - `tensor_handle` must be a valid `NslTensor` pointer.
 /// - `(name_ptr, name_len)` must be valid UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nsl_inspect_dump_full(
     tensor_handle: i64,
     step: u64,

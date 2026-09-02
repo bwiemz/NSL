@@ -160,7 +160,7 @@ pub(crate) fn allocate_f32_tensor(
 /// Load a .safetensors file and return an NslDict (i64 ptr) of name → NslTensor.
 /// All tensors are loaded as f32 (dtype=1).
 /// `device`: 0 = CPU, 1+ = CUDA device
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64) -> i64 {
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
@@ -232,7 +232,7 @@ pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64
 
 /// Save an NslDict of name → NslTensor to a .safetensors file.
 /// All tensors are written as F32 regardless of original dtype.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i64) {
     use std::collections::HashMap;
 

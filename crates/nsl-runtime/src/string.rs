@@ -30,7 +30,7 @@ fn alloc_bytes(bytes: &[u8]) -> i64 {
     ptr as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_concat(a: i64, b: i64) -> i64 {
     let sa = unsafe { as_cstr(a) }.to_bytes();
     let sb = unsafe { as_cstr(b) }.to_bytes();
@@ -40,12 +40,12 @@ pub extern "C" fn nsl_str_concat(a: i64, b: i64) -> i64 {
     alloc_bytes(&result)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_int_to_str(value: i64) -> i64 {
     alloc_cstring(&format!("{}", value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_float_to_str(value: f64) -> i64 {
     // Match C's %g: shortest representation
     if value == value.floor() && value.abs() < 1e15 && value != 0.0 {
@@ -57,7 +57,7 @@ pub extern "C" fn nsl_float_to_str(value: f64) -> i64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_bool_to_str(value: i8) -> i64 {
     if value != 0 {
         alloc_cstring("true")
@@ -66,7 +66,7 @@ pub extern "C" fn nsl_bool_to_str(value: i8) -> i64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_to_int(s: i64) -> i64 {
     let cstr = unsafe { as_cstr(s) };
     let text = cstr.to_str().unwrap_or("");
@@ -79,7 +79,7 @@ pub extern "C" fn nsl_str_to_int(s: i64) -> i64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_to_float(s: i64) -> f64 {
     let cstr = unsafe { as_cstr(s) };
     let text = cstr.to_str().unwrap_or("");
@@ -92,34 +92,34 @@ pub extern "C" fn nsl_str_to_float(s: i64) -> f64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_len(s: i64) -> i64 {
     let cstr = unsafe { as_cstr(s) };
     cstr.to_bytes().len() as i64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_upper(s: i64) -> i64 {
     let cstr = unsafe { as_cstr(s) };
     let text = cstr.to_str().unwrap_or("");
     alloc_cstring(&text.to_uppercase())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_lower(s: i64) -> i64 {
     let cstr = unsafe { as_cstr(s) };
     let text = cstr.to_str().unwrap_or("");
     alloc_cstring(&text.to_lowercase())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_strip(s: i64) -> i64 {
     let cstr = unsafe { as_cstr(s) };
     let text = cstr.to_str().unwrap_or("");
     alloc_cstring(text.trim())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_split(s: i64, sep: i64) -> i64 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let separator = unsafe { as_cstr(sep) }.to_str().unwrap_or("");
@@ -140,7 +140,7 @@ pub extern "C" fn nsl_str_split(s: i64, sep: i64) -> i64 {
     result
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_join(sep: i64, list_ptr: i64) -> i64 {
     let separator = unsafe { as_cstr(sep) }.to_str().unwrap_or("");
     let list = crate::list::NslList::from_ptr(list_ptr);
@@ -154,7 +154,7 @@ pub extern "C" fn nsl_str_join(sep: i64, list_ptr: i64) -> i64 {
     alloc_cstring(&parts.join(separator))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_replace(s: i64, old_s: i64, new_s: i64) -> i64 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let old = unsafe { as_cstr(old_s) }.to_str().unwrap_or("");
@@ -166,7 +166,7 @@ pub extern "C" fn nsl_str_replace(s: i64, old_s: i64, new_s: i64) -> i64 {
     alloc_cstring(&text.replace(old, new))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_find(s: i64, sub: i64) -> i64 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let substr = unsafe { as_cstr(sub) }.to_str().unwrap_or("");
@@ -176,21 +176,21 @@ pub extern "C" fn nsl_str_find(s: i64, sub: i64) -> i64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_startswith(s: i64, prefix: i64) -> i8 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let pfx = unsafe { as_cstr(prefix) }.to_str().unwrap_or("");
     if text.starts_with(pfx) { 1 } else { 0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_endswith(s: i64, suffix: i64) -> i8 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let sfx = unsafe { as_cstr(suffix) }.to_str().unwrap_or("");
     if text.ends_with(sfx) { 1 } else { 0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_str_contains(s: i64, sub: i64) -> i8 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let substr = unsafe { as_cstr(sub) }.to_str().unwrap_or("");
@@ -209,7 +209,7 @@ pub fn nsl_str_from_rust(s: &str) -> i64 {
 
 /// Free a dynamically allocated string (allocated by checked_alloc).
 /// Used for tokenizer decode return values and other dynamic strings.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_string_free(ptr: i64) {
     if ptr == 0 { return; }
     // Strings are null-terminated C strings allocated via checked_alloc.

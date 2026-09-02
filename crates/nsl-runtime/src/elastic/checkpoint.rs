@@ -221,7 +221,7 @@ impl CheckpointManager {
 
 /// Trigger an async checkpoint (called from codegen-generated train loop).
 /// Returns 0 on success.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nsl_checkpoint_async(
     _model_state_ptr: i64,
     _model_state_size: i64,
