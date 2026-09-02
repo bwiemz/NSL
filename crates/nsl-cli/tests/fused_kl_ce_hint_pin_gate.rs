@@ -59,7 +59,16 @@ fn run_with(rewrites: &[(&str, &str)], tag: &str) -> RunOut {
     )
     .expect("fused_klce_pin.nsl fixture missing");
     assert!(src.contains("# GPU_PLACEMENT"));
-    src = src.replace("# GPU_PLACEMENT", "teacher.to(cuda)\nstudent.to(cuda)");
+    // Place the INPUTS as well as the models. A train-step input left on the
+        // host while parameters are on the GPU is refused since acd2535c
+        // (2026-08-25) -- correctly, because every op would otherwise reconcile
+        // the WEIGHTS down to host f64. This fixture predates that guard and
+        // had gone red unnoticed for eight days, which is what the first full
+        // GPU certification run surfaced.
+        src = src.replace(
+            "# GPU_PLACEMENT",
+            "teacher.to(cuda)\nstudent.to(cuda)\nlet x = x.to(cuda)\nlet targets = targets.to(cuda)",
+        );
     for (from, to) in rewrites {
         // Exactly one — `replace` rewrites every occurrence, and a marker
         // that drifted to zero makes the arm vacuous.

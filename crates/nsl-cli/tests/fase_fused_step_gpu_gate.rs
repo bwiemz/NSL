@@ -51,8 +51,11 @@ model Mlp:
 
 let m = Mlp()
 m.to(cuda)
-let x = ones([4, 16])
-let y = zeros([4, 16])
+# Inputs to the device too: since acd2535c a host-resident train-step input
+# with GPU parameters is refused, because every op would otherwise reconcile
+# the WEIGHTS down to host f64.
+let x = ones([4, 16]).to(cuda)
+let y = zeros([4, 16]).to(cuda)
 
 train(model = m, epochs = 4, grad_accumulation = 2):
     optimizer: AdamW(lr = 0.01, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)

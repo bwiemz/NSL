@@ -38,10 +38,19 @@ fn run(save_path: &std::path::Path, checkpoint_blocks: bool, tag: &str) -> Out {
     let fixture = root.join("crates/nsl-cli/tests/fixtures/ccr_checkpoint_activation.nsl");
     let src = std::fs::read_to_string(&fixture).expect("ccr_checkpoint_activation.nsl missing");
     assert!(src.contains("CCR_ACT_SAVE_PATH"));
-    // GPU placement: put the model on CUDA before the train block.
+    // GPU placement: the model AND the train-step input. A host-resident input
+    // with GPU parameters is refused since acd2535c (2026-08-25), because every
+    // op would otherwise reconcile the WEIGHTS down to host f64. This fixture
+    // predates that guard and had been red unnoticed until the first full GPU
+    // certification run.
     assert!(src.contains("let m = Net()"));
+    assert!(src.contains("let x = randn([4, 4]) * 0.1"));
     let program = src
         .replace("let m = Net()", "let m = Net()\nm.to(cuda)")
+        .replace(
+            "let x = randn([4, 4]) * 0.1",
+            "let x = (randn([4, 4]) * 0.1).to(cuda)",
+        )
         .replace(
             "CCR_ACT_SAVE_PATH",
             &save_path.display().to_string().replace('\\', "/"),

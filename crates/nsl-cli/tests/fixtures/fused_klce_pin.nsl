@@ -29,9 +29,9 @@ model Student:
 
 let teacher = Teacher()
 let student = Student()
-# GPU_PLACEMENT
 let x = randn([16, 32])
 let targets = zeros([16])
+# GPU_PLACEMENT
 
 @fused_kl_ce(enabled = true, vocab_size = 256, hidden_size = 32, teacher_hidden = 64, batch_size = 2, seq_len = 8, vocab_tile = 128)
 distill(teacher = teacher, student = student, epochs = 1):
