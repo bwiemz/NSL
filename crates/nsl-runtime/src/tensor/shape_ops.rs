@@ -23,11 +23,13 @@ unsafe fn copy_preserved_dtype_element(
     dst_offset: usize,
 ) {
     let elem_size = tensor.element_size();
-    std::ptr::copy_nonoverlapping(
-        (tensor.data as *const u8).add(src_offset * elem_size),
-        (dst as *mut u8).add(dst_offset * elem_size),
-        elem_size,
-    );
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (tensor.data as *const u8).add(src_offset * elem_size),
+            (dst as *mut u8).add(dst_offset * elem_size),
+            elem_size,
+        );
+    }
 }
 
 // === Shape query operations ===

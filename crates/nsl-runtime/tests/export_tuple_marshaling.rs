@@ -45,8 +45,8 @@ impl Desc {
 /// Read element `i` of a returned desc as f64, honoring its dtype tag.
 unsafe fn desc_elem(desc: &Desc, i: usize) -> f64 {
     match desc.dtype {
-        1 => *(desc.data as *const f32).add(i) as f64,
-        0 => *(desc.data as *const f64).add(i),
+        1 => unsafe { *(desc.data as *const f32).add(i) as f64 },
+        0 => unsafe { *(desc.data as *const f64).add(i) },
         other => panic!("unexpected desc dtype {other}"),
     }
 }

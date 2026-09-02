@@ -81,17 +81,17 @@ pub unsafe extern "C" fn nsl_ort_kernel_compute(
     kernel_state: *mut c_void,
     ctx: *mut OrtKernelContext,
 ) {
-    let state = &*(kernel_state as *const NslOrtKernelState);
-    let api = &*state.api;
+    let state = unsafe { &*(kernel_state as *const NslOrtKernelState) };
+    let api = unsafe { &*state.api };
 
     let mut n_in: usize = 0;
-    let _ = (api.KernelContext_GetInputCount)(ctx, &mut n_in);
+    let _ = unsafe { (api.KernelContext_GetInputCount)(ctx, &mut n_in) };
     let mut n_out: usize = 0;
-    let _ = (api.KernelContext_GetOutputCount)(ctx, &mut n_out);
+    let _ = unsafe { (api.KernelContext_GetOutputCount)(ctx, &mut n_out) };
 
     // Convert ORT inputs to NslTensorDescs.
     let input_descs: Vec<crate::c_api::NslTensorDesc> = (0..n_in)
-        .map(|i| ort_input_to_desc(api, ctx, i))
+        .map(|i| unsafe { ort_input_to_desc(api, ctx, i) })
         .collect();
 
     // For each output, ORT requires us to call KernelContext_GetOutput with
@@ -99,18 +99,20 @@ pub unsafe extern "C" fn nsl_ort_kernel_compute(
     // the output shape mirrors input[0]; multi-output or shape-inferring
     // kernels are out of scope (see module doc).
     let mut output_descs: Vec<crate::c_api::NslTensorDesc> = (0..n_out)
-        .map(|i| ort_alloc_output_desc(api, ctx, i, &input_descs))
+        .map(|i| unsafe { ort_alloc_output_desc(api, ctx, i, &input_descs) })
         .collect();
 
     // Invoke the NSL export. The fn_ptr is the codegen-emitted
     // `<name>__nsl_dispatch` symbol (see `ExportRegistry` for the ABI).
-    let rc = (state.fn_ptr)(
-        state.model_ptr,
-        input_descs.as_ptr() as i64,
-        n_in as i64,
-        output_descs.as_mut_ptr() as i64,
-        n_out as i64,
-    );
+    let rc = unsafe {
+        (state.fn_ptr)(
+            state.model_ptr,
+            input_descs.as_ptr() as i64,
+            n_in as i64,
+            output_descs.as_mut_ptr() as i64,
+            n_out as i64,
+        )
+    };
 
     if rc != 0 {
         // Surface NSL error as ORT status. The v1 `KernelCompute` slot is
@@ -125,7 +127,7 @@ pub unsafe extern "C" fn nsl_ort_kernel_compute(
         } else {
             c"nsl_ort_kernel_compute: NSL export returned non-zero rc".as_ptr()
         };
-        let status = (api.CreateStatus)(OrtErrorCode::ORT_RUNTIME_EXCEPTION, msg);
+        let status = unsafe { (api.CreateStatus)(OrtErrorCode::ORT_RUNTIME_EXCEPTION, msg) };
         let _ = status;
     }
 }
@@ -139,24 +141,24 @@ unsafe fn ort_input_to_desc(
     index: usize,
 ) -> crate::c_api::NslTensorDesc {
     let mut value: *const OrtValue = std::ptr::null();
-    let _ = (api.KernelContext_GetInput)(ctx, index, &mut value);
+    let _ = unsafe { (api.KernelContext_GetInput)(ctx, index, &mut value) };
 
     let mut info: *mut OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-    let _ = (api.GetTensorTypeAndShape)(value, &mut info);
+    let _ = unsafe { (api.GetTensorTypeAndShape)(value, &mut info) };
 
     let mut element_type = ONNXTensorElementDataType::UNDEFINED;
-    let _ = (api.GetTensorElementType)(info, &mut element_type);
+    let _ = unsafe { (api.GetTensorElementType)(info, &mut element_type) };
 
     let mut ndim: usize = 0;
-    let _ = (api.GetDimensionsCount)(info, &mut ndim);
+    let _ = unsafe { (api.GetDimensionsCount)(info, &mut ndim) };
 
     let mut shape: Vec<i64> = vec![0; ndim];
-    let _ = (api.GetDimensions)(info, shape.as_mut_ptr(), ndim);
+    let _ = unsafe { (api.GetDimensions)(info, shape.as_mut_ptr(), ndim) };
 
     let mut data_ptr: *mut c_void = std::ptr::null_mut();
-    let _ = (api.GetTensorMutableData)(value as *mut OrtValue, &mut data_ptr);
+    let _ = unsafe { (api.GetTensorMutableData)(value as *mut OrtValue, &mut data_ptr) };
 
-    (api.ReleaseTensorTypeAndShapeInfo)(info);
+    unsafe { (api.ReleaseTensorTypeAndShapeInfo)(info) };
 
     let nsl_dtype = ort_element_type_to_nsl_dtype(element_type);
 
@@ -197,19 +199,22 @@ unsafe fn ort_alloc_output_desc(
     let template = input_descs
         .first()
         .expect("output requires at least one input for shape inference (v1)");
-    let shape_slice = std::slice::from_raw_parts(template.shape, template.ndim as usize);
+    let shape_slice =
+        unsafe { std::slice::from_raw_parts(template.shape, template.ndim as usize) };
 
     let mut output_value: *mut OrtValue = std::ptr::null_mut();
-    let _ = (api.KernelContext_GetOutput)(
-        ctx,
-        index,
-        shape_slice.as_ptr(),
-        template.ndim as usize,
-        &mut output_value,
-    );
+    let _ = unsafe {
+        (api.KernelContext_GetOutput)(
+            ctx,
+            index,
+            shape_slice.as_ptr(),
+            template.ndim as usize,
+            &mut output_value,
+        )
+    };
 
     let mut data_ptr: *mut c_void = std::ptr::null_mut();
-    let _ = (api.GetTensorMutableData)(output_value, &mut data_ptr);
+    let _ = unsafe { (api.GetTensorMutableData)(output_value, &mut data_ptr) };
 
     crate::c_api::NslTensorDesc {
         data: data_ptr,

@@ -195,7 +195,7 @@ pub(crate) mod inner {
             return 0;
         };
         let mut count: i32 = 0;
-        if cuDeviceGetCount(&mut count) != CUresult::CUDA_SUCCESS || count <= 0 {
+        if unsafe { cuDeviceGetCount(&mut count) } != CUresult::CUDA_SUCCESS || count <= 0 {
             return 0;
         }
         let ordinal = rank.max(0) % count;
@@ -1402,13 +1402,13 @@ pub(crate) mod inner {
         super::graph_capture::taint("transfer-stream event wait");
         let mut ev: CUevent = std::ptr::null_mut();
         // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest event flavor).
-        let r = cuEventCreate(&mut ev, 0x2);
+        let r = unsafe { cuEventCreate(&mut ev, 0x2) };
         assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (offload) failed: {:?}", r);
-        let r = cuEventRecord(ev, current_stream());
+        let r = unsafe { cuEventRecord(ev, current_stream()) };
         assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (offload) failed: {:?}", r);
-        let r = cuStreamWaitEvent(stream, ev, 0);
+        let r = unsafe { cuStreamWaitEvent(stream, ev, 0) };
         assert_eq!(r, CUresult::CUDA_SUCCESS, "cuStreamWaitEvent (offload) failed: {:?}", r);
-        cuEventDestroy_v2(ev);
+        unsafe { cuEventDestroy_v2(ev) };
     }
 
     /// Async DtoH on the per-thread transfer stream, ordered AFTER all
@@ -1771,11 +1771,11 @@ pub(crate) mod inner {
     // === cuEvent wrappers for kernel profiler ===
 
     pub unsafe fn cu_event_create(event: *mut u64) {
-        cuEventCreate(event as *mut CUevent, 0); // CU_EVENT_DEFAULT = 0
+        unsafe { cuEventCreate(event as *mut CUevent, 0) }; // CU_EVENT_DEFAULT = 0
     }
 
     pub unsafe fn cu_event_record(event: u64, stream: *mut std::ffi::c_void) {
-        cuEventRecord(event as CUevent, stream as CUstream);
+        unsafe { cuEventRecord(event as CUevent, stream as CUstream) };
     }
 
     // ------------------------------------------------------------------
@@ -1856,23 +1856,23 @@ pub(crate) mod inner {
     }
 
     pub unsafe fn cu_event_synchronize_raw(event: u64) -> CUresult {
-        cuEventSynchronize(event as CUevent)
+        unsafe { cuEventSynchronize(event as CUevent) }
     }
 
     pub unsafe fn cu_event_elapsed_time_raw(ms: *mut f32, start: u64, stop: u64) -> CUresult {
-        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent)
+        unsafe { cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent) }
     }
 
     pub unsafe fn cu_event_create_checked() -> Result<u64, CUresult> {
         let mut e: CUevent = std::ptr::null_mut();
-        let res = cuEventCreate(&mut e, 0);
+        let res = unsafe { cuEventCreate(&mut e, 0) };
         if res != CUresult::CUDA_SUCCESS { return Err(res); }
         Ok(e as u64)
     }
 
     pub unsafe fn cu_event_record_on_current_stream(event: u64) -> CUresult {
         super::graph_capture::taint("event record on compute stream");
-        cuEventRecord(event as CUevent, current_stream())
+        unsafe { cuEventRecord(event as CUevent, current_stream()) }
     }
 
     /// Elapsed time between two recorded events, in milliseconds.
@@ -1886,16 +1886,16 @@ pub(crate) mod inner {
     /// nobody was checking.
     #[must_use]
     pub unsafe fn cu_event_elapsed_time(ms: *mut f32, start: u64, stop: u64) -> CUresult {
-        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent)
+        unsafe { cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent) }
     }
 
     pub unsafe fn cu_event_destroy(event: u64) {
-        cuEventDestroy_v2(event as CUevent);
+        unsafe { cuEventDestroy_v2(event as CUevent) };
     }
 
     pub unsafe fn cu_ctx_synchronize() {
         super::graph_capture::taint("explicit ctx synchronize");
-        cuCtxSynchronize();
+        unsafe { cuCtxSynchronize() };
     }
 
     /// Launch a PTX kernel. `ptx_ptr` and `name_ptr` must point to null-terminated C strings.
@@ -3055,21 +3055,23 @@ pub(crate) mod cublas_inner {
                 )
             };
         }
-        cublas_result::sgemm(
-            handle,
-            op(transb), // cuBLAS's FIRST operand is B_row
-            op(transa), // ...and its SECOND is A_row
-            n as i32,
-            m as i32,
-            k as i32,
-            &alpha,
-            b_dev,
-            if transb { k as i32 } else { n as i32 }, // lda: B_row's stored row length
-            a_dev,
-            if transa { m as i32 } else { k as i32 }, // ldb: A_row's stored row length
-            &beta,
-            c_dev, n as i32,
-        )
+        unsafe {
+            cublas_result::sgemm(
+                handle,
+                op(transb), // cuBLAS's FIRST operand is B_row
+                op(transa), // ...and its SECOND is A_row
+                n as i32,
+                m as i32,
+                k as i32,
+                &alpha,
+                b_dev,
+                if transb { k as i32 } else { n as i32 }, // lda: B_row's stored row length
+                a_dev,
+                if transa { m as i32 } else { k as i32 }, // ldb: A_row's stored row length
+                &beta,
+                c_dev, n as i32,
+            )
+        }
     }
 
     /// Strided-batched row-major SGEMM: `C[i] = alpha * A[i] @ B[i] + beta * C[i]`
@@ -3309,19 +3311,21 @@ pub(crate) mod cublas_inner {
                 )
             };
         }
-        cublas_result::sgemm(
-            handle,
-            cublas_sys::cublasOperation_t::CUBLAS_OP_N, // G_cm, no transpose
-            cublas_sys::cublasOperation_t::CUBLAS_OP_T, // X_cm, transposed
-            d_out as i32,  // cublas m = rows of C_cm = o
-            d_in as i32,   // cublas n = cols of C_cm = d
-            n_rows as i32, // contraction dim = N
-            &alpha,
-            g_dev, d_out as i32,  // A := G_cm, lda = o
-            x_dev, d_in as i32,   // B := X_cm, ldb = d
-            &beta,
-            c_dev, d_out as i32,  // C := C_cm, ldc = o
-        )
+        unsafe {
+            cublas_result::sgemm(
+                handle,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N, // G_cm, no transpose
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T, // X_cm, transposed
+                d_out as i32,  // cublas m = rows of C_cm = o
+                d_in as i32,   // cublas n = cols of C_cm = d
+                n_rows as i32, // contraction dim = N
+                &alpha,
+                g_dev, d_out as i32,  // A := G_cm, lda = o
+                x_dev, d_in as i32,   // B := X_cm, ldb = d
+                &beta,
+                c_dev, d_out as i32,  // C := C_cm, ldc = o
+            )
+        }
     }
 
     /// Strided-batched SGEMM in RAW cuBLAS column-major terms (muon batched
@@ -6298,10 +6302,10 @@ pub fn cuda_device_name() -> Option<String> {
 unsafe fn device_marketing_name(device: cudarc::driver::sys::CUdevice) -> Option<String> {
     use cudarc::driver::sys::*;
     let mut buf = [0i8; 128];
-    if cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) != CUresult::CUDA_SUCCESS {
+    if unsafe { cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) } != CUresult::CUDA_SUCCESS {
         return None;
     }
-    let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
+    let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
     let mut name = cstr.to_str().ok()?.trim().to_string();
     for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
         if let Some(rest) = name.strip_prefix(prefix) {

@@ -112,7 +112,7 @@ pub unsafe extern "C" fn nsl_profile_flush(path_ptr: *const u8, path_len: usize)
     if path_ptr.is_null() {
         return 1;
     }
-    let bytes = std::slice::from_raw_parts(path_ptr, path_len);
+    let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
     let s = match std::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(_) => return 2,

@@ -49,7 +49,7 @@ fn get_tokenizer(handle: i64) -> &'static mut TokenizerKind {
 
 /// Read a C string pointer (i64) into a `&str`.
 unsafe fn cstr_to_str(ptr: i64) -> &'static str {
-    let cstr = CStr::from_ptr(ptr as *const c_char);
+    let cstr = unsafe { CStr::from_ptr(ptr as *const c_char) };
     cstr.to_str().unwrap_or("")
 }
 

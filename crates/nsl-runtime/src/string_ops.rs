@@ -4,7 +4,7 @@ use std::os::raw::c_char;
 use crate::memory::checked_alloc;
 
 unsafe fn as_cstr(ptr: i64) -> &'static CStr {
-    CStr::from_ptr(ptr as *const c_char)
+    unsafe { CStr::from_ptr(ptr as *const c_char) }
 }
 
 fn alloc_bytes(bytes: &[u8]) -> i64 {

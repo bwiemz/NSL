@@ -165,14 +165,14 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     if ptr.is_null() {
         return zero_stats();
     }
-    let t = &*ptr;
+    let t = unsafe { &*ptr };
     let ndim = t.ndim as u8;
     let dtype = t.dtype as u8;
     let device = t.device;
     let mut shape = [0u32; 4];
     let dims = std::cmp::min(t.ndim as usize, 4);
     for (i, s) in shape.iter_mut().enumerate().take(dims) {
-        *s = *t.shape.add(i) as u32;
+        *s = unsafe { *t.shape.add(i) } as u32;
     }
 
     let len = t.len as usize;
@@ -229,12 +229,12 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     // CPU f32 tensors (dtype 1).
     if dtype == 1 {
         let data = t.data as *const f32;
-        let first = *data;
+        let first = unsafe { *data };
         let mut min_val = first;
         let mut max_val = first;
         let mut sum = 0.0_f64;
         for i in 0..len {
-            let v = *data.add(i);
+            let v = unsafe { *data.add(i) };
             if v < min_val { min_val = v; }
             if v > max_val { max_val = v; }
             sum += v as f64;
@@ -242,7 +242,7 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
         let mean_val = sum / len as f64;
         let mut var_sum = 0.0_f64;
         for i in 0..len {
-            let diff = *data.add(i) as f64 - mean_val;
+            let diff = unsafe { *data.add(i) } as f64 - mean_val;
             var_sum += diff * diff;
         }
         let std_val = (var_sum / len as f64).sqrt();
@@ -254,12 +254,12 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
 
     // CPU f64 path (dtype 0).
     let data = t.data as *const f64;
-    let first = *data;
+    let first = unsafe { *data };
     let mut min_val = first;
     let mut max_val = first;
     let mut sum = 0.0_f64;
     for i in 0..len {
-        let v = *data.add(i);
+        let v = unsafe { *data.add(i) };
         if v < min_val {
             min_val = v;
         }
@@ -273,7 +273,7 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     // Standard deviation (population).
     let mut var_sum = 0.0_f64;
     for i in 0..len {
-        let diff = *data.add(i) - mean_val;
+        let diff = unsafe { *data.add(i) } - mean_val;
         var_sum += diff * diff;
     }
     let std_val = (var_sum / len as f64).sqrt();

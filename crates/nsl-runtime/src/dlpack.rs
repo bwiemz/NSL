@@ -186,17 +186,17 @@ unsafe extern "C" fn nsl_dlpack_deleter(managed: *mut DLManagedTensor) {
     if managed.is_null() {
         return;
     }
-    (*managed).deleter = None;
-    let ctx_ptr = (*managed).manager_ctx as *mut ExportContext;
-    (*managed).manager_ctx = std::ptr::null_mut();
+    unsafe { (*managed).deleter = None };
+    let ctx_ptr = unsafe { (*managed).manager_ctx } as *mut ExportContext;
+    unsafe { (*managed).manager_ctx = std::ptr::null_mut() };
     if !ctx_ptr.is_null() {
-        let ctx = Box::from_raw(ctx_ptr);
+        let ctx = unsafe { Box::from_raw(ctx_ptr) };
         if ctx.owned && ctx.nsl_tensor_ptr != 0 {
             crate::tensor::nsl_tensor_free(ctx.nsl_tensor_ptr);
         }
         drop(ctx);
     }
-    drop(Box::from_raw(managed));
+    drop(unsafe { Box::from_raw(managed) });
 }
 
 /// Shared builder for both export modes. Returns null if the tensor's dtype

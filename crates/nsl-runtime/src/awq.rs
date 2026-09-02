@@ -172,9 +172,9 @@ pub unsafe fn awq_free_packed(packed: &AwqPackedWeight) {
     let k = packed.k as usize;
     let n = packed.n as usize;
     let num_groups = packed.num_groups as usize;
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.data, (k * n).div_ceil(2)));
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.scales, num_groups * n));
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.zeros, num_groups * n));
+    let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.data, (k * n).div_ceil(2))) };
+    let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.scales, num_groups * n)) };
+    let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.zeros, num_groups * n)) };
 }
 
 // ---------------------------------------------------------------------------

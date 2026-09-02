@@ -14,7 +14,7 @@ use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
 
 /// Convert a (ptr, len) pair from the NSL ABI into a Rust `String`.
 unsafe fn str_from_ptr_len(ptr: i64, len: i64) -> String {
-    let slice = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
     String::from_utf8_lossy(slice).into_owned()
 }
 

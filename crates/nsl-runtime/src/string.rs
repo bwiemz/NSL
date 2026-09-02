@@ -6,7 +6,7 @@ use crate::memory::checked_alloc;
 
 /// Helper: convert i64 pointer to &CStr
 unsafe fn as_cstr(ptr: i64) -> &'static CStr {
-    CStr::from_ptr(ptr as *const c_char)
+    unsafe { CStr::from_ptr(ptr as *const c_char) }
 }
 
 /// Helper: allocate a C string copy

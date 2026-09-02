@@ -62,7 +62,7 @@ pub unsafe extern "C" fn nsl_set_exec_fingerprint(ptr: *const u8, len: i64) -> i
     if ptr.is_null() || len <= 0 {
         return 0;
     }
-    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let Ok(s) = std::str::from_utf8(bytes) else {
         return 0;
     };
