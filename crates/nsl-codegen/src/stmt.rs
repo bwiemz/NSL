@@ -15,6 +15,7 @@ use crate::compiler::Compiler;
 use crate::context::{FuncState, LoopContext};
 use crate::error::CodegenError;
 use crate::stmt_csla::{emit_csla_accum_alloc, emit_csla_group_update, MuonCslaCtx};
+use crate::stmt_train::teardown::{emit_train_teardown, TrainTeardown};
 use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
 use cranelift_codegen::ir::Value;
 
@@ -16922,189 +16923,25 @@ sched={sched_s}",
         builder.seal_block(exit_block);
         state.current_block = Some(exit_block);
 
-        // Free param_list after training loop completes
-        self.compile_call_by_name(builder, "nsl_list_free", &[param_list])?;
-
-        // Free optimizer state buffers (runtime lists of momentum/velocity tensors)
-        // Runtime loop: free each tensor in state_list_1 and state_list_2
-        {
-            let free_i_var = state.new_variable();
-            builder.declare_var(free_i_var, cl_types::I64);
-            let f_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(free_i_var, f_zero);
-            let f_header = builder.create_block();
-            let f_body = builder.create_block();
-            let f_exit = builder.create_block();
-            builder.ins().jump(f_header, &[]);
-            builder.switch_to_block(f_header);
-            let fi = builder.use_var(free_i_var);
-            let fc = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, fi, num_params_val);
-            builder.ins().brif(fc, f_body, &[], f_exit, &[]);
-            builder.switch_to_block(f_body);
-            builder.seal_block(f_body);
-            let buf1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, fi])?;
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[buf1])?;
-            if num_state_buffers >= 2 {
-                let buf2 =
-                    self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, fi])?;
-                self.compile_call_by_name(builder, "nsl_tensor_free", &[buf2])?;
-            }
-            let f_one = builder.ins().iconst(cl_types::I64, 1);
-            let f_next = builder.ins().iadd(fi, f_one);
-            builder.def_var(free_i_var, f_next);
-            builder.ins().jump(f_header, &[]);
-            builder.seal_block(f_header);
-            builder.switch_to_block(f_exit);
-            builder.seal_block(f_exit);
-            state.current_block = Some(f_exit);
-        }
-        self.compile_call_by_name(builder, "nsl_list_free", &[state_list_1])?;
-        if num_state_buffers >= 2 {
-            self.compile_call_by_name(builder, "nsl_list_free", &[state_list_2])?;
-        }
-        // Item C: the deferred-fill latch (1 slot, no tensors).
-        if let Some(latch) = moment_fill_latch {
-            self.compile_call_by_name(builder, "nsl_list_free", &[latch])?;
-        }
-
-        // Free gradient accumulation buffers (if allocated) — runtime loop.
-        // CSLA (D1b): slots are NULL between windows (each window allocates
-        // its accumulators fresh and frees them after its group updates;
-        // the partial tail never allocates), so only the shell needs
-        // freeing — the per-slot loop would nsl_tensor_free(0).
-        if let Some(accum) = accum_list.filter(|_| csla_active) {
-            self.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
-        } else if let Some(accum) = accum_list {
-            let fa_i_var = state.new_variable();
-            builder.declare_var(fa_i_var, cl_types::I64);
-            let fa_z = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(fa_i_var, fa_z);
-            let fa_hdr = builder.create_block();
-            let fa_body = builder.create_block();
-            let fa_exit = builder.create_block();
-            builder.ins().jump(fa_hdr, &[]);
-            builder.switch_to_block(fa_hdr);
-            let fai = builder.use_var(fa_i_var);
-            let fac = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, fai, num_params_val);
-            builder.ins().brif(fac, fa_body, &[], fa_exit, &[]);
-            builder.switch_to_block(fa_body);
-            builder.seal_block(fa_body);
-            let buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, fai])?;
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
-            let fa_one = builder.ins().iconst(cl_types::I64, 1);
-            let fa_next = builder.ins().iadd(fai, fa_one);
-            builder.def_var(fa_i_var, fa_next);
-            builder.ins().jump(fa_hdr, &[]);
-            builder.seal_block(fa_hdr);
-            builder.switch_to_block(fa_exit);
-            builder.seal_block(fa_exit);
-            state.current_block = Some(fa_exit);
-            self.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
-        }
-
-        // CSLA: sweep the trailing partial window. A window that never
-        // reached the modulo boundary left its buffered saves + batch dicts
-        // alive (the baseline discards the same tail's m_partial content —
-        // its gradients never influence θ either way, so parity holds; this
-        // sweep is purely against leaks). Every entry here is stale: its
-        // iteration's callbacks are long done, so loss slots free
-        // unconditionally too.
-        if let (Some((saves_outer_var, dicts_var)), Some(sweep)) =
-            (csla_buffers, &csla_teardown_slots)
-        {
-            let so = builder.use_var(saves_outer_var);
-            let tail_len = self.compile_call_by_name(builder, "nsl_list_len", &[so])?;
-            let sw_i_var = state.new_variable();
-            builder.declare_var(sw_i_var, cl_types::I64);
-            let sw_z = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(sw_i_var, sw_z);
-            let sw_hdr = builder.create_block();
-            let sw_body = builder.create_block();
-            let sw_exit = builder.create_block();
-            builder.ins().jump(sw_hdr, &[]);
-            builder.switch_to_block(sw_hdr);
-            let swi = builder.use_var(sw_i_var);
-            let swc = builder.ins().icmp(IntCC::SignedLessThan, swi, tail_len);
-            builder.ins().brif(swc, sw_body, &[], sw_exit, &[]);
-            builder.switch_to_block(sw_body);
-            builder.seal_block(sw_body);
-            let inner = self.compile_call_by_name(builder, "nsl_list_get", &[so, swi])?;
-            for (idx, free_fn) in sweep {
-                let idx_val = builder.ins().iconst(cl_types::I64, *idx);
-                let slot_val =
-                    self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
-                self.compile_call_by_name(builder, free_fn, &[slot_val])?;
-            }
-            self.compile_call_by_name(builder, "nsl_list_free", &[inner])?;
-            let sw_one = builder.ins().iconst(cl_types::I64, 1);
-            let sw_next = builder.ins().iadd(swi, sw_one);
-            builder.def_var(sw_i_var, sw_next);
-            builder.ins().jump(sw_hdr, &[]);
-            builder.seal_block(sw_hdr);
-            builder.switch_to_block(sw_exit);
-            builder.seal_block(sw_exit);
-            state.current_block = Some(sw_exit);
-            self.compile_call_by_name(builder, "nsl_list_free", &[so])?;
-
-            // Tail batch dicts: nsl_dict_free_tensor_values destroys the
-            // whole dict structure (values + shell, free_dict_impl(_, true))
-            // — the same call the baseline makes per iteration; the
-            // DataLoader teardown never touches popped dicts.
-            let dl = builder.use_var(dicts_var);
-            let dl_len = self.compile_call_by_name(builder, "nsl_list_len", &[dl])?;
-            let dw_i_var = state.new_variable();
-            builder.declare_var(dw_i_var, cl_types::I64);
-            let dw_z = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(dw_i_var, dw_z);
-            let dw_hdr = builder.create_block();
-            let dw_body = builder.create_block();
-            let dw_exit = builder.create_block();
-            builder.ins().jump(dw_hdr, &[]);
-            builder.switch_to_block(dw_hdr);
-            let dwi = builder.use_var(dw_i_var);
-            let dwc = builder.ins().icmp(IntCC::SignedLessThan, dwi, dl_len);
-            builder.ins().brif(dwc, dw_body, &[], dw_exit, &[]);
-            builder.switch_to_block(dw_body);
-            builder.seal_block(dw_body);
-            let tail_dict = self.compile_call_by_name(builder, "nsl_list_get", &[dl, dwi])?;
-            self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[tail_dict])?;
-            let dw_one = builder.ins().iconst(cl_types::I64, 1);
-            let dw_next = builder.ins().iadd(dwi, dw_one);
-            builder.def_var(dw_i_var, dw_next);
-            builder.ins().jump(dw_hdr, &[]);
-            builder.seal_block(dw_hdr);
-            builder.switch_to_block(dw_exit);
-            builder.seal_block(dw_exit);
-            state.current_block = Some(dw_exit);
-            self.compile_call_by_name(builder, "nsl_list_free", &[dl])?;
-        }
-
-        // D2b part 2: LOAD-BEARING — under whole-loop streaming every
-        // streamed param exits the training loop EVICTED (the forward
-        // evicts after its last primal touch each micro-batch and there is
-        // no post-epilogue restore), so this teardown is the SOLE restore
-        // of device residency for model_save/eval, plus the pinned-mirror
-        // release. Removing or reordering it after any θ reader crashes on
-        // null data pointers.
-        if csla_active && self.compile_options.weight_stream {
-            self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
-            // Item 3: drop this block's declared plan in the same breath.
-            // The residency tables are cleared above, so leaving the plan
-            // behind would make a SECOND train block in the same program
-            // verify its predecessor's (now unregistered, possibly freed)
-            // pointers and abort on a mismatch that is really just staleness.
-            self.compile_call_by_name(builder, "nsl_param_plan_teardown", &[])?;
-        }
-
-        // P5 item 19: capture/replay counter banner (anti-vacuity evidence
-        // for the gates; harmless no-op when the runtime declined to arm).
-        if self.compile_options.cuda_graphs {
-            self.compile_call_by_name(builder, "nsl_cuda_graphs_report", &[])?;
-        }
+        // Free the block's lists, sweep the trailing CSLA window, restore
+        // streamed weights, print the graphs banner (stmt_train/teardown.rs).
+        emit_train_teardown(
+            self,
+            builder,
+            state,
+            TrainTeardown {
+                param_list,
+                num_params_val,
+                state_list_1,
+                state_list_2,
+                num_state_buffers,
+                moment_fill_latch,
+                accum_list,
+                csla_active,
+                csla_buffers,
+                csla_teardown_slots,
+            },
+        )?;
 
         state.variables = saved_variables;
         state.variable_types = saved_variable_types;
