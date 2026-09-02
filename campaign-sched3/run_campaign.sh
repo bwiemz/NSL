@@ -4,8 +4,8 @@ set -uo pipefail
 C="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$C/campaign.log"
 say() { echo "[$(date '+%F %H:%M:%S')] $*" | tee -a "$LOG"; }
-say "SCHED3 CAMPAIGN START — arms A,B,C from the 262M branch, 32,000 micro each"
-for ARM in A B C; do
+say "SCHED3 CAMPAIGN START — arms ${ARMS:-A B C} from the 262M branch, 32,000 micro each"
+for ARM in ${ARMS:-A B C}; do
   say "=== ARM $ARM starting ==="
   bash "$C/snap_lineage.sh" "$ARM" &
   SNAPPID=$!
