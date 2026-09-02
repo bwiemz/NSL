@@ -112,7 +112,13 @@ PASS_SOURCES=(
 )
 # Phrases that assert absence. Matched case-insensitively on the same line as
 # the pass label, or on the 3 lines following it (docs put the claim under the
-# heading).
+# heading) — except that when the label sits on a table row (`|…`), the
+# following rows are other entries, not the claim under a heading. The
+# generated CLI-Reference.md has flag rows that mention a pass (`--wrga-ablate`,
+# `--weights` "… CPDT path", `--cep-emit-source`) within three rows of the
+# `--allow-unknown-decorators` row ("… unimplemented decorators …"), and
+# that is not a claim about the pass. A heading followed by a status table
+# is still read.
 ABSENCE_RE='no implementation|not implemented|unimplemented|no implementation file|planned future pass|does not exist yet'
 
 for row in "${PASS_SOURCES[@]}"; do
@@ -126,8 +132,16 @@ for row in "${PASS_SOURCES[@]}"; do
   fi
   hit=0
   for doc in "${DOCS[@]}"; do
+    # `grep -n` marks a matching line `N:` and a context line `N-`. The awk
+    # drops a context line that is a table row when the match it follows is
+    # one too. The last grep writes to /dev/null rather than `-q`: under
+    # `pipefail`, `-q` exiting on the first hit can SIGPIPE the upstream and
+    # turn a real hit into a false pass.
     if grep -n -A 3 -E "(^|[^A-Za-z])${label}([^A-Za-z]|$)" "${doc}" 2>/dev/null \
-        | grep -qiE "${ABSENCE_RE}"; then
+        | awk '/^[0-9]+:/ { row = ($0 ~ /^[0-9]+:[ \t]*\|/); print; next }
+               /^[0-9]+-/ { if (row && $0 ~ /^[0-9]+-[ \t]*\|/) next; print; next }
+               { print }' \
+        | grep -iE "${ABSENCE_RE}" > /dev/null; then
       err "${doc}: asserts ${label} is unimplemented, but ${src} exists"
       hit=1
     fi

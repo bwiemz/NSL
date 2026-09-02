@@ -275,6 +275,22 @@ pub(crate) enum Cli {
         #[command(subcommand)]
         cmd: EnvCmd,
     },
+
+    /// Generated reference documentation: the CLI reference page.
+    Doc {
+        #[command(subcommand)]
+        cmd: DocCmd,
+    },
+}
+
+/// `nsl doc` subcommands (roadmap Doc2: reference pages rendered from the
+/// source of truth, gated against the checked-in copy).
+#[derive(clap::Subcommand)]
+pub(crate) enum DocCmd {
+    /// Emit the Markdown CLI reference that docs/wiki/CLI-Reference.md is
+    /// generated from: every subcommand with its positionals and flags,
+    /// in the words of `nsl <command> --help`.
+    Cli,
 }
 
 /// `nsl env` subcommands (roadmap A5: the env-var registry in `nsl-env`).
@@ -527,10 +543,10 @@ pub(crate) struct CheckArgs {
         pub(crate) allow_inert_requests: bool,
 
         /// Milestone A escape hatch: demote UNKNOWN-decorator-name errors to
-        /// warnings (one release, for migration). Documented-but-
-        /// unimplemented decorators (e.g. @tie_weights) stay hard errors —
-        /// accepting those would resurrect the silence this flag's namespace
-        /// close exists to end.
+        /// warnings (one release, for migration).
+        /// Documented-but-unimplemented decorators (e.g. @tie_weights) stay
+        /// hard errors — accepting those would resurrect the silence this
+        /// flag's namespace close exists to end.
         #[arg(long)]
         pub(crate) allow_unknown_decorators: bool,
 }
@@ -1163,9 +1179,13 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "N", default_value_t = 512)]
         pub(crate) calibration_samples: u32,
 
+        /// Calibration batch size: samples per harness forward pass
+        /// (default 8; must be > 0).
         #[arg(long, value_name = "N", default_value_t = 8)]
         pub(crate) calibration_batch_size: u32,
 
+        /// Wall-clock limit for the calibration run, in seconds (default
+        /// 600; must be > 0).
         #[arg(long, value_name = "SECONDS", default_value_t = 600)]
         pub(crate) calibration_timeout: u64,
 
@@ -1206,10 +1226,10 @@ pub(crate) struct BuildArgs {
         pub(crate) allow_inert_requests: bool,
 
         /// Milestone A escape hatch: demote UNKNOWN-decorator-name errors to
-        /// warnings (one release, for migration). Documented-but-
-        /// unimplemented decorators (e.g. @tie_weights) stay hard errors —
-        /// accepting those would resurrect the silence this flag's namespace
-        /// close exists to end.
+        /// warnings (one release, for migration).
+        /// Documented-but-unimplemented decorators (e.g. @tie_weights) stay
+        /// hard errors — accepting those would resurrect the silence this
+        /// flag's namespace close exists to end.
         #[arg(long)]
         pub(crate) allow_unknown_decorators: bool,
 }
@@ -1730,10 +1750,10 @@ pub(crate) struct RunArgs {
         pub(crate) allow_inert_requests: bool,
 
         /// Milestone A escape hatch: demote UNKNOWN-decorator-name errors to
-        /// warnings (one release, for migration). Documented-but-
-        /// unimplemented decorators (e.g. @tie_weights) stay hard errors —
-        /// accepting those would resurrect the silence this flag's namespace
-        /// close exists to end.
+        /// warnings (one release, for migration).
+        /// Documented-but-unimplemented decorators (e.g. @tie_weights) stay
+        /// hard errors — accepting those would resurrect the silence this
+        /// flag's namespace close exists to end.
         #[arg(long)]
         pub(crate) allow_unknown_decorators: bool,
 

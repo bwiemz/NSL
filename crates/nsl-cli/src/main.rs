@@ -1,6 +1,7 @@
 mod activation_enforce;
 mod args;
 mod ast_scan;
+mod cli_reference;
 mod commands;
 mod debug;
 mod formatter;
@@ -15,7 +16,7 @@ use std::process;
 
 use clap::Parser as ClapParser;
 
-use crate::args::Cli;
+use crate::args::{Cli, DocCmd};
 
 /// Scan a parsed module for a top-level `train { ... }` block.
 ///
@@ -150,6 +151,10 @@ fn main_inner() {
         }
         Cli::Env { cmd } => {
             commands::env::run(cmd);
+        }
+        Cli::Doc { cmd: DocCmd::Cli } => {
+            use clap::CommandFactory as _;
+            print!("{}", cli_reference::render_markdown(&Cli::command()));
         }
     }
 }
