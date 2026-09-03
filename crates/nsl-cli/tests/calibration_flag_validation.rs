@@ -70,3 +70,38 @@ fn samples_zero_errors() {
     assert_ne!(code, 0);
     assert!(e.contains("calibration-samples"), "stderr: {e}");
 }
+
+/// `--calibration-data` is accepted and then IGNORED: the harness lives in
+/// `nsl_codegen::compile_and_calibrate`, which no CLI path calls, so the
+/// corpus is validated and dropped. Until the wiring lands that has to be
+/// LOUD -- accepting a corpus and silently discarding it is the one behaviour
+/// with no defence, and it is what let the gap survive from 2026-05-10 to
+/// 2026-09-01.
+///
+/// Paired with `--calibration-samples 0`, which is rejected immediately after
+/// the calibration-data block, so this pins the warning without compiling.
+#[test]
+fn calibration_data_warns_that_it_is_not_consumed() {
+    let dir = std::env::temp_dir().join(format!("nsl_calibwarn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let corpus = dir.join("c.bin");
+    std::fs::write(&corpus, b"NSLB").expect("write corpus");
+
+    let (_o, e, code) = run(&[
+        "--calibration-data",
+        corpus.to_str().expect("utf-8 path"),
+        "--calibration-samples",
+        "0",
+    ]);
+
+    assert_ne!(code, 0, "the samples=0 refusal still has to fire: {e}");
+    assert!(
+        e.contains("NOT consumed by `nsl build`"),
+        "a supplied calibration corpus must say it is ignored:\n{e}"
+    );
+    assert!(
+        e.contains(corpus.to_str().expect("utf-8 path")),
+        "the warning must name the corpus it is discarding:\n{e}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
