@@ -1,6 +1,6 @@
 //! Workspace-level ABI gate: the codegen's declared runtime-function
 //! signatures — every `const RUNTIME_FUNCTIONS*` under `nsl-codegen/src`,
-//! today a single table in `builtins.rs` — must agree with the runtime's
+//! spread over `builtins/` and `runtime_abi/` — must agree with the runtime's
 //! `extern "C"` implementations. These are linked by symbol name only, so
 //! nothing else in the build catches a drift; this test does.
 
