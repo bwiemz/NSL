@@ -1552,7 +1552,23 @@ impl Compiler<'_> {
         // Step 1: Get role from env var via FFI (returns 0=router, 1=prefill, 2=decode)
         let role = self.compile_call_by_name(builder, "nsl_disagg_get_role", &[])?;
 
-        let speculative_config = self.features.speculative_configs.values().next();
+        // ONE worker config slot, so exactly one @speculative configuration can
+        // be represented. `values().next()` picked an arbitrary HashMap entry:
+        // two differing decorators baked whichever the hash seed happened to
+        // yield, differently from build to build. Refuse instead.
+        let speculative_config = crate::speculative::unique_worker_config(
+            &self.features.speculative_configs,
+        )
+        .map_err(|keys| {
+            CodegenError::new(format!(
+                "a disaggregated `serve` block carries {} differing `@speculative` \
+                 configurations ({}), but a worker config slot holds exactly one. \
+                 Give the speculative layers matching decorator arguments, or move \
+                 all but one out of the served model.",
+                keys.len(),
+                keys.join(", ")
+            ))
+        })?;
         let speculative_tokens = speculative_config
             .map(|info| info.num_tokens as i64)
             .unwrap_or(0);
