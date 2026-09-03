@@ -17,7 +17,7 @@ pub enum SpeculativeMethod {
     Lookahead,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpeculativeInfo {
     pub method: SpeculativeMethod,
     pub draft_model: Option<String>,
@@ -140,6 +140,40 @@ pub fn extract_speculative_decorator<'a>(
     None
 }
 
+/// The single `@speculative` configuration a disaggregated worker slot can
+/// carry, or `Err` with the conflicting keys when the program declares more
+/// than one distinct configuration.
+///
+/// `compile_disaggregated_serve` builds ONE `WorkerConfigSpec` -- four scalars
+/// baked into the emitted binary -- so it can represent exactly one
+/// configuration. It used to choose with `configs.values().next()`, which picks
+/// an arbitrary entry of a `HashMap`: with two differing `@speculative` layers
+/// the compiler silently baked one of them, and which one changed from build to
+/// build with the hash seed. Two compilations of identical source could emit
+/// different decode behaviour.
+///
+/// Identical duplicates are NOT a conflict -- several layers may carry the same
+/// decorator, and the worker can represent that faithfully. Only a genuine
+/// disagreement is refused, because there is no answer the slot can hold.
+///
+/// The call-site path uses `moe::resolve_decorator_config_for_call_site`, which
+/// scopes by model name; a serve block has no such context, so this is the
+/// stricter rule rather than a different one.
+pub(crate) fn unique_worker_config(
+    configs: &std::collections::HashMap<String, SpeculativeInfo>,
+) -> Result<Option<&SpeculativeInfo>, Vec<String>> {
+    let mut it = configs.iter();
+    let Some((_, first)) = it.next() else {
+        return Ok(None);
+    };
+    if it.any(|(_, info)| info != first) {
+        let mut keys: Vec<String> = configs.keys().cloned().collect();
+        keys.sort();
+        return Err(keys);
+    }
+    Ok(Some(first))
+}
+
 /// Compile-time info about Medusa multi-head speculation.
 #[derive(Debug, Clone)]
 pub struct MedusaInfo {
@@ -216,5 +250,76 @@ mod tests {
         assert_eq!(info.num_tokens, 5);
         assert_eq!(info.method, SpeculativeMethod::Draft);
         assert!(!info.medusa);
+    }
+
+    fn info(num_tokens: usize, tree_width: usize) -> SpeculativeInfo {
+        SpeculativeInfo {
+            method: SpeculativeMethod::Draft,
+            draft_model: None,
+            num_tokens,
+            temperature: 0.0,
+            tree_width,
+            token_budget: 0,
+            expansion_k: 0,
+            ngram_size: 0,
+            lookahead_window: 0,
+            medusa: false,
+        }
+    }
+
+    fn map(entries: &[(&str, SpeculativeInfo)]) -> std::collections::HashMap<String, SpeculativeInfo> {
+        entries.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn no_speculative_layers_means_no_worker_config() {
+        assert_eq!(unique_worker_config(&map(&[])), Ok(None));
+    }
+
+    #[test]
+    fn a_single_layer_is_the_worker_config() {
+        let m = map(&[("M.draft", info(5, 4))]);
+        assert_eq!(unique_worker_config(&m), Ok(Some(&info(5, 4))));
+    }
+
+    /// Several layers carrying the SAME decorator are not a conflict: the slot
+    /// can represent that faithfully. Ten identical entries also exercise the
+    /// determinism claim -- with `values().next()` the answer was whichever
+    /// entry the hash seed surfaced, so a test like this could only ever assert
+    /// "some entry".
+    #[test]
+    fn identical_duplicates_are_not_a_conflict() {
+        let m = map(&[
+            ("M.a", info(3, 2)),
+            ("M.b", info(3, 2)),
+            ("M.c", info(3, 2)),
+        ]);
+        assert_eq!(unique_worker_config(&m), Ok(Some(&info(3, 2))));
+    }
+
+    /// THE BUG. Two differing decorators used to bake an arbitrary one of them,
+    /// chosen by HashMap iteration order, so two builds of identical source
+    /// could emit different decode behaviour. The keys come back SORTED so the
+    /// diagnostic is stable too.
+    #[test]
+    fn differing_configs_are_refused_with_sorted_keys() {
+        let m = map(&[("M.b", info(5, 4)), ("M.a", info(3, 2))]);
+        assert_eq!(
+            unique_worker_config(&m),
+            Err(vec!["M.a".to_string(), "M.b".to_string()])
+        );
+    }
+
+    /// A difference in ANY field is a difference -- not just the two the old
+    /// code happened to read first.
+    #[test]
+    fn a_difference_in_one_field_is_enough() {
+        let mut other = info(5, 4);
+        other.method = SpeculativeMethod::Eagle2;
+        assert!(unique_worker_config(&map(&[("M.a", info(5, 4)), ("M.b", other)])).is_err());
+
+        let mut temp = info(5, 4);
+        temp.temperature = 0.7;
+        assert!(unique_worker_config(&map(&[("M.a", info(5, 4)), ("M.b", temp)])).is_err());
     }
 }
