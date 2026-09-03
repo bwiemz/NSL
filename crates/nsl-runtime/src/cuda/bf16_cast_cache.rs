@@ -285,7 +285,14 @@ pub(crate) fn stats() -> (u64, u64, u64) {
 
 /// Test-only reset: drop every entry and image, clear counters, disarm the
 /// fast path. Lets gates in one process not see each other's registrations.
-#[cfg(any(test, feature = "test-hooks"))]
+// Gated on `test-hooks` ALONE, matching the two callers in `cuda/mod.rs`
+// (`#[cfg(all(feature = "cuda", feature = "test-hooks"))]`). It used to read
+// `any(test, feature = "test-hooks")`, which is a WIDER condition than its
+// use: `cargo test --features cuda` (no test-hooks) compiled the function --
+// `test` is on for a lib-test build -- but not the callers, so #588's
+// `dead_code = deny` failed the "CUDA feature" CI job on main. The module is
+// already `#[cfg(feature = "cuda")]`, so that axis needs no repeating here.
+#[cfg(feature = "test-hooks")]
 pub(crate) fn reset_for_test() {
     let drained: Vec<Entry> = {
         let mut map = CACHE.lock().unwrap();
