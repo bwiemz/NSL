@@ -3377,6 +3377,46 @@ pub fn declare_runtime_functions(
 mod tests {
     use super::RUNTIME_FUNCTIONS;
 
+    /// No runtime function may be declared twice.
+    ///
+    /// `declare_runtime_functions` calls `Module::declare_function` once per
+    /// entry; Cranelift accepts a repeat declaration when the signature is
+    /// identical, so a duplicate is invisible at build time — and a duplicate
+    /// whose signatures DISAGREE surfaces far from the edit that caused it.
+    /// This keeps the table a set, which is what makes it safe to regroup.
+    ///
+    /// Declaration ORDER, by contrast, does not reach the CLIF: emitted CLIF
+    /// names its runtime callees (`fn0 = nsl_alloc`) and numbers funcrefs per
+    /// function by order of first use, so the global `FuncId` never appears.
+    /// Verified by moving `nsl_alloc` — a callee the snapshots do reference —
+    /// from index 6 to index 0: all 26 `train_clif_snapshots` stayed
+    /// byte-identical. The table may therefore be regrouped by domain freely.
+    ///
+    /// It does reach the OBJECT FILE, though: `cranelift-object` calls
+    /// `add_symbol` eagerly from `declare_function`, including for
+    /// `Linkage::Import`, so every runtime symbol lands in the emitted `.o`
+    /// symbol table in table order whether it is referenced or not. Nothing
+    /// checked in depends on that today — no `.o`/`.a` goldens exist — but a
+    /// future byte-identity gate over object output would need regenerating
+    /// after a regrouping.
+    #[test]
+    fn no_runtime_function_is_declared_twice() {
+        let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+        for (name, _, _) in RUNTIME_FUNCTIONS {
+            *seen.entry(*name).or_default() += 1;
+        }
+        let dupes: Vec<String> = seen
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(name, n)| format!("{name} ({n}x)"))
+            .collect();
+        assert!(
+            dupes.is_empty(),
+            "runtime function(s) declared more than once: {}",
+            dupes.join(", ")
+        );
+    }
+
     #[test]
     fn precision_cast_ops_have_signatures() {
         let names: Vec<&str> = RUNTIME_FUNCTIONS.iter().map(|(n, _, _)| *n).collect();
