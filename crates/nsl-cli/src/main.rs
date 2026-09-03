@@ -6,6 +6,7 @@ mod commands;
 mod debug;
 mod formatter;
 mod loader;
+mod matmul_args;
 mod meta_flags;
 mod pipeline;
 mod mangling;

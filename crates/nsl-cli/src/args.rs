@@ -736,54 +736,9 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) deterministic: bool,
 
-        /// Matmul arithmetic for high-intensity GEMMs: tf32 (default), bf16, f32.
-        ///
-        /// Replaces NSL_MATMUL_BF16. Unlike the environment variable this reaches
-        /// the EXECUTION FINGERPRINT, so a checkpoint records which arithmetic
-        /// produced it and a resume refuses a silent switch. The fingerprint's
-        /// `dtype` key does NOT carry this: it is the model dtype and reads
-        /// `bf16` whatever the GEMMs actually do.
-        #[arg(long, value_name = "MODE", default_value = "tf32")]
-        pub(crate) matmul_mode: String,
-
-        /// Rounding for the bf16 operand cast: rne (default) or sr.
-        /// Replaces NSL_MATMUL_BF16_ROUND. SR re-dithers per launch, which blocks
-        /// CUDA graph capture and is incompatible with --bf16-cast-cache.
-        #[arg(long, value_name = "MODE", default_value = "rne")]
-        pub(crate) bf16_rounding: String,
-
-        /// Minimum arithmetic intensity mnk/(a+b elements) for a GEMM to take the
-        /// bf16 path. Replaces NSL_MATMUL_BF16_MIN_RATIO. ARITHMETIC: it decides
-        /// WHICH matmuls are reduced precision.
-        #[arg(long, value_name = "RATIO", default_value_t = 512.0)]
-        pub(crate) bf16_min_ratio: f64,
-
-        /// Cache the weight operand's bf16 cast across GEMMs. Replaces
-        /// NSL_MATMUL_BF16_CAST_CACHE. Bit-preserving, so a resume only warns --
-        /// but it costs ~2 GiB of pinned VRAM at 1B, so enabling it on a resume
-        /// can OOM a run that previously fit.
-        #[arg(long)]
-        pub(crate) bf16_cast_cache: bool,
-
-        /// Issue bf16-storage GEMMs through cuBLASLt heuristics rather than
-        /// GemmEx. Replaces NSL_MATMUL_BF16_LT. Changes kernel and reduction
-        /// order, so it is arithmetic-class for resume.
-        #[arg(long)]
-        pub(crate) bf16_lt: bool,
-
-        /// Workspace cap in MiB for the cuBLASLt heuristic (clamped to 4096).
-        /// Replaces NSL_MATMUL_BF16_LT_WORKSPACE_MIB. ARITHMETIC: the cap FILTERS
-        /// candidate kernels, so a smaller value excludes split-k and wide-tile
-        /// algorithms and changes the reduction order.
-        #[arg(long, value_name = "MIB", default_value_t = 64)]
-        pub(crate) bf16_lt_workspace_mib: u32,
-
-        /// Disable cuBLASLt timed first-use plan selection. Replaces
-        /// NSL_MATMUL_BF16_LT_TUNE=0. With tuning ON (the default) the winner
-        /// depends on live machine state, so plan choice is NOT reproducible
-        /// across processes.
-        #[arg(long)]
-        pub(crate) no_bf16_lt_tune: bool,
+        /// Matmul arithmetic: --matmul-mode and the --bf16-* family.
+        #[command(flatten)]
+        pub(crate) matmul: crate::matmul_args::MatmulArgs,
 
         /// P0 certification: RNG seed for randn/rand/stochastic ops (see
         /// `run --seed`).
@@ -1399,54 +1354,9 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) deterministic: bool,
 
-        /// Matmul arithmetic for high-intensity GEMMs: tf32 (default), bf16, f32.
-        ///
-        /// Replaces NSL_MATMUL_BF16. Unlike the environment variable this reaches
-        /// the EXECUTION FINGERPRINT, so a checkpoint records which arithmetic
-        /// produced it and a resume refuses a silent switch. The fingerprint's
-        /// `dtype` key does NOT carry this: it is the model dtype and reads
-        /// `bf16` whatever the GEMMs actually do.
-        #[arg(long, value_name = "MODE", default_value = "tf32")]
-        pub(crate) matmul_mode: String,
-
-        /// Rounding for the bf16 operand cast: rne (default) or sr.
-        /// Replaces NSL_MATMUL_BF16_ROUND. SR re-dithers per launch, which blocks
-        /// CUDA graph capture and is incompatible with --bf16-cast-cache.
-        #[arg(long, value_name = "MODE", default_value = "rne")]
-        pub(crate) bf16_rounding: String,
-
-        /// Minimum arithmetic intensity mnk/(a+b elements) for a GEMM to take the
-        /// bf16 path. Replaces NSL_MATMUL_BF16_MIN_RATIO. ARITHMETIC: it decides
-        /// WHICH matmuls are reduced precision.
-        #[arg(long, value_name = "RATIO", default_value_t = 512.0)]
-        pub(crate) bf16_min_ratio: f64,
-
-        /// Cache the weight operand's bf16 cast across GEMMs. Replaces
-        /// NSL_MATMUL_BF16_CAST_CACHE. Bit-preserving, so a resume only warns --
-        /// but it costs ~2 GiB of pinned VRAM at 1B, so enabling it on a resume
-        /// can OOM a run that previously fit.
-        #[arg(long)]
-        pub(crate) bf16_cast_cache: bool,
-
-        /// Issue bf16-storage GEMMs through cuBLASLt heuristics rather than
-        /// GemmEx. Replaces NSL_MATMUL_BF16_LT. Changes kernel and reduction
-        /// order, so it is arithmetic-class for resume.
-        #[arg(long)]
-        pub(crate) bf16_lt: bool,
-
-        /// Workspace cap in MiB for the cuBLASLt heuristic (clamped to 4096).
-        /// Replaces NSL_MATMUL_BF16_LT_WORKSPACE_MIB. ARITHMETIC: the cap FILTERS
-        /// candidate kernels, so a smaller value excludes split-k and wide-tile
-        /// algorithms and changes the reduction order.
-        #[arg(long, value_name = "MIB", default_value_t = 64)]
-        pub(crate) bf16_lt_workspace_mib: u32,
-
-        /// Disable cuBLASLt timed first-use plan selection. Replaces
-        /// NSL_MATMUL_BF16_LT_TUNE=0. With tuning ON (the default) the winner
-        /// depends on live machine state, so plan choice is NOT reproducible
-        /// across processes.
-        #[arg(long)]
-        pub(crate) no_bf16_lt_tune: bool,
+        /// Matmul arithmetic: --matmul-mode and the --bf16-* family.
+        #[command(flatten)]
+        pub(crate) matmul: crate::matmul_args::MatmulArgs,
 
         /// P0 certification: RNG seed for randn/rand/stochastic ops.
         /// Overrides the historical 42 under --deterministic and also seeds
