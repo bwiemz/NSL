@@ -3385,12 +3385,20 @@ mod tests {
     /// whose signatures DISAGREE surfaces far from the edit that caused it.
     /// This keeps the table a set, which is what makes it safe to regroup.
     ///
-    /// Declaration ORDER, by contrast, is not load-bearing: emitted CLIF names
-    /// its runtime callees (`fn0 = nsl_alloc`) and numbers funcrefs per
-    /// function by order of first use, so the global `FuncId` never reaches
-    /// the output. Verified by moving `nsl_alloc` — a callee the snapshots do
-    /// reference — from index 8 to index 0: all 28 `train_clif_snapshots`
-    /// stayed byte-identical.
+    /// Declaration ORDER, by contrast, does not reach the CLIF: emitted CLIF
+    /// names its runtime callees (`fn0 = nsl_alloc`) and numbers funcrefs per
+    /// function by order of first use, so the global `FuncId` never appears.
+    /// Verified by moving `nsl_alloc` — a callee the snapshots do reference —
+    /// from index 6 to index 0: all 26 `train_clif_snapshots` stayed
+    /// byte-identical. The table may therefore be regrouped by domain freely.
+    ///
+    /// It does reach the OBJECT FILE, though: `cranelift-object` calls
+    /// `add_symbol` eagerly from `declare_function`, including for
+    /// `Linkage::Import`, so every runtime symbol lands in the emitted `.o`
+    /// symbol table in table order whether it is referenced or not. Nothing
+    /// checked in depends on that today — no `.o`/`.a` goldens exist — but a
+    /// future byte-identity gate over object output would need regenerating
+    /// after a regrouping.
     #[test]
     fn no_runtime_function_is_declared_twice() {
         let mut seen = std::collections::BTreeMap::<&str, usize>::new();

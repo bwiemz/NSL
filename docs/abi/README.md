@@ -80,15 +80,16 @@ nullability and lifetime are still contract text a reviewer has to check.
 ## Internal codegen ↔ runtime signature agreement
 
 Distinct from the host-facing contract above: the codegen emits calls to the
-runtime's `extern "C"` functions from a table of Cranelift signatures in
-`crates/nsl-codegen/src/builtins.rs::RUNTIME_FUNCTIONS`. That table and the
+runtime's `extern "C"` functions from tables of Cranelift signatures under
+`crates/nsl-codegen/src` — every `const RUNTIME_FUNCTIONS*`, today a single
+table in `builtins.rs`. Those tables and the
 runtime `extern "C" fn` implementations are linked by **symbol name only** — the
 Rust compiler never checks that their arities and types agree, so a drift (a
 parameter added on one side, an `f64` where the table says `I64`, a removed
 impl) compiles cleanly and only surfaces as a stack-corrupting call at runtime.
 
 The `nsl-abi` crate closes this gap: `nsl-abi/tests/signature_agreement.rs`
-parses both surfaces and fails if any of the ~550 declared signatures disagrees
+parses both surfaces and fails if any of the 682 declared signatures disagrees
 with its implementation (arity, register-class-level types, and presence of a
 return value). It runs in the ordinary `cargo test --workspace` gate. When you
 add or change a runtime function, update the `RUNTIME_FUNCTIONS` entry and the
