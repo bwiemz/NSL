@@ -74,6 +74,7 @@
 // --- Core compilation pipeline -------------------------------------------
 pub mod agent;
 pub mod builtins;
+pub mod runtime_abi;
 pub(crate) mod c_export_table;
 pub mod c_header;
 pub mod c_wrapper;

@@ -443,31 +443,53 @@ fn split_top_level(list: &str) -> Vec<String> {
 /// large partial one, but a single table converted to `static` alongside
 /// others would go unnoticed. Keep the registry `const`.
 ///
-/// Anchoring on the `const` KEYWORD — rather than on the bare identifier — is
-/// what makes it safe to look past the first hit. `builtins.rs` mentions
-/// `RUNTIME_FUNCTIONS` several times that are not declarations (the `for &(..)
-/// in RUNTIME_FUNCTIONS` loop, `use super::RUNTIME_FUNCTIONS`, and the tests
-/// that iterate it); anchoring on the identifier would find those, take the
-/// next `=` after each, and parse an unrelated balanced `[...]` as though it
-/// were a table.
+/// A declaration is recognised only where one can appear: at the start of a
+/// line, after optional indentation and an optional visibility prefix.
+///
+/// Anchoring on the `const` keyword anywhere in the text was not enough.
+/// Comments are stripped before this runs, but STRING LITERALS are not, so a
+/// source file containing the text `"const RUNTIME_FUNCTIONS"` inside a string
+/// registered as a declaration. That is not hypothetical: the codegen's own
+/// `every_declared_table_is_reachable` test — which scans these same files —
+/// contains exactly that literal twice, and the two phantoms tripped the
+/// `tables_found == tables_parsed` assertion the moment the registry was
+/// split.
+///
+/// Line-anchoring costs a real declaration only if one is written mid-line
+/// after other code, which rustfmt never produces.
+///
+/// This also still rejects the non-declaration MENTIONS that motivated
+/// anchoring on `const` in the first place — `use super::RUNTIME_FUNCTIONS;`,
+/// a `for &(..) in RUNTIME_FUNCTIONS` loop, and tests that iterate it — since
+/// none of those lines begins with `const`.
 fn runtime_table_decl_offsets(src: &str) -> Vec<(usize, String)> {
+    const VIS: [&str; 3] = ["pub(crate) ", "pub(super) ", "pub "];
     let mut out = Vec::new();
-    let bytes = src.as_bytes();
-    for (i, _) in src.match_indices("const ") {
-        // Reject `const` as a suffix of a longer identifier (`MY_const `).
-        if i > 0 {
-            let prev = bytes[i - 1];
-            if prev.is_ascii_alphanumeric() || prev == b'_' {
-                continue;
+    let mut line_start = 0usize;
+    for line in src.split('\n') {
+        let start = line_start;
+        line_start += line.len() + 1; // +1 for the '\n' that split consumed
+
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let mut rest = trimmed;
+        let mut vis = 0usize;
+        for p in VIS {
+            if let Some(stripped) = rest.strip_prefix(p) {
+                vis = p.len();
+                rest = stripped;
+                break;
             }
         }
-        let name_start = i + "const ".len();
-        let rest = &src[name_start..];
-        let name_end = rest
+        let Some(after_const) = rest.strip_prefix("const ") else {
+            continue;
+        };
+        let name_end = after_const
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        if rest[..name_end].starts_with("RUNTIME_FUNCTIONS") {
-            out.push((name_start, rest[..name_end].to_string()));
+            .unwrap_or(after_const.len());
+        let name = &after_const[..name_end];
+        if name.starts_with("RUNTIME_FUNCTIONS") {
+            out.push((start + indent + vis + "const ".len(), name.to_string()));
         }
     }
     out
@@ -1172,6 +1194,47 @@ mod tests {
         let MY_const RUNTIME_FUNCTIONS_FAKE = ["nope"];
         "#;
         assert!(parse_runtime_functions_table(src).is_empty());
+    }
+
+    /// A `const RUNTIME_FUNCTIONS…` inside a STRING is not a declaration.
+    ///
+    /// Comments are stripped before scanning; string literals are not. The
+    /// codegen's own registry-reachability test contains this exact literal,
+    /// and before declarations were line-anchored each occurrence registered
+    /// as a phantom table.
+    #[test]
+    fn ignores_a_declaration_spelled_inside_a_string_literal() {
+        let src = "
+        fn check(t: &str) -> bool {
+            t.starts_with(\"const RUNTIME_FUNCTIONS\")
+                || t.starts_with(\"pub(crate) const RUNTIME_FUNCTIONS\")
+        }
+        ";
+        let (sigs, seen, parsed) = parse_runtime_functions_table_in_file(src, "probe.rs");
+        assert!(sigs.is_empty());
+        assert_eq!(
+            (seen, parsed),
+            (0, 0),
+            "a string literal must not register as a declaration"
+        );
+    }
+
+    /// Visibility prefixes are part of the declaration, not of the name.
+    #[test]
+    fn recognises_declarations_behind_a_visibility_prefix() {
+        let src = r#"
+        pub(crate) const RUNTIME_FUNCTIONS_A: &[(&str, &[types::Type], Option<types::Type>)] = &[
+            ("nsl_a", &[types::I64], None),
+        ];
+        pub const RUNTIME_FUNCTIONS_B: &[(&str, &[types::Type], Option<types::Type>)] = &[
+            ("nsl_b", &[types::I64], None),
+        ];
+        "#;
+        let (sigs, seen, parsed) = parse_runtime_functions_table_in_file(src, "probe.rs");
+        assert_eq!((seen, parsed), (2, 2));
+        let names: Vec<String> = sigs.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, ["nsl_a", "nsl_b"]);
+        assert_eq!(sigs[0].source, "probe.rs::RUNTIME_FUNCTIONS_A");
     }
 
     #[test]
