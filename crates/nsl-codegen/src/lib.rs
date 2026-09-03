@@ -95,6 +95,7 @@ pub mod schema_convert;
 pub mod standalone;
 pub mod stdlib_loader;
 pub mod stmt;
+pub mod stmt_admission;
 pub mod stmt_csla;
 pub mod stmt_fase;
 pub mod stmt_train;

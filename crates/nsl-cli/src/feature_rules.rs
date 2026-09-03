@@ -112,6 +112,7 @@ const STMT: &str = "crates/nsl-codegen/src/stmt.rs";
 /// `Compiler::finish_wgrad_admission`.
 const CODEGEN_COMPILER: &str = "crates/nsl-codegen/src/compiler/mod.rs";
 const STMT_FASE: &str = "crates/nsl-codegen/src/stmt_fase.rs";
+const STMT_ADMISSION: &str = "crates/nsl-codegen/src/stmt_admission.rs";
 const CLI_RUN: &str = "crates/nsl-cli/src/commands/run.rs";
 const CALIB: &str = "crates/nsl-codegen/src/calibration/binary_codegen.rs";
 const CLI_CHECK: &str = "crates/nsl-cli/src/commands/check.rs";
@@ -168,14 +169,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--weight-stream",
         RuleKind::Requires,
         "--layerwise-accum",
-        STMT,
+        STMT_ADMISSION,
         "--weight-stream requires --layerwise-accum",
     ),
     src_rule(
         "--layerwise-accum",
         RuleKind::Requires,
         "--source-ad",
-        STMT,
+        STMT_ADMISSION,
         "--layerwise-accum requires --source-ad",
     ),
     src_rule(
@@ -189,14 +190,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--layerwise-accum",
         RuleKind::Conflicts,
         "--checkpoint-compress",
-        STMT,
+        STMT_ADMISSION,
         "--layerwise-accum is incompatible with --checkpoint-compress",
     ),
     src_rule(
         "--layerwise-accum",
         RuleKind::Conflicts,
         "--zero-stage",
-        STMT,
+        STMT_ADMISSION,
         "--layerwise-accum is incompatible with --zero-stage 1/2",
     ),
     src_rule(
@@ -214,7 +215,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--layerwise-accum",
         RuleKind::Conflicts,
         "grad_clip=",
-        STMT,
+        STMT_ADMISSION,
         "--layerwise-accum is incompatible with grad_clip",
     ),
     // CORRECTED after review: the guard here is
@@ -236,14 +237,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--zero-stage",
         RuleKind::Requires,
         "--weight-stream",
-        STMT,
+        STMT_ADMISSION,
         "--zero-stage 3 requires --layerwise-accum --weight-stream",
     ),
     src_rule(
         "--zero-stage",
         RuleKind::Conflicts,
         "--optim-state-offload",
-        STMT,
+        STMT_ADMISSION,
         "--zero-stage 3 with --optim-state-offload is not lowered",
     ),
     // grad_clip= is a train-block key partner (see the no_decay group note).
@@ -253,7 +254,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--zero-stage",
         RuleKind::Conflicts,
         "grad_clip=",
-        STMT,
+        STMT_ADMISSION,
         "--zero-stage is incompatible with grad_clip",
     ),
     src_rule(
@@ -275,14 +276,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--zero-elementwise",
         RuleKind::Requires,
         "--zero-stage 3",
-        STMT,
+        STMT_ADMISSION,
         "--zero-elementwise requires --zero-stage 3",
     ),
     src_rule(
         "--zero-elementwise",
         RuleKind::Requires,
         "AdamW/Adam optimizer",
-        STMT,
+        STMT_ADMISSION,
         "--zero-elementwise requires the AdamW/Adam optimizer",
     ),
     src_rule(
