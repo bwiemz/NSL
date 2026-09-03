@@ -5,8 +5,11 @@
 ## clamping a hyper-parameter.
 
 ## Constrain `x` to `[lo, hi]`. Returns `lo` when `x < lo` and `hi` when
-## `x > hi`; `x` is returned unchanged in between. No check that
-## `lo <= hi` — with the bounds reversed the result is `hi`.
+## `x > hi`; `x` is returned unchanged in between.
+##
+## The bounds are not checked. Given `lo > hi` the lower test wins:
+## every `x < lo` returns `lo` and everything else returns `hi`, so `x`
+## never comes back unchanged.
 fn clamp(x: float, lo: float, hi: float) -> float:
     if x < lo:
         return lo

@@ -1,6 +1,9 @@
-## Adam (Kingma & Ba, 2015), with weight decay applied as the coupled
-## L2 form. For the decoupled form — usually what you want for a
-## transformer — use `nsl.optim.adamw`.
+## Adam (Kingma & Ba, 2015).
+##
+## NOTE: this step is currently IDENTICAL to `nsl.optim.adamw` — the
+## decay here is decoupled (it scales `param` directly) rather than the
+## coupled L2 term classical Adam adds to the gradient. Pick either;
+## they do the same arithmetic today.
 ##
 ## The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
 ## codegen and updated in place through `copy_data`, so the step writes

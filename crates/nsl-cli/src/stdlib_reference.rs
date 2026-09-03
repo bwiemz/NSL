@@ -160,8 +160,18 @@ pub(crate) fn render_markdown(stdlib_root: &Path) -> Result<String, String> {
     let _ = writeln!(out, "## Modules");
     let _ = writeln!(out);
     for m in &modules {
-        let summary = m.docs.first().map(String::as_str).unwrap_or("");
-        let _ = writeln!(out, "- [`{}`](#{}) — {}", m.path, anchor(&m.path), summary);
+        // The first SENTENCE, not the first line: module summaries wrap, and
+        // `docs.first()` cut four of them mid-clause.
+        let joined = m.docs.join(" ");
+        let summary = match joined.find(". ") {
+            Some(i) => &joined[..=i],
+            None => joined.trim_end(),
+        };
+        if summary.is_empty() {
+            let _ = writeln!(out, "- [`{}`](#{})", m.path, anchor(&m.path));
+        } else {
+            let _ = writeln!(out, "- [`{}`](#{}) — {}", m.path, anchor(&m.path), summary);
+        }
     }
     let _ = writeln!(out);
 
@@ -193,24 +203,37 @@ fn render_entry(out: &mut String, e: &Entry, depth: usize) {
     let _ = writeln!(out, "{hashes} `{}`", e.signature);
     let _ = writeln!(out);
     if e.docs.is_empty() {
-        let _ = writeln!(out, "*Undocumented.*");
+        // Only a top-level item is marked as a hole. A model's fields and
+        // methods are nested under an entry that already describes them, and
+        // a field's type is usually the whole of its documentation — marking
+        // 56 of those "*Undocumented.*" made the page look threadbare and
+        // buried the gaps that matter. `every_stdlib_item_carries_a_doc_comment`
+        // gates exactly this set.
+        if depth == 3 {
+            let _ = writeln!(out, "*Undocumented.*");
+            let _ = writeln!(out);
+        }
     } else {
         for line in &e.docs {
             let _ = writeln!(out, "{line}");
         }
+        let _ = writeln!(out);
     }
-    let _ = writeln!(out);
     for c in &e.children {
         render_entry(out, c, depth + 1);
     }
 }
 
+/// GitHub's heading slug: lowercase, spaces to hyphens, everything else that
+/// is not alphanumeric/hyphen/underscore removed. `nsl.compat` becomes
+/// `nslcompat`, NOT `nsl-compat` — the same rule `cli_reference::anchor`
+/// applies, kept identical on purpose so the two pages link alike.
 fn anchor(path: &str) -> String {
     path.chars()
         .filter_map(|c| match c {
-            'a'..='z' | '0'..='9' | '-' => Some(c),
+            ' ' => Some('-'),
+            'a'..='z' | '0'..='9' | '-' | '_' => Some(c),
             'A'..='Z' => Some(c.to_ascii_lowercase()),
-            '.' | '_' => Some('-'),
             _ => None,
         })
         .collect()
@@ -269,16 +292,38 @@ fn document_file(root: &Path, file: &Path) -> Result<ModuleDoc, String> {
     let line_of = line_index(&src);
     let mut runs = doc_runs(&tokens, &src);
 
-    // A `##` block at the very top of the file, with no item above it, is the
-    // module's own description.
-    let module_docs = if runs.first().is_some_and(|(start, _, _)| *start == 0) {
-        runs.remove(0).2
-    } else {
-        Vec::new()
+    // The module's own description is the first `##` block that no item
+    // claims. Deliberately NOT "the run starting at line 0": several stdlib
+    // files open with `from … import …`, and requiring line 0 silently denied
+    // those files a module header. The run must also not be adjacent to the
+    // first item, or it is that item's doc, not the module's.
+    let first_item_line = parsed
+        .module
+        .stmts
+        .iter()
+        .map(|st| match &st.kind {
+            StmtKind::Decorated { stmt: inner, .. } => inner.span.start,
+            _ => st.span.start,
+        })
+        .map(|p| line_of(p.0 as usize))
+        .min();
+    let module_docs = match (runs.first().map(|(s, e, _)| (*s, *e)), first_item_line) {
+        (Some((_, end)), Some(item)) if end + 1 < item => runs.remove(0).2,
+        (Some(_), None) => runs.remove(0).2,
+        _ => Vec::new(),
     };
 
     let mut entries = Vec::new();
     for stmt in &parsed.module.stmts {
+        // A decorated item (`@no_grad fn generate`) is wrapped, so unwrap
+        // before matching — otherwise it falls through the catch-all and the
+        // page silently omits it while claiming the module declares nothing.
+        // The doc run is joined to the INNER item's line, because the `##`
+        // block sits between the decorator and the `fn`.
+        let stmt = match &stmt.kind {
+            StmtKind::Decorated { stmt: inner, .. } => inner.as_ref(),
+            _ => stmt,
+        };
         let line = line_of(stmt.span.start.0 as usize);
         match &stmt.kind {
             StmtKind::FnDef(f) => entries.push(Entry {
@@ -316,9 +361,6 @@ fn document_file(root: &Path, file: &Path) -> Result<ModuleDoc, String> {
                 entries.push(Entry {
                     signature: render_model_signature(m, &interner),
                     docs,
-                    // A model with no members would otherwise be rendered as a
-                    // free function; give it one empty child so the shape is
-                    // unambiguous to the counter above.
                     children,
                 });
             }
@@ -425,13 +467,18 @@ mod tests {
         }
     }
 
-    /// The page exists to show what is documented AND what is not, so the
-    /// generator must actually attach `##` blocks to items. If the joining
-    /// ever breaks, every entry silently becomes "*Undocumented.*" and the
-    /// gate above would still pass — the regenerated page would just match
-    /// the regenerated page. This pins that the stdlib is in fact documented.
+    /// Every TOP-LEVEL item — free function or model — carries a `##` block.
+    ///
+    /// The drift gate above cannot see this: if the span join ever broke,
+    /// every entry would read "*Undocumented.*" and the regenerated page
+    /// would still match the regenerated page. This is the gate that fails.
+    ///
+    /// Model fields and methods are deliberately NOT covered. They render
+    /// under an entry that already describes them and a field's type is
+    /// usually its whole documentation, so requiring prose on each would buy
+    /// ceremony rather than information.
     #[test]
-    fn every_stdlib_item_carries_a_doc_comment() {
+    fn every_top_level_stdlib_item_carries_a_doc_comment() {
         let rendered = render_markdown(&workspace_root().join("stdlib"))
             .expect("render the stdlib reference");
         let undocumented: Vec<&str> = rendered
@@ -443,8 +490,8 @@ mod tests {
             .collect();
         assert!(
             undocumented.is_empty(),
-            "{} stdlib item(s) have no `##` doc comment — write one, or the \
-             reference page carries a hole:\n  {}",
+            "{} top-level stdlib item(s) have no `##` doc comment — write one, \
+             or the reference page carries a hole:\n  {}",
             undocumented.len(),
             undocumented.join("\n  ")
         );

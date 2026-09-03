@@ -1,3 +1,5 @@
+## Autoregressive text generation.
+
 # NeuralScript Text Generation Module
 # Autoregressive generation: grows the token sequence one step at a time. Each
 # step runs the model on the current sequence, takes the logits at the last

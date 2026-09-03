@@ -1,3 +1,5 @@
+## Compatibility shims for programs written against older NSL surfaces.
+
 # NeuralScript Interop Module (nsl.compat)
 #
 # Provides interoperability with external ML frameworks:
