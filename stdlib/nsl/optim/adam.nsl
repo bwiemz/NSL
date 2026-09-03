@@ -1,10 +1,22 @@
-## Adam (Kingma & Ba, 2015), with weight decay applied as the coupled
-## L2 form. For the decoupled form — usually what you want for a
-## transformer — use `nsl.optim.adamw`.
+## Adam (Kingma & Ba, 2015).
 ##
-## The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
-## codegen and updated in place through `copy_data`, so the step writes
-## through its arguments and returns nothing.
+## `adam_step` below is byte-identical to `adamw_step`, and the decay it
+## applies is decoupled — it scales `param` directly rather than entering
+## the gradient as classical Adam's coupled L2 term.
+##
+## The two names are NOT interchangeable, because only part of training
+## goes through this function. Under `grad_accumulation = 1` the compiler
+## calls it and `adam` and `adamw` behave the same. Under accumulation
+## greater than 1 the FASE path emits the update itself, and there
+## `adam` is compiled with **weight decay forced to zero** while `adamw`
+## applies it (`fase_optimizer.rs::emit_final_step`). Choosing `adam` for
+## an accumulating run therefore trains with no regularisation at all.
+##
+## Prefer `nsl.optim.adamw` unless you specifically want no decay.
+##
+## The moment buffers `m` and `v` are allocated by codegen and updated in
+## place through `copy_data`, so the step writes through its arguments
+## and returns nothing.
 
 ## One Adam step on `param`, in place. `m` and `v` are the first and
 ## second moment buffers, bias-corrected with `t` (the 1-based step

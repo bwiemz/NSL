@@ -1,3 +1,5 @@
+## Parameter-efficient fine-tuning surface.
+
 # NSL Standard Library — nsl.peft
 #
 # Parameter-Efficient Fine-Tuning surface (WRGA paper §8.2).

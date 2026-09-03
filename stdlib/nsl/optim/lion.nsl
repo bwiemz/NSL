@@ -2,9 +2,9 @@
 ## SIGN of an interpolated momentum, so every parameter moves by the same
 ## magnitude and only one state buffer is needed.
 ##
-## The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
-## codegen and updated in place through `copy_data`, so the step writes
-## through its arguments and returns nothing.
+## That buffer (`m`) is allocated by codegen and updated in place through
+## `copy_data`, so the step writes through its arguments and returns
+## nothing.
 
 ## One Lion step on `param`, in place.
 ##

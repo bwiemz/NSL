@@ -1,3 +1,5 @@
+## Grouped-query attention — the production attention block.
+
 from nsl.nn.rope import RotaryEmbedding
 
 # Grouped Query Attention.

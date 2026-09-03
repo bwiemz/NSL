@@ -1,3 +1,9 @@
+## Data loading and input pipelines.
+##
+## The loading operations themselves (`DataLoader`, `load_jsonl`, `load_csv`,
+## …) are compiler intrinsics callable without importing this module; what
+## lives here is the version marker a program can branch on.
+
 # NeuralScript Data Pipeline Module (nsl.data)
 #
 # Built-in intrinsics (available without importing this module):

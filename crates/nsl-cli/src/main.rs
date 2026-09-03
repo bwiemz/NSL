@@ -160,8 +160,8 @@ fn main_inner() {
         Cli::Doc { cmd: DocCmd::Stdlib } => {
             let Some(root) = resolver::stdlib_roots().into_iter().next() else {
                 eprintln!(
-                    "nsl doc stdlib: no stdlib directory found (looked at $NSL_STDLIB, \
-                     <exe>/stdlib, and the toolchain layout)"
+                    "nsl doc stdlib: no stdlib directory found (looked at $NSL_STDLIB_PATH, \
+                     <exe>/stdlib, the toolchain layout, and ./stdlib)"
                 );
                 std::process::exit(1);
             };

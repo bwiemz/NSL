@@ -8,6 +8,8 @@ use nsl_lexer::Interner;
 /// Resolution order:
 /// 1. `NSL_STDLIB_PATH` environment variable (if set and directory exists)
 /// 2. `<exe_dir>/stdlib/` (relative to the running executable)
+/// 3. `<exe_dir>/../lib/stdlib/` (the toolchain distribution layout)
+/// 4. `./stdlib/` (development: `cargo run` from the workspace root)
 pub(crate) fn stdlib_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 

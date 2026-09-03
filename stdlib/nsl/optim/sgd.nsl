@@ -1,9 +1,9 @@
 ## Stochastic gradient descent with momentum, dampening, decoupled weight
 ## decay and optional Nesterov lookahead.
 ##
-## The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
-## codegen and updated in place through `copy_data`, so the step writes
-## through its arguments and returns nothing.
+## The single state buffer (`velocity`) is allocated by codegen and
+## updated in place through `copy_data`, so the step writes through its
+## arguments and returns nothing.
 
 ## One SGD step on `param`, in place.
 ##

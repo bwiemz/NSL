@@ -1,3 +1,8 @@
+## Muon: momentum orthogonalized by Newton-Schulz, with AdamW routing.
+##
+## The orthogonalized update applies only to rank-2 hidden weight matrices;
+## embeddings, the LM head and every non-rank-2 tensor take an AdamW step.
+
 # NSL Standard Library — nsl.optim.muon
 #
 # Muon (MomentUm Orthogonalized by Newton-Schulz; Jordan et al., 2024) with
