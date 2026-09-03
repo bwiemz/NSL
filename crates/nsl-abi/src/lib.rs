@@ -2,8 +2,9 @@
 //!
 //! # The problem this closes
 //!
-//! The codegen declares every runtime function it emits calls to in
-//! `nsl-codegen/src/builtins.rs::RUNTIME_FUNCTIONS` — a table of *Cranelift*
+//! The codegen declares every runtime function it emits calls to in a
+//! `RUNTIME_FUNCTIONS*` table under `nsl-codegen/src` (today a single one in
+//! `builtins.rs`) — a table of *Cranelift*
 //! signatures `(name, &[param types], Option<ret type>)`. The runtime
 //! *implements* those functions as `#[unsafe(no_mangle)] extern "C" fn`s in
 //! `nsl-runtime`. **The two are linked by symbol name only** — the Rust
@@ -432,9 +433,54 @@ fn split_top_level(list: &str) -> Vec<String> {
     out
 }
 
-/// Parse the `RUNTIME_FUNCTIONS` table (the codegen's *declared* signatures)
-/// out of the text of `builtins.rs`.
+/// Locate every `const RUNTIME_FUNCTIONS*` declaration in a comment-stripped
+/// source text, returning the byte offset of each name.
+///
+/// Anchoring on the `const` KEYWORD — rather than on the bare identifier — is
+/// what makes it safe to look past the first hit. `builtins.rs` mentions
+/// `RUNTIME_FUNCTIONS` several times that are not declarations (the `for &(..)
+/// in RUNTIME_FUNCTIONS` loop, `use super::RUNTIME_FUNCTIONS`, and the tests
+/// that iterate it); anchoring on the identifier would find those, take the
+/// next `=` after each, and parse an unrelated balanced `[...]` as though it
+/// were a table.
+fn runtime_table_decl_offsets(src: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    for (i, _) in src.match_indices("const ") {
+        // Reject `const` as a suffix of a longer identifier (`MY_const `).
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                continue;
+            }
+        }
+        let name_start = i + "const ".len();
+        let rest = &src[name_start..];
+        let name_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if rest[..name_end].starts_with("RUNTIME_FUNCTIONS") {
+            out.push((name_start, rest[..name_end].to_string()));
+        }
+    }
+    out
+}
+
+/// Parse every `RUNTIME_FUNCTIONS*` table (the codegen's *declared*
+/// signatures) out of the text of one source file.
+///
+/// More than one table per file — and more than one file — is supported so the
+/// registry can be grouped by domain without the gate going quiet. A parser
+/// that read only the first table would, after such a split, return a short
+/// list; that is caught by the truncation floor in `signature_agreement`, but
+/// only as a confusing failure rather than as correct behaviour.
 pub fn parse_runtime_functions_table(src_raw: &str) -> Vec<FnSig> {
+    parse_runtime_functions_table_in_file(src_raw, "builtins.rs")
+}
+
+/// As [`parse_runtime_functions_table`], but labelling each signature with the
+/// file it came from so a mismatch report names the file to edit.
+pub fn parse_runtime_functions_table_in_file(src_raw: &str, label: &str) -> Vec<FnSig> {
     let mut out = Vec::new();
     // Strip comments first: the table's `&[...]` blocks carry inline comments
     // like `// q, k, v, out` whose COMMAS would otherwise be counted as extra
@@ -448,17 +494,29 @@ pub fn parse_runtime_functions_table(src_raw: &str) -> Vec<FnSig> {
         .collect::<Vec<_>>()
         .join("\n");
     let src = src.as_str();
-    let Some(const_pos) = src.find("RUNTIME_FUNCTIONS") else {
-        return out;
-    };
+    for (const_pos, const_name) in runtime_table_decl_offsets(src) {
+        parse_one_table(src, const_pos, label, &const_name, &mut out);
+    }
+    out
+}
+
+/// Parse the single table whose name begins at `const_pos`, appending its
+/// entries to `out`.
+fn parse_one_table(
+    src: &str,
+    const_pos: usize,
+    label: &str,
+    const_name: &str,
+    out: &mut Vec<FnSig>,
+) {
     // Anchor on the assignment `=` first: the `[` between `RUNTIME_FUNCTIONS`
     // and `=` belongs to the TYPE annotation (`&[(&str, &[types::Type], ...)]`),
     // not the value. The table body is the balanced `[...]` after `= &`.
     let Some(eq_rel) = src[const_pos..].find('=') else {
-        return out;
+        return;
     };
     let Some((body, _)) = balanced(src, const_pos + eq_rel, '[', ']') else {
-        return out;
+        return;
     };
 
     // Each entry is a top-level `( "name", &[..types..], <ret> )`.
@@ -489,7 +547,7 @@ pub fn parse_runtime_functions_table(src_raw: &str) -> Vec<FnSig> {
                     name,
                     params,
                     ret,
-                    source: "builtins.rs::RUNTIME_FUNCTIONS".to_string(),
+                    source: format!("{label}::{const_name}"),
                 });
                 continue;
             }
@@ -500,10 +558,9 @@ pub fn parse_runtime_functions_table(src_raw: &str) -> Vec<FnSig> {
             name,
             params,
             ret: None,
-            source: "builtins.rs::RUNTIME_FUNCTIONS".to_string(),
+            source: format!("{label}::{const_name}"),
         });
     }
-    out
 }
 
 /// Parse the return slot of a table entry tail (`, Some(types::I64) ),` or
@@ -824,12 +881,32 @@ pub fn cross_check(declared: &[FnSig], impls: &[FnSig], macro_impls: &[FnSig]) -
 }
 
 /// Convenience: run the whole check against a workspace root directory. Reads
-/// `builtins.rs`, every `.rs` under `nsl-runtime/src`, and the inplace macro.
+/// every `.rs` under `nsl-codegen/src` and `nsl-runtime/src`, plus the inplace
+/// macro.
+///
+/// The declared side is found by SCANNING rather than by a hard-coded path.
+/// It was `crates/nsl-codegen/src/builtins.rs` alone, which made the gate's
+/// coverage depend on the registry staying in one file: moving or splitting it
+/// would have left this reading a path that no longer held the table, and the
+/// only thing standing between that and a vacuously-green ABI check was the
+/// truncation floor in `signature_agreement`. Scanning costs one directory walk
+/// of a crate whose sibling is already walked the same way.
 pub fn check_workspace(workspace_root: &Path) -> std::io::Result<Report> {
-    let builtins = std::fs::read_to_string(
-        workspace_root.join("crates/nsl-codegen/src/builtins.rs"),
-    )?;
-    let declared = parse_runtime_functions_table(&builtins);
+    let codegen_src = workspace_root.join("crates/nsl-codegen/src");
+    let mut declared = Vec::new();
+    // Sorted so the report is stable across filesystems: `rust_files` walks in
+    // `read_dir` order, which is not ordered on ext4/btrfs.
+    let mut codegen_files = rust_files(&codegen_src)?;
+    codegen_files.sort();
+    for path in codegen_files {
+        let text = std::fs::read_to_string(&path)?;
+        let label = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        declared.extend(parse_runtime_functions_table_in_file(&text, &label));
+    }
 
     let runtime_src = workspace_root.join("crates/nsl-runtime/src");
     let mut impls = Vec::new();
@@ -901,6 +978,64 @@ mod tests {
         assert_eq!(sigs[0].ret, Some(ParsedType::Known(AbiScalar::Int(64))));
         assert_eq!(sigs[1].name, "nsl_free");
         assert_eq!(sigs[1].ret, None);
+    }
+
+    /// The registry may be grouped into several tables — the point of parsing
+    /// every `const RUNTIME_FUNCTIONS*` rather than only the first.
+    #[test]
+    fn parses_every_table_in_a_file_not_just_the_first() {
+        let src = r#"
+        const RUNTIME_FUNCTIONS_SCALAR: &[(&str, &[types::Type], Option<types::Type>)] = &[
+            ("nsl_pow_int", &[types::I64, types::I64], Some(types::I64)),
+        ];
+
+        pub(crate) const RUNTIME_FUNCTIONS_TENSOR: &[(&str, &[types::Type], Option<types::Type>)] = &[
+            ("nsl_tensor_ones", &[types::I64], Some(types::I64)),
+            ("nsl_tensor_free", &[types::I64], None),
+        ];
+        "#;
+        let sigs = parse_runtime_functions_table(src);
+        let names: Vec<String> = sigs.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, ["nsl_pow_int", "nsl_tensor_ones", "nsl_tensor_free"]);
+    }
+
+    /// Only DECLARATIONS are tables. `builtins.rs` names `RUNTIME_FUNCTIONS`
+    /// in a `for` loop, a `use`, and its own tests; anchoring on the bare
+    /// identifier would take the next `=` after each of those and parse an
+    /// unrelated balanced `[...]` as a table, inventing entries.
+    #[test]
+    fn ignores_mentions_that_are_not_declarations() {
+        let src = r#"
+        use super::RUNTIME_FUNCTIONS;
+
+        const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
+            ("nsl_alloc", &[types::I64], Some(types::I64)),
+        ];
+
+        pub fn declare(module: &mut ObjectModule) {
+            for &(name, params, ret) in RUNTIME_FUNCTIONS {
+                let sig = ["not", "a", "table"];
+                let _ = (name, params, ret, sig);
+            }
+        }
+        "#;
+        let sigs = parse_runtime_functions_table(src);
+        assert_eq!(
+            sigs.len(),
+            1,
+            "expected only the declaration to parse, got {:?}",
+            sigs.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert_eq!(sigs[0].name, "nsl_alloc");
+    }
+
+    /// `const` as the tail of a longer identifier is not the keyword.
+    #[test]
+    fn does_not_match_const_inside_an_identifier() {
+        let src = r#"
+        let MY_const RUNTIME_FUNCTIONS_FAKE = ["nope"];
+        "#;
+        assert!(parse_runtime_functions_table(src).is_empty());
     }
 
     #[test]
