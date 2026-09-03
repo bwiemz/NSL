@@ -1275,7 +1275,7 @@ impl MatmulConfig {
         if self.bf16_cast_cache == d.bf16_cast_cache
             && let Ok(v) = std::env::var("NSL_MATMUL_BF16_CAST_CACHE")
         {
-            warn("NSL_MATMUL_BF16_CAST_CACHE", "--bf16-cast-cache", &mut warned);
+            warn("NSL_MATMUL_BF16_CAST_CACHE", "--no-bf16-cast-cache", &mut warned);
             self.bf16_cast_cache = v != "0";
         }
         if self.bf16_lt == d.bf16_lt

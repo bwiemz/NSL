@@ -45,6 +45,7 @@ fn parse_arg_structs() -> BTreeMap<&'static str, Vec<String>> {
     );
     let mut out: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut cur: Option<&'static str> = None;
+    let mut flatten_next = false;
     for line in src.lines() {
         for name in ["CheckArgs", "BuildArgs", "RunArgs"] {
             if line.contains(&format!("struct {name} {{")) {
@@ -57,16 +58,76 @@ fn parse_arg_structs() -> BTreeMap<&'static str, Vec<String>> {
                 cur = None;
                 continue;
             }
+            if t.starts_with("#[command(flatten)]") {
+                flatten_next = true;
+                continue;
+            }
             if let Some(rest) = t.strip_prefix("pub(crate) ")
-                && let Some((field, _)) = rest.split_once(':')
+                && let Some((field, ty)) = rest.split_once(':')
             {
-                out.entry(struct_name)
-                    .or_default()
-                    .push(field.trim().replace('_', "-"));
+                if std::mem::take(&mut flatten_next) {
+                    // A flattened group contributes the INNER struct's fields.
+                    // Naming the field itself would invent a flag that does not
+                    // exist (`--matmul`) and hide the seven that do.
+                    out.entry(struct_name).or_default().extend(flattened_fields(ty));
+                } else {
+                    out.entry(struct_name)
+                        .or_default()
+                        .push(field.trim().replace('_', "-"));
+                }
             }
         }
     }
     out
+}
+
+/// The flags a `#[command(flatten)]` field contributes.
+///
+/// `ty` is the field's type as written, e.g. `crate::matmul_args::MatmulArgs`.
+/// The module segment names the file under `crates/nsl-cli/src/`, and the last
+/// segment names the struct inside it. Panics rather than returning empty: a
+/// flatten this cannot follow would silently drop every flag in the group, and
+/// the gate exists to make dropped flags impossible.
+fn flattened_fields(ty: &str) -> Vec<String> {
+    let ty = ty.trim().trim_end_matches(',').trim();
+    let segs: Vec<&str> = ty.split("::").collect();
+    let (struct_name, module) = match segs.as_slice() {
+        [.., m, s] => (*s, *m),
+        _ => panic!("cannot resolve flattened type {ty:?} to a module::Struct path"),
+    };
+    let path = workspace_root().join(format!("crates/nsl-cli/src/{module}.rs"));
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("flattened group {ty:?} -> {}: {e}", path.display()));
+    assert!(
+        !src.contains("long = \""),
+        "{module}.rs uses an explicit `long = \"...\"` rename; this parser derives \
+         flags from field names and must learn the rename first"
+    );
+    let mut fields = Vec::new();
+    let mut inside = false;
+    for line in src.lines() {
+        if line.contains(&format!("struct {struct_name} {{")) {
+            inside = true;
+            continue;
+        }
+        if inside {
+            let t = line.trim();
+            if t == "}" {
+                break;
+            }
+            if let Some(rest) = t.strip_prefix("pub(crate) ")
+                && let Some((field, _)) = rest.split_once(':')
+            {
+                fields.push(field.trim().replace('_', "-"));
+            }
+        }
+    }
+    assert!(
+        !fields.is_empty(),
+        "flattened group {ty:?} contributed no flags — struct {struct_name} not found in {}",
+        path.display()
+    );
+    fields
 }
 
 fn declared_on(structs: &BTreeMap<&'static str, Vec<String>>, flag: &str) -> Vec<Subcommand> {

@@ -298,7 +298,7 @@ pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
     ("matmul-mode", "runtime GEMM arithmetic; witnessed by the cuBLAS math-mode banner and the `mm` fingerprint key, not by a pass"),
     ("bf16-rounding", "runtime operand-cast rounding; fingerprint key `mmround`, witnessed by the SR banner line"),
     ("bf16-min-ratio", "runtime bf16 eligibility threshold; fingerprint key `mmratio`"),
-    ("bf16-cast-cache", "runtime weight-cast cache; fingerprint key `mmcache` (placement class -- bit-preserving, warns on resume)"),
+    ("no-bf16-cast-cache", "disables the runtime weight-cast cache (ON by default); fingerprint key `mmcache` (placement class -- bit-preserving, warns on resume)"),
     ("bf16-lt", "runtime cuBLASLt dispatch; fingerprint key `mmlt`"),
     ("bf16-lt-workspace-mib", "runtime Lt workspace cap; fingerprint key `mmltws` (arithmetic class -- the cap filters kernel candidates)"),
     ("no-bf16-lt-tune", "disables Lt timed plan selection; fingerprint key `mmlttune`"),
