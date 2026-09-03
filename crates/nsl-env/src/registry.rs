@@ -794,7 +794,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "1 only engages; 0 or anything else is a no-op (falls through to TF32/pedantic resolution)",
         "off (TF32 unless NSL_MATMUL_TF32=0 or strict-matmul)",
         Behavior,
-        Compile,
+        Both,
         "Run cuBLAS matmuls with bf16 tensor-core compute (bf16 operand storage); beats NSL_MATMUL_TF32, loses to NSL_MATMUL_PEDANTIC."
     ),
     var!(
@@ -803,7 +803,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "0 disables; anything else on",
         "on (active only under NSL_MATMUL_BF16=1 with RNE rounding and no --cuda-graphs)",
         Perf,
-        Compile,
+        Both,
         "Set to 0 to disable the persistent bf16 weight-image cache and re-cast every GEMM operand from fresh scratch."
     ),
     var!(
@@ -812,7 +812,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "1 only",
         "off (cublasGemmEx DFALT)",
         Behavior,
-        Compile,
+        Both,
         "Issue bf16-storage GEMMs through cublasLt with explicit kernel selection and a real workspace instead of cublasGemmEx (changes bits)."
     ),
     var!(
@@ -821,7 +821,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "0 disables; anything else on",
         "on (self-disables under --cuda-graphs, --deterministic, or >1 GiB scratch)",
         Behavior,
-        Compile,
+        Both,
         "Set to 0 to skip timing cublasLt candidates per GEMM shape and take the untimed heuristic[0] kernel instead."
     ),
     var!(
@@ -839,7 +839,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "integer MiB, clamped to 4096 (unparseable → 64)",
         "64",
         Behavior,
-        Compile,
+        Both,
         "Size in MiB of the process-lifetime cublasLt GEMM workspace; larger values admit split-k/wide-tile kernels (affects kernel choice)."
     ),
     var!(
@@ -848,7 +848,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "any f64 (unparsable → 512)",
         "512",
         Behavior,
-        Compile,
+        Both,
         "Min arithmetic-intensity ratio mnk/(a+b elements) for a bf16-mode GEMM to cast operands to bf16; below it the GEMM stays f32/TF32."
     ),
     var!(
@@ -857,7 +857,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "sr = stochastic; anything else = RNE",
         "rne",
         Behavior,
-        Compile,
+        Both,
         "Rounding for the bf16 operand cast under NSL_MATMUL_BF16=1: sr = stochastic (fresh dither per launch, blocks graph capture), else RNE."
     ),
     var!(
