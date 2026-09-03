@@ -463,7 +463,10 @@ fn apply_auto_mode_fallback_note(
             "note: --wggo-importance=auto fell back to magnitude scoring.\n  \
              reason: {reason}\n  \
              effect: WGGO ILP runs against magnitude (||W||₂)-based importance scores.\n  \
-             to silence: add @wggo_target + calibration data, OR set\n             \
+             to silence: add @wggo_target AND supply a calibration SIDECAR --\n             \
+             only `nsl_codegen::compile_and_calibrate` produces one, and\n             \
+             `nsl build --calibration-data` does not call it, so that flag\n             \
+             alone will not lift this note. OR set\n             \
              --wggo-importance=magnitude to opt out of grad scoring entirely."
         );
         opts.wggo.importance = WggoImportance::Magnitude;

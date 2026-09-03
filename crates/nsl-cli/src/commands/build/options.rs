@@ -339,6 +339,29 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                         process::exit(1);
                     }
                 }
+                // The corpus is validated above and then goes nowhere. The
+                // harness (hook registry + run_harness_* + the no-consumer
+                // warning) lives in `nsl_codegen::compile_and_calibrate`, which
+                // e3ab23ad moved it into on 2026-05-10 and which NOTHING in the
+                // workspace calls -- so no CLI build has ever run it. Only that
+                // wrapper populates `calibration_sidecar`, which is also why
+                // `--wggo-importance=grad` is unreachable from the CLI: it
+                // refuses on the missing sidecar, and supplying
+                // --calibration-data cannot produce one.
+                //
+                // Wiring it up is a decision about WHERE calibration fires
+                // (it reorders WGGO against kernel emission and needs weights
+                // plumbing), so this warns rather than refusing: accepting a
+                // corpus and silently ignoring it is the one behaviour with no
+                // defence. `calibration_pipeline_integration.rs` holds the
+                // contract test, ignored until the wiring lands.
+                eprintln!(
+                    "warning: --calibration-data is validated but NOT consumed by `nsl build`.\n\
+                     \x20        {} is ignored: no calibration hooks run, no sidecar is\n\
+                     \x20        written, and --wggo-importance=grad stays unavailable.\n\
+                     \x20        Tracked by crates/nsl-cli/tests/calibration_pipeline_integration.rs.",
+                    p.display()
+                );
             }
             if calibration_samples == 0 {
                 eprintln!("error: --calibration-samples must be > 0");
