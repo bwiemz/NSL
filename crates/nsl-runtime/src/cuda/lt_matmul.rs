@@ -719,7 +719,14 @@ pub(crate) unsafe fn matmul_bf16_f32(
 /// Test-only reset: destroy every plan, clear counters. The Lt handle and
 /// workspace survive (process-lifetime by design; captured graphs and the
 /// banner's once-semantics depend on them).
-#[cfg(any(test, feature = "test-hooks"))]
+// Gated on `test-hooks` ALONE, matching the two callers in `cuda/mod.rs`
+// (`#[cfg(all(feature = "cuda", feature = "test-hooks"))]`). It used to read
+// `any(test, feature = "test-hooks")`, which is a WIDER condition than its
+// use: `cargo test --features cuda` (no test-hooks) compiled the function --
+// `test` is on for a lib-test build -- but not the callers, so #588's
+// `dead_code = deny` failed the "CUDA feature" CI job on main. The module is
+// already `#[cfg(feature = "cuda")]`, so that axis needs no repeating here.
+#[cfg(feature = "test-hooks")]
 pub(crate) fn reset_for_test() {
     let drained: Vec<Option<Plan>> = {
         let mut plans = PLANS.lock().unwrap();
