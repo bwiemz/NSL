@@ -8,8 +8,8 @@ Most of NSL's numeric surface is *language*, not library: tensor arithmetic, `ma
 
 ## Modules
 
-- [`nsl.compat`](#nslcompat) — Compatibility shims for programs written against older NSL surfaces.
-- [`nsl.data.loader`](#nsldataloader) — Dataset loading shims.
+- [`nsl.compat`](#nslcompat) — Interoperability with external ML frameworks — safetensors, HuggingFace and ONNX.
+- [`nsl.data.loader`](#nsldataloader) — Data loading and input pipelines.
 - [`nsl.inference.generate`](#nslinferencegenerate) — Autoregressive text generation.
 - [`nsl.inference.sampling`](#nslinferencesampling) — Token sampling strategies for generation.
 - [`nsl.io`](#nslio) — Console input.
@@ -39,7 +39,12 @@ Most of NSL's numeric surface is *language*, not library: tensor arithmetic, `ma
 
 *Source: `stdlib/nsl/compat.nsl`*
 
-Compatibility shims for programs written against older NSL surfaces.
+Interoperability with external ML frameworks — safetensors, HuggingFace
+and ONNX.
+
+The conversions themselves (`load_safetensors`, `save_safetensors`,
+`from_hf`, `to_onnx`) are compiler intrinsics callable without importing
+this module; what lives here is the shim-revision marker.
 
 ### `fn compat_version() -> int`
 
@@ -50,10 +55,11 @@ shape, so a program can branch on it.
 
 *Source: `stdlib/nsl/data/loader.nsl`*
 
-Dataset loading shims.
+Data loading and input pipelines.
 
-The loader itself is a compiler `dataset` block; this module carries the
-version marker a program can branch on.
+The loading operations themselves (`DataLoader`, `load_jsonl`, `load_csv`,
+…) are compiler intrinsics callable without importing this module; what
+lives here is the version marker a program can branch on.
 
 ### `fn data_version() -> int`
 
@@ -65,7 +71,7 @@ The dataset-shim revision, bumped when the loader contract changes.
 
 Autoregressive text generation.
 
-### `fn generate(lm, prompt: Tensor, max_tokens: int, temperature: float, top_k: int) -> Tensor`
+### `@no_grad fn generate(lm, prompt: Tensor, max_tokens: int, temperature: float, top_k: int) -> Tensor`
 
 Autoregressive generation: extend `prompt` by up to `max_tokens`,
 sampling each step from `lm`'s logits with `temperature` and `top_k`
@@ -522,14 +528,23 @@ normalisation and a residual connection.
 
 Adam (Kingma & Ba, 2015).
 
-NOTE: this step is currently IDENTICAL to `nsl.optim.adamw` — the
-decay here is decoupled (it scales `param` directly) rather than the
-coupled L2 term classical Adam adds to the gradient. Pick either;
-they do the same arithmetic today.
+`adam_step` below is byte-identical to `adamw_step`, and the decay it
+applies is decoupled — it scales `param` directly rather than entering
+the gradient as classical Adam's coupled L2 term.
 
-The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
-codegen and updated in place through `copy_data`, so the step writes
-through its arguments and returns nothing.
+The two names are NOT interchangeable, because only part of training
+goes through this function. Under `grad_accumulation = 1` the compiler
+calls it and `adam` and `adamw` behave the same. Under accumulation
+greater than 1 the FASE path emits the update itself, and there
+`adam` is compiled with **weight decay forced to zero** while `adamw`
+applies it (`fase_optimizer.rs::emit_final_step`). Choosing `adam` for
+an accumulating run therefore trains with no regularisation at all.
+
+Prefer `nsl.optim.adamw` unless you specifically want no decay.
+
+The moment buffers `m` and `v` are allocated by codegen and updated in
+place through `copy_data`, so the step writes through its arguments
+and returns nothing.
 
 ### `fn adam_step(param: Tensor, gradient: Tensor, m: Tensor, v: Tensor, lr: float, beta1: float, beta2: float, eps: float, weight_decay: float, t: float)`
 
@@ -543,9 +558,9 @@ number).
 
 AdamW: Adam with decoupled weight decay (Loshchilov & Hutter, 2019).
 
-The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
-codegen and updated in place through `copy_data`, so the step writes
-through its arguments and returns nothing.
+The moment buffers `m` and `v` are allocated by codegen and updated in
+place through `copy_data`, so the step writes through its arguments and
+returns nothing.
 
 ### `fn adamw_step(param: Tensor, gradient: Tensor, m: Tensor, v: Tensor, lr: float, beta1: float, beta2: float, eps: float, weight_decay: float, t: float)`
 
@@ -556,7 +571,9 @@ with `t` (the 1-based step number). Decay is *decoupled*: it scales
 `param` directly rather than entering the gradient, so it does not
 interact with the second-moment normalisation.
 
-`nsl.optim.adam`'s step is currently identical to this one.
+`nsl.optim.adam`'s step function is byte-identical to this one, but the
+two optimizer NAMES diverge under gradient accumulation — see
+`nsl.optim.adam`.
 
 ## `nsl.optim.lion`
 
@@ -566,9 +583,9 @@ Lion (EvoLved Sign Momentum; Chen et al., 2023): the update is the
 SIGN of an interpolated momentum, so every parameter moves by the same
 magnitude and only one state buffer is needed.
 
-The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
-codegen and updated in place through `copy_data`, so the step writes
-through its arguments and returns nothing.
+That buffer (`m`) is allocated by codegen and updated in place through
+`copy_data`, so the step writes through its arguments and returns
+nothing.
 
 ### `fn lion_step(param: Tensor, gradient: Tensor, m: Tensor, lr: float, beta1: float, beta2: float, weight_decay: float)`
 
@@ -675,9 +692,9 @@ the first `pct_start` of `total_steps`, then a cosine fall to zero.
 Stochastic gradient descent with momentum, dampening, decoupled weight
 decay and optional Nesterov lookahead.
 
-The optimizer state buffers (`m`, `v`, `velocity`) are allocated by
-codegen and updated in place through `copy_data`, so the step writes
-through its arguments and returns nothing.
+The single state buffer (`velocity`) is allocated by codegen and
+updated in place through `copy_data`, so the step writes through its
+arguments and returns nothing.
 
 ### `fn sgd_step(param: Tensor, gradient: Tensor, velocity: Tensor, lr: float, momentum: float, dampening: float, weight_decay: float, nesterov: bool)`
 

@@ -1,7 +1,8 @@
-## Dataset loading shims.
+## Data loading and input pipelines.
 ##
-## The loader itself is a compiler `dataset` block; this module carries the
-## version marker a program can branch on.
+## The loading operations themselves (`DataLoader`, `load_jsonl`, `load_csv`,
+## …) are compiler intrinsics callable without importing this module; what
+## lives here is the version marker a program can branch on.
 
 # NeuralScript Data Pipeline Module (nsl.data)
 #

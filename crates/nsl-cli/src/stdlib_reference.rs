@@ -103,7 +103,13 @@ fn take_docs_above(runs: &mut Vec<(usize, usize, Vec<String>)>, line: usize) -> 
     runs.remove(i).2
 }
 
-pub(crate) fn render_markdown(stdlib_root: &Path) -> Result<String, String> {
+/// Parse every module under `stdlib_root`, in a stable order.
+///
+/// Separate from [`render_markdown`] so a gate can assert something about the
+/// PARSED modules rather than about the rendered text. A gate that greps the
+/// output can only see what the renderer chose to emit, which is exactly the
+/// blind spot that let a dropped item through.
+fn collect_modules(stdlib_root: &Path) -> Result<Vec<ModuleDoc>, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     collect_nsl_files(stdlib_root, &mut files)?;
     files.sort();
@@ -112,6 +118,11 @@ pub(crate) fn render_markdown(stdlib_root: &Path) -> Result<String, String> {
     for file in &files {
         modules.push(document_file(stdlib_root, file)?);
     }
+    Ok(modules)
+}
+
+pub(crate) fn render_markdown(stdlib_root: &Path) -> Result<String, String> {
+    let modules = collect_modules(stdlib_root)?;
 
     let fns: usize = modules.iter().map(|m| m.entries.iter().filter(|e| e.children.is_empty()).count()).sum();
     let models: usize = modules.iter().map(|m| m.entries.iter().filter(|e| !e.children.is_empty()).count()).sum();
@@ -301,9 +312,12 @@ fn document_file(root: &Path, file: &Path) -> Result<ModuleDoc, String> {
         .module
         .stmts
         .iter()
-        .map(|st| match &st.kind {
-            StmtKind::Decorated { stmt: inner, .. } => inner.span.start,
-            _ => st.span.start,
+        .map(|st| {
+            let mut st = st;
+            while let StmtKind::Decorated { stmt: inner, .. } = &st.kind {
+                st = inner.as_ref();
+            }
+            st.span.start
         })
         .map(|p| line_of(p.0 as usize))
         .min();
@@ -320,14 +334,33 @@ fn document_file(root: &Path, file: &Path) -> Result<ModuleDoc, String> {
         // page silently omits it while claiming the module declares nothing.
         // The doc run is joined to the INNER item's line, because the `##`
         // block sits between the decorator and the `fn`.
-        let stmt = match &stmt.kind {
-            StmtKind::Decorated { stmt: inner, .. } => inner.as_ref(),
-            _ => stmt,
+        //
+        // A visibility prefix wraps a decorated item in a SECOND `Decorated`
+        // (`parse_visibility_prefixed` wrapping `parse_decorated_stmt`), so
+        // this unwraps to a fixed point rather than once. The decorators are
+        // collected on the way down: the page says its signatures are what
+        // the compiler accepted, and `@no_grad` is part of that.
+        // Rendered INLINE, not on their own lines: the signature becomes a
+        // `###` heading, and a newline inside one breaks both the heading and
+        // the anchor the index links to.
+        let mut stmt = stmt;
+        let mut decorators: Vec<String> = Vec::new();
+        while let StmtKind::Decorated { decorators: d, stmt: inner } = &stmt.kind {
+            for dec in d {
+                let path: Vec<String> = dec.name.iter().map(|s| sym(&interner, *s)).collect();
+                decorators.push(format!("@{}", path.join(".")));
+            }
+            stmt = inner.as_ref();
+        }
+        let prefix = if decorators.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", decorators.join(" "))
         };
         let line = line_of(stmt.span.start.0 as usize);
         match &stmt.kind {
             StmtKind::FnDef(f) => entries.push(Entry {
-                signature: render_fn_signature(f, &interner),
+                signature: format!("{prefix}{}", render_fn_signature(f, &interner)),
                 docs: take_docs_above(&mut runs, line),
                 children: Vec::new(),
             }),
@@ -359,16 +392,81 @@ fn document_file(root: &Path, file: &Path) -> Result<ModuleDoc, String> {
                     }
                 }
                 entries.push(Entry {
-                    signature: render_model_signature(m, &interner),
+                    signature: format!("{prefix}{}", render_model_signature(m, &interner)),
                     docs,
                     children,
                 });
             }
-            _ => {}
+            // Not declarations — nothing to document.
+            StmtKind::VarDecl { .. }
+            | StmtKind::If { .. }
+            | StmtKind::For { .. }
+            | StmtKind::While { .. }
+            | StmtKind::WhileLet { .. }
+            | StmtKind::Match { .. }
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Return(_)
+            | StmtKind::Yield(_)
+            | StmtKind::Assign { .. }
+            | StmtKind::Import(_)
+            | StmtKind::FromImport(_)
+            | StmtKind::TrainBlock(_)
+            | StmtKind::DistillBlock(_)
+            | StmtKind::GradBlock(_)
+            | StmtKind::QuantBlock(_)
+            | StmtKind::Expr(_) => {}
+
+            // Declaration forms this renderer does not yet know how to show.
+            // REFUSING is the point: the bug this replaced was a catch-all
+            // that silently dropped `@no_grad fn generate`, and no gate could
+            // see it — the drift gate compares the renderer to itself, and a
+            // dropped item emits no "*Undocumented.*" line. There is no
+            // exhaustive match over the INPUT anywhere else, so this arm is
+            // the only thing that turns "stdlib grew a form we don't render"
+            // into a failure rather than a hole. None of these appear in
+            // `stdlib/` today; the first one to be added must teach the
+            // renderer about it.
+            StmtKind::AgentDef(_)
+            | StmtKind::StructDef(_)
+            | StmtKind::EnumDef(_)
+            | StmtKind::TraitDef(_)
+            | StmtKind::KernelDef(_)
+            | StmtKind::TokenizerDef(_)
+            | StmtKind::DatasetDef(_)
+            | StmtKind::DatatypeDef(_)
+            | StmtKind::ServeBlock(_) => {
+                return Err(format!(
+                    "{}: top-level {} is a declaration this reference does not render. \
+                     Teach `stdlib_reference.rs` to render it rather than letting the page \
+                     omit it silently.",
+                    file.display(),
+                    stmt_kind_name(&stmt.kind),
+                ));
+            }
+
+            // Unwrapped to a fixed point above.
+            StmtKind::Decorated { .. } => unreachable!("decorators unwrapped above"),
         }
     }
 
     Ok(ModuleDoc { path, file: rel_str, docs: module_docs, entries })
+}
+
+/// The spelling of a statement kind, for the refusal message above.
+fn stmt_kind_name(kind: &StmtKind) -> &'static str {
+    match kind {
+        StmtKind::AgentDef(_) => "`agent`",
+        StmtKind::StructDef(_) => "`struct`",
+        StmtKind::EnumDef(_) => "`enum`",
+        StmtKind::TraitDef(_) => "`trait`",
+        StmtKind::KernelDef(_) => "`kernel`",
+        StmtKind::TokenizerDef(_) => "`tokenizer`",
+        StmtKind::DatasetDef(_) => "`dataset`",
+        StmtKind::DatatypeDef(_) => "`datatype`",
+        StmtKind::ServeBlock(_) => "`serve`",
+        _ => "declaration",
+    }
 }
 
 fn render_fn_signature(f: &nsl_ast::decl::FnDef, interner: &Interner) -> String {
@@ -494,6 +592,34 @@ mod tests {
              or the reference page carries a hole:\n  {}",
             undocumented.len(),
             undocumented.join("\n  ")
+        );
+    }
+
+    /// Every module carries a header.
+    ///
+    /// Module headers are detected by a rule with a silent failure mode — a
+    /// `##` run ADJACENT to the file's first statement is treated as that
+    /// item's doc, not the module's, and if no item claims it (an `import`
+    /// is not an entry) it is dropped. That is how six modules went
+    /// headerless through #590 unnoticed. The item gate above cannot see it:
+    /// a module with no description emits no "*Undocumented.*" line, it just
+    /// renders a heading with nothing under it.
+    #[test]
+    fn every_stdlib_module_carries_a_header() {
+        let modules = collect_modules(&workspace_root().join("stdlib"))
+            .expect("collect the stdlib modules");
+        let headerless: Vec<String> = modules
+            .iter()
+            .filter(|m| m.docs.is_empty())
+            .map(|m| m.file.clone())
+            .collect();
+        assert!(
+            headerless.is_empty(),
+            "{} stdlib module(s) have no `##` header. Put a `##` block at the top of the \
+             file, separated from the first declaration by a blank line — a run adjacent to \
+             the first item belongs to that item:\n  {}",
+            headerless.len(),
+            headerless.join("\n  ")
         );
     }
 }

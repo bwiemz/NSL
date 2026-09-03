@@ -1,4 +1,9 @@
-## Compatibility shims for programs written against older NSL surfaces.
+## Interoperability with external ML frameworks — safetensors, HuggingFace
+## and ONNX.
+##
+## The conversions themselves (`load_safetensors`, `save_safetensors`,
+## `from_hf`, `to_onnx`) are compiler intrinsics callable without importing
+## this module; what lives here is the shim-revision marker.
 
 # NeuralScript Interop Module (nsl.compat)
 #
