@@ -732,4 +732,10 @@ pub(crate) const RUNTIME_FUNCTIONS_ABI_TENSOR: &[(&str, &[types::Type], Option<t
     // LSE tape-carry gates: fused-SDPA launch counter (0 = base fwd kernel,
     // 1 = Tier-B tile-skip) — NSL-callable as sdpa_fused_launch_count(v).
     ("nsl_sdpa_fused_launch_count", &[types::I64], Some(types::I64)),
+    // --- M39b: vmap runtime ---
+    (
+        "nsl_vmap_check_batch",
+        &[types::I64, types::I64, types::I64],
+        Some(types::I64),
+    ),
 ];

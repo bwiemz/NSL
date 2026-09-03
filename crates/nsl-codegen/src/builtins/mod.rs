@@ -52,29 +52,26 @@ use crate::error::CodegenError;
 
 pub(crate) mod collections;
 pub(crate) mod io;
+pub(crate) mod memory;
 pub(crate) mod scalar;
 pub(crate) mod tensor;
 
 /// Runtime function info: (name, params, returns).
 type RuntimeFn = (&'static str, &'static [types::Type], Option<types::Type>);
 
-#[rustfmt::skip]
-pub(crate) const RUNTIME_FUNCTIONS_MEMORY: &[RuntimeFn] = &[
-    // Memory
-    ("nsl_alloc", &[types::I64], Some(types::I64)),
-    ("nsl_free", &[types::I64], None),
-    ("nsl_closure_free", &[types::I64], None),
-];
-
 /// Every table in the registry.
 ///
 /// A table missing from this list is silently never declared, and the calls
 /// the codegen emits to it fail to link — so a new file must be added here as
-/// well as to its `mod` declaration. `every_table_is_reachable` pins the entry
-/// count against the count `nsl-abi` parses out of the sources, which catches
-/// exactly that.
+/// well as to its `mod` declaration.
+///
+/// `every_declared_table_is_reachable` catches that: it parses every table
+/// under `src/` and asserts the names found there are exactly the names
+/// reachable through this list. (`dead_code = "deny"` usually gets there
+/// first, rejecting the unused const at compile time; the test covers the
+/// case rustc cannot see, a file that is never `mod`-declared.)
 const RUNTIME_TABLES: &[&[RuntimeFn]] = &[
-    RUNTIME_FUNCTIONS_MEMORY,
+    memory::RUNTIME_FUNCTIONS_MEMORY,
     io::RUNTIME_FUNCTIONS_IO,
     scalar::RUNTIME_FUNCTIONS_SCALAR,
     collections::RUNTIME_FUNCTIONS_COLLECTIONS,
@@ -155,6 +152,7 @@ pub fn declare_runtime_functions(
 
     Ok(fns)
 }
+
 #[cfg(test)]
 mod tests {
     use super::all_runtime_functions;
@@ -171,54 +169,56 @@ mod tests {
     ///
     /// So this reads the registry's own sources and compares the names it
     /// finds against the names actually reachable at runtime.
+    ///
+    /// The reading is done by `nsl-abi`, which is the parser the ABI gate
+    /// already uses on these same files. A second hand-rolled scanner lived
+    /// here first and was wrong in a way worth recording: it recognised only
+    /// `const` and `pub(crate) const`, so a table spelled `pub(super) const`
+    /// — arguably the more idiomatic visibility, since these are read only by
+    /// the parent — would have been invisible to it. Its names would never
+    /// enter `on_disk`, they would not be reachable either, and BOTH
+    /// assertions below would have passed over exactly the hole this test
+    /// exists to close. Sharing the parser also means the two cannot drift.
     #[test]
     fn every_declared_table_is_reachable() {
         use std::collections::BTreeSet;
 
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut on_disk: BTreeSet<String> = BTreeSet::new();
-        for dir in ["builtins", "runtime_abi"] {
-            let d = src.join(dir);
-            for entry in std::fs::read_dir(&d).unwrap_or_else(|e| panic!("read {d:?}: {e}")) {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
                 let path = entry.expect("dir entry").path();
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-                // Line-anchored on the DECLARATION, and only within its body.
-                // Anchoring on the bare text would match this very test's own
-                // `"const RUNTIME_FUNCTIONS"` string literal and then sweep the
-                // whole test module, collecting fragments of assert messages
-                // as though they were entries — it did, before this was
-                // line-anchored. `mod.rs` also names a runtime function in the
-                // cfg'd probe block, which is not a table entry either.
-                let mut in_table = false;
-                for line in text.lines() {
-                    let t = line.trim_start();
-                    if t.starts_with("const RUNTIME_FUNCTIONS")
-                        || t.starts_with("pub(crate) const RUNTIME_FUNCTIONS")
-                    {
-                        in_table = true;
-                        continue;
-                    }
-                    if in_table && line.trim_end() == "];" {
-                        in_table = false;
-                        continue;
-                    }
-                    if !in_table {
-                        continue;
-                    }
-                    let code = line.split("//").next().unwrap_or("");
-                    if let Some(q) = code.find("\"nsl_") {
-                        let after = &code[q + 1..];
-                        if let Some(e) = after.find('"') {
-                            on_disk.insert(after[..e].to_string());
-                        }
-                    }
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
                 }
             }
         }
+
+        // The WHOLE crate source, not just the two registry directories: a
+        // table in a third directory, or nested one level deeper, is one
+        // `nsl-abi` would still find and signature-check while nothing
+        // declared it.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        files.sort();
+
+        let mut on_disk: BTreeSet<String> = BTreeSet::new();
+        let (mut found, mut parsed) = (0usize, 0usize);
+        for path in &files {
+            let text =
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let label = path.display().to_string();
+            let (sigs, seen, ok) = nsl_abi::parse_runtime_functions_table_in_file(&text, &label);
+            found += seen;
+            parsed += ok;
+            on_disk.extend(sigs.into_iter().map(|s| s.name));
+        }
+        assert_eq!(
+            found, parsed,
+            "{found} table declaration(s) found under src/ but {parsed} parsed — one was \
+             recognised and then not read, so the comparison below is over an incomplete set."
+        );
 
         let reachable: BTreeSet<String> =
             all_runtime_functions().map(|(n, _, _)| (*n).to_string()).collect();

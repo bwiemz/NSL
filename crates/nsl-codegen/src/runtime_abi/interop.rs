@@ -118,12 +118,6 @@ pub(crate) const RUNTIME_FUNCTIONS_ABI_INTEROP: &[(&str, &[types::Type], Option<
         &[types::I64, types::I64, types::I64],
         None,
     ),
-    // --- M39b: vmap runtime ---
-    (
-        "nsl_vmap_check_batch",
-        &[types::I64, types::I64, types::I64],
-        Some(types::I64),
-    ),
     // --- M48: Multimodal primitives ---
     (
         "nsl_patch_embed",
