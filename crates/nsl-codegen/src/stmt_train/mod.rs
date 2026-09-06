@@ -6,6 +6,9 @@
 //! phases. Each submodule here is one phase peeled off that function
 //! (roadmap A1), in the order the driver runs them:
 //!
+//!   - [`contract`] — section 2: the resolved optimizer / scheduler /
+//!     callbacks contract, the `data:` section, the Muon perf-flag
+//!     refusals and the FASE plan, returned as a [`contract::TrainContract`].
 //!   - [`identity`] — the checkpoint-identity emission at setup: the
 //!     resolved train/optimizer/scheduler record (item 4) and the
 //!     full-state resume load (Milestone B).
@@ -24,6 +27,7 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod contract;
 pub(crate) mod epoch_close;
 pub(crate) mod identity;
 pub(crate) mod param_lists;
