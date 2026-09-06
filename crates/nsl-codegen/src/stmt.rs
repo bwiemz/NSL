@@ -16,6 +16,7 @@ use crate::context::{FuncState, LoopContext};
 use crate::error::CodegenError;
 use crate::stmt_csla::{emit_csla_accum_alloc, emit_csla_group_update, MuonCslaCtx};
 use crate::stmt_train::contract::TrainContract;
+use crate::stmt_train::epoch_close::{emit_epoch_close, EpochClose};
 use crate::stmt_train::teardown::{emit_train_teardown, TrainTeardown};
 use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
 use cranelift_codegen::ir::Value;
@@ -5550,7 +5551,7 @@ impl Compiler<'_> {
     /// passes it to `emit_callback_residency_close`. Returns `None` (no-op)
     /// when streaming is off or the callback never touches the model, so the
     /// steady-state transfer arithmetic the CSLA gates assert is unchanged.
-    fn emit_callback_residency_open(
+    pub(crate) fn emit_callback_residency_open(
         &mut self,
         builder: &mut FunctionBuilder,
         body: &nsl_ast::stmt::Block,
@@ -5580,7 +5581,7 @@ impl Compiler<'_> {
     /// a guarded callback body. `writeback=1` when the body might have mutated
     /// θ so the change survives the next window's upload; `0` for a read-only
     /// body (logging, `model_save`).
-    fn emit_callback_residency_close(
+    pub(crate) fn emit_callback_residency_close(
         &mut self,
         builder: &mut FunctionBuilder,
         guard: Option<bool>,
@@ -7093,129 +7094,43 @@ impl Compiler<'_> {
         builder.def_var(step_count_var, zero_i64);
 
         // Item 4 (2026-08-25): render + install the resolved
-        // train/optimizer/scheduler record for checkpoint identity. At
-        // train-block ENTRY, per block (a module can hold several), before
-        // the resume load below reads it as the LIVE side and before any
-        // save writes it into the sidecar. Values are the RESOLVED config —
-        // compile-time constants the runtime cannot recover. Floats render
-        // via Display (shortest round-trip, digits/dot only for validated
-        // positive config values); the one user-text field (no_decay roles)
-        // is allowlisted to [a-z0-9_-] — the #519 lesson: allowlist user
-        // text inside structured containers.
-        {
-            let clip_s = if grad_clip == f64::MAX {
-                "none".to_string()
-            } else {
-                grad_clip.to_string()
-            };
-            let adamw_lr_s = adamw_lr_value
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "none".to_string());
-            let mut nd: Vec<String> = no_decay_scope
-                .static_roles
-                .iter()
-                .map(|r| {
-                    r.chars()
-                        .map(|c| {
-                            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                                c.to_ascii_lowercase()
-                            } else {
-                                '_'
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
-            if no_decay_scope.exempt_non_rank2 {
-                nd.push("vector".to_string());
-            }
-            nd.sort();
-            let nd_s = if nd.is_empty() { "none".to_string() } else { nd.join("+") };
-            let (sched_s, sched_params): (&str, Vec<f64>) = match &scheduler {
-                None => ("none", Vec::new()),
-                Some(sch) => {
-                    use nsl_semantic::optim_config::ResolvedScheduler as RS;
-                    let ps = match sch {
-                        RS::ConstantLr => Vec::new(),
-                        RS::StepLr { step_size, gamma } => vec![*step_size, *gamma],
-                        RS::ExponentialLr { gamma } => vec![*gamma],
-                        RS::LinearDecay { total_steps, end_factor } => {
-                            vec![*total_steps, *end_factor]
-                        }
-                        RS::CosineAnneal { t_max, eta_min } => vec![*t_max, *eta_min],
-                        RS::WarmupCosine { warmup_steps, total_steps, min_lr } => {
-                            vec![*warmup_steps, *total_steps, *min_lr]
-                        }
-                        RS::OneCycle { max_lr, total_steps, pct_start } => {
-                            vec![*max_lr, *total_steps, *pct_start]
-                        }
-                    };
-                    (sch.fn_name(), ps)
-                }
-            };
-            let mut rec = format!(
-                "opt={optimizer_name},lr={lr_value},accum={grad_accumulation_steps},\
-clip={clip_s},wd={weight_decay_value},beta1={beta1_value},beta2={beta2_value},\
-eps={eps_value},momentum={momentum_value},dampening={dampening_value},\
-nesterov={},ns_steps={ns_steps_value},adamw_lr={adamw_lr_s},no_decay={nd_s},\
-sched={sched_s}",
-                nesterov_value as u8,
-            );
-            for (i, v) in sched_params.iter().enumerate() {
-                rec.push_str(&format!(",sp{}={v}", i + 1));
-            }
-            self.intern_string(&rec)?;
-            let rec_ptr = self.compile_string_literal(builder, &rec)?;
-            let rec_len = builder.ins().iconst(cl_types::I64, rec.len() as i64);
-            self.compile_call_by_name(
-                builder,
-                "nsl_set_train_config_record",
-                &[rec_ptr, rec_len],
-            )?;
-        }
+        // train/optimizer/scheduler record for checkpoint identity. Moved
+        // to `stmt_train/identity.rs` byte-for-byte (roadmap A1), where the
+        // renderer is a pure function with unit tests.
+        self.emit_train_config_record(
+            builder,
+            &crate::stmt_train::identity::TrainConfigRecordInputs {
+                optimizer_name: &optimizer_name,
+                lr_value,
+                grad_accumulation_steps,
+                grad_clip,
+                weight_decay_value,
+                beta1_value,
+                beta2_value,
+                eps_value,
+                momentum_value,
+                dampening_value,
+                nesterov_value,
+                ns_steps_value,
+                adamw_lr_value,
+                no_decay_scope: &no_decay_scope,
+                scheduler: &scheduler,
+            },
+        )?;
 
-        // Milestone B: full-state resume. Emitted AFTER moment allocation and
-        // BEFORE the first register belt: θ and m/v are all still plain f32
-        // device tensors here, so the loader's H2D path covers every arm —
-        // including bf16-sr and --weight-stream, whose registration happens
-        // at step-body top and will quantize/evict the LOADED values. The
-        // restored micro-batch counter seeds step_count_var so bias
-        // correction, the scheduler, and checkpoint cadence all continue
-        // instead of re-warming.
-        //
-        // Item 8: the DataLoader handle travels with the call so the runtime
-        // can restore the data position too (and refuse a resume whose corpus
-        // or geometry drifted). 0 = this train block has no loader, which the
-        // sidecar records and cross-checks — a loader-less checkpoint resumed
-        // into a loader run (or the reverse) is a silently different training
-        // stream, not a continuation.
-        // Bound ONCE here and reused by the batch loop below, so the handle
-        // the checkpoint records and the handle the loop iterates are the
-        // same value by construction — two independent `.last()` reads could
-        // drift and silently record a position from a different loader.
-        let has_dataloader = state.cleanup.dataloader_vars.last().copied();
-        let checkpoint_dl_handle = has_dataloader
-            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
-        if let Some(load_path) = checkpoint_load_path.clone() {
-            self.intern_string(&load_path)?;
-            let path_val = self.compile_string_literal(builder, &load_path)?;
-            let path_len = builder.ins().iconst(cl_types::I64, load_path.len() as i64);
-            let epochs_val_for_resume = builder.ins().iconst(cl_types::I64, epochs);
-            let restored = self.compile_call_by_name(
-                builder,
-                "nsl_train_checkpoint_load",
-                &[
-                    path_val,
-                    path_len,
-                    param_list,
-                    state_list_1,
-                    state_list_2,
-                    checkpoint_dl_handle,
-                    epochs_val_for_resume,
-                ],
-            )?;
-            builder.def_var(step_count_var, restored);
-        }
+        // Milestone B: full-state resume — moved to `stmt_train/identity.rs`
+        // byte-for-byte (roadmap A1); see its header for the ordering and
+        // the once-bound loader handle.
+        let (has_dataloader, checkpoint_dl_handle) = self.emit_checkpoint_resume(
+            builder,
+            state,
+            &checkpoint_load_path,
+            epochs,
+            param_list,
+            state_list_1,
+            state_list_2,
+            step_count_var,
+        )?;
 
         // Dev Tools Phase 5 Task 7: publish step-counter variable so
         // `@inspect` emission inside the step body can gate on `step % N`.
@@ -15856,127 +15771,27 @@ sched={sched_s}",
         }
 
         // ── 8. Close batch loop (if DataLoader) and increment epoch ──────
-        let current = state.current_block.unwrap_or(batch_body_block);
-        if has_dataloader.is_some() {
-            // Jump back to batch_header for next batch
-            if !is_block_filled(builder, current) {
-                builder.ins().jump(batch_header_block, &[]);
-            }
-            // Now seal batch_header — both predecessors connected (entry + back-edge)
-            builder.seal_block(batch_header_block);
-            // batch_exit: all batches done → run epoch callbacks then increment
-            builder.switch_to_block(batch_exit_block);
-            builder.seal_block(batch_exit_block);
-            state.current_block = Some(batch_exit_block);
-        } else {
-            // No DataLoader — single step per epoch, stay in the current block for epoch callbacks
-            state.current_block = Some(current);
-        }
-
-        let mut epoch_loss_alias_sym: Option<nsl_ast::Symbol> = None;
-        for cb in &callbacks {
-            let cb_name = self.resolve_sym(cb.name).to_string();
-            if cb_name == "on_epoch" || cb_name == "on_epoch_end" {
-                for param in &cb.params {
-                    let pname = self.resolve_sym(param.name).to_string();
-                    match pname.as_str() {
-                        "epoch" => {
-                            let var = builder.declare_var(cl_types::I64);
-                            let epoch_val = builder.use_var(epoch_counter_var);
-                            builder.def_var(var, epoch_val);
-                            state.variables.insert(param.name, (var, cl_types::I64));
-                            state.param_symbols.insert(param.name);
-                            // Same invariant as on_step's `step` arm: an untyped
-                            // slot reads as indeterminate to any future
-                            // tensor-cleanup sweep over state.variables, which
-                            // would hand this raw counter to
-                            // nsl_tensor_free_if_valid. No such sweep runs over
-                            // epoch scope today, but the binding shouldn't rely
-                            // on that staying true.
-                            state.variable_types.insert(param.name, Type::Int);
-                        }
-                        "loss" => {
-                            let var = builder.declare_var(cl_types::I64);
-                            let epoch_loss = builder.use_var(epoch_loss_var);
-                            builder.def_var(var, epoch_loss);
-                            state.variables.insert(param.name, (var, cl_types::I64));
-                            state.param_symbols.insert(param.name);
-                            // Unlike `epoch`, this one really is a tensor
-                            // pointer: it aliases the exact value in
-                            // epoch_loss_var, which this function frees
-                            // explicitly (nsl_tensor_free_if_valid) right
-                            // after the callback body below runs. Typing it
-                            // Int like `epoch` would misrepresent it; leaving
-                            // it untyped makes it read as "indeterminate" to
-                            // the step-body sweep's own filter a few hundred
-                            // lines up (`is_tensor || is_unknown`) — and a
-                            // future epoch-scope sweep modeled on that one
-                            // would free this alias too, double-freeing the
-                            // same pointer. non_owning_symbols is the flag
-                            // that sweep already checks (see its
-                            // `!state.non_owning_symbols.contains(sym)`
-                            // filter) to skip exactly this kind of borrowed
-                            // alias, so mark it and clear the mark once this
-                            // callback's body is done using it.
-                            state.non_owning_symbols.insert(param.name);
-                            epoch_loss_alias_sym = Some(param.name);
-                        }
-                        _ => {
-                            let var = builder.declare_var(cl_types::I64);
-                            let z = builder.ins().iconst(cl_types::I64, 0);
-                            builder.def_var(var, z);
-                            state.variables.insert(param.name, (var, cl_types::I64));
-                            state.param_symbols.insert(param.name);
-                            // Typed for the same reason as `epoch` above.
-                            state.variable_types.insert(param.name, Type::Int);
-                        }
-                    }
-                }
-                // Item 12: same scoped-residency guard as on_step — an
-                // on_epoch callback that logs / saves model state runs with
-                // every streamed param evicted.
-                let ws_guard =
-                    self.emit_callback_residency_open(builder, &cb.body, model_sym, &cb_name)?;
-                for stmt in &cb.body.stmts {
-                    self.compile_stmt(builder, state, stmt)?;
-                }
-                self.emit_callback_residency_close(builder, ws_guard)?;
-                // Scope the non_owning mark to this callback's body: it isn't
-                // covered by the saved_variables/saved_variable_types restore
-                // at the end of this train block, and `loss` is common enough
-                // as a symbol name elsewhere that leaving the mark set would
-                // wrongly suppress freeing unrelated tensors bound to it later.
-                if let Some(sym) = epoch_loss_alias_sym.take() {
-                    state.non_owning_symbols.remove(&sym);
-                }
-            }
-        }
-
-        if on_epoch_binds_loss {
-            let saved_loss = builder.use_var(epoch_loss_var);
-            self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[saved_loss])?;
-            let epoch_loss_null = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(epoch_loss_var, epoch_loss_null);
-        }
-
-        let epoch_callback_block = state.current_block.unwrap_or(current);
-        if !is_block_filled(builder, epoch_callback_block) {
-            builder.ins().jump(increment_block, &[]);
-        }
-
-        builder.switch_to_block(increment_block);
-        builder.seal_block(increment_block);
-        state.current_block = Some(increment_block);
-        let counter = builder.use_var(epoch_counter_var);
-        let one = builder.ins().iconst(cl_types::I64, 1);
-        let next = builder.ins().iadd(counter, one);
-        builder.def_var(epoch_counter_var, next);
-        builder.ins().jump(header_block, &[]);
-
-        builder.seal_block(header_block);
-        builder.switch_to_block(exit_block);
-        builder.seal_block(exit_block);
-        state.current_block = Some(exit_block);
+        // Moved to `stmt_train/epoch_close.rs` byte-for-byte (roadmap A1):
+        // the epoch callbacks, the epoch increment and the loop seal.
+        emit_epoch_close(
+            self,
+            builder,
+            state,
+            &callbacks,
+            EpochClose {
+                batch_header_block,
+                batch_body_block,
+                batch_exit_block,
+                has_dataloader,
+                header_block,
+                increment_block,
+                exit_block,
+                epoch_counter_var,
+                epoch_loss_var,
+                on_epoch_binds_loss,
+                model_sym,
+            },
+        )?;
 
         // Free the block's lists, sweep the trailing CSLA window, restore
         // streamed weights, print the graphs banner (stmt_train/teardown.rs).
