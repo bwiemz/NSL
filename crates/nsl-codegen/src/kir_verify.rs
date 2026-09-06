@@ -24,6 +24,12 @@
 //!      `Const` matches its literal, thread-index ops produce `U32`,
 //!      `PtrOffset` keeps the base's pointer type.
 //!
+//!   5. **Async-copy discipline.** Within a block, every `CpAsync` is
+//!      committed (`CpAsyncCommit`) before a `CpAsyncWait` and before the
+//!      block ends, and a `CpAsyncWait { pending }` never names more
+//!      groups than have been committed. `CpAsync` copies 4, 8 or 16 bytes
+//!      from a `Ptr(_, Global)` into a `Ptr(_, Shared)`.
+//!
 //! Untyped variables (`KirBuilder::new_var`) are exempt from rule 4 only;
 //! the FPGA-only structured ops (`Matmul`, `ElementwiseAdd`, `Relu`) carry
 //! their dtypes inline and are checked for rules 1–3 only.
@@ -37,7 +43,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::kernel_ir::{BlockId, KernelIR, KirConst, KirOp, KirTerminator, KirType, VarId};
+use crate::kernel_ir::{
+    AddressSpace, BlockId, KernelIR, KirConst, KirOp, KirTerminator, KirType, VarId,
+};
 
 /// One violation. `block` / `op_index` locate the offending op (the
 /// terminator is reported with `op_index == usize::MAX`).
@@ -69,6 +77,23 @@ pub enum KirVerifyError {
     },
     /// A memory op's address operand is typed but is not a pointer.
     NotAPointer { var: VarId, block: BlockId, op_index: usize, found: KirType },
+    /// A typed pointer operand lives in the wrong state space (`CpAsync`
+    /// copies global → shared, nothing else).
+    AddressSpaceMismatch {
+        var: VarId,
+        block: BlockId,
+        op_index: usize,
+        role: &'static str,
+        expected: AddressSpace,
+        found: AddressSpace,
+    },
+    /// `CpAsync { bytes }` with a width `cp.async` does not have.
+    BadAsyncCopyWidth { block: BlockId, op_index: usize, bytes: u8 },
+    /// A `CpAsync` that is still uncommitted at a `CpAsyncWait` (the wait
+    /// cannot cover it) or at the block's end (`op_index == TERMINATOR_INDEX`).
+    UncommittedAsyncCopy { block: BlockId, op_index: usize },
+    /// `CpAsyncWait { pending }` naming more groups than the block committed.
+    AsyncWaitExceedsGroups { block: BlockId, op_index: usize, pending: u8, committed: u8 },
 }
 
 impl fmt::Display for KirVerifyError {
@@ -103,6 +128,27 @@ impl fmt::Display for KirVerifyError {
             KirVerifyError::NotAPointer { var, block, op_index, found } => write!(
                 f,
                 "v{var} at block {block} op {op_index} is used as an address but has type {found:?}"
+            ),
+            KirVerifyError::AddressSpaceMismatch { var, block, op_index, role, expected, found } => {
+                write!(
+                    f,
+                    "v{var} ({role}) at block {block} op {op_index}: expected a {expected:?} pointer, found {found:?}"
+                )
+            }
+            KirVerifyError::BadAsyncCopyWidth { block, op_index, bytes } => write!(
+                f,
+                "CpAsync at block {block} op {op_index} copies {bytes} bytes; cp.async copies 4, 8 or 16"
+            ),
+            KirVerifyError::UncommittedAsyncCopy { block, op_index } => {
+                if *op_index == TERMINATOR_INDEX {
+                    write!(f, "block {block} ends with an uncommitted CpAsync")
+                } else {
+                    write!(f, "CpAsyncWait at block {block} op {op_index} cannot cover an uncommitted CpAsync")
+                }
+            }
+            KirVerifyError::AsyncWaitExceedsGroups { block, op_index, pending, committed } => write!(
+                f,
+                "CpAsyncWait at block {block} op {op_index} allows {pending} pending group(s) but only {committed} were committed"
             ),
         }
     }
@@ -228,6 +274,51 @@ pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
         }
     }
 
+    // ── 5. Async-copy discipline ─────────────────────────────────────
+    for block in &ir.blocks {
+        let mut uncommitted: u32 = 0;
+        let mut committed: u8 = 0;
+        for (op_index, op) in block.ops.iter().enumerate() {
+            match op {
+                KirOp::CpAsync { bytes, .. } => {
+                    if !matches!(bytes, 4 | 8 | 16) {
+                        errors.push(KirVerifyError::BadAsyncCopyWidth {
+                            block: block.id,
+                            op_index,
+                            bytes: *bytes,
+                        });
+                    }
+                    uncommitted += 1;
+                }
+                KirOp::CpAsyncCommit => {
+                    committed = committed.saturating_add(1);
+                    uncommitted = 0;
+                }
+                KirOp::CpAsyncWait { pending } => {
+                    if uncommitted > 0 {
+                        errors.push(KirVerifyError::UncommittedAsyncCopy { block: block.id, op_index });
+                    }
+                    if *pending > committed {
+                        errors.push(KirVerifyError::AsyncWaitExceedsGroups {
+                            block: block.id,
+                            op_index,
+                            pending: *pending,
+                            committed,
+                        });
+                    }
+                    committed = committed.min(*pending);
+                }
+                _ => {}
+            }
+        }
+        if uncommitted > 0 {
+            errors.push(KirVerifyError::UncommittedAsyncCopy {
+                block: block.id,
+                op_index: TERMINATOR_INDEX,
+            });
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -280,8 +371,15 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::Cmp(d, _, _, _)
         | KirOp::Select(d, _, _, _)
         | KirOp::Const(d, _)
-        | KirOp::PtrOffset(d, _, _) => Some(*d),
-        KirOp::Store(_, _, _) | KirOp::AtomicAdd(_, _, _) | KirOp::Barrier | KirOp::SharedMemFence => None,
+        | KirOp::PtrOffset(d, _, _)
+        | KirOp::SharedBase(d) => Some(*d),
+        KirOp::Store(_, _, _)
+        | KirOp::AtomicAdd(_, _, _)
+        | KirOp::Barrier
+        | KirOp::SharedMemFence
+        | KirOp::CpAsync { .. }
+        | KirOp::CpAsyncCommit
+        | KirOp::CpAsyncWait { .. } => None,
         KirOp::Matmul { out, .. } | KirOp::ElementwiseAdd { out, .. } | KirOp::Relu { out, .. } => {
             Some(*out)
         }
@@ -311,7 +409,11 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::Cast(_, s, _)
         | KirOp::Load(_, s, _) => vec![*s],
         KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) => vec![*p, *v],
-        KirOp::ThreadId(_, _)
+        KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
+        KirOp::SharedBase(_)
+        | KirOp::CpAsyncCommit
+        | KirOp::CpAsyncWait { .. }
+        | KirOp::ThreadId(_, _)
         | KirOp::BlockIdx(_, _)
         | KirOp::BlockDim(_, _)
         | KirOp::GridDim(_, _)
@@ -460,7 +562,44 @@ fn check_types(
             }
             None => {}
         },
-        KirOp::Barrier
+        KirOp::SharedBase(d) => match ty(d) {
+            Some(KirType::Ptr(_, AddressSpace::Shared)) | None => {}
+            Some(KirType::Ptr(_, found)) => errors.push(KirVerifyError::AddressSpaceMismatch {
+                var: *d,
+                block,
+                op_index,
+                role: "dst",
+                expected: AddressSpace::Shared,
+                found,
+            }),
+            Some(found) => errors.push(KirVerifyError::NotAPointer { var: *d, block, op_index, found }),
+        },
+        KirOp::CpAsync { dst, src, .. } => {
+            for (var, role, expected) in
+                [(*dst, "dst", AddressSpace::Shared), (*src, "src", AddressSpace::Global)]
+            {
+                match ty(&var) {
+                    None => {}
+                    Some(KirType::Ptr(_, found)) if found != expected => {
+                        errors.push(KirVerifyError::AddressSpaceMismatch {
+                            var,
+                            block,
+                            op_index,
+                            role,
+                            expected,
+                            found,
+                        });
+                    }
+                    Some(KirType::Ptr(_, _)) => {}
+                    Some(found) => {
+                        errors.push(KirVerifyError::NotAPointer { var, block, op_index, found })
+                    }
+                }
+            }
+        }
+        KirOp::CpAsyncCommit
+        | KirOp::CpAsyncWait { .. }
+        | KirOp::Barrier
         | KirOp::SharedMemFence
         | KirOp::Matmul { .. }
         | KirOp::ElementwiseAdd { .. }
@@ -851,6 +990,185 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(verify(&ir), Ok(()));
+    }
+
+    fn shared_u8_ptr() -> KirType {
+        KirType::Ptr(Box::new(KirType::I8), AddressSpace::Shared)
+    }
+
+    /// One 16-byte async copy, committed and waited, then a barrier: the
+    /// shape every cp.async pipeline stage has.
+    fn async_copy_stage() -> KirBuilder {
+        let mut b = KirBuilder::new("t");
+        let src = b.add_param("src", KirType::Ptr(Box::new(KirType::I8), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(shared_u8_ptr());
+        b.emit(KirOp::SharedBase(smem));
+        b.emit(KirOp::CpAsync { dst: smem, src, bytes: 16 });
+        b.emit(KirOp::CpAsyncCommit);
+        b.emit(KirOp::CpAsyncWait { pending: 0 });
+        b.emit(KirOp::Barrier);
+        b
+    }
+
+    #[test]
+    fn a_committed_and_waited_async_copy_verifies_and_requires_the_feature() {
+        let mut b = async_copy_stage();
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(verify(&ir), Ok(()));
+        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::ASYNC_COPY));
+        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::SHARED_MEMORY));
+    }
+
+    #[test]
+    fn an_async_copy_left_uncommitted_at_block_end_is_reported() {
+        let mut b = KirBuilder::new("t");
+        let src = b.add_param("src", KirType::Ptr(Box::new(KirType::I8), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(shared_u8_ptr());
+        b.emit(KirOp::SharedBase(smem));
+        b.emit(KirOp::CpAsync { dst: smem, src, bytes: 8 });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::UncommittedAsyncCopy { block: 0, op_index: TERMINATOR_INDEX }])
+        );
+    }
+
+    #[test]
+    fn a_wait_cannot_cover_an_uncommitted_copy() {
+        let mut b = KirBuilder::new("t");
+        let src = b.add_param("src", KirType::Ptr(Box::new(KirType::I8), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(shared_u8_ptr());
+        b.emit(KirOp::SharedBase(smem));
+        b.emit(KirOp::CpAsync { dst: smem, src, bytes: 4 });
+        b.emit(KirOp::CpAsyncWait { pending: 0 });
+        b.emit(KirOp::CpAsyncCommit);
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::UncommittedAsyncCopy { block: 0, op_index: 2 }])
+        );
+    }
+
+    #[test]
+    fn a_wait_naming_more_groups_than_committed_is_reported() {
+        let mut b = async_copy_stage();
+        b.emit(KirOp::CpAsyncWait { pending: 2 }); // one group was committed, and the earlier wait drained it
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::AsyncWaitExceedsGroups {
+                block: 0,
+                op_index: 5,
+                pending: 2,
+                committed: 0,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_two_stage_pipeline_may_keep_one_group_in_flight() {
+        let mut b = KirBuilder::new("t");
+        let src = b.add_param("src", KirType::Ptr(Box::new(KirType::I8), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(shared_u8_ptr());
+        b.emit(KirOp::SharedBase(smem));
+        b.emit(KirOp::CpAsync { dst: smem, src, bytes: 16 });
+        b.emit(KirOp::CpAsyncCommit);
+        b.emit(KirOp::CpAsync { dst: smem, src, bytes: 16 });
+        b.emit(KirOp::CpAsyncCommit);
+        b.emit(KirOp::CpAsyncWait { pending: 1 }); // the first group has landed, the second may not have
+        b.emit(KirOp::Barrier);
+        b.emit(KirOp::CpAsyncWait { pending: 0 });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(verify(&ir), Ok(()));
+    }
+
+    #[test]
+    fn an_async_copy_width_cp_async_does_not_have_is_reported() {
+        let mut b = KirBuilder::new("t");
+        let src = b.add_param("src", KirType::Ptr(Box::new(KirType::I8), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(shared_u8_ptr());
+        b.emit(KirOp::SharedBase(smem));
+        b.emit(KirOp::CpAsync { dst: smem, src, bytes: 12 });
+        b.emit(KirOp::CpAsyncCommit);
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::BadAsyncCopyWidth { block: 0, op_index: 1, bytes: 12 }])
+        );
+    }
+
+    #[test]
+    fn an_async_copy_between_the_wrong_state_spaces_is_reported() {
+        // dst is a global pointer and src a shared one: both roles wrong.
+        let mut b = KirBuilder::new("t");
+        let g = b.add_param("g", KirType::Ptr(Box::new(KirType::I8), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(shared_u8_ptr());
+        b.emit(KirOp::SharedBase(smem));
+        b.emit(KirOp::CpAsync { dst: g, src: smem, bytes: 16 });
+        b.emit(KirOp::CpAsyncCommit);
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![
+                KirVerifyError::AddressSpaceMismatch {
+                    var: g,
+                    block: 0,
+                    op_index: 1,
+                    role: "dst",
+                    expected: AddressSpace::Shared,
+                    found: AddressSpace::Global,
+                },
+                KirVerifyError::AddressSpaceMismatch {
+                    var: smem,
+                    block: 0,
+                    op_index: 1,
+                    role: "src",
+                    expected: AddressSpace::Global,
+                    found: AddressSpace::Shared,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_shared_base_typed_as_a_global_pointer_is_reported() {
+        let mut b = KirBuilder::new("t");
+        let entry = b.new_block();
+        b.set_block(entry);
+        let p = b.new_typed_var(f32_ptr());
+        b.emit(KirOp::SharedBase(p));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::AddressSpaceMismatch {
+                var: p,
+                block: 0,
+                op_index: 0,
+                role: "dst",
+                expected: AddressSpace::Shared,
+                found: AddressSpace::Global,
+            }])
+        );
     }
 
     #[test]
