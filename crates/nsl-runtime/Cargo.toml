@@ -19,6 +19,9 @@ crate-type = ["staticlib", "rlib"]
 # declared once in nsl-abi and re-exported here at their historical paths
 # (roadmap A3). Dependency-free.
 nsl-abi.workspace = true
+# The NSL_* registry: the runtime-read behavior tier is checkpoint identity
+# (`env_record.rs`, roadmap A5). Dependency-free, like nsl-abi.
+nsl-env.workspace = true
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

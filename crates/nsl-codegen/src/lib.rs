@@ -1774,11 +1774,41 @@ impl CompileOptions {
     ///    into spurious refusals.
     /// 3. **No key is omitted when false.** `fuse_rms=0` and an absent
     ///    `fuse_rms` are different facts: absent means "a build that predates
-    ///    the key", which is the back-compatible case the runtime skips.
-    ///    Omitting false values would make every default build look like an
-    ///    old one.
+    ///    the key". The runtime skips the comparison only when a WHOLE
+    ///    record is missing; a key present on one side and absent on the
+    ///    other is reported as a difference — deliberately (see
+    ///    `exec_fingerprint::tests` in nsl-runtime), so two builds that
+    ///    disagree about whether a key exists cannot be silently treated as
+    ///    agreeing on its value. Omitting false values would therefore make
+    ///    every default build refuse against every checkpoint.
+    ///
+    /// The five `NSL_*` variables codegen reads at compile time that change
+    /// the arithmetic of the emitted program (the `behavior` tier of
+    /// `nsl env list` with `read_at: compile`) are keys here too (roadmap
+    /// A5): they were words in the build shell that no record captured.
+    /// The runtime-read half of that tier is recorded by the runtime at
+    /// checkpoint save (`nsl_runtime::env_record`).
     pub fn exec_fingerprint(&self) -> String {
+        self.exec_fingerprint_with_env(|name| std::env::var(name).ok())
+    }
+
+    /// `exec_fingerprint` with the environment injected, so a test can
+    /// exercise the env keys without mutating process-global state (which
+    /// races the other env tests in this module).
+    pub fn exec_fingerprint_with_env(&self, env: impl Fn(&str) -> Option<String>) -> String {
         let b = |v: bool| if v { "1" } else { "0" };
+        // The read sites treat exactly "0" as off (`!= Some("0")`); the
+        // fingerprint mirrors that so `NSL_FA_FWD_MMA=1` and unset agree.
+        let on_unless_zero = |name: &str| b(env(name).as_deref() != Some("0"));
+        // Free-text values ride under the same allowlist as `dtype` below;
+        // an unset variable renders as its documented default so the key is
+        // never omitted (property 3).
+        let text = |name: &str, unset: &str| -> String {
+            match env(name) {
+                Some(v) if !v.is_empty() => sanitize_fingerprint_value(&v),
+                _ => unset.to_string(),
+            }
+        };
         let ckpt = if self.checkpoint_selective {
             "selective".to_string()
         } else if self.checkpoint_blocks {
@@ -1806,18 +1836,7 @@ impl CompileOptions {
         // terminates the JSON value and corrupts the whole header — turning a
         // resume guard into an unreadable checkpoint. Everything outside
         // [a-z0-9._-] becomes `_`.
-        let dtype: String = self
-            .dtype
-            .to_ascii_lowercase()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let dtype: String = sanitize_fingerprint_value(&self.dtype.to_ascii_lowercase());
         // Clamp before rendering: the runtime clamps the workspace and falls
         // back on an unparseable ratio, so fingerprinting the raw values would
         // let two runs with identical arithmetic disagree.
@@ -1846,6 +1865,12 @@ impl CompileOptions {
             format!("mmltws={}", mm.bf16_lt_workspace_mib),
             format!("mmlttune={}", b(mm.bf16_lt_tune)),
             format!("mmcache={}", b(mm.bf16_cast_cache)),
+            // --- compile-time behavior-tier environment reads (roadmap A5) ---
+            format!("fa_mma={}", on_unless_zero("NSL_FA_FWD_MMA")),
+            format!("lce_gemm={}", on_unless_zero("NSL_FUSED_LCE_GEMM")),
+            format!("fase_sumsq={}", on_unless_zero("NSL_FASE_BATCH_SUMSQ")),
+            format!("fase_override={}", text("NSL_FASE_FUSED_OVERRIDE", "none")),
+            format!("csha_save={}", text("NSL_CSHA_DUMP_SAVE_STATE", "off")),
             format!("arena={}", b(self.transient_arena)),
             format!("graphs={}", b(self.cuda_graphs)),
             format!("ckpt={ckpt}"),
@@ -1853,6 +1878,24 @@ impl CompileOptions {
         ]
         .join(",")
     }
+}
+
+/// A value bound for the `k=v,k=v` execution fingerprint, which is embedded
+/// as a JSON string in the checkpoint sidecar. An ALLOWLIST, not a blocklist
+/// of the two separators: `,` and `=` would forge extra fields when the
+/// runtime splits the record, but a `"` or a `\` terminates the JSON value
+/// and corrupts the whole header — turning a resume guard into an unreadable
+/// checkpoint. Everything outside `[A-Za-z0-9._-]` becomes `_`.
+fn sanitize_fingerprint_value(v: &str) -> String {
+    v.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 impl Default for CompileOptions {
@@ -2394,6 +2437,7 @@ mod exec_fingerprint_tests {
         for key in [
             "ad=", "det=", "dtype=", "fusion=", "fuse_rms=", "fuse_wgrad=", "zero=", "zero_elem=",
             "ws=", "muon_bns=", "muon_resmom=", "lmhead=", "arena=", "graphs=", "ckpt=", "offload=",
+            "fa_mma=", "lce_gemm=", "fase_sumsq=", "fase_override=", "csha_save=",
         ] {
             assert!(fp.contains(key), "default fingerprint is missing {key}: {fp}");
         }
@@ -2442,6 +2486,40 @@ mod exec_fingerprint_tests {
             o.exec_fingerprint().contains("dtype=bf16-sr"),
             "ordinary dtypes must round-trip lowercased, not be mangled"
         );
+    }
+
+    /// The five compile-time behavior-tier reads reach the fingerprint, with
+    /// the read sites' own semantics ("0" is off, anything else is on), and a
+    /// hostile value cannot forge a field. Injected environment, so this
+    /// cannot race the process-global env test above.
+    #[test]
+    fn compile_time_environment_reads_reach_the_fingerprint() {
+        let o = CompileOptions::default();
+        let unset = o.exec_fingerprint_with_env(|_| None);
+        for key in ["fa_mma=1", "lce_gemm=1", "fase_sumsq=1", "fase_override=none", "csha_save=off"] {
+            assert!(unset.split(',').any(|f| f == key), "unset env must render {key}: {unset}");
+        }
+        let env = |name: &str| -> Option<String> {
+            match name {
+                "NSL_FA_FWD_MMA" => Some("0".into()),
+                "NSL_FUSED_LCE_GEMM" => Some("1".into()),
+                "NSL_FASE_BATCH_SUMSQ" => Some("0".into()),
+                "NSL_FASE_FUSED_OVERRIDE" => Some("1,0,1".into()),
+                "NSL_CSHA_DUMP_SAVE_STATE" => Some(r#"direct_max","x":"y=z"#.into()),
+                _ => None,
+            }
+        };
+        let set = o.exec_fingerprint_with_env(env);
+        for key in ["fa_mma=0", "lce_gemm=1", "fase_sumsq=0", "fase_override=1_0_1"] {
+            assert!(set.split(',').any(|f| f == key), "{key} missing: {set}");
+        }
+        let csha = set.split(',').find(|f| f.starts_with("csha_save=")).unwrap();
+        assert!(!csha.contains('"') && !csha.contains('\\'), "{csha}");
+        assert_eq!(set.split(',').count(), unset.split(',').count(), "a value forged a field: {set}");
+        assert!(set.split(',').all(|f| f.matches('=').count() == 1), "{set}");
+        // Only the values changed, never the key set or order.
+        let keys = |fp: &str| fp.split(',').map(|f| f.split('=').next().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(keys(&set), keys(&unset));
     }
 
     #[test]

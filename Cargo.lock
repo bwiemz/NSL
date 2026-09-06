@@ -1413,6 +1413,7 @@ dependencies = [
  "libloading",
  "memmap2",
  "nsl-abi",
+ "nsl-env",
  "once_cell",
  "prost",
  "rand 0.10.2",
