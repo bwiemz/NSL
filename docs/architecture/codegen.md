@@ -351,7 +351,13 @@ code may use.
 shared_mem_bytes, workgroup_size, required_features: FeatureSet }`, `KirOp`,
 `KirTerminator`, `KirType`, `AddressSpace`, and `KirBuilder` (`new`,
 `add_param`, `new_typed_var`, `new_block`, `set_block`, `emit`, `terminate`,
-`finalize() -> KernelIR`). `src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
+`finalize() -> KernelIR`). `src/kir_verify.rs::verify` is the KIR verifier
+(roadmap A2 step 2): block shape and branch targets, SSA (one definition per
+`VarId`), def-before-use under dominance over the block CFG, and operand
+typing wherever `var_types` records both sides; `KernelIR::verify` and
+`KernelIR::is_well_formed` are the same check, and `lower_kernel_to_ir`
+refuses a kernel that fails it with every violation listed.
+`src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
 (ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
 `src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
 are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` lowers a

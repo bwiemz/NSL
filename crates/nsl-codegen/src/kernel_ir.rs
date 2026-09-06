@@ -388,9 +388,17 @@ impl KernelIR {
         self.blocks.iter().flat_map(|b| b.ops.iter())
     }
 
-    /// Validate that all blocks have terminators.
+    /// Run the KIR verifier (`crate::kir_verify`): shape, SSA,
+    /// def-before-use under dominance, and operand typing. `Ok(())` or
+    /// every violation found.
+    pub fn verify(&self) -> Result<(), Vec<crate::kir_verify::KirVerifyError>> {
+        crate::kir_verify::verify(self)
+    }
+
+    /// `verify().is_ok()`. Until roadmap A2 step 2 this checked only that
+    /// every block had a terminator; that is now rule 1 of the verifier.
     pub fn is_well_formed(&self) -> bool {
-        self.blocks.iter().all(|b| b.terminator.is_some())
+        self.verify().is_ok()
     }
 }
 
