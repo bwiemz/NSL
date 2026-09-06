@@ -694,7 +694,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
         }
     }
     let resume = format!(
-        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}","train_cfg":"{train_cfg}"}}"#,
+        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}","train_cfg":"{train_cfg}","env":"{env_rec}"}}"#,
         hl = (dl_ptr != 0) as u64,
         // The compile-flag record installed by main(). Empty for a program
         // built before the fingerprint existed; the loader treats empty as
@@ -704,6 +704,11 @@ pub extern "C" fn nsl_train_checkpoint_save(
         // train-block entry (item 4). Same tolerance as `exec`: empty for
         // a build predating it; the loader says the check is skipped.
         train_cfg = crate::train_config_record::train_config_record(),
+        // The runtime-read behavior-tier NSL_* variables that are SET
+        // (roadmap A5). Empty means "nothing exported", which is the common
+        // case; the loader tells that apart from "predates the record" by
+        // the key's presence, not its value.
+        env_rec = crate::env_record::env_record(),
         seed_hex = rng.seed_hex(),
         hi = (rng.sampling_pos >> 64) as u64,
         lo = rng.sampling_pos as u64,
@@ -1024,6 +1029,17 @@ pub extern "C" fn nsl_train_checkpoint_load(
                     std::process::abort();
                 }),
             },
+            env: scan_header_string(header_bytes, b"\"env\":").map(|raw| {
+                String::from_utf8(raw).unwrap_or_else(|_| {
+                    eprintln!(
+                        "nsl: train_checkpoint_load: the sidecar's 'env' \
+                         record is not valid UTF-8. Treating it as absent \
+                         would silently disable the environment check, so \
+                         this refuses instead — the checkpoint is corrupt."
+                    );
+                    std::process::abort();
+                })
+            }),
             rng: crate::rng_state::RngSnapshot {
                 sampling_seed,
                 sampling_pos: ((hi as u128) << 64) | (lo as u128),
@@ -1120,6 +1136,11 @@ pub extern "C" fn nsl_train_checkpoint_load(
         // (lr/schedule/clip) aborts naming the acknowledgment env. Policy
         // and messages live in `train_config_record::check_on_resume`.
         crate::train_config_record::check_on_resume(&r.train_cfg);
+
+        // The runtime-read behavior-tier environment (roadmap A5). Same
+        // doctrine as the two checks above: it is arithmetic, so it refuses,
+        // with `NSL_RESUME_ALLOW_ENV_DRIFT=1` as the acknowledged escape.
+        crate::env_record::check_on_resume(r.env.as_deref());
 
         // `epochs` is the run TOTAL (see this function's doc). A checkpoint
         // at or past it leaves the epoch loop with nothing to do: zero steps,
@@ -1380,6 +1401,12 @@ struct ResumeState {
     /// at the SAVING run's train-block entry (item 4). Same empty-means-
     /// predates-the-feature tolerance as `exec`.
     train_cfg: String,
+    /// The runtime-read behavior-tier `NSL_*` variables the SAVING run had
+    /// set (`NAME=v,NAME=v`; roadmap A5). `None` when the sidecar predates
+    /// the record — distinct from `Some("")`, which is a run that had none
+    /// set, so the check runs and an exported variable on THIS side is a
+    /// difference.
+    env: Option<String>,
     /// Whether the SAVING run had a DataLoader. Distinguishes "loader at
     /// epoch 0 slot 0" from "no loader at all" — without it, a loader-less
     /// checkpoint and a loader checkpoint saved before its first batch are
