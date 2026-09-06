@@ -6,6 +6,11 @@
 //! phases. Each submodule here is one phase peeled off that function
 //! (roadmap A1), in the order the driver runs them:
 //!
+//!   - [`identity`] — the checkpoint-identity emission at setup: the
+//!     resolved train/optimizer/scheduler record (item 4) and the
+//!     full-state resume load (Milestone B).
+//!   - [`epoch_close`] — the batch-loop seal, the `on_epoch` callbacks,
+//!     the epoch increment and the jump back to the epoch header.
 //!   - [`teardown`] — every emission after the epoch loop's exit block: free
 //!     the lists, sweep the trailing CSLA window, restore streamed
 //!     weights, print the CUDA-graphs banner.
@@ -16,4 +21,6 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod epoch_close;
+pub(crate) mod identity;
 pub(crate) mod teardown;
