@@ -177,7 +177,7 @@ matched pair measured NOTHING and is withdrawn, not reinterpreted.
 
 bf16, because the chain's theta at 263M was trained under it — switching
 arithmetic mid-chain is itself a trajectory change — and because the
-observed descent under it is the healthiest of the campaign. `run-out/stage4_driver.sh`
+observed descent under it is the healthiest of the campaign. `scripts/experiments/stage4_driver.sh`
 takes the arm as an ARGUMENT, sets the env from scratch, and refuses to
 continue unless the runtime prints the matching math-mode banner. The two
 bf16 arms print the SAME banner, so the stochastic-rounding line is

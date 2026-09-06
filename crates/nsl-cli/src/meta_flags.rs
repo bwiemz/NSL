@@ -208,7 +208,7 @@ pub(crate) fn expand_pretrain_optimized(
     // `--fuse-rmsnorm-backward` (plus whatever else the bundle turns on); the
     // wgrad half contributed nothing to it and cannot until a train block
     // declares `grad_accumulation >= 2`. Codegen now says so out loud —
-    // `[wgrad-fusion] declined: train block #N` from `stmt.rs`, or from
+    // `[wgrad-fusion] declined: train block #N` from `stmt_admission.rs`, or from
     // `Compiler::finish_wgrad_admission` when the program has no train block
     // at all — rather than leaving this comment as the only record.
     //
