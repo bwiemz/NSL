@@ -6,6 +6,9 @@
 //! phases. Each submodule here is one phase peeled off that function
 //! (roadmap A1), in the order the driver runs them:
 //!
+//!   - [`optimizer_state`] — section 4: the moment lists, allocated per
+//!     parameter by a runtime loop (device / host / owner-gated / null /
+//!     route-conditional), returned as an [`optimizer_state::OptimizerState`].
 //!   - [`contract`] — section 2: the resolved optimizer / scheduler /
 //!     callbacks contract, the `data:` section, the Muon perf-flag
 //!     refusals and the FASE plan, returned as a [`contract::TrainContract`].
@@ -27,6 +30,7 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod optimizer_state;
 pub(crate) mod contract;
 pub(crate) mod epoch_close;
 pub(crate) mod identity;
