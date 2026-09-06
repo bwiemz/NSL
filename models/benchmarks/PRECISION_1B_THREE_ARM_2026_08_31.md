@@ -76,7 +76,7 @@ the argument for differential designs, stated more sharply than the original
 draft managed.
 
 The one change that section made which was worth keeping: the chain now
-snapshots theta at EVERY cadence write (`run-out/traj_snapshot.sh`, .nslm
+snapshots theta at EVERY cadence write (`scripts/experiments/traj_snapshot.sh`, .nslm
 only, 4.3 GB each). That is why the gate could be read densely at all.
 
 ## Instruments, and why each was checked
@@ -132,7 +132,7 @@ inspection; never infer health from the loss stream.
 
 ## Reproduce
 
-    run-out/sr3arm_driver.sh          # three arms + held-out scoring
+    scripts/experiments/sr3arm_driver.sh          # three arms + held-out scoring
     tools/nslm_splice.py CKPT TEMPLATE OUT
     models/coder1b/val_from_splice.nsl
 

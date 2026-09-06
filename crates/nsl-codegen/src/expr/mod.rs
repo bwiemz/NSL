@@ -963,7 +963,7 @@ impl Compiler<'_> {
         let arena_ptr = builder.ins().symbol_value(cl_types::I64, arena_gv);
 
         // Determine the data pointer inside the repr(C) NslTensor layout.
-        const DATA_FIELD_OFFSET: i32 = nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
+        const DATA_FIELD_OFFSET: i32 = nsl_abi::wire::tensor::DATA_OFFSET as i32;
         let data_ptr = builder.ins().load(
             cl_types::I64,
             MemFlagsData::new(),

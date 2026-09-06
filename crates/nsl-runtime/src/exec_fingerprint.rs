@@ -58,6 +58,17 @@ const ARITHMETIC_KEYS: &[&str] = &[
     //             It is in this class because it decides whether the other Lt
     //             keys mean anything, not because it is arithmetic itself.
     "mm", "mmround", "mmratio", "mmlt", "mmltws", "mmlttune",
+    // The compile-time behavior-tier environment reads (roadmap A5): each
+    // decides which kernel or reduction the compiled program carries, and
+    // each was a word in the BUILD shell that no record captured.
+    //   fa_mma        NSL_FA_FWD_MMA           mma.sync forward vs scalar
+    //   lce_gemm      NSL_FUSED_LCE_GEMM       fused-CE GEMM vs unfused
+    //   fase_sumsq    NSL_FASE_BATCH_SUMSQ     batched vs per-param sum-sq
+    //   fase_override NSL_FASE_FUSED_OVERRIDE  the per-layer mode table
+    //   csha_save     NSL_CSHA_DUMP_SAVE_STATE probe values in the saved
+    //                 softmax state (corrupts the backward)
+    // The RUNTIME-read half of the tier is `env_record.rs`.
+    "fa_mma", "lce_gemm", "fase_sumsq", "fase_override", "csha_save",
 ];
 
 /// Keys that move bytes without changing the value computed.
@@ -105,6 +116,7 @@ fn parse(fp: &str) -> Vec<(&str, &str)> {
 }
 
 /// One disagreeing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDiff {
     pub key: String,
     pub saved: String,
@@ -156,6 +168,13 @@ pub fn render(diffs: &[FieldDiff]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_compile_time_environment_keys_are_arithmetic_class() {
+        for k in ["fa_mma", "lce_gemm", "fase_sumsq", "fase_override", "csha_save"] {
+            assert!(super::ARITHMETIC_KEYS.contains(&k), "{k}");
+            assert!(!super::PLACEMENT_KEYS.contains(&k), "{k}");
+        }
+    }
 
 
     #[test]

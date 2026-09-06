@@ -9,6 +9,9 @@
 //!   - [`model_params`] — section 3: the model's layout, its tensor
 //!     parameters as a runtime list, the CPDT dtype-code lists and Muon's
 //!     mode table, returned as a [`model_params::ModelParams`].
+//!   - [`param_lists`] — the per-parameter runtime lists built at setup:
+//!     the Muon/AdamW route flags, the weight-decay exemption flags and
+//!     the gradient-accumulation buffers.
 //!   - [`teardown`] — every emission after the epoch loop's exit block: free
 //!     the lists, sweep the trailing CSLA window, restore streamed
 //!     weights, print the CUDA-graphs banner.
@@ -20,4 +23,5 @@
 //! optimizer-step emitters in `stmt_fase.rs`.
 
 pub(crate) mod model_params;
+pub(crate) mod param_lists;
 pub(crate) mod teardown;
