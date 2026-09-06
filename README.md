@@ -24,8 +24,8 @@ Download the latest release from [GitHub Releases](https://github.com/bwiemz/NSL
 
 ```bash
 # Linux/macOS
-tar xzf nsl-v0.9.0-<target>.tar.gz
-export PATH="$PWD/nsl-v0.9.0-<target>/bin:$PATH"
+tar xzf nsl-v0.10.0-<target>.tar.gz
+export PATH="$PWD/nsl-v0.10.0-<target>/bin:$PATH"
 ```
 
 > **Important:** Keep `nsl` binary alongside the `lib/` directory — the compiler needs `lib/libnsl_runtime.a` and `lib/stdlib/`.

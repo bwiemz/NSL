@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 # The workspace crates are a toolchain, not a library set: path dependencies
 # carry no version, so none of them can be published as they stand.

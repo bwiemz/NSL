@@ -4,7 +4,7 @@
 
 NSL's development is organized into milestones (M9-M62) grouped into phases (1-13) shipping as versions (v0.1-v1.2). The roadmap is living -- phases beyond the next version boundary are subject to re-ordering.
 
-**Current version:** `0.9.0` (tagged 2026-03-19; everything since is unreleased work on the 0.9 line — no v0.9.1 was ever tagged)
+**Current version:** `0.10.0` (cut from `main` 2026-09-06; the first release since v0.9.0 on 2026-03-19 — no v0.9.1 was ever tagged. Releases are monthly from here, roadmap D5)
 
 ## Phase table
 
