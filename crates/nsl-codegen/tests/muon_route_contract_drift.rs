@@ -38,16 +38,23 @@ fn read(rel: &str) -> String {
 #[test]
 fn codegen_sites_share_the_one_predicate() {
     let stmt = read("src/stmt.rs");
-    let calls = stmt.matches("self.emit_muon_route_predicate(").count();
+    // Section 4 of the train block (the resident-momentum and v-allocation
+    // sites) lives in `stmt_train/optimizer_state.rs` since roadmap A1; the
+    // helper and the other two sites stay in `stmt.rs`. Count across both.
+    let optimizer_state = read("src/stmt_train/optimizer_state.rs");
+    let calls = stmt.matches("self.emit_muon_route_predicate(").count()
+        + optimizer_state.matches("self.emit_muon_route_predicate(").count();
     assert_eq!(
         calls, 4,
         "expected exactly 4 emission sites calling emit_muon_route_predicate \
          (batch-skip, resident-momentum, v-allocation, zero3 deferred \
-         v-allocation); found {calls}. A new site must call the helper — and \
-         update this count consciously — not hand-spell the predicate"
+         v-allocation) across stmt.rs and stmt_train/optimizer_state.rs; \
+         found {calls}. A new site must call the helper — and update this \
+         count consciously — not hand-spell the predicate"
     );
     // The raw spelling appears exactly once: inside the helper itself.
-    let raw = stmt.matches("band(is_muon, is_r2)").count();
+    let raw = stmt.matches("band(is_muon, is_r2)").count()
+        + optimizer_state.matches("band(is_muon, is_r2)").count();
     assert_eq!(
         raw, 1,
         "the raw `route==0 && rank==2` spelling must live only inside \
