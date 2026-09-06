@@ -6,6 +6,9 @@
 //! phases. Each submodule here is one phase peeled off that function
 //! (roadmap A1), in the order the driver runs them:
 //!
+//!   - [`contract`] — section 2: the resolved optimizer / scheduler /
+//!     callbacks contract, the `data:` section, the Muon perf-flag
+//!     refusals and the FASE plan, returned as a [`contract::TrainContract`].
 //!   - [`teardown`] — every emission after the epoch loop's exit block: free
 //!     the lists, sweep the trailing CSLA window, restore streamed
 //!     weights, print the CUDA-graphs banner.
@@ -16,4 +19,5 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod contract;
 pub(crate) mod teardown;
