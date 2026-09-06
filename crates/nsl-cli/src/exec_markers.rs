@@ -106,14 +106,14 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[muon]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/param_lists.rs",
         ],
         "the Muon optimizer arm was lowered",
     ),
     m(
         "[wd-groups]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/param_lists.rs",
         ],
         "AdamW parameter groups (`no_decay=[...]`) resolved a per-parameter \
          weight decay; the table names every parameter it exempted",

@@ -24,6 +24,7 @@
 //! above this one is the next candidate (120 lines, one escaping local).
 
 use crate::compiler::Compiler;
+use crate::param_roles::NoDecayScope;
 use crate::CodegenError;
 
 impl Compiler<'_> {
@@ -207,5 +208,47 @@ impl Compiler<'_> {
     }
 
         Ok(csla_active)
+    }
+}
+
+impl Compiler<'_> {
+    /// AdamW parameter groups: refuse the compositions that hoist ONE
+    /// weight-decay scalar out of the per-parameter loop, so `no_decay=[...]`
+    /// is never silently ignored. Moved out of `compile_train_block_inner`
+    /// byte-for-byte (roadmap A1); the three messages are pinned by
+    /// `feature_rules.rs` against this file.
+    pub(crate) fn no_decay_composition_admission(
+        &self,
+        no_decay_scope: &NoDecayScope,
+        csla_active: bool,
+    ) -> Result<(), CodegenError> {
+        // weight-decay scalar out of the per-parameter loop. Each of these
+        // would compile and train — decaying the parameters the user asked to
+        // exempt — so they must refuse rather than silently ignore no_decay.
+        if !no_decay_scope.is_empty() {
+            if self.compile_options.muon_batch_ns {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --muon-batch-ns: the \
+                     batched Newton-Schulz pre-loop takes one weight_decay \
+                     scalar for the whole batch, so per-parameter exemption \
+                     cannot be expressed there. Drop one",
+                ));
+            }
+            if csla_active {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --layerwise-accum: the \
+                     window-buffered group update hoists weight_decay out of \
+                     the per-parameter loop. Drop one",
+                ));
+            }
+            if self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --optim-state-offload \
+                     yet (the staged host/device envelope is untested against \
+                     per-parameter decay). Drop one",
+                ));
+            }
+        }
+        Ok(())
     }
 }
