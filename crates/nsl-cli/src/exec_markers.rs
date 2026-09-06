@@ -627,7 +627,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         // NOTHING (the count is gated on the same FASE hook the fusion needs).
         parts: &[(
             "[wgrad-fusion] declined:",
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_admission.rs",
         )],
     },
     NegativeNeedle {
