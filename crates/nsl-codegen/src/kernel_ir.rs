@@ -197,6 +197,23 @@ pub enum KirOp {
     // Shared memory fence
     SharedMemFence,
 
+    // Roadmap A2 step 2: the async-copy group as first-class ops, so the
+    // verifier can check the commit/wait discipline the hand-PTX had to
+    // get right by inspection. `cp.async` on sm_80+ (FeatureSet::ASYNC_COPY).
+    /// dst = the address of the kernel's shared-memory block (`shared_mem`),
+    /// typed `Ptr(_, Shared)` by the producer.
+    SharedBase(VarId),
+    /// Copy `bytes` (4, 8 or 16) from a global address into a shared one
+    /// without staging through registers. The copy is complete only after
+    /// a `CpAsyncWait` that covers the group it is committed into.
+    CpAsync { dst: VarId, src: VarId, bytes: u8 },
+    /// Close the current async-copy group (every `CpAsync` since the last
+    /// commit, or since the block began).
+    CpAsyncCommit,
+    /// Block until at most `pending` committed groups are still in flight
+    /// (`pending == 0`: everything has landed).
+    CpAsyncWait { pending: u8 },
+
     // M57 v1: structured ops for FPGA target. GPU/CPU codegen ignores these
     // (existing AST → templated PTX path for GPU; Cranelift for CPU);
     // FPGA codegen consumes them in the KIR → HIR pass.
@@ -332,6 +349,10 @@ impl KirBuilder {
             KirOp::Barrier => self.required_features |= FeatureSet::SHARED_MEMORY,
             KirOp::WarpShuffle(_, _, _) => self.required_features |= FeatureSet::WARP_SHUFFLE,
             KirOp::SharedMemFence => self.required_features |= FeatureSet::SHARED_MEMORY,
+            KirOp::SharedBase(_) => self.required_features |= FeatureSet::SHARED_MEMORY,
+            KirOp::CpAsync { .. } | KirOp::CpAsyncCommit | KirOp::CpAsyncWait { .. } => {
+                self.required_features |= FeatureSet::SHARED_MEMORY | FeatureSet::ASYNC_COPY
+            }
             KirOp::AtomicAdd(_, _, AddressSpace::Global) => {
                 // Float atomics need ATOMIC_FLOAT; integer atomics are universal
                 self.required_features |= FeatureSet::ATOMIC_FLOAT;

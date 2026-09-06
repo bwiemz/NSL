@@ -4,6 +4,7 @@
 //! Lowers a `KernelIR` to null-terminated PTX text bytes suitable for
 //! `cuModuleLoadData`. Uses PTX ISA 7.0 targeting sm_70.
 
+use crate::gpu_target::FeatureSet;
 use crate::kernel_ir::*;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -12,9 +13,16 @@ use std::fmt::Write;
 pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     let mut ptx = String::new();
 
-    // Header
+    // Header. `cp.async` (FeatureSet::ASYNC_COPY) is an sm_80 instruction;
+    // every other op lowers on sm_70, the floor this backend has always
+    // targeted, so the bump is taken only when a kernel asks for it.
     writeln!(ptx, ".version 7.0").unwrap();
-    writeln!(ptx, ".target sm_70").unwrap();
+    let target = if ir.required_features.contains(FeatureSet::ASYNC_COPY) {
+        "sm_80"
+    } else {
+        "sm_70"
+    };
+    writeln!(ptx, ".target {}", target).unwrap();
     writeln!(ptx, ".address_size 64").unwrap();
     writeln!(ptx).unwrap();
 
@@ -549,6 +557,29 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::SharedMemFence => {
             writeln!(ptx, "    membar.cta;").unwrap();
         }
+        KirOp::SharedBase(dst) => {
+            // The shared block is declared `shared_mem` (see the header);
+            // its address is a shared-window offset, moved into the 64-bit
+            // pointer register the `.shared` loads/stores already use.
+            let prefix = var_reg_prefix(ir, *dst, *dst);
+            writeln!(ptx, "    mov.u64 {}{}, shared_mem;", prefix, dst).unwrap();
+        }
+        KirOp::CpAsync { dst, src, bytes } => {
+            let dst_prefix = var_reg_prefix(ir, *dst, *dst);
+            let src_prefix = var_reg_prefix(ir, *src, *src);
+            writeln!(
+                ptx,
+                "    cp.async.ca.shared.global [{}{}], [{}{}], {};",
+                dst_prefix, dst, src_prefix, src, bytes
+            )
+            .unwrap();
+        }
+        KirOp::CpAsyncCommit => {
+            writeln!(ptx, "    cp.async.commit_group;").unwrap();
+        }
+        KirOp::CpAsyncWait { pending } => {
+            writeln!(ptx, "    cp.async.wait_group {};", pending).unwrap();
+        }
         KirOp::Matmul { .. } | KirOp::ElementwiseAdd { .. } | KirOp::Relu { .. } => {
             unreachable!("M57 v1 structured KIR ops are only emitted for Target::Fpga; \
                           this codegen path is GPU/CPU PTX")
@@ -635,7 +666,9 @@ fn extract_var_ids(op: &KirOp) -> Vec<VarId> {
         | KirOp::BlockDim(d, _)
         | KirOp::GridDim(d, _)
         | KirOp::GlobalId(d, _) => vec![*d],
-        KirOp::Barrier | KirOp::SharedMemFence => vec![],
+        KirOp::Barrier | KirOp::SharedMemFence | KirOp::CpAsyncCommit | KirOp::CpAsyncWait { .. } => vec![],
+        KirOp::SharedBase(d) => vec![*d],
+        KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
         KirOp::WarpShuffle(d, v, o) => vec![*d, *v, *o],
         KirOp::Cmp(d, a, b, _) | KirOp::PtrOffset(d, a, b) => vec![*d, *a, *b],
         KirOp::Const(d, _) => vec![*d],
@@ -805,6 +838,46 @@ mod tests {
     /// returned by `extract_var_ids`, so without an explicit fix the
     /// `.reg .u32 %r<N>` declaration is too small and ptxas rejects the PTX
     /// with an "undeclared register" error at `cuModuleLoadData` time.
+    #[test]
+    fn test_ptx_async_copy_group_lowers_on_sm_80() {
+        let mut b = KirBuilder::new("cp");
+        let src = b.add_param(
+            "src",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        b.set_shared_mem(64);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Shared));
+        b.emit(KirOp::SharedBase(smem));
+        b.emit(KirOp::CpAsync { dst: smem, src, bytes: 16 });
+        b.emit(KirOp::CpAsyncCommit);
+        b.emit(KirOp::CpAsyncWait { pending: 0 });
+        b.emit(KirOp::Barrier);
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()));
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains(".target sm_80"), "{ptx}");
+        assert!(!ptx.contains(".target sm_70"), "{ptx}");
+        assert!(ptx.contains(&format!("    mov.u64 %rd{}, shared_mem;\n", smem)), "{ptx}");
+        assert!(
+            ptx.contains(&format!("    cp.async.ca.shared.global [%rd{}], [%rd{}], 16;\n", smem, src)),
+            "{ptx}"
+        );
+        assert!(ptx.contains("    cp.async.commit_group;\n"), "{ptx}");
+        assert!(ptx.contains("    cp.async.wait_group 0;\n"), "{ptx}");
+        assert!(ptx.contains("    bar.sync 0;\n"), "{ptx}");
+    }
+
+    #[test]
+    fn test_ptx_target_stays_sm_70_without_async_copy() {
+        let ir = build_simple_add_kernel();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains(".target sm_70"), "{ptx}");
+    }
+
     #[test]
     fn test_ptx_global_id_register_count_covers_synthetic_temps() {
         let mut b = KirBuilder::new("test_global_id_regs");

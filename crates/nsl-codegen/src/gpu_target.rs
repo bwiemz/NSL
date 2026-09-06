@@ -72,6 +72,7 @@ impl GpuTarget {
                     | FeatureSet::ATOMIC_FLOAT
                     | FeatureSet::F16_ARITHMETIC
                     | FeatureSet::BF16_ARITHMETIC
+                    | FeatureSet::ASYNC_COPY
             }
             GpuTarget::Rocm => {
                 FeatureSet::SHARED_MEMORY
@@ -124,6 +125,9 @@ impl FeatureSet {
     pub const SUBGROUP_OPS: Self = FeatureSet(0x10);
     pub const F16_ARITHMETIC: Self = FeatureSet(0x20);
     pub const BF16_ARITHMETIC: Self = FeatureSet(0x40);
+    /// Asynchronous global → shared copies with commit/wait groups
+    /// (`cp.async` on sm_80+). Roadmap A2 step 2.
+    pub const ASYNC_COPY: Self = FeatureSet(0x80);
 
     pub fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0

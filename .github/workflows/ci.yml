@@ -411,6 +411,10 @@ jobs:
           cargo test -p nsl-codegen --test fused_linear_ce_bf16_ptxas
           cargo test -p nsl-codegen --test fused_linear_ce_fp16_ptxas
           cargo test -p nsl-codegen --test fused_linear_ce_large_vocab_ptxas
+          # Roadmap A2 step 2: the KIR async-copy group (cp.async / commit /
+          # wait under an sm_80 target) is emitted by backend_ptx and checked
+          # by the KIR verifier; this is the gate that proves ptxas takes it.
+          cargo test -p nsl-codegen --test kir_async_copy_ptxas
           # M35.1: the BitNet forward emitter shipped producing PTX that ptxas
           # rejected at essentially every instruction, while its structural
           # snapshot tests stayed green. This is the gate that catches that.
