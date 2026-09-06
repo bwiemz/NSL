@@ -17,6 +17,7 @@ use crate::error::CodegenError;
 use crate::stmt_csla::{emit_csla_accum_alloc, emit_csla_group_update, MuonCslaCtx};
 use crate::stmt_train::model_params::ModelParams;
 use crate::stmt_train::optimizer_state::OptimizerState;
+use crate::stmt_train::config::TrainConfigSection;
 use crate::stmt_train::contract::TrainContract;
 use crate::stmt_train::epoch_close::{emit_epoch_close, EpochClose};
 use crate::stmt_train::teardown::{emit_train_teardown, TrainTeardown};
@@ -5983,77 +5984,20 @@ impl Compiler<'_> {
         let saved_borrowed_batch_symbols = state.borrowed_batch_symbols.clone();
 
         // ── 1. Extract config from train(...) args ──────────────────────
-        // The Training Configuration Contract: ONE resolver (in
-        // nsl-semantic, also called by `check_train_block` with spans)
-        // owns the closed key set, duplicate/positional refusals, and
-        // literal/range validation. The old inline match here ended in
-        // `_ => {} // ignore unknown config for forward compat` — a typo'd
-        // key silently trained with defaults, a non-literal
-        // grad_accumulation silently clamped to 1, a non-literal grad_clip
-        // vanished without a trace, and epochs=0 trained zero epochs.
-        // This call is the backstop for paths that bypass `nsl check`
-        // (notably the distill lowering's synthesized TrainBlock, which
-        // legitimately has no model= — the context carries it).
-        let purpose = if self.active_distill_context.is_some() {
-            nsl_semantic::train_config::TrainConfigPurpose::DistillLowering
-        } else {
-            nsl_semantic::train_config::TrainConfigPurpose::UserTrainBlock
-        };
-        let cfg = nsl_semantic::train_config::resolve_train_config(
-            train,
-            &|sym| self.resolve_sym(sym).to_string(),
+        // Moved to `stmt_train/config.rs` byte-for-byte (roadmap A1). The
+        // driver destructures the section so every binding below keeps its
+        // name.
+        let TrainConfigSection {
             purpose,
-        )
-        .map_err(|diags| {
-            let msgs: Vec<String> = diags.into_iter().map(|d| d.message).collect();
-            CodegenError::new(format!(
-                "train config refused: {}",
-                msgs.join("; ")
-            ))
-        })?;
-
-        let mut model_sym: Option<nsl_ast::Symbol> = cfg.model;
-        let mut epochs: i64 = cfg.epochs;
-        let grad_accumulation_steps: i64 = cfg.grad_accumulation;
-        let grad_accumulation_decl = if cfg.grad_accumulation_explicit {
-            GradAccumulationDecl::Literal
-        } else {
-            GradAccumulationDecl::Omitted
-        };
-        let grad_clip: f64 = cfg.grad_clip.unwrap_or(f64::MAX); // MAX = no clipping
-        // Milestone B: full-train-state checkpointing (θ + m/v + step).
-        // Pairing (save↔every) already validated by the resolver.
-        let checkpoint_save_path: Option<String> = cfg.checkpoint_save;
-        let checkpoint_every: i64 = cfg.checkpoint_every;
-        let checkpoint_load_path: Option<String> = cfg.checkpoint_load;
-
-        // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
-        // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
-        // legacy NULL stream). The accumulation window rides along — each
-        // micro-batch phase within a window has its own self-consistent
-        // allocator state, so the runtime captures one graph per
-        // (region, phase) instead of requiring a phase-free digest.
-        if self.compile_options.cuda_graphs {
-            let win = builder
-                .ins()
-                .iconst(cl_types::I64, grad_accumulation_steps.max(1));
-            self.compile_call_by_name(builder, "nsl_cuda_graphs_enable", &[win])?;
-        }
-
-        // CPKD: a distill block delegates here with a config carrying only
-        // the keys whose meaning is identical on both blocks — today just
-        // `grad_accumulation`, read by the loop above. The `model=` role and
-        // `epochs` deliberately do NOT travel that way: the context is their
-        // single source of truth, and a second copy is a divergence waiting
-        // for one side to be edited. (`compile_distill_block` installed it.)
-        if let Some(distill) = &self.active_distill_context {
-            model_sym = Some(distill.student_sym);
-            epochs = distill.epochs;
-        }
-
-        let model_sym = model_sym.ok_or_else(|| {
-            CodegenError::new("train block requires 'model=<ident>' config argument")
-        })?;
+            model_sym,
+            epochs,
+            grad_accumulation_steps,
+            grad_accumulation_decl,
+            grad_clip,
+            checkpoint_save_path,
+            checkpoint_every,
+            checkpoint_load_path,
+        } = self.extract_train_config(builder, train)?;
 
         // ── 2. Resolve the optimizer/scheduler/callbacks contract ───────
         // Moved to `stmt_train/contract.rs` byte-for-byte (roadmap A1). The

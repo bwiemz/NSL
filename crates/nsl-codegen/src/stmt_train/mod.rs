@@ -1,11 +1,12 @@
 //! The train block's lowering, one phase per submodule.
 //!
 //! `stmt.rs::compile_train_block_inner` is the driver: it still owns the
-//! config extraction, the parameter / optimizer-state / accumulator lists
-//! and the epoch + batch loops, and the bindings that flow between the
-//! phases. Each submodule here is one phase peeled off that function
+//! epoch + batch loops and the bindings that flow between the phases. Each submodule here is one phase peeled off that function
 //! (roadmap A1), in the order the driver runs them:
 //!
+//!   - [`config`] — section 1: the `train(...)` header resolved through
+//!     `nsl-semantic`'s ONE resolver, the CUDA-graphs arming and the
+//!     distill overrides, returned as a [`config::TrainConfigSection`].
 //!   - [`model_params`] — section 3: the model's layout, its tensor
 //!     parameters as a runtime list, the CPDT dtype-code lists and Muon's
 //!     mode table, returned as a [`model_params::ModelParams`].
@@ -33,6 +34,7 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod config;
 pub(crate) mod model_params;
 pub(crate) mod optimizer_state;
 pub(crate) mod contract;
