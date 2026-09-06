@@ -9,6 +9,9 @@
 //!   - [`model_params`] — section 3: the model's layout, its tensor
 //!     parameters as a runtime list, the CPDT dtype-code lists and Muon's
 //!     mode table, returned as a [`model_params::ModelParams`].
+//!   - [`contract`] — section 2: the resolved optimizer / scheduler /
+//!     callbacks contract, the `data:` section, the Muon perf-flag
+//!     refusals and the FASE plan, returned as a [`contract::TrainContract`].
 //!   - [`identity`] — the checkpoint-identity emission at setup: the
 //!     resolved train/optimizer/scheduler record (item 4) and the
 //!     full-state resume load (Milestone B).
@@ -28,6 +31,7 @@
 //! optimizer-step emitters in `stmt_fase.rs`.
 
 pub(crate) mod model_params;
+pub(crate) mod contract;
 pub(crate) mod epoch_close;
 pub(crate) mod identity;
 pub(crate) mod param_lists;

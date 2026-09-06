@@ -116,6 +116,9 @@ const STMT_ADMISSION: &str = "crates/nsl-codegen/src/stmt_admission.rs";
 /// Section 3 of the train block — the model/parameter-list build and the CPDT
 /// moment-precision plan (roadmap A1).
 const STMT_MODEL_PARAMS: &str = "crates/nsl-codegen/src/stmt_train/model_params.rs";
+/// Section 2 of the train block — the optimizer/scheduler contract and the
+/// Muon perf-flag compositions (roadmap A1).
+const STMT_CONTRACT: &str = "crates/nsl-codegen/src/stmt_train/contract.rs";
 const CLI_RUN: &str = "crates/nsl-cli/src/commands/run.rs";
 const CALIB: &str = "crates/nsl-codegen/src/calibration/binary_codegen.rs";
 const CLI_CHECK: &str = "crates/nsl-cli/src/commands/check.rs";
@@ -435,56 +438,56 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--muon-batch-ns",
         RuleKind::Conflicts,
         "--layerwise-accum",
-        STMT,
+        STMT_CONTRACT,
         "--muon-batch-ns does not compose with --layerwise-accum",
     ),
     src_rule(
         "--muon-batch-ns",
         RuleKind::Conflicts,
         "--optim-state-offload",
-        STMT,
+        STMT_CONTRACT,
         "--muon-batch-ns does not compose with --optim-state-offload",
     ),
     src_rule(
         "--muon-batch-ns",
         RuleKind::Conflicts,
         "--muon-state-dtype",
-        STMT,
+        STMT_CONTRACT,
         "--muon-batch-ns does not compose with --muon-state-dtype bf16",
     ),
     src_rule(
         "--muon-batch-ns",
         RuleKind::Conflicts,
         "--param-dtype",
-        STMT,
+        STMT_CONTRACT,
         "--muon-batch-ns does not compose with --param-dtype bf16-sr",
     ),
     src_rule(
         "--muon-batch-ns",
         RuleKind::Conflicts,
         "--zero-stage",
-        STMT,
+        STMT_CONTRACT,
         "--muon-batch-ns does not compose with --zero-stage",
     ),
     src_rule(
         "--muon-resident-momentum",
         RuleKind::Requires,
         "--optim-state-offload",
-        STMT,
+        STMT_CONTRACT,
         "--muon-resident-momentum is only meaningful with --optim-state-offload",
     ),
     src_rule(
         "--muon-resident-momentum",
         RuleKind::Conflicts,
         "--muon-state-dtype",
-        STMT,
+        STMT_CONTRACT,
         "--muon-resident-momentum does not compose with --muon-state-dtype bf16",
     ),
     src_rule(
         "--muon-resident-momentum",
         RuleKind::Conflicts,
         "--zero-stage",
-        STMT,
+        STMT_CONTRACT,
         "--muon-resident-momentum does not compose with --zero-stage",
     ),
     src_rule(
@@ -585,7 +588,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--muon-batch-ns",
         RuleKind::Requires,
         "muon optimizer",
-        STMT,
+        STMT_CONTRACT,
         "--muon-batch-ns requires the muon optimizer",
     ),
     // ── build / cep / calibration subcommands ──────────────────────────────
