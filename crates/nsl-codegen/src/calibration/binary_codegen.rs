@@ -1631,7 +1631,7 @@ fn emit_model_backward_bridge(
             // Get raw data pointer from the NslTensor struct.
             // NslTensor.data is at offset NSL_TENSOR_DATA_OFFSET (= 8 bytes after magic).
             const DATA_OFF: i32 =
-                nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
+                nsl_abi::wire::tensor::DATA_OFFSET as i32;
             let src_ptr = fb.ins().load(
                 cl_types::I64,
                 MemFlagsData::new(),
@@ -3199,7 +3199,7 @@ pub fn emit_calibration_scaffolding_object(
                             // struct fields. Mirrors the backward bridge's
                             // `on_param_grad` splice at line ~1505.
                             const NSL_TENSOR_DATA_OFFSET_I32: i32 =
-                                nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
+                                nsl_abi::wire::tensor::DATA_OFFSET as i32;
                             let weight_data_ptr = b.ins().load(
                                 ptr_ty,
                                 cranelift_codegen::ir::MemFlagsData::new(),

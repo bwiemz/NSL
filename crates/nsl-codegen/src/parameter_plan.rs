@@ -28,9 +28,10 @@
 //! `nsl_runtime::param_plan`).
 //!
 //! The bit encoding is *shared with*, not mirrored from, the runtime: the
-//! `PLAN_*` constants below are re-exports of `nsl_runtime::param_plan`'s, so
-//! the two crates cannot drift the way the repo's other cross-crate ABI
-//! surfaces have.
+//! `PLAN_*` constants below are re-exports of `nsl_abi::wire::param_plan`'s
+//! — the declaration `nsl_runtime::param_plan` re-exports too (roadmap A3)
+//! — so the two crates cannot drift the way the repo's other cross-crate
+//! ABI surfaces have.
 //!
 //! # What this deliberately is NOT
 //!
@@ -45,7 +46,7 @@
 //! directly, which `feature_rules.rs` explicitly documents as a real caller
 //! class the clap layer does not protect.
 
-pub use nsl_runtime::param_plan::{PLAN_BF16_SR, PLAN_ELEMENTWISE, PLAN_SHARDED, PLAN_STREAMED};
+pub use nsl_abi::wire::param_plan::{PLAN_BF16_SR, PLAN_ELEMENTWISE, PLAN_SHARDED, PLAN_STREAMED};
 
 /// Where a parameter lives between uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

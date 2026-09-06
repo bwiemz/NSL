@@ -67,6 +67,20 @@ Dependency direction: `nsl-errors` and `nsl-runtime` are the true leaves (nothin
 
 NSL binds to NVIDIA CUDA via [cudarc](https://github.com/coreylowman/cudarc) (0.19, dynamic linking). Cranelift is the sole function-emission backend; **PTX is synthesized separately and embedded as Cranelift data sections**, then loaded at runtime via `cuModuleLoadData`. The portable PTX emitter lives in [`crates/nsl-codegen/src/backend_ptx.rs`](../../crates/nsl-codegen/src/backend_ptx.rs) (fed by [`kernel_lower.rs`](../../crates/nsl-codegen/src/kernel_lower.rs)); a legacy direct-AST-to-PTX path lives in [`kernel.rs`](../../crates/nsl-codegen/src/kernel.rs) for kernels outside the portable subset. See [Compiler-Pipeline § Stage 4](Compiler-Pipeline.md#stage-4--codegen) for the full picture.
 
+## Per-crate architecture documents
+
+The reader-facing "how does this crate work" documents — pipeline stages,
+key types, invariants, tests, and where to add a new X — live under
+[`docs/architecture/`](../architecture/README.md): one each for the
+[frontend crates](../architecture/frontend.md),
+[`nsl-semantic`](../architecture/semantic.md),
+[`nsl-codegen`](../architecture/codegen.md),
+[`nsl-runtime`](../architecture/runtime.md) and
+[`nsl-cli`](../architecture/cli.md), plus the
+[compiler-state map](../architecture/compiler-state.md). The design history
+behind each research subsystem is indexed by subsystem in
+[`docs/superpowers/README.md`](../superpowers/README.md).
+
 ## Subsystem deep-dives
 
 The non-obvious compiler sophistication lives in optimization passes — they're what make NSL faster than a naive PyTorch port. See [Optimization-Passes](Optimization-Passes.md) for:
