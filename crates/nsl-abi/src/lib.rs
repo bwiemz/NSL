@@ -23,6 +23,15 @@
 //!
 //! It is deliberately dependency-free and parses source *text* (it does not
 //! link against the codegen or runtime), so it stays a cheap standalone gate.
+//!
+//! Since roadmap A3 the crate is also the home of the ABI's *wire constants*
+//! — dtype tags, the tensor header's data offset, the plan bits, the
+//! allocation-surface tags, the ABI version — in [`wire`]. Those are the
+//! numbers both crates must agree on, and having each crate read them from
+//! here (instead of the compiler importing them from the runtime) is what
+//! lets the compiler stop depending on the runtime's dependency tree.
+
+pub mod wire;
 
 use std::collections::BTreeMap;
 use std::path::Path;

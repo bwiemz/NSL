@@ -200,10 +200,10 @@ pub extern "C" fn nsl_is_training() -> i8 {
     TRAINING_MODE.with(|t| t.get() as i8)
 }
 
-/// Magic marker for live NslTensor instances. Spells "NSLT" in ASCII.
-pub const TENSOR_MAGIC: u32 = 0x4E534C54;
-/// Poison value written into the magic field when a tensor is freed.
-pub const TENSOR_FREED: u32 = 0x0000DEAD;
+/// Magic marker for live NslTensor instances ("NSLT" in ASCII) and the
+/// poison written into the field when a tensor is freed — declared in
+/// `nsl_abi::wire::tensor` (A3), re-exported at the historical names.
+pub use nsl_abi::wire::tensor::{FREED as TENSOR_FREED, MAGIC as TENSOR_MAGIC};
 
 /// Why [`NslTensor::check_handle`] rejected a handle.
 enum BadHandle {
@@ -277,12 +277,17 @@ pub struct NslTensor {
 }
 
 pub const NSL_TENSOR_DATA_OFFSET: usize = std::mem::offset_of!(NslTensor, data);
+// The ABI declares this offset as a number (`nsl_abi::wire::tensor::DATA_OFFSET`)
+// and codegen addresses the header by it; the struct above is the runtime's
+// half of that contract, so the two are pinned to each other here (A3).
+const _: () = assert!(NSL_TENSOR_DATA_OFFSET == nsl_abi::wire::tensor::DATA_OFFSET);
 
 // ---------------------------------------------------------------------------
 // Canonical built-in dtype IDs — the `NslTensor.dtype` (u16) wire tags.
 //
-// THIS is the single source of truth for the runtime tensor dtype tag space.
-// Other modules that must speak these tags (tensor_parallel::collective,
+// The single source of truth is `nsl_abi::wire::dtype` (roadmap A3); the
+// tags are re-exported here at their historical paths so every
+// `crate::tensor::DTYPE_*` reader is unchanged. Other modules that must speak these tags (tensor_parallel::collective,
 // codegen::cpdt_precision_exec, dlpack, ...) are pinned to these values by
 // compile-time `assert!`s; the golden `dtype_abi_lock` test below fails loudly
 // if any tag moves. Add new tags at the next free slot — DO NOT reuse a value.
@@ -298,19 +303,10 @@ pub const NSL_TENSOR_DATA_OFFSET: usize = std::mem::offset_of!(NslTensor, data);
 //     nsl_dtype_to_capi}` survive only as validating identity chokepoints.
 // See the `dtype_abi_lock` test, which pins both properties.
 // ---------------------------------------------------------------------------
-pub const DTYPE_F64: u16 = 0;
-pub const DTYPE_F32: u16 = 1;
-pub const DTYPE_FP16: u16 = 2;
-pub const DTYPE_BF16: u16 = 3;
-pub const DTYPE_INT8: u16 = 4;
-pub const DTYPE_FP8E4M3: u16 = 5;
-pub const DTYPE_FP8E5M2: u16 = 6;
-pub const DTYPE_U16_TOKEN: u16 = 7;
-pub const DTYPE_U16_SEGMENT: u16 = 8;
-pub const DTYPE_I32: u16 = 9;
-
-// Custom dtype IDs start at 256
-pub const DTYPE_CUSTOM_START: u16 = 256;
+pub use nsl_abi::wire::dtype::{
+    DTYPE_BF16, DTYPE_CUSTOM_START, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_FP8E4M3,
+    DTYPE_FP8E5M2, DTYPE_I32, DTYPE_INT8, DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN,
+};
 
 #[inline]
 pub(crate) fn assert_elementwise_byte_copy(dtype: u16, op: &str) {

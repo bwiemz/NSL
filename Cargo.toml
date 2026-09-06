@@ -33,6 +33,7 @@ nsl-parser = { path = "crates/nsl-parser" }
 nsl-semantic = { path = "crates/nsl-semantic" }
 nsl-codegen = { path = "crates/nsl-codegen" }
 nsl-env = { path = "crates/nsl-env" }
+nsl-abi = { path = "crates/nsl-abi" }
 
 codespan-reporting = "0.13"
 clap = { version = "4", features = ["derive"] }

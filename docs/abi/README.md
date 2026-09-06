@@ -15,9 +15,11 @@ The ABI carries an explicit, checkable version:
 - The runtime exports `int64_t nsl_abi_version(void)`, returning the version
   packed as `(major << 16) | minor`.
 - Generated C headers `#define NSL_ABI_VERSION_MAJOR` / `NSL_ABI_VERSION_MINOR`
-  / `NSL_ABI_VERSION`, pinned at generation time to the runtime's
-  `nsl_runtime::c_api::NSL_ABI_VERSION_*` constants (single source of truth — a
-  header can never claim a version the runtime didn't define).
+  / `NSL_ABI_VERSION`, pinned at generation time to the
+  `nsl_abi::wire::version::NSL_ABI_VERSION_*` constants — the one declaration
+  the runtime's `nsl_abi_version()` packs and `nsl_runtime::c_api` re-exports
+  (single source of truth — a header can never claim a version the runtime
+  didn't define).
 
 **Compatibility rule for hosts:** after loading `libnsl_runtime`, call
 `nsl_abi_version()` and compare:

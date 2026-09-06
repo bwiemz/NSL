@@ -1,7 +1,8 @@
 //! PCA Tier B — runtime-side dispatch gate + constants.
 //!
-//! Per planner spec §6 and (α) commitment from P-2 (this module is the source of truth
-//! for both constants since `nsl-codegen` already depends on `nsl-runtime`).
+//! Per planner spec §6 and (α) commitment from P-2. The two constants are
+//! declared in `nsl_abi::wire::pca_tier_b` (roadmap A3) and re-exported here
+//! with their derivations; codegen reads the same declarations.
 //!
 //! The runtime gate's four-condition logic determines whether the kernel launch
 //! dispatches to the Tier-B-on PTX variant (when codegen emitted one for this config)
@@ -13,7 +14,7 @@
 /// (P-1 D-2 sweep; 7 seq_lens × 100 iterations × sparsity=50% on RTX 5070 Ti sm_120).
 /// All 7 sweep points cleared the 10% bar; FLOOR is the smallest sweep point at 128
 /// (win=39.40%; curve saturates near ~75% for seq>=512 = (1-sparsity) theoretical bound).
-pub const TIER_B_SEQ_LEN_FLOOR: u32 = 128;
+pub use nsl_abi::wire::pca_tier_b::TIER_B_SEQ_LEN_FLOOR;
 
 /// Conservative-max seq_len baked into Tier-B-on PTX SMEM allocation.
 ///
@@ -21,7 +22,7 @@ pub const TIER_B_SEQ_LEN_FLOOR: u32 = 128;
 /// (P-0 V-Bii-SMEM probe; 12-config sweep on RTX 5070 Ti sm_120 / sm_80 JIT-fallback).
 /// Sub-variant resolved: B-ii unrestricted. MAX=16384/block=32 fits at 12.12% util sm_120
 /// (`<60%` headroom bucket → planner spec §3.5 v2 trigger #1 is "extend baked max to 32768").
-pub const TIER_B_MAX_BAKED_SEQ_LEN: u32 = 16384;
+pub use nsl_abi::wire::pca_tier_b::TIER_B_MAX_BAKED_SEQ_LEN;
 
 // Compile-time assertion: MAX_BAKED is a probe-validated value (planner spec §5.3).
 const _: () = assert!(

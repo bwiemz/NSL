@@ -20,16 +20,18 @@ use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
 use cranelift_codegen::ir::Value;
 
 // P0.1 per-surface VRAM accounting: the wire values of
-// `nsl_gpu_set_alloc_surface` / `nsl_gpu_get_alloc_surface`, which MUST
-// match `nsl_runtime::cuda::caching_allocator::SurfaceTag` (#[repr(u8)]).
+// `nsl_gpu_set_alloc_surface` / `nsl_gpu_get_alloc_surface`. Declared once in
+// `nsl_abi::wire::surface` (roadmap A3), which is also where the runtime's
+// `SurfaceTag` (#[repr(u8)]) takes its discriminants — so the two cannot
+// drift. Widened to i64 here because they are emitted as `iconst I64`.
 // Each train-block bracket sets a surface for its allocation region and
 // restores the caller's surface afterwards (get/set — nesting-safe).
-pub(crate) const SURFACE_WEIGHTS: i64 = 1;
-pub(crate) const SURFACE_OPTIM_M: i64 = 2;
-pub(crate) const SURFACE_OPTIM_V: i64 = 3;
-pub(crate) const SURFACE_M_PARTIAL: i64 = 4;
-pub(crate) const SURFACE_GRADS: i64 = 5;
-pub(crate) const SURFACE_ACTIVATIONS: i64 = 6;
+pub(crate) const SURFACE_WEIGHTS: i64 = nsl_abi::wire::surface::SURFACE_WEIGHTS as i64;
+pub(crate) const SURFACE_OPTIM_M: i64 = nsl_abi::wire::surface::SURFACE_OPTIM_M as i64;
+pub(crate) const SURFACE_OPTIM_V: i64 = nsl_abi::wire::surface::SURFACE_OPTIM_V as i64;
+pub(crate) const SURFACE_M_PARTIAL: i64 = nsl_abi::wire::surface::SURFACE_M_PARTIAL as i64;
+pub(crate) const SURFACE_GRADS: i64 = nsl_abi::wire::surface::SURFACE_GRADS as i64;
+pub(crate) const SURFACE_ACTIVATIONS: i64 = nsl_abi::wire::surface::SURFACE_ACTIVATIONS as i64;
 
 /// Item C: how ONE parameter's optimizer moments are allocated under
 /// `--zero-stage 3`, decided from its `ParameterPlan` entry and consumed by
