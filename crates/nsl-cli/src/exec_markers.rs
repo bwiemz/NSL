@@ -414,7 +414,7 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[fase]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/contract.rs",
         ],
         "the FASE planner's driver reported a decorator/override decision \
          (the @fase activation witness is `[fase] @fase decorator applied:`)",
@@ -546,7 +546,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         asserts: "a control build without @fase carries no decorator-applied witness",
         parts: &[
             // eprintln!("[fase] @fase decorator applied: mode={:?} ...")
-            ("[fase] @fase decorator applied:", "crates/nsl-codegen/src/stmt.rs"),
+            ("[fase] @fase decorator applied:", "crates/nsl-codegen/src/stmt_train/contract.rs"),
         ],
     },
     NegativeNeedle {
