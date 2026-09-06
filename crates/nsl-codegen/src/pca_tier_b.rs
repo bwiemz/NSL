@@ -39,9 +39,10 @@ use crate::flash_attention_v2::{
 };
 use crate::pca_segment::SegmentResidency;
 
-/// Re-exported from `nsl_runtime::pca_tier_b_runtime` (the (α) single source of truth).
+/// Re-exported from `nsl_abi::wire::pca_tier_b` (the (α) single source of truth,
+/// which `nsl_runtime::pca_tier_b_runtime` re-exports as well — roadmap A3).
 /// See the runtime crate for the findings-doc citations and const assertions.
-pub use nsl_runtime::pca_tier_b_runtime::{TIER_B_MAX_BAKED_SEQ_LEN, TIER_B_SEQ_LEN_FLOOR};
+pub use nsl_abi::wire::pca_tier_b::{TIER_B_MAX_BAKED_SEQ_LEN, TIER_B_SEQ_LEN_FLOOR};
 
 /// Codegen-time gate: should this config's emission include a Tier-B-on PTX variant?
 ///

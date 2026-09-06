@@ -481,29 +481,11 @@ pub extern "C" fn nsl_dispatch_ownership_finish_alloc(
 // FFI: ABI version
 // ---------------------------------------------------------------------------
 
-/// NSL runtime C-ABI version — **major** component.
-///
-/// Bump this on any *breaking* change to an exported symbol's signature or
-/// semantics, or to the [`NslTensorDesc`] memory layout. A host that links a
-/// runtime whose `nsl_abi_version()` major differs from the major baked into
-/// the generated header (`NSL_ABI_VERSION_MAJOR`) must refuse to run: the ABI
-/// is incompatible.
-pub const NSL_ABI_VERSION_MAJOR: u32 = 1;
-
-/// NSL runtime C-ABI version — **minor** component.
-///
-/// Bump this for backward-compatible additions (new exported symbols, new
-/// trailing optional behavior). A host built against minor `m` can safely use a
-/// runtime with minor `>= m` and the same major.
-///
-/// **Minor 1 (item 7):** adds `nsl_model_call_into`, `nsl_model_call_alloc`,
-/// `nsl_model_get_export_signature`, `nsl_dispatch_apply_scalar_result`, and
-/// makes `nsl_model_call_dlpack` / `nsl_model_forward_dlpack` actually return
-/// ownership-transferring outputs (they previously refused every
-/// tensor-returning export — no working caller existed, and the refusal note
-/// was contracted to be deleted with this change, so this is additive, not
-/// breaking). `NslTensorDesc` stays 48 bytes.
-pub const NSL_ABI_VERSION_MINOR: u32 = 1;
+/// NSL runtime C-ABI version, **major** and **minor** components — declared
+/// in `nsl_abi::wire::version` (roadmap A3, so the generated headers and
+/// the runtime read one number) and re-exported here at the historical
+/// path. The bump rules and the minor-1 changelog live on the declarations.
+pub use nsl_abi::wire::version::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR};
 
 /// Return the runtime's C-ABI version packed as `(major << 16) | minor`.
 ///
@@ -512,7 +494,7 @@ pub const NSL_ABI_VERSION_MINOR: u32 = 1;
 /// to detect runtime/header skew before making any other call.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_abi_version() -> i64 {
-    ((NSL_ABI_VERSION_MAJOR as i64) << 16) | (NSL_ABI_VERSION_MINOR as i64)
+    nsl_abi::wire::version::packed()
 }
 
 // ---------------------------------------------------------------------------

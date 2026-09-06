@@ -51,18 +51,22 @@ pub enum AllocPool {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceTag {
-    Other = 0,
-    Weights = 1,
-    OptimM = 2,
-    OptimV = 3,
-    MPartial = 4,
-    Grads = 5,
-    Activations = 6,
-    AttnWorkspace = 7,
+    // The discriminants are the wire values codegen emits for
+    // `nsl_gpu_set_alloc_surface`, declared once in `nsl_abi::wire::surface`
+    // (roadmap A3).
+    Other = wire::SURFACE_OTHER,
+    Weights = wire::SURFACE_WEIGHTS,
+    OptimM = wire::SURFACE_OPTIM_M,
+    OptimV = wire::SURFACE_OPTIM_V,
+    MPartial = wire::SURFACE_M_PARTIAL,
+    Grads = wire::SURFACE_GRADS,
+    Activations = wire::SURFACE_ACTIVATIONS,
+    AttnWorkspace = wire::SURFACE_ATTN_WORKSPACE,
 }
 
 /// Number of `SurfaceTag` variants (array size for per-surface counters).
-pub const NUM_SURFACES: usize = 8;
+pub use nsl_abi::wire::surface::NUM_SURFACES;
+use nsl_abi::wire::surface as wire;
 
 impl SurfaceTag {
     /// All variants in discriminant order (report row order).
