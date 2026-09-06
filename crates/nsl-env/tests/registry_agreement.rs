@@ -25,6 +25,18 @@ fn workspace_root() -> PathBuf {
 const KNOWN_DYNAMIC_READS: &[(&str, &str)] = &[
     // `find_ptxas` iterates over CUDA_PATH / CUDA_HOME: not NSL_ names.
     ("crates/nsl-runtime/src/cuda/mod.rs", "root"),
+    // `env_record::env_record` reads every runtime-read behavior-tier
+    // variable BY REGISTRY NAME to record it in the checkpoint sidecar
+    // (roadmap A5). The names are this crate's, so nothing unregistered can
+    // be read there.
+    ("crates/nsl-runtime/src/env_record.rs", "name"),
+    // `CompileOptions::exec_fingerprint` reads its five compile-time
+    // behavior-tier variables through an injected `env(name)` closure so
+    // the unit test can drive it without touching the process environment;
+    // the closure's one `env::var(name)` is this read. The names are
+    // literals at the call sites (`on_unless_zero("NSL_FA_FWD_MMA")`, …)
+    // and each is registered.
+    ("crates/nsl-codegen/src/lib.rs", "name"),
 ];
 
 #[test]

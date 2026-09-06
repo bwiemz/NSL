@@ -56,26 +56,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// The parameter is registered with a residency backend (it does not sit
-/// device-resident for the whole step).
-pub const PLAN_STREAMED: i64 = 1 << 0;
-/// Its authoritative storage is bf16 with stochastic rounding
-/// (`--param-dtype bf16-sr`) — the [`crate::sr_bf16`] backend.
-pub const PLAN_BF16_SR: i64 = 1 << 1;
-/// It is tensor-granular sharded across ranks (`--zero-stage 3`) — the
-/// [`crate::zero`] broadcast backend.
-pub const PLAN_SHARDED: i64 = 1 << 2;
-/// Item 11: within the zero-3 backend, the parameter is ELEMENTWISE sharded
-/// (each rank persistently holds a 1/ws slice; gathers ride all_gather,
-/// gradients reduce_scatter, every rank steps its own slice). Only valid
-/// alongside [`PLAN_SHARDED`] — it refines the same backend, so `expected()`
-/// still maps it to the zero-3 table.
-pub const PLAN_ELEMENTWISE: i64 = 1 << 3;
+/// The plan bits — `PLAN_STREAMED` (a residency backend), `PLAN_BF16_SR`
+/// (the [`crate::sr_bf16`] backend), `PLAN_SHARDED` (the [`crate::zero`]
+/// broadcast backend) and `PLAN_ELEMENTWISE` (item 11, refines
+/// `PLAN_SHARDED`) — are declared in `nsl_abi::wire::param_plan` (roadmap
+/// A3) so codegen bakes and the runtime checks the same encoding, and are
+/// re-exported here at the historical path.
+pub use nsl_abi::wire::param_plan::{PLAN_BF16_SR, PLAN_ELEMENTWISE, PLAN_SHARDED, PLAN_STREAMED};
 
 /// Every bit this ABI version defines. An unknown bit in a `declare` call
 /// means codegen and runtime disagree about the plan encoding; that is a
 /// build-integrity failure, not a recoverable condition.
-const PLAN_KNOWN_BITS: i64 = PLAN_STREAMED | PLAN_BF16_SR | PLAN_SHARDED | PLAN_ELEMENTWISE;
+use nsl_abi::wire::param_plan::PLAN_KNOWN_BITS;
 
 #[derive(Clone, Copy)]
 struct Declared {

@@ -10,9 +10,11 @@ expectation. Beta features work but may change. Experimental features are
 research vehicles: they may change shape, regress, or be removed between
 releases, and they are not part of the green-build contract.
 
-Last reviewed against: `main` @ v0.9.0 line (2026-08-25, item-19 reconciliation).
-No v0.9.1 was ever tagged; everything since the v0.9.0 tag (2026-03-19) is
-unreleased work on the 0.9 line.
+Last reviewed against: `main` @ v0.10.0 (2026-09-06, the roadmap D5 release
+cut). The tier table is unchanged since the item-19 reconciliation of
+2026-08-25; the only edit since is the hand-PTX freeze note (2026-09-02).
+v0.10.0 is the first tag since v0.9.0 (2026-03-19); no v0.9.1 was ever
+tagged. Releases are monthly from here, each with a review of this file.
 If you change a subsystem's maturity, update this file in the same PR.
 
 ---

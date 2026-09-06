@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+_Nothing yet. v0.10.0 below is the whole of the 0.9 line's unreleased work
+(2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),
+so this section stays short._
+
+## [0.10.0] - 2026-09-06
+
+The first tagged release since v0.9.0 — five and a half months of `main`.
+Highlights, newest first, with the full record below: Milestone B (1B@2048
+as a stable single-GPU workload) and its checkpoint/resume identity work
+(items 4, 7, 8, 17 and 19); the production 50M/500M/1B pretraining
+recipes and the v2 corpus; the Training Configuration Contract; SR-BF16,
+the fused LM head, the transient arena and CUDA-graph composition; the
+bf16 GEMM path (cuBLASLt, weight-cast cache) promoted to first-class
+config; the optimization roadmap's Phase 0/1 hygiene — release profile,
+cargo-deny/Dependabot, criterion benches, every `#[ignore]` with a reason,
+typed and spanned `CodegenError` with no `process::exit` in the codegen
+library, the `NSL_*` registry, Cranelift 0.135, edition 2024, the
+workspace lints, frontend golden tests and fuzz targets, generated CLI,
+env and stdlib references.
+
 ### Milestone B — 1B@2048 as a stable first-class single-GPU workload
 
 - **Full training-state checkpoint/restart** (`train(checkpoint_save=…,

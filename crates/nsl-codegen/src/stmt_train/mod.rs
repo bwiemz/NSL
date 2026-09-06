@@ -9,6 +9,9 @@
 //!   - [`contract`] — section 2: the resolved optimizer / scheduler /
 //!     callbacks contract, the `data:` section, the Muon perf-flag
 //!     refusals and the FASE plan, returned as a [`contract::TrainContract`].
+//!   - [`param_lists`] — the per-parameter runtime lists built at setup:
+//!     the Muon/AdamW route flags, the weight-decay exemption flags and
+//!     the gradient-accumulation buffers.
 //!   - [`teardown`] — every emission after the epoch loop's exit block: free
 //!     the lists, sweep the trailing CSLA window, restore streamed
 //!     weights, print the CUDA-graphs banner.
@@ -20,4 +23,5 @@
 //! optimizer-step emitters in `stmt_fase.rs`.
 
 pub(crate) mod contract;
+pub(crate) mod param_lists;
 pub(crate) mod teardown;
