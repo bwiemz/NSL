@@ -214,6 +214,20 @@ pub enum KirOp {
     /// (`pending == 0`: everything has landed).
     CpAsyncWait { pending: u8 },
 
+    // Roadmap A2 step 2: tensor-core ops with shape-checked fragment types.
+    // Fragments are `Vec(F16, 2)` (one packed f16x2 per .b32 register) for
+    // the A/B operands and `F32` for the accumulator; the verifier holds
+    // every listed register to that type (FeatureSet::TENSOR_CORES, sm_80).
+    /// Warp-collective load of four 8x8 b16 matrices from shared memory:
+    /// `ldmatrix.sync.aligned.m8n8.x4[.trans].shared.b16 {dst}, [addr]`.
+    /// `addr` is a `Ptr(_, Shared)`; each `dst` is a `Vec(F16, 2)`.
+    LdMatrixX4 { dst: [VarId; 4], addr: VarId, trans: bool },
+    /// Warp-collective `d = a * b + c` on one m16n8k16 tile:
+    /// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {d}, {a}, {b}, {c}`.
+    /// `a` (4) and `b` (2) are `Vec(F16, 2)` fragments; `c` and `d` (4 each)
+    /// are `F32`.
+    MmaF16M16N8K16 { d: [VarId; 4], a: [VarId; 4], b: [VarId; 2], c: [VarId; 4] },
+
     // M57 v1: structured ops for FPGA target. GPU/CPU codegen ignores these
     // (existing AST → templated PTX path for GPU; Cranelift for CPU);
     // FPGA codegen consumes them in the KIR → HIR pass.
@@ -353,6 +367,10 @@ impl KirBuilder {
             KirOp::CpAsync { .. } | KirOp::CpAsyncCommit | KirOp::CpAsyncWait { .. } => {
                 self.required_features |= FeatureSet::SHARED_MEMORY | FeatureSet::ASYNC_COPY
             }
+            KirOp::LdMatrixX4 { .. } => {
+                self.required_features |= FeatureSet::SHARED_MEMORY | FeatureSet::TENSOR_CORES
+            }
+            KirOp::MmaF16M16N8K16 { .. } => self.required_features |= FeatureSet::TENSOR_CORES,
             KirOp::AtomicAdd(_, _, AddressSpace::Global) => {
                 // Float atomics need ATOMIC_FLOAT; integer atomics are universal
                 self.required_features |= FeatureSet::ATOMIC_FLOAT;

@@ -17,7 +17,11 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     // every other op lowers on sm_70, the floor this backend has always
     // targeted, so the bump is taken only when a kernel asks for it.
     writeln!(ptx, ".version 7.0").unwrap();
-    let target = if ir.required_features.contains(FeatureSet::ASYNC_COPY) {
+    // The tensor-core ops (`ldmatrix`, `mma.sync` m16n8k16 f16) are sm_80
+    // instructions as well.
+    let target = if ir.required_features.contains(FeatureSet::ASYNC_COPY)
+        || ir.required_features.contains(FeatureSet::TENSOR_CORES)
+    {
         "sm_80"
     } else {
         "sm_70"
@@ -102,6 +106,9 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     let fd_count = *reg_counts.get("%fd").unwrap_or(&0);
     let h_count = *reg_counts.get("%h").unwrap_or(&0);
     let p_count = total_vars; // predicates
+    // Packed fragments (`KirType::Vec`, one .b32 each): declared only when a
+    // kernel has any, sized like the other classes so every VarId fits.
+    let v_count = if reg_counts.contains_key("%v") { total_vars } else { 0 };
 
     if r_count > 0 {
         writeln!(ptx, "    .reg .u32 %r<{}>;", r_count).unwrap();
@@ -120,6 +127,9 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     }
     if p_count > 0 {
         writeln!(ptx, "    .reg .pred %p<{}>;", p_count).unwrap();
+    }
+    if v_count > 0 {
+        writeln!(ptx, "    .reg .b32 %v<{}>;", v_count).unwrap();
     }
     writeln!(ptx).unwrap();
 
@@ -580,6 +590,40 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::CpAsyncWait { pending } => {
             writeln!(ptx, "    cp.async.wait_group {};", pending).unwrap();
         }
+        KirOp::LdMatrixX4 { dst, addr, trans } => {
+            let regs = dst
+                .iter()
+                .map(|v| format!("{}{}", var_reg_prefix(ir, *v, *v), v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let addr_prefix = var_reg_prefix(ir, *addr, *addr);
+            writeln!(
+                ptx,
+                "    ldmatrix.sync.aligned.m8n8.x4{}.shared.b16 {{{}}}, [{}{}];",
+                if *trans { ".trans" } else { "" },
+                regs,
+                addr_prefix,
+                addr
+            )
+            .unwrap();
+        }
+        KirOp::MmaF16M16N8K16 { d, a, b, c } => {
+            let list = |vars: &[VarId]| {
+                vars.iter()
+                    .map(|v| format!("{}{}", var_reg_prefix(ir, *v, *v), v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            writeln!(
+                ptx,
+                "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{}}}, {{{}}}, {{{}}}, {{{}}};",
+                list(d),
+                list(a),
+                list(b),
+                list(c)
+            )
+            .unwrap();
+        }
         KirOp::Matmul { .. } | KirOp::ElementwiseAdd { .. } | KirOp::Relu { .. } => {
             unreachable!("M57 v1 structured KIR ops are only emitted for Target::Fpga; \
                           this codegen path is GPU/CPU PTX")
@@ -669,6 +713,18 @@ fn extract_var_ids(op: &KirOp) -> Vec<VarId> {
         KirOp::Barrier | KirOp::SharedMemFence | KirOp::CpAsyncCommit | KirOp::CpAsyncWait { .. } => vec![],
         KirOp::SharedBase(d) => vec![*d],
         KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
+        KirOp::LdMatrixX4 { dst, addr, .. } => {
+            let mut v = dst.to_vec();
+            v.push(*addr);
+            v
+        }
+        KirOp::MmaF16M16N8K16 { d, a, b, c } => {
+            let mut v = d.to_vec();
+            v.extend_from_slice(a);
+            v.extend_from_slice(b);
+            v.extend_from_slice(c);
+            v
+        }
         KirOp::WarpShuffle(d, v, o) => vec![*d, *v, *o],
         KirOp::Cmp(d, a, b, _) | KirOp::PtrOffset(d, a, b) => vec![*d, *a, *b],
         KirOp::Const(d, _) => vec![*d],
@@ -869,6 +925,55 @@ mod tests {
         assert!(ptx.contains("    cp.async.commit_group;\n"), "{ptx}");
         assert!(ptx.contains("    cp.async.wait_group 0;\n"), "{ptx}");
         assert!(ptx.contains("    bar.sync 0;\n"), "{ptx}");
+    }
+
+    #[test]
+    fn test_ptx_tensor_core_ops_lower_with_a_packed_register_class() {
+        let mut b = KirBuilder::new("mma");
+        let out = b.add_param(
+            "out",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        b.set_shared_mem(512);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let frag = || KirType::Vec(Box::new(KirType::F16), 2);
+        let smem = b.new_typed_var(KirType::Ptr(Box::new(KirType::F16), AddressSpace::Shared));
+        b.emit(KirOp::SharedBase(smem));
+        let a = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
+        b.emit(KirOp::LdMatrixX4 { dst: a, addr: smem, trans: false });
+        let bb = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
+        b.emit(KirOp::LdMatrixX4 { dst: bb, addr: smem, trans: true });
+        let mut c = [0; 4];
+        for slot in &mut c {
+            *slot = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Const(*slot, KirConst { ty: KirType::F32, value: ConstValue::F32(0.0) }));
+        }
+        let d = [b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32)];
+        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.emit(KirOp::Store(out, d[0], AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()));
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains(".target sm_80"), "{ptx}");
+        assert!(ptx.contains("    .reg .b32 %v<"), "{ptx}");
+        assert!(
+            ptx.contains(&format!(
+                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%v{}, %v{}, %v{}, %v{}}}, [%rd{}];\n",
+                a[0], a[1], a[2], a[3], smem
+            )),
+            "{ptx}"
+        );
+        assert!(ptx.contains("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"), "{ptx}");
+        assert!(
+            ptx.contains(&format!(
+                "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%f{}, %f{}, %f{}, %f{}}}, {{%v{}, %v{}, %v{}, %v{}}}, {{%v{}, %v{}}}, {{%f{}, %f{}, %f{}, %f{}}};\n",
+                d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], bb[0], bb[1], c[0], c[1], c[2], c[3]
+            )),
+            "{ptx}"
+        );
     }
 
     #[test]

@@ -1643,6 +1643,8 @@ pub(crate) fn kir_op_kind_name(op: &KirOp) -> &'static str {
         KirOp::CpAsync { .. } => "CpAsync",
         KirOp::CpAsyncCommit => "CpAsyncCommit",
         KirOp::CpAsyncWait { .. } => "CpAsyncWait",
+        KirOp::LdMatrixX4 { .. } => "LdMatrixX4",
+        KirOp::MmaF16M16N8K16 { .. } => "MmaF16M16N8K16",
         KirOp::Matmul { .. } => "Matmul",
         KirOp::ElementwiseAdd { .. } => "ElementwiseAdd",
         KirOp::Relu { .. } => "Relu",

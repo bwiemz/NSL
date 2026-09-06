@@ -30,6 +30,11 @@
 //!      groups than have been committed. `CpAsync` copies 4, 8 or 16 bytes
 //!      from a `Ptr(_, Global)` into a `Ptr(_, Shared)`.
 //!
+//!   6. **Fragment typing.** `LdMatrixX4` loads from a `Ptr(_, Shared)`
+//!      into four `Vec(F16, 2)` registers; `MmaF16M16N8K16` takes four
+//!      `Vec(F16, 2)` A registers, two `Vec(F16, 2)` B registers and four
+//!      `F32` accumulators in and out.
+//!
 //! Untyped variables (`KirBuilder::new_var`) are exempt from rule 4 only;
 //! the FPGA-only structured ops (`Matmul`, `ElementwiseAdd`, `Relu`) carry
 //! their dtypes inline and are checked for rules 1–3 only.
@@ -203,10 +208,10 @@ pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
     }
     for block in &ir.blocks {
         for (op_index, op) in block.ops.iter().enumerate() {
-            if let Some(dst) = op_dst(op)
-                && (params.contains(&dst) || def_site.insert(dst, (block.id, op_index)).is_some())
-            {
-                errors.push(KirVerifyError::Redefined { var: dst, block: block.id, op_index });
+            for dst in op_dsts(op) {
+                if params.contains(&dst) || def_site.insert(dst, (block.id, op_index)).is_some() {
+                    errors.push(KirVerifyError::Redefined { var: dst, block: block.id, op_index });
+                }
             }
         }
     }
@@ -332,6 +337,11 @@ pub fn render_errors(errors: &[KirVerifyError]) -> String {
     errors.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
 }
 
+/// The packed f16x2 fragment register type the tensor-core ops carry.
+fn f16x2() -> KirType {
+    KirType::Vec(Box::new(KirType::F16), 2)
+}
+
 fn terminator_targets(term: &KirTerminator) -> Vec<BlockId> {
     match term {
         KirTerminator::Branch(t) => vec![*t],
@@ -340,10 +350,21 @@ fn terminator_targets(term: &KirTerminator) -> Vec<BlockId> {
     }
 }
 
-/// The `VarId` an op defines, if any. `Store`, `AtomicAdd`, `Barrier` and
-/// `SharedMemFence` define nothing (`AtomicAdd`'s PTX lowering reuses the
+/// The `VarId`s an op defines: one for most ops, four for the
+/// warp-collective loads and MACs, none for `Store`, `AtomicAdd`, the
+/// barriers and the async-copy group (`AtomicAdd`'s PTX lowering reuses the
 /// value register for the returned old value, a backend detail, not an IR
 /// definition).
+pub fn op_dsts(op: &KirOp) -> Vec<VarId> {
+    match op {
+        KirOp::LdMatrixX4 { dst, .. } => dst.to_vec(),
+        KirOp::MmaF16M16N8K16 { d, .. } => d.to_vec(),
+        _ => op_dst(op).into_iter().collect(),
+    }
+}
+
+/// The single `VarId` an op defines, if it defines exactly one. The
+/// multi-destination ops answer `None` here; use [`op_dsts`].
 pub fn op_dst(op: &KirOp) -> Option<VarId> {
     match op {
         KirOp::Add(d, _, _)
@@ -379,7 +400,9 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::SharedMemFence
         | KirOp::CpAsync { .. }
         | KirOp::CpAsyncCommit
-        | KirOp::CpAsyncWait { .. } => None,
+        | KirOp::CpAsyncWait { .. }
+        | KirOp::LdMatrixX4 { .. }
+        | KirOp::MmaF16M16N8K16 { .. } => None,
         KirOp::Matmul { out, .. } | KirOp::ElementwiseAdd { out, .. } | KirOp::Relu { out, .. } => {
             Some(*out)
         }
@@ -410,6 +433,13 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::Load(_, s, _) => vec![*s],
         KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) => vec![*p, *v],
         KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
+        KirOp::LdMatrixX4 { addr, .. } => vec![*addr],
+        KirOp::MmaF16M16N8K16 { a, b, c, .. } => {
+            let mut v = a.to_vec();
+            v.extend_from_slice(b);
+            v.extend_from_slice(c);
+            v
+        }
         KirOp::SharedBase(_)
         | KirOp::CpAsyncCommit
         | KirOp::CpAsyncWait { .. }
@@ -595,6 +625,37 @@ fn check_types(
                         errors.push(KirVerifyError::NotAPointer { var, block, op_index, found })
                     }
                 }
+            }
+        }
+        KirOp::LdMatrixX4 { dst, addr, .. } => {
+            // The address check pushes directly, so it runs after the last
+            // use of the `expect` closure (which holds `errors` mutably).
+            let frag = f16x2();
+            for v in dst {
+                expect(*v, "fragment", &frag);
+            }
+            match ty(addr) {
+                None | Some(KirType::Ptr(_, AddressSpace::Shared)) => {}
+                Some(KirType::Ptr(_, found)) => errors.push(KirVerifyError::AddressSpaceMismatch {
+                    var: *addr,
+                    block,
+                    op_index,
+                    role: "addr",
+                    expected: AddressSpace::Shared,
+                    found,
+                }),
+                Some(found) => {
+                    errors.push(KirVerifyError::NotAPointer { var: *addr, block, op_index, found })
+                }
+            }
+        }
+        KirOp::MmaF16M16N8K16 { d, a, b, c } => {
+            let frag = f16x2();
+            for v in a.iter().chain(b.iter()) {
+                expect(*v, "fragment", &frag);
+            }
+            for v in c.iter().chain(d.iter()) {
+                expect(*v, "accumulator", &KirType::F32);
             }
         }
         KirOp::CpAsyncCommit
@@ -1168,6 +1229,122 @@ mod tests {
                 expected: AddressSpace::Shared,
                 found: AddressSpace::Global,
             }])
+        );
+    }
+
+    fn frag() -> KirType {
+        KirType::Vec(Box::new(KirType::F16), 2)
+    }
+
+    fn f16_shared_ptr() -> KirType {
+        KirType::Ptr(Box::new(KirType::F16), AddressSpace::Shared)
+    }
+
+    /// ldmatrix A and B fragments from shared memory, an all-zero
+    /// accumulator, one mma: the tile every tensor-core loop is made of.
+    fn one_tile() -> (KirBuilder, [VarId; 4], [VarId; 4], [VarId; 4], [VarId; 4]) {
+        let mut b = KirBuilder::new("t");
+        let entry = b.new_block();
+        b.set_block(entry);
+        let smem = b.new_typed_var(f16_shared_ptr());
+        b.emit(KirOp::SharedBase(smem));
+        let a = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
+        b.emit(KirOp::LdMatrixX4 { dst: a, addr: smem, trans: false });
+        let bb = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
+        b.emit(KirOp::LdMatrixX4 { dst: bb, addr: smem, trans: true });
+        let mut c = [0; 4];
+        for slot in &mut c {
+            *slot = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Const(*slot, KirConst { ty: KirType::F32, value: ConstValue::F32(0.0) }));
+        }
+        let d = [b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32)];
+        (b, a, bb, c, d)
+    }
+
+    #[test]
+    fn a_tensor_core_tile_verifies_and_requires_the_feature() {
+        let (mut b, a, bb, c, d) = one_tile();
+        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(verify(&ir), Ok(()));
+        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::TENSOR_CORES));
+    }
+
+    #[test]
+    fn an_accumulator_fragment_typed_as_a_packed_register_is_reported() {
+        let (mut b, a, bb, mut c, d) = one_tile();
+        let wrong = b.new_typed_var(frag());
+        b.emit(KirOp::Const(wrong, KirConst { ty: frag(), value: ConstValue::U32(0) }));
+        c[2] = wrong;
+        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: wrong,
+                block: 0,
+                op_index: 8,
+                role: "accumulator",
+                expected: KirType::F32,
+                found: frag(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_b_fragment_typed_as_f32_is_reported() {
+        let (mut b, a, bb, c, d) = one_tile();
+        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], c[0]], c });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: c[0],
+                block: 0,
+                op_index: 7,
+                role: "fragment",
+                expected: frag(),
+                found: KirType::F32,
+            }])
+        );
+    }
+
+    #[test]
+    fn ldmatrix_from_a_global_pointer_is_reported() {
+        let mut b = KirBuilder::new("t");
+        let g = b.add_param("g", KirType::Ptr(Box::new(KirType::F16), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let a = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
+        b.emit(KirOp::LdMatrixX4 { dst: a, addr: g, trans: false });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::AddressSpaceMismatch {
+                var: g,
+                block: 0,
+                op_index: 0,
+                role: "addr",
+                expected: AddressSpace::Shared,
+                found: AddressSpace::Global,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_fragment_register_listed_twice_as_a_destination_breaks_ssa() {
+        let (mut b, a, bb, c, mut d) = one_tile();
+        d[3] = d[0];
+        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::Redefined { var: d[0], block: 0, op_index: 7 }])
         );
     }
 

@@ -362,8 +362,13 @@ group is first-class KIR (`SharedBase`, `CpAsync { bytes: 4 | 8 | 16 }`,
 verifier checks the global → shared state spaces and the commit/wait
 discipline per block, and the PTX backend lowers them to `cp.async` under an
 `sm_80` target (every other kernel keeps `sm_70`).
-`crates/nsl-codegen/tests/kir_async_copy_ptxas.rs` assembles that lowering
-with `ptxas` where the toolkit is present (CI's cuda-feature lane).
+The tensor-core ops are first-class too (`LdMatrixX4`, `MmaF16M16N8K16`,
+`FeatureSet::TENSOR_CORES`): fragments are `Vec(F16, 2)` (one packed `.b32`
+register each) and `F32` accumulators, held to those types by the verifier,
+and the PTX backend declares the `.reg .b32 %v<N>` class for them.
+`crates/nsl-codegen/tests/kir_async_copy_ptxas.rs` and
+`crates/nsl-codegen/tests/kir_mma_ptxas.rs` assemble those lowerings with
+`ptxas` where the toolkit is present (CI's cuda-feature lane).
 `src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
 (ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
 `src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
