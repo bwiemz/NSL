@@ -226,7 +226,22 @@ pub fn lower_kernel_to_ir(
     lowerer.builder.terminate(KirTerminator::Return);
 
     lowerer.builder.set_workgroup_size([256, 1, 1]);
-    Ok(lowerer.builder.finalize())
+    let ir = lowerer.builder.finalize();
+
+    // Roadmap A2 step 2: no kernel leaves the front door unverified. A
+    // lowering bug (an operand that never got a definition, a load whose
+    // register does not match its pointee, a use ahead of its def) is a
+    // compile-time refusal here, not a wrong answer at runtime.
+    ir.verify().map_err(|errors| {
+        CodegenError::new(format!(
+            "kernel `{}`: lowering produced KIR that fails verification ({} violation{}):\n{}",
+            name,
+            errors.len(),
+            if errors.len() == 1 { "" } else { "s" },
+            crate::kir_verify::render_errors(&errors),
+        ))
+    })?;
+    Ok(ir)
 }
 
 /// Internal lowering state.

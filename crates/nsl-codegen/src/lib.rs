@@ -112,6 +112,7 @@ pub mod gpu_specs;
 pub mod gpu_target;
 pub mod kernel;
 pub mod kernel_ir;
+pub mod kir_verify;
 pub mod kernel_lower;
 pub mod kernel_skeleton;
 pub mod matmul_mma;
