@@ -9,6 +9,11 @@
 //!   - [`model_params`] — section 3: the model's layout, its tensor
 //!     parameters as a runtime list, the CPDT dtype-code lists and Muon's
 //!     mode table, returned as a [`model_params::ModelParams`].
+//!   - [`identity`] — the checkpoint-identity emission at setup: the
+//!     resolved train/optimizer/scheduler record (item 4) and the
+//!     full-state resume load (Milestone B).
+//!   - [`epoch_close`] — the batch-loop seal, the `on_epoch` callbacks,
+//!     the epoch increment and the jump back to the epoch header.
 //!   - [`param_lists`] — the per-parameter runtime lists built at setup:
 //!     the Muon/AdamW route flags, the weight-decay exemption flags and
 //!     the gradient-accumulation buffers.
@@ -23,5 +28,7 @@
 //! optimizer-step emitters in `stmt_fase.rs`.
 
 pub(crate) mod model_params;
+pub(crate) mod epoch_close;
+pub(crate) mod identity;
 pub(crate) mod param_lists;
 pub(crate) mod teardown;
