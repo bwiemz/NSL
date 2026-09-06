@@ -1104,6 +1104,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "When set (any value), marks the disaggregated KV-transfer auto-selection as multi-node, preferring RDMA then TCP over NVLink/shm."
     ),
     var!(
+        "NSL_RESUME_ALLOW_ENV_DRIFT",
+        Bool,
+        "1 only",
+        "off (abort on runtime-environment drift)",
+        Safety,
+        Runtime,
+        "Set to 1 to let checkpoint_load resume under a different set of runtime-read behavior-tier NSL_* variables with an acknowledgment instead of aborting."
+    ),
+    var!(
         "NSL_RESUME_ALLOW_TRAJECTORY_DRIFT",
         Bool,
         "1 only",
