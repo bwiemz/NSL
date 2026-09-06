@@ -113,6 +113,9 @@ const STMT: &str = "crates/nsl-codegen/src/stmt.rs";
 const CODEGEN_COMPILER: &str = "crates/nsl-codegen/src/compiler/mod.rs";
 const STMT_FASE: &str = "crates/nsl-codegen/src/stmt_fase.rs";
 const STMT_ADMISSION: &str = "crates/nsl-codegen/src/stmt_admission.rs";
+/// Section 3 of the train block — the model/parameter-list build and the CPDT
+/// moment-precision plan (roadmap A1).
+const STMT_MODEL_PARAMS: &str = "crates/nsl-codegen/src/stmt_train/model_params.rs";
 const CLI_RUN: &str = "crates/nsl-cli/src/commands/run.rs";
 const CALIB: &str = "crates/nsl-codegen/src/calibration/binary_codegen.rs";
 const CLI_CHECK: &str = "crates/nsl-cli/src/commands/check.rs";
@@ -204,7 +207,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--layerwise-accum",
         RuleKind::Conflicts,
         "--wggo",
-        STMT,
+        STMT_MODEL_PARAMS,
         "Drop --wggo overrides or --layerwise-accum",
     ),
     // grad_clip= is a train-block key, not a flag — same shape as the
@@ -261,7 +264,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--zero-stage",
         RuleKind::Conflicts,
         "--wggo-moment-precision",
-        STMT,
+        STMT_MODEL_PARAMS,
         "Drop --wggo-moment-precision / the CPDT precision plan, or use --zero-stage 2",
     ),
     src_rule(
@@ -298,14 +301,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--param-dtype",
         RuleKind::Requires,
         "--weight-stream",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr requires --weight-stream",
     ),
     src_rule(
         "--param-dtype",
         RuleKind::Requires,
         "FASE-Deferred plan",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr requires the FASE-Deferred plan",
     ),
     // ── Frozen tuning DB (item 10) ─────────────────────────────────────────
@@ -332,7 +335,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--param-dtype",
         RuleKind::Conflicts,
         "--zero-stage 1/2",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr does not compose with --zero-stage 1/2",
     ),
     // Encoded as a CONFLICT against tensor-granular stage 3, not as
@@ -350,28 +353,28 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--param-dtype",
         RuleKind::Conflicts,
         "tensor-granular --zero-stage 3",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr composes with --zero-stage 3 only under --zero-elementwise",
     ),
     src_rule(
         "--param-dtype",
         RuleKind::Conflicts,
         "--optim-state-offload",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr does not compose with --optim-state-offload",
     ),
     src_rule(
         "--param-dtype",
         RuleKind::Conflicts,
         "--wggo-moment-precision",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr does not compose with reduced-precision optimizer moments (drop --wggo-moment-precision",
     ),
     src_rule(
         "--param-dtype",
         RuleKind::Conflicts,
         "--training-reference",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr requires the fused optimizer step, which --training-reference disables",
     ),
     // Found by the completeness sweep below — the registry had CSLA x --wggo
@@ -380,7 +383,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--param-dtype",
         RuleKind::Conflicts,
         "WGGO per-layer FASE overrides",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--param-dtype bf16-sr does not compose with WGGO per-layer FASE overrides",
     ),
     src_rule(
@@ -488,21 +491,21 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--muon-state-dtype",
         RuleKind::Requires,
         "--layerwise-accum",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--muon-state-dtype bf16 requires --layerwise-accum",
     ),
     src_rule(
         "--muon-state-dtype",
         RuleKind::Conflicts,
         "--zero-stage",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--muon-state-dtype bf16 does not compose with --zero-stage",
     ),
     src_rule(
         "--muon-state-dtype",
         RuleKind::Conflicts,
         "--optim-state-offload",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--muon-state-dtype bf16 does not compose with --optim-state-offload",
     ),
     // CORRECTED after review: the guard is `optimizer_name != "muon"`. This is
@@ -513,7 +516,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--muon-state-dtype",
         RuleKind::Requires,
         "muon optimizer",
-        STMT,
+        STMT_MODEL_PARAMS,
         "--muon-state-dtype bf16 applies to the Muon optimizer only",
     ),
     // Second enforcement site for --param-dtype x --training-reference (the

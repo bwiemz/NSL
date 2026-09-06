@@ -6,6 +6,9 @@
 //! phases. Each submodule here is one phase peeled off that function
 //! (roadmap A1), in the order the driver runs them:
 //!
+//!   - [`model_params`] — section 3: the model's layout, its tensor
+//!     parameters as a runtime list, the CPDT dtype-code lists and Muon's
+//!     mode table, returned as a [`model_params::ModelParams`].
 //!   - [`teardown`] — every emission after the epoch loop's exit block: free
 //!     the lists, sweep the trailing CSLA window, restore streamed
 //!     weights, print the CUDA-graphs banner.
@@ -16,4 +19,5 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod model_params;
 pub(crate) mod teardown;
