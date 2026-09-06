@@ -7136,168 +7136,23 @@ impl Compiler<'_> {
         }
 
         // ── 4a. P1 Muon item 6: parameter-ROLE routing flags ────────────
-        // Mixed Muon/AdamW routes by parameter ROLE — explicit @param_role
-        // decorator > embedding_lookup-usage inference > declared rank >
-        // default hidden (see param_roles.rs). The name-substring exclusion
-        // list is gone. Flags ride in an i64 NslList parallel to param_list
-        // (1 = force-AdamW); the rank-2 structural check remains the runtime
-        // backstop inside muon_step. Built BEFORE the optimizer state
-        // buffers so the v (second-moment) allocation can skip Muon-routed
-        // params (item 9). The routing table prints loudly so a misrouted
-        // param is never silent.
-        let muon_route_list = if optimizer_name == "muon" {
-            let table = self.classify_param_roles(&model_type_name, &param_paths);
-            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-            for e in &table.entries {
-                let flag = builder.ins().iconst(cl_types::I64, e.adamw as i64);
-                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
-            }
-            let adamw_count = table.entries.iter().filter(|e| e.adamw).count();
-            eprintln!(
-                "[muon] role-based Muon/AdamW routing over {} params ({} \
-                 AdamW-routed, {} Muon):",
-                table.entries.len(),
-                adamw_count,
-                table.entries.len() - adamw_count,
-            );
-            for e in &table.entries {
-                eprintln!(
-                    "[muon]   {} role={} ({}) -> {}",
-                    e.path,
-                    e.role,
-                    e.source,
-                    if e.adamw {
-                        "AdamW"
-                    } else {
-                        "Muon (if rank-2 at runtime)"
-                    },
-                );
-            }
-            if !table.entries.iter().any(|e| e.role == "head") {
-                eprintln!(
-                    "[muon] note: no param has role 'head' — correct for \
-                     weight-tied models (the tied embedding covers it); if \
-                     this model has an UNTIED lm_head, annotate it with \
-                     @param_role(\"head\")."
-                );
-            }
-            for w in &table.warnings {
-                eprintln!("[muon] warning: {w}");
-            }
-            Some(list)
-        } else {
-            None
-        };
+        // Moved to `stmt_train/param_lists.rs` byte-for-byte (roadmap A1).
+        let muon_route_list =
+            self.muon_route_flags(builder, &optimizer_name, &model_type_name, &param_paths)?;
 
-        // AdamW parameter groups: refuse the compositions that hoist ONE
-        // weight-decay scalar out of the per-parameter loop. Each of these
-        // would compile and train — decaying the parameters the user asked to
-        // exempt — so they must refuse rather than silently ignore no_decay.
-        if !no_decay_scope.is_empty() {
-            if self.compile_options.muon_batch_ns {
-                return Err(CodegenError::new(
-                    "no_decay=[...] is not supported with --muon-batch-ns: the \
-                     batched Newton-Schulz pre-loop takes one weight_decay \
-                     scalar for the whole batch, so per-parameter exemption \
-                     cannot be expressed there. Drop one",
-                ));
-            }
-            if csla_active {
-                return Err(CodegenError::new(
-                    "no_decay=[...] is not supported with --layerwise-accum: the \
-                     window-buffered group update hoists weight_decay out of \
-                     the per-parameter loop. Drop one",
-                ));
-            }
-            if self.compile_options.optim_state_offload {
-                return Err(CodegenError::new(
-                    "no_decay=[...] is not supported with --optim-state-offload \
-                     yet (the staged host/device envelope is untested against \
-                     per-parameter decay). Drop one",
-                ));
-            }
-        }
+        // AdamW parameter groups x hoisted weight-decay compositions: moved
+        // to `stmt_admission.rs` byte-for-byte (roadmap A1).
+        self.no_decay_composition_admission(&no_decay_scope, csla_active)?;
 
         // ── 4a-bis. AdamW parameter groups: per-param decay-exempt flags ──
-        // `no_decay=[...]` names ROLES to exempt from weight decay. The
-        // static half of the decision (embedding / head / hidden) is decided
-        // here from the same role table Muon routes on; the `"vector"` half
-        // is NOT, because a model field only has a statically-derivable rank
-        // when its initializer is a direct zeros/ones/randn/... call over
-        // integer literals — which real models are not. Both halves meet in
-        // `nsl_optim_param_wd`, the single runtime rule.
-        //
-        // Flags ride in an i64 NslList parallel to param_list (1 = exempt),
-        // exactly like the Muon route flags. The table prints loudly: a
-        // parameter group that silently exempted nothing (or everything) is
-        // the failure this feature is supposed to remove, not add.
-        let decay_exempt_list = if no_decay_scope.is_empty() {
-            None
-        } else {
-            if weight_decay_value == 0.0 {
-                eprintln!(
-                    "[wd-groups] warning: no_decay=[...] was given but \
-                     weight_decay is 0.0 — nothing is being decayed, so the \
-                     exemption has no effect."
-                );
-            }
-            let table = self.classify_param_roles(&model_type_name, &param_paths);
-            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-            let mut static_exempt = 0usize;
-            for e in &table.entries {
-                let exempt = no_decay_scope.exempts_role(e.role);
-                static_exempt += usize::from(exempt);
-                let flag = builder.ins().iconst(cl_types::I64, i64::from(exempt));
-                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
-            }
-            let mut scope_desc = no_decay_scope.static_roles.clone();
-            if no_decay_scope.exempt_non_rank2 {
-                scope_desc.push("vector (runtime rank != 2)".to_string());
-            }
-            eprintln!(
-                "[wd-groups] weight_decay={} exempting roles [{}] over {} params: \
-                 {} exempt by role at compile time{}",
-                weight_decay_value,
-                scope_desc.join(", "),
-                table.entries.len(),
-                static_exempt,
-                if no_decay_scope.exempt_non_rank2 {
-                    ", plus every param that is not rank-2 at step time"
-                } else {
-                    ""
-                },
-            );
-            for e in &table.entries {
-                if no_decay_scope.exempts_role(e.role) {
-                    eprintln!(
-                        "[wd-groups]   {} role={} ({}) -> NO decay",
-                        e.path, e.role, e.source
-                    );
-                }
-            }
-            // Anti-vacuity: a scope that exempts nothing statically AND does
-            // not ask for the runtime rank check cannot ever fire. That is a
-            // configuration error, not a no-op to shrug at.
-            if static_exempt == 0 && !no_decay_scope.exempt_non_rank2 {
-                return Err(CodegenError::new(format!(
-                    "no_decay=[{}] matches no parameter in this model — every \
-                     param classified as one of the roles it does NOT name. \
-                     Roles present: {}. Note that norms and biases usually \
-                     classify as role `hidden` (their rank is not derivable \
-                     from the field initializer), so use no_decay=[\"vector\"] \
-                     to exempt them by runtime rank",
-                    no_decay_scope.static_roles.join(", "),
-                    {
-                        let mut roles: Vec<&str> =
-                            table.entries.iter().map(|e| e.role).collect();
-                        roles.sort_unstable();
-                        roles.dedup();
-                        roles.join(", ")
-                    },
-                )));
-            }
-            Some(list)
-        };
+        // Moved to `stmt_train/param_lists.rs` byte-for-byte (roadmap A1).
+        let decay_exempt_list = self.decay_exempt_flags(
+            builder,
+            &no_decay_scope,
+            weight_decay_value,
+            &model_type_name,
+            &param_paths,
+        )?;
 
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
@@ -7791,71 +7646,16 @@ sched={sched_s}",
         }
 
         // ── 5b. Allocate gradient accumulation buffers (if grad_accumulation_steps > 1) ──
-        // These persist across batches within each accumulation window. Each buffer
-        // is zeros_like(param) and gets += each batch's grads, then zeroed after
-        // the optimizer step every N batches.
-        let accum_list = if grad_accumulation_steps > 1 {
-            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-            // P0.1: grad-accumulation buffers under the MPartial surface.
-            let surface_m_partial = builder.ins().iconst(cl_types::I8, SURFACE_M_PARTIAL);
-            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_m_partial])?;
-            // Runtime loop over param_list (not layout.fields — which may include sub-models)
-            let accum_i_var = builder.declare_var(cl_types::I64);
-            let accum_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(accum_i_var, accum_zero);
-            let accum_hdr = builder.create_block();
-            let accum_body = builder.create_block();
-            let accum_exit = builder.create_block();
-            builder.ins().jump(accum_hdr, &[]);
-            builder.switch_to_block(accum_hdr);
-            // Don't seal accum_hdr yet — back-edge not added
-            let ai = builder.use_var(accum_i_var);
-            let ac = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, ai, num_params_val);
-            builder.ins().brif(ac, accum_body, &[], accum_exit, &[]);
-            builder.switch_to_block(accum_body);
-            builder.seal_block(accum_body);
-            let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, ai])?;
-            // P3: under --optim-state-offload the FASE window accumulator
-            // (m_partial) is the last device-resident param-sized f32 surface
-            // (~4.15 GB at 1B). Allocate it HOST-resident (pinned) too; the
-            // accumulate hook stages it to the grad's device per micro-batch
-            // and the final step stages it in for the m/v update. m_partial
-            // is ALWAYS f32 (exact-windowed semantics — the reduced-precision
-            // moment path never touches it), so f32 host regardless of the
-            // CPDT precision plan.
-            //
-            // CSLA (D1b): the whole point — do NOT allocate the full-model
-            // window here. Slots start NULL; the window backward allocates
-            // each layer's accumulators just before that layer's replay and
-            // frees them right after its per-layer update, so the live
-            // accumulator surface is max(one layer) + the epilogue globals
-            // instead of 4·P bytes. (All accumulation happens inside the
-            // window region under csla — the per-micro-batch ga_body loop is
-            // hook-skipped — so a NULL slot is never read between windows.)
-            let zeros = if csla_active {
-                builder.ins().iconst(cl_types::I64, 0)
-            } else if self.compile_options.optim_state_offload {
-                self.compile_call_by_name(builder, "nsl_tensor_zeros_like_host_f32", &[p])?
-            } else {
-                self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?
-            };
-            self.compile_call_by_name(builder, "nsl_list_push", &[list, zeros])?;
-            let a_one = builder.ins().iconst(cl_types::I64, 1);
-            let a_next = builder.ins().iadd(ai, a_one);
-            builder.def_var(accum_i_var, a_next);
-            builder.ins().jump(accum_hdr, &[]);
-            builder.seal_block(accum_hdr);
-            builder.switch_to_block(accum_exit);
-            builder.seal_block(accum_exit);
-            state.current_block = Some(accum_exit);
-            // End of the MPartial bracket — restore the caller's surface.
-            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
-            Some(list)
-        } else {
-            None
-        };
+        // Moved to `stmt_train/param_lists.rs` byte-for-byte (roadmap A1).
+        let accum_list = self.alloc_grad_accum_buffers(
+            builder,
+            state,
+            grad_accumulation_steps,
+            csla_active,
+            num_params_val,
+            param_list,
+            surface_prev,
+        )?;
 
         // ── 5b2. CSLA (D1b): one-time pointer-tie guard ─────────────────
         // Pointer-tied weights (two fields aliasing one storage) are
