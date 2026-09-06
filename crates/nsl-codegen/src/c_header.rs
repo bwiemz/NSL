@@ -215,8 +215,9 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str("#include <stddef.h>\n\n");
 
     // Pin the runtime C-ABI version this header was generated against. The
-    // values come from `nsl_runtime::c_api` so the header can never drift from
-    // the runtime it describes. A host can compare these macros against the
+    // values come from `nsl_abi::wire::version` — the same declaration the
+    // runtime's `nsl_abi_version()` packs — so the header can never drift
+    // from the runtime it describes. A host can compare these macros against the
     // runtime's `nsl_abi_version()` to detect runtime/header skew before use.
     out.push_str(&format!(
         "/* C-ABI version this header was generated against. Compare with the\n\
@@ -224,8 +225,8 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
          #define NSL_ABI_VERSION_MAJOR {}\n\
          #define NSL_ABI_VERSION_MINOR {}\n\
          #define NSL_ABI_VERSION (((int64_t)NSL_ABI_VERSION_MAJOR << 16) | NSL_ABI_VERSION_MINOR)\n\n",
-        nsl_runtime::c_api::NSL_ABI_VERSION_MAJOR,
-        nsl_runtime::c_api::NSL_ABI_VERSION_MINOR,
+        nsl_abi::wire::version::NSL_ABI_VERSION_MAJOR,
+        nsl_abi::wire::version::NSL_ABI_VERSION_MINOR,
     ));
 
     out.push_str("#ifdef __cplusplus\n");
@@ -608,22 +609,25 @@ mod tests {
         // Macros are present and track the runtime's source-of-truth constants.
         assert!(header.contains(&format!(
             "#define NSL_ABI_VERSION_MAJOR {}",
-            nsl_runtime::c_api::NSL_ABI_VERSION_MAJOR
+            nsl_abi::wire::version::NSL_ABI_VERSION_MAJOR
         )));
         assert!(header.contains(&format!(
             "#define NSL_ABI_VERSION_MINOR {}",
-            nsl_runtime::c_api::NSL_ABI_VERSION_MINOR
+            nsl_abi::wire::version::NSL_ABI_VERSION_MINOR
         )));
         // The runtime-provided prototype is declared so hosts can check skew.
         assert!(header.contains("nsl_abi_version(void)"));
     }
 
+    /// The runtime's exported `nsl_abi_version()` — the number a host reads
+    /// at load time — packs the same declaration the header macros print.
     #[test]
     fn runtime_abi_version_packs_major_minor() {
         let packed = nsl_runtime::c_api::nsl_abi_version();
         let major = (packed >> 16) as u32;
         let minor = (packed & 0xffff) as u32;
-        assert_eq!(major, nsl_runtime::c_api::NSL_ABI_VERSION_MAJOR);
-        assert_eq!(minor, nsl_runtime::c_api::NSL_ABI_VERSION_MINOR);
+        assert_eq!(major, nsl_abi::wire::version::NSL_ABI_VERSION_MAJOR);
+        assert_eq!(minor, nsl_abi::wire::version::NSL_ABI_VERSION_MINOR);
+        assert_eq!(packed, nsl_abi::wire::version::packed());
     }
 }

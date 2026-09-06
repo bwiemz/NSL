@@ -21,16 +21,18 @@ use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
 use cranelift_codegen::ir::Value;
 
 // P0.1 per-surface VRAM accounting: the wire values of
-// `nsl_gpu_set_alloc_surface` / `nsl_gpu_get_alloc_surface`, which MUST
-// match `nsl_runtime::cuda::caching_allocator::SurfaceTag` (#[repr(u8)]).
+// `nsl_gpu_set_alloc_surface` / `nsl_gpu_get_alloc_surface`. Declared once in
+// `nsl_abi::wire::surface` (roadmap A3), which is also where the runtime's
+// `SurfaceTag` (#[repr(u8)]) takes its discriminants — so the two cannot
+// drift. Widened to i64 here because they are emitted as `iconst I64`.
 // Each train-block bracket sets a surface for its allocation region and
 // restores the caller's surface afterwards (get/set — nesting-safe).
-pub(crate) const SURFACE_WEIGHTS: i64 = 1;
-pub(crate) const SURFACE_OPTIM_M: i64 = 2;
-pub(crate) const SURFACE_OPTIM_V: i64 = 3;
-pub(crate) const SURFACE_M_PARTIAL: i64 = 4;
-pub(crate) const SURFACE_GRADS: i64 = 5;
-pub(crate) const SURFACE_ACTIVATIONS: i64 = 6;
+pub(crate) const SURFACE_WEIGHTS: i64 = nsl_abi::wire::surface::SURFACE_WEIGHTS as i64;
+pub(crate) const SURFACE_OPTIM_M: i64 = nsl_abi::wire::surface::SURFACE_OPTIM_M as i64;
+pub(crate) const SURFACE_OPTIM_V: i64 = nsl_abi::wire::surface::SURFACE_OPTIM_V as i64;
+pub(crate) const SURFACE_M_PARTIAL: i64 = nsl_abi::wire::surface::SURFACE_M_PARTIAL as i64;
+pub(crate) const SURFACE_GRADS: i64 = nsl_abi::wire::surface::SURFACE_GRADS as i64;
+pub(crate) const SURFACE_ACTIVATIONS: i64 = nsl_abi::wire::surface::SURFACE_ACTIVATIONS as i64;
 
 /// Item C: how ONE parameter's optimizer moments are allocated under
 /// `--zero-stage 3`, decided from its `ParameterPlan` entry and consumed by
@@ -67,7 +69,7 @@ enum SourceAdParamDiagnosticKind {
 /// same contract `distill` always had — so a Literal here means the window
 /// is exactly what the source says.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GradAccumulationDecl {
+pub(crate) enum GradAccumulationDecl {
     /// No `grad_accumulation=` in the train block's config at all.
     Omitted,
     /// Present as an integer literal — the window is what it says.
@@ -6502,124 +6504,16 @@ impl Compiler<'_> {
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── Item 7 (`--fuse-wgrad-accum`) admission ─────────────────────
-        // The fusion has exactly ONE way to fire: the FASE-Deferred
-        // `on_param_grad` hook. `wengert_lower` plans only when that hook is
-        // present, the sole `nsl_tensor_wgrad_accum` emission site sits inside
-        // it, and — the part that made this invisible — the
-        // `[wgrad-fusion] N chain(s) fused` counter is gated on it too. So a
-        // build with the flag on and no hook produced no count, no warning and
-        // no error: the user was told nothing at all.
-        //
-        // `grad_accumulation` defaults to 1 when the train block omits it, and
-        // `fase::plan` returns `Passthrough` unconditionally at accumulation 1
-        // for EVERY optimizer. That is the state `models/coder50m/pretrain.nsl`
-        // and `pretrain_cert.nsl` are in, and `--pretrain-optimized` sets the
-        // flag with no accumulation precondition — so the shipped pretraining
-        // configuration fused zero chains while reporting success.
-        //
-        // NOT fixed by making the fusion work at accumulation 1: there is no
-        // `m_partial` for the beta=1 GEMM to write into, so that needs a
-        // beta=0 dW-output variant and a non-hook lowering path. What is fixed
-        // here is the SILENCE.
-        //
-        // SCOPE: this block only RECORDS. The refusal is compile-scoped, in
-        // `Compiler::finish_wgrad_admission` — see its header for why. The
-        // note below stays per block because it is the part that names WHICH
-        // block is inert, which a compile-scoped message cannot.
-        let fase_hook_reachable = fase_deferred && self.features.source_ad_enabled;
-        if self.compile_options.fuse_wgrad_accum {
-            if fase_hook_reachable {
-                self.wgrad_hook_blocks += 1;
-            } else {
-                // The remedy travels WITH the reason. It used to be one fixed
-                // list appended to every refusal, which made two thirds of it
-                // wrong in the common case: "switch to an Adam-family or SGD
-                // optimizer" is dead advice at accumulation 1, because
-                // `fase::plan` returns Passthrough there BEFORE it looks at
-                // the optimizer at all — including on the shipped scripts,
-                // which are AdamW already.
-                let (reason, remedy): (String, &'static str) = if !self
-                    .features
-                    .source_ad_enabled
-                {
-                    (
-                        "source-AD is off, so there is no compile-time adjoint \
-                         tape to fuse and no FASE accumulate hook to fold into"
-                            .to_string(),
-                        "Add --source-ad, or drop --fuse-wgrad-accum.",
-                    )
-                } else if grad_accumulation_steps <= 1 {
-                    // WHY the window is 1 is the whole content of this
-                    // message, and asserting "the default when the train block
-                    // omits it" unconditionally made it false for a block that
-                    // plainly declares one: the train path CLAMPS a
-                    // non-literal `grad_accumulation` to 1 with no diagnostic
-                    // (spec/05-training-loop.nsl.md documents the asymmetry
-                    // with `distill`, which refuses one instead). Sending that
-                    // user to look for a missing `grad_accumulation=` that is
-                    // right there in the source is the wrong-reason failure
-                    // this admission exists to avoid.
-                    //
-                    // The noun is chosen, not hard-coded: a distill block
-                    // lowers through this same function, and telling its
-                    // author to edit "a train block" names a construct their
-                    // program does not contain while leaving `distill`'s own
-                    // `grad_accumulation` key unmentioned.
-                    let noun = self.training_block_noun();
-                    let how = match grad_accumulation_decl {
-                        GradAccumulationDecl::Omitted => {
-                            format!("the {noun} omits grad_accumulation, so it defaults to 1")
-                        }
-                        // A non-literal window is refused by the Training
-                        // Configuration Contract before this point (train and
-                        // distill alike), so Literal is exact.
-                        GradAccumulationDecl::Literal => {
-                            format!("the {noun} sets grad_accumulation to 1")
-                        }
-                    };
-                    (
-                        format!(
-                            "grad_accumulation is 1 ({how}), so FASE is \
-                             Passthrough and there is no m_partial for the \
-                             beta=1 GEMM to accumulate into"
-                        ),
-                        if self.active_distill_context.is_some() {
-                            "Set grad_accumulation to an integer literal >= 2 on \
-                             the distill block, or drop --fuse-wgrad-accum."
-                        } else {
-                            "Set grad_accumulation to an integer literal >= 2 in a \
-                             train block, or drop --fuse-wgrad-accum."
-                        },
-                    )
-                } else {
-                    (
-                        format!(
-                            "optimizer `{optimizer_name}` resolved to FASE \
-                             {:?}, not Deferred — only a Deferred plan owns \
-                             the per-parameter accumulate this fusion folds \
-                             into",
-                            fase_plan.mode
-                        ),
-                        "Use an Adam-family optimizer or SGD (Lion and unknown \
-                         optimizers resolve to FullBuffer), or drop \
-                         --fuse-wgrad-accum.",
-                    )
-                };
-                // The instrument. Emitted on BOTH provenances, because the
-                // whole defect was that the inert case said nothing; the
-                // refusal is only reachable on one of them. Ordinal included
-                // because the compile-scoped refusal deliberately does NOT
-                // fire when a sibling block fused — so in a multi-block
-                // program this line is the only thing that says which block
-                // is inert.
-                eprintln!(
-                    "[wgrad-fusion] declined: {} #{} — {reason}",
-                    self.training_block_noun(),
-                    self.wgrad_block_ordinal()
-                );
-                self.wgrad_declines.push((reason, remedy));
-            }
-        }
+        // Moved to `stmt_admission.rs` byte-for-byte (roadmap A1); this
+        // block only RECORDS (`wgrad_hook_blocks` / `wgrad_declines`) — the
+        // refusal is compile-scoped, in `Compiler::finish_wgrad_admission`.
+        self.wgrad_fusion_admission(
+            grad_accumulation_steps,
+            grad_accumulation_decl,
+            &optimizer_name,
+            fase_deferred,
+            fase_plan.mode,
+        );
 
         // ── CSLA Stage-2 / ZeRO admission ───────────────────────────────
         // Moved to `stmt_admission.rs` byte-for-byte (roadmap A1); the
@@ -7245,168 +7139,23 @@ impl Compiler<'_> {
         }
 
         // ── 4a. P1 Muon item 6: parameter-ROLE routing flags ────────────
-        // Mixed Muon/AdamW routes by parameter ROLE — explicit @param_role
-        // decorator > embedding_lookup-usage inference > declared rank >
-        // default hidden (see param_roles.rs). The name-substring exclusion
-        // list is gone. Flags ride in an i64 NslList parallel to param_list
-        // (1 = force-AdamW); the rank-2 structural check remains the runtime
-        // backstop inside muon_step. Built BEFORE the optimizer state
-        // buffers so the v (second-moment) allocation can skip Muon-routed
-        // params (item 9). The routing table prints loudly so a misrouted
-        // param is never silent.
-        let muon_route_list = if optimizer_name == "muon" {
-            let table = self.classify_param_roles(&model_type_name, &param_paths);
-            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-            for e in &table.entries {
-                let flag = builder.ins().iconst(cl_types::I64, e.adamw as i64);
-                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
-            }
-            let adamw_count = table.entries.iter().filter(|e| e.adamw).count();
-            eprintln!(
-                "[muon] role-based Muon/AdamW routing over {} params ({} \
-                 AdamW-routed, {} Muon):",
-                table.entries.len(),
-                adamw_count,
-                table.entries.len() - adamw_count,
-            );
-            for e in &table.entries {
-                eprintln!(
-                    "[muon]   {} role={} ({}) -> {}",
-                    e.path,
-                    e.role,
-                    e.source,
-                    if e.adamw {
-                        "AdamW"
-                    } else {
-                        "Muon (if rank-2 at runtime)"
-                    },
-                );
-            }
-            if !table.entries.iter().any(|e| e.role == "head") {
-                eprintln!(
-                    "[muon] note: no param has role 'head' — correct for \
-                     weight-tied models (the tied embedding covers it); if \
-                     this model has an UNTIED lm_head, annotate it with \
-                     @param_role(\"head\")."
-                );
-            }
-            for w in &table.warnings {
-                eprintln!("[muon] warning: {w}");
-            }
-            Some(list)
-        } else {
-            None
-        };
+        // Moved to `stmt_train/param_lists.rs` byte-for-byte (roadmap A1).
+        let muon_route_list =
+            self.muon_route_flags(builder, &optimizer_name, &model_type_name, &param_paths)?;
 
-        // AdamW parameter groups: refuse the compositions that hoist ONE
-        // weight-decay scalar out of the per-parameter loop. Each of these
-        // would compile and train — decaying the parameters the user asked to
-        // exempt — so they must refuse rather than silently ignore no_decay.
-        if !no_decay_scope.is_empty() {
-            if self.compile_options.muon_batch_ns {
-                return Err(CodegenError::new(
-                    "no_decay=[...] is not supported with --muon-batch-ns: the \
-                     batched Newton-Schulz pre-loop takes one weight_decay \
-                     scalar for the whole batch, so per-parameter exemption \
-                     cannot be expressed there. Drop one",
-                ));
-            }
-            if csla_active {
-                return Err(CodegenError::new(
-                    "no_decay=[...] is not supported with --layerwise-accum: the \
-                     window-buffered group update hoists weight_decay out of \
-                     the per-parameter loop. Drop one",
-                ));
-            }
-            if self.compile_options.optim_state_offload {
-                return Err(CodegenError::new(
-                    "no_decay=[...] is not supported with --optim-state-offload \
-                     yet (the staged host/device envelope is untested against \
-                     per-parameter decay). Drop one",
-                ));
-            }
-        }
+        // AdamW parameter groups x hoisted weight-decay compositions: moved
+        // to `stmt_admission.rs` byte-for-byte (roadmap A1).
+        self.no_decay_composition_admission(&no_decay_scope, csla_active)?;
 
         // ── 4a-bis. AdamW parameter groups: per-param decay-exempt flags ──
-        // `no_decay=[...]` names ROLES to exempt from weight decay. The
-        // static half of the decision (embedding / head / hidden) is decided
-        // here from the same role table Muon routes on; the `"vector"` half
-        // is NOT, because a model field only has a statically-derivable rank
-        // when its initializer is a direct zeros/ones/randn/... call over
-        // integer literals — which real models are not. Both halves meet in
-        // `nsl_optim_param_wd`, the single runtime rule.
-        //
-        // Flags ride in an i64 NslList parallel to param_list (1 = exempt),
-        // exactly like the Muon route flags. The table prints loudly: a
-        // parameter group that silently exempted nothing (or everything) is
-        // the failure this feature is supposed to remove, not add.
-        let decay_exempt_list = if no_decay_scope.is_empty() {
-            None
-        } else {
-            if weight_decay_value == 0.0 {
-                eprintln!(
-                    "[wd-groups] warning: no_decay=[...] was given but \
-                     weight_decay is 0.0 — nothing is being decayed, so the \
-                     exemption has no effect."
-                );
-            }
-            let table = self.classify_param_roles(&model_type_name, &param_paths);
-            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-            let mut static_exempt = 0usize;
-            for e in &table.entries {
-                let exempt = no_decay_scope.exempts_role(e.role);
-                static_exempt += usize::from(exempt);
-                let flag = builder.ins().iconst(cl_types::I64, i64::from(exempt));
-                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
-            }
-            let mut scope_desc = no_decay_scope.static_roles.clone();
-            if no_decay_scope.exempt_non_rank2 {
-                scope_desc.push("vector (runtime rank != 2)".to_string());
-            }
-            eprintln!(
-                "[wd-groups] weight_decay={} exempting roles [{}] over {} params: \
-                 {} exempt by role at compile time{}",
-                weight_decay_value,
-                scope_desc.join(", "),
-                table.entries.len(),
-                static_exempt,
-                if no_decay_scope.exempt_non_rank2 {
-                    ", plus every param that is not rank-2 at step time"
-                } else {
-                    ""
-                },
-            );
-            for e in &table.entries {
-                if no_decay_scope.exempts_role(e.role) {
-                    eprintln!(
-                        "[wd-groups]   {} role={} ({}) -> NO decay",
-                        e.path, e.role, e.source
-                    );
-                }
-            }
-            // Anti-vacuity: a scope that exempts nothing statically AND does
-            // not ask for the runtime rank check cannot ever fire. That is a
-            // configuration error, not a no-op to shrug at.
-            if static_exempt == 0 && !no_decay_scope.exempt_non_rank2 {
-                return Err(CodegenError::new(format!(
-                    "no_decay=[{}] matches no parameter in this model — every \
-                     param classified as one of the roles it does NOT name. \
-                     Roles present: {}. Note that norms and biases usually \
-                     classify as role `hidden` (their rank is not derivable \
-                     from the field initializer), so use no_decay=[\"vector\"] \
-                     to exempt them by runtime rank",
-                    no_decay_scope.static_roles.join(", "),
-                    {
-                        let mut roles: Vec<&str> =
-                            table.entries.iter().map(|e| e.role).collect();
-                        roles.sort_unstable();
-                        roles.dedup();
-                        roles.join(", ")
-                    },
-                )));
-            }
-            Some(list)
-        };
+        // Moved to `stmt_train/param_lists.rs` byte-for-byte (roadmap A1).
+        let decay_exempt_list = self.decay_exempt_flags(
+            builder,
+            &no_decay_scope,
+            weight_decay_value,
+            &model_type_name,
+            &param_paths,
+        )?;
 
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Moved to `stmt_train/optimizer_state.rs` byte-for-byte (roadmap
@@ -7580,71 +7329,16 @@ sched={sched_s}",
         }
 
         // ── 5b. Allocate gradient accumulation buffers (if grad_accumulation_steps > 1) ──
-        // These persist across batches within each accumulation window. Each buffer
-        // is zeros_like(param) and gets += each batch's grads, then zeroed after
-        // the optimizer step every N batches.
-        let accum_list = if grad_accumulation_steps > 1 {
-            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-            // P0.1: grad-accumulation buffers under the MPartial surface.
-            let surface_m_partial = builder.ins().iconst(cl_types::I8, SURFACE_M_PARTIAL);
-            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_m_partial])?;
-            // Runtime loop over param_list (not layout.fields — which may include sub-models)
-            let accum_i_var = builder.declare_var(cl_types::I64);
-            let accum_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(accum_i_var, accum_zero);
-            let accum_hdr = builder.create_block();
-            let accum_body = builder.create_block();
-            let accum_exit = builder.create_block();
-            builder.ins().jump(accum_hdr, &[]);
-            builder.switch_to_block(accum_hdr);
-            // Don't seal accum_hdr yet — back-edge not added
-            let ai = builder.use_var(accum_i_var);
-            let ac = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, ai, num_params_val);
-            builder.ins().brif(ac, accum_body, &[], accum_exit, &[]);
-            builder.switch_to_block(accum_body);
-            builder.seal_block(accum_body);
-            let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, ai])?;
-            // P3: under --optim-state-offload the FASE window accumulator
-            // (m_partial) is the last device-resident param-sized f32 surface
-            // (~4.15 GB at 1B). Allocate it HOST-resident (pinned) too; the
-            // accumulate hook stages it to the grad's device per micro-batch
-            // and the final step stages it in for the m/v update. m_partial
-            // is ALWAYS f32 (exact-windowed semantics — the reduced-precision
-            // moment path never touches it), so f32 host regardless of the
-            // CPDT precision plan.
-            //
-            // CSLA (D1b): the whole point — do NOT allocate the full-model
-            // window here. Slots start NULL; the window backward allocates
-            // each layer's accumulators just before that layer's replay and
-            // frees them right after its per-layer update, so the live
-            // accumulator surface is max(one layer) + the epilogue globals
-            // instead of 4·P bytes. (All accumulation happens inside the
-            // window region under csla — the per-micro-batch ga_body loop is
-            // hook-skipped — so a NULL slot is never read between windows.)
-            let zeros = if csla_active {
-                builder.ins().iconst(cl_types::I64, 0)
-            } else if self.compile_options.optim_state_offload {
-                self.compile_call_by_name(builder, "nsl_tensor_zeros_like_host_f32", &[p])?
-            } else {
-                self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?
-            };
-            self.compile_call_by_name(builder, "nsl_list_push", &[list, zeros])?;
-            let a_one = builder.ins().iconst(cl_types::I64, 1);
-            let a_next = builder.ins().iadd(ai, a_one);
-            builder.def_var(accum_i_var, a_next);
-            builder.ins().jump(accum_hdr, &[]);
-            builder.seal_block(accum_hdr);
-            builder.switch_to_block(accum_exit);
-            builder.seal_block(accum_exit);
-            state.current_block = Some(accum_exit);
-            // End of the MPartial bracket — restore the caller's surface.
-            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
-            Some(list)
-        } else {
-            None
-        };
+        // Moved to `stmt_train/param_lists.rs` byte-for-byte (roadmap A1).
+        let accum_list = self.alloc_grad_accum_buffers(
+            builder,
+            state,
+            grad_accumulation_steps,
+            csla_active,
+            num_params_val,
+            param_list,
+            surface_prev,
+        )?;
 
         // ── 5b2. CSLA (D1b): one-time pointer-tie guard ─────────────────
         // Pointer-tied weights (two fields aliasing one storage) are

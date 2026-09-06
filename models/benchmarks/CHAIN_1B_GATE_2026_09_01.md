@@ -12,7 +12,7 @@ behind it are the transferable part.
 
 ## The trajectory
 
-Scored under TF32 by `run-out/score_trajectory.sh`, which rewrites
+Scored under TF32 by `scripts/experiments/score_trajectory.sh`, which rewrites
 `models/coder1b/val_from_splice.nsl`'s `model_load` path per point; every point
 is a spliced `.nslm` snapshot of theta taken at a cadence write. That scorer
 reads `data/tokens/pilot_val_{stack,web}_2m.bin`, which are byte-identical
@@ -167,10 +167,10 @@ re-scoring the early leg has to go find them.
 
 ## Reproduce
 
-    run-out/stage4_driver.sh bf16        # the chain leg
-    run-out/traj_snapshot.sh             # theta at every cadence write
-    run-out/score_trajectory.sh splice   # CPU, runs beside training
-    run-out/score_trajectory.sh score    # GPU
+    scripts/experiments/stage4_driver.sh bf16        # the chain leg
+    scripts/experiments/traj_snapshot.sh             # theta at every cadence write
+    scripts/experiments/score_trajectory.sh splice   # CPU, runs beside training
+    scripts/experiments/score_trajectory.sh score    # GPU
 
 `score_trajectory.sh` prints `FAILED` and names the stderr file for a point it
 could not evaluate; an earlier draft printed `0.0000`, which is a plausible
