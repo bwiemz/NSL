@@ -163,15 +163,17 @@ the same hardening pass produced).
 
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
-`CalibrationOptions`, …). The `calibration_*` cluster moved into
-`CalibrationOptions` (`opts.calibration.{data, mode, samples, batch_size,
+`CalibrationOptions`, `DevToolsOptions`, …). The `calibration_*` cluster moved
+into `CalibrationOptions` (`opts.calibration.{data, mode, samples, batch_size,
 timeout_secs, sidecar, retention, batch_seq, compile_bundle, grad_retention}`)
-with the per-site type analysis that move needed: `HarnessConfig` and the CLI
-`BuildArgs` keep their own identically-named `calibration_data` fields. The
-dev-tools (`profile_*`/`health_*`) cluster is still flat *deliberately*: it is
-prefix-cohesive and its field names (`target_gpu`, `dtype`) collide with
-identically-named fields on other structs, so group it only alongside the same
-kind of analysis.
+and the dev-tools cluster into `DevToolsOptions` (`opts.dev_tools.{profile_kernels,
+manifest_output_path, profile_source_text, profile_source_file_name,
+health_monitor, health_flush_interval, inspect_enabled}`), each with the
+per-site type analysis the move needed: `HarnessConfig` and the CLI `BuildArgs`
+keep their own identically-named `calibration_data` / `profile_kernels` fields.
+`target_gpu` and `dtype` stay flat *deliberately*: the profile walker shares
+them with `serve`, the GPU-spec lookups and the execution fingerprint, and
+they collide with identically-named fields on other structs.
 
 ## How this maps to tests
 
