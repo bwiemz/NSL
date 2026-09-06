@@ -19,11 +19,18 @@
 //! `zero3_gate.rs`, `zero_spmd_gate.rs` and `muon_state_gate.rs` — which
 //! assert the message text, so a dropped or reordered check fails there.
 //!
+//! The Item 7 (`--fuse-wgrad-accum`) admission block that sat immediately
+//! above it in `compile_train_block_inner` followed by the same route
+//! (`wgrad_fusion_admission` below): it only RECORDS — the refusal it feeds
+//! is compile-scoped, in `Compiler::finish_wgrad_admission` — so its accept
+//! path is the same 28 snapshots and its decline text is pinned by
+//! `wgrad_accum_fusion_gate.rs` and `cpkd_distill_e2e.rs`.
+//!
 //! Remaining admission blocks in `compile_train_block_inner` belong here as
-//! they are extracted; the Item 7 (`--fuse-wgrad-accum`) block immediately
-//! above this one is the next candidate (120 lines, one escaping local).
+//! they are extracted.
 
 use crate::compiler::Compiler;
+use crate::stmt::GradAccumulationDecl;
 use crate::CodegenError;
 
 impl Compiler<'_> {
@@ -207,5 +214,144 @@ impl Compiler<'_> {
     }
 
         Ok(csla_active)
+    }
+}
+
+impl Compiler<'_> {
+    /// Item 7 (`--fuse-wgrad-accum`) admission: record whether this training
+    /// block can reach the FASE-Deferred `on_param_grad` hook — the fusion's
+    /// only firing site — and, when it cannot, the reason and remedy that the
+    /// compile-scoped refusal in `Compiler::finish_wgrad_admission` reports.
+    ///
+    /// Moved out of `compile_train_block_inner` byte-for-byte (roadmap A1):
+    /// 119 lines that read configuration, emit no IR, and write exactly two
+    /// `self` fields (`wgrad_hook_blocks`, `wgrad_declines`). The five
+    /// inputs named here were five of the ~200 locals live at the call site.
+    pub(crate) fn wgrad_fusion_admission(
+        &mut self,
+        grad_accumulation_steps: i64,
+        grad_accumulation_decl: GradAccumulationDecl,
+        optimizer_name: &str,
+        fase_deferred: bool,
+        fase_plan_mode: crate::fase::FaseMode,
+    ) {
+        // The fusion has exactly ONE way to fire: the FASE-Deferred
+        // `on_param_grad` hook. `wengert_lower` plans only when that hook is
+        // present, the sole `nsl_tensor_wgrad_accum` emission site sits inside
+        // it, and — the part that made this invisible — the
+        // `[wgrad-fusion] N chain(s) fused` counter is gated on it too. So a
+        // build with the flag on and no hook produced no count, no warning and
+        // no error: the user was told nothing at all.
+        //
+        // `grad_accumulation` defaults to 1 when the train block omits it, and
+        // `fase::plan` returns `Passthrough` unconditionally at accumulation 1
+        // for EVERY optimizer. That is the state `models/coder50m/pretrain.nsl`
+        // and `pretrain_cert.nsl` are in, and `--pretrain-optimized` sets the
+        // flag with no accumulation precondition — so the shipped pretraining
+        // configuration fused zero chains while reporting success.
+        //
+        // NOT fixed by making the fusion work at accumulation 1: there is no
+        // `m_partial` for the beta=1 GEMM to write into, so that needs a
+        // beta=0 dW-output variant and a non-hook lowering path. What is fixed
+        // here is the SILENCE.
+        //
+        // SCOPE: this block only RECORDS. The refusal is compile-scoped, in
+        // `Compiler::finish_wgrad_admission` — see its header for why. The
+        // note below stays per block because it is the part that names WHICH
+        // block is inert, which a compile-scoped message cannot.
+        let fase_hook_reachable = fase_deferred && self.features.source_ad_enabled;
+        if self.compile_options.fuse_wgrad_accum {
+            if fase_hook_reachable {
+                self.wgrad_hook_blocks += 1;
+            } else {
+                // The remedy travels WITH the reason. It used to be one fixed
+                // list appended to every refusal, which made two thirds of it
+                // wrong in the common case: "switch to an Adam-family or SGD
+                // optimizer" is dead advice at accumulation 1, because
+                // `fase::plan` returns Passthrough there BEFORE it looks at
+                // the optimizer at all — including on the shipped scripts,
+                // which are AdamW already.
+                let (reason, remedy): (String, &'static str) = if !self
+                    .features
+                    .source_ad_enabled
+                {
+                    (
+                        "source-AD is off, so there is no compile-time adjoint \
+                         tape to fuse and no FASE accumulate hook to fold into"
+                            .to_string(),
+                        "Add --source-ad, or drop --fuse-wgrad-accum.",
+                    )
+                } else if grad_accumulation_steps <= 1 {
+                    // WHY the window is 1 is the whole content of this
+                    // message, and asserting "the default when the train block
+                    // omits it" unconditionally made it false for a block that
+                    // plainly declares one: the train path CLAMPS a
+                    // non-literal `grad_accumulation` to 1 with no diagnostic
+                    // (spec/05-training-loop.nsl.md documents the asymmetry
+                    // with `distill`, which refuses one instead). Sending that
+                    // user to look for a missing `grad_accumulation=` that is
+                    // right there in the source is the wrong-reason failure
+                    // this admission exists to avoid.
+                    //
+                    // The noun is chosen, not hard-coded: a distill block
+                    // lowers through this same function, and telling its
+                    // author to edit "a train block" names a construct their
+                    // program does not contain while leaving `distill`'s own
+                    // `grad_accumulation` key unmentioned.
+                    let noun = self.training_block_noun();
+                    let how = match grad_accumulation_decl {
+                        GradAccumulationDecl::Omitted => {
+                            format!("the {noun} omits grad_accumulation, so it defaults to 1")
+                        }
+                        // A non-literal window is refused by the Training
+                        // Configuration Contract before this point (train and
+                        // distill alike), so Literal is exact.
+                        GradAccumulationDecl::Literal => {
+                            format!("the {noun} sets grad_accumulation to 1")
+                        }
+                    };
+                    (
+                        format!(
+                            "grad_accumulation is 1 ({how}), so FASE is \
+                             Passthrough and there is no m_partial for the \
+                             beta=1 GEMM to accumulate into"
+                        ),
+                        if self.active_distill_context.is_some() {
+                            "Set grad_accumulation to an integer literal >= 2 on \
+                             the distill block, or drop --fuse-wgrad-accum."
+                        } else {
+                            "Set grad_accumulation to an integer literal >= 2 in a \
+                             train block, or drop --fuse-wgrad-accum."
+                        },
+                    )
+                } else {
+                    (
+                        format!(
+                            "optimizer `{optimizer_name}` resolved to FASE \
+                             {:?}, not Deferred — only a Deferred plan owns \
+                             the per-parameter accumulate this fusion folds \
+                             into",
+                            fase_plan_mode
+                        ),
+                        "Use an Adam-family optimizer or SGD (Lion and unknown \
+                         optimizers resolve to FullBuffer), or drop \
+                         --fuse-wgrad-accum.",
+                    )
+                };
+                // The instrument. Emitted on BOTH provenances, because the
+                // whole defect was that the inert case said nothing; the
+                // refusal is only reachable on one of them. Ordinal included
+                // because the compile-scoped refusal deliberately does NOT
+                // fire when a sibling block fused — so in a multi-block
+                // program this line is the only thing that says which block
+                // is inert.
+                eprintln!(
+                    "[wgrad-fusion] declined: {} #{} — {reason}",
+                    self.training_block_noun(),
+                    self.wgrad_block_ordinal()
+                );
+                self.wgrad_declines.push((reason, remedy));
+            }
+        }
     }
 }
