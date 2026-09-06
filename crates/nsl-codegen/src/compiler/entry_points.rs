@@ -126,7 +126,7 @@ fn install_per_compile_program_facts(
     interner: &Interner,
     type_map: &TypeMap,
 ) -> Result<(), crate::CodegenError> {
-    compiler.compile_options.calibration_compile_bundle = Some(Arc::new(
+    compiler.compile_options.calibration.compile_bundle = Some(Arc::new(
         crate::calibration::CalibrationCompileBundle {
             ast: ast.clone(),
             interner: interner.clone(),
@@ -389,17 +389,17 @@ pub(crate) fn run_pre_scan_phase(
     interner: &Interner,
     mut opts: crate::CompileOptions,
 ) -> crate::CompileOptions {
-    if opts.calibration_retention.is_none() {
+    if opts.calibration.retention.is_none() {
         let discovered_awq = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
         if !discovered_awq.is_empty() {
-            opts.calibration_retention = Some(discovered_awq);
+            opts.calibration.retention = Some(discovered_awq);
         }
     }
-    if opts.calibration_grad_retention.is_none() {
+    if opts.calibration.grad_retention.is_none() {
         let discovered_wggo =
             crate::calibration::discovery::pre_scan_wggo_targets_from_ast(ast, interner);
         if !discovered_wggo.is_empty() {
-            opts.calibration_grad_retention = Some(discovered_wggo);
+            opts.calibration.grad_retention = Some(discovered_wggo);
         }
     }
 
@@ -434,10 +434,10 @@ fn apply_auto_mode_fallback_note(
         return;
     }
 
-    let calibration_data_present = opts.calibration_data.is_some();
+    let calibration_data_present = opts.calibration.data.is_some();
     let decorators_in_ast =
         crate::calibration::discovery::ast_has_wggo_target_decorators(ast, interner);
-    let resolved_targets = opts.calibration_grad_retention.as_deref().unwrap_or(&[]);
+    let resolved_targets = opts.calibration.grad_retention.as_deref().unwrap_or(&[]);
 
     // §5.4: no @wggo_target decorators in source.
     // §5.5: decorators present but none reachable from entry point.
@@ -495,8 +495,8 @@ fn enforce_grad_mode_refusals(
 
     let decorators_in_ast =
         crate::calibration::discovery::ast_has_wggo_target_decorators(ast, interner);
-    let resolved_targets = opts.calibration_grad_retention.as_deref().unwrap_or(&[]);
-    let calibration_data_present = opts.calibration_data.is_some();
+    let resolved_targets = opts.calibration.grad_retention.as_deref().unwrap_or(&[]);
+    let calibration_data_present = opts.calibration.data.is_some();
 
     // §5.4: grad mode requested but the source has no @wggo_target decorators at all.
     if !decorators_in_ast {
@@ -554,12 +554,12 @@ fn populate_calibration_retention_from_ast_if_unset(
 ) -> Result<(), CodegenError> {
     // Delegate to the shared helper for pure-discovery work.
     let updated = run_pre_scan_phase(ast, interner, compiler.compile_options.clone());
-    compiler.compile_options.calibration_retention = updated.calibration_retention;
-    compiler.compile_options.calibration_grad_retention = updated.calibration_grad_retention;
+    compiler.compile_options.calibration.retention = updated.calibration.retention;
+    compiler.compile_options.calibration.grad_retention = updated.calibration.grad_retention;
 
     // AWQ-specific error: if an @quantize decorator is present but discovery
     // returned nothing, that is a user error we must surface.
-    if compiler.compile_options.calibration_retention.is_none()
+    if compiler.compile_options.calibration.retention.is_none()
         && crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner)
     {
         let model_name =
@@ -1845,7 +1845,7 @@ mod tests {
         let (ast, interner) = parse_module(source);
         let resolved_opts = run_pre_scan_phase(&ast, &interner, opts);
         let targets = resolved_opts
-            .calibration_grad_retention
+            .calibration.grad_retention
             .expect("@wggo_target decorators should populate calibration_grad_retention");
         assert!(
             !targets.is_empty(),
@@ -1861,11 +1861,11 @@ mod tests {
         let (ast, interner) = parse_module(source);
         // Pre-populate with a sentinel empty vec to verify idempotency.
         let mut opts = crate::CompileOptions::default();
-        opts.calibration_grad_retention = Some(Vec::new());
+        opts.calibration.grad_retention = Some(Vec::new());
         let resolved_opts = run_pre_scan_phase(&ast, &interner, opts);
         // Must remain the caller-supplied empty vec, not the discovered targets.
         assert_eq!(
-            resolved_opts.calibration_grad_retention,
+            resolved_opts.calibration.grad_retention,
             Some(Vec::new()),
             "run_pre_scan_phase must not overwrite a pre-populated field"
         );

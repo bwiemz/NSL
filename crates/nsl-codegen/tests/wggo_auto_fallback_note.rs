@@ -57,7 +57,7 @@ fn auto_no_calibration_data_demotes_to_magnitude() {
     let mut opts = auto_opts();
     // Explicitly ensure calibration_data is absent (it is by default, but be
     // explicit for clarity and robustness against future default changes).
-    opts.calibration_data = None;
+    opts.calibration.data = None;
     let resolved = debug_resolve_pre_scan_opts(source, opts);
     assert_eq!(
         resolved.wggo.importance,

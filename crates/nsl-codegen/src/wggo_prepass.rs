@@ -109,9 +109,9 @@ pub fn wggo_mode_enabled(options: &crate::CompileOptions) -> bool {
 /// keeps returning `true` there and the pre-pass stays deferred, exactly as
 /// before the WGGO-before-kernels restructure.
 pub fn wggo_prepass_deferred_pending_sidecar(options: &crate::CompileOptions) -> bool {
-    options.calibration_data.is_some()
+    options.calibration.data.is_some()
         && !matches!(options.wggo.importance, crate::WggoImportance::Magnitude)
-        && options.calibration_sidecar.is_none()
+        && options.calibration.sidecar.is_none()
 }
 
 /// Structural fingerprint of a Wengert list: op count plus per-op
@@ -574,8 +574,11 @@ mod tests {
         };
 
         let opts = |imp: WggoImportance, calib: bool, sidecar: Option<Sidecar>| CompileOptions {
-            calibration_data: calib.then(|| std::path::PathBuf::from("calib.safetensors")),
-            calibration_sidecar: sidecar,
+            calibration: crate::CalibrationOptions {
+                data: calib.then(|| std::path::PathBuf::from("calib.safetensors")),
+                sidecar,
+                ..Default::default()
+            },
             wggo: WggoOptions {
                 importance: imp,
                 ..Default::default()

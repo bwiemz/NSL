@@ -146,7 +146,7 @@ pub fn real_subprocess_entry(
         let (_count, seq) = forward_batch_seq.expect("forward path computed batch/seq above");
 
         // Pre-scan WGGO targets from the compile bundle AST. Used both to
-        // drive the model object's backward-IR emission (calibration_grad_retention
+        // drive the model object's backward-IR emission (calibration.grad_retention
         // on model_opts below) and to populate the scaffolding emitter's
         // per-head reduction calls + WGGO descriptor stack-build.
         let scaffolding_wggo_targets: Vec<crate::calibration::discovery::WggoGradTarget> =
@@ -168,13 +168,13 @@ pub fn real_subprocess_entry(
             };
 
         let mut model_opts = crate::CompileOptions::default();
-        model_opts.calibration_batch_seq = Some((1, seq));
-        model_opts.calibration_retention = Some(cfg.projections.clone());
-        model_opts.calibration_compile_bundle = Some(compile_bundle.clone());
+        model_opts.calibration.batch_seq = Some((1, seq));
+        model_opts.calibration.retention = Some(cfg.projections.clone());
+        model_opts.calibration.compile_bundle = Some(compile_bundle.clone());
         // Drive the model object's backward-IR emission. emit_calibration_model_object
         // runs emit_grad_retention_arena and the source-AD splice when this is Some.
         if !scaffolding_wggo_targets.is_empty() {
-            model_opts.calibration_grad_retention = Some(scaffolding_wggo_targets.clone());
+            model_opts.calibration.grad_retention = Some(scaffolding_wggo_targets.clone());
         }
 
         let model_obj = tmp.join("calib_model.o");
@@ -222,7 +222,7 @@ pub fn real_subprocess_entry(
     // Test-only fault injection: `runtime_data_override` swaps the data file
     // the SUBPROCESS reads at runtime (argv[1]) without touching the
     // compile-time shape derivation above (`peek_batch_seq` on
-    // `calibration_data`). This is the only seam that consults the override;
+    // `calibration.data`). This is the only seam that consults the override;
     // it exists so e2e tests can reach the wrapper's status-3 per-batch
     // shape-mismatch refusal, which is otherwise unsatisfiable because
     // compile-time and runtime read the same file. Production always sets
@@ -1949,35 +1949,35 @@ pub fn emit_calibration_model_object(
     out_path: &Path,
 ) -> Result<(), HarnessError> {
     let bundle = opts
-        .calibration_compile_bundle
+        .calibration.compile_bundle
         .as_ref()
         .ok_or_else(|| HarnessError::Infrastructure {
-            reason: "emit_calibration_model_object requires calibration_compile_bundle"
+            reason: "emit_calibration_model_object requires calibration.compile_bundle"
                 .into(),
         })?;
 
     let mut compile_opts = opts.clone();
 
     // #134 §5.2 hop 6 generalization: emit_calibration_model_object reads
-    // from the union calibration_retention ∪ calibration_grad_retention.
-    // AWQ flow: calibration_retention is non-empty (or AWQ pre-scan
+    // from the union calibration.retention ∪ calibration.grad_retention.
+    // AWQ flow: calibration.retention is non-empty (or AWQ pre-scan
     // discovers it from the AST), so the first arm matches and the function
     // reads exactly what it read before — byte-identical by inspection.
-    // WGGO-only flow: calibration_retention is None or empty but
-    // calibration_grad_retention is populated; the second arm synthesizes
+    // WGGO-only flow: calibration.retention is None or empty but
+    // calibration.grad_retention is populated; the second arm synthesizes
     // projections from WGGO targets using grad_target_to_projection_meta
     // (one entry per target, using w_o_shape per spec §5.2).
-    if compile_opts.calibration_retention.is_none() {
+    if compile_opts.calibration.retention.is_none() {
         let discovered =
             crate::calibration::pre_scan_awq_projections_from_ast(ast, &bundle.interner);
         if !discovered.is_empty() {
-            compile_opts.calibration_retention = Some(discovered);
+            compile_opts.calibration.retention = Some(discovered);
         }
     }
 
     let projections: Vec<crate::calibration::discovery::DiscoveredProjection> = match (
-        compile_opts.calibration_retention.as_ref(),
-        compile_opts.calibration_grad_retention.as_ref(),
+        compile_opts.calibration.retention.as_ref(),
+        compile_opts.calibration.grad_retention.as_ref(),
     ) {
         (Some(retn), _) if !retn.is_empty() => retn.clone(),
         (_, Some(grads)) if !grads.is_empty() => {
@@ -1986,8 +1986,8 @@ pub fn emit_calibration_model_object(
         _ => {
             return Err(HarnessError::Infrastructure {
                 reason: "emit_calibration_model_object requires either AWQ \
-                         projections (calibration_retention) or WGGO targets \
-                         (calibration_grad_retention)"
+                         projections (calibration.retention) or WGGO targets \
+                         (calibration.grad_retention)"
                     .into(),
             });
         }
@@ -1996,7 +1996,7 @@ pub fn emit_calibration_model_object(
         "projections vec built from non-empty match arms — first() cannot fail",
     );
     let channels = first_projection.weight_shape[1] as i64;
-    let (batch, seq) = compile_opts.calibration_batch_seq.unwrap_or((8, 4));
+    let (batch, seq) = compile_opts.calibration.batch_seq.unwrap_or((8, 4));
     let model_name = first_projection
         .projection
         .0
@@ -2029,7 +2029,7 @@ pub fn emit_calibration_model_object(
     // Check the AST return annotation here, before any Cranelift IR is emitted, so we
     // get an actionable error rather than a Cranelift verifier panic inside
     // compile_user_functions (which cannot lower a void model method to a returning IR).
-    if compile_opts.calibration_grad_retention.is_some() {
+    if compile_opts.calibration.grad_retention.is_some() {
         let forward_has_return = model_def.members.iter().any(|m| {
             if let nsl_ast::decl::ModelMember::Method(fn_def, _) = m
                 && bundle.interner.resolve(fn_def.name.0) == Some("forward")
@@ -2091,14 +2091,14 @@ pub fn emit_calibration_model_object(
     )?;
 
     // §5.3: defensive check — backward emission with empty grad observations is a bug.
-    // `calibration_grad_retention.is_some()` signals that the caller requested a backward
+    // `calibration.grad_retention.is_some()` signals that the caller requested a backward
     // pass; `grad_arena_layout` must be populated by `emit_grad_retention_arena` above.
     // If it isn't, the targets list was present but yielded zero bytes (corrupt shape
     // metadata or a hook that updated `requires()` without updating its targets list).
     // This fires when callers bypass the pre-scan refusal gate (`enforce_grad_mode_refusals`
-    // in entry_points.rs) and pre-populate `calibration_grad_retention` themselves;
+    // in entry_points.rs) and pre-populate `calibration.grad_retention` themselves;
     // normal flows produce more actionable messages via the §5.4–§5.6 refusals above.
-    if compile_opts.calibration_grad_retention.is_some()
+    if compile_opts.calibration.grad_retention.is_some()
         && compiler.grad_arena_layout.is_none()
     {
         return Err(HarnessError::Infrastructure {
@@ -2106,7 +2106,7 @@ pub fn emit_calibration_model_object(
   requested:  run calibration subprocess with backward pass\n\
   expected:   __nsl_calib_grad_arena has at least one entry when a\n\
               model_backward call is emitted\n\
-  found:      grad_arena_layout is empty but calibration_grad_retention\n\
+  found:      grad_arena_layout is empty but calibration.grad_retention\n\
               was set. Did a hook's requires() change without\n\
               updating its targets() list?\n\
   fix:        verify hook.requires() and pre_scan_wggo_targets_from_ast\n\
@@ -2155,16 +2155,16 @@ pub fn emit_calibration_model_object(
     emit_calibration_forward_wrapper(&mut compiler, model_forward_id, batch, seq, channels)?;
 
     // Spec §4.2: when grad retention is requested, also emit the backward path.
-    if compile_opts.calibration_grad_retention.is_some() {
+    if compile_opts.calibration.grad_retention.is_some() {
         // Clone the layout before the mutable borrow of compiler so there is no
         // simultaneous &/&mut conflict.  The layout is small (a Vec of tuples).
-        // Safe to unwrap: the `calibration_grad_retention.is_some()` guard above
+        // Safe to unwrap: the `calibration.grad_retention.is_some()` guard above
         // plus the defensive check at the start of this function guarantees
         // `grad_arena_layout` is populated when we reach this point.
         let grad_arena_layout_clone = compiler
             .grad_arena_layout
             .clone()
-            .expect("grad_arena_layout must be set when calibration_grad_retention is Some");
+            .expect("grad_arena_layout must be set when calibration.grad_retention is Some");
         let model_backward_id = emit_model_backward_bridge(
             &mut compiler,
             model_def,
@@ -4189,8 +4189,8 @@ mod tests {
         let mut analysis_interner = interner.clone();
         let analysis = nsl_semantic::analyze(ast, &mut analysis_interner);
         let mut opts = crate::CompileOptions::default();
-        opts.calibration_batch_seq = Some((8, 4));
-        opts.calibration_compile_bundle = Some(std::sync::Arc::new(
+        opts.calibration.batch_seq = Some((8, 4));
+        opts.calibration.compile_bundle = Some(std::sync::Arc::new(
             crate::calibration::CalibrationCompileBundle {
                 ast: ast.clone(),
                 interner: analysis_interner,
@@ -4550,11 +4550,11 @@ mod grad_arena_emission {
         let expected_total = 2 * 4 * 64 * 64 * 4u32;
         assert_eq!(layout.total_bytes, expected_total, "fixture sanity");
 
-        // Build a minimal Compiler with calibration_grad_retention set.
+        // Build a minimal Compiler with calibration.grad_retention set.
         let interner = Interner::new();
         let type_map = nsl_semantic::checker::TypeMap::default();
         let mut opts = crate::CompileOptions::default();
-        opts.calibration_grad_retention = Some(targets);
+        opts.calibration.grad_retention = Some(targets);
 
         let mut compiler =
             crate::compiler::Compiler::new(&interner, &type_map, &opts)
@@ -4672,7 +4672,7 @@ mod backward_wrapper {
     }
 
     /// Build `CompileOptions` with both AWQ calibration bundle *and*
-    /// `calibration_grad_retention` set to a minimal single-layer WGGO target
+    /// `calibration.grad_retention` set to a minimal single-layer WGGO target
     /// whose projection names match the TinyMLP fixture.
     ///
     /// The WGGO target uses the same 128×64 weight shape as `TinyMLP.up_proj`
@@ -4686,8 +4686,8 @@ mod backward_wrapper {
         let mut analysis_interner = interner.clone();
         let analysis = nsl_semantic::analyze(ast, &mut analysis_interner);
         let mut opts = crate::CompileOptions::default();
-        opts.calibration_batch_seq = Some((8, 4));
-        opts.calibration_compile_bundle = Some(std::sync::Arc::new(
+        opts.calibration.batch_seq = Some((8, 4));
+        opts.calibration.compile_bundle = Some(std::sync::Arc::new(
             crate::calibration::CalibrationCompileBundle {
                 ast: ast.clone(),
                 interner: analysis_interner,
@@ -4714,7 +4714,7 @@ mod backward_wrapper {
             w_v_index: 0,
             w_o_index: 1,
         }];
-        opts.calibration_grad_retention = Some(targets);
+        opts.calibration.grad_retention = Some(targets);
         opts
     }
 
@@ -4750,13 +4750,13 @@ mod backward_wrapper {
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("calib_model.o");
 
-        // opts WITHOUT calibration_grad_retention.
+        // opts WITHOUT calibration.grad_retention.
         let opts = {
             let mut analysis_interner = interner.clone();
             let analysis = nsl_semantic::analyze(&ast, &mut analysis_interner);
             let mut o = crate::CompileOptions::default();
-            o.calibration_batch_seq = Some((8, 4));
-            o.calibration_compile_bundle = Some(std::sync::Arc::new(
+            o.calibration.batch_seq = Some((8, 4));
+            o.calibration.compile_bundle = Some(std::sync::Arc::new(
                 crate::calibration::CalibrationCompileBundle {
                     ast: ast.clone(),
                     interner: analysis_interner,
@@ -4767,7 +4767,7 @@ mod backward_wrapper {
             o
         };
         // Confirm no grad retention.
-        assert!(opts.calibration_grad_retention.is_none());
+        assert!(opts.calibration.grad_retention.is_none());
 
         emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
             .expect("emit succeeds without grad_retention");
@@ -4856,7 +4856,7 @@ mod backward_wrapper {
     }
 
     /// Regression test for Issue 1: a void-returning `forward` with
-    /// `calibration_grad_retention` set must be refused at compile time, not
+    /// `calibration.grad_retention` set must be refused at compile time, not
     /// silently produce a null y_handle that crashes `nsl_tensor_mul_scalar`.
     ///
     /// The backward wrapper synthesises `dy = 2·y` from the forward output;

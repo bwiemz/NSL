@@ -344,7 +344,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // warning) lives in `nsl_codegen::compile_and_calibrate`, which
                 // e3ab23ad moved it into on 2026-05-10 and which NOTHING in the
                 // workspace calls -- so no CLI build has ever run it. Only that
-                // wrapper populates `calibration_sidecar`, which is also why
+                // wrapper populates `calibration.sidecar`, which is also why
                 // `--wggo-importance=grad` is unreachable from the CLI: it
                 // refuses on the missing sidecar, and supplying
                 // --calibration-data cannot produce one.
@@ -649,27 +649,32 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // CompileOptions with a populated `wrga_check` (wrga_check.rs).
                 wrga_check: nsl_codegen::WrgaCheckContext::default(),
                 export_functions_out: None,
-                calibration_data: calibration_data.clone(),
-                calibration_mode: Some(calibrate.clone()),
-                calibration_samples,
-                calibration_batch_size,
-                calibration_timeout_secs: calibration_timeout,
-                calibration_sidecar: None,
-                calibration_retention: None,
-                // Task 6: peek_batch_seq is called inside the compiler when
-                // calibration_data is set; the CLI passes None here and the
-                // compiler resolves the real (batch, seq) from the data header.
-                calibration_batch_seq: None,
+                calibration: nsl_codegen::CalibrationOptions {
+                    data: calibration_data.clone(),
+                    mode: Some(calibrate.clone()),
+                    samples: calibration_samples,
+                    batch_size: calibration_batch_size,
+                    timeout_secs: calibration_timeout,
+                    sidecar: None,
+                    retention: None,
+                    // Task 6: peek_batch_seq is called inside the compiler when
+                    // `calibration.data` is set; the CLI passes None here and
+                    // the compiler resolves the real (batch, seq) from the
+                    // data header.
+                    batch_seq: None,
+                    // PR #127 (AWQ v2) added this field; CLI build site
+                    // populates it via the calibration plumbing further down,
+                    // not here.
+                    compile_bundle: None,
+                    // PR #132 (WGGO Phase 2) added this field; codegen
+                    // populates it from AST pre-scan inside
+                    // `run_pre_scan_phase`, so the CLI initializes to None and
+                    // lets entry_points.rs do it.
+                    grad_retention: None,
+                },
                 // M62 Task 6: weight_index_map is populated from analysis in
                 // run_build_single/run_build_multi (where analysis is in scope).
                 weight_index_map: std::collections::HashMap::new(),
-                // PR #127 (AWQ v2) added this field; CLI build site populates
-                // it via the calibration plumbing further down, not here.
-                calibration_compile_bundle: None,
-                // PR #132 (WGGO Phase 2) added this field; codegen populates
-                // it from AST pre-scan inside `run_pre_scan_phase`, so the
-                // CLI initializes to None and lets entry_points.rs do it.
-                calibration_grad_retention: None,
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated

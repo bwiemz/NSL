@@ -307,7 +307,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     // tape-AD path bypasses CSHA entirely.
                     opts.source_ad = true;
                     // Suppress unrelated noise: no calibration data.
-                    opts.calibration_data = None;
+                    opts.calibration.data = None;
                     // Drive the same compile entry the `nsl build` path
                     // uses (`compile_returning_plan`) so top-level
                     // `train(...)` blocks reach `compile_train_block`

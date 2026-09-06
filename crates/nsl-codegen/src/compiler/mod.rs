@@ -1865,12 +1865,12 @@ impl<'a> Compiler<'a> {
     /// fixture).  Task 6 will thread the real values from the calibration-data
     /// header through `CompileOptions`.
     pub fn emit_retention_arena(&mut self) -> Result<(), CodegenError> {
-        let projections = match self.compile_options.calibration_retention.clone() {
+        let projections = match self.compile_options.calibration.retention.clone() {
             Some(ps) if !ps.is_empty() => ps,
             _ => return Ok(()),
         };
 
-        let (batch, seq) = self.compile_options.calibration_batch_seq.unwrap_or((8, 4));
+        let (batch, seq) = self.compile_options.calibration.batch_seq.unwrap_or((8, 4));
         let layout = crate::calibration::build_arena_layout(&projections, batch, seq);
         let total = layout.total_bytes() as usize;
         if total == 0 {
@@ -1916,7 +1916,7 @@ impl<'a> Compiler<'a> {
     /// Spec §4.3.  Must run immediately after `emit_retention_arena` in every
     /// entry point (spec §7.2 ordering invariant #2).
     pub fn emit_grad_retention_arena(&mut self) -> Result<(), CodegenError> {
-        let targets = match self.compile_options.calibration_grad_retention.clone() {
+        let targets = match self.compile_options.calibration.grad_retention.clone() {
             Some(t) if !t.is_empty() => t,
             _ => return Ok(()),
         };

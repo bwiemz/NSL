@@ -99,8 +99,11 @@ fn retention_splice_fires_when_arena_declared_before_method_codegen() {
     ];
 
     let opts = CompileOptions {
-        calibration_retention: Some(projections),
-        calibration_batch_seq: Some((1, 1)),
+        calibration: nsl_codegen::CalibrationOptions {
+            retention: Some(projections),
+            batch_seq: Some((1, 1)),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

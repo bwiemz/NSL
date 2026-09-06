@@ -53,8 +53,8 @@ fn opts_with_backward(
     let analysis = nsl_semantic::analyze(ast, &mut analysis_interner);
 
     let mut opts = nsl_codegen::CompileOptions::default();
-    opts.calibration_batch_seq = Some((4, 4));
-    opts.calibration_compile_bundle = Some(std::sync::Arc::new(
+    opts.calibration.batch_seq = Some((4, 4));
+    opts.calibration.compile_bundle = Some(std::sync::Arc::new(
         nsl_codegen::calibration::CalibrationCompileBundle {
             ast: ast.clone(),
             interner: analysis_interner,
@@ -81,7 +81,7 @@ fn opts_with_backward(
         w_v_index: 2,
         w_o_index: 3,
     }];
-    opts.calibration_grad_retention = Some(targets);
+    opts.calibration.grad_retention = Some(targets);
     opts
 }
 
