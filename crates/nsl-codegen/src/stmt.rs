@@ -7292,7 +7292,7 @@ impl Compiler<'_> {
                     // when weights_path is None, producing uniform scores).
                     // compile_options is forwarded so build_scorer can wire the
                     // GradientScorer appropriate for --wggo-importance + --calibration-data.
-                    // calibration_sidecar is populated by compile_and_calibrate's wrapper-
+                    // calibration.sidecar is populated by compile_and_calibrate's wrapper-
                     // level firing BEFORE compile_main runs, ensuring it's available here
                     // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
                     // calibrate wrapper).
@@ -16600,7 +16600,7 @@ impl Compiler<'_> {
         //     silent fallback to uncalibrated is a correctness trap.
         let is_awq = matches!(quant.default_dtype, Some(QuantDtype::Awq4));
         let awq_scales_opt: Option<nsl_runtime::awq::AwqScales> = if is_awq {
-            match self.compile_options.calibration_sidecar.as_ref() {
+            match self.compile_options.calibration.sidecar.as_ref() {
                 None => None,
                 Some(sidecar) => {
                     match sidecar.hooks.get("awq_activation_scales") {

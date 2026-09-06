@@ -598,23 +598,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // `nsl run` never sets WRGA check-mode overrides.
                 wrga_check: nsl_codegen::WrgaCheckContext::default(),
                 export_functions_out: None,
-                calibration_data: None,
-                calibration_mode: Some("required".to_string()),
-                calibration_samples: 512,
-                calibration_batch_size: 8,
-                calibration_timeout_secs: 600,
-                calibration_sidecar: None,
-                calibration_retention: None,
-                calibration_batch_seq: None,
+                // `nsl run` never drives calibration: no data path, no
+                // compile bundle, no retention plans (the defaults).
+                calibration: nsl_codegen::CalibrationOptions::default(),
                 // M62 Task 6: weight_index_map is populated from analysis in
                 // run_build_single (where analysis is in scope).
                 weight_index_map: std::collections::HashMap::new(),
-                // PR #127 (AWQ v2) added this field; CLI run site doesn't
-                // perform calibration so the bundle is unset.
-                calibration_compile_bundle: None,
-                // PR #132 (WGGO Phase 2) added this field; the run site
-                // doesn't drive calibration, so this stays None.
-                calibration_grad_retention: None,
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated

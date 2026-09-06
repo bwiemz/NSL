@@ -71,7 +71,7 @@ fn splice_count_for_source(source: &str) -> u32 {
     );
 
     let opts = CompileOptions::default();
-    assert!(opts.calibration_retention.is_none());
+    assert!(opts.calibration.retention.is_none());
 
     compile_returning_splice_count_for_tests(&parsed.module, &interner, &analysis.type_map, &opts)
         .expect("compile must succeed with auto-discovery")

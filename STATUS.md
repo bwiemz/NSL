@@ -162,12 +162,16 @@ for the compiler-state model (and the thread-local audit + migration plan that
 the same hardening pass produced).
 
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
-(`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`, …).
-The `calibration_*` and dev-tools (`profile_*`/`health_*`) clusters are left
-flat *deliberately*: they are already prefix-cohesive and their field names
-(`target_gpu`, `dtype`, `calibration_data`) collide with identically-named
-fields on other structs, so a mechanical rename is unsafe without per-site type
-analysis. Group them only alongside that analysis.
+(`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
+`CalibrationOptions`, …). The `calibration_*` cluster moved into
+`CalibrationOptions` (`opts.calibration.{data, mode, samples, batch_size,
+timeout_secs, sidecar, retention, batch_seq, compile_bundle, grad_retention}`)
+with the per-site type analysis that move needed: `HarnessConfig` and the CLI
+`BuildArgs` keep their own identically-named `calibration_data` fields. The
+dev-tools (`profile_*`/`health_*`) cluster is still flat *deliberately*: it is
+prefix-cohesive and its field names (`target_gpu`, `dtype`) collide with
+identically-named fields on other structs, so group it only alongside the same
+kind of analysis.
 
 ## How this maps to tests
 

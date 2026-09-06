@@ -588,7 +588,7 @@ fn main():
     // Prepare sidecar with "Tiny.w" matching the above quant block.
     let sidecar_for_final = build_awq_sidecar(&[("Tiny.w", vec![1.0, 1.0, 1.0, 1.0])]);
     let mut final_opts = nsl_codegen::CompileOptions::default();
-    final_opts.calibration_sidecar = Some(sidecar_for_final);
+    final_opts.calibration.sidecar = Some(sidecar_for_final);
     try_compile(TINY_AWQ_SRC, &final_opts)
         .expect("final compile with sidecar should succeed (Task 9 lookup path)");
 

@@ -93,7 +93,7 @@ fn refuse_grad_mode_with_no_calibration_data() {
     let opts = grad_mode_opts_no_data_reachable_model();
     // calibration_data is still None here — that is the trigger for §5.6.
     assert!(
-        opts.calibration_data.is_none(),
+        opts.calibration.data.is_none(),
         "test must start with no calibration_data"
     );
     let err = compile_with_options(source, &opts).expect_err(

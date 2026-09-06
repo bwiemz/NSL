@@ -1317,6 +1317,64 @@ impl MatmulConfig {
     }
 }
 
+/// Calibration-harness options (AWQ / WGGO calibration).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). `data.is_some()`
+/// is the switch that arms calibration; the remaining fields are read by
+/// the harness driver (`compile_and_calibrate`), the retention splices
+/// (`retention`, `batch_seq`, `grad_retention`), the subprocess model
+/// emitter (`compile_bundle`) and the consumers of the sidecar the harness
+/// writes back (`sidecar`).
+#[derive(Clone)]
+pub struct CalibrationOptions {
+    /// Path to calibration dataset.
+    pub data: Option<std::path::PathBuf>,
+    /// Failure-handling mode: `"required"` or `"best-effort"`.
+    pub mode: Option<String>,
+    pub samples: u32,
+    pub batch_size: u32,
+    pub timeout_secs: u64,
+    /// Populated by the harness after a successful calibration run.
+    /// Downstream passes (AWQ quantizer, future hooks' consumers) read
+    /// their sidecar key from here.  `None` when calibration didn't
+    /// run or produced no usable output.
+    pub sidecar: Option<crate::calibration::sidecar::Sidecar>,
+    /// When `Some`, codegen runs the retention pass on `model_forward`, splicing
+    /// memcpys of input activations before matched linear sites. `None` = shipped
+    /// binary, zero IR impact.
+    pub retention: Option<Vec<crate::calibration::DiscoveredProjection>>,
+    /// Batch count and sequence length read from the calibration-data header
+    /// (`peek_batch_seq`).  Must be set whenever `retention` is `Some`.
+    /// Callers that exercise retention in tests without real calib data
+    /// fall back to (8, 4) when this is `None`.
+    pub batch_seq: Option<(u32, u32)>,
+    /// Owned AST/interner/type-map bundle used by the calibration subprocess
+    /// path to emit a dedicated model object.
+    pub compile_bundle: Option<std::sync::Arc<crate::calibration::CalibrationCompileBundle>>,
+    /// When `Some`, codegen emits `model_backward` IR with grad-retention
+    /// splices for the listed attention layers. `None` = forward-only AWQ
+    /// or no calibration. Spec §4.8.
+    pub grad_retention: Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
+}
+
+impl Default for CalibrationOptions {
+    fn default() -> Self {
+        Self {
+            data: None,
+            mode: Some("required".to_string()),
+            samples: 512,
+            batch_size: 8,
+            timeout_secs: 600,
+            sidecar: None,
+            retention: None,
+            batch_seq: None,
+            compile_bundle: None,
+            grad_retention: None,
+        }
+    }
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1716,42 +1774,15 @@ pub struct CompileOptions {
     pub export_functions_out: Option<
         std::sync::Arc<std::sync::Mutex<Option<Vec<crate::c_header::ExportInfo>>>>,
     >,
-    /// Path to calibration dataset.
-    pub calibration_data: Option<std::path::PathBuf>,
-    /// Failure-handling mode: `"required"` or `"best-effort"`.
-    pub calibration_mode: Option<String>,
-    pub calibration_samples: u32,
-    pub calibration_batch_size: u32,
-    pub calibration_timeout_secs: u64,
-    /// Populated by the harness after a successful calibration run.
-    /// Downstream passes (AWQ quantizer, future hooks' consumers) read
-    /// their sidecar key from here.  `None` when calibration didn't
-    /// run or produced no usable output.
-    pub calibration_sidecar: Option<crate::calibration::sidecar::Sidecar>,
-    /// When `Some`, codegen runs the retention pass on `model_forward`, splicing
-    /// memcpys of input activations before matched linear sites. `None` = shipped
-    /// binary, zero IR impact.
-    pub calibration_retention: Option<Vec<crate::calibration::DiscoveredProjection>>,
-    /// Batch count and sequence length read from the calibration-data header
-    /// (`peek_batch_seq`).  Must be set whenever `calibration_retention` is
-    /// `Some`.  Callers that exercise retention in tests without real calib
-    /// data fall back to (8, 4) when this is `None`.
-    pub calibration_batch_seq: Option<(u32, u32)>,
+    /// Calibration-harness options (data path, mode, budgets, retention
+    /// plans, the subprocess compile bundle and the sidecar written back).
+    pub calibration: CalibrationOptions,
     /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
     /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
     /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before
     /// calling any codegen entry point.  Empty map = no @export methods (safe
     /// default, nothing to look up).
     pub weight_index_map: HashMap<nsl_ast::NodeId, usize>,
-    /// Owned AST/interner/type-map bundle used by the calibration subprocess
-    /// path to emit a dedicated model object.
-    pub calibration_compile_bundle:
-        Option<std::sync::Arc<crate::calibration::CalibrationCompileBundle>>,
-    /// When `Some`, codegen emits `model_backward` IR with grad-retention
-    /// splices for the listed attention layers. `None` = forward-only AWQ
-    /// or no calibration. Spec §4.8.
-    pub calibration_grad_retention:
-        Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
 }
 
 impl CompileOptions {
@@ -1978,17 +2009,8 @@ impl Default for CompileOptions {
             cpdt: CpdtOptions::default(),
             wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,
-            calibration_data: None,
-            calibration_mode: Some("required".to_string()),
-            calibration_samples: 512,
-            calibration_batch_size: 8,
-            calibration_timeout_secs: 600,
-            calibration_sidecar: None,
-            calibration_retention: None,
-            calibration_batch_seq: None,
+            calibration: CalibrationOptions::default(),
             weight_index_map: HashMap::new(),
-            calibration_compile_bundle: None,
-            calibration_grad_retention: None,
         }
     }
 }
@@ -1998,8 +2020,8 @@ impl Default for CompileOptions {
 ///
 /// This is a convenience wrapper that:
 /// 1. Reads the calibration-data header to obtain `(batch, seq)`.
-/// 2. Sets up `CompileOptions` with `calibration_data`, `weight_file`,
-///    `calibration_batch_seq`, and `calibration_mode = "required"`.
+/// 2. Sets up `CompileOptions` with `calibration.data`, `weight_file`,
+///    `calibration.batch_seq`, and `calibration.mode = "required"`.
 /// 3. Lexes, parses, and semantically analyses the source.
 /// 4. Constructs a `Compiler` directly, runs all pre-`compile_main` passes
 ///    (string/enum/struct/model collection, function declaration, kernel
@@ -2007,15 +2029,15 @@ impl Default for CompileOptions {
 ///    harness at the wrapper level by invoking `real_subprocess_entry`
 ///    directly — the same canonical path used by AWQ + WGGO end-to-end tests.
 ///    After the harness completes, `compile_main` runs with
-///    `calibration_sidecar` already populated.
-/// 5. Reads back `compiler.compile_options.calibration_sidecar` and returns it.
+///    `calibration.sidecar` already populated.
+/// 5. Reads back `compiler.compile_options.calibration.sidecar` and returns it.
 ///
 /// The NSL source no longer needs a `train` block for calibration to fire.
-/// Calibration fires whenever `calibration_data.is_some()`, driven by the
+/// Calibration fires whenever `calibration.data.is_some()`, driven by the
 /// wrapper-level block (see `#134 (c-i)`).  Models decorated with
 /// `@quantize(dtype="awq4")` will have their AWQ projections discovered via
 /// `discover_awq_projections`; WGGO gradient targets are wired via
-/// `WggoGradientHook` when `calibration_grad_retention` is populated.
+/// `WggoGradientHook` when `calibration.grad_retention` is populated.
 pub fn compile_and_calibrate(
     source_path: &std::path::Path,
     data_path: &std::path::Path,
@@ -2058,11 +2080,11 @@ pub fn compile_and_calibrate(
 
     // Step 3: assemble options.
     let mut opts = CompileOptions::default();
-    opts.calibration_data = Some(data_path.to_path_buf());
+    opts.calibration.data = Some(data_path.to_path_buf());
     opts.weight_file = Some(weights_path.to_path_buf());
-    opts.calibration_batch_seq = Some((1, seq));
-    opts.calibration_mode = Some("required".to_string());
-    opts.calibration_compile_bundle = Some(std::sync::Arc::new(
+    opts.calibration.batch_seq = Some((1, seq));
+    opts.calibration.mode = Some("required".to_string());
+    opts.calibration.compile_bundle = Some(std::sync::Arc::new(
         crate::calibration::CalibrationCompileBundle {
             ast: parsed.module.clone(),
             interner: interner.clone(),
@@ -2079,12 +2101,12 @@ pub fn compile_and_calibrate(
     )?;
 
     // Step 5: construct the Compiler directly so we can read back
-    // `compiler.compile_options.calibration_sidecar` after all passes run.
+    // `compiler.compile_options.calibration.sidecar` after all passes run.
     // (This is Blocker A's fix: compile_module takes &CompileOptions so the
     // sidecar written into the Compiler's internal copy cannot be recovered
     // via the public API.  Driving Compiler directly avoids this limitation.)
     let mut compiler = crate::compiler::Compiler::new(&interner, &analysis.type_map, &opts)?;
-    compiler.compile_options.calibration_compile_bundle = opts.calibration_compile_bundle.clone();
+    compiler.compile_options.calibration.compile_bundle = opts.calibration.compile_bundle.clone();
 
     let pre_finalize = (|| -> Result<(), CodegenError> {
         compiler.intern_string("")?;
@@ -2119,7 +2141,7 @@ pub fn compile_and_calibrate(
         //
         // ORDERING INVARIANT: calibration must fire BEFORE
         // compile_flash_attention_kernels (and therefore before compile_main).
-        // TWO WGGO passes read compile_options.calibration_sidecar via
+        // TWO WGGO passes read compile_options.calibration.sidecar via
         // build_scorer: (1) the WGGO pre-pass inside
         // compile_flash_attention_kernels (the WGGO-before-kernels restructure)
         // and (2) compile_train_block's in-place WGGO pass under compile_main.
@@ -2135,10 +2157,10 @@ pub fn compile_and_calibrate(
         // calls now sequenced below it. Spec §4.1's "after compile_main
         // returns" wording was over-specified; the architectural goal
         // "calibration runs around the compiled code" (§4.3) is preserved.
-        if let Some(data_path) = compiler.compile_options.calibration_data.clone() {
+        if let Some(data_path) = compiler.compile_options.calibration.data.clone() {
             let mut registry = crate::calibration::registry::HookRegistry::new();
             let awq_projections = compiler.discover_awq_projections().unwrap_or_default();
-            if let Some(pre_scan) = compiler.compile_options.calibration_retention.as_ref() {
+            if let Some(pre_scan) = compiler.compile_options.calibration.retention.as_ref() {
                 crate::calibration::discovery::check_discovery_agreement(
                     pre_scan,
                     &awq_projections,
@@ -2153,9 +2175,9 @@ pub fn compile_and_calibrate(
                 registry.register(Box::new(
                     crate::calibration::awq_hook::AwqCalibrationHook::new(proj_refs),
                 ));
-                compiler.compile_options.calibration_retention = Some(awq_projections);
+                compiler.compile_options.calibration.retention = Some(awq_projections);
             }
-            if let Some(targets) = compiler.compile_options.calibration_grad_retention.as_ref()
+            if let Some(targets) = compiler.compile_options.calibration.grad_retention.as_ref()
                 && !targets.is_empty()
             {
                 registry.register(Box::new(
@@ -2173,7 +2195,7 @@ pub fn compile_and_calibrate(
             } else {
                 let mode = match compiler
                     .compile_options
-                    .calibration_mode
+                    .calibration.mode
                     .as_deref()
                     .unwrap_or("required")
                 {
@@ -2188,16 +2210,16 @@ pub fn compile_and_calibrate(
                         .map(|p| vec![p.clone()])
                         .unwrap_or_default(),
                     calibration_data: data_path.clone(),
-                    samples: compiler.compile_options.calibration_samples,
-                    batch_size: compiler.compile_options.calibration_batch_size,
-                    timeout_secs: compiler.compile_options.calibration_timeout_secs,
+                    samples: compiler.compile_options.calibration.samples,
+                    batch_size: compiler.compile_options.calibration.batch_size,
+                    timeout_secs: compiler.compile_options.calibration.timeout_secs,
                     mode,
                     projections: compiler
                         .compile_options
-                        .calibration_retention
+                        .calibration.retention
                         .clone()
                         .unwrap_or_default(),
-                    compile_bundle: compiler.compile_options.calibration_compile_bundle.clone(),
+                    compile_bundle: compiler.compile_options.calibration.compile_bundle.clone(),
                     // Test-only fault-injection seam — production never
                     // overrides the subprocess's runtime data file.
                     runtime_data_override: None,
@@ -2209,7 +2231,7 @@ pub fn compile_and_calibrate(
                             out.outcome_repr,
                             out.sidecar.hooks.len()
                         );
-                        compiler.compile_options.calibration_sidecar = Some(out.sidecar);
+                        compiler.compile_options.calibration.sidecar = Some(out.sidecar);
                     }
                     Err(err) => {
                         return Err(CodegenError::new(format!("calibration: {err}")));
@@ -2233,7 +2255,7 @@ pub fn compile_and_calibrate(
     // The calibration sidecar is stored in the Compiler's copy of compile_options.
     // Extract it before handling errors (the sidecar may have been populated even
     // if a later codegen pass failed, but we want the sidecar from a successful run).
-    let sidecar = compiler.compile_options.calibration_sidecar.take();
+    let sidecar = compiler.compile_options.calibration.sidecar.take();
 
     // Propagate codegen errors only after extracting the sidecar.
     pre_finalize?;
@@ -2250,7 +2272,7 @@ pub fn compile_and_calibrate(
 }
 
 /// Compile a source string with the given options (convenience wrapper for
-/// tests that already hold a populated `CompileOptions::calibration_sidecar`
+/// tests that already hold a populated `CompileOptions::calibration.sidecar`
 /// and want to verify the final compile path).
 pub fn compile_with_options(source: &str, opts: &CompileOptions) -> Result<Vec<u8>, CodegenError> {
     let mut interner = nsl_lexer::Interner::new();
@@ -2286,23 +2308,23 @@ mod calib_options_tests {
     #[test]
     fn default_has_no_calibration_data() {
         let o = CompileOptions::default();
-        assert!(o.calibration_data.is_none());
-        assert_eq!(o.calibration_mode.as_deref(), Some("required"));
-        assert_eq!(o.calibration_samples, 512);
-        assert_eq!(o.calibration_batch_size, 8);
-        assert_eq!(o.calibration_timeout_secs, 600);
+        assert!(o.calibration.data.is_none());
+        assert_eq!(o.calibration.mode.as_deref(), Some("required"));
+        assert_eq!(o.calibration.samples, 512);
+        assert_eq!(o.calibration.batch_size, 8);
+        assert_eq!(o.calibration.timeout_secs, 600);
     }
 
     #[test]
     fn compile_options_default_has_no_calibration_retention() {
         let opts = CompileOptions::default();
-        assert!(opts.calibration_retention.is_none());
+        assert!(opts.calibration.retention.is_none());
     }
 
     #[test]
     fn compile_options_default_has_no_calibration_grad_retention() {
         let opts = CompileOptions::default();
-        assert!(opts.calibration_grad_retention.is_none());
+        assert!(opts.calibration.grad_retention.is_none());
     }
 }
 

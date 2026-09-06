@@ -1353,7 +1353,7 @@ pub fn run_on_wengert_with_weights(
 
     // Build the gradient scorer when compile options are present.
     // `build_scorer` selects Null/Magnitude/Calibrated based on
-    // `wggo_importance` and `calibration_sidecar`.  A `Grad` mode
+    // `wggo_importance` and `calibration.sidecar`.  A `Grad` mode
     // without a sidecar is a hard error propagated as `None` (the
     // compile pipeline will have already caught this via its own
     // validation, but we guard here too).
@@ -2414,7 +2414,7 @@ mod tests {
     }
 
     /// Verify `run_on_wengert_with_weights` wires the scorer when
-    /// `compile_options` carrying a `calibration_sidecar` is passed.
+    /// `compile_options` carrying a `calibration.sidecar` is passed.
     /// Checks that the `importance_source=gradient (calibrated)` log path
     /// fires by inspecting the plan's weight_analysis scores — the gradient
     /// signal must be non-uniform for the layer named in the sidecar.
@@ -2449,7 +2449,7 @@ mod tests {
 
         let mut opts = CompileOptions::default();
         opts.wggo.importance = WggoImportance::Auto;
-        opts.calibration_sidecar = Some(sidecar);
+        opts.calibration.sidecar = Some(sidecar);
 
         let w = two_block_wengert();
         let plan = run_on_wengert_with_weights(

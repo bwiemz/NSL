@@ -6,7 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-_Nothing yet. v0.10.0 below is the whole of the 0.9 line's unreleased work
+### Changed
+
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the ten
+  `calibration_*` fields moved into `CalibrationOptions`
+  (`opts.calibration.{data, mode, samples, batch_size, timeout_secs, sidecar,
+  retention, batch_seq, compile_bundle, grad_retention}`). Defaults are
+  unchanged; `HarnessConfig` and the CLI `BuildArgs` keep their own
+  `calibration_data` fields. 87 → 78 flat fields.
+
+_v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),
 so this section stays short._
 

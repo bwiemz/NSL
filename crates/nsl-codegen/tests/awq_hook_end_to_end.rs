@@ -149,7 +149,7 @@ fn main():
 "#;
 
 /// Build an AWQ sidecar blob for the given projection → scales mapping and
-/// wrap it in a `Sidecar` struct ready to set as `CompileOptions::calibration_sidecar`.
+/// wrap it in a `Sidecar` struct ready to set as `CompileOptions::calibration.sidecar`.
 fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> nsl_codegen::calibration::sidecar::Sidecar {
     use std::collections::BTreeMap;
     use nsl_codegen::calibration::awq_sidecar;
@@ -207,7 +207,7 @@ fn missing_scales_is_hard_error_when_sidecar_present() {
     let sidecar =
         build_awq_sidecar(&[("Tiny.other_field", vec![1.0, 1.0, 1.0, 1.0])]);
     let mut opts = nsl_codegen::CompileOptions::default();
-    opts.calibration_sidecar = Some(sidecar);
+    opts.calibration.sidecar = Some(sidecar);
 
     let err = try_compile(TINY_AWQ_SRC, &opts)
         .expect_err("compile must fail when projection is missing from sidecar");
