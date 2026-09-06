@@ -612,7 +612,12 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         name: "wggo_overrides",
         producer: "WGGO",
         carries: "crate::wggo_overrides::WggoOverrides",
-        consumers: &["crates/nsl-codegen/src/stmt.rs"],
+        consumers: &[
+            "crates/nsl-codegen/src/stmt.rs",
+            // Section 2 of the train block (the FASE plan reads the per-layer
+            // `fase_fused` pattern) lives in `stmt_train/contract.rs` (A1).
+            "crates/nsl-codegen/src/stmt_train/contract.rs",
+        ],
         empty_means: "no WGGO plan exists for this compile, so FASE falls back \
                       to fase::plan, the per-parameter mode table is skipped, \
                       and CSHA and WRGA receive no per-layer decisions",
