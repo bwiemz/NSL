@@ -560,7 +560,11 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         name: "cpdt_plan",
         producer: "CPDT",
         carries: "crate::cpdt::CpdtPlan",
-        consumers: &["crates/nsl-codegen/src/stmt.rs"],
+        consumers: &[
+            "crates/nsl-codegen/src/stmt.rs",
+            // Section 3 of the train block (the CPDT precision-plan resolution) lives in `stmt_train/model_params.rs` (A1).
+            "crates/nsl-codegen/src/stmt_train/model_params.rs",
+        ],
         empty_means: "CPDT is off; the optimizer runs its verbatim FP32 path",
         consumed_by_passes: &[],
         dead_output: Invariant::Enforced,
@@ -612,7 +616,11 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         name: "wggo_overrides",
         producer: "WGGO",
         carries: "crate::wggo_overrides::WggoOverrides",
-        consumers: &["crates/nsl-codegen/src/stmt.rs"],
+        consumers: &[
+            "crates/nsl-codegen/src/stmt.rs",
+            // Section 3 of the train block (the CPDT precision-plan resolution) lives in `stmt_train/model_params.rs` (A1).
+            "crates/nsl-codegen/src/stmt_train/model_params.rs",
+        ],
         empty_means: "no WGGO plan exists for this compile, so FASE falls back \
                       to fase::plan, the per-parameter mode table is skipped, \
                       and CSHA and WRGA receive no per-layer decisions",
