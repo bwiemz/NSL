@@ -275,7 +275,10 @@ fn storage_is_nsl_owned(tensor_ptr: i64) -> bool {
         if cur == 0 {
             return false;
         }
-        let t = NslTensor::from_ptr(cur);
+        // Read-only walk. `from_ptr_ref` rather than `from_ptr`: the
+        // caller already holds a reference derived from the same handle,
+        // and a fresh `&mut` retag here would invalidate it (Miri, roadmap C2).
+        let t = NslTensor::from_ptr_ref(cur);
         if t.data_owner == 0 {
             return t.owns_data == 1 || t.slab_managed == 1;
         }
@@ -311,7 +314,9 @@ pub fn nsl_tensor_to_dlpack_owned(
     if tensor_ptr == 0 {
         return Err("nsl_tensor_to_dlpack_owned: null tensor pointer".to_string());
     }
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    // Shared reference: the export only reads the header, and
+    // `storage_is_nsl_owned` re-derives from the same handle below.
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     if !storage_is_nsl_owned(tensor_ptr) {
         return Err(
             "output aliases memory NSL does not own (the export returned an \
@@ -432,7 +437,7 @@ pub extern "C" fn nsl_dlpack_export(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
     }
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     nsl_tensor_to_dlpack(tensor, tensor_ptr) as i64
 }
 

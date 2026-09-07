@@ -660,7 +660,10 @@ buffer is padded values plus per-block scales (now their own dtype tag);
 across `new_view_i64` (now re-derived); the sparse value buffer was a
 byte allocation read as `&[f64]` (now an f64 allocation); and the KV
 transfer header was written to the socket as the struct's raw bytes,
-padding included (now field by field). Everything else was test-side:
+padding included (now field by field); and the owned DLPack export held
+a `&mut` to the tensor across `storage_is_nsl_owned`, which re-derived
+the same handle (the export entry points now take shared references).
+Everything else was test-side:
 tests holding a handle across a call, an unaligned test buffer for
 `ShmHeader`, stack tensors handed out through `&T` rather than `&mut T`.
 Three `tensor::activation` / `flash_attention` / `context_parallel` tests

@@ -15,8 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   value buffer was a byte allocation read as `&[f64]` (now an f64
   allocation, freed with the same layout); the KV-transfer header was written
   to the socket as the struct's raw bytes, four uninitialized padding bytes
-  included (now serialized field by field, same 48-byte layout). Test-side
-  fixes in `dlpack`, `cfie::bridge`, `tensor_parallel` and `zero`.
+  included (now serialized field by field, same 48-byte layout);
+  `nsl_tensor_to_dlpack_owned` held a `&mut` to the tensor across
+  `storage_is_nsl_owned`, which re-derived the same handle (the export
+  path now takes shared references throughout). Test-side fixes in
+  `dlpack`, `cfie::bridge`, `tensor_parallel` and `zero`.
 - Blockwise-int8 tensors (`nsl_tensor_quant_int8_blockwise`) carry their own
   wire tag, `DTYPE_INT8_BLOCKWISE = 10`, and `data_byte_size` sizes their
   buffer by the packed formula. They were tagged `DTYPE_INT8` and freed (and
