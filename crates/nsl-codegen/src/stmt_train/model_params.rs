@@ -493,7 +493,7 @@ impl Compiler<'_> {
                          ladder). Drop the flag or switch optimizers",
                     ));
                 }
-                if !self.compile_options.weight_stream {
+                if !self.compile_options.weight_stream.enabled {
                     return Err(CodegenError::new(
                         "--param-dtype bf16-sr requires --weight-stream: the \
                          bf16 authoritative mirrors ride the streaming \

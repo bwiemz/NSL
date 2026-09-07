@@ -50,7 +50,8 @@ belongs in the emission caches; configuration belongs on `CompileOptions`.
 `CompileOptions` (in `crates/nsl-codegen/src/lib.rs`) is the configuration
 half of the session. It is being decomposed from a flat "god-config" into
 cohesive sub-structs (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`,
-`CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, …) as part of the
+`CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
+`WeightStreamOptions`, …) as part of the
 same hardening effort.
 
 A future `CompileSession { options, diagnostics, … }` wrapper could formalize

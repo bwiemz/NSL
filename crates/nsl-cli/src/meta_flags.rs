@@ -284,10 +284,10 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     off_bool!(checkpoint.blocks, "--checkpoint-blocks (CCR)");
     off_bool!(checkpoint.selective, "--checkpoint-selective (CCR)");
     off_bool!(layerwise_accum, "--layerwise-accum (CSLA)");
-    off_bool!(weight_stream, "--weight-stream");
-    off_bool!(stream_arena, "--stream-arena");
-    off_bool!(stream_prefetch, "--stream-prefetch");
-    off_bool!(stream_async_writeback, "--stream-async-writeback");
+    off_bool!(weight_stream.enabled, "--weight-stream");
+    off_bool!(weight_stream.arena, "--stream-arena");
+    off_bool!(weight_stream.prefetch, "--stream-prefetch");
+    off_bool!(weight_stream.async_writeback, "--stream-async-writeback");
     off_bool!(optim_state_offload, "--optim-state-offload");
     // Both change the ARITHMETIC, not just the schedule — a reference run must
     // not silently keep a deliberately non-bit-exact fusion. (`--fuse-rmsnorm-backward`
@@ -369,10 +369,12 @@ mod tests {
             training_reference: true,
             checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
             layerwise_accum: true,
-            weight_stream: true,
-            stream_arena: true,
-            stream_prefetch: true,
-            stream_async_writeback: true,
+            weight_stream: nsl_codegen::WeightStreamOptions {
+                enabled: true,
+                arena: true,
+                prefetch: true,
+                async_writeback: true,
+            },
             optim_state_offload: true,
             disable_fusion: false,
             ..Default::default()
@@ -382,10 +384,10 @@ mod tests {
         apply_training_reference(&mut opts);
         assert!(!opts.checkpoint.blocks);
         assert!(!opts.layerwise_accum);
-        assert!(!opts.weight_stream);
-        assert!(!opts.stream_arena);
-        assert!(!opts.stream_prefetch);
-        assert!(!opts.stream_async_writeback);
+        assert!(!opts.weight_stream.enabled);
+        assert!(!opts.weight_stream.arena);
+        assert!(!opts.weight_stream.prefetch);
+        assert!(!opts.weight_stream.async_writeback);
         assert!(!opts.optim_state_offload);
         assert!(opts.disable_fusion, "kernel fusion disabled");
         assert_eq!(opts.wggo.mode.as_deref(), Some("off"));
