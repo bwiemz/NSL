@@ -34,11 +34,17 @@
 #                                                     # what found the cpu.rs
 #                                                     # aliasing case
 #
-# Caveat for wider filters: Miri's math shims (tanh, exp, ...) can differ
-# from the host libm by an ulp, so a test that asserts bit-exact
-# transcendental results (`gelu_backward_cpu_f64_matches_tanh_deriv`) can
-# fail under Miri while passing natively. That is a normal test failure,
-# not "Undefined Behavior", and the run continues past it.
+# Caveat for wider filters: Miri deliberately perturbs the results of the
+# transcendental shims (tanh, exp, ...) by a few ulps, and differently on
+# each run, precisely so code cannot depend on one libm's rounding. A test
+# that asserts bit-exact transcendental results therefore fails under Miri
+# while passing natively — in `tensor::activation` that is
+# `gelu_backward_cpu_f64_matches_tanh_deriv`,
+# `silu_backward_cpu_f64_matches_6op` and
+# `swiglu_gate_backward_cpu_f64_bit_exact_vs_pair`, in a varying subset.
+# Those are normal test failures, not "Undefined Behavior", and the run
+# continues past them: the line to read is the final `test result` plus
+# the absence of any "Undefined Behavior" report.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks}"
