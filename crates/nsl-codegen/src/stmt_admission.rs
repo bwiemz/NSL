@@ -51,7 +51,7 @@ impl Compiler<'_> {
     // repo's deferral-must-refuse rule) instead of silently running the
     // interleaved baseline under a flag that claims otherwise.
     let csla_active = self.compile_options.layerwise_accum;
-    if self.compile_options.weight_stream && !csla_active {
+    if self.compile_options.weight_stream.enabled && !csla_active {
         return Err(CodegenError::new(
             "--weight-stream requires --layerwise-accum (the window-scoped \
              eviction cycle is defined by the layer-major schedule)",
@@ -162,7 +162,7 @@ impl Compiler<'_> {
                  never parameters — there is nothing to slice",
             )));
         }
-        if s == 3 && !(csla_active && self.compile_options.weight_stream) {
+        if s == 3 && !(csla_active && self.compile_options.weight_stream.enabled) {
             return Err(CodegenError::new(
                 "--zero-stage 3 requires --layerwise-accum --weight-stream \
                  (+ --checkpoint-blocks --source-ad): parameter sharding \

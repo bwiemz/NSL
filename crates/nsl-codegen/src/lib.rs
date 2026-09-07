@@ -1439,6 +1439,49 @@ pub struct CheckpointOptions {
     pub policies: HashMap<String, nsl_semantic::effects::CheckpointPolicy>,
 }
 
+/// Layer weight streaming (D2b, `--weight-stream`) and its refinements.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). The four flags form
+/// one ladder — `arena` requires `enabled`, `prefetch` and `async_writeback`
+/// require `arena` — and every consumer reads them together. Defaults are
+/// all off, as the flat fields were.
+#[derive(Clone, Default)]
+pub struct WeightStreamOptions {
+    /// D2b (`--weight-stream`, requires `--layerwise-accum`): layer weight
+    /// streaming across the WHOLE training loop. Layer-grouped params keep
+    /// pinned host mirrors; the forward (sliced per CCR segment) uploads
+    /// each layer before its segment and evicts after its last primal
+    /// read, and the window backward re-uploads per replay range and
+    /// writes back after that layer's update. Teardown restores residency
+    /// for model_save/eval. Tensor POINTERS never change (side-table
+    /// mechanism), so param_list / struct fields / the tie guard stay
+    /// valid. Byte-preserving — bit-exact.
+    pub enabled: bool,
+    /// Item 10 (`--stream-arena`, requires `--weight-stream`): batch each
+    /// layer's per-param host<->device transfers into ONE contiguous transfer
+    /// through a stable, reused device staging arena. Cuts CUDA calls, lands
+    /// one large PCIe transaction per layer, keeps device addresses stable
+    /// across steps, and bounds fragmentation. Bit-exact with the per-param
+    /// path (same mirror bytes, same order).
+    pub arena: bool,
+    /// Item 11 (`--stream-prefetch`, requires `--stream-arena`): double-buffer
+    /// the backward weight stream. Each layer's pack is prefetched (async HtoD
+    /// on the transfer stream) while the PREVIOUS layer computes, and the
+    /// compute stream waits on a per-pack CUDA event before reading it — the
+    /// CADENCE-style assume/guarantee transfer certificate. WGGO's calibration
+    /// activates the overlap only where estimated compute hides the transfer;
+    /// otherwise it falls back to the synchronous arena upload. Bit-exact.
+    pub prefetch: bool,
+    /// Item 11 writeback half (`--stream-async-writeback`, requires
+    /// `--stream-arena`): issue each layer pack's post-update DtoH on the
+    /// transfer stream instead of blocking, deferring the mirror scatter to
+    /// the runtime's drain points (writeback-queue cap / affected re-upload /
+    /// teardown). Completes the double-buffer schedule: compute L, prefetch
+    /// L+1, write back L-1. Bit-exact (same bytes, different timing).
+    pub async_writeback: bool,
+}
+
 /// Dev-tools options: the kernel profiler, the health monitor and
 /// `@inspect` emission.
 ///
@@ -1743,38 +1786,9 @@ pub struct CompileOptions {
     /// loudly on grad_clip, WGGO mode tables, `--optim-state-offload`,
     /// `--checkpoint-compress`, and the pipelined/tape paths.
     pub layerwise_accum: bool,
-    /// D2b (`--weight-stream`, requires `--layerwise-accum`): layer weight
-    /// streaming across the WHOLE training loop. Layer-grouped params keep
-    /// pinned host mirrors; the forward (sliced per CCR segment) uploads
-    /// each layer before its segment and evicts after its last primal
-    /// read, and the window backward re-uploads per replay range and
-    /// writes back after that layer's update. Teardown restores residency
-    /// for model_save/eval. Tensor POINTERS never change (side-table
-    /// mechanism), so param_list / struct fields / the tie guard stay
-    /// valid. Byte-preserving — bit-exact.
-    pub weight_stream: bool,
-    /// Item 10 (`--stream-arena`, requires `--weight-stream`): batch each
-    /// layer's per-param host<->device transfers into ONE contiguous transfer
-    /// through a stable, reused device staging arena. Cuts CUDA calls, lands
-    /// one large PCIe transaction per layer, keeps device addresses stable
-    /// across steps, and bounds fragmentation. Bit-exact with the per-param
-    /// path (same mirror bytes, same order).
-    pub stream_arena: bool,
-    /// Item 11 (`--stream-prefetch`, requires `--stream-arena`): double-buffer
-    /// the backward weight stream. Each layer's pack is prefetched (async HtoD
-    /// on the transfer stream) while the PREVIOUS layer computes, and the
-    /// compute stream waits on a per-pack CUDA event before reading it — the
-    /// CADENCE-style assume/guarantee transfer certificate. WGGO's calibration
-    /// activates the overlap only where estimated compute hides the transfer;
-    /// otherwise it falls back to the synchronous arena upload. Bit-exact.
-    pub stream_prefetch: bool,
-    /// Item 11 writeback half (`--stream-async-writeback`, requires
-    /// `--stream-arena`): issue each layer pack's post-update DtoH on the
-    /// transfer stream instead of blocking, deferring the mirror scatter to
-    /// the runtime's drain points (writeback-queue cap / affected re-upload /
-    /// teardown). Completes the double-buffer schedule: compute L, prefetch
-    /// L+1, write back L-1. Bit-exact (same bytes, different timing).
-    pub stream_async_writeback: bool,
+    /// Layer weight streaming (`--weight-stream` and its `--stream-*`
+    /// refinements); see [`WeightStreamOptions`].
+    pub weight_stream: WeightStreamOptions,
     /// CSHA (compiler-specialized hardware attention) codegen options.
     pub csha: CshaOptions,
     /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
@@ -2016,10 +2030,7 @@ impl Default for CompileOptions {
             fuse_wgrad_accum: false,
             fuse_wgrad_accum_from_bundle: false,
             layerwise_accum: false,
-            weight_stream: false,
-            stream_arena: false,
-            stream_prefetch: false,
-            stream_async_writeback: false,
+            weight_stream: WeightStreamOptions::default(),
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),
             cpdt: CpdtOptions::default(),

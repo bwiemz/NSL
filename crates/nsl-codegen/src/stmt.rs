@@ -5562,7 +5562,7 @@ impl Compiler<'_> {
         model_sym: nsl_ast::Symbol,
         cb_name: &str,
     ) -> Result<Option<bool>, CodegenError> {
-        if !self.compile_options.weight_stream {
+        if !self.compile_options.weight_stream.enabled {
             return Ok(None);
         }
         let touch = self.analyze_callback_model_touch(body, model_sym);
@@ -8347,7 +8347,7 @@ impl Compiler<'_> {
                                 // PCIe latency any in-flight prefetch is
                                 // guaranteed to hide (10 us), and only when the
                                 // prefetch machinery is actually on.
-                                overlap_credit_ns: if self.compile_options.stream_prefetch {
+                                overlap_credit_ns: if self.compile_options.weight_stream.prefetch {
                                     10_000
                                 } else {
                                     0
@@ -9803,7 +9803,7 @@ impl Compiler<'_> {
 
                         // ── Weight-stream admission (moved from the window
                         // site) + the part-2 forward streaming plan ──
-                        let ws_active = self.compile_options.weight_stream;
+                        let ws_active = self.compile_options.weight_stream.enabled;
                         let mut ws_streamed_sorted: Vec<i64> = Vec::new();
                         let ws_plan = if ws_active {
                             // Review D2b-1 (HIGH): a buffered primal VIEW of a
@@ -9965,7 +9965,7 @@ impl Compiler<'_> {
                                     arena_packs.push((first, last, members));
                                 }
                             }
-                            if self.compile_options.stream_arena {
+                            if self.compile_options.weight_stream.arena {
                                 eprintln!(
                                     "[weight-stream] arena mode: {} contiguous layer packs \
                                      (sizes [{}])",
@@ -10033,7 +10033,7 @@ impl Compiler<'_> {
                             &ws_streamed_sorted,
                             &plan_elems,
                             &crate::parameter_plan::PlanFeatures {
-                                weight_stream: self.compile_options.weight_stream,
+                                weight_stream: self.compile_options.weight_stream.enabled,
                                 param_dtype_bf16sr: self.features.param_dtype_bf16sr,
                                 zero_stage: self.features.zero_stage,
                                 zero_elementwise: self.features.zero_elementwise,
@@ -10262,7 +10262,7 @@ impl Compiler<'_> {
                     let mut explicit_freed_vars = std::collections::HashSet::new();
                     // No FASE hook on this forward-streaming path — stays empty.
                     let mut hook_freed_param_vars = std::collections::HashSet::new();
-                    let arena_mode = self.compile_options.stream_arena;
+                    let arena_mode = self.compile_options.weight_stream.arena;
                     for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
                         // Item 10: in arena mode a whole layer pack uploads at
                         // its bracket-start slice (ONE contiguous transfer);
@@ -12361,7 +12361,7 @@ impl Compiler<'_> {
             // excluded there — review D2b-1); each layer re-uploads at its
             // range head and evicts+writes-back after its update; epilogue
             // params never stream.
-            let ws_active = self.compile_options.weight_stream;
+            let ws_active = self.compile_options.weight_stream.enabled;
             let ws_streamed: std::collections::HashSet<i64> =
                 pending.schedule.ws_streamed.iter().copied().collect();
             // P3 ZeRO-3: the sharded set is READ FROM THE PLAN rather than
@@ -12796,12 +12796,12 @@ impl Compiler<'_> {
                     }
                 })
                 .collect();
-            let prefetch_active = self.compile_options.stream_prefetch
-                && self.compile_options.stream_arena
+            let prefetch_active = self.compile_options.weight_stream.prefetch
+                && self.compile_options.weight_stream.arena
                 && ws_active
                 && streamed_range_count >= 2
                 && edge_on.iter().any(|&e| e);
-            if self.compile_options.stream_prefetch {
+            if self.compile_options.weight_stream.prefetch {
                 let edges: Vec<String> = (0..ranges.len().saturating_sub(1))
                     .map(|ri| {
                         if pack_bytes(ri + 1) > 0 {
@@ -12838,7 +12838,7 @@ impl Compiler<'_> {
                     edges.join("; "),
                 );
             }
-            if self.compile_options.stream_async_writeback {
+            if self.compile_options.weight_stream.async_writeback {
                 eprintln!(
                     "[weight-stream] async writeback: {}",
                     if ws_active && streamed_range_count > 0 {
@@ -12875,7 +12875,7 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
                     let wsurf = builder.ins().iconst(cl_types::I8, SURFACE_WEIGHTS);
                     self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
-                    if self.compile_options.stream_arena {
+                    if self.compile_options.weight_stream.arena {
                         if prefetch_active && ri_was_prefetched {
                             // Item 11: weights already streaming in (prefetched
                             // during the previous range's compute). Just wait
@@ -13383,8 +13383,8 @@ impl Compiler<'_> {
                 // D2b: this layer's θ is final for the window — write back
                 // to the mirror and drop the device buffer.
                 if ws_active {
-                    if self.compile_options.stream_async_writeback
-                        && self.compile_options.stream_arena
+                    if self.compile_options.weight_stream.async_writeback
+                        && self.compile_options.weight_stream.arena
                     {
                         // Item 11 (writeback half): issue the pack's DtoH on
                         // the transfer stream and move on — the next range's
@@ -13397,7 +13397,7 @@ impl Compiler<'_> {
                             &ws_range,
                             "nsl_weight_stream_evict_pack_async",
                         )?;
-                    } else if self.compile_options.stream_arena {
+                    } else if self.compile_options.weight_stream.arena {
                         // Item 10: one DtoH writeback for the whole layer pack.
                         self.emit_ws_pack_evict(builder, param_list, &ws_range, 1)?;
                     } else {

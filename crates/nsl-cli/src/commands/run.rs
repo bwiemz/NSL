@@ -489,7 +489,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 fuse_wgrad_accum,
                 fuse_wgrad_accum_from_bundle,
                 layerwise_accum,
-                weight_stream,
+                weight_stream: nsl_codegen::WeightStreamOptions {
+                    enabled: weight_stream,
+                    arena: stream_arena,
+                    prefetch: stream_prefetch,
+                    async_writeback: stream_async_writeback,
+                },
                 param_dtype_bf16sr: param_dtype == "bf16-sr",
                 cuda_graphs,
                 muon_batch_ns,
@@ -506,9 +511,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         std::process::exit(1);
                     }
                 },
-                stream_arena,
-                stream_prefetch,
-                stream_async_writeback,
                 debug_training,
                 grad_integrity,
                 training_reference,

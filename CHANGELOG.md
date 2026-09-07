@@ -83,6 +83,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  weight-streaming ladder moved into `WeightStreamOptions`
+  (`opts.weight_stream.{enabled, arena, prefetch, async_writeback}`, for
+  `--weight-stream` / `--stream-arena` / `--stream-prefetch` /
+  `--stream-async-writeback`). Defaults unchanged (all off); the parameter
+  plan's `PlanFeatures` keeps its own `weight_stream` flag. 67 → 64 flat
+  fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the ten
   `calibration_*` fields moved into `CalibrationOptions`
   (`opts.calibration.{data, mode, samples, batch_size, timeout_secs, sidecar,

@@ -246,7 +246,7 @@ pub(crate) fn emit_train_teardown(
     // of device residency for model_save/eval, plus the pinned-mirror
     // release. Removing or reordering it after any θ reader crashes on
     // null data pointers.
-    if csla_active && c.compile_options.weight_stream {
+    if csla_active && c.compile_options.weight_stream.enabled {
         c.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
         // Item 3: drop this block's declared plan in the same breath.
         // The residency tables are cleared above, so leaving the plan
