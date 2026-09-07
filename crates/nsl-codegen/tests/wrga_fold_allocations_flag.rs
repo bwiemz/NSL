@@ -30,14 +30,17 @@ fn main():
 
 fn compile_with_flag(flag: bool) -> Option<()> {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            freeze: vec![FreezeDecoratorConfig {
-                include: vec!["m.w1".into(), "m.w2".into()],
-                exclude: vec![],
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                freeze: vec![FreezeDecoratorConfig {
+                    include: vec!["m.w1".into(), "m.w2".into()],
+                    exclude: vec![],
+                }],
+                ..Default::default()
+            }),
+            fold_allocations: flag,
             ..Default::default()
-        }),
-        wrga_fold_allocations: flag,
+        },
         source_ad: true,
         ..Default::default()
     };

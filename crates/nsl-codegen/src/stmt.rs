@@ -8238,7 +8238,7 @@ impl Compiler<'_> {
                 // tasks; this branch exists so the flag has observable
                 // effect today.
                 if let Some(plan) = &wrga_plan {
-                    if self.compile_options.wrga_fold_allocations {
+                    if self.compile_options.wrga.fold_allocations {
                         let mut transient = crate::memory_planner::LivenessAnalyzer::new();
                         for a in &plan.memory.assignments {
                             transient.record_activation_alloc(a.var, a.size_bytes);

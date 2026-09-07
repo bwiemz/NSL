@@ -1725,6 +1725,26 @@ pub struct DiagnosticsOptions {
     pub training_reference: bool,
 }
 
+/// WRGA options: the decorator configs the CLI bridge forwards from
+/// nsl-semantic, the Milestone B.2 allocation folding switch, and the
+/// `nsl check --wrga-analyze | --wrga-compare` override context.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). `inputs` is
+/// `None` when WRGA is off; `check` is all-`None` on normal builds.
+#[derive(Clone, Default)]
+pub struct WrgaOptions {
+    /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
+    pub inputs: Option<WrgaInputs>,
+    /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
+    /// allocations (vs. B.1's observational-only path). Default false.
+    pub fold_allocations: bool,
+    /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
+    /// Carries the `--wrga-target` / `--wrga-ablate` overrides and the
+    /// `--wrga-compare` plan-capture slot. All-`None` on normal builds.
+    pub check: WrgaCheckContext,
+}
+
 /// Memory-planning options: the M36 VRAM budget and plan report, and the
 /// transient-arena placement (`--vram-budget`, `--memory-report`,
 /// `--transient-arena`).
@@ -1841,8 +1861,9 @@ pub struct CompileOptions {
     /// other module defining them too causes a "multiple definition"
     /// linker error when the objects are joined. Defaults to `false`.
     pub emit_export_table: bool,
-    /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
-    pub wrga_inputs: Option<WrgaInputs>,
+    /// WRGA: the forwarded decorator configs, the allocation folding switch
+    /// and the check-mode override context; see [`WrgaOptions`].
+    pub wrga: WrgaOptions,
     /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
     /// nsl-semantic.  Empty when no decorator is present; codegen consults
     /// the first `enabled = true` entry to gate the fused linear-CE
@@ -1860,9 +1881,6 @@ pub struct CompileOptions {
     /// does not depend directly on nsl-semantic types (mirrors the
     /// `FusedCeDecoratorConfig` / `WrgaInputs` pattern).
     pub pca_user_strategies: Vec<PcaUserStrategy>,
-    /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
-    /// allocations (vs. B.1's observational-only path). Default false.
-    pub wrga_fold_allocations: bool,
     /// WGGO: weight-graph global-optimization options.
     pub wggo: WggoOptions,
     /// CFIE: compiler-fused inference-engine options.
@@ -1921,10 +1939,6 @@ pub struct CompileOptions {
     pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
     /// CPDT (compiler-planned distributed training) options.
     pub cpdt: CpdtOptions,
-    /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
-    /// Carries the `--wrga-target` / `--wrga-ablate` overrides and the
-    /// `--wrga-compare` plan-capture slot. All-`None` on normal builds.
-    pub wrga_check: WrgaCheckContext,
     /// M62: shared output slot the CLI reads after compile returns so it can
     /// emit a matching C header alongside the shared library. Populated by
     /// `Compiler::finalize` from `features.export_functions`.
@@ -2107,11 +2121,10 @@ impl Default for CompileOptions {
             imported_model: ImportedModelOptions::default(),
             shared_lib: false,
             emit_export_table: false,
-            wrga_inputs: None,
+            wrga: WrgaOptions::default(),
             fused_ce_configs: Vec::new(),
             fused_kl_ce_configs: Vec::new(),
             pca_user_strategies: Vec::new(),
-            wrga_fold_allocations: false,
             wggo: WggoOptions::default(),
             cfie: CfieOptions::default(),
             dev_tools: DevToolsOptions::default(),
@@ -2125,7 +2138,6 @@ impl Default for CompileOptions {
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),
             cpdt: CpdtOptions::default(),
-            wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,
             calibration: CalibrationOptions::default(),
         }

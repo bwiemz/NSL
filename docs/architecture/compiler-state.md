@@ -53,7 +53,7 @@ cohesive sub-structs (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`,
 `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
 `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
 `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,
-`MemoryOptions`, …) as part of the
+`MemoryOptions`, `WrgaOptions`, …) as part of the
 same hardening effort.
 
 A future `CompileSession { options, diagnostics, … }` wrapper could formalize
@@ -116,7 +116,7 @@ including the autodiff `TAPE` itself.)
 
 Retired: the `nsl-cli` build-path globals (`WRGA_TARGET_OVERRIDE` /
 `WRGA_ABLATION_OVERRIDE` / `WRGA_PLAN_CAPTURE`) now live on
-`CompileOptions::wrga_check` — Phase 2 below.
+`CompileOptions::wrga.check` — Phase 2 below.
 
 ---
 
@@ -132,7 +132,7 @@ FFI/RUNTIME-OK.
 
 **Phase 2 — retire the WRGA build-side globals (non-breaking). ✅ DONE.**
 All three (`WRGA_TARGET_OVERRIDE`, `WRGA_ABLATION_OVERRIDE`, `WRGA_PLAN_CAPTURE`)
-plus their RAII guards now live on `CompileOptions::wrga_check`
+plus their RAII guards now live on `CompileOptions::wrga.check`
 (`nsl_codegen::WrgaCheckContext`): the two overrides are CLI-applied onto
 `WrgaInputs` by the WRGA bridge, and `plan_capture` is an
 `Arc<Mutex<Option<WrgaPlan>>>` slot mirroring `cpdt.plan_out`. State now lives on

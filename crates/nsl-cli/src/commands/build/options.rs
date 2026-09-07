@@ -615,11 +615,9 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     .unwrap_or_default(),
                 shared_lib,
                 emit_export_table: shared_lib,
-                wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
                 fused_kl_ce_configs: Vec::new(),
                 pca_user_strategies: Vec::new(),
-                wrga_fold_allocations,
                 wggo: nsl_codegen::WggoOptions {
                     mode: wggo.clone(),
                     report: wggo_report,
@@ -655,10 +653,15 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     moe_roofline_slack: 0.0,
                     plan_out: cpdt_plan_out.clone(),
                 },
-                // Normal `nsl build` never sets WRGA check-mode overrides;
-                // `nsl check --wrga-analyze | --wrga-compare` builds its own
-                // CompileOptions with a populated `wrga_check` (wrga_check.rs).
-                wrga_check: nsl_codegen::WrgaCheckContext::default(),
+                wrga: nsl_codegen::WrgaOptions {
+                    // Filled by the build paths from semantic analysis.
+                    inputs: None,
+                    fold_allocations: wrga_fold_allocations,
+                    // Normal `nsl build` never sets WRGA check-mode overrides;
+                    // `nsl check --wrga-analyze | --wrga-compare` builds its own
+                    // CompileOptions with a populated `wrga.check` (wrga_check.rs).
+                    check: nsl_codegen::WrgaCheckContext::default(),
+                },
                 export_functions_out: None,
                 calibration: nsl_codegen::CalibrationOptions {
                     data: calibration_data.clone(),

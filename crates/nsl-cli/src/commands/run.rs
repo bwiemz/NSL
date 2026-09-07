@@ -540,11 +540,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     .unwrap_or_default(),
                 shared_lib: false,
                 emit_export_table: false,
-                wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
                 fused_kl_ce_configs: Vec::new(),
                 pca_user_strategies: Vec::new(),
-                wrga_fold_allocations: false,
                 // S3: thread the `--wggo*` surface through so the WGGO
                 // mode-table dispatch reaches `emit_unified_optim_step_dispatch`
                 // via `nsl run` (previously hardcoded to defaults, which
@@ -615,8 +613,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     moe_roofline_slack: 0.0,
                     plan_out: cpdt_plan_out.clone(),
                 },
-                // `nsl run` never sets WRGA check-mode overrides.
-                wrga_check: nsl_codegen::WrgaCheckContext::default(),
+                // `nsl run` never drives WRGA: no forwarded decorator configs,
+                // no allocation folding, no check-mode overrides.
+                wrga: nsl_codegen::WrgaOptions::default(),
                 export_functions_out: None,
                 // `nsl run` never drives calibration: no data path, no
                 // compile bundle, no retention plans (the defaults).
