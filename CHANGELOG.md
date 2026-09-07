@@ -79,6 +79,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): section 7e3b,
+  the CSLA (`--layerwise-accum`) window backward — the D1b layer-major
+  schedule replay, per-micro-batch seeding, per-range lowering with the
+  fused per-layer update, the weight-stream prefetch belt and the window
+  cleanup — moved byte-for-byte into `stmt_train/csla_window.rs`
+  (`emit_csla_window_backward`, fed by a `CslaWindowInputs`), together
+  with the `CslaPending` / `CslaSchedule` / `CslaParam` / `CslaSlotKind`
+  carriers that were local to the driver. 1,527 lines out of the driver,
+  no escaping binding; the train-block CLIF snapshots are unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): sections 7e4–7g,
   the optimizer step — the accumulation gate, the mode-table / FASE-deferred
   / stdlib step arms, the ZeRO reduce and param sync, the post-optimizer
