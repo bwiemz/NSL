@@ -1553,6 +1553,23 @@ pub struct ImportedModelOptions {
     pub field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
 }
 
+/// ZeRO optimizer-sharding options (`--zero-stage`, `--zero-elementwise`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). `Features` and
+/// the parameter plan's `PlanFeatures` keep their own `zero_stage` /
+/// `zero_elementwise` copies for the emission paths.
+#[derive(Clone, Default)]
+pub struct ZeroOptions {
+    /// M43b: ZeRO optimizer sharding stage (1, 2, or 3).
+    pub stage: Option<u8>,
+    /// Item 11 (`--zero-elementwise`): elementwise 1/ws parameter sharding
+    /// under `--zero-stage 3` — eligible streamed params live as per-rank
+    /// slices (all_gather to materialize, reduce_scatter gradients, every
+    /// rank steps its own slice); ineligible ones stay tensor-granular.
+    pub elementwise: bool,
+}
+
 /// Dev-tools options: the kernel profiler, the health monitor and
 /// `@inspect` emission.
 ///
@@ -1626,13 +1643,9 @@ pub struct CompileOptions {
     pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
     /// M55: Zero-knowledge proof-circuit emission options.
     pub zk: ZkOptions,
-    /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
-    pub zero_stage: Option<u8>,
-    /// Item 11 (`--zero-elementwise`): elementwise 1/ws parameter sharding
-    /// under `--zero-stage 3` — eligible streamed params live as per-rank
-    /// slices (all_gather to materialize, reduce_scatter gradients, every
-    /// rank steps its own slice); ineligible ones stay tensor-granular.
-    pub zero_elementwise: bool,
+    /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
+    /// [`ZeroOptions`].
+    pub zero: ZeroOptions,
     /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
     /// storage with counter-based stochastic rounding on the fused AdamW
     /// update — no FP32 master copy. Rides the weight-stream residency
@@ -1927,7 +1940,7 @@ impl CompileOptions {
             crate::lm_head_inference::LmHeadFusion::Auto => "auto",
             crate::lm_head_inference::LmHeadFusion::Require => "require",
         };
-        let zero = match self.zero_stage {
+        let zero = match self.zero.stage {
             Some(n) => n.to_string(),
             None => "none".to_string(),
         };
@@ -1951,7 +1964,7 @@ impl CompileOptions {
             format!("fuse_rms={}", b(self.fuse_rmsnorm_backward)),
             format!("fuse_wgrad={}", b(self.fuse_wgrad_accum)),
             format!("zero={zero}"),
-            format!("zero_elem={}", b(self.zero_elementwise)),
+            format!("zero_elem={}", b(self.zero.elementwise)),
             format!("ws={}", self.world_size),
             format!("muon_bns={}", b(self.muon.batch_ns)),
             format!("muon_resmom={}", b(self.muon.resident_momentum)),
@@ -2024,8 +2037,7 @@ impl Default for CompileOptions {
             linear_types_enabled: false,
             ownership_info: HashMap::new(),
             zk: ZkOptions::default(),
-            zero_stage: None,
-            zero_elementwise: false,
+            zero: ZeroOptions::default(),
             param_dtype_bf16sr: false,
             muon: MuonOptions::default(),
             cuda_graphs: false,

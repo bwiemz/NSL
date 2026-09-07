@@ -102,6 +102,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the ZeRO
+  knobs moved into `ZeroOptions` (`opts.zero.{stage, elementwise}`, for
+  `--zero-stage` / `--zero-elementwise`). Defaults unchanged (off); the
+  execution fingerprint reads both through the new path, and `Features` /
+  `PlanFeatures` keep their own `zero_stage` / `zero_elementwise` copies.
+  59 → 57 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the
   imported-model shape channel moved into `ImportedModelOptions`
   (`opts.imported_model.{field_dims, field_ranks, tensor_fields_without_dims,
