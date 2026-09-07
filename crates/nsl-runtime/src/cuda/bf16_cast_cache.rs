@@ -159,7 +159,7 @@ pub(crate) fn note_param_stepped(data: u64, elems: usize) {
         // in an A/B that composed the two.
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
-            eprintln!(
+            crate::nsl_log!(WARN, "bf16-cast-cache", 
                 "[bf16-cast-cache] disabled: --cuda-graphs is active (a cached \
                  image's address is pinned only inside captured graphs; evict \
                  would free memory a replay still reads). Use one or the other."

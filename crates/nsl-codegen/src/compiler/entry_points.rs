@@ -36,7 +36,7 @@ fn run_profile_pre_pass(
         Some(g) => g,
         None => {
             if std::env::var("NSL_DEBUG").is_ok() {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "nsl", 
                     "[nsl] profile_kernels: unknown GPU target {:?}, skipping pre-pass",
                     target_gpu
                 );
@@ -104,7 +104,7 @@ fn run_profile_pre_pass(
         }
         Err(e) => {
             if std::env::var("NSL_DEBUG").is_ok() {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "nsl", 
                     "[nsl] profile_kernels: walker failed ({}), continuing without predictions",
                     e
                 );
@@ -170,7 +170,7 @@ fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::Compil
         match crate::profiling::instrument::write_manifest(out_path, &manifest) {
             Ok(_) => {
                 if std::env::var("NSL_DEBUG").is_ok() {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "profile", 
                         "[profile] wrote manifest with {} kernels to {}",
                         manifest.kernels.len(),
                         out_path.display()
@@ -178,7 +178,7 @@ fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::Compil
                 }
             }
             Err(e) => {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "codegen", 
                     "warning: failed to write profile manifest to {}: {}",
                     out_path.display(),
                     e
@@ -186,7 +186,7 @@ fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::Compil
             }
         }
     } else if std::env::var("NSL_DEBUG").is_ok() {
-        eprintln!(
+        nsl_runtime::nsl_log!(WARN, "profile", 
             "[profile] manifest_builder set but no manifest_output_path — \
              skipping write ({} kernels)",
             manifest.kernels.len()
@@ -239,13 +239,13 @@ fn load_and_register_weights_if_needed(
     // safetensors get the pack for free.
     let auto_pack = crate::moe_hf_pack::pack_all_detected_hf_mixtral_blocks(&mut wmap);
     if !auto_pack.packed.is_empty() {
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "nsl", 
             "[nsl] CPDT v2.7: auto-packed {} HF Mixtral MoE block{} into NSL convention",
             auto_pack.packed.len(),
             if auto_pack.packed.len() == 1 { "" } else { "s" },
         );
         for (block, _) in &auto_pack.packed {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "codegen", 
                 "  - {} (num_experts={})",
                 block.hf_prefix, block.num_experts,
             );
@@ -256,13 +256,13 @@ fn load_and_register_weights_if_needed(
     // packed into NSL convention alongside the weights. Blocks
     // without biases produce no entry here (Ok(None) no-op).
     if !auto_pack.bias_packed.is_empty() {
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "nsl", 
             "[nsl] CPDT v2.15: auto-packed v4 biases for {} HF Mixtral MoE block{}",
             auto_pack.bias_packed.len(),
             if auto_pack.bias_packed.len() == 1 { "" } else { "s" },
         );
         for (block, _) in &auto_pack.bias_packed {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "codegen", 
                 "  - {} (num_experts={})",
                 block.hf_prefix, block.num_experts,
             );
@@ -354,14 +354,14 @@ fn load_and_register_weights_if_needed(
             }
         }
         if !compiler.memory.weight_scales.is_empty() {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "nsl", 
                 "[nsl] M52d: computed compile-time scales for {} quantized weights",
                 compiler.memory.weight_scales.len()
             );
         }
     }
 
-    eprintln!(
+    nsl_runtime::nsl_log!(INFO, "nsl", 
         "[nsl] loaded {} weights from {} (SHA-256: {})",
         wmap.len(),
         wmap.source_path(),
@@ -459,7 +459,7 @@ fn apply_auto_mode_fallback_note(
     };
 
     if let Some(reason) = trigger_reason {
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "codegen", 
             "note: --wggo-importance=auto fell back to magnitude scoring.\n  \
              reason: {reason}\n  \
              effect: WGGO ILP runs against magnitude (||W||₂)-based importance scores.\n  \
@@ -811,7 +811,7 @@ fn compile_returning_plan_impl(
 
                 if options.memory.report || plan.total_bytes > 0 {
                     let report = format_memory_report(&allocs, &plan);
-                    eprintln!("[nsl] {}", report);
+                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] {}", report);
                 }
 
                 if let Some(budget) = options.memory.vram_budget
@@ -832,7 +832,7 @@ fn compile_returning_plan_impl(
                 compiler.memory.slab_plan = Some(plan);
             }
         } else if options.memory.report {
-            eprintln!("[nsl] Memory plan: no static-shape tensor allocations found");
+            nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Memory plan: no static-shape tensor allocations found");
         }
     }
 
@@ -986,13 +986,13 @@ fn compile_with_zk_info_best_effort_plan(
         compiler.compile_pending_lambdas()?;
 
         if let Some(budget) = options.memory.vram_budget {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "nsl", 
                 "[nsl] --vram-budget set to {} bytes (planner integration in progress)",
                 budget
             );
         }
         if options.memory.report {
-            eprintln!("[nsl] --memory-report requested (planner integration in progress)");
+            nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] --memory-report requested (planner integration in progress)");
         }
 
         // M53: Run WCET analysis for @real_time functions
@@ -1029,7 +1029,7 @@ fn compile_with_zk_info_best_effort_plan(
                     "halo2" => crate::zk::backend::ZkBackendType::Halo2,
                     "folding" | "nova" | "" => crate::zk::backend::ZkBackendType::Folding,
                     other => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(WARN, "nsl", 
                             "[nsl] warning: unknown ZK backend '{}', using folding",
                             other
                         );
@@ -1041,7 +1041,7 @@ fn compile_with_zk_info_best_effort_plan(
                     "bn254" | "bn256" => crate::zk::backend::ZkField::BN254,
                     "mersenne31" | "m31" | "" => crate::zk::backend::ZkField::Mersenne31,
                     other => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(WARN, "nsl", 
                             "[nsl] warning: unknown ZK field '{}', using Mersenne31",
                             other
                         );
@@ -1051,7 +1051,7 @@ fn compile_with_zk_info_best_effort_plan(
                 cfg.emit_solidity = compiler.compile_options.zk.solidity;
                 // Wire --zk-weights flag to load weight file for witness generation
                 if let Some(ref weights_path) = compiler.compile_options.zk.weights_path {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "nsl", 
                         "[nsl] ZK: loading weights from {} for witness generation",
                         weights_path.display()
                     );
@@ -1061,7 +1061,7 @@ fn compile_with_zk_info_best_effort_plan(
             };
             match crate::zk::compile_zk(fn_def, *mode, &zk_config, type_map, interner) {
                 Ok(result) => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "nsl", 
                         "[nsl] M55: compiled ZK circuit for '{}' — {} constraints, proof ~{} KB",
                         fn_name,
                         result.stats.num_constraints,
@@ -1070,7 +1070,7 @@ fn compile_with_zk_info_best_effort_plan(
                     zk_results.push((fn_name.clone(), result));
                 }
                 Err(e) => {
-                    eprintln!("[nsl] M55: ZK compilation warning for '{}': {}", fn_name, e);
+                    nsl_runtime::nsl_log!(WARN, "nsl", "[nsl] M55: ZK compilation warning for '{}': {}", fn_name, e);
                 }
             }
         }

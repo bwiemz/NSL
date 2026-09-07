@@ -16,7 +16,7 @@ pub(crate) fn run_fmt(files: &[String], check: bool) {
         // Treat as literal file path (glob support can come later)
         let path = Path::new(pattern);
         if !path.exists() {
-            eprintln!("error: file not found: {}", pattern);
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: file not found: {}", pattern);
             errors += 1;
             continue;
         }
@@ -32,7 +32,7 @@ pub(crate) fn run_fmt(files: &[String], check: bool) {
             }
             Ok(false) => {} // already formatted
             Err(e) => {
-                eprintln!("{}", e);
+                nsl_runtime::nsl_log!(ERROR, "cli", "{}", e);
                 errors += 1;
             }
         }

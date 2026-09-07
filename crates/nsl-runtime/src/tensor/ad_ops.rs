@@ -804,7 +804,7 @@ pub extern "C" fn nsl_cross_entropy_backward(
                         go_hdr.dtype
                     ));
                 }
-                eprintln!(
+                crate::nsl_log!(WARN, "nsl", 
                     "[nsl] warning: GPU cross-entropy backward declined, falling back to the \
                      host path ({} MB of PCIe traffic per call). Reason(s): {}",
                     (lg.len * 4 * 2) / (1024 * 1024),
@@ -2265,7 +2265,7 @@ mod tests {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> i64 {
     if grad_ptr == 0 || target_ptr == 0 {
-        eprintln!("nsl_tensor_reduce_to_shape: null pointer (grad={}, target={})", grad_ptr, target_ptr);
+        crate::nsl_log!(WARN, "tensor", "nsl_tensor_reduce_to_shape: null pointer (grad={}, target={})", grad_ptr, target_ptr);
         return grad_ptr;
     }
     let grad = NslTensor::from_ptr_ref(grad_ptr);
@@ -2285,7 +2285,7 @@ pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> 
         static REDUCE_ALIGN_WARNED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !REDUCE_ALIGN_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
+            crate::nsl_log!(INFO, "nsl", 
                 "[nsl] reduce_to_shape: migrating a host-resident gradient \
                  (ndim={}) to the target parameter's device {} before \
                  reducing (once-per-process note; an adjoint op upstream is \

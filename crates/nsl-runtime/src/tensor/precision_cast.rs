@@ -1519,7 +1519,7 @@ mod tests {
         #[test]
         fn zeros_like_host_f32_is_pinned_and_free_unregisters() {
             if crate::tensor::offload_pageable_forced() {
-                eprintln!("skipping: NSL_OFFLOAD_PAGEABLE=1 in the environment");
+                crate::nsl_log!(WARN, "tensor", "skipping: NSL_OFFLOAD_PAGEABLE=1 in the environment");
                 return;
             }
             let cpu = f32_tensor(&[1.0; 8]);
@@ -1548,7 +1548,7 @@ mod tests {
         #[test]
         fn copy_data_async_pinned_defers_free_until_drain() {
             if crate::tensor::offload_pageable_forced() || crate::tensor::offload_sync_forced() {
-                eprintln!("skipping: offload kill-switch env set");
+                crate::nsl_log!(WARN, "tensor", "skipping: offload kill-switch env set");
                 return;
             }
             let vals = [3.0_f32, -4.0, 5.5, 0.25];

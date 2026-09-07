@@ -242,7 +242,7 @@ pub fn gptq_quantize_obq(
     let cholesky_ok = cholesky_lower(&mut h, k);
     if !cholesky_ok {
         // Fall back to RTN if Cholesky fails (degenerate Hessian)
-        eprintln!("[nsl-gptq] Cholesky failed, falling back to RTN");
+        crate::nsl_log!(WARN, "nsl-gptq", "[nsl-gptq] Cholesky failed, falling back to RTN");
         return crate::awq::awq_quantize_cpu(weights, k, n, group_size);
     }
     let h_inv = hessian_inverse_from_cholesky(&h, k);
@@ -545,7 +545,7 @@ pub extern "C" fn nsl_gptq_quantize(
     group_size: i64,
     bits: i64,
 ) -> i64 {
-    if weight_ptr == 0 { eprintln!("nsl_gptq_quantize: null weight tensor"); return 0; }
+    if weight_ptr == 0 { crate::nsl_log!(WARN, "gptq", "nsl_gptq_quantize: null weight tensor"); return 0; }
     let t = NslTensor::from_ptr_ref(weight_ptr);
     assert!(t.ndim >= 2, "nsl_gptq_quantize requires 2D weight tensor (got {}D)", t.ndim);
     let len = t.len as usize;

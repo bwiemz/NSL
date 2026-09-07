@@ -9,14 +9,14 @@ pub(crate) fn run_init(name: &str) {
 
     // Refuse to overwrite an existing directory
     if root.exists() {
-        eprintln!("error: directory '{}' already exists", name);
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: directory '{}' already exists", name);
         process::exit(1);
     }
 
     // Create project root and sub-directories
     for dir in &[root.to_path_buf(), root.join("data"), root.join("weights")] {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("error: could not create directory '{}': {e}", dir.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create directory '{}': {e}", dir.display());
             process::exit(1);
         }
     }
@@ -70,7 +70,7 @@ entry = \"main.nsl\"
     for (filename, contents) in files {
         let path = root.join(filename);
         if let Err(e) = std::fs::write(&path, contents) {
-            eprintln!("error: could not write '{}': {e}", path.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write '{}': {e}", path.display());
             process::exit(1);
         }
     }

@@ -59,7 +59,7 @@ pub(crate) fn parse_checkpoint_stride(s: &str) -> nsl_codegen::CheckpointStride 
     match t.parse::<usize>() {
         Ok(n) if n >= 1 => CheckpointStride::Fixed(n),
         _ => {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "cli", 
                 "note: --checkpoint-stride '{s}' is not 'auto', 'dp' or a \
                  positive integer; using stride 1 (per-block checkpointing)"
             );
@@ -182,7 +182,7 @@ pub(crate) fn expand_pretrain_optimized(
     // the bundle a worse citizen than the flags it expands to.
     match fuse_lm_head.as_deref() {
         None => *fuse_lm_head = Some("auto".to_string()),
-        Some("off") => eprintln!(
+        Some("off") => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: \
              --fuse-lm-head off (explicit flag wins; the [batch*seq, vocab] \
              logits surface will be materialized unless a @fused_lm_ce \
@@ -233,7 +233,7 @@ pub(crate) fn expand_pretrain_optimized(
             *fuse_wgrad_accum_from_bundle = !*fuse_wgrad_accum;
             *fuse_wgrad_accum = true;
         }
-        Some(flag) => eprintln!(
+        Some(flag) => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: \
              --fuse-wgrad-accum not enabled because {flag} is set ({flag} needs \
              the raw gradient this fusion never materializes; the rest of the \
@@ -242,7 +242,7 @@ pub(crate) fn expand_pretrain_optimized(
     }
     match wggo.as_deref() {
         None => *wggo = Some("greedy".to_string()),
-        Some("off") => eprintln!(
+        Some("off") => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: --wggo off \
              (explicit flag wins; no WGGO plan will drive CSHA/FASE/PCA)"
         ),
@@ -250,7 +250,7 @@ pub(crate) fn expand_pretrain_optimized(
     }
     match csha.as_deref() {
         None => *csha = Some("auto".to_string()),
-        Some("off") => eprintln!(
+        Some("off") => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: --csha off \
              (explicit flag wins)"
         ),
@@ -347,7 +347,7 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
         disabled.push("CSHA attention fusion (mode + @csha)");
     }
 
-    eprintln!(
+    nsl_runtime::nsl_log!(WARN, "cli", 
         "note: --training-reference forces the simplest correct training path. \
          Disabled: {}. Also disabled in codegen: FBIP in-place, the fused FASE \
          optimizer step, and @fused_lm_ce / @fused_kl_ce / @checkpoint decorators.",

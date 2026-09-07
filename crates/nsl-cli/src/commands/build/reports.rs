@@ -22,7 +22,7 @@ pub(super) fn check_wrga_report_preconditions(
         || !analysis.freeze_configs.is_empty()
         || !analysis.adapter_configs.is_empty();
     if has_wrga_decorators {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "nsl", 
             "nsl: --wrga-report requires --source-ad when WRGA decorators are present; re-run with --source-ad"
         );
         process::exit(2);
@@ -67,12 +67,12 @@ pub(super) fn emit_wrga_report(
             if report_path == std::path::Path::new("-") {
                 print!("{}", report);
             } else if let Err(e) = std::fs::write(report_path, &report) {
-                eprintln!("error: could not write WRGA report: {e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write WRGA report: {e}");
                 process::exit(1);
             }
         }
         None => {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "nsl", 
                 "nsl: --wrga-report requested but no @train block with WRGA decorators was compiled"
             );
         }

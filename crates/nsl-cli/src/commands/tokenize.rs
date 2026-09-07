@@ -29,7 +29,7 @@ pub(crate) fn run_tokenize(
     for dir in &search_dirs {
         let dir_path = PathBuf::from(dir);
         if !dir_path.exists() {
-            eprintln!("warning: directory '{}' not found, skipping", dir);
+            nsl_runtime::nsl_log!(WARN, "cli", "warning: directory '{}' not found, skipping", dir);
             continue;
         }
         collect_files_recursive(&dir_path, ext, &mut source_files);
@@ -37,17 +37,17 @@ pub(crate) fn run_tokenize(
     source_files.sort();
 
     if source_files.is_empty() {
-        eprintln!("error: no .{ext} files found in {:?}", search_dirs);
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: no .{ext} files found in {:?}", search_dirs);
         process::exit(1);
     }
 
-    eprintln!("[tokenize] Found {} .{} files across {} directories", source_files.len(), ext, search_dirs.len());
+    nsl_runtime::nsl_log!(INFO, "tokenize", "[tokenize] Found {} .{} files across {} directories", source_files.len(), ext, search_dirs.len());
 
     // Concatenate all source text into a temporary corpus file
     let corpus_path = std::env::temp_dir().join("nsl_tokenizer_corpus.txt");
     {
         let mut corpus = std::fs::File::create(&corpus_path).unwrap_or_else(|e| {
-            eprintln!("error: could not create corpus file: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create corpus file: {e}");
             process::exit(1);
         });
         let mut total_bytes: usize = 0;
@@ -59,11 +59,11 @@ pub(crate) fn run_tokenize(
                     let _ = corpus.write_all(b"\n");
                 }
                 Err(e) => {
-                    eprintln!("warning: could not read '{}': {e}", file.display());
+                    nsl_runtime::nsl_log!(WARN, "cli", "warning: could not read '{}': {e}", file.display());
                 }
             }
         }
-        eprintln!("[tokenize] Corpus: {} bytes from {} files", total_bytes, source_files.len());
+        nsl_runtime::nsl_log!(INFO, "tokenize", "[tokenize] Corpus: {} bytes from {} files", total_bytes, source_files.len());
     }
 
     // Train through the runtime's two-stage trainer, which is the tokenizer the
@@ -86,12 +86,12 @@ pub(crate) fn run_tokenize(
         ],
     };
     if transition >= vocab_size {
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "tokenize", 
             "[tokenize] Training BPE tokenizer (vocab_size={vocab_size}, min_freq={min_freq}, \
              word-bounded)..."
         );
     } else {
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "tokenize", 
             "[tokenize] Training two-stage BPE tokenizer (vocab_size={vocab_size}, \
              min_freq={min_freq}, transition={transition})..."
         );
@@ -103,7 +103,7 @@ pub(crate) fn run_tokenize(
     ) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("error: BPE training failed: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: BPE training failed: {e}");
             process::exit(1);
         }
     };
@@ -119,13 +119,13 @@ pub(crate) fn run_tokenize(
     match tokenizer.save(output.to_string_lossy().as_ref(), true) {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("error: could not save tokenizer to '{}': {e}", output.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not save tokenizer to '{}': {e}", output.display());
             process::exit(1);
         }
     }
 
     let final_vocab = tokenizer.get_vocab_size(true);
-    eprintln!("[tokenize] Saved tokenizer to '{}' (vocab_size={})", output.display(), final_vocab);
+    nsl_runtime::nsl_log!(INFO, "tokenize", "[tokenize] Saved tokenizer to '{}' (vocab_size={})", output.display(), final_vocab);
 
     // Clean up corpus
     let _ = std::fs::remove_file(&corpus_path);
@@ -134,7 +134,7 @@ pub(crate) fn run_tokenize(
     let sample = "fn forward(self, x: Tensor) -> Tensor:";
     if let Ok(encoding) = tokenizer.encode(sample, false) {
         let tokens = encoding.get_tokens();
-        eprintln!("[tokenize] Sample: \"{}\" -> {} tokens: {:?}", sample, tokens.len(), &tokens[..tokens.len().min(10)]);
+        nsl_runtime::nsl_log!(INFO, "tokenize", "[tokenize] Sample: \"{}\" -> {} tokens: {:?}", sample, tokens.len(), &tokens[..tokens.len().min(10)]);
     }
 }
 

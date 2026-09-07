@@ -341,7 +341,7 @@ mod tests {
             crate::cuda::inner::ensure_context();
             cudarc::driver::sys::cuCtxSynchronize();
         }
-        eprintln!(
+        crate::nsl_log!(INFO, "muon-prof-driver", 
             "[muon-prof-driver] one 500M-step NS load (168 calls, ns=5): {:.1} ms wall",
             wall.elapsed().as_secs_f64() * 1e3
         );

@@ -420,7 +420,7 @@ pub extern "C" fn nsl_tokenizer_encode_batch(
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
+                crate::nsl_log!(WARN, "nsl", 
                     "[nsl] warning: encode_batch padded to {widest}, not the requested \
                      max_len={max_len}: a row is longer and truncation is off, so no tokens \
                      were dropped. The batch width will vary with the longest document. \

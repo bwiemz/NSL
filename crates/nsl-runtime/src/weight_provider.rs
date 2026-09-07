@@ -397,22 +397,22 @@ fn print_usage(state: &ArgState) {
             usage.push_str(&format!(" [--{} <{}>]", name, &state.param_types[i]));
         }
     }
-    eprintln!("{}", usage);
+    crate::nsl_log!(INFO, "weight-provider", "{}", usage);
     if !state.param_names.is_empty() {
-        eprintln!();
-        eprintln!("Options:");
+        crate::nsl_log!(INFO, "weight-provider", "");
+        crate::nsl_log!(INFO, "weight-provider", "Options:");
         for i in 0..state.param_names.len() {
             let name = &state.param_names[i];
             let ty = &state.param_types[i];
             let default = &state.param_defaults[i];
             if default.is_empty() {
-                eprintln!("  --{:<20} {} (required)", name, ty);
+                crate::nsl_log!(INFO, "weight-provider", "  --{:<20} {} (required)", name, ty);
             } else {
-                eprintln!("  --{:<20} {} (default: {})", name, ty, default);
+                crate::nsl_log!(INFO, "weight-provider", "  --{:<20} {} (default: {})", name, ty, default);
             }
         }
     }
-    eprintln!("  --{:<20} Show this help message", "help");
+    crate::nsl_log!(INFO, "weight-provider", "  --{:<20} Show this help message", "help");
 }
 
 /// If --help or -h is present in the args, print usage and exit(0).

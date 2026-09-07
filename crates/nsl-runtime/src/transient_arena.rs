@@ -319,7 +319,7 @@ pub(crate) fn take_pin(size_bytes: usize) -> Option<*mut c_void> {
             if ptr != 0 && debug_enabled() {
                 static SHOWN: AtomicUsize = AtomicUsize::new(0);
                 if SHOWN.fetch_add(1, SeqCst) < 2000 {
-                    eprintln!(
+                    crate::nsl_log!(WARN, "arena-debug", 
                         "[arena-debug] pin mismatch: slot {_slot} bound {want} B, \
                          allocation asked {size_bytes} B"
                     );
