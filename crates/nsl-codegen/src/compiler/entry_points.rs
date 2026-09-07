@@ -1706,7 +1706,7 @@ fn compile_entry_impl(
     // ctor-fold channel adds fields (block weights) to model entries the
     // local literal collection already created (with only the literal
     // fields), and a whole-model insert would drop every one of them.
-    for (model_name, fields) in options.imported_model_field_dims.clone() {
+    for (model_name, fields) in options.imported_model.field_dims.clone() {
         let entry = compiler
             .models
             .model_field_dims
@@ -1716,7 +1716,7 @@ fn compile_entry_impl(
             entry.entry(field).or_insert(dims);
         }
     }
-    for (model_name, fields) in options.imported_model_field_ranks.clone() {
+    for (model_name, fields) in options.imported_model.field_ranks.clone() {
         compiler
             .models
             .model_field_ranks
@@ -1730,8 +1730,8 @@ fn compile_entry_impl(
     compiler
         .models
         .tensor_fields_without_dims
-        .extend(options.imported_tensor_fields_without_dims.iter().cloned());
-    for (model_name, fields) in options.imported_model_field_values.clone() {
+        .extend(options.imported_model.tensor_fields_without_dims.iter().cloned());
+    for (model_name, fields) in options.imported_model.field_values.clone() {
         let entry = compiler
             .models
             .model_field_scalar_values
