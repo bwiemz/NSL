@@ -85,13 +85,13 @@ fn run_build_shared_single(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_else(|| {
-            eprintln!("error: invalid input filename '{}'", file.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: invalid input filename '{}'", file.display());
             process::exit(1);
         });
     let obj_path = file.with_file_name(format!("{stem}.o"));
 
     if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-        eprintln!("error: could not write object file: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write object file: {e}");
         process::exit(1);
     }
 
@@ -189,7 +189,7 @@ fn run_build_shared_single(
             println!("Built shared library {}", lib_path.display());
         }
         Err(e) => {
-            eprintln!("link error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
     }
@@ -220,7 +220,7 @@ fn emit_c_header_if_any(
     let header_path = lib_path.with_extension("h");
     match std::fs::write(&header_path, header) {
         Ok(()) => println!("Wrote C header {}", header_path.display()),
-        Err(e) => eprintln!("warning: failed to write header '{}': {e}", header_path.display()),
+        Err(e) => nsl_runtime::nsl_log!(WARN, "cli", "warning: failed to write header '{}': {e}", header_path.display()),
     }
 }
 
@@ -244,14 +244,14 @@ fn run_build_shared_multi(
     let graph = match crate::loader::load_all_modules(file, &mut source_map, &mut interner) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
             process::exit(1);
         }
     };
 
     let temp_dir = std::env::temp_dir().join(format!("nsl_shared_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        eprintln!("error: could not create temp dir: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
         process::exit(1);
     }
 
@@ -386,7 +386,7 @@ fn run_build_shared_multi(
                     || !mod_data.freeze_configs.is_empty()
                     || !mod_data.adapter_configs.is_empty();
                 if has_wrga_decorators {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(ERROR, "nsl", 
                         "nsl: --wrga-report requires --source-ad when WRGA decorators are present; re-run with --source-ad"
                     );
                     process::exit(2);
@@ -479,7 +479,7 @@ fn run_build_shared_multi(
         let obj_path = temp_dir.join(format!("{stem}_{}.o", obj_files.len()));
 
         if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-            eprintln!("error: could not write object file '{}': {e}", obj_path.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write object file '{}': {e}", obj_path.display());
             process::exit(1);
         }
 
@@ -574,7 +574,7 @@ fn run_build_shared_multi(
             println!("Built shared library {}", lib_path.display());
         }
         Err(e) => {
-            eprintln!("link error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
     }

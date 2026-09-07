@@ -47,7 +47,10 @@
 //! `warning:` / `error:` / `note:` lines, the subsystem otherwise —
 //! `"autotune"`, `"ccr"`, `"source-ad"`, `"wggo"`, …), leaving only its
 //! multi-line `eprint!` report dumps and the dev-tool binaries under
-//! `src/bin/` on raw prints. Next: nsl-cli.
+//! `src/bin/` on raw prints. nsl-cli's own lines (`error: …` before an
+//! exit, `warning:` / `note:`, the `[nsl] …` launcher lines) use it too
+//! (target `"cli"`, `"nsl"`, or the line's own marker), so every
+//! diagnostic line the toolchain prints is a `tracing` event.
 
 use std::fmt::Write as _;
 use std::io::Write as _;

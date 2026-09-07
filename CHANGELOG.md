@@ -50,6 +50,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`nsl_runtime::events::opt_out_this_process`): the stream belongs to the
   compiled program (one writer per rank), and a compile-time diagnostic
   mirrored from the compiler would have added a second `seq` sequence.
+- Runtime logging, step 5 (roadmap C3): nsl-cli's 274 diagnostic
+  `eprintln!` sites go through `nsl_runtime::nsl_log!` as well — target
+  `cli` for the `error:` / `warning:` / `note:` lines (`ERROR` where the
+  command exits or returns failure), `nsl` for the `nsl: …` and `[nsl] …`
+  launcher lines, `zk` / `tokenize` / `autotune` / `inspect` for the
+  marker-prefixed ones. stderr is byte-identical; stdout output
+  (`println!`) and the `eprint!` report dumps are untouched. With this,
+  every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
 

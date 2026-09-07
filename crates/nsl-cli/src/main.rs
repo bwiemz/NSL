@@ -135,7 +135,7 @@ fn main_inner() {
             match nsl_cli::profile::run_profile(&args) {
                 Ok(s) => println!("{s}"),
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
                     process::exit(1);
                 }
             }
@@ -150,7 +150,7 @@ fn main_inner() {
             if let Err(e) =
                 commands::fpga::run_fpga_compile(&file, fixture.as_ref(), output_dir.as_ref(), test_taps, seq)
             {
-                eprintln!("error: {e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
                 process::exit(1);
             }
         }
@@ -166,7 +166,7 @@ fn main_inner() {
         }
         Cli::Doc { cmd: DocCmd::Stdlib } => {
             let Some(root) = resolver::stdlib_roots().into_iter().next() else {
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "cli", 
                     "nsl doc stdlib: no stdlib directory found (looked at $NSL_STDLIB_PATH, \
                      <exe>/stdlib, the toolchain layout, and ./stdlib)"
                 );
@@ -175,7 +175,7 @@ fn main_inner() {
             match stdlib_reference::render_markdown(&root) {
                 Ok(md) => print!("{md}"),
                 Err(e) => {
-                    eprintln!("nsl doc stdlib: {e}");
+                    nsl_runtime::nsl_log!(ERROR, "cli", "nsl doc stdlib: {e}");
                     std::process::exit(1);
                 }
             }

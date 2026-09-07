@@ -20,7 +20,7 @@ pub(crate) fn run_build_standalone(
 ) {
     // 1. Read weights from safetensors
     let tensors = crate::standalone::read_safetensors(weights).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
         process::exit(1);
     });
 
@@ -101,13 +101,13 @@ pub(crate) fn run_build_standalone(
     // 7. Write main object file
     let temp_dir = std::env::temp_dir().join(format!("nsl_standalone_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        eprintln!("error: could not create temp dir: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
         process::exit(1);
     }
 
     let main_obj_path = temp_dir.join("main.o");
     if let Err(e) = std::fs::write(&main_obj_path, &obj_bytes) {
-        eprintln!("error: could not write object file: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write object file: {e}");
         process::exit(1);
     }
 
@@ -117,19 +117,19 @@ pub(crate) fn run_build_standalone(
     if embedded {
         // Create weight object containing the nslweights data
         let weight_obj_bytes = nsl_codegen::create_weight_object(&nslweights_data).unwrap_or_else(|e| {
-            eprintln!("error: could not create weight object: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create weight object: {e}");
             process::exit(1);
         });
         let weight_obj_path = temp_dir.join("weights.o");
         if let Err(e) = std::fs::write(&weight_obj_path, &weight_obj_bytes) {
-            eprintln!("error: could not write weight object file: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write weight object file: {e}");
             process::exit(1);
         }
         obj_paths.push(weight_obj_path);
     } else {
         // Write sidecar .nslweights file
         crate::standalone::write_nslweights_sidecar_raw(&nslweights_data, &sidecar_path).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
             process::exit(1);
         });
     }
@@ -153,7 +153,7 @@ pub(crate) fn run_build_standalone(
             }
         }
         Err(e) => {
-            eprintln!("link error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
     }
