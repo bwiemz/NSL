@@ -1537,8 +1537,11 @@ mod tests {
         let count = 4;
         let slot_bytes = count * dtype_byte_width(DTYPE_F32);
         let shm_len = DATA_OFFSET + world_size * slot_bytes;
-        let mut shm = vec![0u8; shm_len];
-        let shm_ptr = shm.as_mut_ptr();
+        // `ShmHeader` holds atomics: the buffer must be 8-aligned, which a
+        // `Vec<u8>` is not (Miri: "unaligned reference"). Production maps a
+        // page-aligned shared-memory file; the test aligns by construction.
+        let mut shm = vec![0u64; shm_len.div_ceil(8)];
+        let shm_ptr = shm.as_mut_ptr() as *mut u8;
 
         // Initialize header.
         let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
@@ -1587,8 +1590,11 @@ mod tests {
         let send_count = 3;
         let slot_bytes = send_count * dtype_byte_width(DTYPE_F64);
         let shm_len = DATA_OFFSET + world_size * slot_bytes;
-        let mut shm = vec![0u8; shm_len];
-        let shm_ptr = shm.as_mut_ptr();
+        // `ShmHeader` holds atomics: the buffer must be 8-aligned, which a
+        // `Vec<u8>` is not (Miri: "unaligned reference"). Production maps a
+        // page-aligned shared-memory file; the test aligns by construction.
+        let mut shm = vec![0u64; shm_len.div_ceil(8)];
+        let shm_ptr = shm.as_mut_ptr() as *mut u8;
 
         let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
         hdr.generation.store(0, Ordering::Release);
@@ -1634,8 +1640,11 @@ mod tests {
         // Allocate a small shm region for single-rank p2p staging.
         let slot_bytes = 4 * std::mem::size_of::<f32>();
         let shm_len = DATA_OFFSET + slot_bytes;
-        let mut shm = vec![0u8; shm_len];
-        let shm_ptr = shm.as_mut_ptr();
+        // `ShmHeader` holds atomics: the buffer must be 8-aligned, which a
+        // `Vec<u8>` is not (Miri: "unaligned reference"). Production maps a
+        // page-aligned shared-memory file; the test aligns by construction.
+        let mut shm = vec![0u64; shm_len.div_ceil(8)];
+        let shm_ptr = shm.as_mut_ptr() as *mut u8;
 
         let backend = SimulatedBackend::new(0, 1, shm_ptr, shm_len);
         let send_data = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -1661,8 +1670,11 @@ mod tests {
         let count = 4;
         let slot_bytes = count * std::mem::size_of::<f32>();
         let shm_len = DATA_OFFSET + world_size * slot_bytes;
-        let mut shm = vec![0u8; shm_len];
-        let shm_ptr = shm.as_mut_ptr();
+        // `ShmHeader` holds atomics: the buffer must be 8-aligned, which a
+        // `Vec<u8>` is not (Miri: "unaligned reference"). Production maps a
+        // page-aligned shared-memory file; the test aligns by construction.
+        let mut shm = vec![0u64; shm_len.div_ceil(8)];
+        let shm_ptr = shm.as_mut_ptr() as *mut u8;
 
         let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
         hdr.generation.store(0, Ordering::Release);
@@ -1701,8 +1713,11 @@ mod tests {
         let count = 4;
         let slot_bytes = count * dtype_byte_width(DTYPE_F32);
         let shm_len = DATA_OFFSET + world_size * slot_bytes;
-        let mut shm = vec![0u8; shm_len];
-        let shm_ptr = shm.as_mut_ptr();
+        // `ShmHeader` holds atomics: the buffer must be 8-aligned, which a
+        // `Vec<u8>` is not (Miri: "unaligned reference"). Production maps a
+        // page-aligned shared-memory file; the test aligns by construction.
+        let mut shm = vec![0u64; shm_len.div_ceil(8)];
+        let shm_ptr = shm.as_mut_ptr() as *mut u8;
 
         let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
         hdr.generation.store(0, Ordering::Release);
@@ -1753,8 +1768,11 @@ mod tests {
         let count = 8usize;
         let slot_bytes = count * dtype_byte_width(DTYPE_F64);
         let shm_len = DATA_OFFSET + world_size * slot_bytes;
-        let mut shm = vec![0u8; shm_len];
-        let shm_ptr = shm.as_mut_ptr();
+        // `ShmHeader` holds atomics: the buffer must be 8-aligned, which a
+        // `Vec<u8>` is not (Miri: "unaligned reference"). Production maps a
+        // page-aligned shared-memory file; the test aligns by construction.
+        let mut shm = vec![0u64; shm_len.div_ceil(8)];
+        let shm_ptr = shm.as_mut_ptr() as *mut u8;
         let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
         hdr.generation.store(0, Ordering::Release);
         hdr.arrival.store(0, Ordering::Release);
@@ -1819,8 +1837,11 @@ mod tests {
         let count = 4usize;
         let slot_bytes = count * dtype_byte_width(DTYPE_F32);
         let shm_len = DATA_OFFSET + world_size * slot_bytes;
-        let mut shm = vec![0u8; shm_len];
-        let shm_ptr = shm.as_mut_ptr();
+        // `ShmHeader` holds atomics: the buffer must be 8-aligned, which a
+        // `Vec<u8>` is not (Miri: "unaligned reference"). Production maps a
+        // page-aligned shared-memory file; the test aligns by construction.
+        let mut shm = vec![0u64; shm_len.div_ceil(8)];
+        let shm_ptr = shm.as_mut_ptr() as *mut u8;
         let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
         hdr.generation.store(0, Ordering::Release);
         hdr.arrival.store(0, Ordering::Release);

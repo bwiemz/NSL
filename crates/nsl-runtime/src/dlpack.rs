@@ -747,6 +747,9 @@ mod tests {
         let dl = nsl_dlpack_export(tensor_ptr);
         assert_ne!(dl, 0);
         nsl_dlpack_free(dl);
+        // Re-derive: the export took `tensor_ptr` and invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(tensor_ptr);
         assert_eq!(
             tensor.refcount.load(Ordering::SeqCst),
             1,

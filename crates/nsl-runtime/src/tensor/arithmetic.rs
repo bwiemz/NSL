@@ -1524,8 +1524,11 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     // Ensure contiguous inputs for flat-indexed matmul
     let a_c = nsl_tensor_contiguous(a_ptr);
     let b_c = nsl_tensor_contiguous(b_ptr);
-    let a = NslTensor::from_ptr(a_c);
-    let b = NslTensor::from_ptr(b_c);
+    // Shared, not `&mut`: `matmul(x, x)` (Muon's Newton-Schulz does it) makes
+    // `a_c == b_c`, and two `&mut` to one tensor is undefined behaviour the
+    // moment the first is read again (Miri, roadmap C2). Both are only read.
+    let a = NslTensor::from_ptr_ref(a_c);
+    let b = NslTensor::from_ptr_ref(b_c);
 
     if a.ndim < 2 || b.ndim < 2 {
         eprintln!(

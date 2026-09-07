@@ -153,7 +153,11 @@ pub extern "C" fn nsl_tensor_get_dtype(tensor_ptr: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    // Read-only, and NOT held across the calls below: `new_view_i64` /
+    // `nsl_tensor_contiguous` take `tensor_ptr` again and their own
+    // `from_ptr` invalidates this reference under Stacked Borrows (Miri
+    // caught the tape-record read below through the stale one).
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     let new_shape_nsl = NslList::from_ptr(new_shape_list);
     let new_ndim = new_shape_nsl.len;
 
@@ -205,7 +209,7 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     // disconnects at every reshape between two recorded ops — grads never
     // reach anything upstream. Backward reshapes the grad to input_shape.
     if autodiff::is_recording() {
-        let input_shape = autodiff::tape_shape(tensor);
+        let input_shape = autodiff::tape_shape(NslTensor::from_ptr_ref(tensor_ptr));
         autodiff::maybe_record(autodiff::TapeOp::Reshape {
             a: tensor_ptr,
             out: result,
