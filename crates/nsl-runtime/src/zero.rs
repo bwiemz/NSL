@@ -606,8 +606,7 @@ fn verify_plan_across_ranks(ctx: &ZeROContext, sizes: &[u64]) -> bool {
         std::ptr::null_mut(),
     );
     if rc != 0 {
-        eprintln!(
-            "nsl: zero plan verification broadcast failed rc={rc} on rank {}",
+        crate::nsl_log!(WARN, "nsl", "nsl: zero plan verification broadcast failed rc={rc} on rank {}",
             ctx.rank
         );
         return false;
@@ -615,8 +614,7 @@ fn verify_plan_across_ranks(ctx: &ZeROContext, sizes: &[u64]) -> bool {
     let root = u64::from_le_bytes(buf);
     let matched = root == local;
     if !matched {
-        eprintln!(
-            "nsl: ZeRO partition plan MISMATCH on rank {}: local hash \
+        crate::nsl_log!(WARN, "nsl", "nsl: ZeRO partition plan MISMATCH on rank {}: local hash \
              {local:#018x} != rank-0 hash {root:#018x} — ranks disagree on \
              param sizes, ownership or bucket config; refusing to train a \
              torn model",
@@ -636,16 +634,14 @@ fn verify_plan_across_ranks(ctx: &ZeROContext, sizes: &[u64]) -> bool {
         std::ptr::null_mut(),
     );
     if rc != 0 {
-        eprintln!(
-            "nsl: zero plan verification all_reduce failed rc={rc} on rank {}",
+        crate::nsl_log!(WARN, "nsl", "nsl: zero plan verification all_reduce failed rc={rc} on rank {}",
             ctx.rank
         );
         return false;
     }
     if flag < ctx.world_size as f64 {
         if matched {
-            eprintln!(
-                "nsl: ZeRO partition plan MISMATCH reported by a peer rank — \
+            crate::nsl_log!(WARN, "nsl", "nsl: ZeRO partition plan MISMATCH reported by a peer rank — \
                  refusing on rank {} too (symmetric shutdown)",
                 ctx.rank
             );
@@ -1333,8 +1329,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
     // path; a cap of 0 would silently fall through to the all-reduce loop,
     // voiding the reduce_scatter contract and its counters. Refuse loudly.
     if cap == 0 && ctx.stage != ZeROStage::Stage1 {
-        eprintln!(
-            "nsl: nsl_zero_reduce_grads: --zero-stage 2 requires bucketed              collectives — do not set NSL_ZERO_BUCKET_MB=0 with stage >= 2"
+        crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: --zero-stage 2 requires bucketed              collectives — do not set NSL_ZERO_BUCKET_MB=0 with stage >= 2"
         );
         return -1;
     }
@@ -1352,8 +1347,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
             }
             let t = NslTensor::from_ptr_ref(raw);
             if t.device != 0 && !ctx.cuda_aware {
-                eprintln!(
-                    "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs \
                      real collectives — run with --collectives nccl \
                      (nccl-featured build), or move the model to CPU / drop \
                      --devices.",
@@ -1361,8 +1355,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 return -5;
             }
             if t.device == 0 && t.dtype > 1 {
-                eprintln!(
-                    "nsl: nsl_zero_reduce_grads: unsupported gradient dtype {} \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: unsupported gradient dtype {} \
                      at index {}; only f64 (0) and f32 (1) gradients are \
                      supported",
                     t.dtype, i
@@ -1370,8 +1363,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 return -1;
             }
             if t.device > 0 && t.dtype != 1 {
-                eprintln!(
-                    "nsl: nsl_zero_reduce_grads: GPU gradient at index {} has \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU gradient at index {} has \
                      dtype {}; only the canonical GPU f32 (dtype 1) is \
                      supported",
                     i, t.dtype
@@ -1404,7 +1396,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 let esz = if dtype == 0 { 8 } else { 4 };
                 for sub in split_scatter_subgroups(ctx, items, cap, esz) {
                     if reduce_scatter_group_cpu(ctx, &sub, dtype, inv_ws) != 0 {
-                        eprintln!("nsl: nsl_zero_reduce_grads: reduce_scatter failed");
+                        crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: reduce_scatter failed");
                         return -1;
                     }
                 }
@@ -1412,13 +1404,13 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
             #[cfg(feature = "cuda")]
             for sub in split_scatter_subgroups(ctx, &gpu_f32, cap, 4) {
                 if reduce_scatter_group_gpu(ctx, &sub, inv_ws) != 0 {
-                    eprintln!("nsl: nsl_zero_reduce_grads: device reduce_scatter failed");
+                    crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: device reduce_scatter failed");
                     return -1;
                 }
             }
             #[cfg(not(feature = "cuda"))]
             if !gpu_f32.is_empty() {
-                eprintln!("nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
                 return -1;
             }
             return 0;
@@ -1427,7 +1419,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         for (items, dtype) in [(&cpu_f64, 0u16), (&cpu_f32, 1u16)] {
             for bucket in split_buckets(items, cap) {
                 if reduce_bucket_cpu(ctx, &bucket, dtype, inv_ws) != 0 {
-                    eprintln!("nsl: nsl_zero_reduce_grads: bucketed all_reduce failed");
+                    crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: bucketed all_reduce failed");
                     return -1;
                 }
             }
@@ -1435,13 +1427,13 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         #[cfg(feature = "cuda")]
         for bucket in split_buckets(&gpu_f32, cap) {
             if reduce_bucket_gpu(ctx, &bucket, inv_ws) != 0 {
-                eprintln!("nsl: nsl_zero_reduce_grads: bucketed device all_reduce failed");
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: bucketed device all_reduce failed");
                 return -1;
             }
         }
         #[cfg(not(feature = "cuda"))]
         if !gpu_f32.is_empty() {
-            eprintln!("nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
             return -1;
         }
         return 0;
@@ -1466,8 +1458,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         // default --target is "cuda" even for CPU-placed models, so a
         // target-based guard would wrongly refuse the CPU SPMD path.)
         if ctx.world_size > 1 && tensor.device != 0 && !ctx.cuda_aware {
-            eprintln!(
-                "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs real \
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs real \
                  collectives — run with --collectives nccl (nccl-featured \
                  build), or move the model to CPU / drop --devices.",
             );
@@ -1477,16 +1468,14 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         // Refuse loudly instead of silently skipping: a skipped tensor would
         // leave one gradient un-averaged and produce silently-wrong training.
         if tensor.device == 0 && tensor.dtype > 1 {
-            eprintln!(
-                "nsl: nsl_zero_reduce_grads: unsupported gradient dtype {} at \
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: unsupported gradient dtype {} at \
                  index {}; only f64 (0) and f32 (1) gradients are supported",
                 tensor.dtype, i
             );
             return -1;
         }
         if tensor.device > 0 && tensor.dtype != 1 {
-            eprintln!(
-                "nsl: nsl_zero_reduce_grads: GPU gradient at index {} has \
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU gradient at index {} has \
                  dtype {}; only the canonical GPU f32 (dtype 1) is supported",
                 i, tensor.dtype
             );
@@ -1506,8 +1495,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 std::ptr::null_mut(),
             );
             if rc != 0 {
-                eprintln!(
-                    "nsl: nsl_zero_reduce_grads: all_reduce failed rc={rc} at \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: all_reduce failed rc={rc} at \
                      index {i}"
                 );
                 return -1;
@@ -1534,8 +1522,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 std::ptr::null_mut(),
             );
             if rc != 0 {
-                eprintln!(
-                    "nsl: nsl_zero_reduce_grads: device all_reduce failed \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: device all_reduce failed \
                      rc={rc} at index {i}"
                 );
                 return -1;
@@ -1585,8 +1572,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                     std::ptr::null_mut(),
                 );
                 if rc != 0 {
-                    eprintln!(
-                        "nsl: nsl_zero_reduce_grads: GPU staged all_reduce \
+                    crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU staged all_reduce \
                          failed rc={rc} at index {i}"
                     );
                     return -1;
@@ -1604,8 +1590,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         }
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!(
-                "nsl: nsl_zero_reduce_grads: GPU gradient at index {} requires \
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_reduce_grads: GPU gradient at index {} requires \
                  the cuda feature",
                 i
             );
@@ -1694,8 +1679,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                 .copied()
                 .unwrap_or((i % ctx.world_size) as i32);
             if t.device != 0 && !ctx.cuda_aware {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs \
                      real collectives — run with --collectives nccl \
                      (nccl-featured build), or move the model to CPU / drop \
                      --devices.",
@@ -1703,16 +1687,14 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                 return -5;
             }
             if t.device == 0 && t.dtype > 1 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: unsupported CPU param dtype {} \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: unsupported CPU param dtype {} \
                      at index {i}",
                     t.dtype
                 );
                 return -1;
             }
             if t.device > 0 && t.dtype != 1 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU param at index {i} has \
                      dtype {}; only f32 is supported",
                     t.dtype
                 );
@@ -1738,8 +1720,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
-                        eprintln!(
-                            "nsl: nsl_zero_sync_params: GPU params require the \
+                        crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU params require the \
                              cuda feature"
                         );
                         -1
@@ -1748,7 +1729,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                     broadcast_bucket_cpu(ctx, &bucket, *dtype, *owner)
                 };
                 if rc != 0 {
-                    eprintln!("nsl: nsl_zero_sync_params: bucketed broadcast failed");
+                    crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: bucketed broadcast failed");
                     return -1;
                 }
             }
@@ -1777,8 +1758,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         // P4 item 14: GPU-resident params need the CUDA-aware backend (see
         // the matching guard in nsl_zero_reduce_grads).
         if tensor.device != 0 && !ctx.cuda_aware {
-            eprintln!(
-                "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs real \
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs real \
                  collectives — run with --collectives nccl (nccl-featured \
                  build), or move the model to CPU / drop --devices.",
             );
@@ -1788,8 +1768,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         #[cfg(feature = "cuda")]
         if tensor.device != 0 && ctx.cuda_aware {
             if tensor.dtype != 1 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU param at index {i} has \
                      dtype {}; only f32 is supported",
                     tensor.dtype
                 );
@@ -1803,8 +1782,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                 std::ptr::null_mut(),
             );
             if rc != 0 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: device broadcast failed rc={rc} \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: device broadcast failed rc={rc} \
                      at index {i}"
                 );
                 return -1;
@@ -1815,8 +1793,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
 
         if tensor.device == 0 {
             if tensor.dtype > 1 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: unsupported CPU param dtype \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: unsupported CPU param dtype \
                      {} at index {i}",
                     tensor.dtype
                 );
@@ -1830,8 +1807,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                 std::ptr::null_mut(),
             );
             if rc != 0 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: broadcast failed rc={rc} at \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: broadcast failed rc={rc} at \
                      index {i}"
                 );
                 return -1;
@@ -1846,8 +1822,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         #[cfg(feature = "cuda")]
         {
             if tensor.dtype != 1 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU param at index {i} has \
                      dtype {}; only f32 is supported",
                     tensor.dtype
                 );
@@ -1869,8 +1844,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                 std::ptr::null_mut(),
             );
             if rc != 0 {
-                eprintln!(
-                    "nsl: nsl_zero_sync_params: GPU staged broadcast failed \
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU staged broadcast failed \
                      rc={rc} at index {i}"
                 );
                 return -1;
@@ -1883,8 +1857,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         }
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!(
-                "nsl: nsl_zero_sync_params: GPU param at index {i} requires \
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_zero_sync_params: GPU param at index {i} requires \
                  the cuda feature"
             );
             return -1;
@@ -1940,8 +1913,7 @@ pub extern "C" fn nsl_grad_accumulate_add(
     let n = num_elems as usize;
 
     if dst.dtype > 1 || src.dtype > 1 {
-        eprintln!(
-            "nsl: nsl_grad_accumulate_add: unsupported gradient dtype pair \
+        crate::nsl_log!(WARN, "nsl", "nsl: nsl_grad_accumulate_add: unsupported gradient dtype pair \
              (dst={}, src={}); only f64 (0) and f32 (1) are supported",
             dst.dtype, src.dtype
         );
@@ -1992,8 +1964,7 @@ pub extern "C" fn nsl_grad_accumulate_add(
     // (honored by the CPU arms above) cannot be expressed here — refuse it
     // rather than silently over-adding.
     if n != dst.len as usize {
-        eprintln!(
-            "nsl: nsl_grad_accumulate_add: partial accumulation \
+        crate::nsl_log!(WARN, "nsl", "nsl: nsl_grad_accumulate_add: partial accumulation \
              (num_elems={} != dst len={}) is not supported on the GPU path; \
              refusing",
             n, dst.len
@@ -2014,8 +1985,7 @@ pub extern "C" fn nsl_grad_accumulate_add(
     }
     let mig = NslTensor::from_ptr_ref(migrated);
     if mig.dtype != dst.dtype || mig.len != dst.len {
-        eprintln!(
-            "nsl: nsl_grad_accumulate_add: post-migration mismatch \
+        crate::nsl_log!(WARN, "nsl", "nsl: nsl_grad_accumulate_add: post-migration mismatch \
              (dst dtype={} len={}, migrated src dtype={} len={}); refusing",
             dst.dtype, dst.len, mig.dtype, mig.len
         );
@@ -2059,8 +2029,7 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
         // non-f32 GPU buffer here means a wiring bug upstream. Refuse instead
         // of guessing widths (mirrors nsl_zero_reduce_grads).
         if tensor.dtype != 1 {
-            eprintln!(
-                "nsl: nsl_grad_zero: GPU grad buffer must be f32 (dtype 1), \
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_grad_zero: GPU grad buffer must be f32 (dtype 1), \
                  got dtype {}; refusing",
                 tensor.dtype
             );
@@ -2073,7 +2042,7 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!("nsl: nsl_grad_zero: GPU tensor requires the cuda feature");
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_grad_zero: GPU tensor requires the cuda feature");
             return -1;
         }
     }

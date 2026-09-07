@@ -17,7 +17,7 @@ pub extern "C" fn nsl_pow_int(base: i64, exp: i64) -> i64 {
             match result.checked_mul(b) {
                 Some(v) => result = v,
                 None => {
-                    eprintln!("nsl: integer overflow in exponentiation ({} ** {})", base, exp);
+                    crate::nsl_log!(ERROR, "nsl", "nsl: integer overflow in exponentiation ({} ** {})", base, exp);
                     std::process::abort();
                 }
             }
@@ -27,7 +27,7 @@ pub extern "C" fn nsl_pow_int(base: i64, exp: i64) -> i64 {
                 Some(v) => b = v,
                 None => {
                     // b² overflowed — the final result cannot fit in i64.
-                    eprintln!("nsl: integer overflow in exponentiation ({} ** {})", base, exp);
+                    crate::nsl_log!(ERROR, "nsl", "nsl: integer overflow in exponentiation ({} ** {})", base, exp);
                     std::process::abort();
                 }
             }

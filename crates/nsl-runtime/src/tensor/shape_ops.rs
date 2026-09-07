@@ -51,7 +51,7 @@ pub extern "C" fn nsl_tensor_shape_dim(tensor_ptr: i64, dim: i64) -> i64 {
     let ndim = tensor.ndim as usize;
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
     if d >= ndim {
-        eprintln!("nsl: shape_dim dimension {} out of range for {}D tensor", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: shape_dim dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
     }
     unsafe { *tensor.shape.add(d) }
@@ -68,8 +68,7 @@ pub extern "C" fn nsl_tensor_assert_dim(tensor_ptr: i64, dim_index: i64, expecte
         dim_index as usize
     };
     if dim_idx >= ndim {
-        eprintln!(
-            "nsl: assert_dim: dimension index {} out of range for rank-{} tensor",
+        crate::nsl_log!(ERROR, "nsl", "nsl: assert_dim: dimension index {} out of range for rank-{} tensor",
             dim_index, ndim
         );
         std::process::abort();
@@ -79,8 +78,7 @@ pub extern "C" fn nsl_tensor_assert_dim(tensor_ptr: i64, dim_index: i64, expecte
         return actual;
     }
     if actual != expected_value {
-        eprintln!(
-            "nsl: dimension mismatch: expected dim[{}] = {}, got {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: dimension mismatch: expected dim[{}] = {}, got {}",
             dim_index, expected_value, actual
         );
         std::process::abort();
@@ -99,16 +97,14 @@ pub extern "C" fn nsl_tensor_assert_dim_bound(tensor_ptr: i64, dim_index: i64, u
         dim_index as usize
     };
     if dim_idx >= ndim {
-        eprintln!(
-            "nsl: assert_dim_bound: dimension index {} out of range for rank-{} tensor",
+        crate::nsl_log!(ERROR, "nsl", "nsl: assert_dim_bound: dimension index {} out of range for rank-{} tensor",
             dim_index, ndim
         );
         std::process::abort();
     }
     let actual = unsafe { *tensor.shape.add(dim_idx) };
     if actual > upper_bound {
-        eprintln!(
-            "nsl: dimension bound exceeded: dim[{}] = {} exceeds upper bound {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: dimension bound exceeded: dim[{}] = {} exceeds upper bound {}",
             dim_index, actual, upper_bound
         );
         std::process::abort();
@@ -171,8 +167,7 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     }
 
     if new_len != tensor.len {
-        eprintln!(
-            "nsl: cannot reshape tensor of size {} into shape of size {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: cannot reshape tensor of size {} into shape of size {}",
             tensor.len, new_len
         );
         std::process::abort();
@@ -236,8 +231,7 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
     let d1 = if dim1 < 0 { dim1 + tensor.ndim } else { dim1 };
 
     if d0 < 0 || d0 >= tensor.ndim || d1 < 0 || d1 >= tensor.ndim {
-        eprintln!(
-            "nsl: transpose dimensions out of range ({}, {} for ndim {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: transpose dimensions out of range ({}, {} for ndim {})",
             dim0, dim1, tensor.ndim
         );
         std::process::abort();
@@ -374,7 +368,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
     // Normalize dim
     let d = if dim < 0 { (tensor.ndim + dim) as usize } else { dim as usize };
     if d >= ndim {
-        eprintln!("nsl: select dim {} out of range for ndim {}", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: select dim {} out of range for ndim {}", dim, ndim);
         std::process::abort();
     }
 
@@ -383,8 +377,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
     // Normalize index
     let idx = if index < 0 { index + dim_size } else { index };
     if idx < 0 || idx >= dim_size {
-        eprintln!(
-            "nsl: select index {} out of range for dim {} size {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: select index {} out of range for dim {} size {}",
             index, dim, dim_size
         );
         std::process::abort();
@@ -618,8 +611,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
 
     let src_ndim = tensor.ndim as usize;
     if src_ndim > target_ndim {
-        eprintln!(
-            "nsl: expand: source ndim {} > target ndim {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: expand: source ndim {} > target ndim {}",
             src_ndim, target_ndim
         );
         std::process::abort();
@@ -630,8 +622,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     for (i, &t) in target_shape.iter().enumerate() {
         let s = if i < pad { 1 } else { unsafe { *tensor.shape.add(i - pad) } };
         if s != 1 && s != t {
-            eprintln!(
-                "nsl: expand: cannot expand dim {} from {} to {}",
+            crate::nsl_log!(ERROR, "nsl", "nsl: expand: cannot expand dim {} from {} to {}",
                 i, s, t
             );
             std::process::abort();
@@ -1090,14 +1081,13 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
         let ndim = tensor.ndim as usize;
 
         if ndim == 0 {
-            eprintln!("nsl: rotate_half requires at least 1 dimension");
+            crate::nsl_log!(ERROR, "nsl", "nsl: rotate_half requires at least 1 dimension");
             std::process::abort();
         }
 
         let last_dim = unsafe { *tensor.shape.add(ndim - 1) } as usize;
         if !last_dim.is_multiple_of(2) {
-            eprintln!(
-                "nsl: rotate_half requires even last dimension, got {}",
+            crate::nsl_log!(ERROR, "nsl", "nsl: rotate_half requires even last dimension, got {}",
                 last_dim
             );
             std::process::abort();
@@ -1201,14 +1191,13 @@ pub extern "C" fn nsl_tensor_rotate_half_neg(tensor_ptr: i64) -> i64 {
     let ndim = tensor.ndim as usize;
 
     if ndim == 0 {
-        eprintln!("nsl: rotate_half_neg requires at least 1 dimension");
+        crate::nsl_log!(ERROR, "nsl", "nsl: rotate_half_neg requires at least 1 dimension");
         std::process::abort();
     }
 
     let last_dim = unsafe { *tensor.shape.add(ndim - 1) } as usize;
     if !last_dim.is_multiple_of(2) {
-        eprintln!(
-            "nsl: rotate_half_neg requires even last dimension, got {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: rotate_half_neg requires even last dimension, got {}",
             last_dim
         );
         std::process::abort();

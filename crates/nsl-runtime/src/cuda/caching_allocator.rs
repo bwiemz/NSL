@@ -366,7 +366,7 @@ impl DriverAlloc for CudaDriverAlloc {
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);
             if result != CUresult::CUDA_SUCCESS {
-                eprintln!("nsl: cuMemFree_v2 failed in caching allocator: {:?} for {:p}", result, ptr);
+                crate::nsl_log!(WARN, "nsl", "nsl: cuMemFree_v2 failed in caching allocator: {:?} for {:p}", result, ptr);
             }
         }
     }

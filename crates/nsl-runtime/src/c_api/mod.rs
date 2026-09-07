@@ -128,8 +128,7 @@ pub fn nsl_dtype_to_capi(nsl_dtype: u16) -> i32 {
     if nsl_dtype > crate::tensor::DTYPE_INT8_BLOCKWISE
         && nsl_dtype < crate::tensor::DTYPE_CUSTOM_START
     {
-        eprintln!(
-            "nsl: internal dtype tag {nsl_dtype} has no C API representation \
+        crate::nsl_log!(ERROR, "nsl", "nsl: internal dtype tag {nsl_dtype} has no C API representation \
              (canonical built-in tags are 0..={})",
             crate::tensor::DTYPE_INT8_BLOCKWISE
         );

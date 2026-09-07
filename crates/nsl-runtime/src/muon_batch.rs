@@ -464,7 +464,7 @@ pub extern "C" fn nsl_muon_step_batch(
     assert_eq!(ms.len as usize, count, "muon_batch: m len mismatch");
     assert_eq!(routes.len as usize, count, "muon_batch: routes len mismatch");
     if !(ns_steps >= 1.0 && ns_steps.fract() == 0.0) {
-        eprintln!("nsl: muon_batch ns_steps must be a positive integer (got {ns_steps})");
+        crate::nsl_log!(ERROR, "nsl", "nsl: muon_batch ns_steps must be a positive integer (got {ns_steps})");
         std::process::abort();
     }
 
@@ -487,8 +487,7 @@ pub extern "C" fn nsl_muon_step_batch(
         let m = NslTensor::from_ptr(m_ptr);
         for (t, what) in [(&*p, "param"), (&*g, "grad"), (&*m, "momentum")] {
             if t.device == 0 || t.dtype != 1 || !t.is_contiguous() {
-                eprintln!(
-                    "nsl: --muon-batch-ns requires device-resident contiguous f32 tensors; \
+                crate::nsl_log!(ERROR, "nsl", "nsl: --muon-batch-ns requires device-resident contiguous f32 tensors; \
                      {what} #{i} is device={} dtype={} contiguous={}. Refusing (run without \
                      the flag, or move training to the GPU).",
                     t.device,
@@ -500,7 +499,7 @@ pub extern "C" fn nsl_muon_step_batch(
         }
         let (r, c) = unsafe { ((*p.shape) as usize, (*p.shape.add(1)) as usize) };
         if r == 0 || c == 0 {
-            eprintln!("nsl: muon_batch: empty rank-2 param #{i} has no orthogonal factor");
+            crate::nsl_log!(ERROR, "nsl", "nsl: muon_batch: empty rank-2 param #{i} has no orthogonal factor");
             std::process::abort();
         }
         let key = (r, c);

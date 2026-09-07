@@ -19,7 +19,7 @@ pub extern "C" fn nsl_abs_float(x: f64) -> f64 { x.abs() }
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_abs_int(x: i64) -> i64 {
     x.checked_abs().unwrap_or_else(|| {
-        eprintln!("nsl: integer overflow in abs({})", x);
+        crate::nsl_log!(ERROR, "nsl", "nsl: integer overflow in abs({})", x);
         std::process::abort();
     })
 }

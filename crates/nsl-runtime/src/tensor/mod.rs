@@ -246,7 +246,7 @@ fn bad_handle(ptr: i64, why: BadHandle) -> ! {
             format!("not a tensor (magic 0x{m:08X}, expected 0x{TENSOR_MAGIC:08X})")
         }
     };
-    eprintln!("nsl: invalid tensor handle 0x{ptr:X}: {what}");
+    crate::nsl_log!(WARN, "nsl", "nsl: invalid tensor handle 0x{ptr:X}: {what}");
     if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| v != "0") {
         eprintln!("{}", std::backtrace::Backtrace::force_capture());
     }
@@ -840,7 +840,7 @@ impl NslTensor {
         for i in 0..ndim as usize {
             let dim = unsafe { *shape.add(i) };
             total = total.checked_mul(dim).unwrap_or_else(|| {
-                eprintln!("nsl: tensor shape overflow -- dimensions too large");
+                crate::nsl_log!(ERROR, "nsl", "nsl: tensor shape overflow -- dimensions too large");
                 std::process::abort();
             });
         }
@@ -1098,16 +1098,14 @@ pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
     let indices = NslList::from_ptr(indices_list);
 
     if tensor.device > 0 {
-        eprintln!(
-            "nsl: element read on a GPU tensor is not supported; move it to the \
+        crate::nsl_log!(ERROR, "nsl", "nsl: element read on a GPU tensor is not supported; move it to the \
              CPU first (e.g. `t.to(cpu)`) — reading device memory host-side \
              would return garbage"
         );
         std::process::abort();
     }
     if indices.len != tensor.ndim {
-        eprintln!(
-            "nsl: tensor index dimension mismatch (got {}, expected {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: tensor index dimension mismatch (got {}, expected {})",
             indices.len, tensor.ndim
         );
         std::process::abort();
@@ -1118,8 +1116,7 @@ pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
         let idx = unsafe { *indices.data.add(i) };
         let dim_size = unsafe { *tensor.shape.add(i) };
         if idx < 0 || idx >= dim_size {
-            eprintln!(
-                "nsl: tensor index out of bounds (index {} for dim {} of size {})",
+            crate::nsl_log!(ERROR, "nsl", "nsl: tensor index out of bounds (index {} for dim {} of size {})",
                 idx, i, dim_size
             );
             std::process::abort();
@@ -1136,16 +1133,14 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
     let indices = NslList::from_ptr(indices_list);
 
     if tensor.device > 0 {
-        eprintln!(
-            "nsl: element write on a GPU tensor is not supported; move it to the \
+        crate::nsl_log!(ERROR, "nsl", "nsl: element write on a GPU tensor is not supported; move it to the \
              CPU first (e.g. `t.to(cpu)`) — writing device memory host-side \
              would corrupt it"
         );
         std::process::abort();
     }
     if indices.len != tensor.ndim {
-        eprintln!(
-            "nsl: tensor index dimension mismatch (got {}, expected {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: tensor index dimension mismatch (got {}, expected {})",
             indices.len, tensor.ndim
         );
         std::process::abort();
@@ -1156,8 +1151,7 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
         let idx = unsafe { *indices.data.add(i) };
         let dim_size = unsafe { *tensor.shape.add(i) };
         if idx < 0 || idx >= dim_size {
-            eprintln!(
-                "nsl: tensor index out of bounds (index {} for dim {} of size {})",
+            crate::nsl_log!(ERROR, "nsl", "nsl: tensor index out of bounds (index {} for dim {} of size {})",
                 idx, i, dim_size
             );
             std::process::abort();
@@ -1175,8 +1169,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.len != 1 {
         let shape: Vec<i64> = (0..tensor.ndim as usize).map(|i| unsafe { *tensor.shape.add(i) }).collect();
-        eprintln!(
-            "nsl: .item() requires a scalar tensor (got {} elements, shape={:?}, ndim={})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: .item() requires a scalar tensor (got {} elements, shape={:?}, ndim={})",
             tensor.len, shape, tensor.ndim
         );
         std::process::abort();
@@ -1321,7 +1314,7 @@ fn print_tensor_recursive(
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
-        eprintln!("nsl: clone called on null tensor");
+        crate::nsl_log!(ERROR, "nsl", "nsl: clone called on null tensor");
         std::process::abort();
     }
     // Note: clone always allocates to maintain memory accounting invariants.
@@ -1671,19 +1664,19 @@ pub(crate) fn evict_bf16_cast_image(t: &NslTensor) {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     if dst_ptr == 0 || src_ptr == 0 {
-        eprintln!("nsl: copy_data called with null ptr (dst={}, src={})", dst_ptr, src_ptr);
+        crate::nsl_log!(WARN, "nsl", "nsl: copy_data called with null ptr (dst={}, src={})", dst_ptr, src_ptr);
         return;
     }
     let dst = NslTensor::from_ptr_ref(dst_ptr);
     let src = NslTensor::from_ptr_ref(src_ptr);
     if dst.data.is_null() || src.data.is_null() {
-        eprintln!("nsl: copy_data null data pointer (dst.data={:?}, src.data={:?})", dst.data, src.data);
+        crate::nsl_log!(WARN, "nsl", "nsl: copy_data null data pointer (dst.data={:?}, src.data={:?})", dst.data, src.data);
         return;
     }
     debug_assert!(dst.is_contiguous(), "copy_data requires contiguous dst");
     debug_assert!(src.is_contiguous(), "copy_data requires contiguous src");
     if dst.device == 0 && !dst.has_writable_storage() {
-        eprintln!("nsl: copy_data cannot write into borrowed CPU storage");
+        crate::nsl_log!(ERROR, "nsl", "nsl: copy_data cannot write into borrowed CPU storage");
         std::process::abort();
     }
     assert_eq!(
@@ -2089,7 +2082,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     debug_assert!(dst.is_contiguous(), "add_inplace requires contiguous dst");
     debug_assert!(src.is_contiguous(), "add_inplace requires contiguous src");
     if dst.device == 0 && !dst.has_writable_storage() {
-        eprintln!("nsl: add_inplace cannot write into borrowed CPU storage");
+        crate::nsl_log!(ERROR, "nsl", "nsl: add_inplace cannot write into borrowed CPU storage");
         std::process::abort();
     }
     assert_eq!(
@@ -2192,7 +2185,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
 pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device == 0 && !tensor.has_writable_storage() {
-        eprintln!("nsl: zero_inplace cannot write into borrowed CPU storage");
+        crate::nsl_log!(ERROR, "nsl", "nsl: zero_inplace cannot write into borrowed CPU storage");
         std::process::abort();
     }
     let byte_count = (tensor.len as usize) * tensor.element_size();
@@ -2280,12 +2273,12 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
 
     #[cfg(not(feature = "cuda"))]
     if tensor.device > 0 {
-        eprintln!("nsl: mul_scalar_inplace: GPU path requires cuda feature");
+        crate::nsl_log!(ERROR, "nsl", "nsl: mul_scalar_inplace: GPU path requires cuda feature");
         std::process::abort();
     }
 
     if !tensor.has_writable_storage() {
-        eprintln!("nsl: mul_scalar_inplace cannot write into borrowed CPU storage");
+        crate::nsl_log!(ERROR, "nsl", "nsl: mul_scalar_inplace cannot write into borrowed CPU storage");
         std::process::abort();
     }
 
@@ -2768,11 +2761,11 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     let indices = NslTensor::from_ptr(indices_ptr);
 
     if weight.ndim != 2 {
-        eprintln!("nsl: embedding_lookup requires 2D weight tensor (got {}D)", weight.ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup requires 2D weight tensor (got {}D)", weight.ndim);
         std::process::abort();
     }
     if indices.ndim != 1 {
-        eprintln!("nsl: embedding_lookup requires 1D indices tensor (got {}D)", indices.ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup requires 1D indices tensor (got {}D)", indices.ndim);
         std::process::abort();
     }
 
@@ -2798,8 +2791,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         for i in 0..n {
             let raw_idx = indices.read_index(i);
             if raw_idx < 0 || raw_idx >= rows {
-                eprintln!(
-                    "nsl: embedding_lookup index {} at position {} is out of bounds \
+                crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup index {} at position {} is out of bounds \
                      for a table with {} rows",
                     raw_idx, i, rows
                 );
@@ -2854,8 +2846,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         // the copy below is an unchecked raw pointer add.
         let raw_idx = indices.read_index(i);
         if raw_idx < 0 || raw_idx >= vocab_size as i64 {
-            eprintln!(
-                "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
+            crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
                 raw_idx, vocab_size
             );
             std::process::abort();
@@ -3624,8 +3615,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
     if !(p > 0.0 && p < 1.0) {
-        eprintln!(
-            "nsl: nsl_tensor_dropout_fwd_mask called with p={p} outside (0, 1) — \
+        crate::nsl_log!(ERROR, "nsl", "nsl: nsl_tensor_dropout_fwd_mask called with p={p} outside (0, 1) — \
              the compiler must elide p==0 and refuse out-of-range p"
         );
         std::process::abort();
@@ -3785,7 +3775,7 @@ pub extern "C" fn nsl_tensor_conv2d(
     let pw = pad_w as usize;
 
     if h + 2 * ph < kh || w + 2 * pw < kw {
-        eprintln!("nsl: conv2d kernel larger than padded input");
+        crate::nsl_log!(ERROR, "nsl", "nsl: conv2d kernel larger than padded input");
         std::process::abort();
     }
     let h_out = (h + 2 * ph - kh) / sh + 1;
@@ -3927,7 +3917,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     let pad = padding as usize;
 
     if h + 2 * pad < kh || w + 2 * pad < kw {
-        eprintln!("nsl: maxpool2d kernel larger than padded input");
+        crate::nsl_log!(ERROR, "nsl", "nsl: maxpool2d kernel larger than padded input");
         std::process::abort();
     }
     let h_out = (h + 2 * pad - kh) / s + 1;
@@ -4010,8 +4000,8 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let bias = NslTensor::from_ptr(bias_ptr);
 
-    if tensor.ndim != 2 { eprintln!("nsl: bias_add requires 2D tensor (got {}D)", tensor.ndim); std::process::abort(); }
-    if bias.ndim != 1 { eprintln!("nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
+    if tensor.ndim != 2 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add requires 2D tensor (got {}D)", tensor.ndim); std::process::abort(); }
+    if bias.ndim != 1 { crate::nsl_log!(WARN, "nsl", "nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
 
     // GPU path: launch fused bias_add kernel when tensor is on GPU.
     if tensor.device > 0 {
@@ -4038,7 +4028,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let bias_len = unsafe { *bias.shape.add(0) } as usize;
 
     if cols != bias_len {
-        eprintln!("nsl: bias_add shape mismatch -- tensor has {} cols but bias has {} elements", cols, bias_len);
+        crate::nsl_log!(ERROR, "nsl", "nsl: bias_add shape mismatch -- tensor has {} cols but bias has {} elements", cols, bias_len);
         std::process::abort();
     }
 
@@ -4368,8 +4358,7 @@ pub extern "C" fn nsl_train_input_device_guard(input_ptr: i64, param_list_ptr: i
     let input = NslTensor::from_ptr(input_ptr);
     let dense_float = matches!(input.dtype, 0 | 1) && input.len > 1;
     if input.device == 0 && dense_float {
-        eprintln!(
-            "nsl: a train-step input tensor ({} elements, dtype {}) is \
+        crate::nsl_log!(ERROR, "nsl", "nsl: a train-step input tensor ({} elements, dtype {}) is \
              host-resident while the model's parameters are on the GPU. \
              Every op would silently reconcile the WEIGHTS down to the host \
              (f64, single-threaded). Move the input first: `x.to(cuda)`.",
@@ -4634,7 +4623,7 @@ pub extern "C" fn nsl_tensor_set_element(
     let n = num_indices as usize;
 
     if n != ndim {
-        eprintln!("nsl: set_element: expected {} indices, got {}", ndim, n);
+        crate::nsl_log!(ERROR, "nsl", "nsl: set_element: expected {} indices, got {}", ndim, n);
         std::process::abort();
     }
 
@@ -4644,7 +4633,7 @@ pub extern "C" fn nsl_tensor_set_element(
         let idx = unsafe { *(indices_ptr as *const i64).add(d) } as usize;
         let dim_size = unsafe { *tensor.shape.add(d) } as usize;
         if idx >= dim_size {
-            eprintln!("nsl: set_element: index {} out of bounds for dim {} (size {})", idx, d, dim_size);
+            crate::nsl_log!(ERROR, "nsl", "nsl: set_element: index {} out of bounds for dim {} (size {})", idx, d, dim_size);
             std::process::abort();
         }
         offset += idx * stride;
@@ -4662,8 +4651,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
     evict_bf16_cast_image(target);
     let ndim = num_dims as usize;
     if ndim != target.ndim as usize {
-        eprintln!(
-            "nsl: slice_assign: expected {} dims, got {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: slice_assign: expected {} dims, got {}",
             target.ndim,
             ndim,
         );
@@ -4691,8 +4679,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
         let normalized = if raw < 0 { dim_i64 + raw } else { raw };
         let upper = if allow_endpoint { dim_i64 } else { dim_i64 - 1 };
         if normalized < 0 || normalized > upper {
-            eprintln!(
-                "nsl: slice_assign: index {} out of bounds for dim of size {}",
+            crate::nsl_log!(ERROR, "nsl", "nsl: slice_assign: index {} out of bounds for dim of size {}",
                 raw,
                 dim_size,
             );
@@ -4716,8 +4703,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
 
     let selected_len: usize = ranges.iter().map(|(start, end)| end.saturating_sub(*start)).product();
     if selected_len != src.len as usize {
-        eprintln!(
-            "nsl: slice_assign: source length {} does not match target slice length {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: slice_assign: source length {} does not match target slice length {}",
             src.len,
             selected_len,
         );
@@ -4778,12 +4764,12 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
 
     let info = match registry.get(&target_dtype_id) {
         Some(info) => info,
-        None => { eprintln!("nsl: unknown custom dtype id {target_dtype_id}"); return tensor_ptr; }
+        None => { crate::nsl_log!(WARN, "nsl", "nsl: unknown custom dtype id {target_dtype_id}"); return tensor_ptr; }
     };
 
     let pack_fn = match info.pack_fn {
         Some(f) => f,
-        None => { eprintln!("nsl: custom dtype '{}' has no pack function", info.name); return tensor_ptr; }
+        None => { crate::nsl_log!(WARN, "nsl", "nsl: custom dtype '{}' has no pack function", info.name); return tensor_ptr; }
     };
 
     let num_elements = tensor.len as usize;
@@ -4827,7 +4813,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let innermost = unsafe { *tensor.shape.add(tensor.ndim as usize - 1) } as usize;
 
         if !innermost.is_multiple_of(block_sz) {
-            eprintln!("nsl: tensor dim {} not divisible by block_size {}", innermost, block_sz);
+            crate::nsl_log!(WARN, "nsl", "nsl: tensor dim {} not divisible by block_size {}", innermost, block_sz);
             return tensor_ptr;
         }
 
@@ -4878,7 +4864,7 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
 
     let unpack_fn = match info.unpack_fn {
         Some(f) => f,
-        None => { eprintln!("nsl: custom dtype '{}' has no unpack function", info.name); return tensor_ptr; }
+        None => { crate::nsl_log!(WARN, "nsl", "nsl: custom dtype '{}' has no unpack function", info.name); return tensor_ptr; }
     };
 
     let num_elements = tensor.len as usize;

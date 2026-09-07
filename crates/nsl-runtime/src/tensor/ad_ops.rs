@@ -310,14 +310,14 @@ pub extern "C" fn nsl_tensor_pad_zero(
     let ndim = tensor.ndim as usize;
 
     if ndim == 0 {
-        eprintln!("nsl: pad_zero requires at least 1 dimension");
+        crate::nsl_log!(ERROR, "nsl", "nsl: pad_zero requires at least 1 dimension");
         std::process::abort();
     }
 
     // Normalise dim
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
     if d >= ndim {
-        eprintln!("nsl: pad_zero dimension {} out of range for {}D tensor", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: pad_zero dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
     }
 
@@ -421,7 +421,7 @@ pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i6
     let idx = NslTensor::from_ptr(idx_cpu);
 
     if src.ndim < 2 {
-        eprintln!("nsl: scatter_add requires src to be at least 2D");
+        crate::nsl_log!(ERROR, "nsl", "nsl: scatter_add requires src to be at least 2D");
         std::process::abort();
     }
 
@@ -430,8 +430,7 @@ pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i6
     let n_indices = idx.len as usize;
 
     if seq_len != n_indices {
-        eprintln!(
-            "nsl: scatter_add: src seq_len {} != indices len {}",
+        crate::nsl_log!(ERROR, "nsl", "nsl: scatter_add: src seq_len {} != indices len {}",
             seq_len, n_indices
         );
         std::process::abort();
@@ -605,7 +604,7 @@ pub extern "C" fn nsl_embedding_backward(
     let weight = NslTensor::from_ptr(weight_cpu);
 
     if weight.ndim < 2 {
-        eprintln!("nsl: embedding_backward requires 2D weight, got {}D", weight.ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: embedding_backward requires 2D weight, got {}D", weight.ndim);
         std::process::abort();
     }
 
@@ -835,7 +834,7 @@ pub extern "C" fn nsl_cross_entropy_backward(
     let grad_out = NslTensor::from_ptr(grad_out_cpu);
 
     if logits.ndim < 2 {
-        eprintln!("nsl: cross_entropy_backward requires 2D logits, got {}D", logits.ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: cross_entropy_backward requires 2D logits, got {}D", logits.ndim);
         std::process::abort();
     }
 
@@ -998,8 +997,7 @@ pub extern "C" fn nsl_mse_backward(
     } else {
         // Non-scalar grad_output is not expected for a scalar MSE loss; log
         // and fall back to 1.0 rather than corrupting the gradient silently.
-        eprintln!(
-            "nsl: nsl_mse_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
+        crate::nsl_log!(WARN, "nsl", "nsl: nsl_mse_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
             go.len
         );
         1.0
@@ -1054,8 +1052,7 @@ pub extern "C" fn nsl_l1_backward(
             _ => unsafe { *go_tensor.data_f64() },
         }
     } else {
-        eprintln!(
-            "nsl: nsl_l1_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
+        crate::nsl_log!(WARN, "nsl", "nsl: nsl_l1_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
             go_tensor.len
         );
         1.0
@@ -1216,7 +1213,7 @@ pub extern "C" fn nsl_tensor_logsoftmax(tensor_ptr: i64, dim: i64) -> i64 {
     // Normalise dim
     let d = if dim < 0 { (ndim as i64 + dim) as usize } else { dim as usize };
     if d >= ndim {
-        eprintln!("nsl: logsoftmax: dim {} out of range for {}D tensor", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: logsoftmax: dim {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
     }
 
@@ -1328,7 +1325,7 @@ pub extern "C" fn nsl_tensor_repeat(tensor_ptr: i64, kernel: i64) -> i64 {
     let k = kernel as usize;
 
     if ndim < 2 {
-        eprintln!("nsl: tensor_repeat requires at least 2 dimensions");
+        crate::nsl_log!(ERROR, "nsl", "nsl: tensor_repeat requires at least 2 dimensions");
         std::process::abort();
     }
 
@@ -1452,14 +1449,14 @@ pub extern "C" fn nsl_tensor_rope_inverse(tensor_ptr: i64, dim: i64) -> i64 {
     let ndim = tensor.ndim as usize;
 
     if ndim == 0 {
-        eprintln!("nsl: rope_inverse requires at least 1 dimension");
+        crate::nsl_log!(ERROR, "nsl", "nsl: rope_inverse requires at least 1 dimension");
         std::process::abort();
     }
 
     let last_dim = unsafe { *tensor.shape.add(ndim - 1) } as usize;
     #[allow(clippy::manual_is_multiple_of)]
     if last_dim % 2 != 0 {
-        eprintln!("nsl: rope_inverse requires even last dimension, got {}", last_dim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: rope_inverse requires even last dimension, got {}", last_dim);
         std::process::abort();
     }
     let half = last_dim / 2;

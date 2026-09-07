@@ -539,8 +539,12 @@ one kind whose `message` is its own marker (`LINE_IS_THE_MARKER` in
 first keeps it and receives the runtime's lines as events. Migrated so far:
 the bracketed-marker family (`[zero3]`, `[cuda-graph]`, `[weight-stream]`,
 `[arena]`, `[sr-bf16]`, `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`,
-`[nsl-tcp]`, `[nsl-trace]`, `[tape-trace]`, `[scope]`); the `nsl: …` fatal
-lines and the remaining prints are the next slices, then nsl-codegen. A
+`[nsl-tcp]`, `[nsl-trace]`, `[tape-trace]`, `[scope]`) and the `nsl: …`
+family (target `nsl`; `ERROR` where the line precedes an abort or exit,
+`WARN` where the entry point returns instead); the remaining prints are
+the next slice, then nsl-codegen. The stderr path allocates nothing — the
+message is formatted straight into the locked handle — so the
+`nsl: out of memory` line in `memory.rs` still prints. A
 new line in a migrated family uses the macro; a new family picks a target
 and a level (ERROR before an abort or a lost result, WARN for degraded-but-
 continuing, INFO for the rest) and keeps the text it would have printed.

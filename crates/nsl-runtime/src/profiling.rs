@@ -180,8 +180,7 @@ pub extern "C" fn nsl_profiler_start(total_blocks: i64) {
                 unsafe { nsl_profiler_dump(path_bytes.as_ptr(), path_bytes.len() as i64) };
 
                 let peak = PROFILER.peak_blocks.load(Ordering::Relaxed);
-                eprintln!(
-                    "nsl: memory profile written to {} (peak: {} blocks)",
+                crate::nsl_log!(WARN, "nsl", "nsl: memory profile written to {} (peak: {} blocks)",
                     path, peak
                 );
             }

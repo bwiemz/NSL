@@ -169,7 +169,7 @@ pub extern "C" fn nsl_dict_get_str(dict_ptr: i64, key: i64) -> i64 {
         }
     }
     let key_str = unsafe { as_cstr(key) }.to_str().unwrap_or("?");
-    eprintln!("nsl: key not found in dict: '{}'", key_str);
+    crate::nsl_log!(ERROR, "nsl", "nsl: key not found in dict: '{}'", key_str);
     std::process::abort();
 }
 

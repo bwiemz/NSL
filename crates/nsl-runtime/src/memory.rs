@@ -16,7 +16,7 @@ pub extern "C" fn nsl_alloc(size: i64) -> *mut u8 {
     let layout = Layout::from_size_align(size as usize, 8).unwrap();
     let ptr = unsafe { alloc(layout) };
     if ptr.is_null() {
-        eprintln!("nsl: out of memory");
+        crate::nsl_log!(ERROR, "nsl", "nsl: out of memory");
         std::process::abort();
     }
     ALLOC_REGISTRY.with(|reg| {
@@ -39,7 +39,7 @@ pub extern "C" fn nsl_free(ptr: *mut u8) {
             unsafe { dealloc(ptr, layout) };
         }
         None => {
-            eprintln!("nsl: warning: nsl_free called on untracked pointer {:p}", ptr);
+            crate::nsl_log!(WARN, "nsl", "nsl: warning: nsl_free called on untracked pointer {:p}", ptr);
         }
     }
 }
@@ -65,7 +65,7 @@ pub(crate) fn checked_alloc(size: usize) -> *mut u8 {
     let layout = Layout::from_size_align(size, 8).unwrap();
     let ptr = unsafe { alloc(layout) };
     if ptr.is_null() {
-        eprintln!("nsl: out of memory");
+        crate::nsl_log!(ERROR, "nsl", "nsl: out of memory");
         std::process::abort();
     }
     #[cfg(test)]
@@ -86,7 +86,7 @@ pub(crate) fn checked_alloc_zeroed(size: usize) -> *mut u8 {
     let layout = Layout::from_size_align(size, 8).unwrap();
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
-        eprintln!("nsl: out of memory");
+        crate::nsl_log!(ERROR, "nsl", "nsl: out of memory");
         std::process::abort();
     }
     #[cfg(test)]
@@ -119,7 +119,7 @@ pub(crate) unsafe fn checked_realloc(ptr: *mut u8, old_size: usize, new_size: us
     }
     let new_ptr = unsafe { std::alloc::realloc(ptr, old_layout, new_size) };
     if new_ptr.is_null() {
-        eprintln!("nsl: out of memory");
+        crate::nsl_log!(ERROR, "nsl", "nsl: out of memory");
         std::process::abort();
     }
     new_ptr

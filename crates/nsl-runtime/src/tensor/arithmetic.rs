@@ -1531,8 +1531,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     let b = NslTensor::from_ptr_ref(b_c);
 
     if a.ndim < 2 || b.ndim < 2 {
-        eprintln!(
-            "nsl: matmul requires at least 2D tensors (got {}D and {}D)",
+        crate::nsl_log!(ERROR, "nsl", "nsl: matmul requires at least 2D tensors (got {}D and {}D)",
             a.ndim, b.ndim
         );
         std::process::abort();
@@ -1549,8 +1548,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     let n = b_shape[b_nd - 1];
 
     if k != k2 {
-        eprintln!(
-            "nsl: matmul inner dimension mismatch ({}x{} @ {}x{})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: matmul inner dimension mismatch ({}x{} @ {}x{})",
             m, k, k2, n
         );
         std::process::abort();
@@ -1567,7 +1565,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
         let a_dim = if i < max_batch_nd - a_batch.len() { 1 } else { a_batch[i - (max_batch_nd - a_batch.len())] };
         let b_dim = if i < max_batch_nd - b_batch.len() { 1 } else { b_batch[i - (max_batch_nd - b_batch.len())] };
         if a_dim != b_dim && a_dim != 1 && b_dim != 1 {
-            eprintln!("nsl: matmul batch dimension mismatch at dim {}: {} vs {}", i, a_dim, b_dim);
+            crate::nsl_log!(ERROR, "nsl", "nsl: matmul batch dimension mismatch at dim {}: {} vs {}", i, a_dim, b_dim);
             std::process::abort();
         }
         out_batch.push(a_dim.max(b_dim));

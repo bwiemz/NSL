@@ -58,7 +58,7 @@ pub extern "C" fn nsl_load_jsonl(
     let file = match fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("nsl: nsl_load_jsonl: cannot open '{}': {}", path, e);
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_load_jsonl: cannot open '{}': {}", path, e);
             return nsl_list_new();
         }
     };
@@ -70,7 +70,7 @@ pub extern "C" fn nsl_load_jsonl(
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("nsl: nsl_load_jsonl: read error at line {}: {}", line_no + 1, e);
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_load_jsonl: read error at line {}: {}", line_no + 1, e);
                 continue;
             }
         };
@@ -81,8 +81,7 @@ pub extern "C" fn nsl_load_jsonl(
         let obj: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!(
-                    "nsl: nsl_load_jsonl: malformed JSON at line {}: {}",
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_load_jsonl: malformed JSON at line {}: {}",
                     line_no + 1,
                     e
                 );
@@ -154,7 +153,7 @@ pub extern "C" fn nsl_load_csv(
     let file = match fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("nsl: nsl_load_csv: cannot open '{}': {}", path, e);
+            crate::nsl_log!(WARN, "nsl", "nsl: nsl_load_csv: cannot open '{}': {}", path, e);
             return nsl_list_new();
         }
     };
@@ -173,7 +172,7 @@ pub extern "C" fn nsl_load_csv(
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("nsl: nsl_load_csv: read error at line {}: {}", line_no + 1, e);
+                crate::nsl_log!(WARN, "nsl", "nsl: nsl_load_csv: read error at line {}: {}", line_no + 1, e);
                 continue;
             }
         };
@@ -208,7 +207,7 @@ pub extern "C" fn nsl_load_mmap(path_ptr: i64, path_len: i64, dtype: i64) -> i64
     let file = match fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("nsl: nsl_load_mmap: cannot open '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "nsl: nsl_load_mmap: cannot open '{}': {}", path, e);
             std::process::abort();
         }
     };
@@ -216,7 +215,7 @@ pub extern "C" fn nsl_load_mmap(path_ptr: i64, path_len: i64, dtype: i64) -> i64
     let mmap = match unsafe { memmap2::Mmap::map(&file) } {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("nsl: nsl_load_mmap: mmap failed for '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "nsl: nsl_load_mmap: mmap failed for '{}': {}", path, e);
             std::process::abort();
         }
     };
@@ -266,7 +265,7 @@ pub extern "C" fn nsl_load_mmap(path_ptr: i64, path_len: i64, dtype: i64) -> i64
             create_mmap_tensor(data_ptr, n_elements as i64, DTYPE_U16_TOKEN, 0)
         }
         _ => {
-            eprintln!("nsl: nsl_load_mmap: unsupported dtype {}", dtype);
+            crate::nsl_log!(ERROR, "nsl", "nsl: nsl_load_mmap: unsupported dtype {}", dtype);
             std::process::abort();
         }
     }

@@ -717,7 +717,7 @@ pub(crate) mod inner {
             unsafe {
                 let result = cuMemFree_v2(ptr as CUdeviceptr);
                 if result != CUresult::CUDA_SUCCESS {
-                    eprintln!("nsl: cuMemFree failed: {:?} for {:p}", result, ptr);
+                    crate::nsl_log!(WARN, "nsl", "nsl: cuMemFree failed: {:?} for {:p}", result, ptr);
                 }
             }
         }
@@ -1670,8 +1670,7 @@ pub(crate) mod inner {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 other => {
-                    eprintln!(
-                        "nsl: {what}: cuStreamQuery failed with {other:?} while waiting \
+                    crate::nsl_log!(ERROR, "nsl", "nsl: {what}: cuStreamQuery failed with {other:?} while waiting \
                          on a collective — aborting"
                     );
                     std::process::abort();
@@ -6559,8 +6558,7 @@ pub extern "C" fn nsl_kernel_launch_tensors(
             // crash with an opaque CUDA_ERROR_ILLEGAL_ADDRESS — refuse loudly
             // with an actionable message instead.
             if tensor.device == 0 {
-                eprintln!(
-                    "nsl: kernel argument {} is a CPU tensor; kernel arguments must be \
+                crate::nsl_log!(ERROR, "nsl", "nsl: kernel argument {} is a CPU tensor; kernel arguments must be \
                      moved to the GPU first (e.g. `arg.to(cuda)`).",
                     i
                 );
@@ -6587,8 +6585,7 @@ pub extern "C" fn nsl_kernel_launch_tensors(
     {
         let _ = (ptx_ptr, name_ptr, grid_x, grid_y, grid_z);
         let _ = (block_x, block_y, block_z, args_ptr, num_args, shared_mem_bytes);
-        eprintln!(
-            "nsl: this program launches a GPU `kernel` block, but the nsl runtime \
+        crate::nsl_log!(ERROR, "nsl", "nsl: this program launches a GPU `kernel` block, but the nsl runtime \
              was built without CUDA support. Rebuild the toolchain with \
              `--features cuda` (e.g. `cargo build -p nsl-cli --features cuda`) to run \
              GPU kernels."
@@ -7552,8 +7549,7 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     // would be read len*4 bytes OOB. Refuse anything but f32 loudly (the
     // CPU arm has the equivalent dtype match).
     if a.dtype != crate::tensor::DTYPE_F32 {
-        eprintln!(
-            "nsl: muon_orthogonalize GPU path requires an f32 tensor (got dtype {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: muon_orthogonalize GPU path requires an f32 tensor (got dtype {})",
             a.dtype
         );
         std::process::abort();

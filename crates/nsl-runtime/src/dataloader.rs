@@ -163,17 +163,17 @@ impl DataLoader {
         config: DataLoaderConfig,
     ) -> Self {
         if data_tensor_ptr == 0 {
-            eprintln!("nsl: DataLoader requires a data tensor");
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader requires a data tensor");
             std::process::abort();
         }
 
         let data_tensor = NslTensor::from_ptr(data_tensor_ptr);
         if data_tensor.device != 0 {
-            eprintln!("nsl: DataLoader data tensor must be on CPU");
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader data tensor must be on CPU");
             std::process::abort();
         }
         if !data_tensor.is_contiguous() {
-            eprintln!("nsl: DataLoader data tensor must be contiguous");
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader data tensor must be contiguous");
             std::process::abort();
         }
 
@@ -181,18 +181,18 @@ impl DataLoader {
         let data_len = data_tensor.len as usize;
         let data_dtype = data_tensor.dtype;
         if !supports_flat_value_dtype(data_dtype) {
-            eprintln!("nsl: DataLoader does not support source dtype {}", data_dtype);
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader does not support source dtype {}", data_dtype);
             std::process::abort();
         }
 
         let (labels, labels_len, labels_dtype) = if labels_tensor_ptr != 0 {
             let labels_tensor = NslTensor::from_ptr(labels_tensor_ptr);
             if labels_tensor.device != 0 {
-                eprintln!("nsl: DataLoader labels tensor must be on CPU");
+                crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader labels tensor must be on CPU");
                 std::process::abort();
             }
             if !labels_tensor.is_contiguous() {
-                eprintln!("nsl: DataLoader labels tensor must be contiguous");
+                crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader labels tensor must be contiguous");
                 std::process::abort();
             }
             (
@@ -206,12 +206,11 @@ impl DataLoader {
 
         let has_labels = !labels.is_null() && labels_len > 0;
         if has_labels && !supports_flat_value_dtype(labels_dtype) {
-            eprintln!("nsl: DataLoader does not support label dtype {}", labels_dtype);
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader does not support label dtype {}", labels_dtype);
             std::process::abort();
         }
         if has_labels && labels_len != data_len {
-            eprintln!(
-                "nsl: DataLoader labels length mismatch: inputs={} labels={}",
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader labels length mismatch: inputs={} labels={}",
                 data_len, labels_len
             );
             std::process::abort();
@@ -234,8 +233,7 @@ impl DataLoader {
         // launched by the --devices spawner (NSL_LOCAL_RANK unset): sharding a
         // lone process would silently train on only its 1/world_size slice.
         if sharding && local_rank_env.is_none() {
-            eprintln!(
-                "nsl: DataLoader(shard_by_rank=true) with world_size={world_size} but \
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader(shard_by_rank=true) with world_size={world_size} but \
                  NSL_LOCAL_RANK is unset — run under `nsl run --devices {world_size} \
                  --zero-stage N`. Refusing to shard a single process (would train on \
                  only 1/{world_size} of the data)."
@@ -272,8 +270,7 @@ impl DataLoader {
         // would be 0 → a silent no-op, frozen-model, exit-0 run — the M43b
         // anti-pattern).
         if sharding && total_batches == 0 {
-            eprintln!(
-                "nsl: DataLoader can't shard {global_total_batches} batches across \
+            crate::nsl_log!(ERROR, "nsl", "nsl: DataLoader can't shard {global_total_batches} batches across \
                  {world_size} ranks (< 1 per rank). Reduce --devices, batch_size, or \
                  seq_len, or provide more data."
             );
@@ -862,8 +859,7 @@ pub extern "C" fn nsl_dataloader_resume_to(dl_ptr: i64, epoch: i64, slot: i64) {
         return;
     }
     if epoch < 0 || slot < 0 {
-        eprintln!(
-            "nsl: dataloader_resume_to: negative position (epoch {epoch}, slot \
+        crate::nsl_log!(ERROR, "nsl", "nsl: dataloader_resume_to: negative position (epoch {epoch}, slot \
              {slot}) — refusing rather than wrapping to a huge usize"
         );
         std::process::abort();

@@ -58,8 +58,7 @@ impl BroadcastPlan {
             } else if db == 1 {
                 da
             } else {
-                eprintln!(
-                    "nsl: tensor shape mismatch in elementwise op{what} (dim {i}: {da} vs {db})\n  full a_shape={a_shape:?}\n  full b_shape={b_shape:?}"
+                crate::nsl_log!(ERROR, "nsl", "nsl: tensor shape mismatch in elementwise op{what} (dim {i}: {da} vs {db})\n  full a_shape={a_shape:?}\n  full b_shape={b_shape:?}"
                 );
                 std::process::abort();
             };
@@ -572,7 +571,7 @@ pub extern "C" fn nsl_fused_matmul_epilogue(
     let b = NslTensor::from_ptr_ref(b_ptr);
 
     if a.ndim < 2 || b.ndim < 2 {
-        eprintln!("nsl: fused_matmul_epilogue requires 2D+ tensors");
+        crate::nsl_log!(ERROR, "nsl", "nsl: fused_matmul_epilogue requires 2D+ tensors");
         std::process::abort();
     }
 

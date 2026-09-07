@@ -301,8 +301,7 @@ impl SimulatedBackend {
                 if spins & 0xFFFF == 0
                     && start.elapsed().as_secs() >= timeout_secs
                 {
-                    eprintln!(
-                        "nsl: collective barrier timed out after {timeout_secs}s \
+                    crate::nsl_log!(ERROR, "nsl", "nsl: collective barrier timed out after {timeout_secs}s \
                          on rank {} — a peer rank likely died. Aborting (set \
                          NSL_TP_BARRIER_TIMEOUT_SECS to tune).",
                         self.rank
@@ -335,8 +334,7 @@ impl CollectiveBackend for SimulatedBackend {
             return 0;
         }
         if !self.slot_fits(nbytes) {
-            eprintln!(
-                "nsl: all_reduce_sum: {nbytes}-byte tensor exceeds the per-rank \
+            crate::nsl_log!(WARN, "nsl", "nsl: all_reduce_sum: {nbytes}-byte tensor exceeds the per-rank \
                  shm slot ({} ranks, {} bytes total) — raise the --devices shm \
                  budget or shard/chunk the tensor",
                 self.world_size, self.shm_len
@@ -438,8 +436,7 @@ impl CollectiveBackend for SimulatedBackend {
             return 0;
         }
         if !self.slot_fits(nbytes) {
-            eprintln!(
-                "nsl: reduce_scatter_sum: {nbytes}-byte tensor exceeds the \
+            crate::nsl_log!(WARN, "nsl", "nsl: reduce_scatter_sum: {nbytes}-byte tensor exceeds the \
                  per-rank shm slot ({} ranks) — raise the --devices shm budget",
                 self.world_size
             );
@@ -508,8 +505,7 @@ impl CollectiveBackend for SimulatedBackend {
         // it an oversized send silently overruns into the next rank's slot
         // (shm corruption, not an error).
         if !self.slot_fits(nbytes) {
-            eprintln!(
-                "nsl: all_gather: {nbytes}-byte send exceeds the per-rank shm \
+            crate::nsl_log!(WARN, "nsl", "nsl: all_gather: {nbytes}-byte send exceeds the per-rank shm \
                  slot ({} ranks) — raise the --devices shm budget",
                 self.world_size
             );
@@ -552,8 +548,7 @@ impl CollectiveBackend for SimulatedBackend {
             return 0;
         }
         if !self.slot_fits(nbytes) {
-            eprintln!(
-                "nsl: broadcast: {nbytes}-byte tensor exceeds the per-rank shm \
+            crate::nsl_log!(WARN, "nsl", "nsl: broadcast: {nbytes}-byte tensor exceeds the per-rank shm \
                  slot ({} ranks) — raise the --devices shm budget",
                 self.world_size
             );
@@ -919,8 +914,7 @@ impl NcclBackend {
                     std::time::Instant::now() + std::time::Duration::from_secs(secs);
                 while !done.load(std::sync::atomic::Ordering::Acquire) {
                     if std::time::Instant::now() >= deadline {
-                        eprintln!(
-                            "nsl: ncclCommInitRank timed out after {secs}s on rank {rank} \
+                        crate::nsl_log!(ERROR, "nsl", "nsl: ncclCommInitRank timed out after {secs}s on rank {rank} \
                              — a peer rank likely died before joining the clique. \
                              Aborting (set NSL_NCCL_TIMEOUT_SECS to tune)."
                         );
@@ -975,8 +969,7 @@ impl NcclBackend {
     fn finish(&self, rc: cudarc::nccl::sys::ncclResult_t, what: &str) -> i32 {
         use cudarc::nccl::sys as nccl;
         if rc != nccl::ncclResult_t::ncclSuccess {
-            eprintln!(
-                "nsl: {what} failed on rank {}: {rc:?} — aborting the communicator",
+            crate::nsl_log!(WARN, "nsl", "nsl: {what} failed on rank {}: {rc:?} — aborting the communicator",
                 self.host.rank()
             );
             self.abort_comm();
@@ -984,8 +977,7 @@ impl NcclBackend {
         }
         let secs = nccl_timeout_secs();
         if !crate::cuda::inner::sync_compute_stream_with_deadline(secs, what) {
-            eprintln!(
-                "nsl: {what} timed out after {secs}s on rank {} — a peer rank likely \
+            crate::nsl_log!(ERROR, "nsl", "nsl: {what} timed out after {secs}s on rank {} — a peer rank likely \
                  died mid-collective. Aborting (set NSL_NCCL_TIMEOUT_SECS to tune).",
                 self.host.rank()
             );
@@ -996,8 +988,7 @@ impl NcclBackend {
         let mut aerr = nccl::ncclResult_t::ncclSuccess;
         unsafe { nccl::ncclCommGetAsyncError(self.comm, &mut aerr) };
         if aerr != nccl::ncclResult_t::ncclSuccess {
-            eprintln!(
-                "nsl: {what}: async NCCL error on rank {}: {aerr:?} — aborting",
+            crate::nsl_log!(WARN, "nsl", "nsl: {what}: async NCCL error on rank {}: {aerr:?} — aborting",
                 self.host.rank()
             );
             self.abort_comm();

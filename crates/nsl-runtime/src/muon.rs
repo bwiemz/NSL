@@ -58,7 +58,7 @@ fn cpu_frobenius_scale(x_ptr: i64) -> i64 {
             0 => unsafe { *(t.data as *const f64) },
             1 => f64::from(unsafe { *(t.data as *const f32) }),
             other => {
-                eprintln!("nsl: muon_orthogonalize unsupported dtype {other}");
+                crate::nsl_log!(ERROR, "nsl", "nsl: muon_orthogonalize unsupported dtype {other}");
                 std::process::abort();
             }
         }
@@ -80,21 +80,20 @@ fn cpu_frobenius_scale(x_ptr: i64) -> i64 {
 pub extern "C" fn nsl_tensor_muon_orthogonalize(g_ptr: i64, ns_steps: f64) -> i64 {
     let g = NslTensor::from_ptr(g_ptr);
     if g.ndim != 2 {
-        eprintln!(
-            "nsl: muon_orthogonalize requires a rank-2 tensor (got rank {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: muon_orthogonalize requires a rank-2 tensor (got rank {})",
             g.ndim
         );
         std::process::abort();
     }
     if !(ns_steps >= 1.0 && ns_steps.fract() == 0.0) {
-        eprintln!("nsl: muon_orthogonalize ns_steps must be a positive integer (got {ns_steps})");
+        crate::nsl_log!(ERROR, "nsl", "nsl: muon_orthogonalize ns_steps must be a positive integer (got {ns_steps})");
         std::process::abort();
     }
     if g.len == 0 {
         // Review finding: a [N, 0] tensor would reach the GPU launch with
         // grid=0 (CUDA_ERROR_INVALID_VALUE abort) and has no orthogonal
         // factor anyway — refuse coherently on both devices.
-        eprintln!("nsl: muon_orthogonalize requires a non-empty rank-2 tensor");
+        crate::nsl_log!(ERROR, "nsl", "nsl: muon_orthogonalize requires a non-empty rank-2 tensor");
         std::process::abort();
     }
     let steps = ns_steps as i64;

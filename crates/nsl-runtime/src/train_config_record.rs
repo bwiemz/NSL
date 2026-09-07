@@ -99,8 +99,7 @@ pub fn check_on_resume(saved: &str) {
     // than silently passing (the #519 vacuity lesson).
     if saved.is_empty() || live.is_empty() {
         let side = if saved.is_empty() { "checkpoint" } else { "this build" };
-        eprintln!(
-            "nsl: train_checkpoint_load: the {side} carries no train-config \
+        crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: the {side} carries no train-config \
              record, so the lr/optimizer/schedule check is SKIPPED. Verify \
              the training configuration matches the saved run by hand."
         );
@@ -108,8 +107,7 @@ pub fn check_on_resume(saved: &str) {
     }
     let moment = moment_diff(saved, &live);
     if !moment.is_empty() {
-        eprintln!(
-            "nsl: train_checkpoint_load: this run's OPTIMIZER CONFIGURATION \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: this run's OPTIMIZER CONFIGURATION \
              differs from the checkpoint's:\n{}\n\
              These change what the restored optimizer moments and step \
              counter MEAN — the resume would not be a continuation of the \
@@ -129,8 +127,7 @@ pub fn check_on_resume(saved: &str) {
         .as_deref()
         == Some("1");
     if allowed {
-        eprintln!(
-            "nsl: train_checkpoint_load: TRAJECTORY drift acknowledged \
+        crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: TRAJECTORY drift acknowledged \
              (NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1):\n{}\n\
              The resume continues under the NEW values. Note: the schedule \
              is recomputed from (base_lr, restored step, schedule \
@@ -140,8 +137,7 @@ pub fn check_on_resume(saved: &str) {
         );
         return;
     }
-    eprintln!(
-        "nsl: train_checkpoint_load: this run's LR/SCHEDULE/CLIP differs \
+    crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: this run's LR/SCHEDULE/CLIP differs \
          from the checkpoint's:\n{}\n\
          If this change is intentional (an lr drop, a schedule extension), \
          re-run with NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1 to resume under \

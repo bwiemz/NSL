@@ -27,7 +27,7 @@ pub extern "C" fn nsl_assert(condition: i8, message: i64) {
         } else {
             "assertion failed"
         };
-        eprintln!("nsl: assertion failed: {}", msg);
+        crate::nsl_log!(ERROR, "nsl", "nsl: assertion failed: {}", msg);
         std::process::abort();
     }
 }

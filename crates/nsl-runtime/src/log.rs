@@ -7,8 +7,10 @@
 //!
 //! 1. **stderr is byte-identical.** [`NslSubscriber`] is the crate's own
 //!    `tracing::Subscriber`: it writes the message plus one newline to
-//!    stderr in one `write_all` under the stderr lock, and nothing else —
-//!    no timestamp, level, target or colour. The `[zero3] …`,
+//!    stderr under the stderr lock, straight from the format arguments
+//!    (no heap allocation on that path, so the `nsl: out of memory` line
+//!    in `memory.rs` still prints), and nothing else — no timestamp,
+//!    level, target or colour. The `[zero3] …`,
 //!    `[cuda-graph] …` marker lines that `nsl-cli`'s gates compare byte for
 //!    byte (`crates/nsl-cli/src/exec_markers.rs`) come out exactly as the
 //!    `eprintln!` they replaced. The subscriber installs itself on the
@@ -34,16 +36,18 @@
 //! Migration status: the bracketed-marker family in `nsl-runtime` (the
 //! `[zero3]`, `[cuda-graph]`, `[weight-stream]`, `[arena]`, `[sr-bf16]`,
 //! `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`, `[nsl-tcp]`,
-//! `[nsl-trace]`, `[tape-trace]`, `[scope]` lines) goes through
-//! `nsl_log!`; the `nsl: …` fatal lines and the rest of the crate's prints
-//! are the next slices, then nsl-codegen.
+//! `[nsl-trace]`, `[tape-trace]`, `[scope]` lines) and the `nsl: …`
+//! family (target `"nsl"`: `ERROR` where the line precedes an abort or
+//! exit, `WARN` where the entry point returns instead) go through
+//! `nsl_log!`; the rest of the crate's prints are the next slice, then
+//! nsl-codegen.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::OnceLock;
 
 use tracing::field::{Field, Visit};
-use tracing::{span, Event, Level, Metadata, Subscriber};
+use tracing::{span, Event, Metadata, Subscriber};
 
 /// Emit one diagnostic line: `nsl_log!(LEVEL, "target", "format", args…)`.
 ///
@@ -64,7 +68,8 @@ macro_rules! nsl_log {
 /// accepted and ignored.
 pub struct NslSubscriber;
 
-/// Collects the `message` field of an event as the formatted string.
+/// Collects the `message` field of an event as the formatted string (the
+/// events-stream mirror, and the tests).
 struct MessageVisitor {
     message: String,
 }
@@ -86,6 +91,29 @@ impl Visit for MessageVisitor {
     }
 }
 
+/// Writes the `message` field straight to a locked stderr, formatting
+/// piece by piece with no intermediate `String` — the path an
+/// out-of-memory diagnostic has to survive.
+struct StderrVisitor<'a> {
+    out: &'a mut std::io::StderrLock<'static>,
+}
+
+impl Visit for StderrVisitor<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            // A failed stderr write has nowhere to be reported; `eprintln!`
+            // would panic here, which inside an `extern "C"` frame aborts.
+            let _ = write!(self.out, "{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            let _ = self.out.write_all(value.as_bytes());
+        }
+    }
+}
+
 impl Subscriber for NslSubscriber {
     fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
         true
@@ -100,41 +128,34 @@ impl Subscriber for NslSubscriber {
     fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
 
     fn event(&self, event: &Event<'_>) {
-        let mut visitor = MessageVisitor { message: String::new() };
-        event.record(&mut visitor);
-        emit_line(event.metadata().level(), event.metadata().target(), &visitor.message);
+        // stderr first, allocation-free, one lock for message + newline:
+        // this is the whole of the stderr contract — the bytes are the
+        // message's, nothing is added.
+        {
+            let stderr = std::io::stderr();
+            let mut handle = stderr.lock();
+            event.record(&mut StderrVisitor { out: &mut handle });
+            let _ = handle.write_all(b"\n");
+        }
+        if crate::events::enabled() {
+            let mut visitor = MessageVisitor { message: String::new() };
+            event.record(&mut visitor);
+            let metadata = event.metadata();
+            crate::events::emit(
+                "log",
+                None,
+                &[
+                    ("level", serde_json::Value::from(metadata.level().as_str())),
+                    ("target", serde_json::Value::from(metadata.target())),
+                    ("message", serde_json::Value::from(visitor.message)),
+                ],
+            );
+        }
     }
 
     fn enter(&self, _span: &span::Id) {}
 
     fn exit(&self, _span: &span::Id) {}
-}
-
-/// Write `message` + `\n` to stderr in one call, and mirror it to the
-/// events stream when that is on. This is the whole of the stderr contract:
-/// the bytes are the message's, nothing is added.
-pub(crate) fn emit_line(level: &Level, target: &str, message: &str) {
-    let mut line = String::with_capacity(message.len() + 1);
-    line.push_str(message);
-    line.push('\n');
-    {
-        let stderr = std::io::stderr();
-        let mut handle = stderr.lock();
-        // A failed stderr write has nowhere to be reported; `eprintln!`
-        // would panic here, which inside an `extern "C"` frame aborts.
-        let _ = handle.write_all(line.as_bytes());
-    }
-    if crate::events::enabled() {
-        crate::events::emit(
-            "log",
-            None,
-            &[
-                ("level", serde_json::Value::from(level.as_str())),
-                ("target", serde_json::Value::from(target)),
-                ("message", serde_json::Value::from(message)),
-            ],
-        );
-    }
 }
 
 /// Install [`NslSubscriber`] as the process's global subscriber, once. A

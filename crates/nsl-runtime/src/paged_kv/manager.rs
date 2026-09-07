@@ -300,8 +300,7 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!(
-            "nsl: nsl_kv_cache_init_gpu called but CUDA feature is disabled, falling back to CPU"
+        crate::nsl_log!(WARN, "nsl", "nsl: nsl_kv_cache_init_gpu called but CUDA feature is disabled, falling back to CPU"
         );
         nsl_kv_cache_init(num_blocks, block_size, num_heads, head_dim, num_layers,
                           compress_scheme, compress_window, compress_sinks)
@@ -325,7 +324,7 @@ pub extern "C" fn nsl_kv_cache_append(handle: i64, seq_id: i64) -> i64 {
     match guard.append_token(seq_id as u64) {
         Ok((block_id, offset)) => ((block_id as i64) << 32) | (offset as i64),
         Err(e) => {
-            eprintln!("nsl: kv_cache_append failed: {}", e);
+            crate::nsl_log!(WARN, "nsl", "nsl: kv_cache_append failed: {}", e);
             -1
         }
     }

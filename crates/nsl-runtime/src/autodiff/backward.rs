@@ -1107,8 +1107,7 @@ fn materialize_conv_output_grad(
         return out_ptr;
     }
 
-    eprintln!(
-        "nsl: conv2d backward received a gradient with {glen} elements, but the \
+    crate::nsl_log!(ERROR, "nsl", "nsl: conv2d backward received a gradient with {glen} elements, but the \
          conv output is [{n}, {c_out}, {h_out}, {w_out}] ({expected} elements); \
          cannot materialize the output gradient."
     );
@@ -1943,7 +1942,7 @@ pub(crate) fn run_backward_core_strict(
                     } else { (g, false) };
                     let g_t = crate::tensor::NslTensor::from_ptr(g_bias_cpu);
                     if g_t.ndim < 2 {
-                        eprintln!("nsl: BiasAdd backward expects 2D+ gradient, got {}D", g_t.ndim);
+                        crate::nsl_log!(ERROR, "nsl", "nsl: BiasAdd backward expects 2D+ gradient, got {}D", g_t.ndim);
                         std::process::abort();
                     }
                     let rows = unsafe { *g_t.shape.add(0) } as usize;

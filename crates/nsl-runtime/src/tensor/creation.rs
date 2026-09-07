@@ -240,7 +240,7 @@ pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
     if step == 0.0 {
-        eprintln!("nsl: tensor arange step cannot be zero");
+        crate::nsl_log!(ERROR, "nsl", "nsl: tensor arange step cannot be zero");
         std::process::abort();
     }
     let len = ((stop - start) / step).ceil().max(0.0) as i64;
