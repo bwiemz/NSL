@@ -53,7 +53,7 @@ impl Compiler<'_> {
                 self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
             }
             let adamw_count = table.entries.iter().filter(|e| e.adamw).count();
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "muon", 
                 "[muon] role-based Muon/AdamW routing over {} params ({} \
                  AdamW-routed, {} Muon):",
                 table.entries.len(),
@@ -61,7 +61,7 @@ impl Compiler<'_> {
                 table.entries.len() - adamw_count,
             );
             for e in &table.entries {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "muon", 
                     "[muon]   {} role={} ({}) -> {}",
                     e.path,
                     e.role,
@@ -74,7 +74,7 @@ impl Compiler<'_> {
                 );
             }
             if !table.entries.iter().any(|e| e.role == "head") {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "muon", 
                     "[muon] note: no param has role 'head' — correct for \
                      weight-tied models (the tied embedding covers it); if \
                      this model has an UNTIED lm_head, annotate it with \
@@ -82,7 +82,7 @@ impl Compiler<'_> {
                 );
             }
             for w in &table.warnings {
-                eprintln!("[muon] warning: {w}");
+                nsl_runtime::nsl_log!(WARN, "muon", "[muon] warning: {w}");
             }
             Some(list)
         } else {
@@ -119,7 +119,7 @@ impl Compiler<'_> {
             None
         } else {
             if weight_decay_value == 0.0 {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "wd-groups", 
                     "[wd-groups] warning: no_decay=[...] was given but \
                      weight_decay is 0.0 — nothing is being decayed, so the \
                      exemption has no effect."
@@ -138,7 +138,7 @@ impl Compiler<'_> {
             if no_decay_scope.exempt_non_rank2 {
                 scope_desc.push("vector (runtime rank != 2)".to_string());
             }
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "wd-groups", 
                 "[wd-groups] weight_decay={} exempting roles [{}] over {} params: \
                  {} exempt by role at compile time{}",
                 weight_decay_value,
@@ -153,7 +153,7 @@ impl Compiler<'_> {
             );
             for e in &table.entries {
                 if no_decay_scope.exempts_role(e.role) {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "wd-groups", 
                         "[wd-groups]   {} role={} ({}) -> NO decay",
                         e.path, e.role, e.source
                     );

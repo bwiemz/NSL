@@ -92,11 +92,11 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
         // empty report must still ANSWER the request — silence here is
         // indistinguishable from the report never being wired (which was
         // literally true on the single-file path until the same change).
-        eprintln!("\nFusion Report: no fusion events (nothing fused on this compile)");
+        nsl_runtime::nsl_log!(INFO, "fusion-report", "\nFusion Report: no fusion events (nothing fused on this compile)");
         return;
     }
 
-    eprintln!("\nFusion Report:");
+    nsl_runtime::nsl_log!(INFO, "fusion-report", "\nFusion Report:");
 
     // Group by function
     let mut functions: Vec<String> = Vec::new();
@@ -126,10 +126,10 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
             .map(|e| e.location.as_str())
             .or_else(|| func_barriers.first().map(|b| b.location.as_str()))
             .unwrap_or("unknown");
-        eprintln!("  {} ({}):", func_name, loc);
+        nsl_runtime::nsl_log!(INFO, "fusion-report", "  {} ({}):", func_name, loc);
 
         for e in &func_events {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "fusion-report", 
                 "    {} -> FUSED ({})",
                 e.matched_ops.join(" + "),
                 e.strategy
@@ -143,7 +143,7 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
             } else {
                 String::new()
             };
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "fusion-report", 
                 "      Savings: {} eliminated launch(es), ~{}MB eliminated traffic{}",
                 e.eliminated_launches,
                 e.estimated_bytes_saved / (1024 * 1024),
@@ -152,7 +152,7 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
         }
 
         for b in &func_barriers {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "fusion-report", 
                 "    {} -> not fused ({} barrier)",
                 b.node_description, b.reason
             );
@@ -163,7 +163,7 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
     let total_opportunities = events.len() + barriers.len();
     let applied = events.len();
     let blocked = barriers.len();
-    eprintln!(
+    nsl_runtime::nsl_log!(INFO, "fusion-report", 
         "\n  Summary: {} opportunities found, {} applied, {} barriers",
         total_opportunities, applied, blocked
     );

@@ -524,7 +524,12 @@ first failure prints one `[nsl] warning:` line and disables the sink. Call
 sites use `events::emit(kind, step, &[(name, value)])` and build the JSON
 and the stderr line from one counter snapshot so the two cannot disagree.
 The registry of kinds and fields is `EVENT_SCHEMAS` in
-`crates/nsl-cli/src/exec_markers.rs`, next to the marker registry.
+`crates/nsl-cli/src/exec_markers.rs`, next to the marker registry. The
+writer is the compiled program, one process per rank: the `nsl` CLI passes
+`NSL_EVENTS` through to the program it spawns and opts its own process out
+(`events::opt_out_this_process`, first thing in `main`), so its
+compile-time `nsl_log!` lines never land in the program's file with a
+second `seq` sequence.
 
 **Logging** (`src/log.rs`, roadmap C3). Diagnostic lines go through
 `nsl_log!(LEVEL, "target", "…")`, a `tracing` event whose target names the

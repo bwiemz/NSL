@@ -42,7 +42,12 @@
 //! …; a line that starts with its own `[marker]` uses the marker as its
 //! target). Program output stays on `println!` — the `print` builtin
 //! (`print.rs`), the tensor printer, the health JSON — since that is
-//! stdout, not a diagnostic. Next: nsl-codegen.
+//! stdout, not a diagnostic. nsl-codegen's compile-time diagnostics use
+//! the same macro (`nsl_runtime::nsl_log!`; target `"codegen"` for the
+//! `warning:` / `error:` / `note:` lines, the subsystem otherwise —
+//! `"autotune"`, `"ccr"`, `"source-ad"`, `"wggo"`, …), leaving only its
+//! multi-line `eprint!` report dumps and the dev-tool binaries under
+//! `src/bin/` on raw prints. Next: nsl-cli.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -61,9 +66,15 @@ use tracing::{span, Event, Metadata, Subscriber};
 macro_rules! nsl_log {
     ($level:ident, $target:literal, $($arg:tt)+) => {{
         $crate::log::ensure_installed();
-        ::tracing::event!(target: $target, ::tracing::Level::$level, $($arg)+);
+        $crate::log::tracing::event!(target: $target, $crate::log::tracing::Level::$level, $($arg)+);
     }};
 }
+
+/// Re-exported for [`nsl_log!`](crate::nsl_log): a crate that invokes the
+/// macro (nsl-codegen, nsl-cli) reaches `tracing` through this path
+/// instead of needing its own dependency on it.
+#[doc(hidden)]
+pub use tracing;
 
 /// The runtime's subscriber: the event's `message` field, verbatim, to
 /// stderr (and to the `NSL_EVENTS` stream when it is on). Spans are

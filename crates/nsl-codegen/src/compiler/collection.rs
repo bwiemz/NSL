@@ -384,7 +384,7 @@ impl Compiler<'_> {
                                 }
                             }
                         }
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "nsl", 
                             "[nsl] M35: @quantize on model '{}' — dtype={}, group_size={}",
                             model_name, dtype, group_size
                         );

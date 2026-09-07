@@ -137,14 +137,14 @@ pub fn report_outcome(outcome: &CpdtDecoratorOutcome) {
     match outcome {
         CpdtDecoratorOutcome::Absent => {}
         CpdtDecoratorOutcome::Applied { mode, cluster_set, .. } => {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "cpdt", 
                 "[cpdt] @cpdt decorator applied: mode={} cluster={} (§6.1)",
                 mode.as_str(),
                 if *cluster_set { "set" } else { "inherited" }
             );
         }
         CpdtDecoratorOutcome::Invalid { .. } => {
-            eprintln!("[cpdt] @cpdt decorator invalid; compiler state untouched (§6.1)");
+            nsl_runtime::nsl_log!(WARN, "cpdt", "[cpdt] @cpdt decorator invalid; compiler state untouched (§6.1)");
         }
     }
 }
