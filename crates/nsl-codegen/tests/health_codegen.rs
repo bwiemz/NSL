@@ -15,11 +15,11 @@ use nsl_codegen::CompileOptions;
 fn health_monitor_default_is_false() {
     let opts = CompileOptions::default();
     assert!(
-        !opts.health_monitor,
+        !opts.dev_tools.health_monitor,
         "health_monitor must default to false to keep codegen byte-identical"
     );
     assert_eq!(
-        opts.health_flush_interval, None,
+        opts.dev_tools.health_flush_interval, None,
         "health_flush_interval must default to None"
     );
 }
@@ -29,12 +29,12 @@ fn health_monitor_flag_round_trips_through_compile_options() {
     // Pure struct-level smoke: the flag survives clone and respects
     // explicit interval overrides.
     let mut opts = CompileOptions::default();
-    opts.health_monitor = true;
-    opts.health_flush_interval = Some(250);
+    opts.dev_tools.health_monitor = true;
+    opts.dev_tools.health_flush_interval = Some(250);
 
     let cloned = opts.clone();
-    assert!(cloned.health_monitor);
-    assert_eq!(cloned.health_flush_interval, Some(250));
+    assert!(cloned.dev_tools.health_monitor);
+    assert_eq!(cloned.dev_tools.health_flush_interval, Some(250));
 }
 
 #[test]
@@ -49,9 +49,9 @@ fn forward(x: Tensor<[B=1, S=2048, D=512], bf16>, W: Tensor<[512, 512], bf16>) -
     return y
 "#;
     let mut opts = CompileOptions::default();
-    opts.health_monitor = true;
-    opts.health_flush_interval = Some(100);
-    opts.profile_kernels = true;
+    opts.dev_tools.health_monitor = true;
+    opts.dev_tools.health_flush_interval = Some(100);
+    opts.dev_tools.profile_kernels = true;
 
     let result = nsl_codegen::test_helpers::run_pre_pass_only(src, &opts)
         .expect("pre-pass should succeed with health_monitor enabled");

@@ -14,6 +14,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   retention, batch_seq, compile_bundle, grad_retention}`). Defaults are
   unchanged; `HarnessConfig` and the CLI `BuildArgs` keep their own
   `calibration_data` fields. 87 → 78 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the dev-tools
+  cluster moved into `DevToolsOptions`
+  (`opts.dev_tools.{profile_kernels, manifest_output_path, profile_source_text,
+  profile_source_file_name, health_monitor, health_flush_interval,
+  inspect_enabled}`). Defaults unchanged (all off / `None`); `target_gpu` and
+  `dtype` stay flat because they are shared beyond the profiler. 78 → 72 flat
+  fields.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

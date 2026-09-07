@@ -240,23 +240,29 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 78 `pub` fields today. The decomposition into cohesive
+The struct has 72 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
 (`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
 `CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
 data path, mode, sample/batch/timeout budgets, the AWQ `retention` and
 WGGO `grad_retention` plans, `batch_seq`, the subprocess `compile_bundle`
-and the `sidecar` the harness writes back), plus `MatmulConfig`
-(`opts.matmul`) and `WrgaCheckContext` (`opts.wrga_check`, which retired
-the CLI's WRGA thread-locals — see compiler-state.md Phase 2). Everything
-else is still a flat field (`source_ad`, `deterministic`, `target`,
-`disable_fusion`, `vram_budget`, `memory_report`, `profile_*`/`health_*`,
-…). New options belong in a sub-struct when they share a subsystem;
-otherwise a flat field is acceptable but should carry a doc comment naming
-the flag. `HarnessConfig` (`src/calibration/mod.rs`) keeps its own
+and the `sidecar` the harness writes back), `DevToolsOptions`
+(`opts.dev_tools`: the kernel profiler's `profile_kernels` /
+`manifest_output_path` / `profile_source_text` / `profile_source_file_name`,
+the health monitor's `health_monitor` / `health_flush_interval`, and
+`inspect_enabled`), plus `MatmulConfig` (`opts.matmul`) and
+`WrgaCheckContext` (`opts.wrga_check`, which retired the CLI's WRGA
+thread-locals — see compiler-state.md Phase 2). Everything else is still a
+flat field (`source_ad`, `deterministic`, `target`, `disable_fusion`,
+`vram_budget`, `memory_report`, `target_gpu`, `dtype`, …). New options
+belong in a sub-struct when they share a subsystem; otherwise a flat field
+is acceptable but should carry a doc comment naming the flag.
+`HarnessConfig` (`src/calibration/mod.rs`) keeps its own
 `calibration_data: PathBuf` — it is the harness's input record, not an
-alias of `opts.calibration.data`.
+alias of `opts.calibration.data`. `target_gpu` / `dtype` stay flat on
+purpose: the profile walker shares them with `serve`, the GPU-spec lookups
+and the execution fingerprint.
 
 **`MatmulConfig`** (`src/lib.rs`): `mode: MatmulMode`, `bf16_rounding`,
 `bf16_min_ratio`, `bf16_cast_cache`, `bf16_lt`, `bf16_lt_workspace_mib`,
@@ -759,8 +765,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 
 1. Add the field to `CompileOptions` in `src/lib.rs` — inside the matching
    sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`, `ZkOptions`,
-   `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `MatmulConfig`) when
-   one exists — with its
+   `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`,
+   `MatmulConfig`) when one exists — with its
    default in `impl Default for CompileOptions` (or the sub-struct's).
 2. Declare the clap flag in `crates/nsl-cli/src/args.rs`. Shared flags are
    declared twice (`BuildArgs`, `RunArgs`) and must be identical; a flag

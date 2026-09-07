@@ -73,7 +73,7 @@ pub fn run_pre_pass_only(
     let mut fusion_plan_set = false;
     let mut source_text_out = String::new();
 
-    if opts.profile_kernels {
+    if opts.dev_tools.profile_kernels {
         use crate::gpu_specs::find_gpu;
         use crate::profiling::instrument::ManifestBuilder;
         use crate::profiling::shape_env::ShapeEnv;
@@ -82,16 +82,16 @@ pub fn run_pre_pass_only(
 
         // Phase 2.5 Task 4: install source-text/name up front, mirroring
         // `run_profile_pre_pass`.  Runs independently of walker success.
-        compiler.source_text = match &opts.profile_source_text {
+        compiler.source_text = match &opts.dev_tools.profile_source_text {
             Some(s) => s.clone(),
             None => opts
-                .profile_source_file_name
+                .dev_tools.profile_source_file_name
                 .as_ref()
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .unwrap_or_default(),
         };
         compiler.source_file_name = opts
-            .profile_source_file_name
+            .dev_tools.profile_source_file_name
             .clone()
             .unwrap_or_default();
         source_text_out = compiler.source_text.clone();
