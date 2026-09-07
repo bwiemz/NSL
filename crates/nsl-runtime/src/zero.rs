@@ -5032,7 +5032,7 @@ mod tests {
         let mut strides = vec![1i64];
 
         // ── Composed side: SR note + elementwise mark + carve ──────────────
-        let t = gpu_f32_tensor(&init, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let mut t = gpu_f32_tensor(&init, shape.as_mut_ptr(), strides.as_mut_ptr());
         let tp = &mut t as *mut NslTensor as i64;
         crate::sr_bf16::nsl_sr_bf16_note_param(tp, 0);
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
