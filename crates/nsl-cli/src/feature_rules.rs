@@ -116,6 +116,8 @@ const STMT_ADMISSION: &str = "crates/nsl-codegen/src/stmt_admission.rs";
 /// Section 3 of the train block — the model/parameter-list build and the CPDT
 /// moment-precision plan (roadmap A1).
 const STMT_MODEL_PARAMS: &str = "crates/nsl-codegen/src/stmt_train/model_params.rs";
+/// Sections 7e4–7g of the train block — the optimizer step (roadmap A1).
+const STMT_OPTIMIZER_STEP: &str = "crates/nsl-codegen/src/stmt_train/optimizer_step.rs";
 /// Section 2 of the train block — the optimizer/scheduler contract and the
 /// Muon perf-flag compositions (roadmap A1).
 const STMT_CONTRACT: &str = "crates/nsl-codegen/src/stmt_train/contract.rs";
@@ -274,7 +276,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--zero-stage",
         RuleKind::Conflicts,
         "--wggo",
-        STMT,
+        STMT_OPTIMIZER_STEP,
         "Drop --wggo mode overrides or --zero-stage",
     ),
     // ── Elementwise ZeRO-3 (item 11, `--zero-elementwise`) ─────────────────

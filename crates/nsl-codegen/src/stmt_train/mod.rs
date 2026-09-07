@@ -21,6 +21,10 @@
 //!     full-state resume load (Milestone B).
 //!   - [`epoch_close`] — the batch-loop seal, the `on_epoch` callbacks,
 //!     the epoch increment and the jump back to the epoch header.
+//!   - [`optimizer_step`] — sections 7e4–7g: the accumulation gate, the
+//!     mode-table / FASE-deferred / stdlib step arms, the ZeRO reduce and
+//!     sync, and the post-optimizer cleanup, fed by an
+//!     [`optimizer_step::OptimizerStepInputs`].
 //!   - [`param_lists`] — the per-parameter runtime lists built at setup:
 //!     the Muon/AdamW route flags, the weight-decay exemption flags and
 //!     the gradient-accumulation buffers.
@@ -40,5 +44,6 @@ pub(crate) mod optimizer_state;
 pub(crate) mod contract;
 pub(crate) mod epoch_close;
 pub(crate) mod identity;
+pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;
 pub(crate) mod teardown;
