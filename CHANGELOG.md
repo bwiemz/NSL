@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Blockwise-int8 tensors (`nsl_tensor_quant_int8_blockwise`) carry their own
+  wire tag, `DTYPE_INT8_BLOCKWISE = 10`, and `data_byte_size` sizes their
+  buffer by the packed formula. They were tagged `DTYPE_INT8` and freed (and
+  cloned) as `len` bytes while their buffer is `len` padded to 4 plus one f32
+  scale per block — a mismatched-layout deallocation Miri caught (roadmap C2).
+  Additive ABI change: the tag has no C-API / DLPack representation and is
+  refused like any other unsupported dtype.
+- Elementwise binary ops (`cpu.rs`) derive their two inputs as shared
+  references: `nsl_tensor_mul(y, y)` had derived two `&mut` to one tensor
+  (undefined behaviour under Stacked Borrows, found by Miri; roadmap C2).
 - Miri on the CPU tensor tests (roadmap C2): `scripts/miri-cpu-tensor.sh`
   runs nsl-runtime's `tensor::tests` under Miri (nightly toolchain, by hand).
   The first run found ten tests holding a `from_ptr` reference across an op

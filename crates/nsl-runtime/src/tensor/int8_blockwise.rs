@@ -6,7 +6,8 @@
 //! This module ships the runtime primitives (the FASE-side cast wrapping is a
 //! follow-on). The blockwise layout is single-allocation: the data buffer holds
 //! `N` `i8` values followed by `ceil(N / BLOCK_SIZE)` `f32` absmax scales,
-//! 4-byte-aligned. The `NslTensor.dtype` field is `DTYPE_INT8`; `len` reports
+//! 4-byte-aligned. The `NslTensor.dtype` field is `DTYPE_INT8_BLOCKWISE` (its
+//! own tag, so `data_byte_size` sizes the packed buffer correctly); `len` reports
 //! the logical INT8-element count (scales are metadata, not visible to ops).
 //!
 //! Scaling: symmetric absmax (`scale = max(|x|) / 127`). Round-to-nearest by
@@ -19,7 +20,7 @@ use std::ffi::c_void;
 
 use crate::memory::checked_alloc;
 
-use super::{NslTensor, DTYPE_F32, DTYPE_INT8};
+use super::{NslTensor, DTYPE_F32, DTYPE_INT8_BLOCKWISE};
 
 /// Block size for blockwise scaling. Chosen for v1 — tight enough to give per-
 /// block scale precision on typical optimizer-state distributions, large enough
@@ -126,7 +127,7 @@ fn block_absmax(block: &[f32]) -> f32 {
 /// Quantize an FP32 tensor to blockwise INT8.
 ///
 /// `stochastic` non-zero enables stochastic rounding (paper §3.3). The returned
-/// tensor's dtype is `DTYPE_INT8`; `len` is the logical INT8 element count.
+/// tensor's dtype is `DTYPE_INT8_BLOCKWISE`; `len` is the logical INT8 element count.
 /// Caller owns the result and must `nsl_tensor_free` it.
 ///
 /// # Safety
@@ -195,7 +196,7 @@ pub extern "C" fn nsl_tensor_quant_int8_blockwise(
         t.ndim,
         t.len,
         t.device,
-        DTYPE_INT8,
+        DTYPE_INT8_BLOCKWISE,
         1,
         0,
     ));
@@ -222,8 +223,8 @@ pub extern "C" fn nsl_tensor_dequant_int8_blockwise(src_ptr: i64) -> i64 {
         t.device
     );
     assert_eq!(
-        t.dtype, DTYPE_INT8,
-        "nsl_tensor_dequant_int8_blockwise: source dtype must be INT8 (got {})",
+        t.dtype, DTYPE_INT8_BLOCKWISE,
+        "nsl_tensor_dequant_int8_blockwise: source dtype must be INT8_BLOCKWISE (got {})",
         t.dtype
     );
 
@@ -377,8 +378,12 @@ mod tests {
         let src = make_f32(&vec![0.5f32; 32]);
         let qt = nsl_tensor_quant_int8_blockwise(src, 0);
         let t = NslTensor::from_ptr_ref(qt);
-        assert_eq!(t.dtype, DTYPE_INT8);
+        assert_eq!(t.dtype, DTYPE_INT8_BLOCKWISE);
         assert_eq!(t.len, 32);
+        // The buffer is values padded to 4 + one f32 scale per block, and
+        // `data_byte_size` must say so or the free path deallocates with
+        // the wrong layout (the Miri finding that gave this dtype its tag).
+        assert_eq!(t.data_byte_size(), int8_blockwise_byte_size(32));
         nsl_tensor_free(src);
         nsl_tensor_free(qt);
     }

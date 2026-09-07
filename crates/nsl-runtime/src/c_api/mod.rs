@@ -115,7 +115,9 @@ pub(crate) const CAPI_DTYPE_TAGS: &str = "0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, \
 /// desc. `nsl_dispatch_apply_result` treats the identical input as a plain
 /// `-1` + `set_error` eighty lines below; this now mirrors it.
 pub fn capi_dtype_to_nsl(capi_dtype: i32) -> Option<u16> {
-    if !(0..=9).contains(&capi_dtype) {
+    // The canonical built-in tags are `0..=DTYPE_INT8_BLOCKWISE` (nsl-abi
+    // `wire::dtype`); anything else is refused here.
+    if !(0..=crate::tensor::DTYPE_INT8_BLOCKWISE as i32).contains(&capi_dtype) {
         return None;
     }
     Some(capi_dtype as u16)
@@ -123,10 +125,13 @@ pub fn capi_dtype_to_nsl(capi_dtype: i32) -> Option<u16> {
 
 /// Validate a canonical internal dtype tag for export through the C API.
 pub fn nsl_dtype_to_capi(nsl_dtype: u16) -> i32 {
-    if nsl_dtype > 9 && nsl_dtype < crate::tensor::DTYPE_CUSTOM_START {
+    if nsl_dtype > crate::tensor::DTYPE_INT8_BLOCKWISE
+        && nsl_dtype < crate::tensor::DTYPE_CUSTOM_START
+    {
         eprintln!(
             "nsl: internal dtype tag {nsl_dtype} has no C API representation \
-             (canonical built-in tags are 0..=9)"
+             (canonical built-in tags are 0..={})",
+            crate::tensor::DTYPE_INT8_BLOCKWISE
         );
         std::process::abort();
     }
@@ -2257,20 +2262,21 @@ mod tests {
     fn test_dtype_mapping() {
         // P4 item 16: the C API tag space IS the canonical tag space — both
         // chokepoints are validating identity maps.
-        for capi_d in 0..=9 {
+        let last = crate::tensor::DTYPE_INT8_BLOCKWISE as i32; // 10
+        for capi_d in 0..=last {
             let nsl_d = capi_dtype_to_nsl(capi_d)
                 .unwrap_or_else(|| panic!("tag {capi_d} must be accepted"));
             assert_eq!(nsl_d as i32, capi_d, "C API tag must equal canonical tag");
             let back = nsl_dtype_to_capi(nsl_d);
             assert_eq!(back, capi_d, "Roundtrip failed for C API dtype {capi_d}");
         }
-        // Out-of-range tags are REFUSED, not aborted on. `-1` and `10` bracket
-        // the accepted window; `42` is the tag the interop gate drives.
-        for bad in [-1_i32, 10, 42, i32::MAX] {
+        // Out-of-range tags are REFUSED, not aborted on. `-1` and `last + 1`
+        // bracket the accepted window; `42` is the tag the interop gate drives.
+        for bad in [-1_i32, last + 1, 42, i32::MAX] {
             assert_eq!(
                 capi_dtype_to_nsl(bad),
                 None,
-                "tag {bad} is outside 0..=9 and must be refused"
+                "tag {bad} is outside 0..={last} and must be refused"
             );
         }
     }

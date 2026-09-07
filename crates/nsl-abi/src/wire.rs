@@ -49,6 +49,15 @@ pub mod dtype {
     pub const DTYPE_U16_TOKEN: u16 = 7;
     pub const DTYPE_U16_SEGMENT: u16 = 8;
     pub const DTYPE_I32: u16 = 9;
+    /// Blockwise-quantized int8 (`nsl_tensor_quant_int8_blockwise`): `len`
+    /// int8 values padded to 4 bytes, then one f32 scale per 64-value block,
+    /// in ONE buffer. It carries its own tag because its buffer is not
+    /// `len` bytes — the runtime's `data_byte_size` sizes it by the packed
+    /// formula, which is what makes its free and clone match its allocation
+    /// (found by Miri as a mismatched-layout dealloc while it was tagged
+    /// `DTYPE_INT8`). No C-API / DLPack representation: exporting one is
+    /// refused like any other unsupported dtype.
+    pub const DTYPE_INT8_BLOCKWISE: u16 = 10;
     /// First user-defined dtype tag.
     pub const DTYPE_CUSTOM_START: u16 = 256;
 }
@@ -139,8 +148,9 @@ mod tests {
             [
                 DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8, DTYPE_FP8E4M3,
                 DTYPE_FP8E5M2, DTYPE_U16_TOKEN, DTYPE_U16_SEGMENT, DTYPE_I32,
+                DTYPE_INT8_BLOCKWISE,
             ],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
         assert_eq!(DTYPE_CUSTOM_START, 256);
     }

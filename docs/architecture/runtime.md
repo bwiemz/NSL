@@ -129,8 +129,12 @@ gates*).
 A3 moves the declaration into `nsl-abi`, with the runtime re-exporting
 every name at this path, so readers are unaffected): `DTYPE_F64 = 0`, `DTYPE_F32 = 1`, `DTYPE_FP16 = 2`,
 `DTYPE_BF16 = 3`, `DTYPE_INT8 = 4`, `DTYPE_FP8E4M3 = 5`, `DTYPE_FP8E5M2 = 6`,
-`DTYPE_U16_TOKEN = 7`, `DTYPE_U16_SEGMENT = 8`, `DTYPE_I32 = 9`, custom
-dtypes from `DTYPE_CUSTOM_START = 256` (registered once at init through the
+`DTYPE_U16_TOKEN = 7`, `DTYPE_U16_SEGMENT = 8`, `DTYPE_I32 = 9`,
+`DTYPE_INT8_BLOCKWISE = 10` (the blockwise-quantized int8 buffer: values
+padded to 4 bytes plus one f32 scale per 64-value block, sized by
+`data_byte_size` through `int8_blockwise_byte_size`; it had been tagged
+`DTYPE_INT8` and freed as `len` bytes until Miri caught the mismatched
+layout), custom dtypes from `DTYPE_CUSTOM_START = 256` (registered once at init through the
 `STAGING_REGISTRY` / `CUSTOM_DTYPE_REGISTRY` pair). The C API's
 `NslTensorDesc.dtype` uses the same space verbatim; the `dtype_abi_lock` unit
 test in the same file fails if any value moves. Add new tags at the next free
