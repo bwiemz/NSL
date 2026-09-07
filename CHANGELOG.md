@@ -108,6 +108,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): section 8 of
+  the source-AD arm — the parameter-gradient list (or the FASE-hook null
+  sentinel), the gradient-summary diagnostics and the ownership sweep of
+  the lowering's intermediates — moved into `stmt_train/source_ad_grads.rs`
+  (`emit_source_ad_grads`, fed by a `SourceAdGradsInputs`, returning the
+  arm's `(grads, loss, source_ad, wengert_freed)` value). 332 lines out of
+  the driver; the train-block CLIF snapshots are unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): the CSLA window
   save phase — the `csla_active` arm of the adjoint-lowering site: the
   side-channel refusals, the per-micro-batch slot push of every
