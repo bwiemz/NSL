@@ -365,8 +365,7 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
     }
     let t = NslTensor::from_ptr(tensor_ptr);
     if t.device == 0 {
-        eprintln!(
-            "[weight-stream] FATAL: --weight-stream requires GPU placement — \
+        crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: --weight-stream requires GPU placement — \
              call m.to(cuda) before the train block (param tensor {tensor_ptr} \
              is CPU-resident)"
         );
@@ -403,8 +402,7 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
         // may enter the streaming table (a view/slab param would corrupt on
         // free-and-reupload — the #397 hazard).
         if t.owns_data == 0 || t.data_owner != 0 || t.slab_managed != 0 {
-            eprintln!(
-                "[weight-stream] refusing to register tensor {tensor_ptr}: \
+            crate::nsl_log!(WARN, "weight-stream", "[weight-stream] refusing to register tensor {tensor_ptr}: \
                  owns_data={} data_owner={} slab_managed={} — only plain owning \
                  non-slab GPU tensors stream",
                 t.owns_data, t.data_owner, t.slab_managed
@@ -463,7 +461,7 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!("[weight-stream] register called in a non-CUDA build");
+        crate::nsl_log!(WARN, "weight-stream", "[weight-stream] register called in a non-CUDA build");
         std::process::abort();
     }
 }
@@ -498,8 +496,7 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
         drain_writebacks_for_params(&[tensor_ptr]);
         let mut guard = MIRRORS.lock().unwrap();
         let Some(m) = guard.as_mut().and_then(|g| g.get_mut(&tensor_ptr)) else {
-            eprintln!(
-                "[weight-stream] FATAL: upload of unregistered tensor {tensor_ptr}"
+            crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: upload of unregistered tensor {tensor_ptr}"
             );
             std::process::abort();
         };
@@ -509,8 +506,7 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
         // would read a null pointer and silently fill θ with garbage.
         // Refuse instead of dereferencing (deferral-must-refuse).
         if m.pinned {
-            eprintln!(
-                "[weight-stream] FATAL: pinned-resident tensor {tensor_ptr} was \
+            crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: pinned-resident tensor {tensor_ptr} was \
                  found evicted — its device storage was freed by something \
                  outside the residency backend, and it has no host mirror to \
                  restore from"
@@ -538,7 +534,7 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!("[weight-stream] upload called in a non-CUDA build");
+        crate::nsl_log!(WARN, "weight-stream", "[weight-stream] upload called in a non-CUDA build");
         std::process::abort();
     }
 }
@@ -579,8 +575,7 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
         let Some(m) = guard.as_mut().and_then(|g| g.get_mut(&tensor_ptr)) else {
             // No call site legitimately evicts an unregistered tensor —
             // a silent pass here would mask a codegen slip (review D2b-6).
-            eprintln!(
-                "[weight-stream] FATAL: evict of unregistered tensor {tensor_ptr}"
+            crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: evict of unregistered tensor {tensor_ptr}"
             );
             std::process::abort();
         };
@@ -616,7 +611,7 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
     #[cfg(not(feature = "cuda"))]
     {
         let _ = writeback;
-        eprintln!("[weight-stream] evict called in a non-CUDA build");
+        crate::nsl_log!(WARN, "weight-stream", "[weight-stream] evict called in a non-CUDA build");
         std::process::abort();
     }
 }
@@ -728,8 +723,7 @@ fn arena_acquire(bytes: usize, live: usize) -> (usize, *mut c_void, *mut u8) {
         .position(|s| s.live == 0 && !s.wb_pending && s.cap >= bytes)
     {
         if pool[idx].pending_event != 0 {
-            eprintln!(
-                "[weight-stream] FATAL: reusing arena slot {idx} with an un-awaited prefetch \
+            crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: reusing arena slot {idx} with an un-awaited prefetch \
                  event — a prefetch was recycled before its await drained (async-evict / \
                  depth>1 regression). This would read a half-overwritten host_stage."
             );
@@ -921,7 +915,7 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
     for i in 0..n {
         let ptr = unsafe { *list.data.add(i) };
         let Some(m) = table.get(&ptr) else {
-            eprintln!("[weight-stream] FATAL: upload_pack of unregistered tensor {ptr}");
+            crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: upload_pack of unregistered tensor {ptr}");
             std::process::abort();
         };
         // Pinned-resident members carry no mirror and need no transfer, so
@@ -1044,8 +1038,7 @@ pub extern "C" fn nsl_weight_stream_await_pack(pw_list_ptr: i64) {
                 // (Item 11 review LOW). Fail loudly rather than leak the event
                 // and leave the HtoD unordered (a silent race).
                 Some(_) => {
-                    eprintln!(
-                        "[weight-stream] FATAL: await_pack of a registered but non-resident \
+                    crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: await_pack of a registered but non-resident \
                          pack (first param {first}) — prefetch/await grouping desync"
                     );
                     std::process::abort();
@@ -1121,7 +1114,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64)
         for i in 0..n {
             let ptr = unsafe { *list.data.add(i) };
             let Some(m) = table.get(&ptr) else {
-                eprintln!("[weight-stream] FATAL: evict_pack of unregistered tensor {ptr}");
+                crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: evict_pack of unregistered tensor {ptr}");
                 std::process::abort();
             };
             // Pinned-resident: by construction arena_slot is -1 AND data is
@@ -1140,8 +1133,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64)
                 // (review Item-10 finding B; matters now that --stream-prefetch
                 // and the callback guard mint per-param owned buffers).
                 if !NslTensor::from_ptr(ptr).data.is_null() {
-                    eprintln!(
-                        "[weight-stream] FATAL: evict_pack member {ptr} is resident via a \
+                    crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: evict_pack member {ptr} is resident via a \
                          non-arena buffer (arena_slot=-1, data!=null) — pack grouping mismatch"
                     );
                     std::process::abort();
@@ -1151,8 +1143,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64)
             if slot < 0 {
                 slot = m.arena_slot;
             } else if slot != m.arena_slot {
-                eprintln!(
-                    "[weight-stream] FATAL: evict_pack members span slots {slot} and {} \
+                crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: evict_pack members span slots {slot} and {} \
                      — pack upload/evict grouping mismatch",
                     m.arena_slot
                 );
@@ -1344,7 +1335,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
         for i in 0..n {
             let ptr = unsafe { *list.data.add(i) };
             let Some(m) = table.get(&ptr) else {
-                eprintln!("[weight-stream] FATAL: evict_pack_async of unregistered tensor {ptr}");
+                crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: evict_pack_async of unregistered tensor {ptr}");
                 std::process::abort();
             };
             // Pinned-resident: same reasoning as the synchronous evict_pack —
@@ -1357,8 +1348,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
             }
             if m.arena_slot < 0 {
                 if !NslTensor::from_ptr(ptr).data.is_null() {
-                    eprintln!(
-                        "[weight-stream] FATAL: evict_pack_async member {ptr} is resident via \
+                    crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: evict_pack_async member {ptr} is resident via \
                          a non-arena buffer (arena_slot=-1, data!=null) — pack grouping mismatch"
                     );
                     std::process::abort();
@@ -1368,8 +1358,7 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
             if slot < 0 {
                 slot = m.arena_slot;
             } else if slot != m.arena_slot {
-                eprintln!(
-                    "[weight-stream] FATAL: evict_pack_async members span slots {slot} and {} \
+                crate::nsl_log!(ERROR, "weight-stream", "[weight-stream] FATAL: evict_pack_async members span slots {slot} and {} \
                      — pack upload/evict grouping mismatch",
                     m.arena_slot
                 );

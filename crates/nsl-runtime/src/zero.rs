@@ -2279,8 +2279,7 @@ pub extern "C" fn nsl_zero3_enable() -> i64 {
     ZERO3_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut guard = ZERO3_TABLE.lock().unwrap();
     guard.get_or_insert_with(std::collections::HashMap::new);
-    eprintln!(
-        "[zero3] tensor-granular parameter sharding enabled: owners keep \
+    crate::nsl_log!(INFO, "zero3", "[zero3] tensor-granular parameter sharding enabled: owners keep \
          their params device-resident, non-owners hold nothing at rest and \
          gather per layer window (optimizer moments are OWNER-ONLY too — \
          allocation is deferred to the first window and every rank holds \
@@ -2360,8 +2359,7 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
     if numel == 0 || !numel.is_multiple_of(ws) {
         // The plan's eligibility already excluded ragged params — reaching
         // here means codegen and runtime disagree about the shard layout.
-        eprintln!(
-            "[zero3] FATAL: param {idx} marked elementwise with numel {numel} \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: param {idx} marked elementwise with numel {numel} \
              not divisible by world_size {ws} — the compile-time eligibility \
              and this runtime have drifted"
         );
@@ -2369,8 +2367,7 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
     }
     let mut guard = ZERO3_TABLE.lock().unwrap();
     let Some(e) = guard.as_mut().and_then(|m| m.get_mut(&tensor_ptr)) else {
-        eprintln!(
-            "[zero3] FATAL: elementwise mark of an un-noted param tensor \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise mark of an un-noted param tensor \
              {tensor_ptr} — codegen must emit nsl_zero3_note_param first"
         );
         std::process::abort();
@@ -2378,8 +2375,7 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
     if !e.elem_pending {
         static ARMED: std::sync::Once = std::sync::Once::new();
         ARMED.call_once(|| {
-            eprintln!(
-                "[zero3] elementwise sharding armed: eligible params live as \
+            crate::nsl_log!(INFO, "zero3", "[zero3] elementwise sharding armed: eligible params live as \
                  1/{ws} slices per rank, gathers ride all_gather, gradients \
                  reduce_scatter, every rank steps its own slice — and m/v are \
                  SLICE-sized too (1/{ws} of the moment surface per rank, \
@@ -2392,16 +2388,14 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
     // re-mark can never silently disagree with the first about storage.
     let sr = sr != 0;
     if sr && !crate::sr_bf16::srbf16_active() {
-        eprintln!(
-            "[zero3] FATAL: param {idx} marked bf16-sr elementwise but the SR \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: param {idx} marked bf16-sr elementwise but the SR \
              backend was never enabled — the plan's storage decision and the \
              emitted enable belt have drifted"
         );
         std::process::abort();
     }
     if e.elem.is_some() && e.elem_sr != sr {
-        eprintln!(
-            "[zero3] FATAL: param {idx} re-marked with storage sr={sr} after \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: param {idx} re-marked with storage sr={sr} after \
              its slice was carved as sr={} — the slice bytes cannot change \
              dtype under a live schedule",
             e.elem_sr
@@ -2430,8 +2424,7 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
     if theta_ptr == 0 {
-        eprintln!(
-            "[zero3] FATAL: elementwise moment allocation for a null \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise moment allocation for a null \
              parameter slot (param {idx})"
         );
         std::process::abort();
@@ -2440,23 +2433,20 @@ pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
     let (shard, elem_bytes) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|map| map.get(&theta_ptr)) else {
-            eprintln!(
-                "[zero3] FATAL: elementwise moment allocation for untracked \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise moment allocation for untracked \
                  tensor {theta_ptr} (param {idx})"
             );
             std::process::abort();
         };
         if e.idx != idx as usize {
-            eprintln!(
-                "[zero3] FATAL: elementwise moment param-index mismatch \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise moment param-index mismatch \
                  (tensor says {}, codegen says {idx})",
                 e.idx
             );
             std::process::abort();
         }
         let Some(s) = e.elem.as_ref() else {
-            eprintln!(
-                "[zero3] FATAL: elementwise moment allocation for param {idx}, \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise moment allocation for param {idx}, \
                  which was never carved — the deferred moment fill must be \
                  emitted AFTER the weight-stream register belt"
             );
@@ -2468,8 +2458,7 @@ pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
     // moment would be sized for one storage and stepped as another.
     let expect_bytes = if th.dtype == 0 { 8 } else { 4 };
     if shard == 0 || (th.dtype != 0 && th.dtype != 1) || elem_bytes != expect_bytes {
-        eprintln!(
-            "[zero3] FATAL: elementwise moment for param {idx} has an \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise moment for param {idx} has an \
              inconsistent slice descriptor (shard={shard} elem_bytes={} \
              theta dtype={})",
             elem_bytes, th.dtype
@@ -2491,8 +2480,7 @@ pub extern "C" fn nsl_zero3_alloc_elem_moment(theta_ptr: i64, idx: i64) -> i64 {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!(
-                "[zero3] FATAL: device elementwise moment in a non-cuda build"
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: device elementwise moment in a non-cuda build"
             );
             std::process::abort();
         }
@@ -2560,8 +2548,7 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
     let mut guard = ZERO3_TABLE.lock().unwrap();
     let table = guard.get_or_insert_with(std::collections::HashMap::new);
     let Some(e) = table.get_mut(&tensor_ptr) else {
-        eprintln!(
-            "[zero3] FATAL: register of an un-noted param tensor {tensor_ptr} \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: register of an un-noted param tensor {tensor_ptr} \
              — codegen must emit nsl_zero3_note_param for every param"
         );
         std::process::abort();
@@ -2572,8 +2559,7 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
     if e.state == ParameterResidency::Replicated
         && (t.owns_data == 0 || t.data_owner != 0 || t.slab_managed != 0)
     {
-        eprintln!(
-            "[zero3] refusing to shard tensor {tensor_ptr}: owns_data={} \
+        crate::nsl_log!(WARN, "zero3", "[zero3] refusing to shard tensor {tensor_ptr}: owns_data={} \
              data_owner={} slab_managed={} — only plain owning tensors shard",
             t.owns_data, t.data_owner, t.slab_managed
         );
@@ -2594,8 +2580,7 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
             // under composed bf16-sr the tensor stays a plain f32 working
             // transient and only the SLICE storage below is bf16.
             if t.dtype != 0 && t.dtype != 1 {
-                eprintln!(
-                    "[zero3] FATAL: elementwise carve of dtype {} (param {}) — \
+                crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise carve of dtype {} (param {}) — \
                      only f64/f32 parameters shard elementwise",
                     t.dtype, e.idx
                 );
@@ -2616,8 +2601,7 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
             let sr_param_idx = if e.elem_sr { Some(e.idx as u64) } else { None };
             if sr_param_idx.is_some() {
                 if t.device == 0 || t.dtype != 1 {
-                    eprintln!(
-                        "[zero3] FATAL: bf16-sr elementwise carve of param {} \
+                    crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise carve of param {} \
                          requires a GPU-resident f32 tensor (device={}, \
                          dtype={}) — the SR backend is GPU-only",
                         e.idx, t.device, t.dtype
@@ -2628,8 +2612,7 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
                     // The rank offset rides inside the param's counter
                     // block; an oversized param would alias the next
                     // param's dither stream (same guard as register's).
-                    eprintln!(
-                        "[zero3] FATAL: bf16-sr elementwise param {} has {} \
+                    crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise param {} has {} \
                          elements — the SR counter block holds 2^{}",
                         e.idx,
                         numel,
@@ -2751,7 +2734,7 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
     let (owner, is_owner, elem_info) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
-            eprintln!("[zero3] FATAL: gather of untracked tensor {tensor_ptr}");
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: gather of untracked tensor {tensor_ptr}");
             std::process::abort();
         };
         if e.state == ParameterResidency::GatheredTemporary {
@@ -2799,22 +2782,20 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
             // A gather after ZeRO teardown would hand back UNINITIALIZED
             // device bytes on non-owners with no error — refuse loudly
             // (deferral-must-refuse; review finding 5).
-            eprintln!("[zero3] FATAL: gather with no ZeRO context (post-destroy?)");
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: gather with no ZeRO context (post-destroy?)");
             std::process::abort();
         };
         // The backend checks apply exactly where a collective will run
         // (ws>1) — a single-rank gather is a local copy (elementwise) or a
         // no-op (tensor-granular) and must not add new refusals.
         if t.device != 0 && ctx.world_size > 1 && !ctx.cuda_aware {
-            eprintln!(
-                "[zero3] FATAL: GPU-resident ZeRO-3 needs a CUDA-aware \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: GPU-resident ZeRO-3 needs a CUDA-aware \
                  collective backend (sim-gpu or nccl)"
             );
             std::process::abort();
         }
         if t.device != 0 && t.dtype != 1 && ctx.world_size > 1 {
-            eprintln!(
-                "[zero3] FATAL: GPU param dtype {} unsupported (f32 only)",
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: GPU param dtype {} unsupported (f32 only)",
                 t.dtype
             );
             std::process::abort();
@@ -2893,8 +2874,7 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
-                        eprintln!(
-                            "[zero3] FATAL: bf16-sr elementwise gather in a \
+                        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise gather in a \
                              non-cuda build"
                         );
                         std::process::abort();
@@ -2936,7 +2916,7 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
         }
     };
     if rc != 0 {
-        eprintln!("[zero3] FATAL: gather collective failed rc={rc}");
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: gather collective failed rc={rc}");
         std::process::abort();
     }
     let mut tbl = ZERO3_TABLE.lock().unwrap();
@@ -2954,7 +2934,7 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
     let (is_owner, elem_info) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
-            eprintln!("[zero3] FATAL: release of untracked tensor {tensor_ptr}");
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: release of untracked tensor {tensor_ptr}");
             std::process::abort();
         };
         if e.state == ParameterResidency::Replicated {
@@ -3118,8 +3098,7 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
                 return -1;
             };
             if (t.len.max(0) as usize) != shard * ctx.world_size.max(1) {
-                eprintln!(
-                    "[zero3] FATAL: elementwise grad slot {idx} has {} elements \
+                crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise grad slot {idx} has {} elements \
                      but the shard layout says {}x{} — plan/runtime drift",
                     t.len,
                     shard,
@@ -3153,14 +3132,13 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
                     .as_ref()
                     .expect("world_size > 1 implies a backend");
                 if t.device != 0 && !ctx.cuda_aware {
-                    eprintln!(
-                        "[zero3] FATAL: GPU-resident gradient reduce_scatter \
+                    crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: GPU-resident gradient reduce_scatter \
                          needs a CUDA-aware collective backend (sim-gpu or nccl)"
                     );
                     std::process::abort();
                 }
                 if t.device != 0 && t.dtype != 1 {
-                    eprintln!("[zero3] FATAL: GPU grad dtype {} unsupported", t.dtype);
+                    crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: GPU grad dtype {} unsupported", t.dtype);
                     std::process::abort();
                 }
                 let rc = backend.reduce_scatter_sum(
@@ -3182,7 +3160,7 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
             }
         };
         if rc != 0 {
-            eprintln!("[zero3] gradient reduce_scatter failed rc={rc} for slot {idx}");
+            crate::nsl_log!(WARN, "zero3", "[zero3] gradient reduce_scatter failed rc={rc} for slot {idx}");
             return -1;
         }
         // The same sum-then-divide averaging as the all-reduce arm, applied
@@ -3234,14 +3212,13 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
         .as_ref()
         .expect("world_size > 1 implies a backend");
     if t.device != 0 && !ctx.cuda_aware {
-        eprintln!(
-            "[zero3] FATAL: GPU-resident gradient all-reduce needs a \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: GPU-resident gradient all-reduce needs a \
              CUDA-aware collective backend (sim-gpu or nccl)"
         );
         std::process::abort();
     }
     if t.device != 0 && t.dtype != 1 {
-        eprintln!("[zero3] FATAL: GPU grad dtype {} unsupported", t.dtype);
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: GPU grad dtype {} unsupported", t.dtype);
         std::process::abort();
     }
     let rc = backend.all_reduce_sum(
@@ -3256,7 +3233,7 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
         std::ptr::null_mut(),
     );
     if rc != 0 {
-        eprintln!("[zero3] gradient all-reduce failed rc={rc} for slot {idx}");
+        crate::nsl_log!(WARN, "zero3", "[zero3] gradient all-reduce failed rc={rc} for slot {idx}");
         return -1;
     }
     // Gradient AVERAGING — the same sum-then-divide convention as
@@ -3309,23 +3286,20 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
     let (shard, elem_bytes, grad_ptr) = {
         let tbl = ZERO3_TABLE.lock().unwrap();
         let Some(e) = tbl.as_ref().and_then(|map| map.get(&theta_ptr)) else {
-            eprintln!(
-                "[zero3] FATAL: elementwise step of untracked tensor \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise step of untracked tensor \
                  {theta_ptr} (param {idx})"
             );
             std::process::abort();
         };
         if e.idx != idx as usize {
-            eprintln!(
-                "[zero3] FATAL: elementwise step param-index mismatch \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise step param-index mismatch \
                  (tensor says {}, codegen says {idx})",
                 e.idx
             );
             std::process::abort();
         }
         let Some(s) = e.elem.as_ref() else {
-            eprintln!(
-                "[zero3] FATAL: elementwise step of param {idx}, which was \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise step of param {idx}, which was \
                  never carved — the plan and the emitted step dispatch have \
                  drifted"
             );
@@ -3334,8 +3308,7 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         if !s.grad_ready {
             // A step without a fresh reduce would apply a stale or
             // uninitialized gradient slice — a silent-wrong-numerics class.
-            eprintln!(
-                "[zero3] FATAL: elementwise step of param {idx} before its \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise step of param {idx} before its \
                  window gradient was reduce_scattered"
             );
             std::process::abort();
@@ -3345,8 +3318,7 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
             // update θ WITHOUT stochastic rounding and then overrun the
             // 2-byte slice with a 4-byte copy. The composed dispatch emits
             // `nsl_zero3_elem_sr_adamw_step` for SR-carved params.
-            eprintln!(
-                "[zero3] FATAL: bf16-sr-carved param {idx} routed to the \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr-carved param {idx} routed to the \
                  plain elementwise step — the emitted dispatch and the carve \
                  have drifted"
             );
@@ -3359,8 +3331,7 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         )
     };
     if th.data.is_null() || grad_ptr == 0 {
-        eprintln!(
-            "[zero3] FATAL: elementwise step of param {idx} without a \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise step of param {idx} without a \
              materialized full tensor (gather must precede the group update)"
         );
         std::process::abort();
@@ -3446,7 +3417,7 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         }
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!("[zero3] FATAL: GPU elementwise step in a non-cuda build");
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: GPU elementwise step in a non-cuda build");
             std::process::abort();
         }
     } else if th.dtype == 0 && m.dtype == 0 && v.dtype == 0 {
@@ -3532,8 +3503,7 @@ pub extern "C" fn nsl_zero3_elem_adamw_step(
         }
         persist_host_slice(theta_ptr, th, off_bytes, shard * elem_bytes);
     } else {
-        eprintln!(
-            "[zero3] FATAL: elementwise step dtype combination unsupported \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: elementwise step dtype combination unsupported \
              (theta={}, m={}, v={})",
             th.dtype, m.dtype, v.dtype
         );
@@ -3604,23 +3574,20 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
         let (shard, elem_bytes, grad_ptr, slice_ptr, sr_idx) = {
             let tbl = ZERO3_TABLE.lock().unwrap();
             let Some(e) = tbl.as_ref().and_then(|map| map.get(&theta_ptr)) else {
-                eprintln!(
-                    "[zero3] FATAL: bf16-sr elementwise step of untracked \
+                crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise step of untracked \
                      tensor {theta_ptr} (param {idx})"
                 );
                 std::process::abort();
             };
             if e.idx != idx as usize {
-                eprintln!(
-                    "[zero3] FATAL: bf16-sr elementwise step param-index \
+                crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise step param-index \
                      mismatch (tensor says {}, codegen says {idx})",
                     e.idx
                 );
                 std::process::abort();
             }
             let Some(s) = e.elem.as_ref() else {
-                eprintln!(
-                    "[zero3] FATAL: bf16-sr elementwise step of param {idx}, \
+                crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise step of param {idx}, \
                      which was never carved — the plan and the emitted step \
                      dispatch have drifted"
                 );
@@ -3630,16 +3597,14 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
                 // The inverse of the plain step's belt: a plain-carved
                 // param stepped here would draw a dither stream nothing
                 // noted, and its 4-byte slice would be read as bf16.
-                eprintln!(
-                    "[zero3] FATAL: param {idx} was carved WITHOUT bf16-sr \
+                crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: param {idx} was carved WITHOUT bf16-sr \
                      but routed to the SR elementwise step — the emitted \
                      dispatch and the carve have drifted"
                 );
                 std::process::abort();
             };
             if !s.grad_ready {
-                eprintln!(
-                    "[zero3] FATAL: bf16-sr elementwise step of param {idx} \
+                crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise step of param {idx} \
                      before its window gradient was reduce_scattered"
                 );
                 std::process::abort();
@@ -3653,8 +3618,7 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
             )
         };
         if th.data.is_null() || grad_ptr == 0 {
-            eprintln!(
-                "[zero3] FATAL: bf16-sr elementwise step of param {idx} \
+            crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: bf16-sr elementwise step of param {idx} \
                  without a materialized full tensor (gather must precede \
                  the group update)"
             );
@@ -3805,8 +3769,7 @@ pub extern "C" fn nsl_zero3_elem_sr_adamw_step(
             theta_ptr, m_ptr, v_ptr, idx, lr, beta1, one_minus_beta1, beta2,
             one_minus_beta2, eps, wd, bc1_inv, bc2_inv, step,
         );
-        eprintln!(
-            "[zero3] FATAL: the bf16-sr elementwise step requires the cuda \
+        crate::nsl_log!(ERROR, "zero3", "[zero3] FATAL: the bf16-sr elementwise step requires the cuda \
              feature (the SR backend is GPU-only)"
         );
         std::process::abort();

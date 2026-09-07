@@ -53,7 +53,7 @@ impl CudaEventClock {
             match crate::cuda::cu_event_create_checked() {
                 Ok(e) => e,
                 Err(res) => {
-                    eprintln!("[nsl-profiler] cuEventCreate failed: {:?}", res);
+                    crate::nsl_log!(WARN, "nsl-profiler", "[nsl-profiler] cuEventCreate failed: {:?}", res);
                     0
                 }
             }
@@ -82,8 +82,7 @@ impl ClockSource for CudaEventClock {
         unsafe {
             let sync_res = crate::cuda::cu_event_synchronize_raw(end);
             if sync_res != CUresult::CUDA_SUCCESS {
-                eprintln!(
-                    "[nsl-profiler] cuEventSynchronize failed ({:?}); dropping pair",
+                crate::nsl_log!(WARN, "nsl-profiler", "[nsl-profiler] cuEventSynchronize failed ({:?}); dropping pair",
                     sync_res
                 );
                 self.return_event(start);
@@ -95,7 +94,7 @@ impl ClockSource for CudaEventClock {
             self.return_event(start);
             self.return_event(end);
             if el_res != CUresult::CUDA_SUCCESS {
-                eprintln!("[nsl-profiler] cuEventElapsedTime failed ({:?})", el_res);
+                crate::nsl_log!(WARN, "nsl-profiler", "[nsl-profiler] cuEventElapsedTime failed ({:?})", el_res);
                 return 0.0;
             }
             // ms → μs

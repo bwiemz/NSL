@@ -50,6 +50,12 @@ rand = "0.10"
 rand_chacha = "0.10"
 toml = "1.1"
 bytemuck = { version = "1", features = ["derive"] }
+# Structured logging front door (roadmap C3): the runtime's prints go
+# through `tracing` events so a host can subscribe, while nsl-runtime's own
+# subscriber keeps stderr byte-identical. `std` only — no `attributes`
+# (the proc-macro crate) and no `log` bridge, so the tree is tracing +
+# tracing-core.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Benchmark harness (roadmap T3). Default features are off: `rayon` and
 # `plotters` (gnuplot-style HTML plots) are dead weight for a compare-against-
 # baseline workflow, and each one is a dependency tree the supply-chain gate

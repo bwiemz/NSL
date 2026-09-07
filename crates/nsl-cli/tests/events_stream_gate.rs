@@ -195,13 +195,22 @@ fn the_schema_registry_is_internally_consistent() {
     for s in EVENT_SCHEMAS {
         assert!(kinds.insert(s.kind), "duplicate event kind '{}'", s.kind);
         assert!(
-            nsl_cli::exec_markers::EXEC_MARKERS
-                .iter()
-                .any(|m| m.token == s.marker),
+            s.marker == nsl_cli::exec_markers::LINE_IS_THE_MARKER
+                || nsl_cli::exec_markers::EXEC_MARKERS
+                    .iter()
+                    .any(|m| m.token == s.marker),
             "schema '{}' names marker '{}' which is not in EXEC_MARKERS",
             s.kind,
             s.marker
         );
+        if s.marker == nsl_cli::exec_markers::LINE_IS_THE_MARKER {
+            // The line-carrying kind must actually carry the line.
+            assert!(
+                s.fields.contains(&"message"),
+                "schema '{}' says the line is the marker but has no `message` field",
+                s.kind
+            );
+        }
         assert!(!s.fields.is_empty(), "schema '{}' has no fields", s.kind);
         let mut f = std::collections::HashSet::new();
         for field in s.fields {

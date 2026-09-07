@@ -394,6 +394,9 @@ fn every_clap_constraint_is_registered_and_vice_versa() {
 const REFUSAL_MARKERS: &[&str] = &[
     "CodegenError::new(",
     "eprintln!(",
+    // The runtime's logging front door (roadmap C3): the line is the
+    // macro's third argument onwards, byte for byte what `eprintln!` took.
+    "nsl_log!(",
     "panic!(",
     "Err(format!(",
     "format!(",
@@ -423,6 +426,9 @@ fn refusal_text(path: &std::path::Path) -> String {
 /// Print macros — the call sites that can put a marker on stderr.
 const PRINT_MARKERS: &[&str] = &[
     "eprintln!(",
+    // `crate::nsl_log!(LEVEL, "target", "…")` — nsl-runtime's `tracing`
+    // front door (roadmap C3); its message reaches stderr verbatim.
+    "nsl_log!(",
     "println!(",
     "eprint!(",
     "print!(",
