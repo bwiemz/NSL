@@ -5691,7 +5691,6 @@ mod tests {
         crate::list::nsl_list_push(shape_list, 3);
         crate::list::nsl_list_push(shape_list, 4);
         let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
-        let tensor = NslTensor::from_ptr(t);
         // strides = [12, 4, 1]
 
         let tr = nsl_tensor_transpose(t, 0, 2);
@@ -5720,7 +5719,6 @@ mod tests {
         crate::list::nsl_list_push(shape_list, 3);
         crate::list::nsl_list_push(shape_list, 4);
         let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
-        let tensor = NslTensor::from_ptr(t);
         // shape=[3,4], strides=[4,1]
 
         let u = nsl_tensor_unsqueeze(t, 0);

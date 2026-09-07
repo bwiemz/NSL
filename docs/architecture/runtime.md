@@ -646,8 +646,12 @@ using it within the call. Those ten tests now re-derive after the call.
 The measured gap that remains is the one the paragraph above describes:
 an op that takes two handles which alias (`add(x, x)`, an in-place op
 whose `dst` is one of its inputs) derives two `&mut` to one tensor, and
-nothing in the suite exercises that under Miri yet. Not in CI: it needs
-a nightly toolchain and interprets at roughly a minute per test.
+nothing in the suite exercises that under Miri yet. The script passes
+`-Zmiri-ignore-leaks`: the tests leak shape lists and tensors on purpose
+(110 allocations at exit), which is test hygiene, not the aliasing
+question. Not in CI only because it needs a nightly toolchain: once the
+crate is built for Miri the whole module interprets in about ten seconds
+(`--each` pays a process start per test and takes a minute or so each).
 
 ## Where to add a new X
 

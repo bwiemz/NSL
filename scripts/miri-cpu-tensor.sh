@@ -19,7 +19,11 @@
 # `-Zmiri-disable-isolation` lets the tests read the clock / env;
 # `-Zmiri-permissive-provenance` silences the int-to-pointer warning that
 # every handle conversion would otherwise print (the handles are integers by
-# ABI design, which is exactly the C2 debt this run measures).
+# ABI design, which is exactly the C2 debt this run measures);
+# `-Zmiri-ignore-leaks` turns off the exit-time leak check, because the
+# question here is aliasing, and the tests leak on purpose (shape lists and
+# tensors that are never freed — 110 allocations across the module). Drop
+# that flag to audit test hygiene instead.
 #
 # Usage:  scripts/miri-cpu-tensor.sh            # whole module, one process
 #         scripts/miri-cpu-tensor.sh --each     # one process per test, so an
@@ -27,7 +31,7 @@
 #                                               # hide the rest (slower)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation -Zmiri-permissive-provenance}"
+export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks}"
 filter="tensor::tests"
 
 if [[ "${1:-}" == "--each" ]]; then
