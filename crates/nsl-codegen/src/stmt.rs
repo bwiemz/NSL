@@ -2355,9 +2355,9 @@ impl Compiler<'_> {
 
                 // Phase 5 Task 7: after the inner VarDecl has bound the
                 // target, emit @inspect hooks.  Only active when
-                // `compile_options.inspect_enabled` is true and the stmt
+                // `compile_options.dev_tools.inspect_enabled` is true and the stmt
                 // is a `let x = ...`.
-                if self.compile_options.inspect_enabled
+                if self.compile_options.dev_tools.inspect_enabled
                     && let StmtKind::VarDecl { pattern, .. } = &stmt.kind
                     && let PatternKind::Ident(target_sym) = &pattern.kind
                 {
@@ -6179,8 +6179,8 @@ impl Compiler<'_> {
         self.inspect_train_step_var = Some(step_count_var);
 
         // ── 5a. Dev Tools Phase 4 Task 4: optional health flush-interval setter ──
-        if self.compile_options.health_monitor
-            && let Some(n) = self.compile_options.health_flush_interval
+        if self.compile_options.dev_tools.health_monitor
+            && let Some(n) = self.compile_options.dev_tools.health_flush_interval
         {
             let n_val = builder.ins().iconst(cl_types::I64, n as i64);
             self.compile_call_by_name(builder, "nsl_health_set_flush_interval", &[n_val])?;
@@ -11644,7 +11644,7 @@ impl Compiler<'_> {
         // `loss` back through nsl_health_get_last_loss, so without this call
         // the collector would stay empty and `loss` would read 0.0 (the exact
         // silent-wrong the getter replaced).
-        if self.compile_options.health_monitor || self.compile_options.inspect_enabled {
+        if self.compile_options.dev_tools.health_monitor || self.compile_options.dev_tools.inspect_enabled {
             let loss_scalar = self.compile_call_by_name(
                 builder,
                 "nsl_tensor_item",
@@ -11658,7 +11658,7 @@ impl Compiler<'_> {
             )?;
         }
 
-        if self.compile_options.health_monitor {
+        if self.compile_options.dev_tools.health_monitor {
             use cranelift_codegen::ir::{types as cl_types, MemFlagsData};
             let _ = MemFlagsData::trusted(); // keep import valid across cfgs
 
@@ -11778,7 +11778,7 @@ impl Compiler<'_> {
             // (d) Snapshot flush (reuses is_flush_due — we're still in wnorm_block).
             let snap_path = self
                 .compile_options
-                .profile_source_file_name
+                .dev_tools.profile_source_file_name
                 .as_ref()
                 .map(|p| format!("{}.nsl-health.json", p))
                 .unwrap_or_else(|| "nsl-health.json".to_string());
@@ -16867,7 +16867,7 @@ impl Compiler<'_> {
     ///     the let-binding site — before the current step's loss compute — the
     ///     predicate sees the previous completed step's loss (0.0 on step 0).
     ///
-    /// All emission gated on `compile_options.inspect_enabled`.  When that
+    /// All emission gated on `compile_options.dev_tools.inspect_enabled`.  When that
     /// flag is off, this method is never called.
     fn emit_inspect_hook(
         &mut self,

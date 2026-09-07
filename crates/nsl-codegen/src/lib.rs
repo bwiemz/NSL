@@ -1375,6 +1375,32 @@ impl Default for CalibrationOptions {
     }
 }
 
+/// Dev-tools options: the kernel profiler, the health monitor and
+/// `@inspect` emission.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). Each field keeps
+/// its tool prefix because the struct spans three tools; `target_gpu` and
+/// `dtype` stay flat on `CompileOptions` since the profile walker shares
+/// them with `serve`, the GPU-spec lookups and the execution fingerprint.
+#[derive(Clone, Default)]
+pub struct DevToolsOptions {
+    /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
+    pub profile_kernels: bool,
+    /// Dev Tools Phase 2, Task 6: manifest output path.
+    pub manifest_output_path: Option<std::path::PathBuf>,
+    /// Dev Tools Phase 2, Task 6: source text for span line numbers.
+    pub profile_source_text: Option<String>,
+    /// Dev Tools Phase 2, Task 6: source file name for manifest spans.
+    pub profile_source_file_name: Option<String>,
+    /// Dev Tools Phase 4, Task 4: enable per-step health hook emission.
+    pub health_monitor: bool,
+    /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter.
+    pub health_flush_interval: Option<u64>,
+    /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
+    pub inspect_enabled: bool,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1575,8 +1601,8 @@ pub struct CompileOptions {
     pub wggo: WggoOptions,
     /// CFIE: compiler-fused inference-engine options.
     pub cfie: CfieOptions,
-    /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
-    pub profile_kernels: bool,
+    /// Dev-tools options (kernel profiler, health monitor, `@inspect`).
+    pub dev_tools: DevToolsOptions,
     /// Dev Tools Phase 2: target GPU name for the profile walker.
     pub target_gpu: String,
     /// Dev Tools Phase 2: tensor dtype assumed by the profile walker.
@@ -1586,16 +1612,6 @@ pub struct CompileOptions {
     /// Promoted from the `NSL_MATMUL_BF16*` family so it reaches the
     /// execution fingerprint; the env vars remain as a deprecated fallback.
     pub matmul: MatmulConfig,
-    /// Dev Tools Phase 2, Task 6: manifest output path.
-    pub manifest_output_path: Option<std::path::PathBuf>,
-    /// Dev Tools Phase 2, Task 6: source text for span line numbers.
-    pub profile_source_text: Option<String>,
-    /// Dev Tools Phase 2, Task 6: source file name for manifest spans.
-    pub profile_source_file_name: Option<String>,
-    /// Dev Tools Phase 4, Task 4: enable per-step health hook emission.
-    pub health_monitor: bool,
-    /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter.
-    pub health_flush_interval: Option<u64>,
     /// Optimizer-state offload (scaling campaign item 4, the single-GPU
     /// ZeRO-Offload analog): allocate m/v HOST-resident (CPU f32) and wrap
     /// every optimizer step in a stage-in → GPU-f32 update → copy-back
@@ -1737,8 +1753,6 @@ pub struct CompileOptions {
     /// teardown). Completes the double-buffer schedule: compute L, prefetch
     /// L+1, write back L-1. Bit-exact (same bytes, different timing).
     pub stream_async_writeback: bool,
-    /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
-    pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
     pub csha: CshaOptions,
     /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
@@ -1979,15 +1993,10 @@ impl Default for CompileOptions {
             wrga_fold_allocations: false,
             wggo: WggoOptions::default(),
             cfie: CfieOptions::default(),
-            profile_kernels: false,
+            dev_tools: DevToolsOptions::default(),
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
             matmul: MatmulConfig::default(),
-            manifest_output_path: None,
-            profile_source_text: None,
-            profile_source_file_name: None,
-            health_monitor: false,
-            health_flush_interval: None,
             optim_state_offload: false,
             checkpoint_blocks: false,
             checkpoint_selective: false,
@@ -2002,7 +2011,6 @@ impl Default for CompileOptions {
             stream_arena: false,
             stream_prefetch: false,
             stream_async_writeback: false,
-            inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),
             checkpoint_policies: HashMap::new(),
