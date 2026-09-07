@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Miri on the CPU tensor tests (roadmap C2): `scripts/miri-cpu-tensor.sh`
+  runs nsl-runtime's `tensor::tests` under Miri (nightly toolchain, by hand).
+  The first run found ten tests holding a `from_ptr` reference across an op
+  that re-derives the same handle — undefined behaviour under Stacked
+  Borrows that ran fine natively; they now re-derive after the call. No
+  production op tripped it; `docs/architecture/runtime.md` records the
+  measured result and the aliasing-inputs gap that remains.
 - CI now runs the `test-helpers`-gated nsl-codegen integration tests
   (`scripts/gated-tests.sh`, Linux lane): 28 crate-level-gated files and the
   three `required-features` targets had compiled to empty binaries or been

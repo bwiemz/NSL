@@ -183,7 +183,7 @@ they collide with identically-named fields on other structs.
 
 | Tier         | CI gate (blocks every PR)                            | Informational / non-blocking              |
 |--------------|------------------------------------------------------|-------------------------------------------|
-| Stable       | build, clippy, workspace unit tests (`--skip e2e_`)  | —                                         |
+| Stable       | build, clippy, workspace unit tests (`--skip e2e_`)  | Miri on the CPU tensor tests (`scripts/miri-cpu-tensor.sh`, nightly toolchain, by hand) |
 | Beta         | CLI e2e (Linux/Windows), ONNX-RT integration job     | real-CUDA-device tests, perf baselines    |
 | Experimental | `fpga` job (build + Yosys gate)                      | full Verilator/Yosys diagnostic (**nightly** workflow), `#[ignore]`'d research tests, macOS e2e |
 

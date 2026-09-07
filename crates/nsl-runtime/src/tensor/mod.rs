@@ -5413,6 +5413,9 @@ mod tests {
         let view = NslTensor::from_ptr(view_ptr);
 
         // View shares same data pointer
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(t);
         assert_eq!(view.data, tensor.data);
         assert_eq!(view.owns_data, 0);
         assert_eq!(view.data_owner, t);
@@ -5480,6 +5483,9 @@ mod tests {
         let r = NslTensor::from_ptr(reshaped);
 
         // Zero-copy: same data pointer
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(t);
         assert_eq!(r.data, tensor.data);
         assert_eq!(r.owns_data, 0);
         assert_eq!(r.data_owner, t);
@@ -5571,6 +5577,9 @@ mod tests {
         // that still passes every correctness test.
         let ok = NslTensor::new_view_i64(t, &[4], &[1], 1, 4);
         assert!(NslTensor::from_ptr(ok).is_contiguous(), "stride 1 IS contiguous");
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tv = NslTensor::from_ptr_ref(t);
         assert!(tv.is_contiguous(), "a fresh row-major [4, 2] is still contiguous");
 
         // And the correct predicate agrees with the fixed one on all of them,
@@ -5653,6 +5662,9 @@ mod tests {
         let trv = NslTensor::from_ptr(tr);
 
         // Zero-copy: same data pointer
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(t);
         assert_eq!(trv.data, tensor.data);
         assert_eq!(trv.owns_data, 0);
         assert_eq!(trv.data_owner, t);
@@ -5679,7 +5691,6 @@ mod tests {
         crate::list::nsl_list_push(shape_list, 3);
         crate::list::nsl_list_push(shape_list, 4);
         let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
-        let tensor = NslTensor::from_ptr(t);
         // strides = [12, 4, 1]
 
         let tr = nsl_tensor_transpose(t, 0, 2);
@@ -5693,6 +5704,9 @@ mod tests {
             assert_eq!(*trv.strides.add(1), 4);
             assert_eq!(*trv.strides.add(2), 12);
         }
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(t);
         assert_eq!(trv.data, tensor.data);
 
         nsl_tensor_free(tr);
@@ -5705,12 +5719,14 @@ mod tests {
         crate::list::nsl_list_push(shape_list, 3);
         crate::list::nsl_list_push(shape_list, 4);
         let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
-        let tensor = NslTensor::from_ptr(t);
         // shape=[3,4], strides=[4,1]
 
         let u = nsl_tensor_unsqueeze(t, 0);
         let uv = NslTensor::from_ptr(u);
 
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(t);
         assert_eq!(uv.data, tensor.data);
         assert_eq!(uv.owns_data, 0);
         assert_eq!(uv.ndim, 3);
@@ -5783,18 +5799,18 @@ mod tests {
         for &d in &[2i64, 4, 2, 3] { crate::list::nsl_list_push(sl1, d); }
         let split = nsl_tensor_reshape(x, sl1);
         let sv = NslTensor::from_ptr(split);
-        assert_eq!(sv.data, xt.data); // zero-copy
+        assert_eq!(sv.data, NslTensor::from_ptr_ref(x).data); // zero-copy
 
         // Transpose [2,4,2,3] -> [2,2,4,3] (zero-copy)
         let perm = nsl_tensor_transpose(split, 1, 2);
         let pv = NslTensor::from_ptr(perm);
-        assert_eq!(pv.data, xt.data); // still zero-copy!
+        assert_eq!(pv.data, NslTensor::from_ptr_ref(x).data); // still zero-copy!
 
         // Materialize for matmul
         let contig = nsl_tensor_contiguous(perm);
         let cv = NslTensor::from_ptr(contig);
         // After transpose, tensor is non-contiguous, so contiguous() allocates new data
-        assert!(cv.data != xt.data as *mut c_void || contig == perm);
+        assert!(cv.data != NslTensor::from_ptr_ref(x).data as *mut c_void || contig == perm);
 
         nsl_tensor_free(contig);
         nsl_tensor_free(perm);
@@ -5815,11 +5831,11 @@ mod tests {
         crate::list::nsl_list_push(sl1, 3);
         crate::list::nsl_list_push(sl1, 4);
         let r1 = nsl_tensor_reshape(t, sl1);
-        assert_eq!(NslTensor::from_ptr(r1).data, tv.data);
+        assert_eq!(NslTensor::from_ptr(r1).data, NslTensor::from_ptr_ref(t).data);
 
         // transpose [3,4] -> [4,3] (zero-copy, non-contiguous)
         let tr = nsl_tensor_transpose(r1, 0, 1);
-        assert_eq!(NslTensor::from_ptr(tr).data, tv.data);
+        assert_eq!(NslTensor::from_ptr(tr).data, NslTensor::from_ptr_ref(t).data);
 
         // reshape [4,3] -> [12] (must materialize because input is non-contiguous)
         let sl2 = crate::list::nsl_list_new();
@@ -6215,6 +6231,9 @@ mod tests {
             *tensor.data_f32().add(2) = 0.0;
         }
         nsl_tensor_mul_scalar_inplace(t, 0.5);
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(t);
         unsafe {
             assert!(((*tensor.data_f32().add(0)) - 1.0).abs() < 1e-6);
             assert!(((*tensor.data_f32().add(1)) - (-0.75)).abs() < 1e-6);
@@ -6236,6 +6255,9 @@ mod tests {
             }
         }
         nsl_tensor_mul_scalar_inplace(t, 0.0);
+        // Re-derive: the op above took `t` and its own `from_ptr` invalidated the
+        // earlier reference under Stacked Borrows (Miri, roadmap C2).
+        let tensor = NslTensor::from_ptr_ref(t);
         unsafe {
             for i in 0..4 {
                 assert_eq!(*tensor.data_f32().add(i), 0.0);
