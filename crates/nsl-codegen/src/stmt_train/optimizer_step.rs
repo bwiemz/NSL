@@ -828,7 +828,7 @@ impl Compiler<'_> {
             // (CSLA, offload, ZeRO, bf16 momentum, non-muon) were refused
             // at parse time above.
             let muon_batch_active =
-                self.compile_options.muon_batch_ns && optimizer_name == "muon";
+                self.compile_options.muon.batch_ns && optimizer_name == "muon";
             if muon_batch_active {
                 let route_list = muon_route_list.ok_or_else(|| {
                     CodegenError::new(

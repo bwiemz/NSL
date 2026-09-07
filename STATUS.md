@@ -163,7 +163,10 @@ the same hardening pass produced).
 
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
-`CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`, …).
+`CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
+`MuonOptions`, …). The Muon knobs moved into `MuonOptions`
+(`opts.muon.{batch_ns, resident_momentum, state_bf16}`; `Features` keeps its
+own `muon_state_bf16` copy).
 The weight-streaming ladder moved into `WeightStreamOptions`
 (`opts.weight_stream.{enabled, arena, prefetch, async_writeback}`; the
 `PlanFeatures` struct keeps its own `weight_stream` flag). The `checkpoint_*` cluster moved

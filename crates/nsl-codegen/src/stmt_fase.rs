@@ -1160,7 +1160,7 @@ impl Compiler<'_> {
         // arm never reads v. The condition value is computed once and
         // reused at the copy-back below (it dominates that code).
         let muon_resident_cond = if offload_only
-            && self.compile_options.muon_resident_momentum
+            && self.compile_options.muon.resident_momentum
             && optimizer_name == "muon"
         {
             use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};

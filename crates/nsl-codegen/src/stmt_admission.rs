@@ -233,7 +233,7 @@ impl Compiler<'_> {
         // would compile and train — decaying the parameters the user asked to
         // exempt — so they must refuse rather than silently ignore no_decay.
         if !no_decay_scope.is_empty() {
-            if self.compile_options.muon_batch_ns {
+            if self.compile_options.muon.batch_ns {
                 return Err(CodegenError::new(
                     "no_decay=[...] is not supported with --muon-batch-ns: the \
                      batched Newton-Schulz pre-loop takes one weight_decay \
