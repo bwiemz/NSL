@@ -301,7 +301,7 @@ impl Compiler<'_> {
         // note below stays per block because it is the part that names WHICH
         // block is inert, which a compile-scoped message cannot.
         let fase_hook_reachable = fase_deferred && self.features.source_ad_enabled;
-        if self.compile_options.fuse_wgrad_accum {
+        if self.compile_options.fusion.wgrad_accum {
             if fase_hook_reachable {
                 self.wgrad_hook_blocks += 1;
             } else {

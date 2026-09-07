@@ -166,7 +166,7 @@ fn fused_wgrad_chain_with_an_unresolved_operand_is_still_a_compile_error() {
     let interner = Interner::new();
     let type_map: TypeMap = HashMap::new();
     let mut opts = CompileOptions::default();
-    opts.fuse_wgrad_accum = true;
+    opts.fusion.wgrad_accum = true;
     let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
         .expect("Compiler::new should succeed");
 
@@ -263,7 +263,7 @@ fn fused_wgrad_chain_with_resolved_operands_fires_the_hook() {
     let interner = Interner::new();
     let type_map: TypeMap = HashMap::new();
     let mut opts = CompileOptions::default();
-    opts.fuse_wgrad_accum = true;
+    opts.fusion.wgrad_accum = true;
     let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
         .expect("Compiler::new should succeed");
 

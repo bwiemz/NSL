@@ -52,7 +52,7 @@ half of the session. It is being decomposed from a flat "god-config" into
 cohesive sub-structs (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`,
 `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
 `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
-`AutotuneOptions`, `WeightsOptions`, …) as part of the
+`AutotuneOptions`, `WeightsOptions`, `FusionOptions`, …) as part of the
 same hardening effort.
 
 A future `CompileSession { options, diagnostics, … }` wrapper could formalize

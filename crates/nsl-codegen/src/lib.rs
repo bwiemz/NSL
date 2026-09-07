@@ -1631,6 +1631,64 @@ pub struct WeightsOptions {
     pub index_map: HashMap<nsl_ast::NodeId, usize>,
 }
 
+/// Fusion options: the global kill switch, the `--fusion-report` dump and
+/// the two opt-in, non-bit-exact source-AD fusions.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). The `@fuse` kernel
+/// path reads `disabled` / `report` through `FusionState`; the source-AD
+/// fusions are read at their lowering sites.
+#[derive(Clone, Default)]
+pub struct FusionOptions {
+    /// Disable all fusion optimizations (for differential testing baseline).
+    pub disabled: bool,
+    /// `--fusion-report`: print the fusion report to stderr after codegen.
+    pub report: bool,
+    /// Item 9 (`--fuse-rmsnorm-backward`): lower the source-AD RMSNorm INPUT
+    /// gradient to a single fused `nsl_rmsnorm_dx_backward` op (native GPU kernel
+    /// / CPU reference) instead of the ~11-op decomposition — fewer launches,
+    /// temporaries, and HBM traffic. Off by default; the fused kernel matches
+    /// the decomposition to an f32 tolerance (approx rsqrt/div), so it is an
+    /// opt-in speedup, not a bit-exact substitution.
+    pub rmsnorm_backward: bool,
+    /// Item 7 (`--fuse-wgrad-accum`): collapse the source-AD weight-gradient
+    /// chain `Transpose -> Matmul -> reduce_to_shape` PLUS the FASE Deferred
+    /// accumulate into ONE cuBLAS call — the flattened contraction
+    /// `[d, B*T] x [B*T, o]` with `beta = 1.0` writing straight into
+    /// `m_partial`. Removes the `[B, d, o]` raw-gradient temporary (B x the
+    /// parameter) and the full read-back the reduce performs over it.
+    ///
+    /// Off by default and NOT bit-exact: the products are summed in cuBLAS's
+    /// order instead of rounding each per-batch partial before the reduce.
+    /// Measured against an f64 CPU reference it is *closer* to the true value
+    /// than the chain it replaces in 2 of 3 shapes, but different is
+    /// different — same opt-in tolerance contract as `rmsnorm_backward`.
+    ///
+    /// Refuses to compose with `grad_integrity` (which must read the raw
+    /// gradient the fusion never materializes) and `optim_state_offload`
+    /// (host-resident `m_partial`, which the device GEMM cannot write).
+    /// See [`crate::wgrad_fusion`].
+    pub wgrad_accum: bool,
+    /// Whether `wgrad_accum` came from the `--pretrain-optimized` bundle
+    /// rather than an explicit `--fuse-wgrad-accum`.
+    ///
+    /// The two have to behave differently when the fusion cannot fire. The
+    /// flag has exactly ONE lowering path — the FASE-*Deferred*
+    /// `on_param_grad` hook — and `grad_accumulation` defaults to 1, at which
+    /// point `fase::plan` returns `Passthrough` for every optimizer. An
+    /// explicitly typed flag must then REFUSE (the repo's deferral-must-refuse
+    /// doctrine; `--layerwise-accum` and `--param-dtype bf16-sr` both refuse on
+    /// this identical precondition). The bundle must only WARN, because it sets
+    /// the flag unconditionally on programs that never asked for it — including
+    /// `models/coder50m/pretrain{,_cert}.nsl`, which declare no
+    /// `grad_accumulation` at all and would stop building.
+    ///
+    /// `--pretrain-optimized --fuse-wgrad-accum` is EXPLICIT, not bundle:
+    /// `expand_pretrain_optimized` reads the clap value before overwriting it,
+    /// so a user who typed the flag still gets the refusal.
+    pub wgrad_accum_from_bundle: bool,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1638,15 +1696,15 @@ pub struct CompileOptions {
     /// [`AutotuneOptions`].
     pub autotune: AutotuneOptions,
     pub world_size: usize,
-    pub fusion_report: bool,
+    /// Fusion: the kill switch, `--fusion-report`, and the opt-in source-AD
+    /// fusions; see [`FusionOptions`].
+    pub fusion: FusionOptions,
     /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
     pub vram_budget: Option<u64>,
     /// M36: Print memory plan report to stderr
     pub memory_report: bool,
     /// M47: GPU compilation target name.
     pub target: String,
-    /// Disable all fusion optimizations (for differential testing baseline).
-    pub disable_fusion: bool,
     /// M40: Use compile-time source-to-source AD for training (default: false = tape AD).
     pub source_ad: bool,
     /// M45: Enable tensor operation tracing.
@@ -1807,49 +1865,6 @@ pub struct CompileOptions {
     pub optim_state_offload: bool,
     /// Activation checkpointing (CCR flags + decorator-derived policies).
     pub checkpoint: CheckpointOptions,
-    /// Item 9 (`--fuse-rmsnorm-backward`): lower the source-AD RMSNorm INPUT
-    /// gradient to a single fused `nsl_rmsnorm_dx_backward` op (native GPU kernel
-    /// / CPU reference) instead of the ~11-op decomposition — fewer launches,
-    /// temporaries, and HBM traffic. Off by default; the fused kernel matches
-    /// the decomposition to an f32 tolerance (approx rsqrt/div), so it is an
-    /// opt-in speedup, not a bit-exact substitution.
-    pub fuse_rmsnorm_backward: bool,
-    /// Item 7 (`--fuse-wgrad-accum`): collapse the source-AD weight-gradient
-    /// chain `Transpose -> Matmul -> reduce_to_shape` PLUS the FASE Deferred
-    /// accumulate into ONE cuBLAS call — the flattened contraction
-    /// `[d, B*T] x [B*T, o]` with `beta = 1.0` writing straight into
-    /// `m_partial`. Removes the `[B, d, o]` raw-gradient temporary (B x the
-    /// parameter) and the full read-back the reduce performs over it.
-    ///
-    /// Off by default and NOT bit-exact: the products are summed in cuBLAS's
-    /// order instead of rounding each per-batch partial before the reduce.
-    /// Measured against an f64 CPU reference it is *closer* to the true value
-    /// than the chain it replaces in 2 of 3 shapes, but different is
-    /// different — same opt-in tolerance contract as `fuse_rmsnorm_backward`.
-    ///
-    /// Refuses to compose with `grad_integrity` (which must read the raw
-    /// gradient the fusion never materializes) and `optim_state_offload`
-    /// (host-resident `m_partial`, which the device GEMM cannot write).
-    /// See [`crate::wgrad_fusion`].
-    pub fuse_wgrad_accum: bool,
-    /// PROVENANCE of `fuse_wgrad_accum`: `true` when `--pretrain-optimized`
-    /// turned it on rather than the user typing `--fuse-wgrad-accum`.
-    ///
-    /// The two have to behave differently when the fusion cannot fire. The
-    /// flag has exactly ONE lowering path — the FASE-*Deferred*
-    /// `on_param_grad` hook — and `grad_accumulation` defaults to 1, at which
-    /// point `fase::plan` returns `Passthrough` for every optimizer. An
-    /// explicitly typed flag must then REFUSE (the repo's deferral-must-refuse
-    /// doctrine; `--layerwise-accum` and `--param-dtype bf16-sr` both refuse on
-    /// this identical precondition). The bundle must only WARN, because it sets
-    /// the flag unconditionally on programs that never asked for it — including
-    /// `models/coder50m/pretrain{,_cert}.nsl`, which declare no
-    /// `grad_accumulation` at all and would stop building.
-    ///
-    /// `--pretrain-optimized --fuse-wgrad-accum` is EXPLICIT, not bundle:
-    /// `expand_pretrain_optimized` reads the clap value before overwriting it,
-    /// so a user who typed the flag still gets the refusal.
-    pub fuse_wgrad_accum_from_bundle: bool,
     /// CSLA Stage-2 (`--layerwise-accum`): window-buffered training schedule.
     /// The N micro-batches of a FASE-Deferred accumulation window run their
     /// forwards first (saving only the adjoint-read, batch-dependent tensors
@@ -1987,9 +2002,9 @@ impl CompileOptions {
             format!("ad={}", if self.source_ad { "source" } else { "tape" }),
             format!("det={}", b(self.deterministic)),
             format!("dtype={dtype}"),
-            format!("fusion={}", if self.disable_fusion { "off" } else { "on" }),
-            format!("fuse_rms={}", b(self.fuse_rmsnorm_backward)),
-            format!("fuse_wgrad={}", b(self.fuse_wgrad_accum)),
+            format!("fusion={}", if self.fusion.disabled { "off" } else { "on" }),
+            format!("fuse_rms={}", b(self.fusion.rmsnorm_backward)),
+            format!("fuse_wgrad={}", b(self.fusion.wgrad_accum)),
             format!("zero={zero}"),
             format!("zero_elem={}", b(self.zero.elementwise)),
             format!("ws={}", self.world_size),
@@ -2045,11 +2060,10 @@ impl Default for CompileOptions {
         Self {
             autotune: AutotuneOptions::default(),
             world_size: 1,
-            fusion_report: false,
+            fusion: FusionOptions::default(),
             vram_budget: None,
             memory_report: false,
             target: "cuda".to_string(),
-            disable_fusion: false,
             source_ad: false,
             trace_ops: false,
             nan_analysis: false,
@@ -2086,9 +2100,6 @@ impl Default for CompileOptions {
             matmul: MatmulConfig::default(),
             optim_state_offload: false,
             checkpoint: CheckpointOptions::default(),
-            fuse_rmsnorm_backward: false,
-            fuse_wgrad_accum: false,
-            fuse_wgrad_accum_from_bundle: false,
             layerwise_accum: false,
             weight_stream: WeightStreamOptions::default(),
             csha: CshaOptions::default(),
