@@ -86,7 +86,7 @@ pub(crate) fn run_cpkd_design(
     let target_params = match parse_param_budget(budget_str) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("error: --cpkd-design-student: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: --cpkd-design-student: {e}");
             return 1;
         }
     };
@@ -111,8 +111,8 @@ pub(crate) fn run_cpkd_design(
     let teacher_spec = match extract_model_spec(module, &resolve) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: {e}");
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", 
                 "note: --cpkd-design-student needs a CEP-recognizable teacher model \
                  (canonical GroupedQueryAttention + SwiGLUFFN blocks)"
             );
@@ -121,7 +121,7 @@ pub(crate) fn run_cpkd_design(
     };
 
     if !module_has_search_decorator(module, &interner) {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: --cpkd-design-student requires @search(axis, [values]) decorators \
              on the model; without them the search space contains only the teacher \
              architecture itself. Add e.g. @search(d_model, [256, 384, 512]); \
@@ -133,7 +133,7 @@ pub(crate) fn run_cpkd_design(
     let axes = match extract_search_axes(module, &resolve) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
             return 1;
         }
     };
@@ -142,7 +142,7 @@ pub(crate) fn run_cpkd_design(
         Some(p) => match nsl_codegen::weight_aware::WeightMap::load(p) {
             Ok(w) => Some(w),
             Err(e) => {
-                eprintln!("error: failed to load --weights {}: {e}", p.display());
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to load --weights {}: {e}", p.display());
                 return 1;
             }
         },
@@ -176,7 +176,7 @@ pub(crate) fn run_cpkd_design(
             0
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
             1
         }
     }

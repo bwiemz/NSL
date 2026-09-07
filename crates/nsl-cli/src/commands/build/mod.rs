@@ -40,7 +40,7 @@ mod zk;
 /// Set `NSL_KEEP_TEMP=1` to retain the directory for debugging.
 pub(crate) fn cleanup_temp_dir(dir: &std::path::Path) {
     if std::env::var("NSL_KEEP_TEMP").as_deref() == Ok("1") {
-        eprintln!("[nsl] NSL_KEEP_TEMP=1 — retaining {}", dir.display());
+        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] NSL_KEEP_TEMP=1 — retaining {}", dir.display());
         return;
     }
     let _ = std::fs::remove_dir_all(dir);

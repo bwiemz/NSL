@@ -283,7 +283,7 @@ pub(crate) fn run_convert(input: &std::path::Path, output: &std::path::Path) {
             match convert_nslm_to_safetensors(input, output) {
                 Ok(()) => println!("Converted {} → {}", input.display(), output.display()),
                 Err(e) => {
-                    eprintln!("error: {}", e);
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: {}", e);
                     process::exit(1);
                 }
             }
@@ -292,13 +292,13 @@ pub(crate) fn run_convert(input: &std::path::Path, output: &std::path::Path) {
             match convert_safetensors_to_nslm(input, output) {
                 Ok(()) => println!("Converted {} → {}", input.display(), output.display()),
                 Err(e) => {
-                    eprintln!("error: {}", e);
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: {}", e);
                     process::exit(1);
                 }
             }
         }
         _ => {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "cli", 
                 "error: unsupported conversion '{}.{}' → '{}.{}'.\n\
                  Supported: .nslm → .safetensors, .safetensors → .nslm",
                 input.display(), in_ext, output.display(), out_ext

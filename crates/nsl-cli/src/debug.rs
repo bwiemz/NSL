@@ -268,7 +268,7 @@ pub fn run_debug(
     export_chrome: Option<&Path>,
 ) {
     let (header, entries) = read_trace_file(file).unwrap_or_else(|e| {
-        eprintln!("error: failed to read trace '{}': {e}", file.display());
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to read trace '{}': {e}", file.display());
         std::process::exit(1);
     });
 
@@ -307,7 +307,7 @@ pub fn run_debug(
 
     if let Some(other_path) = diff {
         let (_, other_entries) = read_trace_file(other_path).unwrap_or_else(|e| {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "cli", 
                 "error: failed to read diff trace '{}': {e}",
                 other_path.display()
             );
@@ -336,7 +336,7 @@ pub fn run_debug(
     if let Some(chrome_path) = export_chrome {
         let json = export_chrome_json(&entries, OP_NAMES);
         std::fs::write(chrome_path, json).unwrap_or_else(|e| {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "cli", 
                 "error: failed to write Chrome JSON '{}': {e}",
                 chrome_path.display()
             );
