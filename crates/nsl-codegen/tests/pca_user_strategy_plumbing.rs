@@ -2,7 +2,7 @@
 //! plumbing tests.
 //!
 //! Exercises the codegen-side `PcaUserStrategy` enum and verifies the
-//! `CompileOptions.pca_user_strategies` field flows the user's
+//! `CompileOptions.analysis.pca_user_strategies` field flows the user's
 //! decorator choice through to the Compiler.
 //!
 //! End-to-end planner-site activation is covered separately by the
@@ -54,7 +54,7 @@ fn pca_user_strategy_is_per_document_only_true_for_per_document() {
 fn compile_options_default_has_empty_pca_strategies() {
     let opts = nsl_codegen::CompileOptions::default();
     assert!(
-        opts.pca_user_strategies.is_empty(),
+        opts.analysis.pca_user_strategies.is_empty(),
         "default CompileOptions must NOT carry any @pca strategies — \
          empty means 'no decorator present', which preserves \
          pre-Item-4 behaviour for the entire test fleet"
@@ -66,11 +66,14 @@ fn compile_options_carrying_per_document_round_trips() {
     // The CLI sets this from `analysis_to_pca_user_strategies(&analysis)`;
     // this test pins the field exists and accepts the value.
     let opts = nsl_codegen::CompileOptions {
-        pca_user_strategies: vec![PcaUserStrategy::PerDocument],
+        analysis: nsl_codegen::AnalysisOptions {
+            pca_user_strategies: vec![PcaUserStrategy::PerDocument],
+            ..Default::default()
+        },
         ..Default::default()
     };
-    assert_eq!(opts.pca_user_strategies.len(), 1);
-    assert!(opts.pca_user_strategies[0].is_per_document());
+    assert_eq!(opts.analysis.pca_user_strategies.len(), 1);
+    assert!(opts.analysis.pca_user_strategies[0].is_per_document());
 }
 
 /// Item 4 review-driven defensive test (reviewer Issue #2 false-positive

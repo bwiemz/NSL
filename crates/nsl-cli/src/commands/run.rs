@@ -471,7 +471,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // M55: ZK flags not exposed on `run`; use defaults.
                 zk: nsl_codegen::ZkOptions::default(),
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
-                ownership_info: std::collections::HashMap::new(),
+                // Semantic-analysis facts: all empty here. `run_build_inner` /
+                // `run_run` route through `run_build_single` (build.rs) which
+                // overwrites them from semantic analysis via
+                // pipeline::analysis_to_*.
+                analysis: nsl_codegen::AnalysisOptions::default(),
                 zero: nsl_codegen::ZeroOptions {
                     stage: zero_stage.map(|s| s as u8),
                     elementwise: zero_elementwise,
@@ -540,9 +544,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     .unwrap_or_default(),
                 shared_lib: false,
                 emit_export_table: false,
-                fused_ce_configs: Vec::new(),
-                fused_kl_ce_configs: Vec::new(),
-                pca_user_strategies: Vec::new(),
                 // S3: thread the `--wggo*` surface through so the WGGO
                 // mode-table dispatch reaches `emit_unified_optim_step_dispatch`
                 // via `nsl run` (previously hardcoded to defaults, which
@@ -592,11 +593,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     mode: csha.clone(),
                     report: csha_report,
                 },
-                // CSHA Sprint 2: default to empty here; `run_build_inner` /
-                // `run_run` route through `run_build_single` (build.rs) which
-                // overwrites this from semantic analysis via
-                // pipeline::analysis_to_csha_configs.
-                csha_configs: std::collections::HashMap::new(),
                 // Cycle-10 §5.3 Task 6: default to empty here; overwritten
                 // downstream in `run_build_single` via
                 // pipeline::analysis_to_checkpoint_policies. Empty = byte-identity.

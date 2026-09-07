@@ -203,7 +203,10 @@ fn lower_and_resolve(
     let interner = Interner::new();
     let type_map: TypeMap = HashMap::new();
     let opts = CompileOptions {
-        fused_ce_configs: vec![cfg_for_dtype_hint(hint, vocab_size)],
+        analysis: nsl_codegen::AnalysisOptions {
+            fused_ce_configs: vec![cfg_for_dtype_hint(hint, vocab_size)],
+            ..Default::default()
+        },
         ..CompileOptions::default()
     };
     let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
