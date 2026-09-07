@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- Runtime logging front door (roadmap C3): `nsl_log!(LEVEL, "target", …)`
+  in nsl-runtime emits a `tracing` event per diagnostic line; the crate's own
+  subscriber (`src/log.rs`) keeps stderr byte-identical to the `eprintln!` it
+  replaces and mirrors each line into the `NSL_EVENTS` stream as a `log`
+  event (`level`, `target`, `message`). A host with its own global
+  subscriber receives the lines as events instead. The bracketed-marker
+  family (`[zero3]`, `[cuda-graph]`, `[weight-stream]`, `[arena]`,
+  `[sr-bf16]`, `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`,
+  `[nsl-tcp]`, `[nsl-trace]`, `[tape-trace]`, `[scope]`; 133 sites) is
+  migrated; new dependency `tracing` (std only, with `tracing-core`).
+
 ### Fixed
 
 - Aliasing-input probes (`tensor::alias_tests`, roadmap C2): every CPU

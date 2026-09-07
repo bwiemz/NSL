@@ -627,8 +627,7 @@ mod imp {
     /// between two recorded passes of a region.
     fn log_first_divergence(id: i64, prev: &[GpuOp], cur: &[GpuOp]) {
         if prev.len() != cur.len() {
-            eprintln!(
-                "[cuda-graph] region {id}: op count changed {} -> {}",
+            crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {id}: op count changed {} -> {}",
                 prev.len(),
                 cur.len()
             );
@@ -648,8 +647,7 @@ mod imp {
                         .zip(pb.iter())
                         .position(|(x, y)| x != y)
                         .unwrap_or(0);
-                    eprintln!(
-                        "[cuda-graph] region {id}: first divergence at op {i}: kernel '{name}' {func:#x} param byte {firstb}/{} ({:#x} vs {:#x})",
+                    crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {id}: first divergence at op {i}: kernel '{name}' {func:#x} param byte {firstb}/{} ({:#x} vs {:#x})",
                         pa.len(),
                         u64::from_le_bytes(pa[firstb & !7..][..8].try_into().unwrap_or([0; 8])),
                         u64::from_le_bytes(pb[firstb & !7..][..8].try_into().unwrap_or([0; 8])),
@@ -663,8 +661,7 @@ mod imp {
                         a: ba, b: bb, c: bc, batch: bbt, kind: bkd, precision: bpr, ..
                     },
                 ) => {
-                    eprintln!(
-                        "[cuda-graph] region {id}: first divergence at op {i}: sgemm ptrs \
+                    crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {id}: first divergence at op {i}: sgemm ptrs \
                          ({aa:#x},{ab:#x},{ac:#x}) batch={abt} {akd:?} {apr:?} vs \
                          ({ba:#x},{bb:#x},{bc:#x}) batch={bbt} {bkd:?} {bpr:?}"
                     );
@@ -690,8 +687,7 @@ mod imp {
                             format!("dtod dst={dst:#x} src={src:#x} n={len}")
                         }
                     };
-                    eprintln!(
-                        "[cuda-graph] region {id}: first divergence at op {i}:\n  prev: {}\n  cur:  {}",
+                    crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {id}: first divergence at op {i}:\n  prev: {}\n  cur:  {}",
                         desc(a),
                         desc(b)
                     );
@@ -741,7 +737,7 @@ mod imp {
             // ignore the inner region entirely, but keep begin/end balanced.
             NESTED_SKIP.with(|n| n.set(n.get() + 1));
             if log_on() {
-                eprintln!("[cuda-graph] nested region_begin({id}) ignored");
+                crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] nested region_begin({id}) ignored");
             }
             return;
         }
@@ -774,7 +770,7 @@ mod imp {
                     };
                     if r != CUresult::CUDA_SUCCESS {
                         if log_on() {
-                            eprintln!("[cuda-graph] region {id}: begin-capture failed: {r:?}");
+                            crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] region {id}: begin-capture failed: {r:?}");
                         }
                         REGIONS.with(|reg| reg.borrow_mut().insert((id, phase), fail_state(attempts)));
                         return;
@@ -869,8 +865,7 @@ mod imp {
             // Unbalanced markers (should be impossible from emitted code) —
             // fail SAFE, not silent: skipped/recorded work must still execute
             // before we disable (review M1).
-            eprintln!(
-                "[cuda-graph] region_end({id}) does not match active region {} — disabling",
+            crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region_end({id}) does not match active region {} — disabling",
                 active.id
             );
             match active.mode {
@@ -916,8 +911,7 @@ mod imp {
                         };
                         let rounds = active.rounds + 1;
                         if log_on() {
-                            eprintln!(
-                                "[cuda-graph] region {id}.{}: recorded {} ops, digest {d:016x}, streak {streak}, round {rounds}",
+                            crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {id}.{}: recorded {} ops, digest {d:016x}, streak {streak}, round {rounds}",
                                 active.phase,
                                 active.seq.len()
                             );
@@ -935,8 +929,7 @@ mod imp {
                             // still cannot repeat a digest is strictly
                             // cheaper eager. See `MAX_RECORD_ROUNDS`.
                             if log_on() {
-                                eprintln!(
-                                    "[cuda-graph] region {id}.{}: no stable digest in {rounds} rounds — going eager",
+                                crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {id}.{}: no stable digest in {rounds} rounds — going eager",
                                     active.phase
                                 );
                             }
@@ -963,7 +956,7 @@ mod imp {
                     let r = unsafe { cuStreamEndCapture(stream, &mut graph) };
                     if r != CUresult::CUDA_SUCCESS || graph.is_null() {
                         if log_on() {
-                            eprintln!("[cuda-graph] region {id}: end-capture failed: {r:?}");
+                            crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] region {id}: end-capture failed: {r:?}");
                         }
                         if !graph.is_null() {
                             unsafe { cuGraphDestroy(graph) };
@@ -977,7 +970,7 @@ mod imp {
                         unsafe { cuGraphDestroy(graph) };
                         if ri != CUresult::CUDA_SUCCESS || exec.is_null() {
                             if log_on() {
-                                eprintln!("[cuda-graph] region {id}: instantiate failed: {ri:?}");
+                                crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] region {id}: instantiate failed: {ri:?}");
                             }
                             repair(&active.seq);
                             fail_state(active.attempts)
@@ -990,8 +983,7 @@ mod imp {
                             } else {
                                 CAPTURES.fetch_add(1, Ordering::Relaxed);
                                 if log_on() {
-                                    eprintln!(
-                                        "[cuda-graph] region {id}.{}: captured ({} ops)",
+                                    crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {id}.{}: captured ({} ops)",
                                         active.phase,
                                         active.seq.len()
                                     );
@@ -1569,8 +1561,7 @@ mod imp {
                         *tainted = true;
                         TAINTS.fetch_add(1, Ordering::Relaxed);
                         if log_on() {
-                            eprintln!(
-                                "[cuda-graph] region {}: tainted by {reason} — stays eager (at {}:{})",
+                            crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {}: tainted by {reason} — stays eager (at {}:{})",
                                 active.id,
                                 loc.file(),
                                 loc.line(),
@@ -1582,8 +1573,7 @@ mod imp {
                 Mode::Capturing | Mode::Skipping { .. } => {
                     TAINTS.fetch_add(1, Ordering::Relaxed);
                     if log_on() {
-                        eprintln!(
-                            "[cuda-graph] region {}: {reason} during capture/replay — repairing (at {}:{})",
+                        crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] region {}: {reason} during capture/replay — repairing (at {}:{})",
                             active.id,
                             loc.file(),
                             loc.line(),
@@ -1631,19 +1621,19 @@ mod imp {
 
     pub fn enable(window: i64) {
         if std::env::var("NSL_CUDA_GRAPHS").ok().as_deref() == Some("0") {
-            eprintln!("[cuda-graph] disabled by NSL_CUDA_GRAPHS=0");
+            crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] disabled by NSL_CUDA_GRAPHS=0");
             return;
         }
         if crate::cuda::inner::sync_mode_enabled() {
-            eprintln!("[cuda-graph] disabled: NSL_CUDA_SYNC=1 (eager sync is incompatible with capture)");
+            crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] disabled: NSL_CUDA_SYNC=1 (eager sync is incompatible with capture)");
             return;
         }
         if crate::kernel_profiler::kernel_profiler_enabled() {
-            eprintln!("[cuda-graph] disabled: kernel profiler active (per-launch events are incompatible with replay)");
+            crate::nsl_log!(INFO, "cuda-graph", "[cuda-graph] disabled: kernel profiler active (per-launch events are incompatible with replay)");
             return;
         }
         if std::env::var("NSL_LEGACY_NULL_STREAM").ok().as_deref() == Some("1") {
-            eprintln!("[cuda-graph] disabled: NSL_LEGACY_NULL_STREAM=1 (the NULL stream cannot be captured)");
+            crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] disabled: NSL_LEGACY_NULL_STREAM=1 (the NULL stream cannot be captured)");
             return;
         }
         if crate::cuda::inner::async_alloc_enabled() {
@@ -1653,8 +1643,7 @@ mod imp {
             // fail the capture) with nothing self-healing it. Every other
             // stream-touching primitive taints; until this one does, the
             // composition is refused up front rather than left to corrupt.
-            eprintln!(
-                "[cuda-graph] disabled: NSL_ASYNC_ALLOC=1 (stream-ordered \
+            crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] disabled: NSL_ASYNC_ALLOC=1 (stream-ordered \
                  allocation on the NULL stream is not capture-safe)"
             );
             return;
@@ -1671,8 +1660,7 @@ mod imp {
         if !enabled() && CAPTURES.load(Ordering::Relaxed) == 0 {
             return;
         }
-        eprintln!(
-            "[cuda-graph] regions={} captured={} replays={} taints={} mismatches={} repaired_ops={} eager={}",
+        crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] regions={} captured={} replays={} taints={} mismatches={} repaired_ops={} eager={}",
             REGIONS_SEEN.load(Ordering::Relaxed),
             CAPTURES.load(Ordering::Relaxed),
             REPLAYS.load(Ordering::Relaxed),

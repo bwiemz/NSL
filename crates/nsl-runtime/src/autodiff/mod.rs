@@ -412,7 +412,7 @@ pub fn maybe_record(mut op: TapeOp) {
         let mut tape = t.borrow_mut();
         op.assign_ids(&mut tape);
         if crate::tensor::tensor_trace_on() {
-            eprintln!("[tape-trace] record {}", tape_op_trace(&op));
+            crate::nsl_log!(INFO, "tape-trace", "[tape-trace] record {}", tape_op_trace(&op));
         }
         tape.ops.push(op);
     });
@@ -474,7 +474,7 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
 pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
     for op in ops.iter() {
         if crate::tensor::tensor_trace_on() {
-            eprintln!("[tape-trace] release {}", tape_op_trace(op));
+            crate::nsl_log!(INFO, "tape-trace", "[tape-trace] release {}", tape_op_trace(op));
         }
         match op {
             TapeOp::Mul { saved_a, saved_b, .. }

@@ -312,7 +312,7 @@ extern "C" fn nsl_ws_decision_json_atexit() {
         plan_fields,
     );
     if let Err(e) = std::fs::write(&path, json) {
-        eprintln!("[weight-stream] warning: could not write decision json to {path}: {e}");
+        crate::nsl_log!(WARN, "weight-stream", "[weight-stream] warning: could not write decision json to {path}: {e}");
     }
 }
 
@@ -361,8 +361,7 @@ extern "C" fn nsl_weight_stream_count_atexit() {
     );
     let stderr_on = std::env::var("NSL_WS_COUNTER").ok().as_deref() == Some("1");
     if stderr_on {
-        eprintln!(
-            "[weight-stream] uploads: {uploads} evicts: {evicts} writeback: {writeback} \
+        crate::nsl_log!(INFO, "weight-stream", "[weight-stream] uploads: {uploads} evicts: {evicts} writeback: {writeback} \
              registered: {registered} ptr_moves: {ptr_moves} pack_uploads: {pack_uploads} \
              pack_evicts: {pack_evicts} prefetches: {prefetches} async_wb: {async_wb} \
              h2d_bytes: {h2d_bytes} d2h_bytes: {d2h_bytes}"

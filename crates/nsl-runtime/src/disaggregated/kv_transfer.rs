@@ -429,7 +429,7 @@ impl TcpBackend {
                 *guard = Some(listener);
             }
             Err(e) => {
-                eprintln!("[nsl-tcp] Failed to bind on {}: {}", addr, e);
+                crate::nsl_log!(WARN, "nsl-tcp", "[nsl-tcp] Failed to bind on {}: {}", addr, e);
             }
         }
     }
@@ -598,7 +598,7 @@ impl KvTransferBackend for TcpBackend {
         let mut stream = match stream {
             Some(s) => s,
             None => {
-                eprintln!("[nsl-tcp] Failed to connect to rank {} at {}", target_rank, addr);
+                crate::nsl_log!(WARN, "nsl-tcp", "[nsl-tcp] Failed to connect to rank {} at {}", target_rank, addr);
                 return -1;
             }
         };
@@ -618,7 +618,7 @@ impl KvTransferBackend for TcpBackend {
         match Self::write_transfer(&mut stream, header, block_entries, k_slice, v_slice) {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("[nsl-tcp] Send failed to rank {}: {}", target_rank, e);
+                crate::nsl_log!(WARN, "nsl-tcp", "[nsl-tcp] Send failed to rank {}: {}", target_rank, e);
                 -1
             }
         }

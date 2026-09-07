@@ -582,7 +582,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.note_surface_alloc(block.surface, block.size);
 
         if mem_trace_on() {
-            eprintln!("[mem-trace] A ptr={:p} size={} ctx={}", block.ptr, block.size, block.context);
+            crate::nsl_log!(INFO, "mem-trace", "[mem-trace] A ptr={:p} size={} ctx={}", block.ptr, block.size, block.context);
         }
         Some(block.ptr)
     }
@@ -670,7 +670,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.note_surface_alloc(blk.surface, blk.size);
 
         if mem_trace_on() {
-            eprintln!("[mem-trace] A ptr={:p} size={} ctx={}", blk.ptr, blk.size, blk.context);
+            crate::nsl_log!(INFO, "mem-trace", "[mem-trace] A ptr={:p} size={} ctx={}", blk.ptr, blk.size, blk.context);
         }
         Some(base_ptr)
     }
@@ -742,7 +742,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let old_surface = block.surface;
         let old_pool = block.alloc_pool;
         if mem_trace_on() {
-            eprintln!("[mem-trace] F ptr={:p} size={} ctx={}", ptr, old_size, block.context);
+            crate::nsl_log!(INFO, "mem-trace", "[mem-trace] F ptr={:p} size={} ctx={}", ptr, old_size, block.context);
         }
         block.allocated = false;
         block.requested_size = 0;

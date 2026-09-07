@@ -411,7 +411,7 @@ pub extern "C" fn nsl_trace_flush() -> i64 {
 
         let path = "trace.nsltrace";
         let Ok(mut file) = std::fs::File::create(path) else {
-            eprintln!("[nsl-trace] failed to create {path}");
+            crate::nsl_log!(WARN, "nsl-trace", "[nsl-trace] failed to create {path}");
             return -1;
         };
 
@@ -433,7 +433,7 @@ pub extern "C" fn nsl_trace_flush() -> i64 {
             )
         };
         if file.write_all(header_bytes).is_err() {
-            eprintln!("[nsl-trace] write header failed");
+            crate::nsl_log!(WARN, "nsl-trace", "[nsl-trace] write header failed");
             return -1;
         }
 
@@ -445,7 +445,7 @@ pub extern "C" fn nsl_trace_flush() -> i64 {
             )
         };
         if file.write_all(entries_bytes).is_err() {
-            eprintln!("[nsl-trace] write entries failed");
+            crate::nsl_log!(WARN, "nsl-trace", "[nsl-trace] write entries failed");
             return -1;
         }
 

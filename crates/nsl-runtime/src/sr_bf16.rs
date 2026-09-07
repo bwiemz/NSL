@@ -189,8 +189,7 @@ pub(crate) fn srbf16_active() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_sr_bf16_enable() {
     if !SRBF16_ACTIVE.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "[sr-bf16] authoritative parameter dtype: bf16 with counter-based \
+        crate::nsl_log!(INFO, "sr-bf16", "[sr-bf16] authoritative parameter dtype: bf16 with counter-based \
              stochastic rounding (no FP32 master copy)"
         );
     }
@@ -249,7 +248,7 @@ pub(crate) fn sr_hist_record_step(before: &[u16], after: &[u16]) {
 #[cfg(not(feature = "cuda"))]
 mod no_cuda {
     fn refuse(op: &str) -> ! {
-        eprintln!("[sr-bf16] {op} requires the cuda feature");
+        crate::nsl_log!(WARN, "sr-bf16", "[sr-bf16] {op} requires the cuda feature");
         std::process::abort();
     }
     // register's redirect lives inside weight_stream's cfg(cuda) block, so
@@ -279,8 +278,7 @@ pub(crate) fn srbf16_register(tensor_ptr: i64) {
         return;
     }
     if t.owns_data == 0 || t.data_owner != 0 || t.slab_managed != 0 {
-        eprintln!(
-            "[sr-bf16] refusing to register tensor {tensor_ptr}: owns_data={} \
+        crate::nsl_log!(WARN, "sr-bf16", "[sr-bf16] refusing to register tensor {tensor_ptr}: owns_data={} \
              data_owner={} slab_managed={} — only plain owning non-slab GPU \
              tensors take a bf16 mirror",
             t.owns_data, t.data_owner, t.slab_managed
@@ -288,8 +286,7 @@ pub(crate) fn srbf16_register(tensor_ptr: i64) {
         std::process::abort();
     }
     if t.dtype != crate::tensor::DTYPE_F32 {
-        eprintln!(
-            "[sr-bf16] FATAL: register expects an f32 GPU param (dtype 1), \
+        crate::nsl_log!(ERROR, "sr-bf16", "[sr-bf16] FATAL: register expects an f32 GPU param (dtype 1), \
              got dtype {} for tensor {tensor_ptr}",
             t.dtype
         );
@@ -300,8 +297,7 @@ pub(crate) fn srbf16_register(tensor_ptr: i64) {
         match guard.as_ref().and_then(|g| g.get(&tensor_ptr)).copied() {
             Some(i) => i,
             None => {
-                eprintln!(
-                    "[sr-bf16] FATAL: tensor {tensor_ptr} registered without a \
+                crate::nsl_log!(ERROR, "sr-bf16", "[sr-bf16] FATAL: tensor {tensor_ptr} registered without a \
                      prior nsl_sr_bf16_note_param — codegen must assign the \
                      stable SR counter index first"
                 );
@@ -368,7 +364,7 @@ pub(crate) fn srbf16_upload(tensor_ptr: i64) {
     }
     let guard = SRBF16_TABLE.lock().unwrap();
     let Some(m) = guard.as_ref().and_then(|g| g.get(&tensor_ptr)) else {
-        eprintln!("[sr-bf16] FATAL: upload of unregistered tensor {tensor_ptr}");
+        crate::nsl_log!(ERROR, "sr-bf16", "[sr-bf16] FATAL: upload of unregistered tensor {tensor_ptr}");
         std::process::abort();
     };
     crate::cuda::inner::ensure_context();
@@ -395,7 +391,7 @@ pub(crate) fn srbf16_evict(tensor_ptr: i64) {
         return;
     }
     if !srbf16_is_registered(tensor_ptr) {
-        eprintln!("[sr-bf16] FATAL: evict of unregistered tensor {tensor_ptr}");
+        crate::nsl_log!(ERROR, "sr-bf16", "[sr-bf16] FATAL: evict of unregistered tensor {tensor_ptr}");
         std::process::abort();
     }
     crate::cuda::inner::ensure_context();
@@ -711,7 +707,7 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
             theta_ptr, m_ptr, v_ptr, mp_ptr, lr, beta1, one_minus_beta1, beta2,
             one_minus_beta2, eps, wd, bc1_inv, bc2_inv, step,
         );
-        eprintln!("[sr-bf16] nsl_sr_bf16_step_adamw requires the cuda feature");
+        crate::nsl_log!(WARN, "sr-bf16", "[sr-bf16] nsl_sr_bf16_step_adamw requires the cuda feature");
         std::process::abort();
     }
 }
@@ -1022,7 +1018,7 @@ fn bf16sr_multi_impl(
             one_minus_beta1, beta2, one_minus_beta2, eps, wd, bc1_inv, bc2_inv,
             wd_exempt_list, wd_exempt_non_rank2, step,
         );
-        eprintln!("[sr-bf16] the fused bf16-sr multi step requires the cuda feature");
+        crate::nsl_log!(WARN, "sr-bf16", "[sr-bf16] the fused bf16-sr multi step requires the cuda feature");
         std::process::abort();
     }
 }

@@ -360,7 +360,7 @@ pub(crate) fn gemm_forward(
             inner::current_stream(),
         );
         if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            eprintln!("[fused-lce-gemm] mstate memset failed: {r:?}");
+            crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] mstate memset failed: {r:?}");
             return free_all(1);
         }
     }
@@ -386,7 +386,7 @@ pub(crate) fn gemm_forward(
             )
         };
         if gemm.is_err() {
-            eprintln!("[fused-lce-gemm] forward chunk gemm failed at {chunk_start}");
+            crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] forward chunk gemm failed at {chunk_start}");
             return free_all(2);
         }
         let mut a_logits = logits_buf;
@@ -420,7 +420,7 @@ pub(crate) fn gemm_forward(
             0,
         ) as u32;
         if rc != 0 {
-            eprintln!("[fused-lce-gemm] chunk stats launch failed: {rc}");
+            crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] chunk stats launch failed: {rc}");
             return free_all(3);
         }
         chunk_start += cols;
@@ -453,7 +453,7 @@ pub(crate) fn gemm_forward(
         0,
     ) as u32;
     if rc != 0 {
-        eprintln!("[fused-lce-gemm] finalize launch failed: {rc}");
+        crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] finalize launch failed: {rc}");
         return free_all(4);
     }
     free_all(0)
@@ -514,7 +514,7 @@ pub(crate) fn gemm_backward(
             )
         };
         if gemm.is_err() {
-            eprintln!("[fused-lce-gemm] backward logits gemm failed at {chunk_start}");
+            crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] backward logits gemm failed at {chunk_start}");
             return free_all(2);
         }
         // dlogits in place (+ dbias scatter).
@@ -551,7 +551,7 @@ pub(crate) fn gemm_backward(
             0,
         ) as u32;
         if rc != 0 {
-            eprintln!("[fused-lce-gemm] chunk dlogits launch failed: {rc}");
+            crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] chunk dlogits launch failed: {rc}");
             return free_all(3);
         }
         // dx += dlogits_chunk @ W_chunk       [rows, h]
@@ -570,7 +570,7 @@ pub(crate) fn gemm_backward(
             )
         };
         if gemm.is_err() {
-            eprintln!("[fused-lce-gemm] dx gemm failed at {chunk_start}");
+            crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] dx gemm failed at {chunk_start}");
             return free_all(4);
         }
         // dW_chunk += dlogits_chunk^T @ x     [cols, h]
@@ -587,7 +587,7 @@ pub(crate) fn gemm_backward(
             )
         };
         if gemm.is_err() {
-            eprintln!("[fused-lce-gemm] dW gemm failed at {chunk_start}");
+            crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] dW gemm failed at {chunk_start}");
             return free_all(5);
         }
         chunk_start += cols;

@@ -160,7 +160,7 @@ pub extern "C" fn nsl_tensor_scope_end(keep: i64) {
         p
     });
     if list_ptr.is_null() {
-        eprintln!("[scope] WARNING: scope_end called with no active scope!");
+        crate::nsl_log!(WARN, "scope", "[scope] WARNING: scope_end called with no active scope!");
         return;
     }
     let list = unsafe { *Box::from_raw(list_ptr) };
@@ -181,7 +181,7 @@ pub extern "C" fn nsl_tensor_scope_end(keep: i64) {
         }
     }
     if std::env::var("NSL_SCOPE_TRACE").map(|v| v == "1").unwrap_or(false) {
-        eprintln!("[scope] tracked={total}, freed={freed}, kept={kept} (refcount>1)");
+        crate::nsl_log!(INFO, "scope", "[scope] tracked={total}, freed={freed}, kept={kept} (refcount>1)");
     }
 }
 

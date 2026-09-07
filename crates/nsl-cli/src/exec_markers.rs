@@ -739,13 +739,28 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
 pub struct EventSchema {
     /// `kind` value in the event envelope.
     pub kind: &'static str,
-    /// The stderr marker this event twins (must appear in `EXEC_MARKERS`).
+    /// The stderr marker this event twins (must appear in `EXEC_MARKERS`),
+    /// or [`LINE_IS_THE_MARKER`] for the `log` kind, whose `message` field
+    /// IS the stderr line (roadmap C3: every `nsl_log!` line is mirrored
+    /// into the stream, whatever marker it starts with).
     pub marker: &'static str,
     /// Field names REQUIRED in `fields` of every event of this kind.
     pub fields: &'static [&'static str],
 }
 
+/// The `marker` of a schema whose events carry their own stderr line in a
+/// `message` field instead of twinning one fixed marker.
+pub const LINE_IS_THE_MARKER: &str = "*";
+
 pub const EVENT_SCHEMAS: &[EventSchema] = &[
+    EventSchema {
+        // One event per `nsl_log!` line (crates/nsl-runtime/src/log.rs):
+        // `message` is the stderr line byte for byte, `target` the
+        // subsystem tag the emitter named, `level` ERROR / WARN / INFO.
+        kind: "log",
+        marker: LINE_IS_THE_MARKER,
+        fields: &["level", "target", "message"],
+    },
     EventSchema {
         kind: "fused_ew_counters",
         marker: "[fused-ew]",

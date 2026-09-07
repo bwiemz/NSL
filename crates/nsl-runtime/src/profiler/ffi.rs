@@ -76,7 +76,7 @@ pub extern "C" fn nsl_profile_kernel_begin(kernel_id: u32) {
         unsafe {
             let res = crate::cuda::cu_event_record_on_current_stream(event);
             if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("[nsl-profiler] cuEventRecord(begin) failed: {:?}", res);
+                crate::nsl_log!(WARN, "nsl-profiler", "[nsl-profiler] cuEventRecord(begin) failed: {:?}", res);
             }
         }
     }
@@ -92,7 +92,7 @@ pub extern "C" fn nsl_profile_kernel_end(kernel_id: u32) {
         unsafe {
             let res = crate::cuda::cu_event_record_on_current_stream(event);
             if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("[nsl-profiler] cuEventRecord(end) failed: {:?}", res);
+                crate::nsl_log!(WARN, "nsl-profiler", "[nsl-profiler] cuEventRecord(end) failed: {:?}", res);
             }
         }
     }

@@ -143,7 +143,7 @@ pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
     {
         let ptr = crate::cuda::inner::try_alloc_device(total);
         if ptr.is_null() {
-            eprintln!("[arena] init failed: {total} bytes unavailable; the run \
+            crate::nsl_log!(WARN, "arena", "[arena] init failed: {total} bytes unavailable; the run \
                        continues on the caching allocator (addresses will not \
                        be stable)");
             return 0;
@@ -161,8 +161,7 @@ pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
         SLOTS.lock().unwrap().clear();
         N_SLOTS.store(n_slots as usize, SeqCst);
         MISPLACED.store(0, SeqCst);
-        eprintln!(
-            "[arena] init: {:.1} MiB payload in {} slot(s), {:.1} MiB total with guards",
+        crate::nsl_log!(INFO, "arena", "[arena] init: {:.1} MiB payload in {} slot(s), {:.1} MiB total with guards",
             payload_bytes as f64 / 1048576.0,
             n_slots,
             total as f64 / 1048576.0,
@@ -212,8 +211,7 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
             // inverts the experiment ("0x08" would otherwise read as
             // unlimited and the operator chases a phantom).
             Ok(v) => v.trim().parse().unwrap_or_else(|_| {
-                eprintln!(
-                    "[arena] NSL_ARENA_SLOT_LIMIT={v:?} is not an integer; \
+                crate::nsl_log!(WARN, "arena", "[arena] NSL_ARENA_SLOT_LIMIT={v:?} is not an integer; \
                      placing NOTHING (fail-closed)"
                 );
                 0
@@ -226,8 +224,7 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
     let payload = base + payload_offset as u64 + REDZONE as u64 * (slot_index as u64 + 1);
     let end = payload + bytes as u64 + REDZONE as u64;
     if end > base + ARENA_SIZE.load(SeqCst) {
-        eprintln!(
-            "[arena] bind slot {slot_index} (+{payload_offset}, {bytes} B) runs past \
+        crate::nsl_log!(WARN, "arena", "[arena] bind slot {slot_index} (+{payload_offset}, {bytes} B) runs past \
              the arena; refusing to place it"
         );
         return;
@@ -263,8 +260,7 @@ pub extern "C" fn nsl_arena_unbind_verify(result_tensor: i64) {
             MISPLACED.fetch_add(1, SeqCst);
             static SHOWN: AtomicUsize = AtomicUsize::new(0);
             if SHOWN.fetch_add(1, SeqCst) < 20 {
-                eprintln!(
-                    "[arena] MISPLACED: an op-interior allocation consumed the                      pin; the planned address holds scratch, not the result"
+                crate::nsl_log!(WARN, "arena", "[arena] MISPLACED: an op-interior allocation consumed the                      pin; the planned address holds scratch, not the result"
                 );
             }
         }
@@ -286,8 +282,7 @@ pub extern "C" fn nsl_arena_unbind() {
             // training log.
             static SHOWN: AtomicUsize = AtomicUsize::new(0);
             if SHOWN.fetch_add(1, SeqCst) < 500 {
-                eprintln!(
-                    "[arena] bound slot {slot} ({want} B) was never allocated into; \
+                crate::nsl_log!(WARN, "arena", "[arena] bound slot {slot} ({want} B) was never allocated into; \
                      the plan and the emitted code disagree about which ops allocate"
                 );
             }
@@ -365,11 +360,11 @@ pub extern "C" fn nsl_arena_check() -> i64 {
         );
         let mut bad = 0i64;
         if host[..REDZONE].iter().any(|&b| b != POISON) {
-            eprintln!("[arena] leading guard corrupted");
+            crate::nsl_log!(WARN, "arena", "[arena] leading guard corrupted");
             bad += 1;
         }
         if host[size - REDZONE..].iter().any(|&b| b != POISON) {
-            eprintln!("[arena] trailing guard corrupted — a slot wrote past the arena");
+            crate::nsl_log!(WARN, "arena", "[arena] trailing guard corrupted — a slot wrote past the arena");
             bad += 1;
         }
         // Interior guards, from the declared slot geometry: slot k's payload
@@ -382,12 +377,12 @@ pub extern "C" fn nsl_arena_check() -> i64 {
             let payload_end = off as usize + REDZONE * (k + 1) + bytes as usize;
             let guard_end = payload_end + REDZONE;
             if guard_end > size {
-                eprintln!("[arena] declared slot {k} runs past the arena");
+                crate::nsl_log!(WARN, "arena", "[arena] declared slot {k} runs past the arena");
                 bad += 1;
                 continue;
             }
             if host[payload_end..guard_end].iter().any(|&b| b != POISON) {
-                eprintln!("[arena] guard after slot {k} corrupted — its op wrote past its planned {bytes} B");
+                crate::nsl_log!(WARN, "arena", "[arena] guard after slot {k} corrupted — its op wrote past its planned {bytes} B");
                 bad += 1;
             }
         }
@@ -414,7 +409,7 @@ pub extern "C" fn nsl_arena_check_step(step: i64) {
     }
     let bad = nsl_arena_check();
     if bad > 0 {
-        eprintln!("[arena] step {step}: {bad} corrupted guard region(s)");
+        crate::nsl_log!(WARN, "arena", "[arena] step {step}: {bad} corrupted guard region(s)");
     }
 }
 
@@ -435,8 +430,7 @@ pub extern "C" fn nsl_arena_destroy() {
     }
     let binds = BINDS.load(SeqCst);
     let placements = PLACEMENTS.load(SeqCst);
-    eprintln!(
-        "[arena] teardown: {placements} placement(s) from {binds} bind(s), \
+    crate::nsl_log!(WARN, "arena", "[arena] teardown: {placements} placement(s) from {binds} bind(s), \
          {} guard failure(s), {} misplaced; allocator probes: {} total, {} \
          while armed",
         GUARD_FAILURES.load(SeqCst),
@@ -445,8 +439,7 @@ pub extern "C" fn nsl_arena_destroy() {
         PIN_PROBES_ARMED.load(SeqCst),
     );
     if binds != placements {
-        eprintln!(
-            "[arena] WARNING: {} bind(s) were never allocated into — the plan \
+        crate::nsl_log!(WARN, "arena", "[arena] WARNING: {} bind(s) were never allocated into — the plan \
              claims slots for ops that do not allocate",
             binds - placements
         );

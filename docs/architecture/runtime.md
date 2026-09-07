@@ -526,6 +526,25 @@ and the stderr line from one counter snapshot so the two cannot disagree.
 The registry of kinds and fields is `EVENT_SCHEMAS` in
 `crates/nsl-cli/src/exec_markers.rs`, next to the marker registry.
 
+**Logging** (`src/log.rs`, roadmap C3). Diagnostic lines go through
+`nsl_log!(LEVEL, "target", "…")`, a `tracing` event whose target names the
+subsystem and whose message is the line. The crate's own subscriber
+(`NslSubscriber`, installed on the first line by `ensure_installed`) writes
+the message plus one newline to stderr and nothing else, so the marker
+lines the CLI gates compare byte for byte are unchanged from the
+`eprintln!` they replaced; when `NSL_EVENTS` is on, the same line is
+appended to the stream as a `log` event (`level`, `target`, `message`), the
+one kind whose `message` is its own marker (`LINE_IS_THE_MARKER` in
+`exec_markers.rs`). A host that installed a global `tracing` subscriber
+first keeps it and receives the runtime's lines as events. Migrated so far:
+the bracketed-marker family (`[zero3]`, `[cuda-graph]`, `[weight-stream]`,
+`[arena]`, `[sr-bf16]`, `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`,
+`[nsl-tcp]`, `[nsl-trace]`, `[tape-trace]`, `[scope]`); the `nsl: …` fatal
+lines and the remaining prints are the next slices, then nsl-codegen. A
+new line in a migrated family uses the macro; a new family picks a target
+and a level (ERROR before an abort or a lost result, WARN for degraded-but-
+continuing, INFO for the rest) and keeps the text it would have printed.
+
 **The stderr marker contract with nsl-cli.** Subsystems announce engagement
 with a bracketed tag at the start of a stderr line — `[zero3]`,
 `[cuda-graph]`, `[weight-stream]`, `[arena]`, `[sr-bf16]`,
