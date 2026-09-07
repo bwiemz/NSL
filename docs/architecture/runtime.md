@@ -118,6 +118,12 @@ handles at the *next* entry point; it does not make the reference itself
 sound. This is tracked as roadmap item C2. When touching a call site, prefer
 `from_ptr_ref` for read-only access and keep the reference's scope as short
 as the op allows; do not introduce new long-lived `&'static mut` borrows.
+Concretely: never hold the reference across a call that takes the same
+handle — the callee's own `from_ptr` invalidates yours under Stacked
+Borrows (Miri reports it as "trying to retag … but that tag does not exist
+in the borrow stack"); re-derive with `from_ptr` / `from_ptr_ref` after the
+call instead. `scripts/miri-cpu-tensor.sh` is the check (see *Tests and
+gates*).
 
 **Dtype tags.** `src/tensor/mod.rs` declares the `u16` wire tags (roadmap
 A3 moves the declaration into `nsl-abi`, with the runtime re-exporting
@@ -628,10 +634,20 @@ tiers over it; `scripts/gpu-guard.sh` serialises device access.
 on a small MLP, the elementwise record chain, the tiled f32 matmul, and
 allocation churn. `cargo bench -p nsl-runtime`.
 
-**Miri.** Nothing in the tree runs Miri: no workflow, script or `Cargo.toml`
-mentions it. Given the `&'static mut` pattern above, expect Miri to reject
-large parts of the crate; treat that as part of the C2 work, not a quick
-win.
+**Miri.** `scripts/miri-cpu-tensor.sh` runs the `tensor::tests` module
+(the CPU path is pure Rust, so it interprets end to end) under Miri's
+Stacked Borrows model; `--each` runs one process per test so one error
+does not hide the rest. First run (2026-09-07, roadmap C2): 45 tests, 35
+clean, 10 undefined behaviour — every one the same shape, in the tests
+themselves: a `&'static mut` from `from_ptr` held across an op that
+re-derives the same handle, then read again. No production op tripped
+it, which is consistent with each op deriving its own reference and
+using it within the call. Those ten tests now re-derive after the call.
+The measured gap that remains is the one the paragraph above describes:
+an op that takes two handles which alias (`add(x, x)`, an in-place op
+whose `dst` is one of its inputs) derives two `&mut` to one tensor, and
+nothing in the suite exercises that under Miri yet. Not in CI: it needs
+a nightly toolchain and interprets at roughly a minute per test.
 
 ## Where to add a new X
 
