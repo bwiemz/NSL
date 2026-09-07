@@ -347,7 +347,7 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
     // Review L7: a clamped out-of-range rank would silently alias the last
     // rank (duplicate segment claims, overlapping shm writes). Refuse.
     if rank >= ws {
-        eprintln!(
+        crate::nsl_log!(WARN, "zero", 
             "nsl_zero_init: NSL_LOCAL_RANK={rank} out of range for              world_size={ws} — refusing"
         );
         return -1;
@@ -704,7 +704,7 @@ pub extern "C" fn nsl_zero_owned_step_indices(accum_list: i64, num_params: i64) 
         let guard = ZERO_CTX.lock().unwrap();
         let Some(ctx) = guard.as_ref() else {
             if n > 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "zero", 
                     "nsl_zero_owned_step_indices: no ZeRO context is installed, \
                      but this program was compiled with --zero-stage and is \
                      asking which of {n} parameter(s) this rank owns. \
@@ -2274,7 +2274,7 @@ pub extern "C" fn nsl_zero3_note_param(tensor_ptr: i64, idx: i64) -> i64 {
     let owner = {
         let guard = ZERO_CTX.lock().unwrap();
         let Some(ctx) = guard.as_ref() else {
-            eprintln!("nsl_zero3_note_param: ZeRO context not initialized");
+            crate::nsl_log!(WARN, "zero", "nsl_zero3_note_param: ZeRO context not initialized");
             return -1;
         };
         ctx.owner_of
@@ -2318,7 +2318,7 @@ pub extern "C" fn nsl_zero3_mark_elementwise(tensor_ptr: i64, idx: i64, sr: i64)
     let ws = {
         let guard = ZERO_CTX.lock().unwrap();
         let Some(ctx) = guard.as_ref() else {
-            eprintln!("nsl_zero3_mark_elementwise: ZeRO context not initialized");
+            crate::nsl_log!(WARN, "zero", "nsl_zero3_mark_elementwise: ZeRO context not initialized");
             return -1;
         };
         ctx.world_size.max(1)

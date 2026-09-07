@@ -91,7 +91,7 @@ pub extern "C" fn nsl_fused_kl_ce_forward(
             smem_bytes as u32,
         );
         if rc != 0 {
-            eprintln!("nsl_fused_kl_ce_forward: CUDA launch failed rc={rc}");
+            crate::nsl_log!(ERROR, "fused-kl-ce", "nsl_fused_kl_ce_forward: CUDA launch failed rc={rc}");
             return -(rc as i64);
         }
         crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
@@ -121,7 +121,7 @@ pub extern "C" fn nsl_fused_kl_ce_forward(
             temp_bits,
             smem_bytes,
         );
-        eprintln!(
+        crate::nsl_log!(WARN, "fused-kl-ce", 
             "nsl_fused_kl_ce_forward: compiled without the cuda feature; the fused \
              KL-CE distillation loss is GPU-only in v1 (use the stdlib composite \
              fused_kl_ce on CPU)"
@@ -195,7 +195,7 @@ pub extern "C" fn nsl_fused_kl_ce_backward(
             num_valid as u32,
         );
         if rc != 0 {
-            eprintln!("nsl_fused_kl_ce_backward: CUDA launch failed rc={rc}");
+            crate::nsl_log!(ERROR, "fused-kl-ce", "nsl_fused_kl_ce_backward: CUDA launch failed rc={rc}");
             return -(rc as i64);
         }
         crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
@@ -228,7 +228,7 @@ pub extern "C" fn nsl_fused_kl_ce_backward(
             temp_bits,
             num_valid,
         );
-        eprintln!(
+        crate::nsl_log!(WARN, "fused-kl-ce", 
             "nsl_fused_kl_ce_backward: compiled without the cuda feature; the fused \
              KL-CE distillation loss is GPU-only in v1"
         );

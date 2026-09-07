@@ -927,7 +927,7 @@ mod perf_driver {
         let wall = std::time::Instant::now();
         nsl_muon_step_batch(params, grads, ms, routes, 0.02, 0.9, 0.01, 0, 5.0);
         unsafe { cudarc::driver::sys::cuCtxSynchronize() };
-        eprintln!(
+        crate::nsl_log!(INFO, "muon-batch-driver", 
             "[muon-batch-driver] one 500M-step Muon load (168 matrices, ns=5, batched): {:.1} ms wall",
             wall.elapsed().as_secs_f64() * 1e3
         );

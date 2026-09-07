@@ -320,7 +320,7 @@ pub fn build_onnx_model(graph: &TraceGraph) -> ModelProto {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_onnx_export(trace_ptr: i64, path_ptr: i64, path_len: i64) {
     if trace_ptr == 0 || path_ptr == 0 || path_len <= 0 {
-        eprintln!("[NSL] nsl_onnx_export: invalid arguments");
+        crate::nsl_log!(WARN, "onnx", "[NSL] nsl_onnx_export: invalid arguments");
         return;
     }
 
@@ -331,7 +331,7 @@ pub extern "C" fn nsl_onnx_export(trace_ptr: i64, path_ptr: i64, path_len: i64) 
         match std::str::from_utf8(bytes) {
             Ok(s) => s.to_owned(),
             Err(e) => {
-                eprintln!("[NSL] nsl_onnx_export: invalid UTF-8 path: {}", e);
+                crate::nsl_log!(WARN, "onnx", "[NSL] nsl_onnx_export: invalid UTF-8 path: {}", e);
                 return;
             }
         }
@@ -341,18 +341,18 @@ pub extern "C" fn nsl_onnx_export(trace_ptr: i64, path_ptr: i64, path_len: i64) 
 
     let mut buf = Vec::new();
     if let Err(e) = model.encode(&mut buf) {
-        eprintln!("[NSL] nsl_onnx_export: encode error: {}", e);
+        crate::nsl_log!(ERROR, "onnx", "[NSL] nsl_onnx_export: encode error: {}", e);
         return;
     }
 
     match std::fs::File::create(&path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(&buf) {
-                eprintln!("[NSL] nsl_onnx_export: write error: {}", e);
+                crate::nsl_log!(ERROR, "onnx", "[NSL] nsl_onnx_export: write error: {}", e);
             }
         }
         Err(e) => {
-            eprintln!("[NSL] nsl_onnx_export: create file '{}' error: {}", path, e);
+            crate::nsl_log!(ERROR, "onnx", "[NSL] nsl_onnx_export: create file '{}' error: {}", path, e);
         }
     }
 }

@@ -212,7 +212,7 @@ pub extern "C" fn nsl_kv_dequantize_gpu(
     #[cfg(not(feature = "cuda"))]
     {
         let _ = (data_ptr, out_ptr, meta_ptr, n, num_heads, block_size, head_dim, qs);
-        eprintln!("[nsl] nsl_kv_dequantize_gpu requires CUDA");
+        crate::nsl_log!(WARN, "nsl", "[nsl] nsl_kv_dequantize_gpu requires CUDA");
         -1
     }
 }

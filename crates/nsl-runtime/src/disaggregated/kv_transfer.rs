@@ -772,9 +772,9 @@ impl NvlinkBackend {
         // Probe CUDA IPC availability
         let cuda_ipc_available = Self::probe_cuda_ipc();
         if cuda_ipc_available {
-            eprintln!("[nsl-nvlink] CUDA IPC available, using GPU-direct transfer");
+            crate::nsl_log!(INFO, "nsl-nvlink", "[nsl-nvlink] CUDA IPC available, using GPU-direct transfer");
         } else {
-            eprintln!("[nsl-nvlink] CUDA IPC not available, using staged CPU transfer");
+            crate::nsl_log!(WARN, "nsl-nvlink", "[nsl-nvlink] CUDA IPC not available, using staged CPU transfer");
         }
         NvlinkBackend {
             rank,
@@ -1178,9 +1178,9 @@ impl RdmaBackend {
         // always fall back to TCP until real ibv_reg_mr/ibv_post_send is implemented.
         let rdma_available = false;
         if Self::probe_rdma() {
-            eprintln!("[nsl-rdma] RDMA NIC detected but ibverbs not yet wired — using TCP fallback");
+            crate::nsl_log!(WARN, "nsl-rdma", "[nsl-rdma] RDMA NIC detected but ibverbs not yet wired — using TCP fallback");
         } else {
-            eprintln!("[nsl-rdma] No RDMA NIC detected, falling back to TCP");
+            crate::nsl_log!(WARN, "nsl-rdma", "[nsl-rdma] No RDMA NIC detected, falling back to TCP");
         }
         RdmaBackend {
             rank,
@@ -1372,7 +1372,7 @@ impl KvTransferBackend for RdmaBackend {
                     let k_valid = (transfer.k_rkey & 0x80000000) != 0;
                     let v_valid = (transfer.v_rkey & 0x80000000) != 0;
                     if !k_valid || !v_valid {
-                        eprintln!(
+                        crate::nsl_log!(WARN, "nsl-rdma", 
                             "[nsl-rdma] Warning: invalid remote keys k_rkey={:#x} v_rkey={:#x}, using CPU fallback",
                             transfer.k_rkey, transfer.v_rkey
                         );

@@ -333,7 +333,7 @@ pub extern "C" fn nsl_cfie_kv_pool_alloc(bytes: i64) -> i64 {
     #[cfg(not(feature = "cuda"))]
     {
         let _ = bytes;
-        eprintln!("CFIE: kv_pool_alloc requires a CUDA-enabled build and GPU — refusing (no pool allocated)");
+        crate::nsl_log!(WARN, "cfie", "CFIE: kv_pool_alloc requires a CUDA-enabled build and GPU — refusing (no pool allocated)");
         -1
     }
 }
@@ -355,7 +355,7 @@ pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
             Err(_) => return -1,
         };
         if g.kernels.is_empty() {
-            eprintln!("CFIE: engine_finalize called with zero kernel registrations — refusing");
+            crate::nsl_log!(WARN, "cfie", "CFIE: engine_finalize called with zero kernel registrations — refusing");
             return -1;
         }
         if g.finalized {
@@ -370,7 +370,7 @@ pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
                 let module = match crate::cuda::inner::load_module_once(&k.ptx) {
                     Ok(m) => m,
                     Err(code) => {
-                        eprintln!(
+                        crate::nsl_log!(ERROR, "cfie", 
                             "CFIE: cuModuleLoadData failed for kernel (kind {}, layer {}): CUresult {}",
                             key.0, key.1, code
                         );
@@ -380,7 +380,7 @@ pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
                 let func = match crate::cuda::inner::get_function(module, &k.name) {
                     Ok(f) => f,
                     Err(code) => {
-                        eprintln!(
+                        crate::nsl_log!(ERROR, "cfie", 
                             "CFIE: cuModuleGetFunction('{}') failed for kernel (kind {}, layer {}): CUresult {}",
                             k.name.to_string_lossy(),
                             key.0,
@@ -410,7 +410,7 @@ pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
                     // "mask absent": the sampler would silently run
                     // UNCONSTRAINED (mask ptr 0 = grammar disabled).
                     // Refuse finalize like the load/lookup failures.
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: cuModuleGetGlobal('nsl_cfie_grammar_mask') failed: CUresult {} — refusing finalize",
                         code
                     );
@@ -423,7 +423,7 @@ pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!("CFIE: engine_finalize requires a CUDA-enabled build and GPU — refusing (no kernels resolved)");
+        crate::nsl_log!(WARN, "cfie", "CFIE: engine_finalize requires a CUDA-enabled build and GPU — refusing (no kernels resolved)");
         -1
     }
 }
@@ -626,7 +626,7 @@ pub extern "C" fn nsl_cfie_upload_weight_f16(host_f32_ptr: i64, n_elems: i64) ->
     #[cfg(not(feature = "cuda"))]
     {
         let _ = (host_f32_ptr, n_elems);
-        eprintln!("CFIE: upload_weight_f16 requires a CUDA-enabled build and GPU — refusing (no upload)");
+        crate::nsl_log!(WARN, "cfie", "CFIE: upload_weight_f16 requires a CUDA-enabled build and GPU — refusing (no upload)");
         -1
     }
 }
@@ -680,7 +680,7 @@ pub extern "C" fn nsl_cfie_upload_weight_f32(host_f32_ptr: i64, n_elems: i64) ->
     #[cfg(not(feature = "cuda"))]
     {
         let _ = (host_f32_ptr, n_elems);
-        eprintln!("CFIE: upload_weight_f32 requires a CUDA-enabled build and GPU — refusing (no upload)");
+        crate::nsl_log!(WARN, "cfie", "CFIE: upload_weight_f32 requires a CUDA-enabled build and GPU — refusing (no upload)");
         -1
     }
 }
@@ -972,7 +972,7 @@ pub extern "C" fn nsl_cfie_bind_model(
     #[cfg(feature = "cuda")]
     {
         if model_handle == 0 {
-            eprintln!("CFIE: bind_model refused — null model handle");
+            crate::nsl_log!(WARN, "cfie", "CFIE: bind_model refused — null model handle");
             return -1;
         }
         if n_layers <= 0
@@ -983,7 +983,7 @@ pub extern "C" fn nsl_cfie_bind_model(
             || d_ff <= 0
             || vocab_size <= 0
         {
-            eprintln!("CFIE: bind_model refused — non-positive dimension in the model shape");
+            crate::nsl_log!(WARN, "cfie", "CFIE: bind_model refused — non-positive dimension in the model shape");
             return -1;
         }
 
@@ -1013,7 +1013,7 @@ pub extern "C" fn nsl_cfie_bind_model(
                         let mut g = engine().lock().unwrap_or_else(|e| e.into_inner());
                         g.bound_model = None;
                         g.draft_model = None;
-                        eprintln!("CFIE: bind_model refused — engine lock poisoned");
+                        crate::nsl_log!(WARN, "cfie", "CFIE: bind_model refused — engine lock poisoned");
                         return -1;
                     }
                 };
@@ -1037,7 +1037,7 @@ pub extern "C" fn nsl_cfie_bind_model(
                     g.bound_model = None;
                     g.draft_model = None;
                 }
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: bind_model refused — missing or mis-shaped weight: {missing}"
                 );
                 -1
@@ -1056,7 +1056,7 @@ pub extern "C" fn nsl_cfie_bind_model(
             d_ff,
             vocab_size,
         );
-        eprintln!("CFIE: bind_model requires a CUDA-enabled build and GPU — refusing (no binding)");
+        crate::nsl_log!(WARN, "cfie", "CFIE: bind_model requires a CUDA-enabled build and GPU — refusing (no binding)");
         -1
     }
 }
@@ -1110,7 +1110,7 @@ pub extern "C" fn nsl_cfie_generate(
             || out_cap <= 0
             || max_new_tokens <= 0
         {
-            eprintln!("CFIE: generate refused — bad argument (null ptr or non-positive length/cap)");
+            crate::nsl_log!(WARN, "cfie", "CFIE: generate refused — bad argument (null ptr or non-positive length/cap)");
             return -1;
         }
 
@@ -1122,7 +1122,7 @@ pub extern "C" fn nsl_cfie_generate(
             let g = match engine().lock() {
                 Ok(g) => g,
                 Err(_) => {
-                    eprintln!("CFIE: generate refused — engine lock poisoned");
+                    crate::nsl_log!(WARN, "cfie", "CFIE: generate refused — engine lock poisoned");
                     return -1;
                 }
             };
@@ -1137,7 +1137,7 @@ pub extern "C" fn nsl_cfie_generate(
                     bm.vocab_size,
                 ),
                 None => {
-                    eprintln!("CFIE: generate refused — no model bound (call nsl_cfie_bind_model first)");
+                    crate::nsl_log!(WARN, "cfie", "CFIE: generate refused — no model bound (call nsl_cfie_bind_model first)");
                     return -1;
                 }
             }
@@ -1146,7 +1146,7 @@ pub extern "C" fn nsl_cfie_generate(
         // checks finalize; probe kind 2 so a not-finalized engine refuses
         // here rather than deep in the loop.
         if resolved(KIND_DECODE_BLOCK, 0).is_err() || resolved(KIND_FUSED_SAMPLE, 0).is_err() {
-            eprintln!("CFIE: generate refused — engine not finalized (kinds 1+2 unresolved)");
+            crate::nsl_log!(WARN, "cfie", "CFIE: generate refused — engine not finalized (kinds 1+2 unresolved)");
             return -1;
         }
 
@@ -1162,7 +1162,7 @@ pub extern "C" fn nsl_cfie_generate(
         // Acquire a fresh KV slot for this sequence.
         let slot = crate::cfie::ffi::nsl_cfie_kv_slot_acquire();
         if slot < 0 {
-            eprintln!("CFIE: generate refused — KV slot acquire failed (pool exhausted?)");
+            crate::nsl_log!(ERROR, "cfie", "CFIE: generate refused — KV slot acquire failed (pool exhausted?)");
             return -1;
         }
 
@@ -1195,7 +1195,7 @@ pub extern "C" fn nsl_cfie_generate(
             // vocab so a bad id refuses rather than reading OOB host mem.
             if input_token < 0 || input_token >= vocab_size {
                 cleanup(x_a, x_b, tok_dev, slot);
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: generate refused — input token id {input_token} out of range [0, {vocab_size})"
                 );
                 return -1;
@@ -1227,7 +1227,7 @@ pub extern "C" fn nsl_cfie_generate(
             if rc < 0 {
                 // Real decode failure -> release slot + free scratch, -1.
                 cleanup(x_a, x_b, tok_dev, slot);
-                eprintln!("CFIE: generate — decode_step failed with rc {rc}");
+                crate::nsl_log!(ERROR, "cfie", "CFIE: generate — decode_step failed with rc {rc}");
                 return -1;
             }
 
@@ -1271,7 +1271,7 @@ pub extern "C" fn nsl_cfie_generate(
             out_tokens_ptr,
             out_cap,
         );
-        eprintln!("CFIE: generate requires a CUDA-enabled build and GPU — refusing (no generation)");
+        crate::nsl_log!(WARN, "cfie", "CFIE: generate requires a CUDA-enabled build and GPU — refusing (no generation)");
         -1
     }
 }
@@ -1349,7 +1349,7 @@ pub extern "C" fn nsl_cfie_bind_draft_model(
     // Cross-build guards (pure bookkeeping — meaningful CPU-only tests):
     // arg validation, target-bound ordering, shared-vocab invariant.
     if model_handle == 0 {
-        eprintln!("CFIE: bind_draft_model refused — null model handle");
+        crate::nsl_log!(WARN, "cfie", "CFIE: bind_draft_model refused — null model handle");
         return -1;
     }
     if n_layers <= 0
@@ -1360,26 +1360,26 @@ pub extern "C" fn nsl_cfie_bind_draft_model(
         || d_ff <= 0
         || vocab_size <= 0
     {
-        eprintln!("CFIE: bind_draft_model refused — non-positive dimension in the model shape");
+        crate::nsl_log!(WARN, "cfie", "CFIE: bind_draft_model refused — non-positive dimension in the model shape");
         return -1;
     }
     {
         let g = match engine().lock() {
             Ok(g) => g,
             Err(_) => {
-                eprintln!("CFIE: bind_draft_model refused — engine lock poisoned");
+                crate::nsl_log!(WARN, "cfie", "CFIE: bind_draft_model refused — engine lock poisoned");
                 return -1;
             }
         };
         match g.bound_model.as_ref() {
             None => {
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: bind_draft_model refused — no target model bound (call nsl_cfie_bind_model first)"
                 );
                 return -1;
             }
             Some(bm) if bm.vocab_size != vocab_size => {
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: bind_draft_model refused — draft vocab {} != target vocab {} (speculative decoding requires a shared vocab)",
                     vocab_size, bm.vocab_size
                 );
@@ -1395,7 +1395,7 @@ pub extern "C" fn nsl_cfie_bind_draft_model(
         let start = match engine().lock() {
             Ok(g) => g.weight_allocs.len(),
             Err(_) => {
-                eprintln!("CFIE: bind_draft_model refused — engine lock poisoned");
+                crate::nsl_log!(WARN, "cfie", "CFIE: bind_draft_model refused — engine lock poisoned");
                 return -1;
             }
         };
@@ -1421,7 +1421,7 @@ pub extern "C" fn nsl_cfie_bind_draft_model(
                 );
                 if !target_ok {
                     free_weight_allocs_from(&mut g, start);
-                    eprintln!(
+                    crate::nsl_log!(WARN, "cfie", 
                         "CFIE: bind_draft_model refused — target binding changed during the draft bind"
                     );
                     return -1;
@@ -1436,7 +1436,7 @@ pub extern "C" fn nsl_cfie_bind_draft_model(
                     free_weight_allocs_from(&mut g, start);
                     g.draft_model = None;
                 }
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: bind_draft_model refused — missing or mis-shaped weight: {missing}"
                 );
                 -1
@@ -1445,7 +1445,7 @@ pub extern "C" fn nsl_cfie_bind_draft_model(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!(
+        crate::nsl_log!(WARN, "cfie", 
             "CFIE: bind_draft_model requires a CUDA-enabled build and GPU — refusing (no binding)"
         );
         -1
@@ -1491,7 +1491,7 @@ pub extern "C" fn nsl_cfie_draft_pool_alloc(bytes: i64) -> i64 {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!("CFIE: draft_pool_alloc requires a CUDA-enabled build and GPU — refusing (no pool allocated)");
+        crate::nsl_log!(WARN, "cfie", "CFIE: draft_pool_alloc requires a CUDA-enabled build and GPU — refusing (no pool allocated)");
         -1
     }
 }
@@ -2461,13 +2461,13 @@ pub extern "C" fn nsl_cfie_speculative_generate(
         || out_cap <= 0
         || max_new_tokens <= 0
     {
-        eprintln!(
+        crate::nsl_log!(WARN, "cfie", 
             "CFIE: speculative_generate refused — bad argument (null ptr or non-positive length/cap)"
         );
         return -1;
     }
     if !(1..=32).contains(&k_tokens) {
-        eprintln!(
+        crate::nsl_log!(WARN, "cfie", 
             "CFIE: speculative_generate refused — k_tokens {k_tokens} outside the frozen 1..=32 range"
         );
         return -1;
@@ -2476,14 +2476,14 @@ pub extern "C" fn nsl_cfie_speculative_generate(
         let g = match engine().lock() {
             Ok(g) => g,
             Err(_) => {
-                eprintln!("CFIE: speculative_generate refused — engine lock poisoned");
+                crate::nsl_log!(WARN, "cfie", "CFIE: speculative_generate refused — engine lock poisoned");
                 return -1;
             }
         };
         let bm = match g.bound_model.as_ref() {
             Some(bm) => bm,
             None => {
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: speculative_generate refused — no model bound (call nsl_cfie_bind_model first)"
                 );
                 return -1;
@@ -2492,14 +2492,14 @@ pub extern "C" fn nsl_cfie_speculative_generate(
         match g.draft_model.as_ref() {
             Some(dm) if dm.vocab_size == bm.vocab_size => {}
             Some(dm) => {
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: speculative_generate refused — draft vocab {} != target vocab {} (rebind required)",
                     dm.vocab_size, bm.vocab_size
                 );
                 return -1;
             }
             None => {
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: speculative_generate refused — no draft model bound (call nsl_cfie_bind_draft_model first)"
                 );
                 return -1;
@@ -2521,7 +2521,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             }
         }
         if SPEC_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-            eprintln!(
+            crate::nsl_log!(WARN, "cfie", 
                 "CFIE: speculative_generate refused — another speculative call is in flight (single-slot draft KV pool; serialize calls)"
             );
             return -1;
@@ -2572,7 +2572,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             || resolved(KIND_VERIFY_PROBS, 0).is_err()
             || resolved(KIND_SPEC_REJECT, 0).is_err()
         {
-            eprintln!(
+            crate::nsl_log!(WARN, "cfie", 
                 "CFIE: speculative_generate refused — engine not finalized (kinds 1/2/4/6/7/8 unresolved)"
             );
             return -1;
@@ -2584,7 +2584,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 Err(_) => return -1,
             };
             if g.draft_pool_base == 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: speculative_generate refused — draft KV pool not allocated (call nsl_cfie_draft_pool_alloc)"
                 );
                 return -1;
@@ -2595,7 +2595,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
         if checked_host_i64_bytes(prompt_len).is_none()
             || checked_host_i64_bytes(out_cap).is_none()
         {
-            eprintln!("CFIE: speculative_generate refused — token array size overflows");
+            crate::nsl_log!(WARN, "cfie", "CFIE: speculative_generate refused — token array size overflows");
             return -1;
         }
         let probs_bytes = match (k_tokens as u64)
@@ -2605,7 +2605,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
         {
             Some(b) => b as usize,
             None => {
-                eprintln!("CFIE: speculative_generate refused — K x vocab prob matrix overflows");
+                crate::nsl_log!(WARN, "cfie", "CFIE: speculative_generate refused — K x vocab prob matrix overflows");
                 return -1;
             }
         };
@@ -2624,7 +2624,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
         // its own single-slot pool.
         let slot = crate::cfie::ffi::nsl_cfie_kv_slot_acquire();
         if slot < 0 {
-            eprintln!("CFIE: speculative_generate refused — KV slot acquire failed (pool exhausted?)");
+            crate::nsl_log!(ERROR, "cfie", "CFIE: speculative_generate refused — KV slot acquire failed (pool exhausted?)");
             return -1;
         }
 
@@ -2684,7 +2684,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             let t = prompt[pos as usize];
             if t < 0 || t >= vocab_size {
                 cleanup();
-                eprintln!(
+                crate::nsl_log!(WARN, "cfie", 
                     "CFIE: speculative_generate refused — prompt token id {t} out of range [0, {vocab_size})"
                 );
                 return -1;
@@ -2710,7 +2710,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             }
             if rc < 0 {
                 cleanup();
-                eprintln!("CFIE: speculative_generate — prefill decode_step failed with rc {rc}");
+                crate::nsl_log!(ERROR, "cfie", "CFIE: speculative_generate — prefill decode_step failed with rc {rc}");
                 return -1;
             }
         }
@@ -2727,7 +2727,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             gather_embed_row(&draft_embed, dd, prompt[pos as usize], x_da);
             if let Err(rc) = draft_chain(x_da, x_db, draft_n_layers, pos) {
                 cleanup();
-                eprintln!("CFIE: speculative_generate — draft prefill launch failed with rc {rc}");
+                crate::nsl_log!(ERROR, "cfie", "CFIE: speculative_generate — draft prefill launch failed with rc {rc}");
                 return -1;
             }
         }
@@ -2767,7 +2767,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 loop {
                     if last < 0 || last >= vocab_size {
                         cleanup();
-                        eprintln!(
+                        crate::nsl_log!(WARN, "cfie", 
                             "CFIE: speculative_generate refused — tail input token id {last} out of range [0, {vocab_size})"
                         );
                         return -1;
@@ -2791,7 +2791,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                     }
                     if rc < 0 {
                         cleanup();
-                        eprintln!(
+                        crate::nsl_log!(ERROR, "cfie", 
                             "CFIE: speculative_generate — tail decode_step failed with rc {rc}"
                         );
                         return -1;
@@ -2800,7 +2800,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                     let t = read_u32(tok_dev) as i64;
                     if t >= vocab_size {
                         cleanup();
-                        eprintln!(
+                        crate::nsl_log!(ERROR, "cfie", 
                             "CFIE: speculative_generate — sampler produced out-of-vocab token {t} (kernel contract violation)"
                         );
                         return -1;
@@ -2818,7 +2818,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             for j in 0..k {
                 if prev < 0 || prev >= vocab_size {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(WARN, "cfie", 
                         "CFIE: speculative_generate refused — draft input token id {prev} out of range [0, {vocab_size})"
                     );
                     return -1;
@@ -2828,7 +2828,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                     Ok(h) => h,
                     Err(rc) => {
                         cleanup();
-                        eprintln!(
+                        crate::nsl_log!(ERROR, "cfie", 
                             "CFIE: speculative_generate — draft block launch failed with rc {rc}"
                         );
                         return -1;
@@ -2842,7 +2842,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 );
                 if rc != 0 {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — draft sample launch failed with rc {rc}"
                     );
                     return -1;
@@ -2851,7 +2851,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 let dt = read_u32(d_tokens_dev + (j as i64) * 4) as i64;
                 if dt >= vocab_size {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — draft sampler produced out-of-vocab token {dt} (kernel contract violation)"
                     );
                     return -1;
@@ -2886,7 +2886,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 }
                 if rc != 0 {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — verify step failed with rc {rc}"
                     );
                     return -1;
@@ -2908,7 +2908,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             );
             if rc != 0 {
                 cleanup();
-                eprintln!("CFIE: speculative_generate — reject launch failed with rc {rc}");
+                crate::nsl_log!(ERROR, "cfie", "CFIE: speculative_generate — reject launch failed with rc {rc}");
                 return -1;
             }
             round += 1;
@@ -2916,7 +2916,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
             let correction = read_u32(rj_dev + 4);
             if accepted > k_tokens {
                 cleanup();
-                eprintln!(
+                crate::nsl_log!(ERROR, "cfie", 
                     "CFIE: speculative_generate — reject kernel reported {accepted} accepted of {k_tokens} (kernel contract violation)"
                 );
                 return -1;
@@ -2929,7 +2929,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 // in lock-step.
                 if accepted != k_tokens {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — all-accept sentinel with accepted {accepted} != K {k_tokens} (kernel contract violation)"
                     );
                     return -1;
@@ -2959,7 +2959,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 }
                 if rc < 0 {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — bonus decode_step failed with rc {rc}"
                     );
                     return -1;
@@ -2968,7 +2968,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 let bonus = read_u32(tok_dev) as i64;
                 if bonus >= vocab_size {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — sampler produced out-of-vocab token {bonus} (kernel contract violation)"
                     );
                     return -1;
@@ -2978,7 +2978,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 gather_embed_row(&draft_embed, dd, inp, x_da);
                 if let Err(rc) = draft_chain(x_da, x_db, draft_n_layers, draft_pos) {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — draft sync launch failed with rc {rc}"
                     );
                     return -1;
@@ -2993,7 +2993,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 // prefix, then the residual correction sample.
                 if accepted >= k_tokens {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — correction with accepted {accepted} >= K {k_tokens} (kernel contract violation)"
                     );
                     return -1;
@@ -3006,7 +3006,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                 let corr = correction as i64;
                 if corr >= vocab_size {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — reject kernel produced out-of-vocab correction {corr} (kernel contract violation)"
                     );
                     return -1;
@@ -3023,7 +3023,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
                     && crate::cfie::ffi::nsl_cfie_kv_slot_rollback(slot, stale) < 0
                 {
                     cleanup();
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "cfie", 
                         "CFIE: speculative_generate — KV rollback of {stale} rejected rows failed"
                     );
                     return -1;
@@ -3043,7 +3043,7 @@ pub extern "C" fn nsl_cfie_speculative_generate(
     #[cfg(not(feature = "cuda"))]
     {
         let _ = (eos_token_id, rng_seed);
-        eprintln!(
+        crate::nsl_log!(WARN, "cfie", 
             "CFIE: speculative_generate requires a CUDA-enabled build and GPU — refusing (no generation)"
         );
         -1

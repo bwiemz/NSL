@@ -29,7 +29,7 @@ pub extern "C" fn nsl_agent_pool_new(
     }) {
         Ok(p) => Box::into_raw(Box::new(p)),
         Err(e) => {
-            eprintln!("[m56 ffi] pool_new construction error: {}", e);
+            crate::nsl_log!(ERROR, "m56-ffi", "[m56 ffi] pool_new construction error: {}", e);
             std::ptr::null_mut()
         }
     }

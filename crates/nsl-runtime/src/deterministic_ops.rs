@@ -38,7 +38,7 @@ static RNG_SEED_SET: AtomicBool = AtomicBool::new(false);
 pub extern "C" fn nsl_set_deterministic(mode: i64) -> i64 {
     DETERMINISTIC_MODE.store(mode != 0, Ordering::SeqCst);
     if mode != 0 {
-        eprintln!("[nsl] deterministic mode enabled");
+        crate::nsl_log!(INFO, "nsl", "[nsl] deterministic mode enabled");
     }
     0
 }
@@ -81,7 +81,7 @@ pub extern "C" fn nsl_rng_seed(seed: i64) -> i64 {
         seed as u64,
         crate::rng_state::GPU_DROPOUT_SEED_DEFAULT,
     ));
-    eprintln!("[nsl] deterministic RNG seed set to {seed}");
+    crate::nsl_log!(INFO, "nsl", "[nsl] deterministic RNG seed set to {seed}");
     0
 }
 

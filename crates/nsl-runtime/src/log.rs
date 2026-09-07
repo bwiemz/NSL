@@ -33,14 +33,16 @@
 //! detected), `INFO` for the informational markers (counters, traces,
 //! `disabled by …`). The level does not change what is printed.
 //!
-//! Migration status: the bracketed-marker family in `nsl-runtime` (the
-//! `[zero3]`, `[cuda-graph]`, `[weight-stream]`, `[arena]`, `[sr-bf16]`,
-//! `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`, `[nsl-tcp]`,
-//! `[nsl-trace]`, `[tape-trace]`, `[scope]` lines) and the `nsl: …`
-//! family (target `"nsl"`: `ERROR` where the line precedes an abort or
-//! exit, `WARN` where the entry point returns instead) go through
-//! `nsl_log!`; the rest of the crate's prints are the next slice, then
-//! nsl-codegen.
+//! Migration status: every diagnostic `eprintln!` in `nsl-runtime` goes
+//! through `nsl_log!` — the bracketed-marker family (`[zero3]`,
+//! `[cuda-graph]`, `[weight-stream]`, `[arena]`, …), the `nsl: …` and
+//! `[nsl] …` families (target `"nsl"`), and the per-subsystem lines
+//! (`"cfie"` for the `CFIE: …` refusals, `"flash-attention"` /
+//! `"flash-bwd"`, `"fused-linear-ce"`, `"cuda"`, `"tensor"`, `"huggingface"`,
+//! …; a line that starts with its own `[marker]` uses the marker as its
+//! target). Program output stays on `println!` — the `print` builtin
+//! (`print.rs`), the tensor printer, the health JSON — since that is
+//! stdout, not a diagnostic. Next: nsl-codegen.
 
 use std::fmt::Write as _;
 use std::io::Write as _;

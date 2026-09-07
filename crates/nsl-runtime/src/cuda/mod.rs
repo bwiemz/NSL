@@ -219,7 +219,7 @@ pub(crate) mod inner {
         }
         let ordinal = rank.max(0) % count;
         if ordinal != 0 {
-            eprintln!("[nsl] rank {rank}: binding CUDA device {ordinal} (of {count})");
+            crate::nsl_log!(INFO, "nsl", "[nsl] rank {rank}: binding CUDA device {ordinal} (of {count})");
         }
         ordinal
     }
@@ -260,7 +260,7 @@ pub(crate) mod inner {
                 );
                 if std::env::var("NSL_CUDA_SYNC").map(|v| v == "1").unwrap_or(false) {
                     CUDA_SYNC_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch");
+                    crate::nsl_log!(INFO, "nsl", "[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch");
                 }
                 // Register atexit handler for memory stats if NSL_MEMSTATS=1
                 if super::caching_allocator::memstats_enabled() {
@@ -423,7 +423,7 @@ pub(crate) mod inner {
     /// convention here (see `assert.rs`).
     pub(crate) fn oom_fatal(msg: String) -> ! {
         use std::io::Write;
-        eprintln!("{msg}");
+        crate::nsl_log!(ERROR, "cuda", "{msg}");
         let _ = std::io::stderr().flush();
         std::process::exit(NSL_EXIT_GPU_OOM);
     }
@@ -753,9 +753,9 @@ pub(crate) mod inner {
                 r == CUresult::CUDA_SUCCESS && !pool.is_null()
             };
             if supported {
-                eprintln!("[nsl] Async GPU allocation ENABLED (cuMemAllocAsync)");
+                crate::nsl_log!(INFO, "nsl", "[nsl] Async GPU allocation ENABLED (cuMemAllocAsync)");
             } else {
-                eprintln!("[nsl] NSL_ASYNC_ALLOC=1 but driver does not support memory pools — using sync alloc");
+                crate::nsl_log!(INFO, "nsl", "[nsl] NSL_ASYNC_ALLOC=1 but driver does not support memory pools — using sync alloc");
             }
             supported
         })
@@ -1244,7 +1244,7 @@ pub(crate) mod inner {
         // remembering a hook. One relaxed load when the cache never armed.
         super::bf16_cast_cache::evict(dst_device as u64);
         if size_bytes >= 262144 && crate::host_profile::enabled() {
-            eprintln!("[copy] H2D {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
+            crate::nsl_log!(INFO, "copy", "[copy] H2D {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
         }
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         crate::host_profile::record_h2d(size_bytes);
@@ -1323,7 +1323,7 @@ pub(crate) mod inner {
     #[track_caller]
     pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
         if size_bytes >= 262144 && crate::host_profile::enabled() {
-            eprintln!("[copy] D2H {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
+            crate::nsl_log!(INFO, "copy", "[copy] D2H {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
         }
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         crate::host_profile::record_d2h(size_bytes);
@@ -1800,7 +1800,7 @@ pub(crate) mod inner {
                 // Don't panic on prefetch failures — device memory (cuMemAlloc_v2)
                 // doesn't support prefetch (that's a unified memory API).
                 // Log and continue.
-                eprintln!("[nsl] cuMemPrefetchAsync warning: {:?} (non-fatal)", result);
+                crate::nsl_log!(WARN, "nsl", "[nsl] cuMemPrefetchAsync warning: {:?} (non-fatal)", result);
             }
         }
     }
@@ -2543,27 +2543,27 @@ pub(crate) mod cublas_inner {
                 // valid `cublasHandle_t`; `raw_mode` is a valid enum variant.
                 let status = unsafe { cublas_sys::cublasSetMathMode(handle, raw_mode) };
                 if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "nsl-matmul", 
                         "[nsl-matmul] cublasSetMathMode({raw_mode:?}) failed: {status:?} \
                          (handle left in cuBLAS default math mode)"
                     );
                 }
 
                 match mode {
-                    CublasMathMode::Fp32Cores => eprintln!(
+                    CublasMathMode::Fp32Cores => crate::nsl_log!(INFO, "nsl-matmul", 
                         "[nsl-matmul] cuBLAS math mode: f32 on FP32 CUDA cores \
                          (NSL_MATMUL_TF32=0)"
                     ),
-                    CublasMathMode::Pedantic => eprintln!(
+                    CublasMathMode::Pedantic => crate::nsl_log!(INFO, "nsl-matmul", 
                         "[nsl-matmul] cuBLAS math mode: pedantic (strict f32; same arithmetic \
                          units as FP32 cores, fewer internal shortcuts)"
                     ),
-                    CublasMathMode::Tf32 => eprintln!(
+                    CublasMathMode::Tf32 => crate::nsl_log!(INFO, "nsl-matmul", 
                         "[nsl-matmul] cuBLAS math mode: TF32 tensor cores (default) — 1.55x on \
                          gemms, 1.18x on total kernel time at Coder-50M, at ~13 bits less \
                          mantissa per product. Set NSL_MATMUL_TF32=0 for full f32."
                     ),
-                    CublasMathMode::Bf16 => eprintln!(
+                    CublasMathMode::Bf16 => crate::nsl_log!(INFO, "nsl-matmul", 
                         "[nsl-matmul] cuBLAS math mode: BF16 tensor-core GEMMs \
                          (NSL_MATMUL_BF16=1) — high-intensity products cast operands to \
                          bf16 storage (measured 71.3 vs TF32's 36.4 TFLOPS at N=4096, \
@@ -2751,7 +2751,7 @@ pub(crate) mod cublas_inner {
                 == crate::matmul_config::ROUND_SR;
             match if sr { Some("sr") } else { None } {
                 Some("sr") => {
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "nsl-matmul", 
                         "[nsl-matmul] bf16 operand cast: STOCHASTIC rounding \
                          (NSL_MATMUL_BF16_ROUND=sr). Decorrelates the \
                          weight-operand error that round-to-nearest holds \
@@ -3069,7 +3069,7 @@ pub(crate) mod cublas_inner {
                 )
             };
             if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                eprintln!("[nsl] cublasSetStream_v2 failed: {r:?} — gemm stays on its previous stream");
+                crate::nsl_log!(ERROR, "nsl", "[nsl] cublasSetStream_v2 failed: {r:?} — gemm stays on its previous stream");
             }
         }
         let op = |t: bool| {
@@ -3189,7 +3189,7 @@ pub(crate) mod cublas_inner {
                 )
             };
             if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                eprintln!(
+                crate::nsl_log!(ERROR, "nsl", 
                     "[nsl] cublasSetStream_v2 failed: {r:?} — batched matmul stays on its previous stream"
                 );
             }
@@ -3331,7 +3331,7 @@ pub(crate) mod cublas_inner {
                 )
             };
             if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                eprintln!("[nsl] cublasSetStream_v2 failed: {:?} — wgrad gemm stays on its previous stream", r);
+                crate::nsl_log!(ERROR, "nsl", "[nsl] cublasSetStream_v2 failed: {:?} — wgrad gemm stays on its previous stream", r);
             }
         }
         // BF16 goes per-call through `gemm_bf16_mode` (no handle-level BF16
@@ -3423,7 +3423,7 @@ pub(crate) mod cublas_inner {
                 )
             };
             if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                eprintln!(
+                crate::nsl_log!(ERROR, "nsl", 
                     "[nsl] cublasSetStream_v2 failed: {r:?} — batched gemm stays on its previous stream"
                 );
             }
@@ -3674,7 +3674,7 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let out_data = match inner::try_alloc_managed(n * 4) {
         Some(ptr) => ptr,
         None => {
-            eprintln!("[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
+            crate::nsl_log!(WARN, "nsl", "[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
             return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
         }
     };
@@ -3712,7 +3712,7 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     );
     if result as u32 != 0 {
         // Free the allocated tensor+data to avoid leak on kernel failure
-        eprintln!("GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+        crate::nsl_log!(ERROR, "cuda", "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
         unsafe { let _ = Box::from_raw(out_ptr); }
         inner::free_managed(out_data);
         return 0;
@@ -3775,7 +3775,7 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     let out_data = match inner::try_alloc_managed(n * 4) {
         Some(ptr) => ptr,
         None => {
-            eprintln!("[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
+            crate::nsl_log!(WARN, "nsl", "[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
             return cpu_fallback_unary(a_ptr, kernel_name);
         }
     };
@@ -5594,7 +5594,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             )
         };
         if let Err(e) = res {
-            eprintln!("[nsl-matmul] cuBLAS sgemm failed ({}x{}x{}): {:?}", m, n, k, e);
+            crate::nsl_log!(ERROR, "nsl-matmul", "[nsl-matmul] cuBLAS sgemm failed ({}x{}x{}): {:?}", m, n, k, e);
             // Match existing failure convention: null pointer so callers can
             // detect the failure (existing kernel path used assert_eq!; this
             // is a safer non-panicking failure mode).
@@ -5684,7 +5684,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             )
         };
         if let Err(e) = res {
-            eprintln!(
+            crate::nsl_log!(ERROR, "nsl-matmul", 
                 "[nsl-matmul] cuBLAS batched gemm failed ({total_batch}x{m}x{n}x{k}): {e:?}"
             );
             // Release the output we allocated above before signalling failure.
@@ -5950,7 +5950,7 @@ pub(crate) fn gpu_fused_ew_launch(
         Some(ptr) => ptr,
         None => {
             if !OOM_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
+                crate::nsl_log!(WARN, "nsl", 
                     "[nsl] GPU OOM in nsl_fused_ew_chain — degrading to decomposed replay \
                      (warn-once; see fused_ew_counters for totals)"
                 );
@@ -6007,7 +6007,7 @@ pub(crate) fn gpu_fused_ew_launch(
         // leaves TENSOR_MAGIC in freed memory; review finding). Then let the
         // caller replay — same degrade contract as the OOM arm above.
         if !LAUNCH_FAIL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
+            crate::nsl_log!(ERROR, "nsl", 
                 "[nsl] fused-ew GPU kernel launch failed ({}) — degrading to decomposed \
                  replay (warn-once; see fused_ew_counters for totals)",
                 result as u32
@@ -6301,7 +6301,7 @@ pub extern "C" fn nsl_cuda_init() -> i64 {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!("CUDA support not compiled. Rebuild with --features cuda");
+        crate::nsl_log!(ERROR, "cuda", "CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
     }
 }
@@ -6503,7 +6503,7 @@ pub extern "C" fn nsl_kernel_launch(
     {
         let _ = (ptx_ptr, name_ptr, grid_x, grid_y, grid_z);
         let _ = (block_x, block_y, block_z, args_ptr, num_args, shared_mem_bytes);
-        eprintln!("CUDA support not compiled. Rebuild with --features cuda");
+        crate::nsl_log!(ERROR, "cuda", "CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
     }
 }
@@ -7055,7 +7055,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     if *LOG_SHAPES.get_or_init(|| {
         std::env::var("NSL_SUM_DIM_LOG").ok().as_deref() == Some("1")
     }) {
-        eprintln!(
+        crate::nsl_log!(INFO, "sum_dim", 
             "[sum_dim] reduce={reduce_size} outer={outer} inner={inner} out_total={out_total} fast={}",
             reduce_size <= short_axis_max
         );
@@ -10444,7 +10444,7 @@ mod tests {
     #[test]
     fn all_handwritten_ptx_assembles_with_ptxas() {
         let Some(ptxas) = find_ptxas() else {
-            eprintln!("ptxas not found (no CUDA toolkit); skipping PTX assembly gate");
+            crate::nsl_log!(WARN, "cuda", "ptxas not found (no CUDA toolkit); skipping PTX assembly gate");
             return;
         };
         let dir = std::env::temp_dir().join(format!("nsl_ptx_gate_{}", std::process::id()));

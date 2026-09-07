@@ -248,7 +248,7 @@ fn fault() -> Option<Fault> {
             "drop" => Fault::Drop(idx),
             _ => return None,
         };
-        eprintln!(
+        crate::nsl_log!(INFO, "grad-integrity", 
             "[grad-integrity] FAULT INJECTION ACTIVE (NSL_GRAD_INTEGRITY_FAULT={}): \
              parameter {idx}'s gradient contributions will be miscounted on purpose. \
              This is a test hook; never set it for a real run.",
@@ -540,13 +540,13 @@ extern "C" fn grad_integrity_atexit() {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    eprintln!("[grad-integrity]");
-    eprintln!("checks={checks}");
-    eprintln!("expected_params={expected}");
-    eprintln!("gradient_params={gradient}");
-    eprintln!("finite={finite}");
-    eprintln!("nonzero={nonzero}");
-    eprintln!("missing=[{}]", list(&missing));
+    crate::nsl_log!(INFO, "grad-integrity", "[grad-integrity]");
+    crate::nsl_log!(INFO, "grad-integrity", "checks={checks}");
+    crate::nsl_log!(INFO, "grad-integrity", "expected_params={expected}");
+    crate::nsl_log!(INFO, "grad-integrity", "gradient_params={gradient}");
+    crate::nsl_log!(INFO, "grad-integrity", "finite={finite}");
+    crate::nsl_log!(INFO, "grad-integrity", "nonzero={nonzero}");
+    crate::nsl_log!(INFO, "grad-integrity", "missing=[{}]", list(&missing));
     // APPEND-ONLY below this line: two consumers pin the six legacy fields by
     // POSITION, and inserting a field above pushes `missing` out of their
     // six-line window. They then fail differently, which is the part worth
@@ -562,11 +562,11 @@ extern "C" fn grad_integrity_atexit() {
     // A new parser must use the `?`-anchored form. (Third consumer,
     // models/benchmarks/p0_campaign.py, no longer pins positions: it reads
     // `key=value` lines until the block ends, so appends just widen it.)
-    eprintln!("notes_expected={}", notes.expected);
-    eprintln!("notes_observed={}..{}", notes.min, notes.max);
-    eprintln!("under_noted=[{}]", list(&notes.under));
-    eprintln!("over_noted=[{}]", list(&notes.over));
-    eprintln!("unjudged_checks={}", notes.unjudged);
+    crate::nsl_log!(INFO, "grad-integrity", "notes_expected={}", notes.expected);
+    crate::nsl_log!(INFO, "grad-integrity", "notes_observed={}..{}", notes.min, notes.max);
+    crate::nsl_log!(INFO, "grad-integrity", "under_noted=[{}]", list(&notes.under));
+    crate::nsl_log!(INFO, "grad-integrity", "over_noted=[{}]", list(&notes.over));
+    crate::nsl_log!(INFO, "grad-integrity", "unjudged_checks={}", notes.unjudged);
 }
 
 /// Snapshot for the atexit report and for tests:
