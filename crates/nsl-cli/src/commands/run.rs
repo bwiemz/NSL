@@ -474,14 +474,20 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 zero_stage: zero_stage.map(|s| s as u8),
                 zero_elementwise,
                 optim_state_offload,
-                checkpoint_blocks,
-                checkpoint_selective,
-                checkpoint_budget_mib,
-                checkpoint_stride: crate::meta_flags::parse_checkpoint_stride(&checkpoint_stride),
+                checkpoint: nsl_codegen::CheckpointOptions {
+                    blocks: checkpoint_blocks,
+                    selective: checkpoint_selective,
+                    budget_mib: checkpoint_budget_mib,
+                    stride: crate::meta_flags::parse_checkpoint_stride(&checkpoint_stride),
+                    compress: checkpoint_compress,
+                    // Cycle-10 §5.3 Task 6: default to empty here; overwritten
+                    // per build path by pipeline::analysis_to_checkpoint_policies
+                    // once the semantic checker has run. Empty = byte-identity.
+                    policies: std::collections::HashMap::new(),
+                },
                 fuse_rmsnorm_backward,
                 fuse_wgrad_accum,
                 fuse_wgrad_accum_from_bundle,
-                checkpoint_compress,
                 layerwise_accum,
                 weight_stream,
                 param_dtype_bf16sr: param_dtype == "bf16-sr",
@@ -585,7 +591,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // Cycle-10 §5.3 Task 6: default to empty here; overwritten
                 // downstream in `run_build_single` via
                 // pipeline::analysis_to_checkpoint_policies. Empty = byte-identity.
-                checkpoint_policies: std::collections::HashMap::new(),
+
                 // CPDT: thread the planner mode + cluster + plan-out slot into
                 // codegen exactly as `nsl build` does — the compiler copies
                 // cpdt.cluster into Compiler::cpdt_cluster and reads

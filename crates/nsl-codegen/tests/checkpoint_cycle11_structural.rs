@@ -223,7 +223,7 @@ fn g3c_rope_k_write_between_projection_and_ds_compute() {
 
 #[test]
 fn g5_production_wire_up_smoke() {
-    // Cycle-12 T1: when `compile_options.checkpoint_policies` contains
+    // Cycle-12 T1: when `compile_options.checkpoint.policies` contains
     // a Full entry, the kernel.rs CSHA training-PTX wire-up MUST
     // construct `Some(CheckpointExtras::full())` on the training_config
     // (line 757). The downstream backward synthesis then routes through

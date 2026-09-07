@@ -274,15 +274,15 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     }
     let mut disabled: Vec<&str> = Vec::new();
     macro_rules! off_bool {
-        ($field:ident, $name:literal) => {
-            if opts.$field {
-                opts.$field = false;
+        ($($field:ident).+, $name:literal) => {
+            if opts.$($field).+ {
+                opts.$($field).+ = false;
                 disabled.push($name);
             }
         };
     }
-    off_bool!(checkpoint_blocks, "--checkpoint-blocks (CCR)");
-    off_bool!(checkpoint_selective, "--checkpoint-selective (CCR)");
+    off_bool!(checkpoint.blocks, "--checkpoint-blocks (CCR)");
+    off_bool!(checkpoint.selective, "--checkpoint-selective (CCR)");
     off_bool!(layerwise_accum, "--layerwise-accum (CSLA)");
     off_bool!(weight_stream, "--weight-stream");
     off_bool!(stream_arena, "--stream-arena");
@@ -294,16 +294,16 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     // was missing here too; same reason, same fix.)
     off_bool!(fuse_wgrad_accum, "--fuse-wgrad-accum (non-bit-exact)");
     off_bool!(fuse_rmsnorm_backward, "--fuse-rmsnorm-backward (non-bit-exact)");
-    if opts.checkpoint_budget_mib.is_some() {
-        opts.checkpoint_budget_mib = None;
+    if opts.checkpoint.budget_mib.is_some() {
+        opts.checkpoint.budget_mib = None;
         disabled.push("--checkpoint-budget-mib (CCR)");
     }
-    if opts.checkpoint_stride != nsl_codegen::CheckpointStride::Fixed(1) {
-        opts.checkpoint_stride = nsl_codegen::CheckpointStride::Fixed(1);
+    if opts.checkpoint.stride != nsl_codegen::CheckpointStride::Fixed(1) {
+        opts.checkpoint.stride = nsl_codegen::CheckpointStride::Fixed(1);
         disabled.push("--checkpoint-stride (periodic checkpointing)");
     }
-    if opts.checkpoint_compress.is_some() {
-        opts.checkpoint_compress = None;
+    if opts.checkpoint.compress.is_some() {
+        opts.checkpoint.compress = None;
         disabled.push("--checkpoint-compress (CCR)");
     }
     // Item 4: the reference arm is what the fused head's numerics are
@@ -367,7 +367,7 @@ mod tests {
     fn training_reference_forces_field_opts_off() {
         let mut opts = nsl_codegen::CompileOptions {
             training_reference: true,
-            checkpoint_blocks: true,
+            checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
             layerwise_accum: true,
             weight_stream: true,
             stream_arena: true,
@@ -380,7 +380,7 @@ mod tests {
         opts.wggo.mode = Some("greedy".to_string());
         opts.wggo.moment_precision = true;
         apply_training_reference(&mut opts);
-        assert!(!opts.checkpoint_blocks);
+        assert!(!opts.checkpoint.blocks);
         assert!(!opts.layerwise_accum);
         assert!(!opts.weight_stream);
         assert!(!opts.stream_arena);
@@ -398,11 +398,11 @@ mod tests {
     fn training_reference_noop_when_flag_absent() {
         let mut opts = nsl_codegen::CompileOptions {
             training_reference: false,
-            checkpoint_blocks: true,
+            checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
             ..Default::default()
         };
         apply_training_reference(&mut opts);
-        assert!(opts.checkpoint_blocks, "no override without the flag");
+        assert!(opts.checkpoint.blocks, "no override without the flag");
     }
 
     /// No blockers: the bundle may fill both fusions.

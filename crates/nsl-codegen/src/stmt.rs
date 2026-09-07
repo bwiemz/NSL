@@ -320,7 +320,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // P1.7 --training-reference: report no checkpointing in the memory estimate,
     // matching codegen (which ignores @checkpoint decorators in that mode).
     model.activation_checkpointing = !compiler.compile_options.training_reference
-        && !compiler.compile_options.checkpoint_policies.is_empty();
+        && !compiler.compile_options.checkpoint.policies.is_empty();
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
     // Phase 1 weight-aware CPDT: the compiler holds a WeightMap loaded from
@@ -6603,7 +6603,7 @@ impl Compiler<'_> {
                 .with_checkpoint_policies(if self.compile_options.training_reference {
                     Default::default() // P1.7: ignore @checkpoint decorators in the reference path
                 } else {
-                    self.compile_options.checkpoint_policies.clone()
+                    self.compile_options.checkpoint.policies.clone()
                 })
                 .with_fused_ce_config(fused_ce_cfg)
                 .with_fused_kl_ce_config(fused_kl_ce_cfg, distill_alpha, distill_temp);
@@ -8260,7 +8260,7 @@ impl Compiler<'_> {
                 let ccr_selective_decorated = !self.compile_options.training_reference
                     && self
                         .compile_options
-                        .checkpoint_policies
+                        .checkpoint.policies
                         .values()
                         .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
                 let mut effective_primal = effective_primal;
@@ -8273,7 +8273,7 @@ impl Compiler<'_> {
                 // with adjoint-generator ids (the generator start is bumped
                 // to this watermark below).
                 let mut ccr_fresh: crate::wengert::VarId = extractor.next_var_id();
-                let ccr_plan = if self.compile_options.checkpoint_blocks
+                let ccr_plan = if self.compile_options.checkpoint.blocks
                     || ccr_selective_decorated
                 {
                     // Milestone C: SCHEDULED as ONE region — the whole
@@ -8294,14 +8294,14 @@ impl Compiler<'_> {
                         self.bus.csha_backward_claims().map(|claims| {
                             claims.op_to_chain.keys().copied().collect()
                         });
-                    let policy = if self.compile_options.checkpoint_selective
+                    let policy = if self.compile_options.checkpoint.selective
                         || ccr_selective_decorated
                     {
                         crate::ccr::CcrPolicy::Selective
                     } else {
                         crate::ccr::CcrPolicy::Block
                     };
-                    let compress_requested = self.compile_options.checkpoint_compress.is_some();
+                    let compress_requested = self.compile_options.checkpoint.compress.is_some();
                     // Item 8: resolve the periodic-checkpoint stride. `Fixed(k)`
                     // passes straight through (ccr::plan logs the coalescing);
                     // `Auto` searches strides against the projected activation
@@ -8311,7 +8311,7 @@ impl Compiler<'_> {
                     // set rather than a stride; carried out-of-band to the
                     // plan construction below.
                     let mut dp_kept_anchors: Option<Vec<usize>> = None;
-                    let resolved_stride = match self.compile_options.checkpoint_stride {
+                    let resolved_stride = match self.compile_options.checkpoint.stride {
                         crate::CheckpointStride::Fixed(k) => k,
                         crate::CheckpointStride::Dp => {
                             let sizes = crate::profiling::captures::size_hints_from_var_nodes(
@@ -8325,7 +8325,7 @@ impl Compiler<'_> {
                             };
                             let budget_bytes = self
                                 .compile_options
-                                .checkpoint_budget_mib
+                                .checkpoint.budget_mib
                                 .map(|m| m.saturating_mul(1024 * 1024));
                             let spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
                                 .unwrap_or_else(crate::gpu_specs::default_gpu);
@@ -8467,7 +8467,7 @@ impl Compiler<'_> {
                             };
                             let budget_bytes = self
                                 .compile_options
-                                .checkpoint_budget_mib
+                                .checkpoint.budget_mib
                                 .map(|m| m.saturating_mul(1024 * 1024));
                             match crate::ccr::select_stride(
                                 &effective_primal,
@@ -8541,7 +8541,7 @@ impl Compiler<'_> {
                         );
                     }
                     if let (Some(p), Some(dtype)) =
-                        (&plan, self.compile_options.checkpoint_compress.as_deref())
+                        (&plan, self.compile_options.checkpoint.compress.as_deref())
                     {
                         if !p.compress.is_empty() {
                             ccr_compress_map = crate::ccr::append_compressed_saves(
@@ -8631,7 +8631,7 @@ impl Compiler<'_> {
                             },
                         );
                         ccr_plan = None;
-                    } else if let Some(budget_mib) = self.compile_options.checkpoint_budget_mib {
+                    } else if let Some(budget_mib) = self.compile_options.checkpoint.budget_mib {
                         // P1.c: knapsack arbitration under the byte budget,
                         // with the C-01 FASE-Deferred credit (the gradient
                         // buffer Deferred never allocates) when parameter
@@ -16137,7 +16137,7 @@ impl Compiler<'_> {
             .with_checkpoint_policies(if self.compile_options.training_reference {
                     Default::default() // P1.7: ignore @checkpoint decorators in the reference path
                 } else {
-                    self.compile_options.checkpoint_policies.clone()
+                    self.compile_options.checkpoint.policies.clone()
                 });
         extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
         extractor.set_model_field_types(self.models.model_field_types.clone());

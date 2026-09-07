@@ -240,7 +240,7 @@ fn try_capture_real(
     options.fused_kl_ce_configs = crate::analysis_bridges::analysis_to_fused_kl_ce_configs(analysis);
     options.pca_user_strategies = crate::analysis_bridges::analysis_to_pca_user_strategies(analysis);
     options.csha_configs = crate::analysis_bridges::analysis_to_csha_configs(analysis);
-    options.checkpoint_policies = crate::analysis_bridges::analysis_to_checkpoint_policies(analysis);
+    options.checkpoint.policies = crate::analysis_bridges::analysis_to_checkpoint_policies(analysis);
     options.weight_index_map = analysis.weight_index_map.clone();
     let (captures, result) = nsl_codegen::compile_with_profile_captures(
         &input.module,

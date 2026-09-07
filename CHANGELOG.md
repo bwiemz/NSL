@@ -35,6 +35,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   inspect_enabled}`). Defaults unchanged (all off / `None`); `target_gpu` and
   `dtype` stay flat because they are shared beyond the profiler. 78 → 72 flat
   fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the six
+  `checkpoint_*` fields moved into `CheckpointOptions`
+  (`opts.checkpoint.{blocks, selective, budget_mib, stride, compress,
+  policies}`). Defaults unchanged; `AnalysisResult`, `ModuleData` and
+  `WengertExtractor` keep their own `checkpoint_policies`; the CLI's
+  training-reference override macro now takes a field path. 72 → 67 flat
+  fields.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

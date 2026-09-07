@@ -56,7 +56,7 @@ fn run_build_shared_single(
     // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
     // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
     // can stamp the prologue + emit a PrologueRecompute marker.
-    options.checkpoint_policies = crate::pipeline::analysis_to_checkpoint_policies(&analysis);
+    options.checkpoint.policies = crate::pipeline::analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     // M62: allocate a slot the compiler publishes @export functions into,
@@ -406,7 +406,7 @@ fn run_build_shared_multi(
             entry_options.csha_configs = crate::pipeline::module_data_to_csha_configs(mod_data);
             // Cycle-10 §5.3 Task 6: forward @checkpoint(policy=...) policies
             // from the entry module's semantic analysis into CompileOptions.
-            entry_options.checkpoint_policies =
+            entry_options.checkpoint.policies =
                 crate::pipeline::module_data_to_checkpoint_policies(mod_data);
             entry_options.export_functions_out = Some(exports_slot.clone());
             // M62: route entry-module weight_index_map so @export model methods

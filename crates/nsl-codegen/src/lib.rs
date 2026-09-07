@@ -1375,6 +1375,70 @@ impl Default for CalibrationOptions {
     }
 }
 
+/// Activation-checkpointing options: the CCR flags and the decorator-derived
+/// per-function policies.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). `policies` is the
+/// one member that is not a CLI flag: it is what `EffectChecker` collected
+/// from `@checkpoint(policy=...)` decorators, published onto the options by
+/// the `nsl-cli` command handlers (`pipeline::analysis_to_checkpoint_policies`).
+#[derive(Clone, Default)]
+pub struct CheckpointOptions {
+    /// CCR P1.a (`--checkpoint-blocks`): block-granular activation
+    /// checkpointing on the source-AD path. Interiors of each transformer
+    /// block are freed after the forward and recomputed just before that
+    /// block's adjoint runs — activation residency drops from
+    /// O(layers x interiors) to O(layers x boundaries + one block).
+    /// Bit-exact (same kernels, same order, same inputs); Dropout results
+    /// and CSHA-claimed chains are force-saved. No-ops with a loud stderr
+    /// note when the tape has no `blocks.N` structure.
+    pub blocks: bool,
+    /// CCR P1.b: with `blocks`, use the SELECTIVE policy —
+    /// matmul-class outputs stay saved, only cheap bandwidth-bound ops
+    /// (norms, RoPE, elementwise, softmax, reshapes) are replayed. Less
+    /// memory reduction than the block policy at near-zero recompute cost.
+    pub selective: bool,
+    /// CCR P1.c (`--checkpoint-budget-mib`): allowed SAVED-interior bytes.
+    /// The per-tensor SAVE/RECOMPUTE knapsack (ccr::apply_budget) flips the
+    /// highest-value tensors back to SAVE within this budget, minimizing
+    /// recompute cost. Under FASE Deferred the C-01 credit (the gradient
+    /// buffer Deferred never materializes) is added when parameter sizes
+    /// are statically known. None = pure policy decision, no arbitration.
+    pub budget_mib: Option<u64>,
+    /// Item 8 (`--checkpoint-stride N|auto`): periodic checkpointing. With
+    /// `Fixed(k)`, CCR coalesces every `k` transformer-block anchors into one
+    /// super-segment — saving only every k-th block boundary and recomputing
+    /// the k-block span. Trades recompute for a k× smaller saved-boundary
+    /// surface (the activation surface CSLA buffers across the accumulation
+    /// window). `Auto` searches strides with `ccr::project_activation_peak`
+    /// and picks the smallest projected peak within `budget_mib`
+    /// (or the min-peak stride if none fits). `Fixed(1)` = classic per-block.
+    /// Bit-exact regardless of stride (recompute replays the same kernels).
+    ///
+    /// NOTE: under `Auto`, `budget_mib` is consulted twice with two
+    /// meanings — first as a peak-concurrent-activation budget to pick the
+    /// stride (`select_stride`), then as a saved-interior-bytes budget by the
+    /// per-tensor knapsack (`ccr::apply_budget`). Both keep the plan valid (the
+    /// number is a soft target, not a hard cap), so the dual use is safe but
+    /// deliberate; unifying them is future work (the full DP scheduler).
+    pub stride: CheckpointStride,
+    /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
+    /// Selective policy's saved matmul-class interiors to half precision
+    /// between forward and backward (cast-on-save, dequant-on-load via the
+    /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
+    /// activations; gated by the repo's 3-4 dp loss-parity standard.
+    pub compress: Option<String>,
+    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
+    /// per-function `@checkpoint(policy=...)` policies collected by
+    /// `EffectChecker::checkpoint_policies()` and routed through the
+    /// `nsl-cli` loader (`crates/nsl-cli/src/loader.rs`). Consumed
+    /// by extractor construction sites in `stmt.rs` /
+    /// `binary_codegen.rs` via `WengertExtractor::with_checkpoint_policies`.
+    /// Empty map = no checkpointing transformations = byte-identity preserved.
+    pub policies: HashMap<String, nsl_semantic::effects::CheckpointPolicy>,
+}
+
 /// Dev-tools options: the kernel profiler, the health monitor and
 /// `@inspect` emission.
 ///
@@ -1623,44 +1687,8 @@ pub struct CompileOptions {
     /// reduced-precision moments (`nsl_tensor_cast_into` cannot cross
     /// devices) — enforced with a loud compile error in stmt.rs.
     pub optim_state_offload: bool,
-    /// CCR P1.a (`--checkpoint-blocks`): block-granular activation
-    /// checkpointing on the source-AD path. Interiors of each transformer
-    /// block are freed after the forward and recomputed just before that
-    /// block's adjoint runs — activation residency drops from
-    /// O(layers x interiors) to O(layers x boundaries + one block).
-    /// Bit-exact (same kernels, same order, same inputs); Dropout results
-    /// and CSHA-claimed chains are force-saved. No-ops with a loud stderr
-    /// note when the tape has no `blocks.N` structure.
-    pub checkpoint_blocks: bool,
-    /// CCR P1.b: with `checkpoint_blocks`, use the SELECTIVE policy —
-    /// matmul-class outputs stay saved, only cheap bandwidth-bound ops
-    /// (norms, RoPE, elementwise, softmax, reshapes) are replayed. Less
-    /// memory reduction than the block policy at near-zero recompute cost.
-    pub checkpoint_selective: bool,
-    /// CCR P1.c (`--checkpoint-budget-mib`): allowed SAVED-interior bytes.
-    /// The per-tensor SAVE/RECOMPUTE knapsack (ccr::apply_budget) flips the
-    /// highest-value tensors back to SAVE within this budget, minimizing
-    /// recompute cost. Under FASE Deferred the C-01 credit (the gradient
-    /// buffer Deferred never materializes) is added when parameter sizes
-    /// are statically known. None = pure policy decision, no arbitration.
-    pub checkpoint_budget_mib: Option<u64>,
-    /// Item 8 (`--checkpoint-stride N|auto`): periodic checkpointing. With
-    /// `Fixed(k)`, CCR coalesces every `k` transformer-block anchors into one
-    /// super-segment — saving only every k-th block boundary and recomputing
-    /// the k-block span. Trades recompute for a k× smaller saved-boundary
-    /// surface (the activation surface CSLA buffers across the accumulation
-    /// window). `Auto` searches strides with `ccr::project_activation_peak`
-    /// and picks the smallest projected peak within `checkpoint_budget_mib`
-    /// (or the min-peak stride if none fits). `Fixed(1)` = classic per-block.
-    /// Bit-exact regardless of stride (recompute replays the same kernels).
-    ///
-    /// NOTE: under `Auto`, `checkpoint_budget_mib` is consulted twice with two
-    /// meanings — first as a peak-concurrent-activation budget to pick the
-    /// stride (`select_stride`), then as a saved-interior-bytes budget by the
-    /// per-tensor knapsack (`ccr::apply_budget`). Both keep the plan valid (the
-    /// number is a soft target, not a hard cap), so the dual use is safe but
-    /// deliberate; unifying them is future work (the full DP scheduler).
-    pub checkpoint_stride: CheckpointStride,
+    /// Activation checkpointing (CCR flags + decorator-derived policies).
+    pub checkpoint: CheckpointOptions,
     /// Item 9 (`--fuse-rmsnorm-backward`): lower the source-AD RMSNorm INPUT
     /// gradient to a single fused `nsl_rmsnorm_dx_backward` op (native GPU kernel
     /// / CPU reference) instead of the ~11-op decomposition — fewer launches,
@@ -1704,12 +1732,6 @@ pub struct CompileOptions {
     /// `expand_pretrain_optimized` reads the clap value before overwriting it,
     /// so a user who typed the flag still gets the refusal.
     pub fuse_wgrad_accum_from_bundle: bool,
-    /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
-    /// Selective policy's saved matmul-class interiors to half precision
-    /// between forward and backward (cast-on-save, dequant-on-load via the
-    /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
-    /// activations; gated by the repo's 3-4 dp loss-parity standard.
-    pub checkpoint_compress: Option<String>,
     /// CSLA Stage-2 (`--layerwise-accum`): window-buffered training schedule.
     /// The N micro-batches of a FASE-Deferred accumulation window run their
     /// forwards first (saving only the adjoint-read, batch-dependent tensors
@@ -1767,15 +1789,6 @@ pub struct CompileOptions {
     /// Empty map = no `@csha` decorators in the program (the default), which
     /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
     pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
-    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
-    /// per-function `@checkpoint(policy=...)` policies collected by
-    /// `EffectChecker::checkpoint_policies()` and routed through the
-    /// `nsl-cli` loader (`crates/nsl-cli/src/loader.rs:414`). Consumed
-    /// by extractor construction sites in `stmt.rs` /
-    /// `binary_codegen.rs` via `WengertExtractor::with_checkpoint_policies`.
-    /// Empty map = no checkpointing transformations = byte-identity preserved.
-    pub checkpoint_policies:
-        HashMap<String, nsl_semantic::effects::CheckpointPolicy>,
     /// CPDT (compiler-planned distributed training) options.
     pub cpdt: CpdtOptions,
     /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
@@ -1855,10 +1868,10 @@ impl CompileOptions {
                 _ => unset.to_string(),
             }
         };
-        let ckpt = if self.checkpoint_selective {
+        let ckpt = if self.checkpoint.selective {
             "selective".to_string()
-        } else if self.checkpoint_blocks {
-            match self.checkpoint_stride {
+        } else if self.checkpoint.blocks {
+            match self.checkpoint.stride {
                 CheckpointStride::Fixed(n) => format!("blocks:{n}"),
                 CheckpointStride::Auto => "blocks:auto".to_string(),
                 CheckpointStride::Dp => "blocks:dp".to_string(),
@@ -1998,14 +2011,10 @@ impl Default for CompileOptions {
             dtype: "bf16".to_string(),
             matmul: MatmulConfig::default(),
             optim_state_offload: false,
-            checkpoint_blocks: false,
-            checkpoint_selective: false,
-            checkpoint_budget_mib: None,
-            checkpoint_stride: CheckpointStride::default(),
+            checkpoint: CheckpointOptions::default(),
             fuse_rmsnorm_backward: false,
             fuse_wgrad_accum: false,
             fuse_wgrad_accum_from_bundle: false,
-            checkpoint_compress: None,
             layerwise_accum: false,
             weight_stream: false,
             stream_arena: false,
@@ -2013,7 +2022,6 @@ impl Default for CompileOptions {
             stream_async_writeback: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),
-            checkpoint_policies: HashMap::new(),
             cpdt: CpdtOptions::default(),
             wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,

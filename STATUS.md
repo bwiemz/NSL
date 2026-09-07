@@ -163,8 +163,12 @@ the same hardening pass produced).
 
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
-`CalibrationOptions`, `DevToolsOptions`, …). The `calibration_*` cluster moved
-into `CalibrationOptions` (`opts.calibration.{data, mode, samples, batch_size,
+`CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, …). The `checkpoint_*` cluster moved
+into `CheckpointOptions` (`opts.checkpoint.{blocks, selective, budget_mib,
+stride, compress, policies}`; `AnalysisResult` / `ModuleData` /
+`WengertExtractor` keep their own `checkpoint_policies`). The `calibration_*`
+cluster moved into
+`CalibrationOptions` (`opts.calibration.{data, mode, samples, batch_size,
 timeout_secs, sidecar, retention, batch_seq, compile_bundle, grad_retention}`)
 and the dev-tools cluster into `DevToolsOptions` (`opts.dev_tools.{profile_kernels,
 manifest_output_path, profile_source_text, profile_source_file_name,

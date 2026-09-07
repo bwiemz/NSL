@@ -1328,7 +1328,7 @@ fn emit_model_backward_bridge(
     // per-fn @checkpoint(policy=...) policies into the extractor. Empty
     // map = byte-identity preserved.
     let mut extractor = crate::source_ad::WengertExtractor::new(compiler.interner)
-        .with_checkpoint_policies(compiler.compile_options.checkpoint_policies.clone());
+        .with_checkpoint_policies(compiler.compile_options.checkpoint.policies.clone());
     extractor.set_model_method_bodies(compiler.models.model_method_bodies.clone());
     extractor.set_model_field_types(compiler.models.model_field_types.clone());
 

@@ -547,14 +547,20 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 zero_stage: zero_stage.map(|s| s as u8),
                 zero_elementwise,
                 optim_state_offload,
-                checkpoint_blocks,
-                checkpoint_selective,
-                checkpoint_budget_mib,
-                checkpoint_stride: crate::meta_flags::parse_checkpoint_stride(&checkpoint_stride),
+                checkpoint: nsl_codegen::CheckpointOptions {
+                    blocks: checkpoint_blocks,
+                    selective: checkpoint_selective,
+                    budget_mib: checkpoint_budget_mib,
+                    stride: crate::meta_flags::parse_checkpoint_stride(&checkpoint_stride),
+                    compress: checkpoint_compress,
+                    // Cycle-10 §5.3 Task 6: default to empty here; overwritten
+                    // per build path by pipeline::analysis_to_checkpoint_policies
+                    // once the semantic checker has run. Empty = byte-identity.
+                    policies: std::collections::HashMap::new(),
+                },
                 fuse_rmsnorm_backward,
                 fuse_wgrad_accum,
                 fuse_wgrad_accum_from_bundle,
-                checkpoint_compress,
                 layerwise_accum,
                 weight_stream,
                 param_dtype_bf16sr: param_dtype == "bf16-sr",
@@ -629,10 +635,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // run_build_multi) overwrite this from semantic analysis via
                 // pipeline::{analysis,module_data}_to_csha_configs.
                 csha_configs: std::collections::HashMap::new(),
-                // Cycle-10 §5.3 Task 6: default to empty here; overwritten
-                // per build path by pipeline::{analysis,module_data}_to_checkpoint_policies
-                // once the semantic checker has run. Empty = byte-identity.
-                checkpoint_policies: std::collections::HashMap::new(),
                 cpdt: nsl_codegen::CpdtOptions {
                     mode: cpdt_mode,
                     cluster: cpdt_cluster.clone(),
