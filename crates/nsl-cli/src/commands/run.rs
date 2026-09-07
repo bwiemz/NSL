@@ -440,8 +440,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // Clamp like `nsl build` (build/options.rs) — `--devices 0` must not
                 // produce world_size=0 (WGGO ZeRO/TP math assumes >= 1 rank).
                 world_size: (devices as usize).max(1),
-                vram_budget: None,
-                memory_report: false,
+                memory: nsl_codegen::MemoryOptions {
+                    vram_budget: None,
+                    report: false,
+                    transient_arena,
+                },
                 target,
                 source_ad,
                 deterministic,
@@ -524,7 +527,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     trace_ops,
                     nan_analysis: false,
                 },
-                transient_arena,
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
                 // come from `collect_models` directly.

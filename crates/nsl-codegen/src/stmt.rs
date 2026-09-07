@@ -9058,8 +9058,8 @@ impl Compiler<'_> {
                 //      gradient transients, the surface the arena exists
                 //      to place.
                 // Symbolic/computed dims stay unsized; nothing is guessed.
-                let arena_place_on = self.compile_options.transient_arena;
-                let arena_report_on = self.compile_options.memory_report
+                let arena_place_on = self.compile_options.memory.transient_arena;
+                let arena_report_on = self.compile_options.memory.report
                     || arena_place_on
                     || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1");
                 let elem_hints: std::collections::HashMap<crate::wengert::VarId, u64> =
@@ -13863,7 +13863,7 @@ impl Compiler<'_> {
         // Stage-2C canary: verify every red zone after the step's kernels
         // have all run. Runtime-gated by NSL_ARENA_CHECK=1, so one binary
         // serves both the validation runs and production.
-        if self.compile_options.transient_arena {
+        if self.compile_options.memory.transient_arena {
             let step_val = builder.use_var(step_count_var);
             self.compile_call_by_name(builder, "nsl_arena_check_step", &[step_val])?;
         }

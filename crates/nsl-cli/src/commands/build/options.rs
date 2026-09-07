@@ -488,21 +488,24 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
                 // Milestone A: an unparseable budget must refuse, not
                 // silently become "no budget" — the flag is a guard rail.
-                vram_budget: match vram_budget.as_deref() {
-                    None => None,
-                    Some(s) => match nsl_codegen::memory_planner::parse_vram_budget(s) {
-                        Some(b) => Some(b),
-                        None => {
-                            eprintln!(
-                                "error: --vram-budget '{s}' is not a size; \
-                                 accepted forms: <n>GB/<n>GiB/<n>MB/<n>MiB/\
-                                 <n>KB/<n>KiB/<n>B (1024-based)"
-                            );
-                            process::exit(1);
-                        }
+                memory: nsl_codegen::MemoryOptions {
+                    vram_budget: match vram_budget.as_deref() {
+                        None => None,
+                        Some(s) => match nsl_codegen::memory_planner::parse_vram_budget(s) {
+                            Some(b) => Some(b),
+                            None => {
+                                eprintln!(
+                                    "error: --vram-budget '{s}' is not a size; \
+                                     accepted forms: <n>GB/<n>GiB/<n>MB/<n>MiB/\
+                                     <n>KB/<n>KiB/<n>B (1024-based)"
+                                );
+                                process::exit(1);
+                            }
+                        },
                     },
+                    report: memory_report,
+                    transient_arena,
                 },
-                memory_report,
                 target,
                 source_ad: _source_ad,
                 deterministic: _deterministic,
@@ -599,7 +602,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     trace_ops: false,
                     nan_analysis,
                 },
-                transient_arena,
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
                 // come from `collect_models` directly.
