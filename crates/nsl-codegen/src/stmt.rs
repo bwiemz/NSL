@@ -14,7 +14,10 @@ use nsl_semantic::types::Type;
 use crate::compiler::Compiler;
 use crate::context::{FuncState, LoopContext};
 use crate::error::CodegenError;
-use crate::stmt_train::csla_window::{CslaParam, CslaPending, CslaSchedule, CslaSlotKind, CslaWindowInputs};
+use crate::stmt_train::csla_window::{
+    CslaParam, CslaPending, CslaPre, CslaSaveInputs, CslaSchedule, CslaWindowInputs,
+    CslaWindowSave,
+};
 use crate::stmt_train::model_params::ModelParams;
 use crate::stmt_train::optimizer_state::OptimizerState;
 use crate::stmt_train::optimizer_step::OptimizerStepInputs;
@@ -38,6 +41,16 @@ pub(crate) const SURFACE_OPTIM_V: i64 = nsl_abi::wire::surface::SURFACE_OPTIM_V 
 pub(crate) const SURFACE_M_PARTIAL: i64 = nsl_abi::wire::surface::SURFACE_M_PARTIAL as i64;
 pub(crate) const SURFACE_GRADS: i64 = nsl_abi::wire::surface::SURFACE_GRADS as i64;
 pub(crate) const SURFACE_ACTIVATIONS: i64 = nsl_abi::wire::surface::SURFACE_ACTIVATIONS as i64;
+
+/// FASE hook: one parameter's primal Value and its `accum_list` /
+/// `param_list` index, keyed by its adjoint gradient VarId in the driver's
+/// `adj_vid_to_hook_entry` (the CSLA save phase copies the indices into
+/// its pending carrier; the FASE Deferred arm consumes the entries).
+pub(crate) struct ParamHookEntry {
+    pub(crate) primal_val: Value,
+    // i64 index into accum_list (== param_list index for this param)
+    pub(crate) accum_idx: i64,
+}
 
 /// Item C: how ONE parameter's optimizer moments are allocated under
 /// `--zero-stage 3`, decided from its `ParameterPlan` entry and consumed by
@@ -9494,15 +9507,6 @@ impl Compiler<'_> {
                 // the segment-streamed forward below and the window backward
                 // consume the same schedule. `CslaPre` flows into the save
                 // phase; `WsForwardPlan` drives the sliced forward emission.
-                struct CslaPre {
-                    params: Vec<CslaParam>,
-                    primal_view_of: std::collections::HashMap<
-                        crate::wengert::VarId,
-                        crate::wengert::VarId,
-                    >,
-                    imports: Vec<crate::wengert::VarId>,
-                    schedule: CslaSchedule,
-                }
                 struct WsForwardPlan {
                     /// Half-open primal-op slices (prologue, per-segment,
                     /// epilogue) — a partition of the tape.
@@ -10455,11 +10459,6 @@ impl Compiler<'_> {
                 // The primal_cranelift_value is used for a runtime pointer-scan against
                 // param_list so we find the correct accum_list slot even when
                 // trainable params are a subset of named_param_var_ids.
-                struct ParamHookEntry {
-                    primal_val: Value,
-                    // i64 index into accum_list (== param_list index for this param)
-                    accum_idx: i64,
-                }
                 let mut adj_vid_to_hook_entry: std::collections::HashMap<
                     crate::wengert::VarId,
                     ParamHookEntry,
@@ -10508,352 +10507,36 @@ impl Compiler<'_> {
                 //    VarIds (unnamed temporaries like `x @ m.w`) were missing.
                 let grad_lowered: Option<crate::wengert_lower::LoweredWengert> = if csla_active {
                     // === CSLA Stage-2 (D1a): window-buffered save phase ===
-                    //
-                    // Instead of lowering the adjoint here (the interleaved
-                    // schedule), push every adjoint-read primal value into
-                    // this micro-batch's slot list and defer the whole
-                    // window's backward to the should_step region, where a
-                    // runtime loop replays the adjoint once per buffered
-                    // micro-batch (one tape, N executions — unrolling would
-                    // break CCR's anchor segmentation). Param/Constant leaves
-                    // are loop-invariant (FASE Deferred updates θ only at
-                    // window boundaries, after the replay), so the replay
-                    // reuses the current iteration's SSA values for them via
-                    // seed_base.
-                    debug_assert!(fase_hook_active);
-
-                    // Review findings H1/H2/M1 (D1a adversarial review): three
-                    // compile-time SIDE CHANNELS travel by SSA Value instead
-                    // of the tape, so the window replay cannot see them —
-                    // refuse each loudly rather than replay wrong.
-                    //
-                    // H1 — CSHA-claimed fused backward: `csha_forward_saves`
-                    // is keyed by layer name and holds the STEP iteration's
-                    // save-buffer SSA values; the claimed backward consumes
-                    // AND frees them once — inside the b-loop that means
-                    // stale saves for b<N-1 plus an N-fold double-free.
-                    if !self.csha_forward_saves.is_empty()
-                        || adjoint.ops.iter().any(|op| {
-                            matches!(
-                                op.op,
-                                crate::wengert::PrimalOp::FusedCshaBackward { .. }
-                                    | crate::wengert::PrimalOp::CshaFusedBackwardExtract { .. }
-                            )
-                        })
-                    {
-                        return Err(CodegenError::new(
-                            "--layerwise-accum is incompatible with CSHA-claimed \
-                             fused attention backward: the claimed saves travel \
-                             through a compile-time side channel \
-                             (csha_forward_saves) that the window replay cannot \
-                             re-bind per micro-batch. Drop @csha/@flash_attention \
-                             claims or --layerwise-accum",
-                        ));
-                    }
-                    // H2 (RESOLVED by the LSE tape-carry): the fused SDPA
-                    // dispatch saves its logsumexp through the Value-keyed
-                    // `flash_attn_aux` side-band + a u32::MAX-sentinel owned
-                    // entry. The save phase below buffers every aux entry as
-                    // an extra window slot, and the replay re-binds the aux
-                    // map per micro-batch before each consuming range's
-                    // lowering — the emitted backward then consumes the SAME
-                    // per-batch LSE the baseline did (or the runtime-0
-                    // decline sentinel), keeping the fused phase-2 kernel on
-                    // the fused path.
-                    // M1, NARROWED by the fused-CE tape-carry: the f32
-                    // @fused_lm_ce path is now supported — the only real
-                    // side-band is `fused_ce_fwd_lse` (one [B*S] f32 tensor
-                    // per micro-batch), buffered as an extra window slot
-                    // below and re-bound per replay range exactly like the
-                    // flash-attention LSE; the f32 cast-cache MISS path is
-                    // already correct at replay (pass-through of the seeded
-                    // inputs, zero extra emission). Still refused:
-                    //
-                    // - distill blocks: the KL-CE carry would need THREE
-                    //   lse slots per micro-batch plus the frozen teacher's
-                    //   activation buffered per micro-batch — a large new
-                    //   surface with no gate; refuse until designed.
-                    // - @fused_lm_ce(dtype="f16"/"bf16"): the fp16/bf16
-                    //   shadow-cast tensors are step-scoped (freed at
-                    //   function-scope exit); a replay-side re-cast would
-                    //   pile N cast sets per window with no free (the
-                    //   original M1 finding), and buffering w_cast per
-                    //   micro-batch (V×H×2 B) would erase the memory win.
-                    if self.active_distill_context.is_some() {
-                        return Err(CodegenError::new(
-                            "--layerwise-accum is incompatible with distill \
-                             blocks: the fused KL-CE backward reads Value-keyed \
-                             forward saves (three LSE buffers + the teacher \
-                             activations) the window replay cannot see. Drop \
-                             the distill block or --layerwise-accum",
-                        ));
-                    }
-                    if let Some(cfg) = &self.active_fused_ce_config {
-                        let non_f32 = cfg.enabled
-                            && !matches!(
-                                cfg.dtype,
-                                None | Some(crate::FusedCeDtypeHint::F32)
-                            );
-                        if non_f32 {
-                            return Err(CodegenError::new(
-                                "--layerwise-accum supports @fused_lm_ce only \
-                                 with dtype=\"f32\": the fp16/bf16 forward cast \
-                                 tensors are step-scoped and cannot be carried \
-                                 through the window replay without either \
-                                 leaking N cast sets per window or buffering \
-                                 the V*H weight cast per micro-batch. Use \
-                                 dtype=\"f32\" or drop --layerwise-accum",
-                            ));
-                        }
-                    }
-
-                    let (saves_outer_var, dicts_var) =
-                        csla_buffers.expect("csla_buffers allocated when csla_active");
-                    // D2b part 2: the plan / params / view chains / imports /
-                    // layer-major schedule were all computed in the
-                    // pre-forward pure pipeline (the forward streamer needed
-                    // them at emission time) — consume, don't recompute.
-                    let pre = csla_pre.expect("csla_pre computed when csla_active");
-                    let imports = pre.imports;
-                    let owned_map: std::collections::HashMap<
-                        crate::wengert::VarId,
-                        crate::wengert::WengertType,
-                    > = full_lowered
-                        .owned_values
-                        .iter()
-                        .map(|(vid, _, ty)| (*vid, *ty))
-                        .collect();
-                    let inner = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-                    let mut slots: Vec<(crate::wengert::VarId, CslaSlotKind)> = Vec::new();
-                    let mut loss_slot: Option<usize> = None;
-                    for v in imports {
-                        // Ghost VarIds (never lowered) are skipped here AND at
-                        // replay seed time — the adjoint lowering ghost-skips
-                        // their consumers identically to the baseline.
-                        let Some(&val) = full_vars.get(&v) else { continue };
-                        let vty = builder.func.dfg.value_type(val);
-                        if vty == cl_types::I64 {
-                            self.compile_call_by_name(builder, "nsl_list_push", &[inner, val])?;
-                            if v == loss_var_id {
-                                loss_slot = Some(slots.len());
-                            }
-                            slots.push((
-                                v,
-                                CslaSlotKind::Raw {
-                                    owned: owned_map.get(&v).copied(),
-                                },
-                            ));
-                        } else if vty == cl_types::F64 {
-                            let bits = builder.ins().bitcast(
-                                cl_types::I64,
-                                MemFlagsData::new(),
-                                val,
-                            );
-                            self.compile_call_by_name(builder, "nsl_list_push", &[inner, bits])?;
-                            slots.push((v, CslaSlotKind::F64Bits));
-                        } else {
-                            return Err(CodegenError::new(format!(
-                                "--layerwise-accum: adjoint-imported primal VarId {v} \
-                                 lowered to unsupported Cranelift type {vty} — the \
-                                 window buffer stores i64 pointers/integers and \
-                                 bitcast f64 scalars only",
-                            )));
-                        }
-                    }
-                    // LSE tape-carry: append one slot per fused-SDPA aux
-                    // entry whose forward output the adjoint reads. The
-                    // stored value is the aux LSE (join-block param on the
-                    // dispatch arm — a real tensor when the fused launch
-                    // fired, runtime 0 when it declined; the decomposed
-                    // arm's compile-time iconst 0 buffers as a plain 0).
-                    // Sorted by min fwd-out vid so slot order is
-                    // deterministic.
-                    let mut lse_slots: Vec<(usize, Vec<crate::wengert::VarId>)> = Vec::new();
-                    let mut csla_lse_pushed: std::collections::HashSet<Value> =
-                        std::collections::HashSet::new();
-                    if !self.flash_attn_aux.is_empty() {
-                        let slot_vid_set: std::collections::HashSet<crate::wengert::VarId> =
-                            slots.iter().map(|(v, _)| *v).collect();
-                        let mut by_val: std::collections::HashMap<
-                            Value,
-                            Vec<crate::wengert::VarId>,
-                        > = std::collections::HashMap::new();
-                        for (vid, val) in full_vars.iter() {
-                            by_val.entry(*val).or_default().push(*vid);
-                        }
-                        let mut entries: Vec<(Vec<crate::wengert::VarId>, Value)> = self
-                            .flash_attn_aux
-                            .iter()
-                            .filter_map(|(out_val, (_, lse_val))| {
-                                let mut vids: Vec<crate::wengert::VarId> = by_val
-                                    .get(out_val)?
-                                    .iter()
-                                    .copied()
-                                    .filter(|v| slot_vid_set.contains(v))
-                                    .collect();
-                                if vids.is_empty() {
-                                    return None;
-                                }
-                                vids.sort_unstable();
-                                Some((vids, *lse_val))
-                            })
-                            .collect();
-                        entries.sort_by_key(|(vids, _)| vids[0]);
-                        for (vids, lse_val) in entries {
-                            let idx = slots.len() + lse_slots.len();
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_list_push",
-                                &[inner, lse_val],
-                            )?;
-                            csla_lse_pushed.insert(lse_val);
-                            lse_slots.push((idx, vids));
-                        }
-                    }
-                    // Anti-vacuity marker (tape-carry review F1): under the
-                    // Block checkpoint policy every in-block SDPA out is a
-                    // recompute victim (the clone RE-LAUNCHES the fused
-                    // forward during replay and re-establishes the aux
-                    // side-band locally), so lse_slots is 0 and the carry is
-                    // inert; the carry engages under --checkpoint-selective
-                    // (SDPA outs saved). Gates assert this line's exact slot
-                    // count so the tested path is named, not assumed.
-                    nsl_runtime::nsl_log!(INFO, "csla", "[csla] lse tape-carry: {} slots", lse_slots.len());
-
-                    // Fused-CE tape-carry: one extra slot per
-                    // `fused_ce_fwd_lse` entry — the [B*S] f32 logsumexp the
-                    // fused backward consumes, keyed by the fwd-result
-                    // (loss-scalar) Value. Unlike the flash-attention carry
-                    // this one is LIVE under BOTH checkpoint policies:
-                    // FusedLinearCe sits in the CCR epilogue (never a
-                    // recompute victim), so a replay clone can never
-                    // re-establish the side-band locally. Lifecycle also
-                    // differs: the emitted backward CONSUMES AND FREES the
-                    // buffered tensor per (range, b) — the per-b slot-free
-                    // machinery must NOT touch these slots; only the
-                    // trailing-partial-window teardown sweep frees
-                    // unreplayed entries. (The f32 cast cache needs no
-                    // carry: its replay MISS path re-emits pass-through
-                    // inputs — the seeded x/W/bias — with zero extra cost;
-                    // non-f32 dtypes are refused above.)
-                    let mut fce_slots: Vec<(usize, Vec<crate::wengert::VarId>)> = Vec::new();
-                    if !self.fused_ce_fwd_lse.is_empty() {
-                        let slot_vid_set: std::collections::HashSet<crate::wengert::VarId> =
-                            slots.iter().map(|(v, _)| *v).collect();
-                        let mut by_val: std::collections::HashMap<
-                            Value,
-                            Vec<crate::wengert::VarId>,
-                        > = std::collections::HashMap::new();
-                        for (vid, val) in full_vars.iter() {
-                            by_val.entry(*val).or_default().push(*vid);
-                        }
-                        let mut entries: Vec<(Vec<crate::wengert::VarId>, Value)> = self
-                            .fused_ce_fwd_lse
-                            .iter()
-                            .filter_map(|(res_val, lse_val)| {
-                                let mut vids: Vec<crate::wengert::VarId> = by_val
-                                    .get(res_val)?
-                                    .iter()
-                                    .copied()
-                                    .filter(|v| slot_vid_set.contains(v))
-                                    .collect();
-                                if vids.is_empty() {
-                                    return None;
-                                }
-                                vids.sort_unstable();
-                                Some((vids, *lse_val))
-                            })
-                            .collect();
-                        entries.sort_by_key(|(vids, _)| vids[0]);
-                        for (vids, lse_val) in entries {
-                            let idx = slots.len() + lse_slots.len() + fce_slots.len();
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_list_push",
-                                &[inner, lse_val],
-                            )?;
-                            fce_slots.push((idx, vids));
-                        }
-                        // The step body's adjoint is never lowered under
-                        // csla, so its map entries would otherwise linger
-                        // for the whole compile — clear them; the replay
-                        // re-binds fresh entries keyed by SEEDED Values
-                        // per consuming range. Same for the pass-through
-                        // cast entries (the replay's miss path is the
-                        // correct one).
-                        self.fused_ce_fwd_lse.clear();
-                        self.fused_ce_fwd_casts.clear();
-                    }
-                    // Anti-vacuity twin of the LSE line: asserted exactly
-                    // by the fused-CE gates (1 slot = the carry engaged; a
-                    // composite fallback shows 0 and the launch counters
-                    // catch it too).
-                    nsl_runtime::nsl_log!(INFO, "csla", 
-                        "[csla] fused-ce tape-carry: {} slots",
-                        fce_slots.len()
-                    );
-
-                    let so = builder.use_var(saves_outer_var);
-                    self.compile_call_by_name(builder, "nsl_list_push", &[so, inner])?;
-                    if has_dataloader.is_some() {
-                        let dl = builder.use_var(dicts_var);
-                        let batch_now = builder.use_var(step_param_var);
-                        self.compile_call_by_name(builder, "nsl_list_push", &[dl, batch_now])?;
-                    }
-                    let hook_accum_idx: std::collections::HashMap<crate::wengert::VarId, i64> =
-                        adj_vid_to_hook_entry
-                            .iter()
-                            .map(|(vid, e)| (*vid, e.accum_idx))
-                            .collect();
-                    csla_loss_buffered = loss_slot.is_some();
-                    csla_teardown_slots = Some(
-                        slots
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, (_, kind))| match kind {
-                                CslaSlotKind::Raw {
-                                    owned: Some(crate::wengert::WengertType::Tensor),
-                                } => Some((idx as i64, "nsl_tensor_free")),
-                                CslaSlotKind::Raw {
-                                    owned: Some(crate::wengert::WengertType::List),
-                                } => Some((idx as i64, "nsl_list_free")),
-                                _ => None,
-                            })
-                            // LSE slots: owned tensors when the fused launch
-                            // fired, runtime 0 when it declined — the
-                            // null-safe free covers both.
-                            .chain(
-                                lse_slots
-                                    .iter()
-                                    .map(|(idx, _)| (*idx as i64, "nsl_tensor_free_if_valid")),
-                            )
-                            // Fused-CE LSE slots: always real tensors (the
-                            // fused forward allocates unconditionally); the
-                            // teardown sweep is their ONLY free on the
-                            // trailing partial window (replayed entries are
-                            // consumed+freed by the emitted backward).
-                            .chain(
-                                fce_slots
-                                    .iter()
-                                    .map(|(idx, _)| (*idx as i64, "nsl_tensor_free")),
-                            )
-                            .collect(),
-                    );
-                    csla_pending = Some(CslaPending {
-                        adjoint: adjoint.clone(),
-                        slots,
-                        seed_base: full_vars.clone(),
-                        param_adj_set: param_adj_set.clone(),
-                        hook_accum_idx,
-                        accum_scale: fase_plan.recipe.accum_scale,
-                        loss_slot,
-                        params: pre.params,
-                        primal_view_of: pre.primal_view_of,
-                        lse_slots,
-                        lse_pushed: csla_lse_pushed,
-                        fce_slots,
-                        schedule: pre.schedule,
-                    });
+                    // Moved to `stmt_train/csla_window.rs` byte-for-byte (roadmap A1):
+                    // the side-channel refusals, the per-micro-batch slot push of
+                    // every adjoint-read primal value (plus the LSE / fused-CE
+                    // tape-carries), and the pending carrier the window backward
+                    // consumes. It fills the three window carriers the driver
+                    // declared above the epoch loop.
+                    let CslaWindowSave {
+                        csla_pending: pending,
+                        csla_loss_buffered: loss_buffered,
+                        csla_teardown_slots: teardown_slots,
+                    } = self.emit_csla_window_save(
+                        builder,
+                        CslaSaveInputs {
+                            adjoint: &adjoint,
+                            adj_vid_to_hook_entry: &adj_vid_to_hook_entry,
+                            csla_buffers,
+                            csla_pre,
+                            fase_hook_active,
+                            fase_plan: &fase_plan,
+                            full_lowered: &full_lowered,
+                            full_vars,
+                            has_dataloader,
+                            loss_var_id,
+                            param_adj_set: &param_adj_set,
+                            step_param_var,
+                        },
+                    )?;
+                    csla_pending = pending;
+                    csla_loss_buffered = loss_buffered;
+                    csla_teardown_slots = teardown_slots;
                     None
                 } else if fase_hook_active && !param_adj_set.is_empty() {
                     // FASE Deferred: consume each param gradient immediately.

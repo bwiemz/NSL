@@ -116,6 +116,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the CSLA window
+  save phase — the `csla_active` arm of the adjoint-lowering site: the
+  side-channel refusals, the per-micro-batch slot push of every
+  adjoint-read primal value (plus the LSE / fused-CE tape-carries) and the
+  pending carrier — moved into `stmt_train/csla_window.rs`
+  (`emit_csla_window_save`, fed by a `CslaSaveInputs`, returning the three
+  window carriers as a `CslaWindowSave`), together with the `CslaPre`
+  carrier; `ParamHookEntry` moves from the driver's local scope to
+  `stmt.rs` module scope. 347 lines out of the driver; the train-block
+  CLIF snapshots are unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): section 7e3b,
   the CSLA (`--layerwise-accum`) window backward — the D1b layer-major
   schedule replay, per-micro-batch seeding, per-range lowering with the

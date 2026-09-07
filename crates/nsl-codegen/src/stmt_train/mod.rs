@@ -16,11 +16,14 @@
 //!   - [`contract`] — section 2: the resolved optimizer / scheduler /
 //!     callbacks contract, the `data:` section, the Muon perf-flag
 //!     refusals and the FASE plan, returned as a [`contract::TrainContract`].
-//!   - [`csla_window`] — section 7e3b: the `--layerwise-accum` window
-//!     backward (schedule replay, per-layer fused updates, prefetch belt,
-//!     window cleanup), fed by a [`csla_window::CslaWindowInputs`]; the
-//!     `CslaPending` / `CslaSchedule` / `CslaParam` / `CslaSlotKind`
-//!     carriers the save phase fills live here too.
+//!   - [`csla_window`] — the `--layerwise-accum` window: the save phase
+//!     (the `csla_active` arm of the adjoint-lowering site, fed by a
+//!     [`csla_window::CslaSaveInputs`], returning the window carriers as a
+//!     [`csla_window::CslaWindowSave`]) and section 7e3b's window backward
+//!     (schedule replay, per-layer fused updates, prefetch belt, window
+//!     cleanup, fed by a [`csla_window::CslaWindowInputs`]); the
+//!     `CslaPre` / `CslaPending` / `CslaSchedule` / `CslaParam` /
+//!     `CslaSlotKind` carriers live here too.
 //!   - [`identity`] — the checkpoint-identity emission at setup: the
 //!     resolved train/optimizer/scheduler record (item 4) and the
 //!     full-state resume load (Milestone B).

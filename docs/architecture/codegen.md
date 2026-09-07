@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~6.4k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~6k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -138,12 +138,15 @@ driver runs it:
 6. Adjoint generation (`AdjointGenerator::generate`, `ad_rules::apply_ad_rule`)
    and lowering (`wengert_lower::compile_wengert_ops` /
    `compile_wengert_ops_range`). Under `--layerwise-accum` the adjoint is
-   instead buffered per micro-batch and replayed on the accumulation
-   boundary by the CSLA window backward (`src/stmt_train/csla_window.rs`:
+   instead buffered per micro-batch (`src/stmt_train/csla_window.rs`:
+   `emit_csla_window_save`, the `csla_active` arm of that site, which
+   pushes every adjoint-read primal value into the window's slot list and
+   returns the `CslaPending` carrier) and replayed on the accumulation
+   boundary by the CSLA window backward (same file:
    `emit_csla_window_backward` — the D1b layer-major schedule, per-b
    seeding, per-range lowering with the fused per-layer update, the
-   weight-stream prefetch belt, the window cleanup; the `CslaPending` /
-   `CslaSchedule` carriers the save phase fills live there too).
+   weight-stream prefetch belt, the window cleanup; the `CslaPre` /
+   `CslaPending` / `CslaSchedule` carriers live there too).
 7. Optimizer step (`src/stmt_train/optimizer_step.rs`: `emit_optimizer_step`
    — the accumulation gate, the mode-table / FASE-deferred / stdlib step
    arms, the ZeRO reduce and sync, the post-optimizer cleanup), calling the
