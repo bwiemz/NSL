@@ -32,6 +32,11 @@
 #         scripts/miri-cpu-tensor.sh --each           # one process per test, so an
 #                                                     # error in one test does not
 #                                                     # hide the rest (slower)
+#         scripts/miri-cpu-tensor.sh --each tensor::alias_tests
+#                                                     # the aliasing-input probes:
+#                                                     # every multi-input CPU op
+#                                                     # called with one handle
+#                                                     # for all its inputs
 #         scripts/miri-cpu-tensor.sh [--each] tensor:: # any test-name filter; the
 #                                                     # whole tensor namespace is
 #                                                     # what found the cpu.rs

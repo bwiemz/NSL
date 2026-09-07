@@ -61,8 +61,8 @@ fn release_cpu_input(contig_ptr: i64, cpu_ptr: i64) {
 pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i64 {
     let (a_contig, a_cpu, a_device) = prepare_cpu_input(a_ptr);
     let (b_contig, b_cpu, _b_device) = prepare_cpu_input(b_ptr);
-    let a = NslTensor::from_ptr(a_cpu);
-    let b = NslTensor::from_ptr(b_cpu);
+    let a = NslTensor::from_ptr_ref(a_cpu);
+    let b = NslTensor::from_ptr_ref(b_cpu);
     let len = a.len as usize;
     let b_len = b.len as usize;
     let b_is_scalar = b_len == 1;
@@ -196,9 +196,9 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
     let (true_contig, true_cpu, true_device) = prepare_cpu_input(true_ptr);
     let (false_contig, false_cpu, _false_device) = prepare_cpu_input(false_ptr);
 
-    let cond = NslTensor::from_ptr(cond_cpu);
-    let tv = NslTensor::from_ptr(true_cpu);
-    let fv = NslTensor::from_ptr(false_cpu);
+    let cond = NslTensor::from_ptr_ref(cond_cpu);
+    let tv = NslTensor::from_ptr_ref(true_cpu);
+    let fv = NslTensor::from_ptr_ref(false_cpu);
 
     let len = tv.len as usize;
     let cond_scalar = cond.len == 1;
@@ -980,16 +980,16 @@ pub extern "C" fn nsl_mse_backward(
     pred_ptr: i64,
     target_ptr: i64,
 ) -> i64 {
-    let pred = NslTensor::from_ptr(pred_ptr);
+    let pred = NslTensor::from_ptr_ref(pred_ptr);
     if pred.len <= 0 {
         return super::nsl_tensor_clone(pred_ptr);
     }
-    let grad_out_cpu = if NslTensor::from_ptr(grad_output_ptr).device > 0 {
+    let grad_out_cpu = if NslTensor::from_ptr_ref(grad_output_ptr).device > 0 {
         nsl_tensor_to_device(grad_output_ptr, 0)
     } else {
         grad_output_ptr
     };
-    let go = NslTensor::from_ptr(grad_out_cpu);
+    let go = NslTensor::from_ptr_ref(grad_out_cpu);
     let go_scalar = if go.len == 1 {
         match go.dtype {
             1 => (unsafe { *go.data_f32() }) as f64,
@@ -2271,8 +2271,8 @@ pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> 
         eprintln!("nsl_tensor_reduce_to_shape: null pointer (grad={}, target={})", grad_ptr, target_ptr);
         return grad_ptr;
     }
-    let grad = NslTensor::from_ptr(grad_ptr);
-    let target = NslTensor::from_ptr(target_ptr);
+    let grad = NslTensor::from_ptr_ref(grad_ptr);
+    let target = NslTensor::from_ptr_ref(target_ptr);
 
     // Device alignment (deferral-closure 2026-07-14): the reduce's output
     // is a parameter gradient — it is consumed where the parameter lives.

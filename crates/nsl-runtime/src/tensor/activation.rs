@@ -967,9 +967,9 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
         // downcast of the gradient). CPU f64 → f64, everything else → f32.
         let one = crate::tensor::nsl_tensor_scalar(1.0, if xt.dtype == 0 { 0 } else { 1 });
         // sigmoid(x) without consuming x (bump so it can't take the FBIP path).
-        NslTensor::from_ptr(x_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr_ref(x_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         let s = nsl_tensor_sigmoid(x_ptr);
-        NslTensor::from_ptr(x_ptr).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr_ref(x_ptr).refcount.fetch_sub(1, Ordering::SeqCst);
         let t1 = crate::tensor::nsl_tensor_sub(one, s, 0); // 1 - s
         let t2 = crate::tensor::nsl_tensor_mul(x_ptr, t1, 0); // x*(1-s)
         let t3 = crate::tensor::nsl_tensor_add(one, t2, 0); // 1 + t2
@@ -1004,8 +1004,8 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     // each a round-to-nearest op (no FMA), so byte-identical.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
     let x_c = nsl_tensor_contiguous(x_ptr);
-    let g = NslTensor::from_ptr(grad_c);
-    let a = NslTensor::from_ptr(x_c);
+    let g = NslTensor::from_ptr_ref(grad_c);
+    let a = NslTensor::from_ptr_ref(x_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = NslTensor::copy_shape(a.shape, ndim);
@@ -1210,8 +1210,8 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
     // CPU path: same order as the decomposed sub/mul/mul, each round-to-nearest.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
     let y_c = nsl_tensor_contiguous(y_ptr);
-    let g = NslTensor::from_ptr(grad_c);
-    let a = NslTensor::from_ptr(y_c);
+    let g = NslTensor::from_ptr_ref(grad_c);
+    let a = NslTensor::from_ptr_ref(y_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = NslTensor::copy_shape(a.shape, ndim);
@@ -1299,8 +1299,8 @@ pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
     // CPU path: same order as the decomposed mul/sub/mul, each round-to-nearest.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
     let y_c = nsl_tensor_contiguous(y_ptr);
-    let g = NslTensor::from_ptr(grad_c);
-    let a = NslTensor::from_ptr(y_c);
+    let g = NslTensor::from_ptr_ref(grad_c);
+    let a = NslTensor::from_ptr_ref(y_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = NslTensor::copy_shape(a.shape, ndim);
@@ -1461,8 +1461,8 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     // CPU: tanh-approx derivative (the CPU forward's formula), elementwise.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
     let x_c = nsl_tensor_contiguous(x_ptr);
-    let g = NslTensor::from_ptr(grad_c);
-    let a = NslTensor::from_ptr(x_c);
+    let g = NslTensor::from_ptr_ref(grad_c);
+    let a = NslTensor::from_ptr_ref(x_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = NslTensor::copy_shape(a.shape, ndim);

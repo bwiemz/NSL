@@ -447,7 +447,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
 
     // GPU redirect: if any tensor is on GPU, move all to CPU, stack, move result to GPU.
     let source_device = {
-        let first = NslTensor::from_ptr(unsafe { *list.data });
+        let first = NslTensor::from_ptr_ref(unsafe { *list.data });
         first.device
     };
     if source_device > 0 {
@@ -496,7 +496,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         .map(|i| nsl_tensor_contiguous(unsafe { *list.data.add(i) }))
         .collect();
 
-    let first = NslTensor::from_ptr(contiguous_ptrs[0]);
+    let first = NslTensor::from_ptr_ref(contiguous_ptrs[0]);
     super::assert_elementwise_byte_copy(first.dtype, "nsl_tensor_stack");
     let in_ndim = first.ndim as usize;
     let out_ndim = (in_ndim + 1) as i64;
@@ -514,7 +514,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
 
     // Validate all tensors have the same shape
     for &cp in &contiguous_ptrs {
-        let t = NslTensor::from_ptr(cp);
+        let t = NslTensor::from_ptr_ref(cp);
         assert_eq!(t.ndim as usize, in_ndim, "nsl_tensor_stack: ndim mismatch");
         assert_eq!(
             t.dtype,
@@ -549,7 +549,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         .map(|i| unsafe { *out_strides.add(i) })
         .collect();
     for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
-        let t = NslTensor::from_ptr(cp);
+        let t = NslTensor::from_ptr_ref(cp);
         let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
         for flat in 0..per_tensor {
             let mut remaining = flat;
@@ -879,7 +879,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
 
     // GPU redirect: if any tensor is on GPU, move all to CPU, cat, move result to GPU.
     let source_device = {
-        let first = NslTensor::from_ptr(unsafe { *list.data });
+        let first = NslTensor::from_ptr_ref(unsafe { *list.data });
         first.device
     };
     if source_device > 0 {
@@ -909,11 +909,11 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
             let input_ptrs: Vec<i64> = (0..num_tensors)
                 .map(|i| unsafe { *list.data.add(i) })
                 .collect();
-            let first = NslTensor::from_ptr(input_ptrs[0]);
+            let first = NslTensor::from_ptr_ref(input_ptrs[0]);
             let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
             let split_sizes: Vec<i64> = input_ptrs
                 .iter()
-                .map(|&p| unsafe { *NslTensor::from_ptr(p).shape.add(d) })
+                .map(|&p| unsafe { *NslTensor::from_ptr_ref(p).shape.add(d) })
                 .collect();
             autodiff::maybe_record(autodiff::TapeOp::Cat {
                 inputs: input_ptrs,
@@ -930,7 +930,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         .map(|i| nsl_tensor_contiguous(unsafe { *list.data.add(i) }))
         .collect();
 
-    let first = NslTensor::from_ptr(contiguous_ptrs[0]);
+    let first = NslTensor::from_ptr_ref(contiguous_ptrs[0]);
     super::assert_elementwise_byte_copy(first.dtype, "nsl_tensor_cat");
     let ndim = first.ndim as usize;
     let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
@@ -940,7 +940,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let mut total_cat_dim: i64 = 0;
 
     for &cp in &contiguous_ptrs {
-        let t = NslTensor::from_ptr(cp);
+        let t = NslTensor::from_ptr_ref(cp);
         assert_eq!(t.ndim as usize, ndim, "nsl_tensor_cat: ndim mismatch");
         // f32/f64 CPU inputs may be mixed (creation ops make f32 tensors while
         // many op results are f64 — the known split CPU dtype model): the
@@ -986,7 +986,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let data = alloc_preserved_dtype_buffer(out_dtype, out_len as usize);
     let mut cat_offset: usize = 0;
     for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
-        let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
+        let t = NslTensor::from_ptr_ref(contiguous_ptrs[t_idx]);
         let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
         for flat in 0..t.len as usize {
             let mut remaining = flat;

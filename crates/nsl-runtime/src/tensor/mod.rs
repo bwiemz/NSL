@@ -11,6 +11,8 @@ pub mod fbip_flags;
 pub mod fused_chain;
 pub mod precision_cast;
 pub mod int8_blockwise;
+#[cfg(test)]
+mod alias_tests;
 
 // Re-export everything from sub-modules so the public API is unchanged.
 pub use creation::*;
@@ -1672,8 +1674,8 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         eprintln!("nsl: copy_data called with null ptr (dst={}, src={})", dst_ptr, src_ptr);
         return;
     }
-    let dst = NslTensor::from_ptr(dst_ptr);
-    let src = NslTensor::from_ptr(src_ptr);
+    let dst = NslTensor::from_ptr_ref(dst_ptr);
+    let src = NslTensor::from_ptr_ref(src_ptr);
     if dst.data.is_null() || src.data.is_null() {
         eprintln!("nsl: copy_data null data pointer (dst.data={:?}, src.data={:?})", dst.data, src.data);
         return;
@@ -1970,7 +1972,7 @@ pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
-    let dst = NslTensor::from_ptr(dst_ptr);
+    let dst = NslTensor::from_ptr_ref(dst_ptr);
     evict_bf16_cast_image(dst);
     {
         // PCA Stage C hardening: reconcile a mismatched src instead of
@@ -1980,7 +1982,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         // already reconcile exactly like this. The warn-once keeps the
         // perf smell visible: a converted src on every step means some
         // producer op should grow a device kernel.
-        let src_probe = NslTensor::from_ptr(src_ptr);
+        let src_probe = NslTensor::from_ptr_ref(src_ptr);
         if src_probe.device != dst.device
             || src_probe.dtype != dst.dtype
             || !src_probe.is_contiguous()
@@ -2016,7 +2018,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
             // a CPU f32 buffer read back from the GPU) needs an explicit
             // cast. nsl_tensor_cast is CPU-only, which is exactly the only
             // case where a dtype gap can exist (GPU tensors are always f32).
-            let contig_probe = NslTensor::from_ptr(contig);
+            let contig_probe = NslTensor::from_ptr_ref(contig);
             let casted = if contig_probe.dtype == 0 && dst.dtype == 1 && contig_probe.device == 0 {
                 // f64 host grad into an f32 buffer: plain downcast copy.
                 // (nsl_tensor_cast is the CPDT F32/FP16/BF16 tool and
@@ -2083,7 +2085,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
             }
         }
     }
-    let src = NslTensor::from_ptr(src_ptr);
+    let src = NslTensor::from_ptr_ref(src_ptr);
     debug_assert!(dst.is_contiguous(), "add_inplace requires contiguous dst");
     debug_assert!(src.is_contiguous(), "add_inplace requires contiguous src");
     if dst.device == 0 && !dst.has_writable_storage() {
@@ -2136,8 +2138,8 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
             nsl_tensor_to_device(src_ptr, 0)
         } else { src_ptr };
         // CPU add
-        let dc = NslTensor::from_ptr(dst_cpu);
-        let sc = NslTensor::from_ptr(src_cpu);
+        let dc = NslTensor::from_ptr_ref(dst_cpu);
+        let sc = NslTensor::from_ptr_ref(src_cpu);
         if dc.dtype == 1 {
             for i in 0..dc.len as usize {
                 unsafe { *dc.data_f32().add(i) += *sc.data_f32().add(i); }
@@ -2923,8 +2925,8 @@ pub extern "C" fn nsl_tensor_layernorm(
                 nsl_tensor_free(g_gpu);
                 nsl_tensor_free(b_gpu);
                 if autodiff::is_recording() {
-                    NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-                    NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr_ref(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr_ref(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
                     // For backward, we need mean/inv_std which are computed on CPU fallback.
                     // Record the tape op with the original pointers; backward will use CPU redirect.
                     let input = NslTensor::from_ptr(input_ptr);
@@ -2985,13 +2987,13 @@ pub extern "C" fn nsl_tensor_layernorm(
         }
     }
 
-    let input_ref = NslTensor::from_ptr(input_ptr);
+    let input_ref = NslTensor::from_ptr_ref(input_ptr);
     let need_contig = !input_ref.is_contiguous();
     let effective_input_ptr = if need_contig { NslTensor::make_contiguous(input_ptr) } else { input_ptr };
 
-    let input = NslTensor::from_ptr(effective_input_ptr);
-    let weight = NslTensor::from_ptr(weight_ptr);
-    let bias = NslTensor::from_ptr(bias_ptr);
+    let input = NslTensor::from_ptr_ref(effective_input_ptr);
+    let weight = NslTensor::from_ptr_ref(weight_ptr);
+    let bias = NslTensor::from_ptr_ref(bias_ptr);
 
     let total = input.len as usize;
     let ndim = input.ndim as usize;
@@ -3095,8 +3097,8 @@ pub extern "C" fn nsl_tensor_layernorm(
     let inv_std_ptr = NslTensor::publish(inv_std_tensor);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr_ref(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr_ref(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::LayerNorm {
             input: input_ptr, weight: weight_ptr, bias: bias_ptr, out: out_ptr,
             saved_input: input_ptr, saved_mean: mean_ptr, saved_inv_std: inv_std_ptr, saved_weight: weight_ptr,
@@ -3125,8 +3127,8 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
                 nsl_tensor_free(c_input);
                 nsl_tensor_free(g_gpu);
                 if autodiff::is_recording() {
-                    NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-                    NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr_ref(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr_ref(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
                     // Compute rms on CPU for backward pass
                     let input = NslTensor::from_ptr(input_ptr);
                     let ndim = input.ndim as usize;
@@ -3165,12 +3167,12 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         }
     }
 
-    let input_ref = NslTensor::from_ptr(input_ptr);
+    let input_ref = NslTensor::from_ptr_ref(input_ptr);
     let need_contig = !input_ref.is_contiguous();
     let effective_input_ptr = if need_contig { NslTensor::make_contiguous(input_ptr) } else { input_ptr };
 
-    let input = NslTensor::from_ptr(effective_input_ptr);
-    let weight = NslTensor::from_ptr(weight_ptr);
+    let input = NslTensor::from_ptr_ref(effective_input_ptr);
+    let weight = NslTensor::from_ptr_ref(weight_ptr);
 
     let total = input.len as usize;
     let ndim = input.ndim as usize;
@@ -3240,8 +3242,8 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
     let rms_ptr = NslTensor::publish(rms_tensor);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr_ref(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr_ref(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::RMSNorm {
             input: input_ptr, weight: weight_ptr, out: out_ptr,
             saved_input: input_ptr, saved_rms: rms_ptr, saved_weight: weight_ptr,
