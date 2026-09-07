@@ -42,7 +42,7 @@ pub(crate) fn run_build_zk(
     // can stamp the prologue + emit a PrologueRecompute marker.
     options.checkpoint.policies = crate::pipeline::analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
-    options.weight_index_map = analysis.weight_index_map.clone();
+    options.weights.index_map = analysis.weight_index_map.clone();
     let options = &options;
 
     // Task 4 (B.2): use the `_returning_plan` variant so the WRGA plan is

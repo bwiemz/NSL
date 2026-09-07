@@ -491,7 +491,7 @@ Grepping `nsl_semantic::` in `crates/nsl-codegen/src` and
 | `types::{Type, Dim, Shape, DType, Device}` | Everywhere codegen inspects a type; `types::display_type` for messages; `Dim::Bounded`/`Symbolic`/`Computed` in `dynamic_shapes.rs`. |
 | `train_config::resolve_train_config`, `TrainConfigPurpose`, `ResolvedTrainConfig` | `stmt.rs` train lowering (standard and pipelined) — the backstop call. |
 | `optim_config::resolve_optim_config`, `ResolvedScheduler`, `OptimizerKind`, `VALID_ROLES` | `stmt.rs` optimizer/scheduler emission; `param_roles.rs`. |
-| `AnalysisResult.weight_index_map` (`export::WeightIndexMap`) | `CompileOptions` → `Compiler.weight_index_map`; lowers `self.W` in `@export` methods to an indexed load. |
+| `AnalysisResult.weight_index_map` (`export::WeightIndexMap`) | `CompileOptions.weights.index_map` → `Compiler.weight_index_map`; lowers `self.W` in `@export` methods to an indexed load. |
 | `AnalysisResult.ownership_info` | `func.rs` via the features struct. |
 | `effects::CheckpointPolicy`, `AnalysisResult.checkpoint_policies`, `paged_kv_models` | CLI loader → `WengertExtractor::with_checkpoint_policy`; flash-attention backward refusal. |
 | `csha::CshaConfig`, `cftp::{FusedCeConfig, PcaConfig, FaseConfig, FaseMode, PcaStrategy, FusedCeDtypeHint}`, `cpkd::FusedKlCeConfig`, `cep::{CepPruneConfig, CepSearchConfig, ..}`, `wrga::{WrgaConfig, FreezeConfig, AdapterConfig, AdapterKind}`, `cpdt::*` | `CompileOptions` side-channels populated by `crates/nsl-cli/src/loader.rs` and `pipeline.rs`; codegen's per-feature drivers read them. |

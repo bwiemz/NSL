@@ -86,6 +86,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  autotune flags moved into `AutotuneOptions` (`opts.autotune.{disabled,
+  fresh}` for `--no-autotune` / `--autotune-fresh`) and the weight-aware
+  cluster into `WeightsOptions` (`opts.weights.{file, config, analysis,
+  index_map}`: the `--weights` path, the M52 sparsity / dead-weight /
+  constant-fold config, the `nsl check --weight-analysis` flag and the
+  `@export` weight-index map). Pure rename; defaults unchanged.
+  57 → 51 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the ZeRO
   knobs moved into `ZeroOptions` (`opts.zero.{stage, elementwise}`, for
   `--zero-stage` / `--zero-elementwise`). Defaults unchanged (off); the

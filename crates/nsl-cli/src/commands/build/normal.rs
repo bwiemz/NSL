@@ -118,7 +118,7 @@ fn run_build_single(
     options.checkpoint.policies = crate::pipeline::analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
-    options.weight_index_map = analysis.weight_index_map.clone();
+    options.weights.index_map = analysis.weight_index_map.clone();
     // Item 5: constructor-argument folding — dims for parameterized
     // submodule weights (`randn([d_model, d_ff])` under `Ctor(512, 1408)`),
     // which literal-only collection cannot derive. Routed through the

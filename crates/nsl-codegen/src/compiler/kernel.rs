@@ -124,7 +124,7 @@ impl Compiler<'_> {
                                 .unwrap_or("unknown")
                                 .to_string();
 
-                            if self.compile_options.no_autotune {
+                            if self.compile_options.autotune.disabled {
                                 // --no-autotune: use middle values, skip benchmarking
                                 eprintln!(
                                     "[nsl] autotune: --no-autotune, using middle values for {}",
@@ -402,7 +402,7 @@ impl Compiler<'_> {
         kernel: &nsl_ast::block::KernelDef,
         tuning_params: &crate::autotune::TuningParams,
     ) -> Result<HashMap<String, i64>, CodegenError> {
-        let fresh = self.compile_options.autotune_fresh;
+        let fresh = self.compile_options.autotune.fresh;
 
         // Two different notions of "which GPU", and conflating them was the
         // item-10 defect:
@@ -1796,7 +1796,7 @@ impl Compiler<'_> {
                 ("block_kv".to_string(), block_kv_values.clone()),
             ];
 
-            if self.compile_options.no_autotune {
+            if self.compile_options.autotune.disabled {
                 // Not "--no-autotune made us use middle values" — nothing here
                 // ever did anything else. The primary config below is
                 // `select_middle_values` unconditionally, and no cost model or
