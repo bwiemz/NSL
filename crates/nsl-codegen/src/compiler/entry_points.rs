@@ -195,7 +195,7 @@ fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::Compil
 }
 
 /// M52 / CPDT follow-up: shared weight-loading path for every codegen entry
-/// point.  When `options.weight_file` is set, loads the safetensors file,
+/// point.  When `options.weights.file` is set, loads the safetensors file,
 /// runs sparsity analysis + dead-weight elimination + optional weight-analysis
 /// report + M52d scale computation, and stashes the resulting `WeightMap` +
 /// integrity hash on the compiler.  A missing/unreadable file is a hard error.
@@ -213,7 +213,7 @@ fn load_and_register_weights_if_needed(
     compiler: &mut Compiler<'_>,
     options: &crate::CompileOptions,
 ) -> Result<(), CodegenError> {
-    let Some(weight_path) = options.weight_file.as_ref() else {
+    let Some(weight_path) = options.weights.file.as_ref() else {
         return Ok(());
     };
 
@@ -317,19 +317,19 @@ fn load_and_register_weights_if_needed(
     }
 
     // Sparsity analysis for sparse codegen / dead-weight elimination.
-    if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
+    if options.weights.config.sparse_codegen || options.weights.config.dead_weight_elim {
         let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
         for name in &names {
             if let Some(entry) = wmap.get_mut(name) {
-                entry.analyze_sparsity(&options.weight_config);
+                entry.analyze_sparsity(&options.weights.config);
             }
         }
     }
 
     // Dead-weight elimination.
-    if options.weight_config.dead_weight_elim {
+    if options.weights.config.dead_weight_elim {
         let eliminator =
-            crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
+            crate::weight_aware::DeadWeightEliminator::new(&options.weights.config);
         let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
         for name in &names {
             if let Some(entry) = wmap.get_mut(name) {
@@ -339,8 +339,8 @@ fn load_and_register_weights_if_needed(
     }
 
     // Optional --weight-analysis report.
-    if options.weight_analysis {
-        crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
+    if options.weights.analysis {
+        crate::weight_aware::print_weight_analysis_report(&wmap, &options.weights.config);
     }
 
     // M52d: compile-time quantization scales for FP8/INT8 weights.

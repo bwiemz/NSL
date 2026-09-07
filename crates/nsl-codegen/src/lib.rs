@@ -1596,11 +1596,47 @@ pub struct DevToolsOptions {
     pub inspect_enabled: bool,
 }
 
+/// Kernel autotuning options (`--no-autotune`, `--autotune-fresh`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct AutotuneOptions {
+    /// `--no-autotune`: skip benchmarking and take the middle value of every
+    /// tuning parameter.
+    pub disabled: bool,
+    /// `--autotune-fresh`: ignore cached measurements and re-benchmark.
+    pub fresh: bool,
+}
+
+/// Weight-aware compilation options (M52: `--weights`, the sparsity /
+/// dead-weight / constant-fold config, `nsl check --weight-analysis`) plus
+/// the `@export` weight-index map (M62).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct WeightsOptions {
+    /// M52: Path to safetensors weight file for weight-aware compilation
+    pub file: Option<std::path::PathBuf>,
+    /// M52: Weight-aware compilation configuration
+    pub config: weight_aware::WeightAwareConfig,
+    /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
+    pub analysis: bool,
+    /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
+    /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
+    /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before
+    /// calling any codegen entry point.  Empty map = no @export methods (safe
+    /// default, nothing to look up).
+    pub index_map: HashMap<nsl_ast::NodeId, usize>,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
-    pub no_autotune: bool,
-    pub autotune_fresh: bool,
+    /// Kernel autotuning (`--no-autotune` / `--autotune-fresh`); see
+    /// [`AutotuneOptions`].
+    pub autotune: AutotuneOptions,
     pub world_size: usize,
     pub fusion_report: bool,
     /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
@@ -1626,12 +1662,9 @@ pub struct CompileOptions {
     /// campaigns need distinct reproducible inits; bit-reproducibility of
     /// the DEVICE path still requires --deterministic).
     pub rng_seed: Option<u64>,
-    /// M52: Path to safetensors weight file for weight-aware compilation
-    pub weight_file: Option<std::path::PathBuf>,
-    /// M52: Weight-aware compilation configuration
-    pub weight_config: weight_aware::WeightAwareConfig,
-    /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
-    pub weight_analysis: bool,
+    /// Weight-aware compilation (`--weights`, the M52 config, the analysis
+    /// report) and the `@export` weight-index map; see [`WeightsOptions`].
+    pub weights: WeightsOptions,
     /// M54: Unikernel build configuration (None = normal build)
     pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
     /// M53: Worst-case-execution-time analysis / certification options.
@@ -1860,12 +1893,6 @@ pub struct CompileOptions {
     /// Calibration-harness options (data path, mode, budgets, retention
     /// plans, the subprocess compile bundle and the sidecar written back).
     pub calibration: CalibrationOptions,
-    /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
-    /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
-    /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before
-    /// calling any codegen entry point.  Empty map = no @export methods (safe
-    /// default, nothing to look up).
-    pub weight_index_map: HashMap<nsl_ast::NodeId, usize>,
 }
 
 impl CompileOptions {
@@ -2016,8 +2043,7 @@ fn sanitize_fingerprint_value(v: &str) -> String {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
-            no_autotune: false,
-            autotune_fresh: false,
+            autotune: AutotuneOptions::default(),
             world_size: 1,
             fusion_report: false,
             vram_budget: None,
@@ -2029,9 +2055,7 @@ impl Default for CompileOptions {
             nan_analysis: false,
             deterministic: false,
             rng_seed: None,
-            weight_file: None,
-            weight_config: weight_aware::WeightAwareConfig::default(),
-            weight_analysis: false,
+            weights: WeightsOptions::default(),
             unikernel_config: None,
             wcet: WcetOptions::default(),
             linear_types_enabled: false,
@@ -2073,7 +2097,6 @@ impl Default for CompileOptions {
             wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,
             calibration: CalibrationOptions::default(),
-            weight_index_map: HashMap::new(),
         }
     }
 }
@@ -2083,7 +2106,7 @@ impl Default for CompileOptions {
 ///
 /// This is a convenience wrapper that:
 /// 1. Reads the calibration-data header to obtain `(batch, seq)`.
-/// 2. Sets up `CompileOptions` with `calibration.data`, `weight_file`,
+/// 2. Sets up `CompileOptions` with `calibration.data`, `weights.file`,
 ///    `calibration.batch_seq`, and `calibration.mode = "required"`.
 /// 3. Lexes, parses, and semantically analyses the source.
 /// 4. Constructs a `Compiler` directly, runs all pre-`compile_main` passes
@@ -2144,7 +2167,7 @@ pub fn compile_and_calibrate(
     // Step 3: assemble options.
     let mut opts = CompileOptions::default();
     opts.calibration.data = Some(data_path.to_path_buf());
-    opts.weight_file = Some(weights_path.to_path_buf());
+    opts.weights.file = Some(weights_path.to_path_buf());
     opts.calibration.batch_seq = Some((1, seq));
     opts.calibration.mode = Some("required".to_string());
     opts.calibration.compile_bundle = Some(std::sync::Arc::new(
@@ -2268,7 +2291,7 @@ pub fn compile_and_calibrate(
                 let cfg = crate::calibration::HarnessConfig {
                     checkpoints: compiler
                         .compile_options
-                        .weight_file
+                        .weights.file
                         .as_ref()
                         .map(|p| vec![p.clone()])
                         .unwrap_or_default(),

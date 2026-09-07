@@ -484,8 +484,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // the same bounds the runtime applies, so the fingerprint
                 // records the EFFECTIVE value rather than the raw one.
                 matmul: matmul.to_config(),
-                no_autotune,
-                autotune_fresh,
+                autotune: nsl_codegen::AutotuneOptions { disabled: no_autotune, fresh: autotune_fresh },
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
                 fusion_report,
                 // Milestone A: an unparseable budget must refuse, not
@@ -515,15 +514,20 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // M52: When --standalone, weights are handled by standalone pipeline;
                 // otherwise pass through the four-case-resolved weight file from
                 // above (AST auto-detect + --weights flag decision table).
-                weight_file: if standalone { None } else { resolved_weight_file.clone() },
-                weight_config: nsl_codegen::weight_aware::WeightAwareConfig {
-                    dead_weight_threshold,
-                    sparse_threshold,
-                    constant_fold: !no_constant_fold,
-                    dead_weight_elim: !no_dead_weight,
-                    sparse_codegen: !no_sparse_codegen,
+                weights: nsl_codegen::WeightsOptions {
+                    file: if standalone { None } else { resolved_weight_file.clone() },
+                    config: nsl_codegen::weight_aware::WeightAwareConfig {
+                        dead_weight_threshold,
+                        sparse_threshold,
+                        constant_fold: !no_constant_fold,
+                        dead_weight_elim: !no_dead_weight,
+                        sparse_codegen: !no_sparse_codegen,
+                    },
+                    analysis: false,
+                    // Populated from the semantic analysis in the build paths
+                    // that have it in scope.
+                    index_map: std::collections::HashMap::new(),
                 },
-                weight_analysis: false,
                 unikernel_config,
                 wcet: nsl_codegen::WcetOptions {
                     enabled: wcet,
@@ -673,9 +677,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // lets entry_points.rs do it.
                     grad_retention: None,
                 },
-                // M62 Task 6: weight_index_map is populated from analysis in
-                // run_build_single/run_build_multi (where analysis is in scope).
-                weight_index_map: std::collections::HashMap::new(),
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated

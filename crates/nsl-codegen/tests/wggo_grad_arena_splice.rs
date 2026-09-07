@@ -61,7 +61,7 @@ fn opts_with_backward(
             type_map: analysis.type_map.clone(),
         },
     ));
-    opts.weight_index_map = analysis.weight_index_map.clone();
+    opts.weights.index_map = analysis.weight_index_map.clone();
 
     // Four distinct weight projections with compatible square shapes (16x16).
     let targets = vec![WggoGradTarget {

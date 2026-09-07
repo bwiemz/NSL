@@ -1329,7 +1329,7 @@ impl<'a> Compiler<'a> {
             retention_offsets: std::collections::HashMap::new(),
             retention_splices_emitted: 0,
             grad_arena_layout: None,
-            weight_index_map: options.weight_index_map.clone(),
+            weight_index_map: options.weights.index_map.clone(),
         })
     }
 

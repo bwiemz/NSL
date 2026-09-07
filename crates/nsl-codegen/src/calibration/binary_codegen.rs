@@ -4197,7 +4197,7 @@ mod tests {
                 type_map: analysis.type_map.clone(),
             },
         ));
-        opts.weight_index_map = analysis.weight_index_map.clone();
+        opts.weights.index_map = analysis.weight_index_map.clone();
         opts
     }
 
@@ -4694,7 +4694,7 @@ mod backward_wrapper {
                 type_map: analysis.type_map.clone(),
             },
         ));
-        opts.weight_index_map = analysis.weight_index_map.clone();
+        opts.weights.index_map = analysis.weight_index_map.clone();
 
         // One WGGO target that mirrors TinyMLP's weight shapes (128×64).
         let targets = vec![WggoGradTarget {
@@ -4763,7 +4763,7 @@ mod backward_wrapper {
                     type_map: analysis.type_map.clone(),
                 },
             ));
-            o.weight_index_map = analysis.weight_index_map.clone();
+            o.weights.index_map = analysis.weight_index_map.clone();
             o
         };
         // Confirm no grad retention.

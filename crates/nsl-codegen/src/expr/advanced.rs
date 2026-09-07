@@ -2917,7 +2917,7 @@ impl Compiler<'_> {
             None => return Ok(None),
         };
 
-        if !self.compile_options.weight_config.constant_fold {
+        if !self.compile_options.weights.config.constant_fold {
             return Ok(None);
         }
 
@@ -3011,11 +3011,11 @@ impl Compiler<'_> {
             && let Some(entry) = wmap.get(key)
         {
             let elim = crate::weight_aware::DeadWeightEliminator::new(
-                &self.compile_options.weight_config,
+                &self.compile_options.weights.config,
             );
             if elim.is_near_identity(
                 entry,
-                self.compile_options.weight_config.dead_weight_threshold,
+                self.compile_options.weights.config.dead_weight_threshold,
             ) {
                 nsl_runtime::nsl_log!(INFO, "nsl", 
                     "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
@@ -3030,11 +3030,11 @@ impl Compiler<'_> {
             && let Some(entry) = wmap.get(key)
         {
             let elim = crate::weight_aware::DeadWeightEliminator::new(
-                &self.compile_options.weight_config,
+                &self.compile_options.weights.config,
             );
             if elim.is_near_identity(
                 entry,
-                self.compile_options.weight_config.dead_weight_threshold,
+                self.compile_options.weights.config.dead_weight_threshold,
             ) {
                 nsl_runtime::nsl_log!(INFO, "nsl", 
                     "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
@@ -3063,7 +3063,7 @@ impl Compiler<'_> {
             None => return Ok(None),
         };
 
-        if !self.compile_options.weight_config.sparse_codegen {
+        if !self.compile_options.weights.config.sparse_codegen {
             return Ok(None);
         }
 
