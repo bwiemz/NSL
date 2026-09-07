@@ -165,7 +165,9 @@ The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
-`WeightsOptions`, …). The autotune flags moved into `AutotuneOptions`
+`WeightsOptions`, `FusionOptions`, …). The fusion flags moved into
+`FusionOptions` (`opts.fusion.{disabled, report, rmsnorm_backward, wgrad_accum,
+wgrad_accum_from_bundle}`). The autotune flags moved into `AutotuneOptions`
 (`opts.autotune.{disabled, fresh}`) and the weight-aware cluster into
 `WeightsOptions` (`opts.weights.{file, config, analysis, index_map}`). The ZeRO knobs moved
 into `ZeroOptions` (`opts.zero.{stage, elementwise}`). The imported-model shape channel

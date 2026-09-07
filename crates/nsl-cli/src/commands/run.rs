@@ -440,11 +440,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // Clamp like `nsl build` (build/options.rs) — `--devices 0` must not
                 // produce world_size=0 (WGGO ZeRO/TP math assumes >= 1 rank).
                 world_size: (devices as usize).max(1),
-                fusion_report: false,
                 vram_budget: None,
                 memory_report: false,
                 target,
-                disable_fusion,
                 source_ad,
                 trace_ops,
                 nan_analysis: false,
@@ -489,9 +487,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     // once the semantic checker has run. Empty = byte-identity.
                     policies: std::collections::HashMap::new(),
                 },
-                fuse_rmsnorm_backward,
-                fuse_wgrad_accum,
-                fuse_wgrad_accum_from_bundle,
+                fusion: nsl_codegen::FusionOptions {
+                    disabled: disable_fusion,
+                    report: false,
+                    rmsnorm_backward: fuse_rmsnorm_backward,
+                    wgrad_accum: fuse_wgrad_accum,
+                    wgrad_accum_from_bundle: fuse_wgrad_accum_from_bundle,
+                },
                 layerwise_accum,
                 weight_stream: nsl_codegen::WeightStreamOptions {
                     enabled: weight_stream,

@@ -123,6 +123,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the fusion
+  flags moved into `FusionOptions` (`opts.fusion.{disabled, report,
+  rmsnorm_backward, wgrad_accum, wgrad_accum_from_bundle}` for
+  `--disable-fusion` / `--fusion-report` / `--fuse-rmsnorm-backward` /
+  `--fuse-wgrad-accum` and its bundle provenance). Pure rename; defaults
+  unchanged; the execution fingerprint reads `fusion` / `fuse_rms` /
+  `fuse_wgrad` through the new path and `--training-reference` clears the
+  same three knobs. 51 → 47 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the
   autotune flags moved into `AutotuneOptions` (`opts.autotune.{disabled,
   fresh}` for `--no-autotune` / `--autotune-fresh`) and the weight-aware

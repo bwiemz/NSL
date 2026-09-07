@@ -247,7 +247,7 @@ pub fn compile_wengert_ops_range(
     // per-slice — `plan` needs global reader counts to prove the elided
     // intermediates have no other consumer, and a CSLA slice boundary must
     // not be able to make a chain look dead when it is not.
-    let wgrad_plan = match (&on_param_grad, compiler.compile_options.fuse_wgrad_accum) {
+    let wgrad_plan = match (&on_param_grad, compiler.compile_options.fusion.wgrad_accum) {
         (Some((param_set, _)), true) => crate::wgrad_fusion::plan(wengert, param_set),
         _ => crate::wgrad_fusion::WgradFusionPlan::default(),
     };
@@ -267,7 +267,7 @@ pub fn compile_wengert_ops_range(
         range.end,
         wengert.ops.len()
     );
-    if compiler.compile_options.fuse_wgrad_accum && on_param_grad.is_some() {
+    if compiler.compile_options.fusion.wgrad_accum && on_param_grad.is_some() {
         // Non-vacuity signal for the parity gate: a flag-on-vs-flag-off loss
         // comparison passes trivially if the fusion never fired. Print the
         // count so the gate can assert it is non-zero, and so a tape change

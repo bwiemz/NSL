@@ -486,7 +486,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 matmul: matmul.to_config(),
                 autotune: nsl_codegen::AutotuneOptions { disabled: no_autotune, fresh: autotune_fresh },
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
-                fusion_report,
                 // Milestone A: an unparseable budget must refuse, not
                 // silently become "no budget" — the flag is a guard rail.
                 vram_budget: match vram_budget.as_deref() {
@@ -505,7 +504,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 },
                 memory_report,
                 target,
-                disable_fusion,
                 source_ad: _source_ad,
                 trace_ops: false,
                 nan_analysis,
@@ -564,9 +562,13 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // once the semantic checker has run. Empty = byte-identity.
                     policies: std::collections::HashMap::new(),
                 },
-                fuse_rmsnorm_backward,
-                fuse_wgrad_accum,
-                fuse_wgrad_accum_from_bundle,
+                fusion: nsl_codegen::FusionOptions {
+                    disabled: disable_fusion,
+                    report: fusion_report,
+                    rmsnorm_backward: fuse_rmsnorm_backward,
+                    wgrad_accum: fuse_wgrad_accum,
+                    wgrad_accum_from_bundle: fuse_wgrad_accum_from_bundle,
+                },
                 layerwise_accum,
                 weight_stream: nsl_codegen::WeightStreamOptions {
                     enabled: weight_stream,
