@@ -63,6 +63,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): sections 7e4–7g,
+  the optimizer step — the accumulation gate, the mode-table / FASE-deferred
+  / stdlib step arms, the ZeRO reduce and param sync, the post-optimizer
+  cleanup — moved byte-for-byte into `stmt_train/optimizer_step.rs`
+  (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
+  the driver, no escaping binding; the train-block CLIF snapshots are
+  unchanged.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the ten
   `calibration_*` fields moved into `CalibrationOptions`
   (`opts.calibration.{data, mode, samples, batch_size, timeout_secs, sidecar,
