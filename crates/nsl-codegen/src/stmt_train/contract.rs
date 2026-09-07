@@ -188,7 +188,7 @@ impl Compiler<'_> {
         // Muon perf campaign (`--muon-batch-ns`): the batched engine is
         // wired into the FullBuffer optimizer loop only. Every path where
         // it would silently not batch (or corrupt state) refuses loudly.
-        if self.compile_options.muon_batch_ns {
+        if self.compile_options.muon.batch_ns {
             if optimizer_name != "muon" {
                 return Err(CodegenError::new(format!(
                     "--muon-batch-ns requires the muon optimizer (train block \
@@ -212,7 +212,7 @@ impl Compiler<'_> {
                      or drop one of the flags",
                 ));
             }
-            if self.compile_options.muon_state_bf16 {
+            if self.compile_options.muon.state_bf16 {
                 return Err(CodegenError::new(
                     "--muon-batch-ns does not compose with --muon-state-dtype \
                      bf16: the batched kernels read/write f32 momentum \
@@ -237,7 +237,7 @@ impl Compiler<'_> {
 
         // Muon perf campaign (`--muon-resident-momentum`): only meaningful
         // under offload, and only for the muon optimizer's routed params.
-        if self.compile_options.muon_resident_momentum {
+        if self.compile_options.muon.resident_momentum {
             if optimizer_name != "muon" {
                 return Err(CodegenError::new(format!(
                     "--muon-resident-momentum requires the muon optimizer \
@@ -251,7 +251,7 @@ impl Compiler<'_> {
                      already device-resident). Drop the flag",
                 ));
             }
-            if self.compile_options.muon_state_bf16 {
+            if self.compile_options.muon.state_bf16 {
                 return Err(CodegenError::new(
                     "--muon-resident-momentum does not compose with \
                      --muon-state-dtype bf16 (the bf16 envelope owns the \

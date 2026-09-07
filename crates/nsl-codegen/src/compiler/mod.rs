@@ -619,7 +619,7 @@ impl FeatureConfigs {
             zero_stage: options.zero_stage,
             zero_elementwise: options.zero_elementwise,
             param_dtype_bf16sr: options.param_dtype_bf16sr,
-            muon_state_bf16: options.muon_state_bf16,
+            muon_state_bf16: options.muon.state_bf16,
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),
             kv_compress_policies: HashMap::new(),

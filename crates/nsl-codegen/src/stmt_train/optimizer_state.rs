@@ -281,7 +281,7 @@ impl Compiler<'_> {
             // combos (zero/bf16/non-muon/no-offload) were rejected at parse.
             let muon_resident_m = optimizer_name == "muon"
                 && offload
-                && self.compile_options.muon_resident_momentum;
+                && self.compile_options.muon.resident_momentum;
             let buf1 = if zero3_defer {
                 builder.ins().iconst(cl_types::I64, 0)
             } else if muon_resident_m {

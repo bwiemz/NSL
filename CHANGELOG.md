@@ -83,6 +83,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the Muon
+  knobs moved into `MuonOptions` (`opts.muon.{batch_ns, resident_momentum,
+  state_bf16}`, for `--muon-batch-ns` / `--muon-resident-momentum` /
+  `--muon-state-dtype`). Defaults unchanged (all off); the execution
+  fingerprint reads `batch_ns` / `resident_momentum` through the new path and
+  `Features` keeps its own `muon_state_bf16` copy. 64 → 62 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the
   weight-streaming ladder moved into `WeightStreamOptions`
   (`opts.weight_stream.{enabled, arena, prefetch, async_writeback}`, for

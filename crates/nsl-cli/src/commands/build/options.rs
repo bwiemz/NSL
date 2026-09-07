@@ -570,19 +570,21 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 },
                 param_dtype_bf16sr: param_dtype == "bf16-sr",
                 cuda_graphs,
-                muon_batch_ns,
-                muon_resident_momentum,
-                muon_state_bf16: match muon_state_dtype.as_str() {
-                    "f32" => false,
-                    "bf16" => true,
-                    other => {
-                        eprintln!(
-                            "error: --muon-state-dtype {other}: ladder rung not \
-                             implemented yet (P4 item 18 order: f32 -> bf16 -> \
-                             blockwise 8-bit -> 4-bit experimental). Use f32 or bf16"
-                        );
-                        std::process::exit(1);
-                    }
+                muon: nsl_codegen::MuonOptions {
+                    batch_ns: muon_batch_ns,
+                    resident_momentum: muon_resident_momentum,
+                    state_bf16: match muon_state_dtype.as_str() {
+                        "f32" => false,
+                        "bf16" => true,
+                        other => {
+                            eprintln!(
+                                "error: --muon-state-dtype {other}: ladder rung not \
+                                 implemented yet (P4 item 18 order: f32 -> bf16 -> \
+                                 blockwise 8-bit -> 4-bit experimental). Use f32 or bf16"
+                            );
+                            std::process::exit(1);
+                        }
+                    },
                 },
                 debug_training,
                 grad_integrity,

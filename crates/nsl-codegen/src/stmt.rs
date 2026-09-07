@@ -5743,13 +5743,13 @@ impl Compiler<'_> {
             // Muon perf campaign: the pipelined path never reaches the
             // batch/resident emission — refuse rather than silently no-op
             // (the non-pipeline path refuses non-muon optimizers too).
-            if self.compile_options.muon_batch_ns {
+            if self.compile_options.muon.batch_ns {
                 return Err(CodegenError::new(
                     "--muon-batch-ns is not supported on the pipelined train \
                      path (@pipeline). Drop one",
                 ));
             }
-            if self.compile_options.muon_resident_momentum {
+            if self.compile_options.muon.resident_momentum {
                 return Err(CodegenError::new(
                     "--muon-resident-momentum is not supported on the \
                      pipelined train path (@pipeline). Drop one",
