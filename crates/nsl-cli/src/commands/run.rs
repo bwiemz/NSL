@@ -436,8 +436,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // the same bounds the runtime applies, so the fingerprint
                 // records the EFFECTIVE value rather than the raw one.
                 matmul: matmul.to_config(),
-                no_autotune: false,
-                autotune_fresh: false,
+                autotune: nsl_codegen::AutotuneOptions::default(),
                 // Clamp like `nsl build` (build/options.rs) — `--devices 0` must not
                 // produce world_size=0 (WGGO ZeRO/TP math assumes >= 1 rank).
                 world_size: (devices as usize).max(1),
@@ -453,9 +452,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 rng_seed: seed,
                 // CPDT: pass through the four-case-resolved weight file so the
                 // weight-aware tier assignment runs during train-block codegen.
-                weight_file: resolved_weight_file.clone(),
-                weight_config: Default::default(),
-                weight_analysis: false,
+                weights: nsl_codegen::WeightsOptions {
+                    file: resolved_weight_file.clone(),
+                    // `index_map` is populated from the semantic analysis in
+                    // run_build_single (where analysis is in scope).
+                    ..Default::default()
+                },
                 unikernel_config: None,
                 wcet: nsl_codegen::WcetOptions {
                     enabled: wcet,
@@ -471,8 +473,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 zk: nsl_codegen::ZkOptions::default(),
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
                 ownership_info: std::collections::HashMap::new(),
-                zero_stage: zero_stage.map(|s| s as u8),
-                zero_elementwise,
+                zero: nsl_codegen::ZeroOptions {
+                    stage: zero_stage.map(|s| s as u8),
+                    elementwise: zero_elementwise,
+                },
                 optim_state_offload,
                 checkpoint: nsl_codegen::CheckpointOptions {
                     blocks: checkpoint_blocks,
@@ -520,10 +524,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
                 // come from `collect_models` directly.
-                imported_model_field_dims: Default::default(),
-                imported_model_field_ranks: Default::default(),
-                imported_tensor_fields_without_dims: Default::default(),
-                imported_model_field_values: Default::default(),
+                imported_model: Default::default(),
                 // Item 4: unset means off. `--pretrain-optimized` has already
                 // filled `auto` above, so an explicit `off` reaching here is a
                 // decision the bundle deliberately did not override.
@@ -614,9 +615,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // `nsl run` never drives calibration: no data path, no
                 // compile bundle, no retention plans (the defaults).
                 calibration: nsl_codegen::CalibrationOptions::default(),
-                // M62 Task 6: weight_index_map is populated from analysis in
-                // run_build_single (where analysis is in scope).
-                weight_index_map: std::collections::HashMap::new(),
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated

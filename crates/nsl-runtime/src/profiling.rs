@@ -257,7 +257,7 @@ pub unsafe extern "C" fn nsl_profiler_dump(path_ptr: *const u8, path_len: i64) {
     );
 
     std::fs::write(path_str, json).unwrap_or_else(|e| {
-        eprintln!("nsl_profiler_dump: failed to write {}: {}", path_str, e);
+        crate::nsl_log!(ERROR, "profiling", "nsl_profiler_dump: failed to write {}: {}", path_str, e);
     });
 }
 

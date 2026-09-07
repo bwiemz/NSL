@@ -76,7 +76,7 @@ pub(crate) fn build_to_temp(
             let jc = nsl_codegen::cpdt_joint::JointConfig::default();
             println!("joint_cfg:     {:?} (override: --cpdt-budget, future)", jc);
             println!("expert_cfg:    none (no MoE block detected)");
-            match &options.weight_file {
+            match &options.weights.file {
                 Some(p) => println!("weights:       {}", p.display()),
                 None => println!(
                     "weights:       none (no --weights flag and no AST load_safetensors)"

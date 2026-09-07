@@ -252,7 +252,7 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 62 `pub` fields today. The decomposition into cohesive
+The struct has 51 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
 (`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
@@ -270,7 +270,19 @@ semantic analysis), `WeightStreamOptions` (`opts.weight_stream`: the
 `--weight-stream` ladder — `enabled` / `arena` / `prefetch` /
 `async_writeback`), `MuonOptions` (`opts.muon`: `batch_ns` /
 `resident_momentum` / `state_bf16`; `Features` keeps its own
-`muon_state_bf16` copy for the emission paths), plus `MatmulConfig`
+`muon_state_bf16` copy for the emission paths), `ImportedModelOptions`
+(`opts.imported_model`: the multi-file build's `field_dims` / `field_ranks`
+/ `tensor_fields_without_dims` / `field_values` channel for model fields
+declared in imported modules, which `ctor_fold` also merges into and
+`entry_points` merges under the entry module's own collection),
+`ZeroOptions` (`opts.zero`: `stage` / `elementwise` for `--zero-stage` /
+`--zero-elementwise`; `Features` and the parameter plan's `PlanFeatures`
+keep their own copies), `AutotuneOptions` (`opts.autotune`: `disabled` /
+`fresh` for `--no-autotune` / `--autotune-fresh`), `WeightsOptions`
+(`opts.weights`: the `--weights` `file`, the M52 weight-aware `config`,
+the `nsl check --weight-analysis` report flag `analysis`, and the `@export`
+`index_map` the CLI fills from `AnalysisResult.weight_index_map`), plus
+`MatmulConfig`
 (`opts.matmul`) and
 `WrgaCheckContext` (`opts.wrga_check`, which retired the CLI's WRGA
 thread-locals — see compiler-state.md Phase 2). Everything else is still a
@@ -594,6 +606,20 @@ refusals that write no artifact), and the WGGO unit test
 pins the site that used to exit. Diagnostic *messages* on stderr are a
 different thing: they are the execution markers (below) and are fine.
 
+**Diagnostics go through `nsl_runtime::nsl_log!`** (roadmap C3; the front
+door and its byte-identical stderr subscriber are described in
+runtime.md, "Logging"). A compile-time warning, note or marker line is
+`nsl_runtime::nsl_log!(LEVEL, "target", "…")` rather than `eprintln!`: the
+`warning:` / `error:` / `note:` lines use target `codegen`, a line that
+starts with its own `[marker]` uses that marker (`autotune`, `ccr`,
+`source-ad`, `wggo`, `cpdt`, `arena`, `weight-stream`, …), and the levels
+follow the runtime's rule (`ERROR` for a lost result, `WARN` for a refusal
+or fallback, `INFO` for reports and traces). The macro reaches `tracing`
+through nsl-runtime's re-export, so nsl-codegen carries no dependency of
+its own. The multi-line report dumps that `eprint!` a pre-rendered string
+(`plan.render_report()`, the linker's tool output) and the dev-tool
+binaries under `src/bin/` are the only raw prints left.
+
 ## Experimental subsystems
 
 The `experimental` facade (`src/lib.rs`) and STATUS.md's Experimental tier
@@ -786,8 +812,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 1. Add the field to `CompileOptions` in `src/lib.rs` — inside the matching
    sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`, `ZkOptions`,
    `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
-   `WeightStreamOptions`, `MuonOptions`,
-   `MatmulConfig`) when one exists — with its
+   `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
+   `AutotuneOptions`, `WeightsOptions`, `MatmulConfig`) when one exists — with its
    default in `impl Default for CompileOptions` (or the sub-struct's).
 2. Declare the clap flag in `crates/nsl-cli/src/args.rs`. Shared flags are
    declared twice (`BuildArgs`, `RunArgs`) and must be identical; a flag

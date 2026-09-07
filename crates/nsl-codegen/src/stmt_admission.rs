@@ -386,7 +386,7 @@ impl Compiler<'_> {
                 // fire when a sibling block fused — so in a multi-block
                 // program this line is the only thing that says which block
                 // is inert.
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "wgrad-fusion", 
                     "[wgrad-fusion] declined: {} #{} — {reason}",
                     self.training_block_noun(),
                     self.wgrad_block_ordinal()

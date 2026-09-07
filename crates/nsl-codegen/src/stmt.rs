@@ -424,14 +424,14 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // wording overclaiming exactly that.
     if applied_plan.is_none() {
         if compiler.cpdt_mode == CpdtMode::Full && weights_present {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "cpdt", 
                 "[cpdt] planned without a WGGO plan for this block \
                  (weights-only): optimizer-moment precision derives from \
                  the weight map; the ZeRO/comm halves saw an empty cost \
                  model."
             );
         } else {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "cpdt", 
                 "[cpdt] planned without a WGGO plan for this block: the \
                  ZeRO/comm halves saw an empty cost model, and this \
                  configuration builds no per-param precision plan (mode \
@@ -465,13 +465,13 @@ pub(crate) fn invoke_cpdt_if_enabled(
         } else {
             100.0 * agree_params as f64 / total_params as f64
         };
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "cpdt", 
             "[cpdt] weight-aware tier agreement: {:.2}% ({}/{} layers, \
                  parameter-weighted {:.2}%)",
             layer_pct, agree_layers, total_layers, param_pct,
         );
         if param_pct < 95.0 {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "codegen", 
                 "warning: weight-aware tier agreement below 95% (parameter-weighted \
                      {:.2}%). This may indicate that the calibration constants do not fit \
                      this weight distribution well. Phase 2's spectral factor + sidecar \
@@ -482,7 +482,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
         }
 
         if let Ok(val) = std::env::var("CPDT_CALIB_K") {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "codegen", 
                 "warning: CPDT_CALIB_K={val} is set but ignored. Weights are present, \
                      so the computed gradient_magnitude_est is authoritative. If CPDT_CALIB_K \
                      is vestigial in your shell, you can unset it to silence this warning."
@@ -788,9 +788,9 @@ pub(crate) fn invoke_csha_if_enabled(
             compiler.bus.wggo_overrides(),
         ) {
             if compiler.compile_options.csha.report {
-                eprintln!("{}", plan.render_report());
+                nsl_runtime::nsl_log!(INFO, "codegen", "{}", plan.render_report());
             } else {
-                eprintln!("[csha] {}", plan.summary());
+                nsl_runtime::nsl_log!(INFO, "csha", "[csha] {}", plan.summary());
             }
             // Emit override-rejection diagnostics after the summary line
             // so CLI readers see summary first, per-layer details after.
@@ -804,7 +804,7 @@ pub(crate) fn invoke_csha_if_enabled(
                     }
                     other => format!("{:?}", other),
                 };
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "csha", 
                     "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
                     diag.layer_index,
                     diag.requested,
@@ -837,7 +837,7 @@ pub(crate) fn invoke_csha_if_enabled(
                 extras.save_activations_for_backward = true;
             }
             compiler.bus.publish_csha_bridge(bridge_out);
-            for d in diags { eprintln!("warning: {d}"); }
+            for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
             // A.2.1d: record the Wengert OpIds CSHA has
             // claimed across all boundary chains so
             // downstream passes (A.2.2 RMSNorm prologue,
@@ -1942,7 +1942,7 @@ impl Compiler<'_> {
                                 );
                             }
                             Ownership::TapeHeld => {
-                                eprintln!(
+                                nsl_runtime::nsl_log!(WARN, "codegen", 
                                     "ELTLS warning: returning TapeHeld tensor — semantic error"
                                 );
                                 let _ = self.compile_call_by_name(
@@ -3962,7 +3962,7 @@ impl Compiler<'_> {
             return self.compile_for_dataloader(builder, state, pattern, iterable, body);
         }
         if matches!(iter_type, Type::Unknown) {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "nsl-codegen", 
                 "[nsl-codegen] warning: for-loop iterable has Unknown type — compiling as list iteration. \
                  If this is a DataLoader, ensure the variable type is inferred correctly."
             );
@@ -5582,7 +5582,7 @@ impl Compiler<'_> {
         if !touch.touches {
             return Ok(None);
         }
-        eprintln!(
+        nsl_runtime::nsl_log!(WARN, "weight-stream", 
             "[weight-stream] callback '{}' reads model state ({}); inserting a \
              scoped upload/re-evict bracket ({} writeback) so its reads see \
              resident \u{3b8} instead of crashing on evicted (null) data",
@@ -5786,7 +5786,7 @@ impl Compiler<'_> {
                               on_param_grad hook to its Wengert lowerings, so \
                               there is no FASE accumulate for the fused GEMM \
                               to fold into";
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "wgrad-fusion", 
                     "[wgrad-fusion] declined: train block #{} — {reason}",
                     self.wgrad_block_ordinal()
                 );
@@ -6446,7 +6446,7 @@ impl Compiler<'_> {
 
         let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
-            eprintln!("[nsl] Using source-to-source AD for backward pass");
+            nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for backward pass");
 
             // 1. Set training mode
             let true_val = builder.ins().iconst(cl_types::I8, 1);
@@ -6678,7 +6678,7 @@ impl Compiler<'_> {
                     // Partial: at least one call fused. Report the rest so a
                     // head that quietly stopped matching is still visible.
                     for d in &declines {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "fused-lm-ce", 
                             "[fused-lm-ce] a cross_entropy call fell back to the \
                              composite path: {}",
                             d.describe()
@@ -6703,7 +6703,7 @@ impl Compiler<'_> {
                 // than refuse: unlike a decline, this path has a legitimate
                 // reading (the body genuinely is not statically extractable)
                 // and refusing would break those fixtures.
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "fused-lm-ce", 
                     "[fused-lm-ce] @fused_lm_ce(enabled = true) is active, but \
                      source-AD extraction of the step body failed — the fused \
                      linear-CE kernel exists only on the source-AD path, so it \
@@ -6766,7 +6766,7 @@ impl Compiler<'_> {
                     ));
                 }
                 // Source AD extraction failed — fall back to tape
-                eprintln!("[nsl] source AD extraction failed, falling back to tape-based AD");
+                nsl_runtime::nsl_log!(WARN, "nsl", "[nsl] source AD extraction failed, falling back to tape-based AD");
 
                 // Undo training mode — tape path sets it itself
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
@@ -7078,7 +7078,7 @@ impl Compiler<'_> {
                     }
                 }
                 for h in &heads {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "lm-head-fusion", 
                         "[lm-head-fusion] inferred: vocab={} hidden={} \
                          rows={}x{}={} bias={} (no @fused_lm_ce decorator \
                          needed; --fuse-lm-head {})",
@@ -7092,7 +7092,7 @@ impl Compiler<'_> {
                     );
                 }
                 for r in &reasons {
-                    eprintln!("[lm-head-fusion] declined: {r}");
+                    nsl_runtime::nsl_log!(WARN, "lm-head-fusion", "[lm-head-fusion] declined: {r}");
                 }
                 if heads.is_empty()
                     && ctx.mode
@@ -7215,13 +7215,13 @@ impl Compiler<'_> {
                             // Additive observability line (tests key off
                             // it); the [wggo] summary itself still prints
                             // below, identically to the in-place path.
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "wggo", 
                                 "[wggo] consumed pre-solved plan \
                                      (graph fingerprint match)"
                             );
                             Some(pre.plan.clone())
                         } else {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(WARN, "wggo", 
                                 "[wggo] wggo-preplan-rejected \
                                      reason=graph_fingerprint_mismatch — replanning in place"
                             );
@@ -7295,7 +7295,7 @@ impl Compiler<'_> {
                             // FullBuffer-global / muon): nothing stale
                             // executes — downstream consumers get the
                             // fresh plan. Note it loudly anyway.
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "wggo", 
                                 "[wggo] note: the rejected pre-plan and the \
                                      in-place replan disagree on fase_fused, but no \
                                      per-param FASE mode table was emitted for this \
@@ -7306,9 +7306,9 @@ impl Compiler<'_> {
                     }
                     if let Some(plan) = plan {
                         if self.compile_options.wggo.report {
-                            eprintln!("{}", plan.render_report());
+                            nsl_runtime::nsl_log!(INFO, "codegen", "{}", plan.render_report());
                         } else {
-                            eprintln!("[wggo] {}", plan.summary());
+                            nsl_runtime::nsl_log!(INFO, "wggo", "[wggo] {}", plan.summary());
                         }
                         // Prune consumer (diagnostic stub): WGGO's DP can
                         // emit `CoarseDecision::Prune` for low-importance
@@ -7338,7 +7338,7 @@ impl Compiler<'_> {
                                 }
                                 other => std::borrow::Cow::Owned(format!("{:?}", other)),
                             };
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "prune", 
                                 "[prune] layer:{} name={} wggo-override-rejected \
                                      requested={} applied={} reason={}",
                                 diag.layer_index,
@@ -7410,7 +7410,7 @@ impl Compiler<'_> {
                                 state,
                             ) {
                                 match &diag.verdict {
-                                    PackingVerdict::Consumed { kernel } => eprintln!(
+                                    PackingVerdict::Consumed { kernel } => nsl_runtime::nsl_log!(INFO, "pca", 
                                         "[pca] layer:{} name={} wggo-override-consumed \
                                              packing_mode={} -> {}",
                                         diag.layer_index,
@@ -7438,7 +7438,7 @@ impl Compiler<'_> {
                                                 "unexpected_packing_reject_reason"
                                             }
                                         };
-                                        eprintln!(
+                                        nsl_runtime::nsl_log!(INFO, "pca", 
                                             "[pca] layer:{} name={} wggo-override-rejected \
                                                  requested={} applied={} reason={}",
                                             diag.layer_index,
@@ -7527,7 +7527,7 @@ impl Compiler<'_> {
                 state.flags.in_tape_region = false;
                 // Debug: dump primal Wengert ops
                 if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "wengert", 
                         "[wengert] primal_vars: {:?}",
                         primal_vars.keys().collect::<Vec<_>>()
                     );
@@ -7538,7 +7538,7 @@ impl Compiler<'_> {
                             .get(&op.result)
                             .cloned()
                             .unwrap_or_default();
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "wengert", 
                             "[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
                             op.result,
                             name,
@@ -7586,7 +7586,7 @@ impl Compiler<'_> {
                         // diagnostic contract.
                         for refusal in &wggo_prune_result.refusals {
                             let text = crate::wggo_prune::format_refusal(refusal);
-                            eprintln!("{text}");
+                            nsl_runtime::nsl_log!(INFO, "codegen", "{text}");
                         }
                         return Err(crate::error::CodegenError::new(
                             "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
@@ -7623,7 +7623,7 @@ impl Compiler<'_> {
                             layer_index,
                             rewrite.ops_deleted,  // per-rewrite, not aggregate
                         );
-                        eprintln!("{line}");
+                        nsl_runtime::nsl_log!(INFO, "codegen", "{line}");
                     }
                 }
                 // --- END NEW ---
@@ -7795,7 +7795,7 @@ impl Compiler<'_> {
                             // in-place plan is born at this site, after the
                             // moments were allocated. That residual gap is
                             // what this arm reports.
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "cpdt", 
                                 "[cpdt] optimizer-moment precision NOT fully \
                                  lowered: WGGO's in-place plan (and its \
                                  moment-bit decisions) arrived after the \
@@ -7886,7 +7886,7 @@ impl Compiler<'_> {
                     // from a pre-plan offer, and claimed planning happened
                     // on feature-off builds where the bridge no-ops).
                     if !cfg!(feature = "experimental-cpdt") {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "cpdt", 
                             "[cpdt] requested, but this build omits the \
                              experimental-cpdt feature — no planning ran. \
                              No CPDT decisions apply to this block."
@@ -7896,7 +7896,7 @@ impl Compiler<'_> {
                         // in-place replan produced no plan, and the consult
                         // consumed nothing (e.g. the pre-plan's moment bits
                         // arbitrated to NotLoweredNoOptIn).
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "cpdt", 
                             "[cpdt] optimizer-moment precision not active \
                              for this block (planned from the WGGO pre-plan \
                              offer; the fingerprint rejected it and the \
@@ -7912,7 +7912,7 @@ impl Compiler<'_> {
                         // < 2). The pre-#470 wording claimed CPDT
                         // "requires a WGGO plan", which stopped being true
                         // when the weights-only offer landed.
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "cpdt", 
                             "[cpdt] optimizer-moment precision not active \
                              for this block (planned weights-only; no WGGO \
                              plan): arbitration lowered nothing. Check \
@@ -7945,7 +7945,7 @@ impl Compiler<'_> {
                             } => format!("site_outside_placement_[{placement}]"),
                             other => format!("{:?}", other),
                         };
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "wrga", 
                             "[wrga] layer:{} wggo-override-rejected requested={} applied={} reason={}",
                             diag.layer_index, diag.requested, diag.applied, reason_str
                         );
@@ -8247,7 +8247,7 @@ impl Compiler<'_> {
                             };
                             let mut fell_back = true;
                             if sizes.is_empty() {
-                                eprintln!(
+                                nsl_runtime::nsl_log!(WARN, "ccr", 
                                     "[ccr] --checkpoint-stride dp: no static tensor sizes \
                                      available (symbolic shapes) — falling back to the \
                                      uniform-stride search"
@@ -8277,7 +8277,7 @@ impl Compiler<'_> {
                                         .is_none_or(|b| true_peak <= b)
                                         || !choice.fits_budget;
                                     if budget_ok {
-                                        eprintln!(
+                                        nsl_runtime::nsl_log!(INFO, "ccr", 
                                             "[ccr] --checkpoint-stride dp: kept {} of {} block \
                                              anchors {:?} (true peak {} MiB, DP projected {} MiB, \
                                              est recompute {:.2} ms/step, window G={window}{})",
@@ -8296,7 +8296,7 @@ impl Compiler<'_> {
                                         dp_kept_anchors = Some(choice.keep);
                                         fell_back = false;
                                     } else {
-                                        eprintln!(
+                                        nsl_runtime::nsl_log!(WARN, "ccr", 
                                             "[ccr] --checkpoint-stride dp: true plan peak \
                                              {} MiB contradicts the DP projection ({} MiB) \
                                              over budget — falling back to the uniform search",
@@ -8306,7 +8306,7 @@ impl Compiler<'_> {
                                     }
                                 }
                             } else {
-                                eprintln!(
+                                nsl_runtime::nsl_log!(WARN, "ccr", 
                                     "[ccr] --checkpoint-stride dp: DP declined (single block \
                                      or no plan) — falling back to the uniform-stride search"
                                 );
@@ -8322,7 +8322,7 @@ impl Compiler<'_> {
                                     crate::ccr::DEFAULT_STRIDE_CANDIDATES,
                                 ) {
                                     Some(c) => {
-                                        eprintln!(
+                                        nsl_runtime::nsl_log!(WARN, "ccr", 
                                             "[ccr] --checkpoint-stride dp fallback: uniform \
                                              stride {} (peak {} MiB)",
                                             c.stride,
@@ -8346,7 +8346,7 @@ impl Compiler<'_> {
                             // and the search silently returns stride 1. Say so,
                             // rather than printing a decision that looks real.
                             if sizes.is_empty() {
-                                eprintln!(
+                                nsl_runtime::nsl_log!(WARN, "ccr", 
                                     "[ccr] --checkpoint-stride auto: no static tensor sizes \
                                      available (symbolic shapes) — cannot project the \
                                      activation peak; using stride 1. Pass an explicit \
@@ -8379,7 +8379,7 @@ impl Compiler<'_> {
                                             format!("k={k}:{}MiB", pb / (1024 * 1024))
                                         })
                                         .collect();
-                                    eprintln!(
+                                    nsl_runtime::nsl_log!(INFO, "ccr", 
                                         "[ccr] --checkpoint-stride auto: chose stride {} \
                                          (projected activation peak {} MiB{}, window G={window}); \
                                          candidates [{}]",
@@ -8395,7 +8395,7 @@ impl Compiler<'_> {
                                     choice.stride
                                 }
                                 None => {
-                                    eprintln!(
+                                    nsl_runtime::nsl_log!(INFO, "ccr", 
                                         "[ccr] --checkpoint-stride auto: no candidate produced a \
                                          plan; using stride 1"
                                     );
@@ -8426,7 +8426,7 @@ impl Compiler<'_> {
                     if resolved_stride > 1
                         && let Some(p) = &plan
                     {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "ccr", 
                             "[ccr] periodic checkpointing: stride {resolved_stride} → \
                                  {} CCR super-segment(s) (saving every {resolved_stride}th block \
                                  boundary, recomputing each span — bit-exact)",
@@ -8443,12 +8443,12 @@ impl Compiler<'_> {
                                 dtype,
                                 &mut ccr_fresh,
                             );
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "ccr", 
                                 "[ccr] compressed saves: {} matmul-class tensors -> {dtype}",
                                 ccr_compress_map.len()
                             );
                         } else if compress_requested {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(WARN, "ccr", 
                                 "[ccr] --checkpoint-compress requested but no \
                                  compressible saves exist (policy must be selective \
                                  with matmul-class interiors); continuing without"
@@ -8503,7 +8503,7 @@ impl Compiler<'_> {
                         .as_ref()
                         .expect("inferred_owned computed whenever a plan exists");
                     if !plan.restrict_to_owned(owned) {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(WARN, "ccr", 
                             "[ccr] nothing recomputable after the owned-tensor \
                              restriction; running without checkpointing"
                         );
@@ -8543,7 +8543,7 @@ impl Compiler<'_> {
                                 .sum();
                             if credit > 0 {
                                 budget_bytes = budget_bytes.saturating_add(credit);
-                                eprintln!(
+                                nsl_runtime::nsl_log!(INFO, "ccr", 
                                     "[ccr] C-01 credit: FASE Deferred frees the gradient \
                                      buffer — activation budget grows by {} MiB",
                                     credit / (1024 * 1024)
@@ -8555,7 +8555,7 @@ impl Compiler<'_> {
                             &effective_primal,
                             &crate::ccr::CcrBudget { sizes, budget_bytes },
                         );
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "ccr", 
                             "[ccr] budget {} MiB: {} tensors flipped back to SAVE",
                             budget_bytes / (1024 * 1024),
                             flipped
@@ -8600,18 +8600,18 @@ impl Compiler<'_> {
                 // targets. Pre-CCR: recompute clones are forward ops, so this is
                 // the true backward-op composition.
                 if std::env::var("NSL_PROFILE_ADJOINT").is_ok() {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
                         "[adjoint-profile] {} generated backward ops:",
                         adjoint.ops.len()
                     );
                     for (k, c) in crate::ew_chain_fusion::histogram(&adjoint.ops) {
-                        eprintln!("[adjoint-profile]   {c:>5}  {k}");
+                        nsl_runtime::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
                     }
                     // D2b prevalence: binaries whose LEFT operand is a
                     // Constant run the baseline chain in host f64 (the
                     // recorded reconcile_device pull-down) — the v1 fuser
                     // must skip them, so count what that costs.
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
                         "[adjoint-profile] const-left binary sites: {}",
                         crate::ew_chain_fusion::const_left_binary_sites(&adjoint.ops)
                     );
@@ -8624,7 +8624,7 @@ impl Compiler<'_> {
                 self.bus.restore_csha_backward_claims(generator.take_csha_claims());
                 // T7.1: surface any CSHA fallback diagnostics.
                 for diag in generator.csha_diagnostics() {
-                    eprintln!("[nsl] {diag}");
+                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] {diag}");
                 }
 
                 // 6a. Task 4: WRGA backward-live filter — drop adjoint ops
@@ -8667,7 +8667,7 @@ impl Compiler<'_> {
                 let norm_res_folds =
                     crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &adjoint_needed);
                 if norm_res_folds > 0 {
-                    eprintln!("[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
+                    nsl_runtime::nsl_log!(INFO, "fuse", "[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
                 }
                 // MFU campaign C2: the RoPE backward fold is generation-time
                 // (rotate_half_neg emitted instead of rotate_half + Neg);
@@ -8681,7 +8681,7 @@ impl Compiler<'_> {
                     })
                     .count();
                 if rope_folds > 0 {
-                    eprintln!("[fuse] rope backward folds: {rope_folds}");
+                    nsl_runtime::nsl_log!(INFO, "fuse", "[fuse] rope backward folds: {rope_folds}");
                 }
                 // MFU campaign C3: generic elementwise-chain fusion + the
                 // standalone scalar-immediate sweep. Chain fuser first so
@@ -8699,7 +8699,7 @@ impl Compiler<'_> {
                         &adjoint.var_types,
                     );
                     if ew_stats.chains > 0 {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "fuse", 
                             "[fuse] elementwise backward chains: {} ({} device ops elided, \
                              {} reduces absorbed, {} imms baked)",
                             ew_stats.chains,
@@ -8714,21 +8714,21 @@ impl Compiler<'_> {
                         &adjoint.var_types,
                     );
                     if scalar_imms > 0 {
-                        eprintln!("[fuse] scalar immediates: {scalar_imms}");
+                        nsl_runtime::nsl_log!(INFO, "fuse", "[fuse] scalar immediates: {scalar_imms}");
                     }
                     if (ew_stats.chains > 0 || scalar_imms > 0)
                         && std::env::var("NSL_PROFILE_ADJOINT").is_ok()
                     {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
                             "[adjoint-profile] post-fusion: {} backward ops:",
                             adjoint.ops.len()
                         );
                         for (k, c) in crate::ew_chain_fusion::histogram(&adjoint.ops) {
-                            eprintln!("[adjoint-profile]   {c:>5}  {k}");
+                            nsl_runtime::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
                         }
                     }
                 } else {
-                    eprintln!("[fuse] elementwise backward fusion skipped (--layerwise-accum)");
+                    nsl_runtime::nsl_log!(WARN, "fuse", "[fuse] elementwise backward fusion skipped (--layerwise-accum)");
                 }
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
@@ -8745,7 +8745,7 @@ impl Compiler<'_> {
                         .map(|(n, v)| (n.clone(), *v))
                         .collect();
                     let plan = crate::layerwise::analyze(&adjoint, &params, &|_| None);
-                    eprintln!("[csla]\n{}", plan.render_report("  "));
+                    nsl_runtime::nsl_log!(INFO, "csla", "[csla]\n{}", plan.render_report("  "));
                 }
 
                 // 6c. CCR P1.a: splice recompute clones + FreeTensor markers
@@ -8878,9 +8878,9 @@ impl Compiler<'_> {
                         wgrad_chains.as_ref(),
                     );
                     if std::env::var("NSL_CCR_DEBUG").is_ok() {
-                        eprintln!("[ccr] adjoint last-use frees inserted: {n}");
+                        nsl_runtime::nsl_log!(INFO, "ccr", "[ccr] adjoint last-use frees inserted: {n}");
                         if let Some(ref chains) = wgrad_chains {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "ccr", 
                                 "[ccr] wgrad chains kept contiguous: {}",
                                 chains.by_reduce_result.len()
                             );
@@ -8896,7 +8896,7 @@ impl Compiler<'_> {
                     if let Some(ref before) = wgrad_chains {
                         let after = crate::wgrad_fusion::plan(&adjoint, &ccr_protect);
                         if after.by_reduce_result.len() < before.by_reduce_result.len() {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(WARN, "codegen", 
                                 "warning: [ccr] last-use freeing broke {} weight-gradient \
                                  fusion chain(s) ({} admissible before, {} after) — \
                                  --fuse-wgrad-accum will silently fuse fewer chains on \
@@ -9086,7 +9086,7 @@ impl Compiler<'_> {
                             ) && op.inputs.len() == 1
                                 && input_leaves.contains(&op.inputs[0]);
                             if arena_debug {
-                                eprintln!(
+                                nsl_runtime::nsl_log!(INFO, "arena-debug", 
                                     "[arena-debug] dict_get:{field} v{} inputs={:?} \
                                      leaf={} -> seed {}",
                                     op.result,
@@ -9104,7 +9104,7 @@ impl Compiler<'_> {
                             }
                         }
                     } else if arena_debug {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "arena-debug", 
                             "[arena-debug] loader scan unproven: {:?}",
                             self.lm_head_loader_scan.reason()
                         );
@@ -9158,7 +9158,7 @@ impl Compiler<'_> {
                     // Provenance split. "Sized nothing" reads completely
                     // differently when the seeds are empty vs when the
                     // propagation stopped early — and the fixes differ too.
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "arena", 
                         "[arena] element counts: {} dim seed(s) + {} numel \
                          hint(s) -> {} shape-propagated -> {} sized, of {} \
                          tape value(s)",
@@ -9195,7 +9195,7 @@ impl Compiler<'_> {
                         .map_err(CodegenError::new)?
                         .finish(&self.bus)
                         .map_err(CodegenError::new)?;
-                    eprintln!("[arena]\n{}", arena.render_report("  "));
+                    nsl_runtime::nsl_log!(INFO, "arena", "[arena]\n{}", arena.render_report("  "));
 
                     // ── Stage-2B: placement ──────────────────────────
                     //
@@ -9238,7 +9238,7 @@ impl Compiler<'_> {
                                     "runtime path varies (broadcast/view operand)",
                             }).or_default() += 1;
                         }
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "arena", 
                             "[arena] placement: {} of {} transient(s) admitted, \
                              {:.2} MiB payload in {} slot(s)",
                             placements.len(),
@@ -9247,7 +9247,7 @@ impl Compiler<'_> {
                             placements.len(),
                         );
                         for (reason, n) in &by_reason {
-                            eprintln!("[arena]   refused {n:>5} — {reason}");
+                            nsl_runtime::nsl_log!(WARN, "arena", "[arena]   refused {n:>5} — {reason}");
                         }
                         // Which op kinds cost the coverage. Unsized = a
                         // propagation rule is missing or a seed never
@@ -9291,7 +9291,7 @@ impl Compiler<'_> {
                             let mut rows: Vec<_> = by_kind.into_iter().collect();
                             rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
                             for (kind, n) in rows {
-                                eprintln!("[arena-debug]   {n:>5} x {kind}");
+                                nsl_runtime::nsl_log!(INFO, "arena-debug", "[arena-debug]   {n:>5} x {kind}");
                             }
                             // The forward stall is invisible above (admit
                             // refuses forward transients NotBackward before
@@ -9330,7 +9330,7 @@ impl Compiler<'_> {
                             let mut rows: Vec<_> = fwd_unsized.into_iter().collect();
                             rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
                             for (kind, n) in rows {
-                                eprintln!("[arena-debug]   fwd unsized {n:>5} x {kind}");
+                                nsl_runtime::nsl_log!(INFO, "arena-debug", "[arena-debug]   fwd unsized {n:>5} x {kind}");
                             }
                             // The FIRST stalls in tape order — everything
                             // after the first is usually just downstream
@@ -9377,7 +9377,7 @@ impl Compiler<'_> {
                                     }
                                     other => format!("{other:?}"),
                                 };
-                                eprintln!(
+                                nsl_runtime::nsl_log!(INFO, "arena-debug", 
                                     "[arena-debug]   stall #{i} v{} {} <- [{}]",
                                     o.result,
                                     kind.chars().take(60).collect::<String>(),
@@ -9413,7 +9413,7 @@ impl Compiler<'_> {
                                     }
                                     other => format!("{other:?}"),
                                 };
-                                eprintln!(
+                                nsl_runtime::nsl_log!(INFO, "arena-debug", 
                                     "[arena-debug]   numel #{i} v{} {} <- [{}]",
                                     o.result,
                                     kind.chars().take(60).collect::<String>(),
@@ -9467,7 +9467,7 @@ impl Compiler<'_> {
                                             .join(", ")
                                     })
                                     .unwrap_or_default();
-                                eprintln!(
+                                nsl_runtime::nsl_log!(INFO, "arena-debug", 
                                     "[arena-debug] slot {} v{} {} B {} <- {}",
                                     p.slot_index, p.var, p.bytes, kind, inputs_desc
                                 );
@@ -9676,7 +9676,7 @@ impl Compiler<'_> {
                         // anchor for the LAYER-MAJOR shape itself (the runtime
                         // window counter can't distinguish a degenerate
                         // all-epilogue schedule from the real k-range one).
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "csla", 
                             "[csla] layer-major schedule: {} ranges, {} layer-grouped params, \
                              {} epilogue params",
                             n_ranges,
@@ -9715,7 +9715,7 @@ impl Compiler<'_> {
                                     .map(|cp| cp.accum_idx)
                                     .collect();
                             if !unstreamable_idxs.is_empty() {
-                                eprintln!(
+                                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                                     "[weight-stream] {} param(s) stay resident: a buffered \
                                      view of their storage rides the window slots",
                                     unstreamable_idxs.len()
@@ -9812,7 +9812,7 @@ impl Compiler<'_> {
                                     .collect::<Vec<_>>()
                                     .join(",")
                             };
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "weight-stream", 
                                 "[weight-stream] forward streaming: {} slices, \
                                  {} streamed params ({} touched by the primal); \
                                  uploads/slice [{}] evicts/slice [{}]",
@@ -9849,7 +9849,7 @@ impl Compiler<'_> {
                                 }
                             }
                             if self.compile_options.weight_stream.arena {
-                                eprintln!(
+                                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                                     "[weight-stream] arena mode: {} contiguous layer packs \
                                      (sizes [{}])",
                                     arena_packs.len(),
@@ -10331,7 +10331,7 @@ impl Compiler<'_> {
                             }
                         }
                     }
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "ccr", 
                         "[ccr] per-segment early-free: {} interior value(s) freed \
                          across {} segment(s) during the forward",
                         freed_count, segments_freed,
@@ -10687,7 +10687,7 @@ impl Compiler<'_> {
                     let fase_out = match fase_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(ERROR, "nsl", 
                                 "[nsl] source AD lowering (FASE hook) failed ({}), \
                                  rerun without --source-ad",
                                 e
@@ -10713,7 +10713,7 @@ impl Compiler<'_> {
                     match full_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(WARN, "nsl", 
                                 "[nsl] source AD lowering failed ({}), \
                                  cannot fall back to tape AD after forward emit; \
                                  rerun without --source-ad",
@@ -10783,9 +10783,9 @@ impl Compiler<'_> {
                         }
                         let mut counts: Vec<_> = counts.into_iter().collect();
                         counts.sort_by_key(|a| std::cmp::Reverse(a.1));
-                        eprintln!("[nsl] source-ad owned {} ops:", label);
+                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source-ad owned {} ops:", label);
                         for (name, count) in counts {
-                            eprintln!("  {} -> {}", name, count);
+                            nsl_runtime::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
                         }
                     };
 
@@ -10814,9 +10814,9 @@ impl Compiler<'_> {
                     }
                     let mut final_grad_counts: Vec<_> = final_grad_counts.into_iter().collect();
                     final_grad_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
-                    eprintln!("[nsl] source-ad final grad ops:");
+                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source-ad final grad ops:");
                     for (name, count) in final_grad_counts {
-                        eprintln!("  {} -> {}", name, count);
+                        nsl_runtime::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
                     }
                 }
 
@@ -10917,12 +10917,12 @@ impl Compiler<'_> {
                         }
                     }
                     let Some(param_ptr) = full_vars.get(vid).copied() else {
-                        eprintln!("[nsl] source AD: param '{}' has no primal value (VarId {:?} not in full_vars)", param_name, vid);
+                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' has no primal value (VarId {:?} not in full_vars)", param_name, vid);
                         grad_skipped_no_primal += 1;
                         continue;
                     };
                     let Some(adj_vid) = generator.adjoint_of(*vid) else {
-                        eprintln!("[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
+                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
                         grad_skipped_no_adjoint += 1;
                         continue;
                     };
@@ -10931,7 +10931,7 @@ impl Compiler<'_> {
                         .get(&adj_vid)
                         .copied()
                     else {
-                        eprintln!("[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
+                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
                         grad_skipped_no_lowered += 1;
                         continue;
                     };
@@ -11028,7 +11028,7 @@ impl Compiler<'_> {
                 let grad_missing_trainable = trainable_tensor_param_paths
                     .len()
                     .saturating_sub(seen_trainable_tensor_params.len());
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "nsl", 
                     "[nsl] source AD gradient summary: {}/{} trainable tensor params connected, {} missing-from-forward, {} no-primal, {} no-adjoint, {} cascade-skip, {} ignored config-tensor, {} ignored non-tensor",
                     grad_connected,
                     trainable_tensor_param_paths.len(),
@@ -11281,7 +11281,7 @@ impl Compiler<'_> {
                     )?;
                 }
             } else {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "health", 
                     "[health] note: per-parameter gradient norms are not \
                      recorded under the FASE-Deferred hook (per-batch grads \
                      are consumed into m_partial during the backward) — the \
@@ -13262,7 +13262,7 @@ impl Compiler<'_> {
         grad: &nsl_ast::block::GradBlock,
         targets_val: Value,
     ) -> Result<Option<(Value, Value)>, CodegenError> {
-        eprintln!("[nsl] Using source-to-source AD for grad block");
+        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for grad block");
 
         // Cycle-10 §5.3 Task 6 wire-up (grad block): route per-fn
         // @checkpoint(policy=...) policies into the extractor. Empty map
@@ -13296,7 +13296,7 @@ impl Compiler<'_> {
                     "source-AD extraction refused: {msg}"
                 )));
             }
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "nsl", 
                 "[nsl] source AD extraction failed in grad block, falling back to tape-based AD"
             );
             return Ok(None);
@@ -13316,7 +13316,7 @@ impl Compiler<'_> {
 
         let Some(loss_var_id) = self.resolve_source_ad_expr_var_id(&extractor, loss_expr, true)
         else {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "nsl", 
                 "[nsl] source AD could not resolve grad block loss, falling back to tape-based AD"
             );
             return Ok(None);
@@ -13328,14 +13328,14 @@ impl Compiler<'_> {
                 self.resolve_source_ad_expr_var_id(&extractor, &grad.targets, false)
             }
             _ => {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "nsl", 
                     "[nsl] source AD does not yet resolve this grad target shape, falling back to tape-based AD"
                 );
                 return Ok(None);
             }
         };
         let Some(target_var_id) = target_var_id else {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "nsl", 
                 "[nsl] source AD could not resolve grad target, falling back to tape-based AD"
             );
             return Ok(None);
@@ -13445,7 +13445,7 @@ impl Compiler<'_> {
                 let grad_lowered = match grad_block_lowered {
                     Ok(gv) => gv,
                     Err(e) => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(ERROR, "nsl", 
                             "[nsl] source AD lowering failed ({}) in grad block; rerun without --source-ad",
                             e
                         );
@@ -13969,7 +13969,7 @@ impl Compiler<'_> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[calibration] AWQ discovery for model '{model_name}': {e}");
+                    nsl_runtime::nsl_log!(INFO, "calibration", "[calibration] AWQ discovery for model '{model_name}': {e}");
                 }
             }
         }
@@ -14126,7 +14126,7 @@ impl Compiler<'_> {
             let ast = match crate::inspect::predicate::parse_predicate(&cond_src) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(ERROR, "codegen", 
                         "[@inspect] predicate parse failed for {:?}: {}",
                         cond_src, e
                     );

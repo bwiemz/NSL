@@ -1419,7 +1419,7 @@ impl Compiler<'_> {
         if let Some(path) = self.compile_options.cfie.report_path.clone()
             && let Err(e) = std::fs::write(&path, &report)
         {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "codegen", 
                 "warning: --cfie-report: failed to write {}: {e}",
                 path.display()
             );

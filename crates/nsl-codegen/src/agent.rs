@@ -592,7 +592,7 @@ impl Compiler<'_> {
                     // The lowercase binding never appears in the function body — this
                     // agent slot is still allocated but nothing dispatches through it.
                     // Log so it's diagnosable without a hard error (the slot doesn't hurt).
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "nsl-codegen", 
                         "[nsl-codegen] @pipeline_agent fn '{fn_name}': agent '{agent_name}' \
                          binding '{lowercase}' not found in parsed source; \
                          agent method calls on this receiver will not dispatch."

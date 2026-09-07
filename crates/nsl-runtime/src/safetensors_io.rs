@@ -135,7 +135,7 @@ pub(crate) fn allocate_f32_tensor(
         }
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!("[nsl] safetensors_load: device>0 requires CUDA feature");
+            crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_load: device>0 requires CUDA feature");
             std::process::abort();
         }
     };
@@ -165,7 +165,7 @@ pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         std::str::from_utf8(slice).unwrap_or_else(|_| {
-            eprintln!("[nsl] safetensors_load: path is not valid UTF-8");
+            crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_load: path is not valid UTF-8");
             std::process::abort();
         })
     };
@@ -173,7 +173,7 @@ pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[nsl] safetensors_load: cannot read '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_load: cannot read '{}': {}", path, e);
             std::process::abort();
         }
     };
@@ -181,7 +181,7 @@ pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64
     let tensors = match safetensors::SafeTensors::deserialize(&bytes) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[nsl] safetensors_load: parse error in '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_load: parse error in '{}': {}", path, e);
             std::process::abort();
         }
     };
@@ -205,7 +205,7 @@ pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64
         let f32_data = match convert_to_f32(view.dtype(), view.data()) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!(
+                crate::nsl_log!(ERROR, "nsl", 
                     "[nsl] safetensors_load: tensor '{}' in '{}': {}",
                     name, path, e
                 );
@@ -239,7 +239,7 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         std::str::from_utf8(slice).unwrap_or_else(|_| {
-            eprintln!("[nsl] safetensors_save: path is not valid UTF-8");
+            crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_save: path is not valid UTF-8");
             std::process::abort();
         })
     };
@@ -289,7 +289,7 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
                     .collect()
             }
             other => {
-                eprintln!("[nsl] safetensors_save: unknown dtype {other}");
+                crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_save: unknown dtype {other}");
                 std::process::abort();
             }
         };
@@ -309,7 +309,7 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
                 bytes.as_slice(),
             )
             .unwrap_or_else(|e| {
-                eprintln!("[nsl] safetensors_save: TensorView error for '{}': {}", name, e);
+                crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_save: TensorView error for '{}': {}", name, e);
                 std::process::abort();
             });
             (name.clone(), view)
@@ -320,13 +320,13 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
     let serialized = match safetensors::tensor::serialize(data, None) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[nsl] safetensors_save: serialize error: {}", e);
+            crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_save: serialize error: {}", e);
             std::process::abort();
         }
     };
 
     if let Err(e) = std::fs::write(path, &serialized) {
-        eprintln!("[nsl] safetensors_save: write error for '{}': {}", path, e);
+        crate::nsl_log!(ERROR, "nsl", "[nsl] safetensors_save: write error for '{}': {}", path, e);
         std::process::abort();
     }
 }

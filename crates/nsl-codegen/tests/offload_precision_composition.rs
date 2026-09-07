@@ -229,7 +229,7 @@ fn offload_composes_with_cpdt_precision_plan() {
     let opts = CompileOptions {
         source_ad: true,
         optim_state_offload: true,
-        weight_file: Some(weights.clone()),
+        weights: nsl_codegen::WeightsOptions { file: Some(weights.clone()), ..Default::default() },
         wggo: nsl_codegen::WggoOptions {
             // CPDT only runs when WGGO produced an AppliedPlan.
             mode: Some("full".to_string()),

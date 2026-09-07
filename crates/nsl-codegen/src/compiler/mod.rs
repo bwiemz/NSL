@@ -616,8 +616,8 @@ impl FeatureConfigs {
             decode_workers: 1,
             pipeline_config: None,
             parallelism_config: None,
-            zero_stage: options.zero_stage,
-            zero_elementwise: options.zero_elementwise,
+            zero_stage: options.zero.stage,
+            zero_elementwise: options.zero.elementwise,
             param_dtype_bf16sr: options.param_dtype_bf16sr,
             muon_state_bf16: options.muon.state_bf16,
             moe_configs: HashMap::new(),
@@ -1222,13 +1222,13 @@ impl<'a> Compiler<'a> {
         let call_conv = {
             let detected = isa.default_call_conv();
             if std::env::var("NSL_DEBUG").is_ok() {
-                eprintln!("[nsl] Cranelift ISA call convention: {:?}", detected);
+                nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Cranelift ISA call convention: {:?}", detected);
             }
             // Force WindowsFastcall on Windows x64 — Cranelift may misdetect
             #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
             {
                 if detected != cranelift_codegen::isa::CallConv::WindowsFastcall {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(WARN, "nsl", 
                         "[nsl] WARNING: Cranelift detected {:?} on Windows x64, \
                          forcing WindowsFastcall for ABI correctness",
                         detected
@@ -1329,7 +1329,7 @@ impl<'a> Compiler<'a> {
             retention_offsets: std::collections::HashMap::new(),
             retention_splices_emitted: 0,
             grad_arena_layout: None,
-            weight_index_map: options.weight_index_map.clone(),
+            weight_index_map: options.weights.index_map.clone(),
         })
     }
 
@@ -1348,7 +1348,7 @@ impl<'a> Compiler<'a> {
             return;
         }
         if self.dump_ir {
-            eprintln!("--- IR: {label} ---\n{}", func.display());
+            nsl_runtime::nsl_log!(INFO, "codegen", "--- IR: {label} ---\n{}", func.display());
         }
         if let Some(slot) = &self.ir_capture {
             slot.borrow_mut().push(crate::ir_capture::IrDump::capture(
@@ -1752,7 +1752,7 @@ impl<'a> Compiler<'a> {
         {
             match crate::gpu_specs::find_cpu(cpu_name) {
                 Some(cpu) => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "nsl", 
                         "[nsl] WCET CPU target: {} @ {} MHz, {:.0} GFLOPS/core (fp32), {} cores",
                         cpu.name,
                         cpu.base_clock_mhz,
@@ -1761,7 +1761,7 @@ impl<'a> Compiler<'a> {
                     );
                 }
                 None => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(WARN, "nsl", 
                         "[nsl] warning: unknown --cpu '{}'. Known models: cortex-a78, x86-64-v4. \
                              CPU WCET will use GPU/FPGA estimates only.",
                         cpu_name
@@ -1775,7 +1775,7 @@ impl<'a> Compiler<'a> {
             let ops = match &target {
                 WcetTarget::Gpu { device_name } => {
                     let gpu = find_gpu(device_name).unwrap();
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "codegen", 
                         "note: GPU WCET is a statistical p95 estimate (not a certified proof). \
                          For safety-critical applications, use --wcet-target fpga."
                     );
@@ -1824,7 +1824,7 @@ impl<'a> Compiler<'a> {
                     ops,
                     suggestions,
                 };
-                eprintln!("{}", format_wcet_violation(&violation));
+                nsl_runtime::nsl_log!(INFO, "codegen", "{}", format_wcet_violation(&violation));
                 return Err(CodegenError::new(format!(
                     "WCET bound exceeded for '{}': {:.3} ms > {:.3} ms",
                     fn_name, final_ms, constraint.max_latency_ms
@@ -1838,7 +1838,7 @@ impl<'a> Compiler<'a> {
                 emit_certificate(&cert, cert_path).map_err(|e| {
                     CodegenError::new(format!("WCET certificate write failed: {}", e))
                 })?;
-                eprintln!("WCET certificate: {}", cert_path.display());
+                nsl_runtime::nsl_log!(INFO, "codegen", "WCET certificate: {}", cert_path.display());
             }
 
             // Emit DO-178C report if requested (guarded: FPGA only)
@@ -2134,7 +2134,7 @@ impl<'a> Compiler<'a> {
             let reason = "this program has no train block, so the FASE-Deferred \
                           on_param_grad hook — the fusion's only lowering path — \
                           is never built";
-            eprintln!("[wgrad-fusion] declined: {reason}");
+            nsl_runtime::nsl_log!(WARN, "wgrad-fusion", "[wgrad-fusion] declined: {reason}");
             reasons.push(reason);
             remedies.push(
                 "Add a train block with grad_accumulation >= 2, or drop \
@@ -2149,7 +2149,7 @@ impl<'a> Compiler<'a> {
             // `models/coder50m/pretrain*.nsl`, which declare no
             // `grad_accumulation` — so erroring here would turn the flagship
             // configuration into a build failure.
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "codegen", 
                 "note: --pretrain-optimized bundle partially disabled: \
                  --fuse-wgrad-accum fused nothing in this compile ({reason}); \
                  the rest of the bundle still applies"

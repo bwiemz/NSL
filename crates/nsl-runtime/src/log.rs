@@ -33,14 +33,21 @@
 //! detected), `INFO` for the informational markers (counters, traces,
 //! `disabled by …`). The level does not change what is printed.
 //!
-//! Migration status: the bracketed-marker family in `nsl-runtime` (the
-//! `[zero3]`, `[cuda-graph]`, `[weight-stream]`, `[arena]`, `[sr-bf16]`,
-//! `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`, `[nsl-tcp]`,
-//! `[nsl-trace]`, `[tape-trace]`, `[scope]` lines) and the `nsl: …`
-//! family (target `"nsl"`: `ERROR` where the line precedes an abort or
-//! exit, `WARN` where the entry point returns instead) go through
-//! `nsl_log!`; the rest of the crate's prints are the next slice, then
-//! nsl-codegen.
+//! Migration status: every diagnostic `eprintln!` in `nsl-runtime` goes
+//! through `nsl_log!` — the bracketed-marker family (`[zero3]`,
+//! `[cuda-graph]`, `[weight-stream]`, `[arena]`, …), the `nsl: …` and
+//! `[nsl] …` families (target `"nsl"`), and the per-subsystem lines
+//! (`"cfie"` for the `CFIE: …` refusals, `"flash-attention"` /
+//! `"flash-bwd"`, `"fused-linear-ce"`, `"cuda"`, `"tensor"`, `"huggingface"`,
+//! …; a line that starts with its own `[marker]` uses the marker as its
+//! target). Program output stays on `println!` — the `print` builtin
+//! (`print.rs`), the tensor printer, the health JSON — since that is
+//! stdout, not a diagnostic. nsl-codegen's compile-time diagnostics use
+//! the same macro (`nsl_runtime::nsl_log!`; target `"codegen"` for the
+//! `warning:` / `error:` / `note:` lines, the subsystem otherwise —
+//! `"autotune"`, `"ccr"`, `"source-ad"`, `"wggo"`, …), leaving only its
+//! multi-line `eprint!` report dumps and the dev-tool binaries under
+//! `src/bin/` on raw prints. Next: nsl-cli.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -59,9 +66,15 @@ use tracing::{span, Event, Metadata, Subscriber};
 macro_rules! nsl_log {
     ($level:ident, $target:literal, $($arg:tt)+) => {{
         $crate::log::ensure_installed();
-        ::tracing::event!(target: $target, ::tracing::Level::$level, $($arg)+);
+        $crate::log::tracing::event!(target: $target, $crate::log::tracing::Level::$level, $($arg)+);
     }};
 }
+
+/// Re-exported for [`nsl_log!`](crate::nsl_log): a crate that invokes the
+/// macro (nsl-codegen, nsl-cli) reaches `tracing` through this path
+/// instead of needing its own dependency on it.
+#[doc(hidden)]
+pub use tracing;
 
 /// The runtime's subscriber: the event's `message` field, verbatim, to
 /// stderr (and to the `NSL_EVENTS` stream when it is on). Spans are

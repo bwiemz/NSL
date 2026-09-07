@@ -86,7 +86,7 @@ impl Compiler<'_> {
         // (see compile_train_block_pipelined).
         if self.compile_options.optim_state_offload {
             if cpdt_precision_dtypes.is_some() {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "offload", 
                     "[offload] optimizer state (m/v) is HOST-resident at the \
                      planned reduced-precision dtypes (offload x \
                      --wggo-moment-precision/CPDT composition): each optimizer \
@@ -95,7 +95,7 @@ impl Compiler<'_> {
                      offload). VRAM saved: {num_state_buffers}x parameter bytes."
                 );
             } else {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "offload", 
                     "[offload] optimizer state (m/v) is HOST-resident: each optimizer \
                      step stages state to the device and copies it back (2 PCIe \
                      round-trips of total state per step). VRAM saved: \
@@ -103,7 +103,7 @@ impl Compiler<'_> {
                 );
             }
             if optimizer_name == "muon" {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "muon", 
                     "[muon] note: v is fully allocated (host-resident) under \
                      --optim-state-offload — the offload stage-in envelope \
                      touches both moments unconditionally, so the \

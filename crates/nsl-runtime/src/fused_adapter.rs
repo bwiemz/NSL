@@ -61,7 +61,7 @@ static WARNED_UNMATERIALIZED_ADAPTER: AtomicBool = AtomicBool::new(false);
 /// docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
 fn warn_unmaterialized_adapter_once() {
     if !WARNED_UNMATERIALIZED_ADAPTER.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] @adapter field accessed before materialization (adapter \
              tensors are null) - running base `x @ W` forward WITHOUT the adapter. \
              Adapters materialize only inside a `train` block; there is no \
@@ -111,7 +111,7 @@ pub extern "C" fn nsl_fused_adapter_launch_count_atexit() {
         &[("count", crate::events::u(n))],
     );
     if std::env::var("NSL_KERNEL_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
-        eprintln!("[nsl-kernel-count] {n}");
+        crate::nsl_log!(INFO, "nsl-kernel-count", "[nsl-kernel-count] {n}");
     }
 }
 
@@ -127,7 +127,7 @@ pub extern "C" fn nsl_fused_adapter_gpu_launch_count_atexit() {
         &[("count", crate::events::u(n))],
     );
     if std::env::var("NSL_WRGA_GPU_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
-        eprintln!("[nsl-gpu-launch-count] {n}");
+        crate::nsl_log!(INFO, "nsl-gpu-launch-count", "[nsl-gpu-launch-count] {n}");
     }
 }
 
@@ -267,14 +267,14 @@ fn try_cuda_launch_fused_lora(
     let at = NslTensor::from_ptr_ref(lora_a);
     let bt = NslTensor::from_ptr_ref(lora_b);
     if xt.device == 0 || wt.device == 0 || at.device == 0 || bt.device == 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but inputs not on GPU — \
              falling back to CPU math"
         );
         return None;
     }
     if !all_f32(&[xt, wt, at, bt]) {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but fused LoRA inputs are not \
              f32-only storage (dtypes {}/{}/{}/{}) — falling back to CPU math",
             xt.dtype, wt.dtype, at.dtype, bt.dtype
@@ -348,7 +348,7 @@ fn try_cuda_launch_fused_lora(
         0,
     );
     if res as u32 != 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] fused LoRA PTX launch failed ({:?}) — falling back to CPU math",
             res
         );
@@ -366,7 +366,7 @@ fn try_cuda_launch_fused_lora(
         cudarc::driver::sys::CUresult::CUDA_SUCCESS
     };
     if sync_result as u32 != 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] fused LoRA kernel caused GPU error ({:?}) — falling back to CPU math",
             sync_result
         );
@@ -413,7 +413,7 @@ fn try_cuda_launch_fused_ia3(
     let wt = NslTensor::from_ptr_ref(w);
     let gt = NslTensor::from_ptr_ref(ia3_scale);
     if xt.device == 0 || wt.device == 0 || gt.device == 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but inputs not on GPU — \
              falling back to CPU math"
         );
@@ -423,7 +423,7 @@ fn try_cuda_launch_fused_ia3(
     // reads every operand with `ld.global.f32` and the output is sized at
     // 4 bytes per element.
     if !all_f32(&[xt, wt, gt]) {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but fused IA3 inputs are not \
              f32-only storage (dtypes {}/{}/{}) — falling back to CPU math",
             xt.dtype, wt.dtype, gt.dtype
@@ -471,7 +471,7 @@ fn try_cuda_launch_fused_ia3(
         0,
     );
     if res as u32 != 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] fused IA3 PTX launch failed ({:?}) — falling back to CPU math",
             res
         );
@@ -703,7 +703,7 @@ fn try_cuda_launch_fused_gatedlora(
     let bt = NslTensor::from_ptr_ref(lora_b);
     let gat = NslTensor::from_ptr_ref(gate);
     if xt.device == 0 || wt.device == 0 || at.device == 0 || bt.device == 0 || gat.device == 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but GatedLoRA inputs not on GPU - \
              falling back to CPU math"
         );
@@ -712,7 +712,7 @@ fn try_cuda_launch_fused_gatedlora(
     // f32 storage, same reason as `try_cuda_launch_fused_lora`; the gate is
     // read by two more `ld.global.f32` (`wrga_kernel_helpers.rs:796-799`).
     if !all_f32(&[xt, wt, at, bt, gat]) {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but GatedLoRA inputs are not \
              f32-only storage (dtypes {}/{}/{}/{}/{}) - falling back to CPU math",
             xt.dtype, wt.dtype, at.dtype, bt.dtype, gat.dtype
@@ -785,7 +785,7 @@ fn try_cuda_launch_fused_gatedlora(
         0,
     );
     if res as u32 != 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] fused GatedLoRA PTX launch failed ({:?}) - falling back to CPU math",
             res
         );
@@ -802,7 +802,7 @@ fn try_cuda_launch_fused_gatedlora(
         cudarc::driver::sys::CUresult::CUDA_SUCCESS
     };
     if sync_result as u32 != 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-wrga", 
             "[nsl-wrga] fused GatedLoRA kernel caused GPU error ({:?}) - falling back to CPU math",
             sync_result
         );

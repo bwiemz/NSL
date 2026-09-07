@@ -1314,7 +1314,7 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
     }
     WGRAD_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if std::env::var("NSL_WGRAD_DEBUG").ok().as_deref() == Some("1") {
-        eprintln!(
+        crate::nsl_log!(WARN, "wgrad-accum", 
             "[wgrad-accum] fallback: m{ms:?} dev={} dt={} contig={} | \
              x{xs:?} dev={} dt={} contig={} | g{gs:?} dev={} dt={} contig={}",
             m.device,
@@ -1424,7 +1424,7 @@ pub extern "C" fn nsl_sparse_matmul(
         }
     }
     // CPU fallback: use dense matmul
-    eprintln!("[nsl] sparse_matmul: CPU fallback (sparse kernels are GPU-only)");
+    crate::nsl_log!(WARN, "nsl", "[nsl] sparse_matmul: CPU fallback (sparse kernels are GPU-only)");
     nsl_tensor_matmul(values_ptr, b_ptr, 0) // approximate fallback
 }
 

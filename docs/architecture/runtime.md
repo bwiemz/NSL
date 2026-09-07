@@ -524,7 +524,12 @@ first failure prints one `[nsl] warning:` line and disables the sink. Call
 sites use `events::emit(kind, step, &[(name, value)])` and build the JSON
 and the stderr line from one counter snapshot so the two cannot disagree.
 The registry of kinds and fields is `EVENT_SCHEMAS` in
-`crates/nsl-cli/src/exec_markers.rs`, next to the marker registry.
+`crates/nsl-cli/src/exec_markers.rs`, next to the marker registry. The
+writer is the compiled program, one process per rank: the `nsl` CLI passes
+`NSL_EVENTS` through to the program it spawns and opts its own process out
+(`events::opt_out_this_process`, first thing in `main`), so its
+compile-time `nsl_log!` lines never land in the program's file with a
+second `seq` sequence.
 
 **Logging** (`src/log.rs`, roadmap C3). Diagnostic lines go through
 `nsl_log!(LEVEL, "target", "…")`, a `tracing` event whose target names the
@@ -536,13 +541,17 @@ lines the CLI gates compare byte for byte are unchanged from the
 appended to the stream as a `log` event (`level`, `target`, `message`), the
 one kind whose `message` is its own marker (`LINE_IS_THE_MARKER` in
 `exec_markers.rs`). A host that installed a global `tracing` subscriber
-first keeps it and receives the runtime's lines as events. Migrated so far:
-the bracketed-marker family (`[zero3]`, `[cuda-graph]`, `[weight-stream]`,
-`[arena]`, `[sr-bf16]`, `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`,
-`[nsl-tcp]`, `[nsl-trace]`, `[tape-trace]`, `[scope]`) and the `nsl: …`
-family (target `nsl`; `ERROR` where the line precedes an abort or exit,
-`WARN` where the entry point returns instead); the remaining prints are
-the next slice, then nsl-codegen. The stderr path allocates nothing — the
+first keeps it and receives the runtime's lines as events. Every
+diagnostic `eprintln!` in the crate is migrated: the bracketed-marker
+family (`[zero3]`, `[cuda-graph]`, `[weight-stream]`, `[arena]`, …), the
+`nsl: …` and `[nsl] …` families (target `nsl`; `ERROR` where the line
+precedes an abort or exit, `WARN` where the entry point returns instead),
+and the per-subsystem lines (`cfie`, `flash-attention` / `flash-bwd`,
+`fused-linear-ce`, `cuda`, `tensor`, `huggingface`, …; a line that starts
+with its own `[marker]` uses the marker as its target). Program output —
+the `print` builtin, the tensor printer, the health JSON — stays on
+`println!` because it is stdout, not a diagnostic. nsl-codegen is next.
+The stderr path allocates nothing — the
 message is formatted straight into the locked handle — so the
 `nsl: out of memory` line in `memory.rs` still prints. A
 new line in a migrated family uses the macro; a new family picks a target

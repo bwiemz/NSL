@@ -1095,7 +1095,7 @@ impl Compiler<'_> {
                         }
                     })
                     .collect();
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] prefetch double-buffer: {} \
                      (streamed_ranges={streamed_range_count}, gpu={}, accum_window={}, \
                      edges [{}])",
@@ -1110,7 +1110,7 @@ impl Compiler<'_> {
                 );
             }
             if self.compile_options.weight_stream.async_writeback {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] async writeback: {}",
                     if ws_active && streamed_range_count > 0 {
                         "ACTIVE — pack evict DtoH on the transfer stream, mirror \
@@ -1436,7 +1436,7 @@ impl Compiler<'_> {
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(ERROR, "nsl", 
                             "[nsl] csla window backward lowering failed (range {ri}: {}), \
                              rerun without --layerwise-accum",
                             e
@@ -1693,7 +1693,7 @@ impl Compiler<'_> {
             // read — the CADENCE assume/guarantee obligation, discharged.
             if prefetch_active {
                 let total: usize = transfer_cert.iter().map(|(_, _, n)| n).sum();
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] transfer certificate: {} prefetch obligations discharged \
                      ({total} params double-buffered); chain [{}]",
                     transfer_cert.len(),
@@ -1840,6 +1840,7 @@ impl Compiler<'_> {
             param_adj_set,
             step_param_var,
         } = inputs;
+
         // === CSLA Stage-2 (D1a): window-buffered save phase ===
         //
         // Instead of lowering the adjoint here (the interleaved
@@ -2051,7 +2052,7 @@ impl Compiler<'_> {
         // inert; the carry engages under --checkpoint-selective
         // (SDPA outs saved). Gates assert this line's exact slot
         // count so the tested path is named, not assumed.
-        eprintln!("[csla] lse tape-carry: {} slots", lse_slots.len());
+        nsl_runtime::nsl_log!(INFO, "csla", "[csla] lse tape-carry: {} slots", lse_slots.len());
 
         // Fused-CE tape-carry: one extra slot per
         // `fused_ce_fwd_lse` entry — the [B*S] f32 logsumexp the
@@ -2121,7 +2122,7 @@ impl Compiler<'_> {
         // by the fused-CE gates (1 slot = the carry engaged; a
         // composite fallback shows 0 and the launch counters
         // catch it too).
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "csla", 
             "[csla] fused-ce tape-carry: {} slots",
             fce_slots.len()
         );

@@ -459,7 +459,7 @@ pub fn debug_compile_and_return_cfie_plan_from_ast(
     match (res, cfie_plan) {
         (Ok(_), plan) => Ok(plan),
         (Err(e), Some(plan)) => {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "debug_compile_and_return_cfie_plan", 
                 "[debug_compile_and_return_cfie_plan] codegen failed but a CFIE plan was produced: {}",
                 e.message
             );
@@ -491,7 +491,7 @@ fn debug_compile_and_return_plan_with_imports(
     match (res, plan) {
         (Ok(_), plan) => Ok(plan),
         (Err(e), Some(plan)) => {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "debug_compile_and_return_plan", 
                 "[debug_compile_and_return_plan] codegen failed but a WRGA plan was produced: {}",
                 e.message
             );
@@ -1248,7 +1248,7 @@ impl MatmulConfig {
                 return;
             }
             warned.push(var);
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "nsl-matmul", 
                 "[nsl-matmul] DEPRECATED: {var} is set; use {flag}. The variable \
                  still works and its value IS recorded in the execution \
                  fingerprint, but the flag is the supported spelling."
@@ -1516,6 +1516,60 @@ pub struct MuonOptions {
     pub state_bf16: bool,
 }
 
+/// Shape and value facts about model fields declared in IMPORTED modules,
+/// keyed `model_type -> field_name`.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). The four maps are
+/// one channel: the CLI's multi-file build fills them from the imported
+/// modules' ASTs (plus `ctor_fold`, which merges into the same maps), and
+/// `entry_points` merges them field-level under the entry module's own
+/// collection. Carried on the options rather than as positional parameters
+/// to a twelve-argument `compile_entry_returning_plan`, matching how
+/// `csha_configs` and `checkpoint_policies` already reach it.
+#[derive(Clone, Default)]
+pub struct ImportedModelOptions {
+    /// Item 4: literal dims of model fields declared in imported modules.
+    ///
+    /// `collect_models` only sees the entry module's AST, and the multi-file
+    /// build path propagated `model_field_types` but never the dims/ranks.
+    /// Every real model lives in its own `model.nsl` and is imported, so the
+    /// fused LM head of every real model was invisible to both the CFTP v10
+    /// rank guard (which treats an absent rank as "fire", so it was silently
+    /// inoperative on exactly the MoE-expert-stack case it was written for)
+    /// and to item 4's dims lookup.
+    pub field_dims: std::collections::HashMap<String, std::collections::HashMap<String, Vec<i64>>>,
+    /// See [`Self::field_dims`].
+    pub field_ranks: std::collections::HashMap<String, std::collections::HashMap<String, usize>>,
+    /// The veto companion to [`Self::field_dims`]: bare names of imported
+    /// tensor fields whose dims could NOT be derived. Without this,
+    /// `unique_field_elems`/`unique_field_dims` let a derivable same-named
+    /// field in one model win uncontested over an underivable twin in an
+    /// imported model — sizing it wrong instead of not at all.
+    pub tensor_fields_without_dims: std::collections::HashSet<String>,
+    /// Constructor-folded VALUES of 1-element config fields — the runtime
+    /// `int(self._n_heads.item())` reads these back, so the arena's shape
+    /// propagation needs them to fold attention reshape targets.
+    pub field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+}
+
+/// ZeRO optimizer-sharding options (`--zero-stage`, `--zero-elementwise`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). `Features` and
+/// the parameter plan's `PlanFeatures` keep their own `zero_stage` /
+/// `zero_elementwise` copies for the emission paths.
+#[derive(Clone, Default)]
+pub struct ZeroOptions {
+    /// M43b: ZeRO optimizer sharding stage (1, 2, or 3).
+    pub stage: Option<u8>,
+    /// Item 11 (`--zero-elementwise`): elementwise 1/ws parameter sharding
+    /// under `--zero-stage 3` — eligible streamed params live as per-rank
+    /// slices (all_gather to materialize, reduce_scatter gradients, every
+    /// rank steps its own slice); ineligible ones stay tensor-granular.
+    pub elementwise: bool,
+}
+
 /// Dev-tools options: the kernel profiler, the health monitor and
 /// `@inspect` emission.
 ///
@@ -1542,11 +1596,47 @@ pub struct DevToolsOptions {
     pub inspect_enabled: bool,
 }
 
+/// Kernel autotuning options (`--no-autotune`, `--autotune-fresh`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct AutotuneOptions {
+    /// `--no-autotune`: skip benchmarking and take the middle value of every
+    /// tuning parameter.
+    pub disabled: bool,
+    /// `--autotune-fresh`: ignore cached measurements and re-benchmark.
+    pub fresh: bool,
+}
+
+/// Weight-aware compilation options (M52: `--weights`, the sparsity /
+/// dead-weight / constant-fold config, `nsl check --weight-analysis`) plus
+/// the `@export` weight-index map (M62).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct WeightsOptions {
+    /// M52: Path to safetensors weight file for weight-aware compilation
+    pub file: Option<std::path::PathBuf>,
+    /// M52: Weight-aware compilation configuration
+    pub config: weight_aware::WeightAwareConfig,
+    /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
+    pub analysis: bool,
+    /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
+    /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
+    /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before
+    /// calling any codegen entry point.  Empty map = no @export methods (safe
+    /// default, nothing to look up).
+    pub index_map: HashMap<nsl_ast::NodeId, usize>,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
-    pub no_autotune: bool,
-    pub autotune_fresh: bool,
+    /// Kernel autotuning (`--no-autotune` / `--autotune-fresh`); see
+    /// [`AutotuneOptions`].
+    pub autotune: AutotuneOptions,
     pub world_size: usize,
     pub fusion_report: bool,
     /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
@@ -1572,12 +1662,9 @@ pub struct CompileOptions {
     /// campaigns need distinct reproducible inits; bit-reproducibility of
     /// the DEVICE path still requires --deterministic).
     pub rng_seed: Option<u64>,
-    /// M52: Path to safetensors weight file for weight-aware compilation
-    pub weight_file: Option<std::path::PathBuf>,
-    /// M52: Weight-aware compilation configuration
-    pub weight_config: weight_aware::WeightAwareConfig,
-    /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
-    pub weight_analysis: bool,
+    /// Weight-aware compilation (`--weights`, the M52 config, the analysis
+    /// report) and the `@export` weight-index map; see [`WeightsOptions`].
+    pub weights: WeightsOptions,
     /// M54: Unikernel build configuration (None = normal build)
     pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
     /// M53: Worst-case-execution-time analysis / certification options.
@@ -1589,13 +1676,9 @@ pub struct CompileOptions {
     pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
     /// M55: Zero-knowledge proof-circuit emission options.
     pub zk: ZkOptions,
-    /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
-    pub zero_stage: Option<u8>,
-    /// Item 11 (`--zero-elementwise`): elementwise 1/ws parameter sharding
-    /// under `--zero-stage 3` — eligible streamed params live as per-rank
-    /// slices (all_gather to materialize, reduce_scatter gradients, every
-    /// rank steps its own slice); ineligible ones stay tensor-granular.
-    pub zero_elementwise: bool,
+    /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
+    /// [`ZeroOptions`].
+    pub zero: ZeroOptions,
     /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
     /// storage with counter-based stochastic rounding on the fused AdamW
     /// update — no FP32 master copy. Rides the weight-stream residency
@@ -1644,20 +1727,6 @@ pub struct CompileOptions {
     /// Forced `Off` under `--training-reference`, alongside the decorator, so
     /// the reference arm's numerics stay a single composite path.
     pub lm_head_fusion: crate::lm_head_inference::LmHeadFusion,
-    /// Item 4: literal dims and ranks of model fields declared in IMPORTED
-    /// modules, `model_type -> field_name -> dims|rank`.
-    ///
-    /// `collect_models` only sees the entry module's AST, and the multi-file
-    /// build path propagated `model_field_types` but never these two. Every
-    /// real model lives in its own `model.nsl` and is imported, so the fused
-    /// LM head of every real model was invisible to both the CFTP v10 rank
-    /// guard (which treats an absent rank as "fire", so it was silently
-    /// inoperative on exactly the MoE-expert-stack case it was written for)
-    /// and to item 4's dims lookup.
-    ///
-    /// Carried on the options rather than as two more positional parameters
-    /// to a twelve-argument `compile_entry_returning_plan`, matching how
-    /// `csha_configs` and `checkpoint_policies` already reach it.
     /// Item 5 (`--transient-arena`): place admitted backward temporaries at
     /// fixed arena offsets instead of letting the caching allocator choose.
     ///
@@ -1669,19 +1738,10 @@ pub struct CompileOptions {
     /// jump from lower-bound analysis to placement that the staging exists to
     /// prevent.
     pub transient_arena: bool,
-    pub imported_model_field_dims: std::collections::HashMap<String, std::collections::HashMap<String, Vec<i64>>>,
-    /// See [`Self::imported_model_field_dims`].
-    pub imported_model_field_ranks: std::collections::HashMap<String, std::collections::HashMap<String, usize>>,
-    /// The veto companion to [`Self::imported_model_field_dims`]: bare names
-    /// of imported tensor fields whose dims could NOT be derived. Without
-    /// this, `unique_field_elems`/`unique_field_dims` let a derivable
-    /// same-named field in one model win uncontested over an underivable
-    /// twin in an imported model — sizing it wrong instead of not at all.
-    pub imported_tensor_fields_without_dims: std::collections::HashSet<String>,
-    /// Constructor-folded VALUES of 1-element config fields — the runtime
-    /// `int(self._n_heads.item())` reads these back, so the arena's shape
-    /// propagation needs them to fold attention reshape targets.
-    pub imported_model_field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+    /// Shape/value facts about model fields declared in imported modules
+    /// (the multi-file build's dims/ranks/values channel); see
+    /// [`ImportedModelOptions`].
+    pub imported_model: ImportedModelOptions,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     /// Also controls PIC codegen (`is_pic`), which every object linked into
     /// the shared library needs — including non-entry modules on the
@@ -1833,12 +1893,6 @@ pub struct CompileOptions {
     /// Calibration-harness options (data path, mode, budgets, retention
     /// plans, the subprocess compile bundle and the sidecar written back).
     pub calibration: CalibrationOptions,
-    /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
-    /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
-    /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before
-    /// calling any codegen entry point.  Empty map = no @export methods (safe
-    /// default, nothing to look up).
-    pub weight_index_map: HashMap<nsl_ast::NodeId, usize>,
 }
 
 impl CompileOptions {
@@ -1913,7 +1967,7 @@ impl CompileOptions {
             crate::lm_head_inference::LmHeadFusion::Auto => "auto",
             crate::lm_head_inference::LmHeadFusion::Require => "require",
         };
-        let zero = match self.zero_stage {
+        let zero = match self.zero.stage {
             Some(n) => n.to_string(),
             None => "none".to_string(),
         };
@@ -1937,7 +1991,7 @@ impl CompileOptions {
             format!("fuse_rms={}", b(self.fuse_rmsnorm_backward)),
             format!("fuse_wgrad={}", b(self.fuse_wgrad_accum)),
             format!("zero={zero}"),
-            format!("zero_elem={}", b(self.zero_elementwise)),
+            format!("zero_elem={}", b(self.zero.elementwise)),
             format!("ws={}", self.world_size),
             format!("muon_bns={}", b(self.muon.batch_ns)),
             format!("muon_resmom={}", b(self.muon.resident_momentum)),
@@ -1989,8 +2043,7 @@ fn sanitize_fingerprint_value(v: &str) -> String {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
-            no_autotune: false,
-            autotune_fresh: false,
+            autotune: AutotuneOptions::default(),
             world_size: 1,
             fusion_report: false,
             vram_budget: None,
@@ -2002,16 +2055,13 @@ impl Default for CompileOptions {
             nan_analysis: false,
             deterministic: false,
             rng_seed: None,
-            weight_file: None,
-            weight_config: weight_aware::WeightAwareConfig::default(),
-            weight_analysis: false,
+            weights: WeightsOptions::default(),
             unikernel_config: None,
             wcet: WcetOptions::default(),
             linear_types_enabled: false,
             ownership_info: HashMap::new(),
             zk: ZkOptions::default(),
-            zero_stage: None,
-            zero_elementwise: false,
+            zero: ZeroOptions::default(),
             param_dtype_bf16sr: false,
             muon: MuonOptions::default(),
             cuda_graphs: false,
@@ -2020,10 +2070,7 @@ impl Default for CompileOptions {
             training_reference: false,
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
             transient_arena: false,
-            imported_model_field_dims: std::collections::HashMap::new(),
-            imported_model_field_ranks: std::collections::HashMap::new(),
-            imported_tensor_fields_without_dims: std::collections::HashSet::new(),
-            imported_model_field_values: std::collections::HashMap::new(),
+            imported_model: ImportedModelOptions::default(),
             shared_lib: false,
             emit_export_table: false,
             wrga_inputs: None,
@@ -2050,7 +2097,6 @@ impl Default for CompileOptions {
             wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,
             calibration: CalibrationOptions::default(),
-            weight_index_map: HashMap::new(),
         }
     }
 }
@@ -2060,7 +2106,7 @@ impl Default for CompileOptions {
 ///
 /// This is a convenience wrapper that:
 /// 1. Reads the calibration-data header to obtain `(batch, seq)`.
-/// 2. Sets up `CompileOptions` with `calibration.data`, `weight_file`,
+/// 2. Sets up `CompileOptions` with `calibration.data`, `weights.file`,
 ///    `calibration.batch_seq`, and `calibration.mode = "required"`.
 /// 3. Lexes, parses, and semantically analyses the source.
 /// 4. Constructs a `Compiler` directly, runs all pre-`compile_main` passes
@@ -2121,7 +2167,7 @@ pub fn compile_and_calibrate(
     // Step 3: assemble options.
     let mut opts = CompileOptions::default();
     opts.calibration.data = Some(data_path.to_path_buf());
-    opts.weight_file = Some(weights_path.to_path_buf());
+    opts.weights.file = Some(weights_path.to_path_buf());
     opts.calibration.batch_seq = Some((1, seq));
     opts.calibration.mode = Some("required".to_string());
     opts.calibration.compile_bundle = Some(std::sync::Arc::new(
@@ -2227,7 +2273,7 @@ pub fn compile_and_calibrate(
                 ));
             }
             if registry.is_empty() {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "codegen", 
                     "warning: --calibration-data {} supplied but no calibration hooks \
                      registered (no consumers yet — this is a no-op in MVP)",
                     data_path.display()
@@ -2245,7 +2291,7 @@ pub fn compile_and_calibrate(
                 let cfg = crate::calibration::HarnessConfig {
                     checkpoints: compiler
                         .compile_options
-                        .weight_file
+                        .weights.file
                         .as_ref()
                         .map(|p| vec![p.clone()])
                         .unwrap_or_default(),
@@ -2266,7 +2312,7 @@ pub fn compile_and_calibrate(
                 };
                 match crate::calibration::binary_codegen::real_subprocess_entry(&cfg, &registry) {
                     Ok(out) => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(INFO, "calibration", 
                             "[calibration] {} ({} hooks)",
                             out.outcome_repr,
                             out.sidecar.hooks.len()

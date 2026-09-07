@@ -346,7 +346,7 @@ impl Compiler<'_> {
                         .collect();
                     match forced {
                         Some(forced) if forced.len() == fused.len() => {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(INFO, "fase", 
                                 "[fase] NSL_FASE_FUSED_OVERRIDE applied: {spec} \
                                  (replacing plan fase_fused for {} layers)",
                                 fused.len()
@@ -354,7 +354,7 @@ impl Compiler<'_> {
                             fused = forced;
                         }
                         Some(forced) => {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(WARN, "fase", 
                                 "[fase] NSL_FASE_FUSED_OVERRIDE ignored: {} entries \
                                  for {} WGGO layers",
                                 forced.len(),
@@ -362,7 +362,7 @@ impl Compiler<'_> {
                             );
                         }
                         None => {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(WARN, "fase", 
                                 "[fase] NSL_FASE_FUSED_OVERRIDE ignored: \
                                  unrecognized token in '{spec}' (only 0/1/true/false)"
                             );
@@ -386,7 +386,7 @@ impl Compiler<'_> {
                     .to_lowercase(),
                 other => format!("{:?}", other),
             };
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "fase", 
                 "[fase] layer:{} wggo-override-rejected requested={} applied={} reason={}",
                 diag.layer_index, diag.requested, diag.applied, reason_str
             );
@@ -473,7 +473,7 @@ impl Compiler<'_> {
         // rewrite. Emitted only when the decorator is present, so vanilla
         // builds' stderr is unchanged.
         if fase_decorator.is_some() {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "fase", 
                 "[fase] @fase decorator applied: mode={:?} v_approx={} — {}",
                 plan.mode, fase_cfg.allow_v_approx, plan.rationale,
             );

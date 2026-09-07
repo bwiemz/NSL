@@ -390,12 +390,12 @@ pub fn find_best_variant(
     match load_cache_record(kernel_name, cache_hash, device, None) {
         Ok(Some(rec)) if matches!(rec.selection, SelectionMethod::Measured) => {
             if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                eprintln!("[autotune] cache hit for {kernel_name} (measured)");
+                nsl_runtime::nsl_log!(INFO, "autotune", "[autotune] cache hit for {kernel_name} (measured)");
             }
             return Ok(rec.winner);
         }
         Ok(Some(_)) if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() => {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "autotune", 
                 "[autotune] {kernel_name}: cost-model record present — measuring \
                  (measurement replaces estimates, never the reverse)"
             );
@@ -406,7 +406,7 @@ pub fn find_best_variant(
     // 2. Fallback mode (no GPU)
     if std::env::var("NSL_AUTOTUNE_FALLBACK").is_ok() {
         if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-            eprintln!("[autotune] fallback mode: picking median values (no GPU benchmarking)");
+            nsl_runtime::nsl_log!(WARN, "autotune", "[autotune] fallback mode: picking median values (no GPU benchmarking)");
         }
         return Ok(select_middle_values(tuning_params));
     }
@@ -422,7 +422,7 @@ pub fn find_best_variant(
             Ok(p) => p,
             Err(e) => {
                 if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                    eprintln!("[autotune]   {:?} => compile FAILED: {e}", variant);
+                    nsl_runtime::nsl_log!(ERROR, "autotune", "[autotune]   {:?} => compile FAILED: {e}", variant);
                 }
                 continue; // skip failed compilation
             }
@@ -433,7 +433,7 @@ pub fn find_best_variant(
                 // Timeout check
                 if result.median_ms > VARIANT_TIMEOUT_MS {
                     if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(WARN, "autotune", 
                             "[autotune]   {:?} => too slow ({:.1}ms), skipping",
                             variant, result.median_ms
                         );
@@ -444,7 +444,7 @@ pub fn find_best_variant(
             }
             Err(e) => {
                 if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                    eprintln!("[autotune]   {:?} => benchmark FAILED: {e}", variant);
+                    nsl_runtime::nsl_log!(ERROR, "autotune", "[autotune]   {:?} => benchmark FAILED: {e}", variant);
                 }
                 continue;
             }
@@ -453,7 +453,7 @@ pub fn find_best_variant(
 
     // 5. All failed? Fall back to median
     if results.is_empty() {
-        eprintln!(
+        nsl_runtime::nsl_log!(WARN, "autotune", 
             "[autotune] WARNING: all {num_variants} variants failed for {kernel_name}, using median fallback"
         );
         return Ok(select_middle_values(tuning_params));
@@ -873,7 +873,7 @@ fn bench_one_variant(
                 variant.iter().filter(|(n, _)| n.contains("block")).collect();
             let block = match block_params.as_slice() {
                 [] => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "autotune", 
                         "[autotune] {kernel_name}: no block-named tuning param — \
                          launching at blockDim.x=256"
                     );
@@ -881,7 +881,7 @@ fn bench_one_variant(
                 }
                 [one] => one.1,
                 many => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "autotune", 
                         "[autotune] {kernel_name}: {} block-named params — using '{}' \
                          for blockDim.x",
                         many.len(),
@@ -892,7 +892,7 @@ fn bench_one_variant(
             };
             let clamped = block.clamp(1, 1024);
             if clamped != block {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "autotune", 
                     "[autotune] {kernel_name}: blockDim.x clamped {block} -> {clamped}; \
                      this variant's timing mixes PTX compiled for {block} with a \
                      {clamped}-thread launch"
@@ -995,18 +995,18 @@ pub fn find_best_variant_cost_model(
         if let Some(cached) = check_cache(kernel_name, cache_hash, device, Some(cost_model_spec))
         {
             if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                eprintln!("[autotune] cache hit for {kernel_name}");
+                nsl_runtime::nsl_log!(INFO, "autotune", "[autotune] cache hit for {kernel_name}");
             }
             return Ok(cached);
         }
     } else if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-        eprintln!("[autotune] --autotune-fresh: skipping cache for {kernel_name}");
+        nsl_runtime::nsl_log!(WARN, "autotune", "[autotune] --autotune-fresh: skipping cache for {kernel_name}");
     }
 
     // 2. Fallback mode
     if std::env::var("NSL_AUTOTUNE_FALLBACK").is_ok() {
         if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-            eprintln!("[autotune] fallback mode: picking median values");
+            nsl_runtime::nsl_log!(WARN, "autotune", "[autotune] fallback mode: picking median values");
         }
         return Ok(select_middle_values(tuning_params));
     }
@@ -1023,7 +1023,7 @@ pub fn find_best_variant_cost_model(
             Ok(_) => {}
             Err(e) => {
                 if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                    eprintln!("[autotune]   {:?} => compile FAILED: {e}", variant);
+                    nsl_runtime::nsl_log!(ERROR, "autotune", "[autotune]   {:?} => compile FAILED: {e}", variant);
                 }
                 continue;
             }
@@ -1042,7 +1042,7 @@ pub fn find_best_variant_cost_model(
             }
             Err(e) => {
                 if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                    eprintln!("[autotune]   {:?} => cost estimate FAILED: {e}", variant);
+                    nsl_runtime::nsl_log!(ERROR, "autotune", "[autotune]   {:?} => cost estimate FAILED: {e}", variant);
                 }
                 continue;
             }
@@ -1051,7 +1051,7 @@ pub fn find_best_variant_cost_model(
 
     // 5. All failed? Fall back to median
     if results.is_empty() {
-        eprintln!(
+        nsl_runtime::nsl_log!(WARN, "autotune", 
             "[autotune] WARNING: all {num_variants} variants failed for {kernel_name}, using median fallback"
         );
         return Ok(select_middle_values(tuning_params));
@@ -1063,7 +1063,7 @@ pub fn find_best_variant_cost_model(
 
     // 7. Verbose report
     if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-        eprintln!("\n=== Autotune Cost-Model Report: {kernel_name} (estimated, not measured) ===");
+        nsl_runtime::nsl_log!(INFO, "autotune", "\n=== Autotune Cost-Model Report: {kernel_name} (estimated, not measured) ===");
         print_benchmark_report(kernel_name, &results);
     }
 
@@ -1086,12 +1086,12 @@ pub fn find_best_variant_cost_model(
 
 /// Print a formatted benchmark report table to stderr.
 pub fn print_benchmark_report(kernel_name: &str, results: &[BenchmarkResult]) {
-    eprintln!("\n=== Autotune Report: {kernel_name} ===");
-    eprintln!(
+    nsl_runtime::nsl_log!(INFO, "autotune", "\n=== Autotune Report: {kernel_name} ===");
+    nsl_runtime::nsl_log!(INFO, "autotune", 
         "{:<40} {:>10} {:>10} {:>10}",
         "Variant", "Median", "Min", "Max"
     );
-    eprintln!("{:-<72}", "");
+    nsl_runtime::nsl_log!(INFO, "autotune", "{:-<72}", "");
     for r in results {
         let params_str: String = r
             .variant
@@ -1104,12 +1104,12 @@ pub fn print_benchmark_report(kernel_name: &str, results: &[BenchmarkResult]) {
         } else {
             ""
         };
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "autotune", 
             "{:<40} {:>9.3}ms {:>9.3}ms {:>9.3}ms{}",
             params_str, r.median_ms, r.min_ms, r.max_ms, marker
         );
     }
-    eprintln!();
+    nsl_runtime::nsl_log!(INFO, "autotune", "");
 }
 
 /// Hash a kernel's AST body for cache key generation (SHA-256).
@@ -1207,7 +1207,7 @@ pub fn load_cache_record(
                 std::sync::Mutex::new(None);
             let mut g = WARNED.lock().unwrap();
             if g.get_or_insert_with(Default::default).insert(kernel_name.to_string()) {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "autotune", 
                     "[autotune] warning: the frozen tuning DB has record(s) for \
                      '{kernel_name}' but none match this source/device — the kernel \
                      or its file changed since the DB was frozen; falling back to \
@@ -1350,7 +1350,7 @@ pub fn check_cache(
         Ok(None) => None,
         Err(reject) => {
             if reject.is_noteworthy() || std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "autotune", 
                     "[autotune] ignoring cache entry for '{kernel_name}': {}",
                     reject.describe()
                 );
