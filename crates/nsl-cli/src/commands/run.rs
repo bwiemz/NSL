@@ -149,7 +149,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
 
     // Dev Tools paper completion (PDF section 4.3): --health-interval
     // validation. The value reaches codegen via
-    // CompileOptions.health_flush_interval and is only emitted when the
+    // CompileOptions.dev_tools.health_flush_interval and is only emitted when the
     // health monitor is active (stmt.rs guards on health_monitor), so
     // without --monitor the flag is inert -- warn instead of silently
     // accepting it.
@@ -549,33 +549,36 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     memory_budget_bytes: wggo_memory_budget_bytes,
                 },
                 cfie: nsl_codegen::CfieOptions::default(),
-                // Phase 4 Task 6: when a train block is detected with --monitor,
-                // the health monitor takes over; disable the Phase 1/2 kernel
-                // timing path so they don't stomp on each other.
-                profile_kernels: if detected_train_block { false } else { monitor },
+                dev_tools: nsl_codegen::DevToolsOptions {
+                    // Phase 4 Task 6: when a train block is detected with
+                    // --monitor, the health monitor takes over; disable the
+                    // Phase 1/2 kernel timing path so they don't stomp on
+                    // each other.
+                    profile_kernels: if detected_train_block { false } else { monitor },
+                    manifest_output_path: if monitor {
+                        Some(file.with_extension("nsl-profile.json"))
+                    } else {
+                        None
+                    },
+                    profile_source_text: if monitor {
+                        std::fs::read_to_string(&file).ok()
+                    } else {
+                        None
+                    },
+                    profile_source_file_name: if monitor {
+                        Some(file.display().to_string())
+                    } else {
+                        None
+                    },
+                    health_monitor: detected_train_block,
+                    // Dev Tools paper completion: user-tunable flush interval
+                    // (steps). None keeps the runtime default of 100; consumed
+                    // in stmt.rs only when health_monitor is on.
+                    health_flush_interval: health_interval,
+                    inspect_enabled: inspect,
+                },
                 target_gpu: "h100".to_string(),
                 dtype: "bf16".to_string(),
-                manifest_output_path: if monitor {
-                    Some(file.with_extension("nsl-profile.json"))
-                } else {
-                    None
-                },
-                profile_source_text: if monitor {
-                    std::fs::read_to_string(&file).ok()
-                } else {
-                    None
-                },
-                profile_source_file_name: if monitor {
-                    Some(file.display().to_string())
-                } else {
-                    None
-                },
-                health_monitor: detected_train_block,
-                // Dev Tools paper completion: user-tunable flush interval
-                // (steps). None keeps the runtime default of 100; consumed
-                // in stmt.rs only when health_monitor is on.
-                health_flush_interval: health_interval,
-                inspect_enabled: inspect,
                 csha: nsl_codegen::CshaOptions {
                     mode: csha.clone(),
                     report: csha_report,

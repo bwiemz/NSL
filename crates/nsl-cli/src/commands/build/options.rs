@@ -620,15 +620,11 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     mode_override: cfie.clone(),
                     report_path: cfie_report.clone(),
                 },
-                profile_kernels: false,
+                // `nsl build` never arms the profiler, health monitor or
+                // `@inspect` emission (the defaults); `nsl run` does.
+                dev_tools: nsl_codegen::DevToolsOptions::default(),
                 target_gpu: "h100".to_string(),
                 dtype: "bf16".to_string(),
-                manifest_output_path: None,
-                profile_source_text: None,
-                profile_source_file_name: None,
-                health_monitor: false,
-                health_flush_interval: None,
-                inspect_enabled: false,
                 csha: nsl_codegen::CshaOptions {
                     mode: csha.clone(),
                     report: csha_report,

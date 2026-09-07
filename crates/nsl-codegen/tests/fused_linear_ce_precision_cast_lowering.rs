@@ -208,6 +208,12 @@ fn lower_and_resolve(
     };
     let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
         .expect("Compiler::new must succeed");
+    // CFTP v10 (item 3) scopes the active @fused_lm_ce config to a train
+    // block (`set_active_fused_ce_config_for_train_block`); this test lowers
+    // a wengert list directly, so activate the sole config here the way
+    // `compile_train_block` does. Without it the lowering sees no config and
+    // emits dtype_tag 0 with no precision casts.
+    compiler.set_active_fused_ce_config_for_train_block(nsl_ast::NodeId::dummy());
     compiler
         .declare_runtime_functions()
         .expect("declare_runtime_functions must succeed");
@@ -423,6 +429,12 @@ fn bf16_hint_emits_three_to_bf16_calls_forward_large() {
     );
 }
 
+/// f32 + large vocab takes the Sprint 2.5 GEMM-chunked route
+/// (`use_gemm = dtype_tag == 0 && (is_large || !has_bias)` in
+/// `lower_fused_linear_ce_forward`), not the v1 `_large` scalar kernel: no
+/// precision casts, and the forward FFI is `nsl_fused_linear_ce_forward_gemm`.
+/// (Updated 2026-09-07 when this gated file first ran in CI; it predated
+/// the GEMM route and still expected `_forward_large` here.)
 #[test]
 fn f32_hint_emits_no_precision_cast_forward_large() {
     let (func, idx) = lower_and_resolve(
@@ -433,14 +445,20 @@ fn f32_hint_emits_no_precision_cast_forward_large() {
         &[
             "nsl_tensor_to_bf16",
             "nsl_tensor_to_fp16",
+            "nsl_fused_linear_ce_forward_gemm",
             "nsl_fused_linear_ce_forward_large",
         ],
     );
     assert_eq!(count_calls(&func, idx.get("nsl_tensor_to_bf16").copied()), 0);
     assert_eq!(count_calls(&func, idx.get("nsl_tensor_to_fp16").copied()), 0);
     assert!(
-        count_calls(&func, idx.get("nsl_fused_linear_ce_forward_large").copied())
-            >= 1,
+        count_calls(&func, idx.get("nsl_fused_linear_ce_forward_gemm").copied()) >= 1,
+        "f32 + large vocab must take the GEMM-chunked forward route",
+    );
+    assert_eq!(
+        count_calls(&func, idx.get("nsl_fused_linear_ce_forward_large").copied()),
+        0,
+        "f32 + large vocab must not fall back to the v1 `_large` scalar kernel",
     );
 }
 

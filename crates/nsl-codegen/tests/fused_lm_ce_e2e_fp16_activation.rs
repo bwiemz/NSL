@@ -192,6 +192,12 @@ fn lower_and_resolve(
 
     let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
         .expect("Compiler::new must succeed");
+    // CFTP v10 (item 3) scopes the active @fused_lm_ce config to a train
+    // block (`set_active_fused_ce_config_for_train_block`); this test lowers
+    // a wengert list directly, so activate the sole config here the way
+    // `compile_train_block` does. Without it the lowering sees no config and
+    // emits dtype_tag 0 with no precision casts.
+    compiler.set_active_fused_ce_config_for_train_block(nsl_ast::NodeId::dummy());
     compiler
         .declare_runtime_functions()
         .expect("declare_runtime_functions must succeed");

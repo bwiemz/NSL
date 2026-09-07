@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- CI now runs the `test-helpers`-gated nsl-codegen integration tests
+  (`scripts/gated-tests.sh`, Linux lane): 28 crate-level-gated files and the
+  three `required-features` targets had compiled to empty binaries or been
+  skipped, so `cargo test --workspace` reported them green while running
+  nothing. The CUDA lane's ptxas step now passes the feature too, so the
+  gated `a1_gpu_sm_matches_compile_target` test and the whole
+  `csha_ptx_ptxas_backward_validation` gate run for real. Eight targets had
+  rotted in the dark and are repaired: the five fused-CE dtype-hint witnesses
+  activate their config the way `compile_train_block` does (CFTP v10 scoped
+  the active config to a train block), and the cycle-11/15/16 RoPE probes are
+  restored to their pre-700bfaa8 structural assertions now that R7 is retired.
+
 ### Changed
 
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the ten
@@ -14,12 +28,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   retention, batch_seq, compile_bundle, grad_retention}`). Defaults are
   unchanged; `HarnessConfig` and the CLI `BuildArgs` keep their own
   `calibration_data` fields. 87 → 78 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the dev-tools
+  cluster moved into `DevToolsOptions`
+  (`opts.dev_tools.{profile_kernels, manifest_output_path, profile_source_text,
+  profile_source_file_name, health_monitor, health_flush_interval,
+  inspect_enabled}`). Defaults unchanged (all off / `None`); `target_gpu` and
+  `dtype` stay flat because they are shared beyond the profiler. 78 → 72 flat
+  fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the six
   `checkpoint_*` fields moved into `CheckpointOptions`
   (`opts.checkpoint.{blocks, selective, budget_mib, stride, compress,
   policies}`). Defaults unchanged; `AnalysisResult`, `ModuleData` and
   `WengertExtractor` keep their own `checkpoint_policies`; the CLI's
-  training-reference override macro now takes a field path. 78 → 73 flat
+  training-reference override macro now takes a field path. 72 → 67 flat
   fields.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
