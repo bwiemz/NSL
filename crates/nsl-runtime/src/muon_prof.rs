@@ -169,8 +169,8 @@ pub fn report() {
     if stage_total == 0 && TOTAL_NS[Region::AdamwArm as usize].load(Ordering::Relaxed) == 0 {
         return;
     }
-    eprintln!("[muon-prof] mode={mode_name} — per-region totals (muon-route stage share excludes ns-total/adamw-arm)");
-    eprintln!(
+    crate::nsl_log!(INFO, "muon-prof", "[muon-prof] mode={mode_name} — per-region totals (muon-route stage share excludes ns-total/adamw-arm)");
+    crate::nsl_log!(INFO, "muon-prof", 
         "[muon-prof] {:<20} {:>10} {:>12} {:>10} {:>7}",
         "region", "calls", "total_ms", "avg_us", "share"
     );
@@ -185,7 +185,7 @@ pub fn report() {
         } else {
             "    —".to_string()
         };
-        eprintln!(
+        crate::nsl_log!(INFO, "muon-prof", 
             "[muon-prof] {:<20} {:>10} {:>12.2} {:>10.1} {:>7}",
             NAMES[i],
             calls,

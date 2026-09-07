@@ -278,7 +278,7 @@ pub fn compile_wengert_ops_range(
         // construction, and printing "0 chain(s) fused out of N adjoint ops"
         // for the forward primal, the CCR free-list and every weight-stream
         // slice would be both noisy and wrong (those N are PRIMAL ops).
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "wgrad-fusion", 
             "[wgrad-fusion] {} chain(s) fused out of {} adjoint ops",
             wgrad_plan.by_reduce_result.len(),
             wengert.ops.len()
@@ -432,7 +432,7 @@ pub fn compile_wengert_ops_range(
                 // pre-existing latent drop can proceed while the root cause is
                 // fixed, without silently pretending nothing is wrong.
                 if std::env::var("NSL_ALLOW_UNRESOLVED_LIVE_ADJOINT").as_deref() == Ok("1") {
-                    eprintln!("[source-ad] WARNING (NSL_ALLOW_UNRESOLVED_LIVE_ADJOINT=1): {diag}");
+                    nsl_runtime::nsl_log!(WARN, "source-ad", "[source-ad] WARNING (NSL_ALLOW_UNRESOLVED_LIVE_ADJOINT=1): {diag}");
                 } else {
                     return Err(CodegenError::new(diag));
                 }
@@ -440,7 +440,7 @@ pub fn compile_wengert_ops_range(
             // Ghost VarId — skip this op. Its result stays unmapped,
             // which propagates the "no gradient" signal downstream.
             if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "wengert-skip", 
                     "[wengert-skip] VarId {} ({:?}) — missing inputs: {:?}",
                     op.result, op.op, missing
                 );
@@ -986,7 +986,7 @@ fn emit_fused_forward_under_claim(
             &training_cfg, &mut diags,
         ) as i64;
         for s in diags {
-            eprintln!("warning: {s}");
+            nsl_runtime::nsl_log!(WARN, "codegen", "warning: {s}");
         }
         bytes
     };
@@ -1402,7 +1402,7 @@ fn lower_single_op(
             // Unresolved Param — may be a scalar config field (eps, _d_model)
             // used only in non-differentiable contexts. Safe to use null for
             // Passthrough ops that don't need the actual tensor value.
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "source-ad", 
                 "[source-ad] note: unresolved Param VarId {} ('{}'), using null placeholder",
                 op.result, name
             );
@@ -2978,7 +2978,7 @@ fn lower_single_op(
                         // cache-miss path and the whole adjoint graph
                         // falls back to per-op AD via the AD emitter's
                         // reset-cell pattern in EmitFused.
-                        eprintln!(
+                        nsl_runtime::nsl_log!(WARN, "nsl", 
                             "[nsl] FusedCshaBackward: no csha_training_config for layer '{}'; \
                              skipping launch (cache stays empty, extract ops will fail).",
                             layer
@@ -4033,7 +4033,7 @@ fn emit_fused_lce_route_note(
     } else {
         "v1"
     };
-    eprintln!(
+    nsl_runtime::nsl_log!(INFO, "fused-lce", 
         "[fused-lce] {phase} route={route} vocab={vocab_size} bias={} dtype_tag={dtype_tag}",
         if has_bias { "yes" } else { "no" }
     );
@@ -4054,7 +4054,7 @@ fn emit_fused_lce_route_note(
     // deliberately-supported configuration. Making the cost impossible to
     // miss is the whole ask; refusing to compile it is not mine to decide.
     if !use_gemm && is_large && dtype_tag != 0 {
-        eprintln!(
+        nsl_runtime::nsl_log!(WARN, "fused-lce", 
             "[fused-lce] warning: {phase} takes the v1 per-row-CTA kernels because \
              @fused_lm_ce carries a 16-bit `dtype=` hint and vocab_size {vocab_size} \
              is above {} — there is no GEMM-chunked path for 16-bit storage. \

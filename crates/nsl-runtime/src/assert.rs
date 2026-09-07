@@ -36,7 +36,7 @@ pub extern "C" fn nsl_assert(condition: i8, message: i64) {
 pub extern "C" fn nsl_assert_eq_int(a: i64, b: i64, msg_ptr: i64, msg_len: i64) {
     if a != b {
         let msg = extract_msg(msg_ptr, msg_len);
-        eprintln!("ASSERTION FAILED: {} (expected {} == {})", msg, a, b);
+        crate::nsl_log!(ERROR, "assert", "ASSERTION FAILED: {} (expected {} == {})", msg, a, b);
         std::process::abort();
     }
 }
@@ -45,7 +45,7 @@ pub extern "C" fn nsl_assert_eq_int(a: i64, b: i64, msg_ptr: i64, msg_len: i64) 
 pub extern "C" fn nsl_assert_eq_float(a: f64, b: f64, msg_ptr: i64, msg_len: i64) {
     if a != b {
         let msg = extract_msg(msg_ptr, msg_len);
-        eprintln!("ASSERTION FAILED: {} (expected {} == {})", msg, a, b);
+        crate::nsl_log!(ERROR, "assert", "ASSERTION FAILED: {} (expected {} == {})", msg, a, b);
         std::process::abort();
     }
 }
@@ -65,7 +65,7 @@ pub extern "C" fn nsl_assert_close(
 
     // Check ndim
     if a.ndim != b.ndim {
-        eprintln!(
+        crate::nsl_log!(ERROR, "assert", 
             "ASSERTION FAILED: {} (ndim mismatch: {} vs {})",
             msg, a.ndim, b.ndim
         );
@@ -77,7 +77,7 @@ pub extern "C" fn nsl_assert_close(
         let da = unsafe { *a.shape.add(i) };
         let db = unsafe { *b.shape.add(i) };
         if da != db {
-            eprintln!(
+            crate::nsl_log!(ERROR, "assert", 
                 "ASSERTION FAILED: {} (shape mismatch at dim {}: {} vs {})",
                 msg, i, da, db
             );
@@ -98,7 +98,7 @@ pub extern "C" fn nsl_assert_close(
         let diff = (va - vb).abs();
         let tol = atol + rtol * vb.abs();
         if diff > tol {
-            eprintln!(
+            crate::nsl_log!(ERROR, "assert", 
                 "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
                 msg, i, va, vb, diff, tol
             );

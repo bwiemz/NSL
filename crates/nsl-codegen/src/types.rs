@@ -42,7 +42,7 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
             use std::sync::atomic::{AtomicBool, Ordering};
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "nsl-codegen", 
                     "[nsl-codegen] warning: Type::Unknown reached codegen (defaulting to I64). \
                            This may indicate a type inference gap."
                 );

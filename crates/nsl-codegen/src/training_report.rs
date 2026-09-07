@@ -143,7 +143,7 @@ pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &st
                             &dataset_configs,
                         ));
                     }
-                    Err(why) => eprintln!(
+                    Err(why) => nsl_runtime::nsl_log!(WARN, "codegen", 
                         "note: --training-report skipped a distill block whose \
                          header cannot be planned: {why}"
                     ),

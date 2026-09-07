@@ -53,7 +53,7 @@ impl YosysGate {
 
         // Budget gate per §5.4 (post-mortem; see BudgetExceeded comment)
         if elapsed > Duration::from_secs(300) {
-            eprintln!("WARNING: Yosys gate exceeded 5-min target ({elapsed:?}).");
+            nsl_runtime::nsl_log!(WARN, "codegen", "WARNING: Yosys gate exceeded 5-min target ({elapsed:?}).");
         }
         if elapsed > Duration::from_secs(600) {
             return Err(YosysGateError::BudgetExceeded { elapsed_secs: elapsed.as_secs() });

@@ -137,7 +137,7 @@ fn flash_attention_hopper(
     );
 
     if result as u32 != 0 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl", 
             "[nsl] FA3 Hopper kernel launch failed ({:?}), falling back to FA2",
             result
         );
@@ -187,7 +187,7 @@ fn fa_write_target_data_ptr(entry: &str, name: &str, ptr: i64) -> u64 {
     }
     let t = NslTensor::from_ptr(ptr);
     if t.device == 0 {
-        eprintln!(
+        crate::nsl_log!(ERROR, "flash-attn", 
             "[flash-attn] FATAL: {entry} write target '{name}' is a CPU-resident \
              tensor — the fused attention kernels are GPU-only, and promoting a \
              write target would strand the results in a hidden copy. Move the \
@@ -238,7 +238,7 @@ fn fa_out_write_resolution(entry: &str, name: &str, ptr: i64) -> (u64, bool) {
     }
     let t = NslTensor::from_ptr(ptr);
     if t.device == 0 {
-        eprintln!(
+        crate::nsl_log!(ERROR, "flash-attn", 
             "[flash-attn] FATAL: {entry} write target '{name}' is a CPU-resident \
              tensor — the fused attention kernels are GPU-only, and promoting a \
              write target would strand the results in a hidden copy. Move the \
@@ -255,7 +255,7 @@ fn fa_out_write_resolution(entry: &str, name: &str, ptr: i64) -> (u64, bool) {
             // buffer (bf16/u16) that's a device heap overflow, into an
             // f64 buffer it's silent bit garbage. No call site passes
             // these today; refuse loudly rather than corrupt.
-            eprintln!(
+            crate::nsl_log!(ERROR, "flash-attn", 
                 "[flash-attn] FATAL: {entry} write target '{name}' has dtype \
                  {other} — the forward kernel stores f16 and this launcher \
                  only knows how to deliver into f32 (staged widen) or f16 \
@@ -317,7 +317,7 @@ fn fa_widen_out_staging(
     };
     crate::cuda::inner::free_managed(out_f16);
     if conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-        eprintln!(
+        crate::nsl_log!(ERROR, "flash-attention", 
             "[{entry}] f16->f32 output widen kernel FAILED (rc {conv_rc:?}) — \
              the f32 attention output buffer is UNWRITTEN (zeros)."
         );
@@ -393,7 +393,7 @@ fn csha_bwd_f16_read_ptr(
             crate::cuda::inner::memset_d8(dst, elems * 2);
             let rc = csha_bwd_convert_f32_to_f16(src as *mut c_void, dst, elems);
             if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!(
+                crate::nsl_log!(ERROR, "flash-attention", 
                     "[{entry}] f32->f16 narrow of '{name}' FAILED (rc {rc:?}) — \
                      the fused backward will read zeros for this operand."
                 );
@@ -402,7 +402,7 @@ fn csha_bwd_f16_read_ptr(
             dst as u64
         }
         other => {
-            eprintln!(
+            crate::nsl_log!(ERROR, "flash-attention", 
                 "[{entry}] FATAL: operand '{name}' has dtype {other}, but the \
                  fused backward kernel reads it as f16 — a silent reinterpret \
                  here produces smoothly-wrong gradients. Supported: f32 \
@@ -633,7 +633,7 @@ pub extern "C" fn nsl_flash_attention(
             );
             if fa3_result == 0 {
                 if !FA_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
-                    eprintln!("[nsl] Using FlashAttention-3 (Hopper wgmma, sm_90a)");
+                    crate::nsl_log!(INFO, "nsl", "[nsl] Using FlashAttention-3 (Hopper wgmma, sm_90a)");
                 }
                 true
             } else {
@@ -652,7 +652,7 @@ pub extern "C" fn nsl_flash_attention(
             0
         } else {
             if !FA_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
-                eprintln!("[nsl] Using FlashAttention-2 (Ampere mma.sync)");
+                crate::nsl_log!(INFO, "nsl", "[nsl] Using FlashAttention-2 (Ampere mma.sync)");
             }
             let rc = crate::cuda::inner::kernel_launch(
                 effective_ptx_ptr as *const u8,
@@ -671,7 +671,7 @@ pub extern "C" fn nsl_flash_attention(
                 // comments with CUDA_ERROR_INVALID_PTX=218, the forward
                 // "succeeded" with zero attention output, and the loss
                 // climbed to the uniform plateau.)
-                eprintln!(
+                crate::nsl_log!(ERROR, "flash-fwd", 
                     "[flash-fwd] FlashAttention forward kernel launch FAILED \
                      (CUDA error {rc}) — the attention output buffer is \
                      UNWRITTEN (zeros) and training/inference results are \
@@ -746,7 +746,7 @@ pub extern "C" fn nsl_flash_attention(
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (effective_ptx_ptr, effective_name_ptr);
-        eprintln!("[nsl] FlashAttention requires CUDA. Use naive path (no @flash_attention decorator).");
+        crate::nsl_log!(WARN, "nsl", "[nsl] FlashAttention requires CUDA. Use naive path (no @flash_attention decorator).");
         -1
     }
 }
@@ -1134,7 +1134,7 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         macro_rules! decline {
             ($reason:expr) => {{
                 if std::env::var("NSL_SDPA_FUSED_DEBUG").is_ok() {
-                    eprintln!("[sdpa-fused-debug] decline: {}", $reason);
+                    crate::nsl_log!(WARN, "sdpa-fused-debug", "[sdpa-fused-debug] decline: {}", $reason);
                 }
                 return 0;
             }};
@@ -1461,7 +1461,7 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         SDPA_FUSED_LAUNCH_COUNTS[if tier_b_selected { 1 } else { 0 }]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !SDPA_FUSED_LAUNCH_LOGGED.swap(true, Ordering::Relaxed) {
-            eprintln!(
+            crate::nsl_log!(INFO, "nsl", 
                 "[nsl] sdpa fused forward: launched (segmask={}, head_dim={d}, \
                  tiles={block_q}x{block_kv}, tier_b={})",
                 if seg_dev.is_null() { 0 } else { 1 },
@@ -1786,7 +1786,7 @@ fn csha_tier_b1_prepass_substitute(
         x_data, nw_data, scratch.x_scratch as u64, seq, dm, chunk, eps,
     );
     if rc_x as u32 != 0 {
-        eprintln!("[csha-tier-b1] x prepass launch failed rc={:?}", rc_x);
+        crate::nsl_log!(ERROR, "csha-tier-b1", "[csha-tier-b1] x prepass launch failed rc={:?}", rc_x);
         return None;
     }
     let wq_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wq_data, dm, hd, chunk)?;
@@ -1947,7 +1947,7 @@ pub extern "C" fn nsl_flash_attention_csha(
         let per_doc_cta = csha_is_per_doc_cta_kernel(effective_name_ptr);
         if per_doc_cta {
             if num_docs_or_zero <= 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha: per-doc CTA kernel \
                      ({:?}) requires num_docs_or_zero > 0, got {}",
                     csha_kernel_name_for_diag(effective_name_ptr),
@@ -1956,7 +1956,7 @@ pub extern "C" fn nsl_flash_attention_csha(
                 return -1;
             }
             if doc_starts_ptr == 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha: per-doc CTA kernel \
                      ({:?}) requires doc_starts_ptr != 0",
                     csha_kernel_name_for_diag(effective_name_ptr),
@@ -1966,7 +1966,7 @@ pub extern "C" fn nsl_flash_attention_csha(
         } else if num_docs_or_zero > 0 {
             // Caller passed a per-doc grid_x but the dispatched kernel is
             // not a per-doc variant — likely a planner/dispatch bug.
-            eprintln!(
+            crate::nsl_log!(INFO, "flash-attention", 
                 "[nsl::flash_attention] nsl_flash_attention_csha: num_docs_or_zero={} provided but \
                  kernel name {:?} lacks the `_per_doc_cta` suffix",
                 num_docs_or_zero,
@@ -1988,7 +1988,7 @@ pub extern "C" fn nsl_flash_attention_csha(
             && csha_is_fused_projection_kernel(effective_name_ptr)
             && (seq_len > block_q || seq_len > _block_kv)
         {
-            eprintln!(
+            crate::nsl_log!(WARN, "flash-attention", 
                 "[nsl::flash_attention] nsl_flash_attention_csha: fused-projection kernel {:?} is \
                  single-tile (seq_len={seq_len} > block_q={block_q}/block_kv={}) — refusing; use \
                  nsl_flash_attention_csha_with_saves (two-launch multi-tile dispatch) instead",
@@ -2249,7 +2249,7 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _ = (rmsnorm_eps_bits, active_heads, d_model, segment_ids_ptr, doc_starts_ptr);
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
         let _ = num_docs_or_zero;
-        eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
+        crate::nsl_log!(WARN, "nsl", "[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
         -1
     }
 }
@@ -2378,7 +2378,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let per_doc_cta = csha_is_per_doc_cta_kernel(effective_name_ptr);
         if per_doc_cta {
             if num_docs_or_zero <= 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: per-doc CTA kernel \
                      ({:?}) requires num_docs_or_zero > 0, got {}",
                     csha_kernel_name_for_diag(effective_name_ptr),
@@ -2387,7 +2387,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 return -1;
             }
             if doc_starts_ptr == 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: per-doc CTA kernel \
                      ({:?}) requires doc_starts_ptr != 0",
                     csha_kernel_name_for_diag(effective_name_ptr),
@@ -2395,7 +2395,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 return -1;
             }
         } else if num_docs_or_zero > 0 {
-            eprintln!(
+            crate::nsl_log!(INFO, "flash-attention", 
                 "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: num_docs_or_zero={} provided but \
                  kernel name {:?} lacks the `_per_doc_cta` suffix",
                 num_docs_or_zero,
@@ -2427,7 +2427,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             && (seq_len > block_q || seq_len > _block_kv);
         if multi_tile_fused {
             if block_q != _block_kv {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: multi-tile fused-projection \
                      dispatch requires block_q == block_kv (got {block_q} vs {_block_kv}, seq_len={seq_len}); \
                      asymmetric fused tiles are single-tile only — refusing instead of launching into garbage"
@@ -2435,7 +2435,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 return -1;
             }
             if is_tier_b1 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: multi-tile dispatch not \
                      implemented for Tier B.1 kernels ({:?}, seq_len={seq_len} > block_q={block_q}) — refusing",
                     csha_kernel_name_for_diag(effective_name_ptr),
@@ -2443,7 +2443,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 return -1;
             }
             if segment_ids_ptr != 0 || doc_starts_ptr != 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: multi-tile fused dispatch \
                      does not support segment_masked / doc-aware launches yet (seq_len={seq_len} > \
                      block_q={block_q}) — refusing"
@@ -2652,7 +2652,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                     String::from_utf8_lossy(std::slice::from_raw_parts(c, end)).into_owned()
                 }
             };
-            eprintln!(
+            crate::nsl_log!(INFO, "csha-dump-fwd", 
                 "[csha-dump-fwd] with_saves kernel=\"{}\" q_proj=0x{:x} k_proj=0x{:x} v_proj=0x{:x} \
                  row_max=0x{:x} row_sum=0x{:x} x_raw=0x{:x}",
                 kname, q_proj, k_proj, v_proj, rmax, rsum, xraw
@@ -2670,7 +2670,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                             std::env::temp_dir().join("csha_with_saves.ptx"),
                             bytes,
                         );
-                        eprintln!(
+                        crate::nsl_log!(INFO, "csha-dump-fwd", 
                             "[csha-dump-fwd] ptx written to {}/csha_with_saves.ptx ({} bytes)",
                             std::env::temp_dir().display(), end
                         );
@@ -2729,7 +2729,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             for (src, dst, tag) in [(q_proj, qf, "q_proj"), (k_proj, kf, "k_proj"), (v_proj, vf, "v_proj")] {
                 let rc = csha_fwd_convert_f16_to_f32(src, dst, qkv_elems);
                 if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "flash-attention", 
                         "[nsl::flash_attention] multi-tile dispatch: f16->f32 widening of {tag} failed: {rc:?}"
                     );
                     free_mt(qf, kf, vf);
@@ -2808,7 +2808,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         // flag OR the saves emit but to wrong addresses.
         if dump_on {
             unsafe { crate::cuda::inner::cu_ctx_synchronize(); }
-            eprintln!("[csha-dump-fwd-post] launch_rc={:?}", fwd_rc);
+            crate::nsl_log!(INFO, "csha-dump-fwd-post", "[csha-dump-fwd-post] launch_rc={:?}", fwd_rc);
             let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
             let stats_elems = (batch * heads * seq_len) as usize;
             let x_elems = (batch * heads * seq_len * head_dim) as usize;
@@ -2825,7 +2825,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 let nz = host.iter().filter(|&&b| b != 0).count();
                 let first8: Vec<f32> = host.iter().take(8)
                     .map(|&b| crate::tensor::f16_bits_to_f32(b)).collect();
-                eprintln!(
+                crate::nsl_log!(INFO, "csha-dump-fwd-post", 
                     "[csha-dump-fwd-post]  q_proj first8={:?} nonzero_bits={}/{}",
                     first8, nz, qkv_elems
                 );
@@ -2841,7 +2841,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                     );
                 }
                 let nz = host.iter().filter(|&&v| v != 0.0).count();
-                eprintln!(
+                crate::nsl_log!(INFO, "csha-dump-fwd-post", 
                     "[csha-dump-fwd-post]  row_sum first8={:?} nonzero={}/{}",
                     host.iter().take(8).cloned().collect::<Vec<_>>(),
                     nz, stats_elems
@@ -2858,7 +2858,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                     );
                 }
                 let nz = host.iter().filter(|&&v| v != 0.0).count();
-                eprintln!(
+                crate::nsl_log!(INFO, "csha-dump-fwd-post", 
                     "[csha-dump-fwd-post]  x_raw  first8={:?} nonzero={}/{}",
                     host.iter().take(8).cloned().collect::<Vec<_>>(),
                     nz, x_elems
@@ -2880,7 +2880,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr, doc_starts_ptr);
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
         let _ = num_docs_or_zero;
-        eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
+        crate::nsl_log!(WARN, "nsl", "[nsl] CSHA FlashAttention w/ saves requires CUDA.");
         -1
     }
 }
@@ -3234,7 +3234,7 @@ fn csha_backward_impl(
         let per_doc_cta = csha_is_per_doc_cta_kernel(effective_name_ptr);
         if per_doc_cta {
             if num_docs_or_zero <= 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_backward: per-doc CTA \
                      kernel ({:?}) requires num_docs_or_zero > 0, got {}",
                     csha_kernel_name_for_diag(effective_name_ptr),
@@ -3243,7 +3243,7 @@ fn csha_backward_impl(
                 return -1;
             }
             if doc_starts_ptr == 0 {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_backward: per-doc CTA \
                      kernel ({:?}) requires doc_starts_ptr != 0",
                     csha_kernel_name_for_diag(effective_name_ptr),
@@ -3251,7 +3251,7 @@ fn csha_backward_impl(
                 return -1;
             }
         } else if num_docs_or_zero > 0 {
-            eprintln!(
+            crate::nsl_log!(INFO, "flash-attention", 
                 "[nsl::flash_attention] nsl_flash_attention_csha_backward: num_docs_or_zero={} \
                  provided but kernel name {:?} lacks the `_per_doc_cta` suffix",
                 num_docs_or_zero,
@@ -3285,7 +3285,7 @@ fn csha_backward_impl(
                     .map(|v| v != "0" && v != "")
                     .unwrap_or(false);
                 if !validation_only {
-                    eprintln!(
+                    crate::nsl_log!(WARN, "flash-attention", 
                         "[nsl::flash_attention] nsl_flash_attention_csha_backward: multi-tile backward \
                          (seq_len={seq_len} > block_q={block_q}/block_kv={_block_kv}) is implemented only \
                          for batch=1, heads=1 (got batch={batch}, heads={heads}): heads>1 needs cross-head \
@@ -3294,7 +3294,7 @@ fn csha_backward_impl(
                     );
                     return -1;
                 }
-                eprintln!(
+                crate::nsl_log!(INFO, "flash-attention", 
                     "[nsl::flash_attention] nsl_flash_attention_csha_backward: MULTI-TILE VALIDATION MODE \
                      (batch={batch}, heads={heads}) — gradients NOT guaranteed correct for heads>1/batch>1"
                 );
@@ -3709,12 +3709,12 @@ fn csha_backward_impl(
                 let mut host = vec![0f32; qkv_elems];
                 crate::cuda::inner::memcpy_dtoh(host.as_mut_ptr() as *mut c_void, ptr, scratch_bytes);
                 if let Some((idx, value)) = host.iter().copied().enumerate().find(|(_, x)| !x.is_finite()) {
-                    eprintln!(
+                    crate::nsl_log!(INFO, "csha-dump-bwd-scratch", 
                         "[csha-dump-bwd-scratch] first non-finite {name}[{idx}]={value:?}"
                     );
                 } else {
                     let first = host.iter().take(4).copied().collect::<Vec<_>>();
-                    eprintln!(
+                    crate::nsl_log!(INFO, "csha-dump-bwd-scratch", 
                         "[csha-dump-bwd-scratch] {name} first4={first:?} max_abs={:.6e}",
                         host.iter().copied().map(f32::abs).fold(0.0f32, f32::max)
                     );
@@ -3803,7 +3803,7 @@ fn csha_backward_impl(
                     rc = pp_rc;
                 }
             } else {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-attention", 
                     "[nsl::flash_attention] multi-tile backward post-pass skipped: a required input \
                      buffer is null (xraw={xraw:#x}, d_q={d_q:#x}) — dWk/dWv/dx will be WRONG"
                 );
@@ -3869,13 +3869,13 @@ fn csha_backward_impl(
                     String::from_utf8_lossy(std::slice::from_raw_parts(c, end)).into_owned()
                 }
             };
-            eprintln!("[csha-dump-bwd] kernel=\"{}\"", kname);
-            eprintln!(
+            crate::nsl_log!(INFO, "csha-dump-bwd", "[csha-dump-bwd] kernel=\"{}\"", kname);
+            crate::nsl_log!(INFO, "csha-dump-bwd", 
                 "[csha-dump-bwd] saves: q_proj=0x{:x} k_proj=0x{:x} v_proj=0x{:x} \
                  row_max=0x{:x} row_sum=0x{:x} x_raw=0x{:x}",
                 qp, kpj, vpj, rmax, rsum, xraw
             );
-            eprintln!(
+            crate::nsl_log!(INFO, "csha-dump-bwd", 
                 "[csha-dump-bwd] grads: dO=0x{:x} dq=0x{:x} dk=0x{:x} dv=0x{:x} \
                  dwq=0x{:x} dwk=0x{:x} dwv=0x{:x} dx=0x{:x} dx_norm=0x{:x}",
                 d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn
@@ -3917,7 +3917,7 @@ fn csha_backward_impl(
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
         let _ = num_docs_or_zero;
         let _ = probe_ptrs;
-        eprintln!("[nsl] CSHA backward requires CUDA.");
+        crate::nsl_log!(WARN, "nsl", "[nsl] CSHA backward requires CUDA.");
         -1
     }
 }
@@ -4226,7 +4226,7 @@ fn csha_tier_b2_backward_launch(
         std::ptr::null_mut()
     };
     if d_scratch_raw.is_null() {
-        eprintln!("[nsl] CSHA Tier B.2 backward: D-scratch alloc failed");
+        crate::nsl_log!(ERROR, "nsl", "[nsl] CSHA Tier B.2 backward: D-scratch alloc failed");
         return CUresult::CUDA_ERROR_OUT_OF_MEMORY as i64;
     }
     crate::cuda::inner::memset_d8(d_scratch_raw, d_elems * 4);
@@ -4280,7 +4280,7 @@ fn csha_tier_b2_backward_launch(
         }
     };
     if qkv_elems > 0 && (dq_scratch_raw.is_null() || dk_scratch_raw.is_null() || dv_scratch_raw.is_null()) {
-        eprintln!("[nsl] CSHA Tier B.2 backward: dQ/dK/dV scratch alloc failed");
+        crate::nsl_log!(ERROR, "nsl", "[nsl] CSHA Tier B.2 backward: dQ/dK/dV scratch alloc failed");
         free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
         return CUresult::CUDA_ERROR_OUT_OF_MEMORY as i64;
     }
@@ -5189,7 +5189,7 @@ fn csha_bwd_multitile_postpass(
         return cudarc::driver::sys::CUresult::CUDA_SUCCESS;
     }
     if seq_len > 4096 {
-        eprintln!(
+        crate::nsl_log!(WARN, "flash-attention", 
             "[nsl::flash_attention] multi-tile backward post-pass: seq_len={seq_len} > 4096 \
              (static inv_rms shared cap) — refusing"
         );
@@ -5253,7 +5253,7 @@ fn csha_dump_backward_buffers(
     d_wq_dev: u64, d_wk_dev: u64, d_wv_dev: u64,
     d_x_dev: u64, d_xn_dev: u64,
 ) {
-    eprintln!(
+    crate::nsl_log!(INFO, "csha-dump", 
         "[csha-dump] launch_rc={} batch={} heads={} seq={} head_dim={} d_model={}",
         launch_rc, batch, heads, seq_len, head_dim, d_model
     );
@@ -5271,7 +5271,7 @@ fn csha_dump_backward_buffers(
 
     fn dump_f16(name: &str, dev_ptr: u64, n: usize) {
         if dev_ptr == 0 || n == 0 {
-            eprintln!("[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
+            crate::nsl_log!(WARN, "csha-dump", "[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
             return;
         }
         let mut host: Vec<u16> = vec![0u16; n];
@@ -5293,7 +5293,7 @@ fn csha_dump_backward_buffers(
             if v.is_finite() { sum += v as f64; }
         }
         let first8: Vec<f32> = host.iter().take(8).map(|&b| crate::tensor::f16_bits_to_f32(b)).collect();
-        eprintln!(
+        crate::nsl_log!(INFO, "csha-dump", 
             "[csha-dump] {:>9} [f16 n={}]: first8={:?} max|.|={:.6e} sum={:.6e} nan_count={}",
             name, n, first8, max_abs, sum, nan_count
         );
@@ -5301,7 +5301,7 @@ fn csha_dump_backward_buffers(
 
     fn dump_f32(name: &str, dev_ptr: u64, n: usize) {
         if dev_ptr == 0 || n == 0 {
-            eprintln!("[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
+            crate::nsl_log!(WARN, "csha-dump", "[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
             return;
         }
         let mut host: Vec<f32> = vec![0.0f32; n];
@@ -5322,7 +5322,7 @@ fn csha_dump_backward_buffers(
             if v.is_finite() { sum += v as f64; }
         }
         let first8: Vec<f32> = host.iter().take(8).cloned().collect();
-        eprintln!(
+        crate::nsl_log!(INFO, "csha-dump", 
             "[csha-dump] {:>9} [f32 n={}]: first8={:?} max|.|={:.6e} sum={:.6e} nan_count={}",
             name, n, first8, max_abs, sum, nan_count
         );
@@ -5512,7 +5512,7 @@ pub extern "C" fn nsl_flash_attention_quantized(
         let _ = (meta_k, meta_v, kv_quant_scheme);
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv);
         let _ = (effective_ptx_ptr, effective_name_ptr);
-        eprintln!("[nsl] quantized FlashAttention requires CUDA.");
+        crate::nsl_log!(WARN, "nsl", "[nsl] quantized FlashAttention requires CUDA.");
         -1
     }
 }
@@ -5590,7 +5590,7 @@ pub extern "C" fn nsl_rope_cache_write(
         let _ = (k_projected_ptr, v_projected_ptr, cos_ptr, sin_ptr, positions_ptr);
         let _ = (k_pool_ptr, v_pool_ptr, block_table_ptr, seq_ids_ptr, seq_lens_ptr);
         let _ = (num_tokens, num_heads, head_dim, block_size, ptx_ptr, name_ptr);
-        eprintln!("[nsl] rope_cache_write requires CUDA.");
+        crate::nsl_log!(WARN, "nsl", "[nsl] rope_cache_write requires CUDA.");
         -1
     }
 }
@@ -6074,7 +6074,7 @@ fn flash_bwd_warn_once(msg: &str) {
         .map(|mut s| s.insert(msg.to_string()))
         .unwrap_or(true);
     if first {
-        eprintln!("{msg}");
+        crate::nsl_log!(WARN, "flash-attention", "{msg}");
     }
 }
 
@@ -6278,7 +6278,7 @@ fn flash_attention_backward_gpu(
             // silently corrupt training. Free scratch and signal failure (0) so
             // the caller falls back to the correct CPU backward. See the return-0
             // contract in `nsl_flash_attention_backward`.
-            eprintln!(
+            crate::nsl_log!(WARN, "flash-bwd", 
                 "[flash-bwd] Phase 1 (D-correction) kernel launch FAILED: {:?} — \
                  refusing to return zero gradients; caller will fall back to CPU. \
                  (This means the GPU backward PTX is invalid/unlaunchable for this config.)",
@@ -6425,7 +6425,7 @@ fn flash_attention_backward_gpu(
             if lse_res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 // Never return zero gradients on a launch failure — free scratch
                 // and signal 0 so the caller takes the correct CPU backward.
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-bwd", 
                     "[flash-bwd] logsumexp kernel launch FAILED: {:?} — refusing to \
                      return zero gradients; caller will fall back to CPU.",
                     lse_res
@@ -6539,7 +6539,7 @@ fn flash_attention_backward_gpu(
             // Free everything and signal failure (0) so the caller uses the CPU
             // backward. Common causes: MMA path PTX not yet valid (sm>=80), or the
             // dynamic shared request exceeds the device opt-in cap for this head_dim.
-            eprintln!(
+            crate::nsl_log!(WARN, "flash-bwd", 
                 "[flash-bwd] Phase 2 (dQ/dK/dV) kernel launch FAILED: {:?} — \
                  refusing to return zero gradients; caller will fall back to CPU. \
                  (shmem request = {} bytes; check MMA-path PTX validity and the \
@@ -6574,7 +6574,7 @@ fn flash_attention_backward_gpu(
             cudarc::driver::sys::CUresult::CUDA_SUCCESS
         };
         if sync_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            eprintln!(
+            crate::nsl_log!(WARN, "flash-bwd", 
                 "[flash-bwd] backward kernels reported an ASYNCHRONOUS execution fault \
                  on cuCtxSynchronize: {:?} — refusing to return possibly-corrupt \
                  gradients; caller will fall back to CPU.",
@@ -6854,7 +6854,7 @@ pub extern "C" fn nsl_flash_attention_backward(
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-bwd", 
                     "[flash-bwd] WARNING: NSL_FLASH_BWD_CPU=0 overrides --deterministic. \
                      The phase-2 backward accumulates dQ with a cross-CTA atomicAdd, so this \
                      run is NOT bit-reproducible run-to-run."
@@ -6875,7 +6875,7 @@ pub extern "C" fn nsl_flash_attention_backward(
                 } else {
                     "NSL_FLASH_BWD_CPU=1"
                 };
-                eprintln!(
+                crate::nsl_log!(INFO, "flash-bwd", 
                     "[flash-bwd] {why} — deterministic CPU reference backward forced"
                 );
             }
@@ -6895,17 +6895,17 @@ pub extern "C" fn nsl_flash_attention_backward(
 
         if flash_debug && dout_t.device > 0 && !force_cpu_bwd {
             if phase1_ptx_ptr == 0 {
-                eprintln!(
+                crate::nsl_log!(INFO, "flash-bwd", 
                     "[flash-bwd] no backward PTX provided (phase1_ptx=0) — CPU reference \
                      backward (batch={b}, heads={h}, seq={s}, head_dim={d})"
                 );
             } else if kv_h != h && !gqa_groups_env {
-                eprintln!(
+                crate::nsl_log!(INFO, "flash-bwd", 
                     "[flash-bwd] irregular GQA layout (kv_heads={kv_h} does not divide \
                      heads={h}) — CPU reference backward"
                 );
             } else if kv_h != h && force_gqa_cpu {
-                eprintln!(
+                crate::nsl_log!(WARN, "flash-bwd", 
                     "[flash-bwd] NSL_FLASH_GQA_BWD_CPU=1 — GQA expand-KV GPU backward \
                      disabled; CPU reference backward"
                 );
@@ -6947,7 +6947,7 @@ pub extern "C" fn nsl_flash_attention_backward(
                     return ptr;
                 }
                 if flash_debug {
-                    eprintln!(
+                    crate::nsl_log!(INFO, "flash-bwd", 
                         "[flash-bwd] input `{name}` is a non-contiguous view — \
                          materializing a canonical device copy for the \
                          stride-blind GPU backward kernels"
@@ -7018,7 +7018,7 @@ pub extern "C" fn nsl_flash_attention_backward(
                     reduce_expanded_kv_grads(gpu_result, b, kv_h, groups, s, d);
                 }
                 if flash_debug {
-                    eprintln!(
+                    crate::nsl_log!(INFO, "flash-bwd", 
                         "[flash-bwd] GPU backward dispatched \
                          (batch={b}, heads={h}, kv_heads={kv_h}, seq={s}, head_dim={d}, \
                          causal={is_causal}, blocks=({block_q},{block_kv}))"
@@ -7097,7 +7097,7 @@ pub extern "C" fn nsl_flash_attention_backward(
         // ever appears, keep the old contiguous read but say so loudly.
         let mut canonical = is_canonical_row_major(t);
         if !canonical && strides.iter().any(|&st| st < 0) {
-            eprintln!(
+            crate::nsl_log!(WARN, "flash-bwd", 
                 "[flash-bwd] tensor has negative strides (unsupported) — \
                  reading as contiguous; gradients may be WRONG"
             );
@@ -7130,7 +7130,7 @@ pub extern "C" fn nsl_flash_attention_backward(
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    eprintln!("[flash-bwd] WARNING: GPU tensor but CUDA not enabled");
+                    crate::nsl_log!(WARN, "flash-bwd", "[flash-bwd] WARNING: GPU tensor but CUDA not enabled");
                 }
             } else {
                 for (i, slot) in buf.iter_mut().enumerate() {
@@ -7197,7 +7197,7 @@ pub extern "C" fn nsl_flash_attention_backward(
             // fallback, so be LOUD (unconditional — this must never scroll
             // away) and compute unmasked gradients rather than reading out
             // of bounds: training fails visibly instead of crashing.
-            eprintln!(
+            crate::nsl_log!(WARN, "flash-bwd", 
                 "[flash-bwd] segment_ids tensor has len {} but batch*seq = {} \
                  — IGNORING the segment mask; gradients for this packed \
                  batch are WRONG. This is a compiler dispatch bug.",

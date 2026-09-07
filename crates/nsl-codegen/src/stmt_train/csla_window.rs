@@ -1093,7 +1093,7 @@ impl Compiler<'_> {
                         }
                     })
                     .collect();
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] prefetch double-buffer: {} \
                      (streamed_ranges={streamed_range_count}, gpu={}, accum_window={}, \
                      edges [{}])",
@@ -1108,7 +1108,7 @@ impl Compiler<'_> {
                 );
             }
             if self.compile_options.weight_stream.async_writeback {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] async writeback: {}",
                     if ws_active && streamed_range_count > 0 {
                         "ACTIVE — pack evict DtoH on the transfer stream, mirror \
@@ -1434,7 +1434,7 @@ impl Compiler<'_> {
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(ERROR, "nsl", 
                             "[nsl] csla window backward lowering failed (range {ri}: {}), \
                              rerun without --layerwise-accum",
                             e
@@ -1691,7 +1691,7 @@ impl Compiler<'_> {
             // read — the CADENCE assume/guarantee obligation, discharged.
             if prefetch_active {
                 let total: usize = transfer_cert.iter().map(|(_, _, n)| n).sum();
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] transfer certificate: {} prefetch obligations discharged \
                      ({total} params double-buffered); chain [{}]",
                     transfer_cert.len(),

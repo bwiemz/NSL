@@ -21,6 +21,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   and `WARN` where the entry point returns) are migrated; the stderr path
   allocates nothing, so the out-of-memory line still prints. New dependency
   `tracing` (std only, with `tracing-core`).
+- Runtime logging, step 3 (roadmap C3): the remaining 387 diagnostic
+  `eprintln!` sites in nsl-runtime go through `nsl_log!` — the `[nsl] …`
+  lines (target `nsl`), the `CFIE: …` refusals (`cfie`), FlashAttention
+  (`flash-attention` / `flash-bwd` / the `csha-dump*` probes), the fused
+  losses (`fused-linear-ce`, `fused-kl-ce`), `cuda`, `tensor`,
+  `huggingface`, `safetensors-io`, `grad-integrity`, `param-plan`, … A line
+  that starts with its own `[marker]` uses that marker as its target.
+  Levels: `ERROR` before an abort/exit or for a lost result (a failed
+  launch, a contract violation), `WARN` for a refusal or fallback, `INFO`
+  for reports and traces. stderr is byte-identical; every line now also
+  reaches the `NSL_EVENTS` stream and a host subscriber. Program output
+  (`print.rs`, the tensor printer, the health JSON) stays on `println!`.
+  No `eprintln!` remains in nsl-runtime. The `NSL_EVENTS` sink opens its
+  file (and reports an unopenable path) outside its `OnceLock`
+  initializer, since the warning now reaches the subscriber, which asks the
+  same sink whether to mirror the line.
+- Runtime logging, step 4 (roadmap C3): nsl-codegen's 371 compile-time
+  diagnostic `eprintln!` sites go through `nsl_runtime::nsl_log!` — target
+  `codegen` for the `warning:` / `error:` / `note:` lines, the subsystem
+  otherwise (`autotune`, `ccr`, `source-ad`, `wggo`, `cpdt`, `arena`,
+  `weight-stream`, `fusion-report`, …; a line that starts with its own
+  `[marker]` uses that marker). stderr is byte-identical. The macro reaches
+  `tracing` through a re-export in `nsl_runtime::log`, so a calling crate
+  needs no dependency of its own. The `eprint!` report dumps and the
+  dev-tool binaries under `src/bin/` keep raw prints. The `nsl` CLI now
+  opts its own process out of the `NSL_EVENTS` stream
+  (`nsl_runtime::events::opt_out_this_process`): the stream belongs to the
+  compiled program (one writer per rank), and a compile-time diagnostic
+  mirrored from the compiler would have added a second `seq` sequence.
 
 ### Fixed
 
@@ -95,6 +124,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  autotune flags moved into `AutotuneOptions` (`opts.autotune.{disabled,
+  fresh}` for `--no-autotune` / `--autotune-fresh`) and the weight-aware
+  cluster into `WeightsOptions` (`opts.weights.{file, config, analysis,
+  index_map}`: the `--weights` path, the M52 sparsity / dead-weight /
+  constant-fold config, the `nsl check --weight-analysis` flag and the
+  `@export` weight-index map). Pure rename; defaults unchanged.
+  57 → 51 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the ZeRO
+  knobs moved into `ZeroOptions` (`opts.zero.{stage, elementwise}`, for
+  `--zero-stage` / `--zero-elementwise`). Defaults unchanged (off); the
+  execution fingerprint reads both through the new path, and `Features` /
+  `PlanFeatures` keep their own `zero_stage` / `zero_elementwise` copies.
+  59 → 57 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  imported-model shape channel moved into `ImportedModelOptions`
+  (`opts.imported_model.{field_dims, field_ranks, tensor_fields_without_dims,
+  field_values}` — the dims/ranks/values of model fields declared in imported
+  modules that the multi-file build and `ctor_fold` publish and
+  `entry_points` merges under the entry module's collection). Pure rename;
+  defaults unchanged (all empty). 62 → 59 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the Muon
   knobs moved into `MuonOptions` (`opts.muon.{batch_ns, resident_momentum,
   state_bf16}`, for `--muon-batch-ns` / `--muon-resident-momentum` /

@@ -56,7 +56,7 @@ fn awq_fixture_compile_options(
             type_map: analysis.type_map.clone(),
         },
     ));
-    opts.weight_index_map = analysis.weight_index_map.clone();
+    opts.weights.index_map = analysis.weight_index_map.clone();
     opts
 }
 

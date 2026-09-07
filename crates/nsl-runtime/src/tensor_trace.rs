@@ -471,11 +471,11 @@ pub extern "C" fn nsl_trace_nan_warning(nan_flag: i64, op_type: i64) -> i64 {
             9 => "mean",
             _ => "unknown",
         };
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl", 
             "[nsl] WARNING: NaN/Inf detected in output of '{}' (op_type={})",
             op_name, op_type
         );
-        eprintln!("[nsl]   Run with: nsl debug <trace_file> --find-nan for details");
+        crate::nsl_log!(INFO, "nsl", "[nsl]   Run with: nsl debug <trace_file> --find-nan for details");
     }
     0
 }

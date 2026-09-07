@@ -26,6 +26,10 @@
 //! - Emission is best-effort and NEVER aborts or panics: a training run must
 //!   not die because an events path is unwritable. The first failure prints
 //!   one `[nsl] warning:` line and further emission is disabled.
+//! - The writer is the compiled program (one process per rank). The `nsl`
+//!   CLI, which passes `NSL_EVENTS` through to the program it spawns and
+//!   whose own diagnostics also go through `nsl_log!`, opts itself out with
+//!   [`opt_out_this_process`] so the file has one writer per rank.
 //! - The stderr markers are UNCHANGED, byte for byte, and stay gated by
 //!   their own env vars; `NSL_EVENTS` gates only this file. Both renderings
 //!   are built from a single snapshot of the underlying counters at each
@@ -50,27 +54,56 @@ pub const EVENTS_VERSION: u32 = 1;
 static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static FAILED: AtomicBool = AtomicBool::new(false);
+static OPTED_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Keep this process out of the stream, whatever `NSL_EVENTS` says.
+///
+/// The stream belongs to the compiled program: `seq` is a per-process
+/// counter and `rank` a process identity, so its consumers assume one
+/// writer per rank. The `nsl` CLI calls this first thing in `main` — it
+/// inherits the variable it passes to the program it spawns, and since its
+/// compile-time diagnostics go through `nsl_log!` too, without this the
+/// compiler's `log` events would land in the program's file with a second
+/// `seq` sequence starting at 0 (the events gate pins this). The file is
+/// not opened or created by an opted-out process.
+pub fn opt_out_this_process() {
+    OPTED_OUT.store(true, Ordering::Relaxed);
+}
 
 fn sink() -> &'static Option<Mutex<std::fs::File>> {
-    SINK.get_or_init(|| {
-        let path = std::env::var("NSL_EVENTS").ok()?;
-        if path.is_empty() {
-            return None;
-        }
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Some(s) = SINK.get() {
+        return s;
+    }
+    // The open happens OUTSIDE the `OnceLock` initializer, and so does the
+    // warning: `nsl_log!` dispatches to the subscriber, which asks
+    // `enabled()` → `sink()` whether to mirror the line into this stream,
+    // and a `get_or_init` that re-enters itself from its own closure blocks
+    // forever (a compiled program whose `NSL_EVENTS` points at an
+    // unopenable path used to hang on its first diagnostic line). A racing
+    // second initializer just drops its extra append-mode handle.
+    let mut failure = None;
+    let opened = match std::env::var("NSL_EVENTS").ok().filter(|p| !p.is_empty()) {
+        None => None,
+        Some(path) => match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => Some(Mutex::new(f)),
             Err(e) => {
-                eprintln!("[nsl] warning: NSL_EVENTS={path} could not be opened ({e}); events disabled");
+                failure = Some((path, e));
                 None
             }
-        }
-    })
+        },
+    };
+    let first = SINK.set(opened).is_ok();
+    let out = SINK.get().expect("SINK is set above");
+    if let (true, Some((path, e))) = (first, failure) {
+        crate::nsl_log!(WARN, "nsl", "[nsl] warning: NSL_EVENTS={path} could not be opened ({e}); events disabled");
+    }
+    out
 }
 
 /// True when `NSL_EVENTS` is set to a writable path. Callers use this to
 /// decide whether to take a snapshot at all on hot paths.
 pub fn enabled() -> bool {
-    sink().is_some() && !FAILED.load(Ordering::Relaxed)
+    !OPTED_OUT.load(Ordering::Relaxed) && sink().is_some() && !FAILED.load(Ordering::Relaxed)
 }
 
 /// This process's rank for the event envelope: `NSL_LOCAL_RANK`, 0 when
@@ -90,6 +123,9 @@ fn rank() -> i64 {
 /// Best-effort: errors disable the stream with one warning, never panic —
 /// this runs inside `extern "C"` atexit hooks where unwinding aborts.
 pub fn emit(kind: &str, step: Option<i64>, fields: &[(&str, serde_json::Value)]) {
+    if OPTED_OUT.load(Ordering::Relaxed) {
+        return;
+    }
     let Some(file) = sink() else { return };
     if FAILED.load(Ordering::Relaxed) {
         return;
@@ -121,7 +157,7 @@ pub fn emit(kind: &str, step: Option<i64>, fields: &[(&str, serde_json::Value)])
         Err(_) => true,
     };
     if write_failed && !FAILED.swap(true, Ordering::Relaxed) {
-        eprintln!("[nsl] warning: NSL_EVENTS write failed; events disabled for the rest of the run");
+        crate::nsl_log!(WARN, "nsl", "[nsl] warning: NSL_EVENTS write failed; events disabled for the rest of the run");
     }
 }
 

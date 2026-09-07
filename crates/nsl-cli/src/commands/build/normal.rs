@@ -118,7 +118,7 @@ fn run_build_single(
     options.checkpoint.policies = crate::pipeline::analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
-    options.weight_index_map = analysis.weight_index_map.clone();
+    options.weights.index_map = analysis.weight_index_map.clone();
     // Item 5: constructor-argument folding — dims for parameterized
     // submodule weights (`randn([d_model, d_ff])` under `Ctor(512, 1408)`),
     // which literal-only collection cannot derive. Routed through the
@@ -126,9 +126,9 @@ fn run_build_single(
     // local collection.
     nsl_codegen::ctor_fold::fold_constructor_dims(&[&parse_result.module], &interner)
         .merge_into(
-            &mut options.imported_model_field_dims,
-            &mut options.imported_model_field_values,
-            &mut options.imported_tensor_fields_without_dims,
+            &mut options.imported_model.field_dims,
+            &mut options.imported_model.field_values,
+            &mut options.imported_model.tensor_fields_without_dims,
         );
     let options = &options;
 
@@ -460,11 +460,11 @@ fn run_build_multi(
                 &mut imported_model_field_values,
                 &mut imported_tensor_fields_without_dims,
             );
-            entry_options.imported_model_field_dims = imported_model_field_dims;
-            entry_options.imported_model_field_ranks = imported_model_field_ranks;
-            entry_options.imported_tensor_fields_without_dims =
+            entry_options.imported_model.field_dims = imported_model_field_dims;
+            entry_options.imported_model.field_ranks = imported_model_field_ranks;
+            entry_options.imported_model.tensor_fields_without_dims =
                 imported_tensor_fields_without_dims;
-            entry_options.imported_model_field_values = imported_model_field_values;
+            entry_options.imported_model.field_values = imported_model_field_values;
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(

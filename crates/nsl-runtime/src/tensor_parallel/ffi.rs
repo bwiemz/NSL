@@ -80,7 +80,7 @@ pub extern "C" fn nsl_tp_init() -> i64 {
         .map(|v| v == "1")
         .unwrap_or(true);
     if !simulated && world_size > 1 {
-        eprintln!(
+        crate::nsl_log!(WARN, "tensor-parallel", 
             "nsl_tp_init: NSL_SIMULATED_TP=0 requests a real collective \
              backend, but no NCCL/inter-device transport is built into \
              this runtime — refusing rather than silently simulating. \

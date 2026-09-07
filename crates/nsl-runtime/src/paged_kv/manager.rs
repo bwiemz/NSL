@@ -246,7 +246,7 @@ pub extern "C" fn nsl_kv_cache_init(
         num_layers as usize,
     );
     if compress_scheme > 0 {
-        eprintln!(
+        crate::nsl_log!(INFO, "nsl-runtime", 
             "[nsl-runtime] KV cache compression: scheme={}, window={}, sinks={}",
             compress_scheme, compress_window, compress_sinks
         );
@@ -285,7 +285,7 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
             num_layers as usize,
         );
         if compress_scheme > 0 {
-            eprintln!(
+            crate::nsl_log!(INFO, "nsl-runtime", 
                 "[nsl-runtime] KV cache compression (GPU): scheme={}, window={}, sinks={}",
                 compress_scheme, compress_window, compress_sinks
             );

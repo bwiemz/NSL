@@ -1457,7 +1457,7 @@ mod item8_gpu_bench {
     #[ignore = "requires CUDA GPU"]
     fn unaligned_parameter_lengths_are_numerically_correct() {
         if unsafe { nsl_cuda_init() } != 0 {
-            eprintln!("skipping: no CUDA device");
+            crate::nsl_log!(WARN, "fase-step", "skipping: no CUDA device");
             return;
         }
         // Deliberately awkward: 1 element, one short of a block, one over a
@@ -1551,7 +1551,7 @@ mod item8_gpu_bench {
     #[ignore = "requires CUDA GPU"]
     fn flat_grid_multi_adamw_step_at_coder50m_shapes() {
         if unsafe { nsl_cuda_init() } != 0 {
-            eprintln!("skipping: no CUDA device");
+            crate::nsl_log!(WARN, "fase-step", "skipping: no CUDA device");
             return;
         }
         let lens = coder50m_param_lens();
@@ -1600,7 +1600,7 @@ mod item8_gpu_bench {
         let block = 256u32;
         let useful: u64 = lens.iter().map(|&n| n.div_ceil(block) as u64).sum();
         let rectangular = (*lens.iter().max().unwrap()).div_ceil(block) as u64 * k as u64;
-        eprintln!(
+        crate::nsl_log!(INFO, "fase-step", 
             "multi AdamW @ Coder-50M: k={k}, {total} elems\n  \
              flat grid  : {useful} blocks\n  \
              rectangular: {rectangular} blocks ({:.1}x more)\n  \

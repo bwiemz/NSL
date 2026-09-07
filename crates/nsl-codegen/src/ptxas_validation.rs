@@ -161,7 +161,7 @@ mod tests {
         match validate_ptx(ptx) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                eprintln!(
+                nsl_runtime::nsl_log!(INFO, "skip", 
                     "[skip] validates_trivial_valid_ptx: no validator available: {msg}"
                 );
             }
@@ -183,7 +183,7 @@ mod tests {
 "#;
         match validate_ptx(ptx) {
             Err(msg) if msg.contains("nvcc not available") => {
-                eprintln!("[skip] rejects_invalid_ptx: no validator available: {msg}");
+                nsl_runtime::nsl_log!(WARN, "skip", "[skip] rejects_invalid_ptx: no validator available: {msg}");
             }
             Err(_) => {} // expected — ptxas rejects it
             Ok(()) => panic!("expected invalid PTX to be rejected, but it validated"),

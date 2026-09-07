@@ -559,10 +559,10 @@ pub extern "C" fn nsl_sr_bf16_hist_report() {
     }
     let h = SR_HIST.lock().unwrap();
     if h.sampled == 0 {
-        eprintln!("[sr-hist] enabled but nothing sampled (no mirrored steps ran)");
+        crate::nsl_log!(INFO, "sr-hist", "[sr-hist] enabled but nothing sampled (no mirrored steps ran)");
         return;
     }
-    eprintln!(
+    crate::nsl_log!(INFO, "sr-hist", 
         "[sr-hist] |dtheta| over {} sampled element-updates across {} step-param launches:",
         h.sampled, h.steps
     );
@@ -570,14 +570,14 @@ pub extern "C" fn nsl_sr_bf16_hist_report() {
         if c == 0 {
             continue;
         }
-        eprintln!(
+        crate::nsl_log!(INFO, "sr-hist", 
             "[sr-hist]   2^{:>3} : {:>12}  ({:.3}%)",
             i as i32 - 48,
             c,
             100.0 * c as f64 / h.sampled as f64
         );
     }
-    eprintln!(
+    crate::nsl_log!(INFO, "sr-hist", 
         "[sr-hist]   stalled (bf16 bits unchanged — includes exactly-zero f32 \
          updates, e.g. untouched embedding rows): {} ({:.3}%)",
         h.stalled,
@@ -1085,7 +1085,7 @@ pub extern "C" fn nsl_muon_state_sr_store(
         );
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!("[muon-state] GPU SR store requires the cuda feature");
+            crate::nsl_log!(ERROR, "muon-state", "[muon-state] GPU SR store requires the cuda feature");
             std::process::abort();
         }
     } else {
@@ -1102,7 +1102,7 @@ pub extern "C" fn nsl_muon_state_sr_store(
         }
     }
     if MUON_STATE_SR_STORES.fetch_add(1, Ordering::Relaxed) == 0 {
-        eprintln!(
+        crate::nsl_log!(INFO, "muon-state", 
             "[muon-state] bf16 momentum active: f32 working buffer + \
              counter-based SR store (item 18 rung 2)"
         );

@@ -157,7 +157,7 @@ impl PipelineContextPool {
                 self.available.push_back(idx);
             }
             Err(reason) => {
-                eprintln!(
+                crate::nsl_log!(INFO, "m56-pool", 
                     "[m56 pool] reset failure on context {}: {}. \
                      Slot tombstoned; effective pool size now {}.",
                     idx,

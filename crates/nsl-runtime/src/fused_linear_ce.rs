@@ -107,7 +107,7 @@ fn refuse_non_f32_if_unsafe(dtype_tag: i64, ffi_name: &str) -> bool {
     if std::env::var_os("NSL_FUSED_LCE_REFUSE_NON_F32").is_none() {
         return false;
     }
-    eprintln!(
+    crate::nsl_log!(WARN, "fused-linear-ce", 
         "{ffi_name}: NSL_FUSED_LCE_REFUSE_NON_F32=1 set; refusing \
          dtype_tag={dtype_tag}.  The v7 production path is now safe by \
          default (GPU PTX cast kernel + RTE rounding + wengert-inserted \
@@ -129,7 +129,7 @@ fn warn_on_legacy_env_once() {
     static WARNED: Once = Once::new();
     WARNED.call_once(|| {
         if std::env::var_os("NSL_FUSED_LCE_ALLOW_NON_F32_FFI").is_some() {
-            eprintln!(
+            crate::nsl_log!(WARN, "fused-linear-ce", 
                 "nsl_fused_linear_ce: legacy env var \
                  NSL_FUSED_LCE_ALLOW_NON_F32_FFI is set but has NO effect \
                  under CFTP v7 — the v6 default-on FFI refusal was lifted \
@@ -417,7 +417,7 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
         1 => ("@fused_kl_ce student shape-hint pin (hidden_size)", "hidden_size"),
         2 => ("@fused_kl_ce teacher shape-hint pin (teacher_hidden)", "teacher_hidden"),
         other => {
-            eprintln!(
+            crate::nsl_log!(ERROR, "fused-linear-ce", 
                 "nsl_fused_lce_pin_hint_extents: unknown site code {other} — \
                  the emit_fused_lce_hint_pin helper and this match are out of \
                  sync; refusing rather than misattributing the diagnostic"
@@ -427,7 +427,7 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
     };
     let extents_of = |ptr: i64, what: &str| -> Extents {
         if ptr == 0 {
-            eprintln!("{site}: null {what} tensor");
+            crate::nsl_log!(ERROR, "fused-linear-ce", "{site}: null {what} tensor");
             std::process::abort();
         }
         // NOT `NslTensor::from_ptr_ref`: that would abort with the generic
@@ -436,7 +436,7 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
         // tensor — which is the mistake that actually happens here.
         let t = unsafe { &*(ptr as *const crate::tensor::NslTensor) };
         if t.magic != crate::tensor::TENSOR_MAGIC {
-            eprintln!(
+            crate::nsl_log!(INFO, "fused-linear-ce", 
                 "{site}: {what} is not an NslTensor handle (magic \
                  0x{:08X} at 0x{ptr:X}, expected 0x{:08X}). The pin needs \
                  the tensor, not the `nsl_tensor_data_ptr` result the \
@@ -457,10 +457,10 @@ pub extern "C" fn nsl_fused_lce_pin_hint_extents(
     let w = extents_of(w_tensor_ptr, "LM-head weight (W)");
     if let Err(msg) = check_hint_extents(site, h_name, &x, &w, batch, seq, v, h) {
         if hint_pin_disabled() {
-            eprintln!("{msg}\n{site}: NSL_FUSED_LCE_HINT_PIN=0 set — continuing anyway.");
+            crate::nsl_log!(ERROR, "fused-linear-ce", "{msg}\n{site}: NSL_FUSED_LCE_HINT_PIN=0 set — continuing anyway.");
             return;
         }
-        eprintln!("{msg}");
+        crate::nsl_log!(ERROR, "fused-linear-ce", "{msg}");
         std::process::abort();
     }
 }
@@ -795,7 +795,7 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
     expected_rows: i64,
 ) -> i64 {
     if tensor_ptr == 0 {
-        eprintln!("nsl_fused_lce_targets_i64_alloc: null tensor");
+        crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_lce_targets_i64_alloc: null tensor");
         std::process::abort();
     }
     // The length pin is a device-path guard; the no-cuda build never stages.
@@ -806,7 +806,7 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
         let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
         let n = t.len as usize;
         if expected_rows > 0 && t.len != expected_rows {
-            eprintln!(
+            crate::nsl_log!(WARN, "fused-linear-ce", 
                 "nsl_fused_lce_targets_i64_alloc: label tensor has {} entries \
                  but the @fused_lm_ce decorator pins batch_size * seq_len = \
                  {expected_rows}. The loss flatten and the decorator hints \
@@ -835,7 +835,7 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
                 dense_extent += st * (dim - 1).max(0);
             }
             if has_zero_stride || dense_extent != t.len {
-                eprintln!(
+                crate::nsl_log!(INFO, "fused-linear-ce", 
                     "nsl_fused_lce_targets_i64_alloc: non-contiguous label \
                      tensor (dense extent {dense_extent} vs len {}, \
                      zero-stride={has_zero_stride}) — call .contiguous() \
@@ -882,7 +882,7 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
                 s.iter().map(|&v| v as i64).collect()
             }
             (dev, dt) => {
-                eprintln!(
+                crate::nsl_log!(ERROR, "fused-linear-ce", 
                     "nsl_fused_lce_targets_i64_alloc: unsupported label tensor \
                      form (device={dev} dtype={dt})"
                 );
@@ -899,7 +899,7 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        eprintln!("nsl_fused_lce_targets_i64_alloc: compiled without cuda feature");
+        crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_lce_targets_i64_alloc: compiled without cuda feature");
         std::process::abort();
     }
 }
@@ -965,7 +965,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
             smem_bytes as u32,
         );
         if rc != 0 {
-            eprintln!(
+            crate::nsl_log!(ERROR, "fused-linear-ce", 
                 "nsl_fused_linear_ce_forward: CUDA launch failed rc={}",
                 rc
             );
@@ -982,7 +982,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
     {
         let _ = (ptx_ptr, kname_ptr, x_ptr, w_ptr, bias_ptr, targets_ptr,
                  loss_out_ptr, lse_out_ptr, b, s, v, h, smem_bytes);
-        eprintln!("nsl_fused_linear_ce_forward: compiled without cuda feature");
+        crate::nsl_log!(WARN, "fused-linear-ce", "nsl_fused_linear_ce_forward: compiled without cuda feature");
         -1
     }
 }
@@ -1073,7 +1073,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
             smem_bytes as u32,
         );
         if rc != 0 {
-            eprintln!("nsl_fused_linear_ce_forward_large: CUDA launch failed rc={rc}");
+            crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_linear_ce_forward_large: CUDA launch failed rc={rc}");
             return -(rc as i64);
         }
         crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
@@ -1088,7 +1088,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
             loss_out_ptr, lse_out_ptr,
             b, s, v, h, num_tiles, smem_bytes,
         );
-        eprintln!("nsl_fused_linear_ce_forward_large: compiled without cuda feature");
+        crate::nsl_log!(WARN, "fused-linear-ce", "nsl_fused_linear_ce_forward_large: compiled without cuda feature");
         -1
     }
 }
@@ -1173,7 +1173,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
             smem_bytes as u32,
         );
         if rc != 0 {
-            eprintln!(
+            crate::nsl_log!(ERROR, "fused-linear-ce", 
                 "nsl_fused_linear_ce_backward: CUDA launch failed rc={}",
                 rc
             );
@@ -1189,7 +1189,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
         let _ = (ptx_ptr, kname_ptr, grad_output, x_ptr, w_ptr, bias_ptr,
                  targets_ptr, lse_ptr, dx_out_ptr, dw_out_ptr, dbias_out_ptr,
                  b, s, v, h, num_valid, smem_bytes);
-        eprintln!("nsl_fused_linear_ce_backward: compiled without cuda feature");
+        crate::nsl_log!(WARN, "fused-linear-ce", "nsl_fused_linear_ce_backward: compiled without cuda feature");
         -1
     }
 }
@@ -1234,7 +1234,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_gemm(
             has_bias != 0,
         );
         if rc != 0 {
-            eprintln!("nsl_fused_linear_ce_forward_gemm: failed rc={rc}");
+            crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_linear_ce_forward_gemm: failed rc={rc}");
             return -(rc as i64);
         }
         crate::cuda::inner::sync_after_kernel();
@@ -1247,7 +1247,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_gemm(
             x_ptr, w_ptr, bias_ptr, targets_ptr, loss_out_ptr, lse_out_ptr, b, s, v, h,
             has_bias,
         );
-        eprintln!("nsl_fused_linear_ce_forward_gemm: compiled without cuda feature");
+        crate::nsl_log!(WARN, "fused-linear-ce", "nsl_fused_linear_ce_forward_gemm: compiled without cuda feature");
         -1
     }
 }
@@ -1299,7 +1299,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward_gemm(
             has_bias != 0,
         );
         if rc != 0 {
-            eprintln!("nsl_fused_linear_ce_backward_gemm: failed rc={rc}");
+            crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_linear_ce_backward_gemm: failed rc={rc}");
             return -(rc as i64);
         }
         crate::cuda::inner::sync_after_kernel();
@@ -1312,7 +1312,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward_gemm(
             grad_output, x_ptr, w_ptr, bias_ptr, targets_ptr, lse_ptr, dx_out_ptr,
             dw_out_ptr, dbias_out_ptr, b, s, v, h, num_valid, has_bias,
         );
-        eprintln!("nsl_fused_linear_ce_backward_gemm: compiled without cuda feature");
+        crate::nsl_log!(WARN, "fused-linear-ce", "nsl_fused_linear_ce_backward_gemm: compiled without cuda feature");
         -1
     }
 }
