@@ -232,7 +232,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
             .filter(|w| *w == needle)
             .count();
         if saved_param_count != tensors.len as usize {
-            eprintln!(
+            crate::nsl_log!(WARN, "nsl", 
                 "[nsl] WARNING: checkpoint has {} params but model expects {} params; \
                  weights may be mismatched",
                 saved_param_count, tensors.len
@@ -760,14 +760,14 @@ pub extern "C" fn nsl_train_checkpoint_save(
         std::process::abort();
     }
     if dl_ptr != 0 {
-        eprintln!(
+        crate::nsl_log!(INFO, "checkpoint", 
             "[checkpoint] saved: {path} (+.optim) at micro-batch step \
              {step_count} ({} params, epoch {train_epoch} loader slot \
              {loader_slot})",
             m_list.len
         );
     } else {
-        eprintln!(
+        crate::nsl_log!(INFO, "checkpoint", 
             "[checkpoint] saved: {path} (+.optim) at micro-batch step {step_count} \
              ({} params)",
             m_list.len
@@ -917,7 +917,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // ── Item 8: the resume block, parsed and VALIDATED here; applied only
     // after every other check has passed (validate-before-mutate).
     let resume = if is_v1 {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl", 
             "[nsl] WARNING: '{optim_path}' is a v1 sidecar — it carries θ, \
              AdamW moments and the step counter, but NOT the data position \
              or the RNG state. This resume restarts the DataLoader at epoch \
@@ -1326,7 +1326,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
                     r.loader_slot as i64,
                 );
             }
-            eprintln!(
+            crate::nsl_log!(INFO, "checkpoint", 
                 "[checkpoint] resumed: {path} (+.optim) at micro-batch step \
                  {step_count} ({} params, epoch {} loader slot {})",
                 m_list.len, r.train_epoch, r.loader_slot
@@ -1337,7 +1337,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             // reset the published epoch so a v1 load after a v2 load in the
             // same process cannot inherit the v2 value.
             RESUME_TRAIN_EPOCH.store(0, std::sync::atomic::Ordering::SeqCst);
-            eprintln!(
+            crate::nsl_log!(INFO, "checkpoint", 
                 "[checkpoint] resumed: {path} (+.optim) at micro-batch step {step_count} \
                  ({} params)",
                 m_list.len

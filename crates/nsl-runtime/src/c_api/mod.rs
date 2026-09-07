@@ -209,7 +209,7 @@ pub(crate) fn set_error_cstring(cstr: std::ffi::CString) {
 
 fn capi_trace(msg: impl AsRef<str>) {
     if std::env::var_os("NSL_CAPI_TRACE").is_some() {
-        eprintln!("[nsl-capi] {}", msg.as_ref());
+        crate::nsl_log!(INFO, "nsl-capi", "[nsl-capi] {}", msg.as_ref());
     }
 }
 

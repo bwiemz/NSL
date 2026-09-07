@@ -52,19 +52,33 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 static FAILED: AtomicBool = AtomicBool::new(false);
 
 fn sink() -> &'static Option<Mutex<std::fs::File>> {
-    SINK.get_or_init(|| {
-        let path = std::env::var("NSL_EVENTS").ok()?;
-        if path.is_empty() {
-            return None;
-        }
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Some(s) = SINK.get() {
+        return s;
+    }
+    // The open happens OUTSIDE the `OnceLock` initializer, and so does the
+    // warning: `nsl_log!` dispatches to the subscriber, which asks
+    // `enabled()` → `sink()` whether to mirror the line into this stream,
+    // and a `get_or_init` that re-enters itself from its own closure blocks
+    // forever (a compiled program whose `NSL_EVENTS` points at an
+    // unopenable path used to hang on its first diagnostic line). A racing
+    // second initializer just drops its extra append-mode handle.
+    let mut failure = None;
+    let opened = match std::env::var("NSL_EVENTS").ok().filter(|p| !p.is_empty()) {
+        None => None,
+        Some(path) => match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => Some(Mutex::new(f)),
             Err(e) => {
-                eprintln!("[nsl] warning: NSL_EVENTS={path} could not be opened ({e}); events disabled");
+                failure = Some((path, e));
                 None
             }
-        }
-    })
+        },
+    };
+    let first = SINK.set(opened).is_ok();
+    let out = SINK.get().expect("SINK is set above");
+    if let (true, Some((path, e))) = (first, failure) {
+        crate::nsl_log!(WARN, "nsl", "[nsl] warning: NSL_EVENTS={path} could not be opened ({e}); events disabled");
+    }
+    out
 }
 
 /// True when `NSL_EVENTS` is set to a writable path. Callers use this to
@@ -121,7 +135,7 @@ pub fn emit(kind: &str, step: Option<i64>, fields: &[(&str, serde_json::Value)])
         Err(_) => true,
     };
     if write_failed && !FAILED.swap(true, Ordering::Relaxed) {
-        eprintln!("[nsl] warning: NSL_EVENTS write failed; events disabled for the rest of the run");
+        crate::nsl_log!(WARN, "nsl", "[nsl] warning: NSL_EVENTS write failed; events disabled for the rest of the run");
     }
 }
 

@@ -429,7 +429,7 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
         unsafe {
             let result = cuCtxSynchronize();
             if result != CUresult::CUDA_SUCCESS {
-                eprintln!(
+                crate::nsl_log!(WARN, "nsl", 
                     "[nsl] WARNING: CUDA deferred error detected at tape_start: {:?}\n\
                      A prior GPU operation failed. Re-run with --cuda-sync to identify it.",
                     result

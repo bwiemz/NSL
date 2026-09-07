@@ -776,7 +776,7 @@ pub extern "C" fn nsl_dataloader_reset(dl_ptr: i64) {
             // replay. Yield an empty epoch rather than clamping to the last
             // batch (which would train on it a second time) — the epoch loop
             // then moves on to the next epoch, freshly permuted.
-            eprintln!(
+            crate::nsl_log!(INFO, "checkpoint", 
                 "[checkpoint] resume slot {slot} is at/after this epoch's \
                  {} batches — resuming at the next epoch boundary",
                 dl.total_batches

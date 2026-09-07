@@ -151,7 +151,7 @@ fn fault_injected_flags(idx: i64, flags: i64) -> i64 {
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok());
         if let Some(t) = t {
-            eprintln!(
+            crate::nsl_log!(ERROR, "param-plan", 
                 "[param-plan] FAULT INJECTION ACTIVE (NSL_PARAM_PLAN_FAULT={t}): \
                  parameter {t}'s declared plan will be corrupted on purpose. \
                  This is a test hook; never set it for a real run."
@@ -181,7 +181,7 @@ pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) 
     }
     let flags = fault_injected_flags(idx, flags);
     if flags & !PLAN_KNOWN_BITS != 0 {
-        eprintln!(
+        crate::nsl_log!(ERROR, "param-plan", 
             "[param-plan] FATAL: parameter {idx} declared with unknown plan \
              bits {:#x} (known {:#x}) — the codegen and runtime plan encodings \
              have drifted",
@@ -196,7 +196,7 @@ pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) 
     // hand-built CompileOptions caller can still trip it.
     if flags & PLAN_STREAMED == 0 && flags & (PLAN_BF16_SR | PLAN_SHARDED | PLAN_ELEMENTWISE) != 0
     {
-        eprintln!(
+        crate::nsl_log!(ERROR, "param-plan", 
             "[param-plan] FATAL: parameter {idx} declared with a storage mode \
              ({:#x}) but not STREAMED — bf16-sr and zero-3 residency only \
              exist for registered parameters",
@@ -207,7 +207,7 @@ pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) 
     // Item 11: ELEMENTWISE refines the zero-3 backend — without SHARDED it
     // names no backend at all.
     if flags & PLAN_ELEMENTWISE != 0 && flags & PLAN_SHARDED == 0 {
-        eprintln!(
+        crate::nsl_log!(ERROR, "param-plan", 
             "[param-plan] FATAL: parameter {idx} declared ELEMENTWISE without \
              SHARDED — elementwise sharding is a refinement of the zero-3 \
              backend, not a backend"
@@ -236,7 +236,7 @@ pub extern "C" fn nsl_param_plan_verify() -> i64 {
             // reporting a clean bill of health.
             _ => {
                 if PLAN_VERIFIES.fetch_add(1, Ordering::Relaxed) == 0 {
-                    eprintln!(
+                    crate::nsl_log!(INFO, "param-plan", 
                         "[param-plan] verify called with an empty plan — nothing \
                          was declared, so nothing was checked"
                     );
@@ -280,7 +280,7 @@ pub extern "C" fn nsl_param_plan_verify() -> i64 {
         // drifts mid-run is caught) but only the FIRST clean result is
         // printed — otherwise a 500-step run buries its own stderr.
         if first {
-            eprintln!(
+            crate::nsl_log!(INFO, "param-plan", 
                 "[param-plan] verified {} parameter(s): {} resident, {} host-mirrored, \
                  {} bf16-sr, {} sharded",
                 snapshot.len(),
@@ -293,7 +293,7 @@ pub extern "C" fn nsl_param_plan_verify() -> i64 {
         return 0;
     }
     mismatches.sort_by_key(|(idx, _)| *idx);
-    eprintln!(
+    crate::nsl_log!(ERROR, "param-plan", 
         "[param-plan] FATAL: {} of {} parameter(s) did not land in the backend \
          the compiled plan named. The run would train storage the certification \
          does not describe.\n{}",

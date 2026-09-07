@@ -422,7 +422,7 @@ extern "C" fn nsl_csla_window_count_atexit() {
         &[("window_backward_phases", crate::events::i(phases))],
     );
     if std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
-        eprintln!("[csla] window backward phases: {phases}");
+        crate::nsl_log!(INFO, "csla", "[csla] window backward phases: {phases}");
     }
 }
 
@@ -527,14 +527,14 @@ extern "C" fn nsl_wgrad_count_atexit() {
         ],
     );
     if std::env::var("NSL_WGRAD_COUNTER").ok().as_deref() == Some("1") {
-        eprintln!("[wgrad-accum] fused GEMM: {fused}, decomposed fallback: {fallback}");
+        crate::nsl_log!(WARN, "wgrad-accum", "[wgrad-accum] fused GEMM: {fused}, decomposed fallback: {fallback}");
     }
 }
 
 extern "C" fn nsl_gpu_mem_report_atexit() {
     let epilog_frees = crate::tensor::nsl_debug_epilog_free_count();
-    eprintln!("--- GPU memory report ---");
-    eprintln!("epilog_frees_total: {epilog_frees}");
+    crate::nsl_log!(INFO, "args", "--- GPU memory report ---");
+    crate::nsl_log!(INFO, "args", "epilog_frees_total: {epilog_frees}");
     #[cfg(feature = "cuda")]
     {
         // Print live caching-allocator block summary (step=0 so it prints).

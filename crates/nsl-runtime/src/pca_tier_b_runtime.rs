@@ -94,7 +94,7 @@ pub fn assert_tier_b_sentinels(
     tier_b_name_ptr: i64,
 ) {
     if (tier_b_ptx_ptr == 0) != (tier_b_name_ptr == 0) {
-        eprintln!(
+        crate::nsl_log!(ERROR, "pca-tier-b-runtime", 
             "FATAL [{entry_point}]: tier_b_ptx_ptr={tier_b_ptx_ptr:#x} but \
              tier_b_name_ptr={tier_b_name_ptr:#x}; sentinel pair must agree \
              (both zero = disabled, both non-zero = enabled). Call site emitted \

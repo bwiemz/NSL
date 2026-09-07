@@ -459,7 +459,7 @@ pub extern "C" fn nsl_packed_batch_align_device(dict_ptr: i64, param_list_ptr: i
 
         let mut moved = 0i64;
         if std::env::var("NSL_ALIGN_DEBUG").is_ok() {
-            eprintln!("[align-debug] fired: first_param_device={}", NslTensor::from_ptr(first_param).device);
+            crate::nsl_log!(INFO, "align-debug", "[align-debug] fired: first_param_device={}", NslTensor::from_ptr(first_param).device);
         }
         for key in ["attention_mask", "segment_ids", "position_ids"] {
             let k = nsl_str_from_rust(key);
@@ -470,7 +470,7 @@ pub extern "C" fn nsl_packed_batch_align_device(dict_ptr: i64, param_list_ptr: i
                 let old_ptr = crate::dict::nsl_dict_get_str(dict_ptr, k);
                 if std::env::var("NSL_ALIGN_DEBUG").is_ok() && old_ptr != 0 {
                     let t = NslTensor::from_ptr(old_ptr);
-                    eprintln!("[align-debug] {key}: device={} dtype={}", t.device, t.dtype);
+                    crate::nsl_log!(INFO, "align-debug", "[align-debug] {key}: device={} dtype={}", t.device, t.dtype);
                 }
                 if old_ptr != 0 && NslTensor::from_ptr(old_ptr).device == 0 {
                     let gpu_ptr = crate::tensor::nsl_tensor_to_device(old_ptr, 1);
