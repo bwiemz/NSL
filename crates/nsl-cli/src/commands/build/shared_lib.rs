@@ -426,11 +426,11 @@ fn run_build_shared_multi(
                 &mut imported_model_field_values,
                 &mut imported_tensor_fields_without_dims,
             );
-            entry_options.imported_model_field_dims = imported_model_field_dims;
-            entry_options.imported_model_field_ranks = imported_model_field_ranks;
-            entry_options.imported_tensor_fields_without_dims =
+            entry_options.imported_model.field_dims = imported_model_field_dims;
+            entry_options.imported_model.field_ranks = imported_model_field_ranks;
+            entry_options.imported_model.tensor_fields_without_dims =
                 imported_tensor_fields_without_dims;
-            entry_options.imported_model_field_values = imported_model_field_values;
+            entry_options.imported_model.field_values = imported_model_field_values;
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(

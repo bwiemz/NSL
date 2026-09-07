@@ -593,10 +593,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
                 // come from `collect_models` directly.
-                imported_model_field_dims: Default::default(),
-                imported_model_field_ranks: Default::default(),
-                imported_tensor_fields_without_dims: Default::default(),
-                imported_model_field_values: Default::default(),
+                imported_model: Default::default(),
                 // Item 4: unset means off. `--pretrain-optimized` has already
                 // filled `auto` above, so an explicit `off` reaching here is a
                 // decision the bundle deliberately did not override.

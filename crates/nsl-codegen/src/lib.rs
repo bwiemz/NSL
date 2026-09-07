@@ -1516,6 +1516,43 @@ pub struct MuonOptions {
     pub state_bf16: bool,
 }
 
+/// Shape and value facts about model fields declared in IMPORTED modules,
+/// keyed `model_type -> field_name`.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). The four maps are
+/// one channel: the CLI's multi-file build fills them from the imported
+/// modules' ASTs (plus `ctor_fold`, which merges into the same maps), and
+/// `entry_points` merges them field-level under the entry module's own
+/// collection. Carried on the options rather than as positional parameters
+/// to a twelve-argument `compile_entry_returning_plan`, matching how
+/// `csha_configs` and `checkpoint_policies` already reach it.
+#[derive(Clone, Default)]
+pub struct ImportedModelOptions {
+    /// Item 4: literal dims of model fields declared in imported modules.
+    ///
+    /// `collect_models` only sees the entry module's AST, and the multi-file
+    /// build path propagated `model_field_types` but never the dims/ranks.
+    /// Every real model lives in its own `model.nsl` and is imported, so the
+    /// fused LM head of every real model was invisible to both the CFTP v10
+    /// rank guard (which treats an absent rank as "fire", so it was silently
+    /// inoperative on exactly the MoE-expert-stack case it was written for)
+    /// and to item 4's dims lookup.
+    pub field_dims: std::collections::HashMap<String, std::collections::HashMap<String, Vec<i64>>>,
+    /// See [`Self::field_dims`].
+    pub field_ranks: std::collections::HashMap<String, std::collections::HashMap<String, usize>>,
+    /// The veto companion to [`Self::field_dims`]: bare names of imported
+    /// tensor fields whose dims could NOT be derived. Without this,
+    /// `unique_field_elems`/`unique_field_dims` let a derivable same-named
+    /// field in one model win uncontested over an underivable twin in an
+    /// imported model — sizing it wrong instead of not at all.
+    pub tensor_fields_without_dims: std::collections::HashSet<String>,
+    /// Constructor-folded VALUES of 1-element config fields — the runtime
+    /// `int(self._n_heads.item())` reads these back, so the arena's shape
+    /// propagation needs them to fold attention reshape targets.
+    pub field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+}
+
 /// Dev-tools options: the kernel profiler, the health monitor and
 /// `@inspect` emission.
 ///
@@ -1644,20 +1681,6 @@ pub struct CompileOptions {
     /// Forced `Off` under `--training-reference`, alongside the decorator, so
     /// the reference arm's numerics stay a single composite path.
     pub lm_head_fusion: crate::lm_head_inference::LmHeadFusion,
-    /// Item 4: literal dims and ranks of model fields declared in IMPORTED
-    /// modules, `model_type -> field_name -> dims|rank`.
-    ///
-    /// `collect_models` only sees the entry module's AST, and the multi-file
-    /// build path propagated `model_field_types` but never these two. Every
-    /// real model lives in its own `model.nsl` and is imported, so the fused
-    /// LM head of every real model was invisible to both the CFTP v10 rank
-    /// guard (which treats an absent rank as "fire", so it was silently
-    /// inoperative on exactly the MoE-expert-stack case it was written for)
-    /// and to item 4's dims lookup.
-    ///
-    /// Carried on the options rather than as two more positional parameters
-    /// to a twelve-argument `compile_entry_returning_plan`, matching how
-    /// `csha_configs` and `checkpoint_policies` already reach it.
     /// Item 5 (`--transient-arena`): place admitted backward temporaries at
     /// fixed arena offsets instead of letting the caching allocator choose.
     ///
@@ -1669,19 +1692,10 @@ pub struct CompileOptions {
     /// jump from lower-bound analysis to placement that the staging exists to
     /// prevent.
     pub transient_arena: bool,
-    pub imported_model_field_dims: std::collections::HashMap<String, std::collections::HashMap<String, Vec<i64>>>,
-    /// See [`Self::imported_model_field_dims`].
-    pub imported_model_field_ranks: std::collections::HashMap<String, std::collections::HashMap<String, usize>>,
-    /// The veto companion to [`Self::imported_model_field_dims`]: bare names
-    /// of imported tensor fields whose dims could NOT be derived. Without
-    /// this, `unique_field_elems`/`unique_field_dims` let a derivable
-    /// same-named field in one model win uncontested over an underivable
-    /// twin in an imported model — sizing it wrong instead of not at all.
-    pub imported_tensor_fields_without_dims: std::collections::HashSet<String>,
-    /// Constructor-folded VALUES of 1-element config fields — the runtime
-    /// `int(self._n_heads.item())` reads these back, so the arena's shape
-    /// propagation needs them to fold attention reshape targets.
-    pub imported_model_field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+    /// Shape/value facts about model fields declared in imported modules
+    /// (the multi-file build's dims/ranks/values channel); see
+    /// [`ImportedModelOptions`].
+    pub imported_model: ImportedModelOptions,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     /// Also controls PIC codegen (`is_pic`), which every object linked into
     /// the shared library needs — including non-entry modules on the
@@ -2020,10 +2034,7 @@ impl Default for CompileOptions {
             training_reference: false,
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
             transient_arena: false,
-            imported_model_field_dims: std::collections::HashMap::new(),
-            imported_model_field_ranks: std::collections::HashMap::new(),
-            imported_tensor_fields_without_dims: std::collections::HashSet::new(),
-            imported_model_field_values: std::collections::HashMap::new(),
+            imported_model: ImportedModelOptions::default(),
             shared_lib: false,
             emit_export_table: false,
             wrga_inputs: None,

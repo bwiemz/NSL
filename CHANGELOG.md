@@ -86,6 +86,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  imported-model shape channel moved into `ImportedModelOptions`
+  (`opts.imported_model.{field_dims, field_ranks, tensor_fields_without_dims,
+  field_values}` — the dims/ranks/values of model fields declared in imported
+  modules that the multi-file build and `ctor_fold` publish and
+  `entry_points` merges under the entry module's collection). Pure rename;
+  defaults unchanged (all empty). 62 → 59 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the Muon
   knobs moved into `MuonOptions` (`opts.muon.{batch_ns, resident_momentum,
   state_bf16}`, for `--muon-batch-ns` / `--muon-resident-momentum` /
