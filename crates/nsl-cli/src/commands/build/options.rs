@@ -544,8 +544,10 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 },
                 linear_types_enabled: linear_types,
                 ownership_info: std::collections::HashMap::new(), // populated by loader
-                zero_stage: zero_stage.map(|s| s as u8),
-                zero_elementwise,
+                zero: nsl_codegen::ZeroOptions {
+                    stage: zero_stage.map(|s| s as u8),
+                    elementwise: zero_elementwise,
+                },
                 optim_state_offload,
                 checkpoint: nsl_codegen::CheckpointOptions {
                     blocks: checkpoint_blocks,

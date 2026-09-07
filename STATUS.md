@@ -164,7 +164,8 @@ the same hardening pass produced).
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
-`MuonOptions`, `ImportedModelOptions`, …). The imported-model shape channel
+`MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, …). The ZeRO knobs moved
+into `ZeroOptions` (`opts.zero.{stage, elementwise}`). The imported-model shape channel
 moved into `ImportedModelOptions` (`opts.imported_model.{field_dims,
 field_ranks, tensor_fields_without_dims, field_values}`). The Muon knobs moved into `MuonOptions`
 (`opts.muon.{batch_ns, resident_momentum, state_bf16}`; `Features` keeps its
