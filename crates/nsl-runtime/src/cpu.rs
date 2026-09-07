@@ -139,8 +139,8 @@ impl BroadcastPlan {
 
 /// Elementwise binary op with NumPy-style broadcasting (f64 path).
 pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64 {
-    let a = NslTensor::from_ptr(a_ptr);
-    let b = NslTensor::from_ptr(b_ptr);
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
 
     // Dtype dispatch — preserves prior behaviour for f64/f32 ops and adds
     // f16/bf16 support:
@@ -225,8 +225,8 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
 
 /// Elementwise binary op with NumPy-style broadcasting (f32 path).
 pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn(f32, f32) -> f32) -> i64 {
-    let a = NslTensor::from_ptr(a_ptr);
-    let b = NslTensor::from_ptr(b_ptr);
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
 
     let plan = BroadcastPlan::new(a, b, "");
     let (shape, strides) = plan.alloc_out_shape_strides();
@@ -289,8 +289,8 @@ pub(crate) fn tensor_elementwise_op_f16_impl(
     out_dtype: u16,
     op: impl Fn(f32, f32) -> f32,
 ) -> i64 {
-    let a = NslTensor::from_ptr(a_ptr);
-    let b = NslTensor::from_ptr(b_ptr);
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
 
     let plan = BroadcastPlan::new(a, b, " f16");
     let (shape, strides) = plan.alloc_out_shape_strides();
@@ -412,8 +412,8 @@ pub extern "C" fn nsl_fused_elementwise_2(
     ops_ptr: i64,
     num_ops: i64,
 ) -> i64 {
-    let a = NslTensor::from_ptr(a_ptr);
-    let b = NslTensor::from_ptr(b_ptr);
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
     let ops_list = crate::list::NslList::from_ptr(ops_ptr);
 
     let ops: Vec<i64> = (0..num_ops as usize)
@@ -497,7 +497,7 @@ pub extern "C" fn nsl_fused_elementwise_1(
     ops_ptr: i64,
     num_ops: i64,
 ) -> i64 {
-    let a = NslTensor::from_ptr(a_ptr);
+    let a = NslTensor::from_ptr_ref(a_ptr);
     let ops_list = crate::list::NslList::from_ptr(ops_ptr);
 
     let ops: Vec<i64> = (0..num_ops as usize)
@@ -568,8 +568,8 @@ pub extern "C" fn nsl_fused_matmul_epilogue(
     epilogue_ops_ptr: i64,
     num_epilogue_ops: i64,
 ) -> i64 {
-    let a = NslTensor::from_ptr(a_ptr);
-    let b = NslTensor::from_ptr(b_ptr);
+    let a = NslTensor::from_ptr_ref(a_ptr);
+    let b = NslTensor::from_ptr_ref(b_ptr);
 
     if a.ndim < 2 || b.ndim < 2 {
         eprintln!("nsl: fused_matmul_epilogue requires 2D+ tensors");
@@ -591,7 +591,7 @@ pub extern "C" fn nsl_fused_matmul_epilogue(
 
     let has_bias = bias_ptr != 0;
     let bias_data: *const f32 = if has_bias {
-        let bt = NslTensor::from_ptr(bias_ptr);
+        let bt = NslTensor::from_ptr_ref(bias_ptr);
         bt.data as *const f32
     } else {
         std::ptr::null()

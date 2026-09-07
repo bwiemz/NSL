@@ -25,16 +25,28 @@
 # tensors that are never freed — 110 allocations across the module). Drop
 # that flag to audit test hygiene instead.
 #
-# Usage:  scripts/miri-cpu-tensor.sh            # whole module, one process
-#         scripts/miri-cpu-tensor.sh --each     # one process per test, so an
-#                                               # error in one test does not
-#                                               # hide the rest (slower)
+# Usage:  scripts/miri-cpu-tensor.sh                  # tensor::tests, one process
+#         scripts/miri-cpu-tensor.sh --each           # one process per test, so an
+#                                                     # error in one test does not
+#                                                     # hide the rest (slower)
+#         scripts/miri-cpu-tensor.sh [--each] tensor:: # any test-name filter; the
+#                                                     # whole tensor namespace is
+#                                                     # what found the cpu.rs
+#                                                     # aliasing case
+#
+# Caveat for wider filters: Miri's math shims (tanh, exp, ...) can differ
+# from the host libm by an ulp, so a test that asserts bit-exact
+# transcendental results (`gelu_backward_cpu_f64_matches_tanh_deriv`) can
+# fail under Miri while passing natively. That is a normal test failure,
+# not "Undefined Behavior", and the run continues past it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks}"
-filter="tensor::tests"
+each=0
+if [[ "${1:-}" == "--each" ]]; then each=1; shift; fi
+filter="${1:-tensor::tests}"
 
-if [[ "${1:-}" == "--each" ]]; then
+if [[ "$each" == 1 ]]; then
   names=$(cargo +nightly miri test -p nsl-runtime --lib -- "$filter" --list 2>/dev/null \
     | sed -n 's/: test$//p')
   fail=0
