@@ -262,14 +262,14 @@ pub(crate) fn expand_pretrain_optimized(
 /// an already-built `CompileOptions`, so the emitted training path is the
 /// simplest correct baseline. The remaining optimizations that are decorator- or
 /// pattern-driven (FBIP, the fused FASE step, fused-CE substitution, @checkpoint
-/// decorators) are gated in codegen on `opts.training_reference`.
+/// decorators) are gated in codegen on `opts.diagnostics.training_reference`.
 ///
 /// Loud-override semantics (mirrors `--pretrain-optimized`): anything actually
 /// turned off is listed once on stderr, so a user who also passed e.g.
 /// `--checkpoint-blocks` sees exactly what the reference mode overrode rather
 /// than silently getting a different path than they asked for.
 pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
-    if !opts.training_reference {
+    if !opts.diagnostics.training_reference {
         return;
     }
     let mut disabled: Vec<&str> = Vec::new();
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn training_reference_forces_field_opts_off() {
         let mut opts = nsl_codegen::CompileOptions {
-            training_reference: true,
+            diagnostics: nsl_codegen::DiagnosticsOptions { training_reference: true, ..Default::default() },
             checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
             layerwise_accum: true,
             weight_stream: nsl_codegen::WeightStreamOptions {
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn training_reference_noop_when_flag_absent() {
         let mut opts = nsl_codegen::CompileOptions {
-            training_reference: false,
+            diagnostics: nsl_codegen::DiagnosticsOptions { training_reference: false, ..Default::default() },
             checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
             ..Default::default()
         };
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn training_reference_turns_an_inferred_head_off() {
         let mut opts = nsl_codegen::CompileOptions {
-            training_reference: true,
+            diagnostics: nsl_codegen::DiagnosticsOptions { training_reference: true, ..Default::default() },
             lm_head_fusion: nsl_codegen::lm_head_inference::LmHeadFusion::Require,
             ..Default::default()
         };
@@ -593,7 +593,7 @@ mod tests {
         let (_, _, _, fr, fw) = expand(true, None, None, clear());
         assert!(fr && fw);
         let mut opts = nsl_codegen::CompileOptions {
-            training_reference: true,
+            diagnostics: nsl_codegen::DiagnosticsOptions { training_reference: true, ..Default::default() },
             fusion: nsl_codegen::FusionOptions {
                 rmsnorm_backward: fr,
                 wgrad_accum: fw,

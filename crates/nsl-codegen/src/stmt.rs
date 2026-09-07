@@ -320,7 +320,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // blend needs a layer->function map that AppliedPlan does not carry.
     // P1.7 --training-reference: report no checkpointing in the memory estimate,
     // matching codegen (which ignores @checkpoint decorators in that mode).
-    model.activation_checkpointing = !compiler.compile_options.training_reference
+    model.activation_checkpointing = !compiler.compile_options.diagnostics.training_reference
         && !compiler.compile_options.checkpoint.policies.is_empty();
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
@@ -6588,7 +6588,7 @@ impl Compiler<'_> {
                     // substitution so the composite KL-CE baseline runs instead
                     // (mirrors the @fused_lm_ce gate on active_fused_ce_config).
                     // The composite distill loss (alpha/temperature) still runs.
-                    if self.compile_options.training_reference {
+                    if self.compile_options.diagnostics.training_reference {
                         None
                     } else {
                         d.fused_kl_ce.clone()
@@ -6601,7 +6601,7 @@ impl Compiler<'_> {
                 None => (None, None, None),
             };
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-                .with_checkpoint_policies(if self.compile_options.training_reference {
+                .with_checkpoint_policies(if self.compile_options.diagnostics.training_reference {
                     Default::default() // P1.7: ignore @checkpoint decorators in the reference path
                 } else {
                     self.compile_options.checkpoint.policies.clone()
@@ -8258,7 +8258,7 @@ impl Compiler<'_> {
                 // P1.7 --training-reference: ignore @checkpoint decorators so a
                 // decorated program still runs the un-checkpointed reference
                 // path (the --checkpoint-blocks flag is already forced off).
-                let ccr_selective_decorated = !self.compile_options.training_reference
+                let ccr_selective_decorated = !self.compile_options.diagnostics.training_reference
                     && self
                         .compile_options
                         .checkpoint.policies
@@ -11040,7 +11040,7 @@ impl Compiler<'_> {
                         // zero and the value is that it stays that way.
                         let grad_ptr = match grad_src {
                             crate::wengert_lower::ParamGradSource::FusedWgrad { x, g } => {
-                                if c.compile_options.grad_integrity {
+                                if c.compile_options.diagnostics.grad_integrity {
                                     return Err(CodegenError::new(
                                         "internal: --fuse-wgrad-accum reached lowering with \
                                          --grad-integrity active. The fused chain never \
@@ -11073,7 +11073,7 @@ impl Compiler<'_> {
                         };
                         // P0.3: note this parameter's gradient BEFORE accumulate
                         // frees/consumes it. accum_idx == the param_paths index.
-                        if c.compile_options.grad_integrity {
+                        if c.compile_options.diagnostics.grad_integrity {
                             c.compile_call_by_name(
                                 b,
                                 "nsl_grad_integrity_note",
@@ -11100,7 +11100,7 @@ impl Compiler<'_> {
                     // every trainable param must be noted exactly once inside
                     // it — anything else is a dropped or double-consumed
                     // gradient, which is what the declared expectation catches.
-                    let gi = self.compile_options.grad_integrity;
+                    let gi = self.compile_options.diagnostics.grad_integrity;
                     if gi {
                         let one_note = builder.ins().iconst(cl_types::I64, 1);
                         self.compile_call_by_name(
@@ -11608,7 +11608,7 @@ impl Compiler<'_> {
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
         // Skip when hook active — grads_list is a null sentinel.
-        if self.compile_options.debug_training && !fase_hook_active {
+        if self.compile_options.diagnostics.debug_training && !fase_hook_active {
             self.compile_call_by_name(
                 builder,
                 "nsl_debug_grad_checksum",
@@ -11620,7 +11620,7 @@ impl Compiler<'_> {
         // scan the materialized grads list once per step. Skipped when the
         // FASE hook is active (grads_list is a null sentinel) — that path is
         // instrumented per-parameter inside the hook (step_begin/note/step_end).
-        if self.compile_options.grad_integrity && !fase_hook_active {
+        if self.compile_options.diagnostics.grad_integrity && !fase_hook_active {
             self.compile_call_by_name(
                 builder,
                 "nsl_grad_integrity_check",
@@ -12647,7 +12647,7 @@ impl Compiler<'_> {
                     // from this site.
                     && zero3_streamed.is_none()
                     && two_state
-                    && !self.compile_options.training_reference
+                    && !self.compile_options.diagnostics.training_reference
                     && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
                     && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
                 {
@@ -12665,7 +12665,7 @@ impl Compiler<'_> {
             // emit_final_step no longer matches).
             let zero3_elem_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
                 if zero3_elem.as_ref().is_some_and(|s| !s.is_empty()) {
-                    if wrap_precision || self.compile_options.training_reference {
+                    if wrap_precision || self.compile_options.diagnostics.training_reference {
                         return Err(CodegenError::new(
                             "--zero-elementwise does not compose with a CPDT \
                              reduced-precision moment plan or \
@@ -12715,7 +12715,7 @@ impl Compiler<'_> {
             // to exactly that length), and each param's adjoint op lives in
             // exactly one range, so the hook must fire exactly N times per
             // param per window.
-            if self.compile_options.grad_integrity {
+            if self.compile_options.diagnostics.grad_integrity {
                 let expected_notes = builder
                     .ins()
                     .iconst(cl_types::I64, grad_accumulation_steps.max(1));
@@ -13136,7 +13136,7 @@ impl Compiler<'_> {
                     // param's adjoint lands in exactly one range — and the
                     // accumulator merges repeat notes per index (finite ANDs,
                     // nonzero ORs), so the report attests every partial.
-                    if c.compile_options.grad_integrity {
+                    if c.compile_options.diagnostics.grad_integrity {
                         c.compile_call_by_name(
                             b,
                             "nsl_grad_integrity_note",
@@ -13464,7 +13464,7 @@ impl Compiler<'_> {
             // P0.3: close the window-scoped grad-integrity step — every
             // range's hook (and the epilogue params' notes from whichever
             // range produced them) has fired by here.
-            if self.compile_options.grad_integrity {
+            if self.compile_options.diagnostics.grad_integrity {
                 self.compile_call_by_name(builder, "nsl_grad_integrity_step_end", &[])?;
             }
             // D2b part 2: NO post-epilogue restore. The next iterations'
@@ -15191,7 +15191,7 @@ impl Compiler<'_> {
         // @checkpoint(policy=...) policies into the extractor. Empty map
         // = byte-identity preserved.
         let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-            .with_checkpoint_policies(if self.compile_options.training_reference {
+            .with_checkpoint_policies(if self.compile_options.diagnostics.training_reference {
                     Default::default() // P1.7: ignore @checkpoint decorators in the reference path
                 } else {
                     self.compile_options.checkpoint.policies.clone()

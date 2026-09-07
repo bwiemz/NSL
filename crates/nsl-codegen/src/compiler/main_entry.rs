@@ -82,7 +82,7 @@ impl Compiler<'_> {
             };
             // Disable FBIP in debug_training mode to prevent in-place mutation
             // of tensors needed by backward pass
-            if !self.compile_options.debug_training {
+            if !self.compile_options.diagnostics.debug_training {
                 state.use_counts = Some(crate::use_count::analyze_use_counts(&main_block));
             }
             // Dict-local tensor lifetime: arm the return sweep's

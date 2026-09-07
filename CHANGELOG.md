@@ -86,6 +86,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the training
+  diagnostics moved into `DiagnosticsOptions` (`opts.diagnostics.{trace_ops,
+  nan_analysis, debug_training, grad_integrity, training_reference}` for
+  `--trace-ops` / `--nan-analysis` / `--debug-training` / `--grad-integrity`
+  / `--training-reference`; field names unchanged). Pure rename; defaults
+  unchanged. 47 → 43 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the fusion
   flags moved into `FusionOptions` (`opts.fusion.{disabled, report,
   rmsnorm_backward, wgrad_accum, wgrad_accum_from_bundle}` for

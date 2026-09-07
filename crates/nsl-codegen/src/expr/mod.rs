@@ -846,7 +846,7 @@ impl Compiler<'_> {
     }
 
     /// Emit a tensor FFI call, optionally followed by trace recording
-    /// when `compile_options.trace_ops` is enabled.
+    /// when `compile_options.diagnostics.trace_ops` is enabled.
     pub(crate) fn compile_traced_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -855,7 +855,7 @@ impl Compiler<'_> {
     ) -> Result<Value, CodegenError> {
         let result = self.compile_call_by_name(builder, fn_name, args)?;
 
-        if self.compile_options.trace_ops {
+        if self.compile_options.diagnostics.trace_ops {
             // Emit: nsl_trace_record_op(op_type_id, input0, input1_or_0, result)
             let op_id = builder
                 .ins()
