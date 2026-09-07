@@ -305,7 +305,8 @@ const _: () = assert!(NSL_TENSOR_DATA_OFFSET == nsl_abi::wire::tensor::DATA_OFFS
 // ---------------------------------------------------------------------------
 pub use nsl_abi::wire::dtype::{
     DTYPE_BF16, DTYPE_CUSTOM_START, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_FP8E4M3,
-    DTYPE_FP8E5M2, DTYPE_I32, DTYPE_INT8, DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN,
+    DTYPE_FP8E5M2, DTYPE_I32, DTYPE_INT8, DTYPE_INT8_BLOCKWISE, DTYPE_U16_SEGMENT,
+    DTYPE_U16_TOKEN,
 };
 
 #[inline]
@@ -332,7 +333,7 @@ pub(crate) fn dtype_element_size(dtype: u16) -> usize {
         DTYPE_F64 => std::mem::size_of::<f64>(),
         DTYPE_F32 => std::mem::size_of::<f32>(),
         DTYPE_FP16 | DTYPE_BF16 | DTYPE_U16_TOKEN | DTYPE_U16_SEGMENT => std::mem::size_of::<u16>(),
-        DTYPE_INT8 => std::mem::size_of::<i8>(),
+        DTYPE_INT8 | DTYPE_INT8_BLOCKWISE => std::mem::size_of::<i8>(),
         DTYPE_I32 => std::mem::size_of::<i32>(),  // i32 token IDs
         id if id >= DTYPE_CUSTOM_START => {
             get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
@@ -800,6 +801,13 @@ impl NslTensor {
     /// Total byte size of the data buffer, accounting for block-packed custom dtypes.
     #[inline]
     pub(crate) fn data_byte_size(&self) -> usize {
+        // Blockwise int8 is `len` values padded to 4 bytes plus one f32
+        // scale per block in the same buffer — `len * 1` is the wrong
+        // layout for its free and clone (Miri: "incorrect layout on
+        // deallocation: alloc has size 36 ... but gave size 32").
+        if self.dtype == DTYPE_INT8_BLOCKWISE {
+            return int8_blockwise::int8_blockwise_byte_size(self.len as usize);
+        }
         if self.dtype >= DTYPE_CUSTOM_START
             && let Some(info) = get_registry().get(&self.dtype)
             && info.block_size > 0 && info.packed_block_size > 0
@@ -1326,8 +1334,9 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
 
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let elem_size = tensor.element_size();
-    let data_size = (len as usize) * elem_size;
+    // The buffer's true size: block-packed dtypes (custom and blockwise
+    // int8) are not `len * element_size` bytes.
+    let data_size = tensor.data_byte_size();
     let data = if tensor.device > 0 {
         #[cfg(feature = "cuda")]
         {
@@ -5267,6 +5276,7 @@ mod tests {
         assert_eq!(DTYPE_U16_TOKEN, 7);
         assert_eq!(DTYPE_U16_SEGMENT, 8);
         assert_eq!(DTYPE_I32, 9);
+        assert_eq!(DTYPE_INT8_BLOCKWISE, 10);
         assert_eq!(DTYPE_CUSTOM_START, 256);
 
         // Byte widths. Tag 4 (int8) is 1 byte — the historical tag-4-as-i32
@@ -5278,6 +5288,7 @@ mod tests {
         assert_eq!(dtype_element_size(DTYPE_U16_TOKEN), 2);
         assert_eq!(dtype_element_size(DTYPE_U16_SEGMENT), 2);
         assert_eq!(dtype_element_size(DTYPE_INT8), 1);
+        assert_eq!(dtype_element_size(DTYPE_INT8_BLOCKWISE), 1);
         assert_eq!(dtype_element_size(DTYPE_I32), 4);
 
         // The C API uses the canonical tag space verbatim: the conversion
@@ -5287,7 +5298,7 @@ mod tests {
         for tag in [
             DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8,
             DTYPE_FP8E4M3, DTYPE_FP8E5M2, DTYPE_U16_TOKEN, DTYPE_U16_SEGMENT,
-            DTYPE_I32,
+            DTYPE_I32, DTYPE_INT8_BLOCKWISE,
         ] {
             assert_eq!(nsl_dtype_to_capi(tag), tag as i32, "C-API tag must equal canonical tag {tag}");
             assert_eq!(
