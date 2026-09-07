@@ -101,7 +101,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     let ndim = tensor.ndim as usize;
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
     if d >= ndim {
-        eprintln!("nsl: sum_dim dimension {} out of range for {}D tensor", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: sum_dim dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
     }
 
@@ -275,7 +275,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
     let ndim = tensor.ndim as usize;
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
     if d >= ndim {
-        eprintln!("nsl: mean_dim dimension {} out of range for {}D tensor", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: mean_dim dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
     }
 
@@ -366,7 +366,7 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
 
     if d >= ndim {
-        eprintln!("nsl: reduce_max dimension {} out of range for {}D tensor", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: reduce_max dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
     }
 
@@ -549,8 +549,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                             .iter()
                             .find(|&&i| i < 0 || i as usize >= gather_dim_size)
                         {
-                            eprintln!(
-                                "nsl: gather index {} out of bounds for dim {} with size {}",
+                            crate::nsl_log!(ERROR, "nsl", "nsl: gather index {} out of bounds for dim {} with size {}",
                                 bad, d, gather_dim_size
                             );
                             std::process::abort();
@@ -655,7 +654,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
 
     if d >= ndim {
-        eprintln!("nsl: gather dimension {} out of range for {}D tensor", dim, ndim);
+        crate::nsl_log!(ERROR, "nsl", "nsl: gather dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
     }
 
@@ -675,8 +674,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 
     // indices must match outer dimension count
     if num_indices != outer {
-        eprintln!(
-            "nsl: gather dim={} requires indices length ({}) == outer size ({})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: gather dim={} requires indices length ({}) == outer size ({})",
             d, num_indices, outer
         );
         std::process::abort();
@@ -689,8 +687,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     for o in 0..outer {
         let raw_idx = indices.read_index(o);
         if raw_idx < 0 || raw_idx as usize >= gather_dim_size {
-            eprintln!(
-                "nsl: gather index {} out of bounds for dim {} with size {}",
+            crate::nsl_log!(ERROR, "nsl", "nsl: gather index {} out of bounds for dim {} with size {}",
                 raw_idx, d, gather_dim_size
             );
             std::process::abort();

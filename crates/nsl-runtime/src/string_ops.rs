@@ -49,7 +49,7 @@ pub extern "C" fn nsl_str_slice(s: i64, lo: i64, hi: i64, step_val: i64) -> i64 
 
     let step = if step_val == i64::MIN { 1 } else { step_val };
     if step == 0 {
-        eprintln!("nsl: slice step cannot be zero");
+        crate::nsl_log!(ERROR, "nsl", "nsl: slice step cannot be zero");
         std::process::abort();
     }
 

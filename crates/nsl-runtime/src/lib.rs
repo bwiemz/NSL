@@ -209,7 +209,7 @@ pub extern "C" fn nsl_muon_step_batch(
     _nesterov: i64,
     _ns_steps: f64,
 ) {
-    eprintln!("nsl: --muon-batch-ns requires a CUDA-enabled build/GPU");
+    crate::nsl_log!(ERROR, "nsl", "nsl: --muon-batch-ns requires a CUDA-enabled build/GPU");
     std::process::abort();
 }
 pub mod sr_bf16;

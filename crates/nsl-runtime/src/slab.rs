@@ -27,7 +27,7 @@ pub extern "C" fn nsl_slab_alloc(size_bytes: i64) -> i64 {
     // SAFETY: layout has non-zero size (checked above) and valid alignment.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
-        eprintln!("nsl: slab allocation failed ({} bytes)", size_bytes);
+        crate::nsl_log!(ERROR, "nsl", "nsl: slab allocation failed ({} bytes)", size_bytes);
         std::process::abort();
     }
     ptr as i64

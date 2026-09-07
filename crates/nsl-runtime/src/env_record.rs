@@ -140,8 +140,7 @@ pub fn check_on_resume(saved: Option<&str>) {
     let allow = std::env::var("NSL_RESUME_ALLOW_ENV_DRIFT").ok().as_deref() == Some("1");
     match verdict(saved, &live, allow) {
         Verdict::Predates => {
-            eprintln!(
-                "nsl: train_checkpoint_load: the checkpoint carries no \
+            crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: the checkpoint carries no \
                  environment record (written before one existed), so the \
                  runtime NSL_* behavior check is SKIPPED for this resume. \
                  Re-save from a current build to restore it."
@@ -149,8 +148,7 @@ pub fn check_on_resume(saved: Option<&str>) {
         }
         Verdict::Same => {}
         Verdict::Acknowledged(d) => {
-            eprintln!(
-                "nsl: train_checkpoint_load: runtime ENVIRONMENT drift \
+            crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: runtime ENVIRONMENT drift \
                  acknowledged (NSL_RESUME_ALLOW_ENV_DRIFT=1):\n{}\n\
                  The resume continues under this run's values. Each of these \
                  routes a kernel to a different implementation, so the \
@@ -159,8 +157,7 @@ pub fn check_on_resume(saved: Option<&str>) {
             );
         }
         Verdict::Refuse(d) => {
-            eprintln!(
-                "nsl: train_checkpoint_load: this run's ENVIRONMENT differs \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: this run's ENVIRONMENT differs \
                  from the one the checkpoint was saved under:\n{}\n  \
                  These are behavior-tier variables (`nsl env list --tier \
                  behavior`): each changes what a training step computes, so \

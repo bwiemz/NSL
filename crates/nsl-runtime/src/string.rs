@@ -73,7 +73,7 @@ pub extern "C" fn nsl_str_to_int(s: i64) -> i64 {
     match text.trim().parse::<i64>() {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("nsl: invalid int conversion from string '{}'", text);
+            crate::nsl_log!(ERROR, "nsl", "nsl: invalid int conversion from string '{}'", text);
             std::process::abort();
         }
     }
@@ -86,7 +86,7 @@ pub extern "C" fn nsl_str_to_float(s: i64) -> f64 {
     match text.trim().parse::<f64>() {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("nsl: invalid float conversion from string '{}'", text);
+            crate::nsl_log!(ERROR, "nsl", "nsl: invalid float conversion from string '{}'", text);
             std::process::abort();
         }
     }

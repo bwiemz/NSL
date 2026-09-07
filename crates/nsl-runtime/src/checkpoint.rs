@@ -8,7 +8,7 @@ const VERSION: u32 = 1;
 /// Write helper: aborts on I/O error instead of panicking across extern "C".
 fn write_or_abort(file: &mut std::fs::File, buf: &[u8], context: &str) {
     if let Err(e) = file.write_all(buf) {
-        eprintln!("nsl: model_save: {}: {}", context, e);
+        crate::nsl_log!(ERROR, "nsl", "nsl: model_save: {}: {}", context, e);
         std::process::abort();
     }
 }
@@ -31,8 +31,7 @@ pub extern "C" fn nsl_model_save(
     let names = NslList::from_ptr(param_names_ptr);
     let tensors = NslList::from_ptr(param_tensors_ptr);
     if names.len != tensors.len {
-        eprintln!(
-            "nsl: model_save: name/tensor count mismatch ({} names, {} tensors)",
+        crate::nsl_log!(ERROR, "nsl", "nsl: model_save: name/tensor count mismatch ({} names, {} tensors)",
             names.len, tensors.len
         );
         std::process::abort();
@@ -67,7 +66,7 @@ pub extern "C" fn nsl_model_save(
     let mut file = match std::fs::File::create(path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("nsl: model_save: cannot create file '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "nsl: model_save: cannot create file '{}': {}", path, e);
             std::process::abort();
         }
     };
@@ -148,8 +147,7 @@ pub extern "C" fn nsl_model_save(
                 }
                 write_or_abort(&mut file, &buf, "write tensor data (GPU f32 via f64 staging)");
             } else {
-                eprintln!(
-                    "nsl: model_save: unsupported dtype transition in GPU staging \
+                crate::nsl_log!(ERROR, "nsl", "nsl: model_save: unsupported dtype transition in GPU staging \
                      (device dtype {} -> staged dtype {}) for tensor #{}",
                     tensor.dtype, cpu_tensor.dtype, i
                 );
@@ -188,20 +186,19 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("nsl: model_load: cannot read file '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "nsl: model_load: cannot read file '{}': {}", path, e);
             std::process::abort();
         }
     };
 
     if data.len() < 16 {
-        eprintln!(
-            "nsl: model_load: file too small ({} bytes, need at least 16)",
+        crate::nsl_log!(ERROR, "nsl", "nsl: model_load: file too small ({} bytes, need at least 16)",
             data.len()
         );
         std::process::abort();
     }
     if &data[0..4] != MAGIC {
-        eprintln!("nsl: model_load: invalid .nslm file (bad magic)");
+        crate::nsl_log!(ERROR, "nsl", "nsl: model_load: invalid .nslm file (bad magic)");
         std::process::abort();
     }
     let version = u32::from_le_bytes(
@@ -210,8 +207,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
             .unwrap_or_else(|_| std::process::abort()),
     );
     if version != VERSION {
-        eprintln!(
-            "nsl: model_load: unsupported version {} (expected {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: model_load: unsupported version {} (expected {})",
             version, VERSION
         );
         std::process::abort();
@@ -280,8 +276,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
         if let Some(file_dtype) = file_dtypes.get(i) {
             let live_dtype: &[u8] = if tensor.dtype == 1 { b"f32" } else { b"f64" };
             if *file_dtype != live_dtype {
-                eprintln!(
-                    "nsl: model_load: dtype mismatch for tensor #{}: file has {}, \
+                crate::nsl_log!(ERROR, "nsl", "nsl: model_load: dtype mismatch for tensor #{}: file has {}, \
                      model expects {} — raw byte copy would corrupt this tensor and \
                      misalign all subsequent ones. Re-save the checkpoint from a \
                      model on the same device convention (CPU=f64, GPU=f32).",
@@ -300,8 +295,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
         let tensor = NslTensor::from_ptr(tensor_ptr);
         let byte_count = (tensor.len as usize) * tensor.element_size();
         if offset + byte_count > data.len() {
-            eprintln!(
-                "nsl: model_load: unexpected end of file at offset {} (tensor {}, need {} bytes, have {})",
+            crate::nsl_log!(ERROR, "nsl", "nsl: model_load: unexpected end of file at offset {} (tensor {}, need {} bytes, have {})",
                 offset, i, byte_count, data.len() - offset
             );
             std::process::abort();
@@ -328,7 +322,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
             }
             #[cfg(not(feature = "cuda"))]
             {
-                eprintln!("nsl: model_load: tensor {} is on GPU but CUDA not compiled", i);
+                crate::nsl_log!(ERROR, "nsl", "nsl: model_load: tensor {} is on GPU but CUDA not compiled", i);
                 std::process::abort();
             }
         } else {
@@ -413,7 +407,7 @@ fn model_file_sig(path: &str) -> u64 {
     let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("nsl: checkpoint: cannot open '{path}' for signature: {e}");
+            crate::nsl_log!(ERROR, "nsl", "nsl: checkpoint: cannot open '{path}' for signature: {e}");
             std::process::abort();
         }
     };
@@ -510,8 +504,7 @@ fn scan_header_shapes(header: &[u8]) -> Vec<String> {
 /// loudly rather than serialize garbage.
 fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>) -> usize {
     if tensor_ptr == 0 {
-        eprintln!(
-            "nsl: train_checkpoint_save: {which}[{idx}] is a null moment slot \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: {which}[{idx}] is a null moment slot \
              (ZeRO placeholder?) — full-state checkpointing does not compose \
              with sharded/owner-gated moments"
         );
@@ -519,8 +512,7 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.dtype != 1 {
-        eprintln!(
-            "nsl: train_checkpoint_save: {which}[{idx}] has dtype {} — only \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: {which}[{idx}] has dtype {} — only \
              plain f32 moments are checkpointable (CPDT moment precision is \
              refused at compile time)",
             tensor.dtype
@@ -542,8 +534,7 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
         }
         #[cfg(not(feature = "cuda"))]
         {
-            eprintln!(
-                "nsl: train_checkpoint_save: {which}[{idx}] is on GPU but CUDA \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: {which}[{idx}] is on GPU but CUDA \
                  not compiled"
             );
             std::process::abort();
@@ -605,8 +596,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
     let m_list = NslList::from_ptr(state1_ptr);
     let v_list = NslList::from_ptr(state2_ptr);
     if m_list.len != v_list.len || m_list.len != names.len {
-        eprintln!(
-            "nsl: train_checkpoint_save: list length mismatch ({} names, {} m, {} v)",
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: list length mismatch ({} names, {} m, {} v)",
             names.len, m_list.len, v_list.len
         );
         std::process::abort();
@@ -636,8 +626,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
         for i in 0..list.len as usize {
             let tensor_ptr = unsafe { *list.data.add(i) };
             if tensor_ptr == 0 {
-                eprintln!(
-                    "nsl: train_checkpoint_save: {prefix}[{i}] is a null moment \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: {prefix}[{i}] is a null moment \
                      slot — refused composition (see codegen checkpoint rules)"
                 );
                 std::process::abort();
@@ -733,7 +722,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
     let mut file = match std::fs::File::create(&optim_tmp) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("nsl: train_checkpoint_save: cannot create '{optim_tmp}': {e}");
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: cannot create '{optim_tmp}': {e}");
             std::process::abort();
         }
     };
@@ -763,11 +752,11 @@ pub extern "C" fn nsl_train_checkpoint_save(
     drop(file);
     // Both tmps are complete — commit the pair back-to-back.
     if let Err(e) = std::fs::rename(&model_tmp, path) {
-        eprintln!("nsl: train_checkpoint_save: rename '{model_tmp}' -> '{path}': {e}");
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: rename '{model_tmp}' -> '{path}': {e}");
         std::process::abort();
     }
     if let Err(e) = std::fs::rename(&optim_tmp, &optim_path) {
-        eprintln!("nsl: train_checkpoint_save: rename '{optim_tmp}' -> '{optim_path}': {e}");
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: rename '{optim_tmp}' -> '{optim_path}': {e}");
         std::process::abort();
     }
     if dl_ptr != 0 {
@@ -823,8 +812,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // the step counter from the sidecar — exactly the mixed half-state this
     // function's contract forbids.
     if crate::weight_provider::provider_is_set() {
-        eprintln!(
-            "nsl: train_checkpoint_load: a standalone weight provider is \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: a standalone weight provider is \
              armed — θ would come from the embedded weights while moments \
              and the step counter come from '{path}.optim' (mixed state). \
              Drop checkpoint_load in the embedded-weights build, or build \
@@ -840,8 +828,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     let data = match std::fs::read(&optim_path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
-                "nsl: train_checkpoint_load: cannot read '{optim_path}': {e} — \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: cannot read '{optim_path}': {e} — \
                  resuming without optimizer state would silently re-warm \
                  AdamW; aborting instead"
             );
@@ -849,7 +836,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         }
     };
     if data.len() < 16 || &data[0..4] != OPTIM_MAGIC {
-        eprintln!("nsl: train_checkpoint_load: '{optim_path}' is not an NSLO sidecar");
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' is not an NSLO sidecar");
         std::process::abort();
     }
     let version = u32::from_le_bytes(
@@ -861,8 +848,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // position and RNG state — so say exactly that, loudly, instead of
     // resuming into a silently different data order.
     if version != OPTIM_VERSION && version != 1 {
-        eprintln!(
-            "nsl: train_checkpoint_load: unsupported sidecar version {version} \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: unsupported sidecar version {version} \
              (this runtime writes {OPTIM_VERSION} and reads 1..={OPTIM_VERSION})"
         );
         std::process::abort();
@@ -872,7 +858,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         data[8..16].try_into().unwrap_or_else(|_| std::process::abort()),
     ) as usize;
     if 16 + header_size > data.len() {
-        eprintln!("nsl: train_checkpoint_load: sidecar header overruns the file");
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header overruns the file");
         std::process::abort();
     }
     let header_bytes = &data[16..16 + header_size];
@@ -885,7 +871,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             .windows(needle.len())
             .position(|w| w == needle)
             .unwrap_or_else(|| {
-                eprintln!("nsl: train_checkpoint_load: sidecar header has no step_count");
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header has no step_count");
                 std::process::abort();
             });
         let digits = &header_bytes[pos + needle.len()..];
@@ -897,7 +883,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or_else(|| {
-                eprintln!("nsl: train_checkpoint_load: unparsable step_count");
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: unparsable step_count");
                 std::process::abort();
             })
     };
@@ -911,8 +897,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         Some(&saved_sig) => {
             let live_sig = model_file_sig(path);
             if saved_sig != live_sig {
-                eprintln!(
-                    "nsl: train_checkpoint_load: '{optim_path}' was not saved \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was not saved \
                      with '{path}' (model_sig {live_sig} vs sidecar \
                      {saved_sig}) — the pair is from different checkpoints \
                      (crash between commits, or mixed files). Refusing the \
@@ -922,8 +907,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             }
         }
         None => {
-            eprintln!(
-                "nsl: train_checkpoint_load: sidecar header has no model_sig \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header has no model_sig \
                  — not a checkpoint this runtime wrote"
             );
             std::process::abort();
@@ -952,8 +936,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             match scan_header_numbers(header_bytes, needle).first() {
                 Some(&v) => v,
                 None => {
-                    eprintln!(
-                        "nsl: train_checkpoint_load: v2 sidecar header is \
+                    crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: v2 sidecar header is \
                          missing '{what}' — malformed checkpoint"
                     );
                     std::process::abort();
@@ -969,8 +952,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         let counter = |needle: &[u8], what: &str| -> u64 {
             let v = num(needle, what);
             if v > i64::MAX as u64 {
-                eprintln!(
-                    "nsl: train_checkpoint_load: '{what}' is {v}, past the \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{what}' is {v}, past the \
                      signed range every consumer of it uses — refusing rather \
                      than wrapping to a negative counter"
                 );
@@ -980,16 +962,14 @@ pub extern "C" fn nsl_train_checkpoint_load(
         };
         let seed_hex = scan_header_string(header_bytes, b"\"rng_seed\":")
             .unwrap_or_else(|| {
-                eprintln!(
-                    "nsl: train_checkpoint_load: v2 sidecar header is missing \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: v2 sidecar header is missing \
                      'rng_seed' — malformed checkpoint"
                 );
                 std::process::abort();
             });
         let sampling_seed = crate::rng_state::RngSnapshot::seed_from_hex(&seed_hex)
             .unwrap_or_else(|| {
-                eprintln!(
-                    "nsl: train_checkpoint_load: 'rng_seed' is not 64 hex \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: 'rng_seed' is not 64 hex \
                      digits — a partially-parsed seed would restore a \
                      DIFFERENT random stream while looking successful"
                 );
@@ -1008,8 +988,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             exec: match scan_header_string(header_bytes, b"\"exec\":") {
                 None => String::new(),
                 Some(raw) => String::from_utf8(raw).unwrap_or_else(|_| {
-                    eprintln!(
-                        "nsl: train_checkpoint_load: the sidecar's 'exec' \
+                    crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: the sidecar's 'exec' \
                          record is not valid UTF-8. Treating it as absent \
                          would silently disable the compile-flag check, so \
                          this refuses instead — the checkpoint is corrupt."
@@ -1020,8 +999,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             train_cfg: match scan_header_string(header_bytes, b"\"train_cfg\":") {
                 None => String::new(),
                 Some(raw) => String::from_utf8(raw).unwrap_or_else(|_| {
-                    eprintln!(
-                        "nsl: train_checkpoint_load: the sidecar's \
+                    crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: the sidecar's \
                          'train_cfg' record is not valid UTF-8. Treating it \
                          as absent would silently disable the config check, \
                          so this refuses instead — the checkpoint is corrupt."
@@ -1031,8 +1009,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             },
             env: scan_header_string(header_bytes, b"\"env\":").map(|raw| {
                 String::from_utf8(raw).unwrap_or_else(|_| {
-                    eprintln!(
-                        "nsl: train_checkpoint_load: the sidecar's 'env' \
+                    crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: the sidecar's 'env' \
                          record is not valid UTF-8. Treating it as absent \
                          would silently disable the environment check, so \
                          this refuses instead — the checkpoint is corrupt."
@@ -1067,8 +1044,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             let fmt = |set: bool, v: u64| {
                 if set { format!("--seed {v}") } else { format!("no --seed (default {v})") }
             };
-            eprintln!(
-                "nsl: train_checkpoint_load: this run has {} but '{optim_path}' \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: this run has {} but '{optim_path}' \
                  was saved with {} — the seed keys the stochastic-rounding and \
                  ZeRO dither streams directly, so resuming would continue θ and \
                  the moments while switching those streams. Re-run with the \
@@ -1093,8 +1069,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         let live_exec = crate::exec_fingerprint::exec_fingerprint();
         if r.exec.is_empty() || live_exec.is_empty() {
             let which = if r.exec.is_empty() { "checkpoint" } else { "this run" };
-            eprintln!(
-                "nsl: train_checkpoint_load: no execution fingerprint in {which} \
+            crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: no execution fingerprint in {which} \
                  — the compile-flag check is SKIPPED for this resume. A build \
                  predating the fingerprint cannot prove it used the same AD \
                  mode, dtype or fusion settings; re-save from a current build \
@@ -1103,8 +1078,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         } else {
             let arith = crate::exec_fingerprint::arithmetic_diff(&r.exec, &live_exec);
             if !arith.is_empty() {
-                eprintln!(
-                    "nsl: train_checkpoint_load: '{optim_path}' was written by a \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was written by a \
                      build whose ARITHMETIC differs from this one:\n{}\n  \
                      Resuming would continue theta and the optimizer moments \
                      while changing what a step computes, which is not a \
@@ -1121,8 +1095,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             // the run changed under them.
             let placement = crate::exec_fingerprint::placement_diff(&r.exec, &live_exec);
             if !placement.is_empty() {
-                eprintln!(
-                    "nsl: train_checkpoint_load: resuming with different memory \
+                crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: resuming with different memory \
                      placement than '{optim_path}' was saved under:\n{}\n  \
                      These are value-neutral by construction, so the resume \
                      continues.",
@@ -1147,8 +1120,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         // no output, exit 0 — the silent-no-op anti-pattern this codebase
         // refuses elsewhere (see the DataLoader's per-rank floor check).
         if (r.train_epoch as i64) >= epochs {
-            eprintln!(
-                "nsl: train_checkpoint_load: '{optim_path}' is at epoch {} but \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' is at epoch {} but \
                  this train block declares epochs = {epochs}, so the epoch \
                  loop would run ZERO steps and exit 0. `epochs` is the TOTAL \
                  for the run, not a count of additional epochs: raise it past \
@@ -1159,8 +1131,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             std::process::abort();
         }
         if r.had_loader && dl_ptr == 0 {
-            eprintln!(
-                "nsl: train_checkpoint_load: '{optim_path}' was saved from a \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was saved from a \
                  DataLoader-driven run (epoch {}, slot {}) but this train \
                  block has no DataLoader — the saved data position cannot be \
                  restored. Use model_load(...) for a weights-only warm start.",
@@ -1169,8 +1140,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             std::process::abort();
         }
         if !r.had_loader && dl_ptr != 0 {
-            eprintln!(
-                "nsl: train_checkpoint_load: '{optim_path}' was saved from a \
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was saved from a \
                  run with no DataLoader, but this train block has one — there \
                  is no saved data position to continue from, so the loader \
                  would silently start at epoch 0 batch 0. Use \
@@ -1181,8 +1151,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         if r.had_loader && dl_ptr != 0 {
             let live_id = crate::dataloader::nsl_dataloader_identity(dl_ptr) as u64;
             if live_id != r.loader_id {
-                eprintln!(
-                    "nsl: train_checkpoint_load: the DataLoader does not match \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: the DataLoader does not match \
                      the one '{optim_path}' was saved from (loader_id {live_id} \
                      vs sidecar {}) — a different corpus, batch geometry, or \
                      shuffle seed. Slot {} of a different permutation is \
@@ -1208,8 +1177,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         // A hard abort, not the model loader's warning: mismatched moments
         // positionally restored into the wrong buffers is a silent training
         // corruption, and the caller explicitly asked for a full resume.
-        eprintln!(
-            "nsl: train_checkpoint_load: sidecar has {saved} moment tensors, \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar has {saved} moment tensors, \
              live train state expects {expected} — model/optimizer shape drift \
              between save and resume"
         );
@@ -1224,8 +1192,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     let saved_nbytes = scan_header_numbers(header_bytes, b"\"nbytes\":");
     let saved_shapes = scan_header_shapes(header_bytes);
     if saved_nbytes.len() != expected || saved_shapes.len() != expected {
-        eprintln!(
-            "nsl: train_checkpoint_load: sidecar header lists {} nbytes / {} \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header lists {} nbytes / {} \
              shape entries for {expected} tensors — malformed header",
             saved_nbytes.len(),
             saved_shapes.len()
@@ -1237,8 +1204,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         for i in 0..list.len as usize {
             let tensor_ptr = unsafe { *list.data.add(i) };
             if tensor_ptr == 0 {
-                eprintln!(
-                    "nsl: train_checkpoint_load: {which}[{i}] is a null \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is a null \
                      moment slot — refused composition"
                 );
                 std::process::abort();
@@ -1253,8 +1219,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 rendered[1..rendered.len() - 1].to_string()
             };
             if saved_nbytes[entry] != live_bytes || saved_shapes[entry] != live_shape {
-                eprintln!(
-                    "nsl: train_checkpoint_load: {which}[{i}] drifted between \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] drifted between \
                      save and resume: sidecar has shape [{}] ({} bytes), live \
                      tensor is [{}] ({} bytes) — a positional restore would \
                      read from the wrong offsets. Re-save from the current \
@@ -1277,16 +1242,14 @@ pub extern "C" fn nsl_train_checkpoint_load(
         for i in 0..list.len as usize {
             let tensor_ptr = unsafe { *list.data.add(i) };
             if tensor_ptr == 0 {
-                eprintln!(
-                    "nsl: train_checkpoint_load: {which}[{i}] is a null moment \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is a null moment \
                      slot — refused composition"
                 );
                 std::process::abort();
             }
             let tensor = NslTensor::from_ptr(tensor_ptr);
             if tensor.dtype != 1 {
-                eprintln!(
-                    "nsl: train_checkpoint_load: {which}[{i}] has dtype {} — \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] has dtype {} — \
                      only plain f32 moments are restorable",
                     tensor.dtype
                 );
@@ -1294,8 +1257,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
             }
             let byte_count = (tensor.len as usize) * tensor.element_size();
             if offset + byte_count > data.len() {
-                eprintln!(
-                    "nsl: train_checkpoint_load: sidecar ended early at {which}[{i}] \
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar ended early at {which}[{i}] \
                      (need {byte_count} bytes at offset {offset}, have {})",
                     data.len().saturating_sub(offset)
                 );
@@ -1323,8 +1285,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    eprintln!(
-                        "nsl: train_checkpoint_load: {which}[{i}] is on GPU but \
+                    crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is on GPU but \
                          CUDA not compiled"
                     );
                     std::process::abort();
@@ -1345,8 +1306,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // unreachable in practice, but a walk that ends short of the data
     // section would mean the header lied — refuse rather than trust it.
     if offset != data.len() {
-        eprintln!(
-            "nsl: train_checkpoint_load: sidecar has {} unconsumed trailing \
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar has {} unconsumed trailing \
              bytes after the last moment — header/data drift",
             data.len().saturating_sub(offset)
         );
@@ -1433,8 +1393,7 @@ fn check_tensor_contiguous(tensor: &NslTensor, idx: usize) {
     for d in (0..tensor.ndim as usize).rev() {
         let actual = unsafe { *tensor.strides.add(d) };
         if actual != expected_stride {
-            eprintln!(
-                "nsl: model_save: parameter {} is not contiguous (dim {} stride {} expected {})",
+            crate::nsl_log!(ERROR, "nsl", "nsl: model_save: parameter {} is not contiguous (dim {} stride {} expected {})",
                 idx, d, actual, expected_stride
             );
             std::process::abort();

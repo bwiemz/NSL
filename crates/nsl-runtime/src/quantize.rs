@@ -110,7 +110,7 @@ fn alloc_qtensor(
     let data_bytes = match dtype {
         DTYPE_INT4 => total.div_ceil(2),
         DTYPE_INT8 => total,
-        _ => { eprintln!("nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
+        _ => { crate::nsl_log!(WARN, "nsl", "nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
     };
 
     // MUST use zeroed alloc — int4_pack uses |= which blends with existing bits
@@ -151,7 +151,7 @@ pub extern "C" fn nsl_qtensor_free(ptr: i64) {
     let data_bytes = match qt.dtype {
         DTYPE_INT4 => total.div_ceil(2),
         DTYPE_INT8 => total,
-        _ => { eprintln!("nsl: unknown quantization dtype {}", qt.dtype); std::process::abort(); }
+        _ => { crate::nsl_log!(WARN, "nsl", "nsl: unknown quantization dtype {}", qt.dtype); std::process::abort(); }
     };
 
     unsafe {
@@ -297,7 +297,7 @@ pub extern "C" fn nsl_qtensor_quantize(
     let (qmin, qmax) = match dtype {
         DTYPE_INT4 => (0.0_f64, 15.0_f64),
         DTYPE_INT8 => (0.0_f64, 255.0_f64),
-        _ => { eprintln!("nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
+        _ => { crate::nsl_log!(WARN, "nsl", "nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
     };
 
     // Read all source data into a Vec for easier slicing
@@ -417,7 +417,7 @@ pub extern "C" fn nsl_qtensor_quantize(
             }
         }
         _ => {
-            eprintln!("nsl: unknown quantization granularity {}", granularity);
+            crate::nsl_log!(ERROR, "nsl", "nsl: unknown quantization granularity {}", granularity);
             std::process::abort();
         }
     }
@@ -517,7 +517,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
             }
         }
         _ => {
-            eprintln!("nsl: unknown quantization granularity {} in dequantize", qt.granularity);
+            crate::nsl_log!(ERROR, "nsl", "nsl: unknown quantization granularity {} in dequantize", qt.granularity);
             std::process::abort();
         }
     }
@@ -548,8 +548,7 @@ pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
     // Validate qw is 2D
     let qw = QuantizedTensor::from_ptr(qw_ptr);
     if qw.ndim != 2 {
-        eprintln!(
-            "nsl: nsl_qtensor_matmul_mixed: quantized weight must be 2D, got {}D",
+        crate::nsl_log!(ERROR, "nsl", "nsl: nsl_qtensor_matmul_mixed: quantized weight must be 2D, got {}D",
             qw.ndim
         );
         std::process::abort();
@@ -561,12 +560,11 @@ pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
     let x_last = if x.ndim > 0 {
         unsafe { *x.shape.add((x.ndim - 1) as usize) }
     } else {
-        eprintln!("nsl: nsl_qtensor_matmul_mixed: x must be at least 1D");
+        crate::nsl_log!(ERROR, "nsl", "nsl: nsl_qtensor_matmul_mixed: x must be at least 1D");
         std::process::abort();
     };
     if x_last != qw_k {
-        eprintln!(
-            "nsl: nsl_qtensor_matmul_mixed: x last dim ({}) != qw dim 0 ({})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: nsl_qtensor_matmul_mixed: x last dim ({}) != qw dim 0 ({})",
             x_last, qw_k
         );
         std::process::abort();

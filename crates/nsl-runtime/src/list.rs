@@ -46,8 +46,7 @@ pub extern "C" fn nsl_list_get(list_ptr: i64, index: i64) -> i64 {
     // Support negative indices: -1 is last element, -2 is second to last, etc.
     let actual = if index < 0 { index + list.len } else { index };
     if actual < 0 || actual >= list.len {
-        eprintln!(
-            "nsl: list index out of bounds (index {}, length {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: list index out of bounds (index {}, length {})",
             index, list.len
         );
         std::process::abort();
@@ -66,8 +65,7 @@ pub extern "C" fn nsl_list_set(list_ptr: i64, index: i64, value: i64) {
     let list = NslList::from_ptr(list_ptr);
     let actual = if index < 0 { index + list.len } else { index };
     if actual < 0 || actual >= list.len {
-        eprintln!(
-            "nsl: list index out of bounds in assignment (index {}, length {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: list index out of bounds in assignment (index {}, length {})",
             index, list.len
         );
         std::process::abort();
@@ -95,7 +93,7 @@ pub extern "C" fn nsl_list_slice(list_ptr: i64, lo: i64, hi: i64, step_val: i64)
     let step = if step_val == i64::MIN { 1 } else { step_val };
 
     if step == 0 {
-        eprintln!("nsl: slice step cannot be zero");
+        crate::nsl_log!(ERROR, "nsl", "nsl: slice step cannot be zero");
         std::process::abort();
     }
 

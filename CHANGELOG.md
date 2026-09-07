@@ -16,8 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   subscriber receives the lines as events instead. The bracketed-marker
   family (`[zero3]`, `[cuda-graph]`, `[weight-stream]`, `[arena]`,
   `[sr-bf16]`, `[fused-lce-gemm]`, `[nsl-profiler]`, `[mem-trace]`,
-  `[nsl-tcp]`, `[nsl-trace]`, `[tape-trace]`, `[scope]`; 133 sites) is
-  migrated; new dependency `tracing` (std only, with `tracing-core`).
+  `[nsl-tcp]`, `[nsl-trace]`, `[tape-trace]`, `[scope]`; 133 sites) and the
+  `nsl: …` family (292 sites, target `nsl`, `ERROR` before an abort or exit
+  and `WARN` where the entry point returns) are migrated; the stderr path
+  allocates nothing, so the out-of-memory line still prints. New dependency
+  `tracing` (std only, with `tracing-core`).
 
 ### Fixed
 

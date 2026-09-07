@@ -222,7 +222,7 @@ pub extern "C" fn nsl_muon_prof_begin(region: i64) {
     }
     let r = region as usize;
     if r >= N_REGIONS {
-        eprintln!("nsl: muon_prof_begin: bad region id {region}");
+        crate::nsl_log!(WARN, "nsl", "nsl: muon_prof_begin: bad region id {region}");
         return;
     }
     maybe_sync();
@@ -244,12 +244,11 @@ pub extern "C" fn nsl_muon_prof_end(region: i64) {
                 CALLS[r].fetch_add(1, Ordering::Relaxed);
             }
             Some((top, _)) => {
-                eprintln!(
-                    "nsl: muon_prof_end region {region} does not match open region {top} — dropping sample"
+                crate::nsl_log!(WARN, "nsl", "nsl: muon_prof_end region {region} does not match open region {top} — dropping sample"
                 );
             }
             None => {
-                eprintln!("nsl: muon_prof_end with no open region (id {region})");
+                crate::nsl_log!(WARN, "nsl", "nsl: muon_prof_end with no open region (id {region})");
             }
         }
     });

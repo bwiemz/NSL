@@ -211,7 +211,7 @@ pub extern "C" fn nsl_bpe_train(
     )));
 
     if let Err(e) = tokenizer.train_from_files(&mut trainer, vec![path.to_string()]) {
-        eprintln!("nsl: BPE training failed: {e}");
+        crate::nsl_log!(ERROR, "nsl", "nsl: BPE training failed: {e}");
         std::process::abort();
     }
 
@@ -230,7 +230,7 @@ pub extern "C" fn nsl_tokenizer_load(path_ptr: i64) -> i64 {
     match Tokenizer::from_file(path) {
         Ok(tok) => store_tokenizer(TokenizerKind::HuggingFace(Box::new(tok))),
         Err(e) => {
-            eprintln!("nsl: failed to load tokenizer from '{path}': {e}");
+            crate::nsl_log!(ERROR, "nsl", "nsl: failed to load tokenizer from '{path}': {e}");
             std::process::abort();
         }
     }
@@ -246,12 +246,12 @@ pub extern "C" fn nsl_tokenizer_save(handle: i64, path_ptr: i64) {
     let path = unsafe { cstr_to_str(path_ptr) };
     match get_tokenizer(handle) {
         TokenizerKind::Byte => {
-            eprintln!("nsl: cannot save byte tokenizer (no serializable model)");
+            crate::nsl_log!(ERROR, "nsl", "nsl: cannot save byte tokenizer (no serializable model)");
             std::process::abort();
         }
         TokenizerKind::HuggingFace(tok) => {
             if let Err(e) = tok.save(path, false) {
-                eprintln!("nsl: failed to save tokenizer to '{path}': {e}");
+                crate::nsl_log!(ERROR, "nsl", "nsl: failed to save tokenizer to '{path}': {e}");
                 std::process::abort();
             }
         }
@@ -277,7 +277,7 @@ pub extern "C" fn nsl_tokenizer_encode(handle: i64, text_ptr: i64) -> i64 {
             let encoding = match tok.encode(text, false) {
                 Ok(enc) => enc,
                 Err(e) => {
-                    eprintln!("nsl: tokenizer encode failed: {e}");
+                    crate::nsl_log!(ERROR, "nsl", "nsl: tokenizer encode failed: {e}");
                     std::process::abort();
                 }
             };
@@ -320,7 +320,7 @@ pub extern "C" fn nsl_tokenizer_decode(handle: i64, tensor_ptr: i64) -> i64 {
             match tok.decode(&ids, true) {
                 Ok(s) => alloc_cstring(&s),
                 Err(e) => {
-                    eprintln!("nsl: tokenizer decode failed: {e}");
+                    crate::nsl_log!(ERROR, "nsl", "nsl: tokenizer decode failed: {e}");
                     std::process::abort();
                 }
             }
@@ -376,7 +376,7 @@ pub extern "C" fn nsl_tokenizer_encode_batch(
                 let encoding = match tok.encode(text, false) {
                     Ok(enc) => enc,
                     Err(e) => {
-                        eprintln!("nsl: tokenizer batch encode failed: {e}");
+                        crate::nsl_log!(ERROR, "nsl", "nsl: tokenizer batch encode failed: {e}");
                         std::process::abort();
                     }
                 };

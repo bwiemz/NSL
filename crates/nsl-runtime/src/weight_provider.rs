@@ -69,20 +69,18 @@ static WEIGHT_PROVIDER: OnceLock<WeightProvider> = OnceLock::new();
 /// index at which the raw tensor data begins inside `raw`.
 fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
     if raw.len() < 16 {
-        eprintln!(
-            "nsl: weight_provider: blob too small ({} bytes, need at least 16)",
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: blob too small ({} bytes, need at least 16)",
             raw.len()
         );
         std::process::abort();
     }
     if &raw[0..4] != NSLW_MAGIC {
-        eprintln!("nsl: weight_provider: invalid .nslweights blob (bad magic)");
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: invalid .nslweights blob (bad magic)");
         std::process::abort();
     }
     let version = u32::from_le_bytes(raw[4..8].try_into().unwrap_or_else(|_| std::process::abort()));
     if version != NSLW_VERSION {
-        eprintln!(
-            "nsl: weight_provider: unsupported version {} (expected {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: unsupported version {} (expected {})",
             version, NSLW_VERSION
         );
         std::process::abort();
@@ -91,8 +89,7 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
 
     let header_end = 16 + header_size;
     if raw.len() < header_end {
-        eprintln!(
-            "nsl: weight_provider: blob truncated (need {} bytes for header, have {})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: blob truncated (need {} bytes for header, have {})",
             header_end,
             raw.len()
         );
@@ -102,16 +99,16 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
     // Parse JSON
     let json_bytes = &raw[16..header_end];
     let json_str = std::str::from_utf8(json_bytes).unwrap_or_else(|_| {
-        eprintln!("nsl: weight_provider: header is not valid UTF-8");
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: header is not valid UTF-8");
         std::process::abort();
     });
     let root: serde_json::Value = serde_json::from_str(json_str).unwrap_or_else(|e| {
-        eprintln!("nsl: weight_provider: header JSON parse error: {}", e);
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: header JSON parse error: {}", e);
         std::process::abort();
     });
 
     let params = root["params"].as_array().unwrap_or_else(|| {
-        eprintln!("nsl: weight_provider: header missing 'params' array");
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: header missing 'params' array");
         std::process::abort();
     });
 
@@ -121,11 +118,11 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
             let name = p["name"].as_str().unwrap_or("?").to_string();
             let dtype = p["dtype"].as_str().unwrap_or("f64").to_string();
             let offset = p["offset"].as_u64().unwrap_or_else(|| {
-                eprintln!("nsl: weight_provider: tensor '{}' missing 'offset'", name);
+                crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: tensor '{}' missing 'offset'", name);
                 std::process::abort();
             }) as usize;
             let nbytes = p["nbytes"].as_u64().unwrap_or_else(|| {
-                eprintln!("nsl: weight_provider: tensor '{}' missing 'nbytes'", name);
+                crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: tensor '{}' missing 'nbytes'", name);
                 std::process::abort();
             }) as usize;
             let shape: Vec<i64> = p["shape"]
@@ -155,8 +152,7 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_init_embedded(data_ptr: i64, data_len: i64) {
     if data_ptr <= 0 || data_len <= 0 {
-        eprintln!(
-            "nsl: weight_provider: invalid embedded data (ptr={}, len={})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: invalid embedded data (ptr={}, len={})",
             data_ptr, data_len
         );
         std::process::abort();
@@ -186,8 +182,7 @@ pub extern "C" fn nsl_standalone_init_embedded(data_ptr: i64, data_len: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_path_len: i64) {
     if compiled_path_ptr <= 0 || compiled_path_len <= 0 {
-        eprintln!(
-            "nsl: weight_provider: invalid sidecar path (ptr={}, len={})",
+        crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: invalid sidecar path (ptr={}, len={})",
             compiled_path_ptr, compiled_path_len
         );
         std::process::abort();
@@ -245,8 +240,7 @@ pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_p
     let file = match file {
         Some(f) => f,
         None => {
-            eprintln!(
-                "nsl: weight_provider: could not find .nslweights sidecar (searched: {:?})",
+            crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: could not find .nslweights sidecar (searched: {:?})",
                 candidates
             );
             std::process::abort();
@@ -255,7 +249,7 @@ pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_p
 
     let mmap = unsafe {
         memmap2::Mmap::map(&file).unwrap_or_else(|e| {
-            eprintln!("nsl: weight_provider: mmap failed: {}", e);
+            crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: mmap failed: {}", e);
             std::process::abort();
         })
     };
@@ -319,8 +313,7 @@ pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
         let meta = match meta {
             Some(m) => m,
             None => {
-                eprintln!(
-                    "nsl: weight_provider: no weight entry for tensor index {}",
+                crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: no weight entry for tensor index {}",
                     i
                 );
                 std::process::abort();
@@ -328,8 +321,7 @@ pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
         };
 
         if meta.nbytes < byte_count {
-            eprintln!(
-                "nsl: weight_provider: tensor '{}' stored size {} < required {} bytes",
+            crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: tensor '{}' stored size {} < required {} bytes",
                 meta.name, meta.nbytes, byte_count
             );
             std::process::abort();
@@ -337,8 +329,7 @@ pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
 
         let src_offset = meta.offset;
         if src_offset + byte_count > raw.len() {
-            eprintln!(
-                "nsl: weight_provider: tensor '{}' offset {} + {} exceeds blob size {}",
+            crate::nsl_log!(ERROR, "nsl", "nsl: weight_provider: tensor '{}' offset {} + {} exceeds blob size {}",
                 meta.name, src_offset, byte_count, raw.len()
             );
             std::process::abort();
@@ -454,7 +445,7 @@ fn find_arg<'a>(state: &'a ArgState, name: &str) -> Option<(&'a str, usize)> {
                 return Some((&state.args[i + 1], i));
             }
             // Flag present but no value
-            eprintln!("nsl: --{} requires a value", name);
+            crate::nsl_log!(ERROR, "nsl", "nsl: --{} requires a value", name);
             print_usage(state);
             std::process::exit(1);
         }
@@ -532,8 +523,7 @@ pub extern "C" fn nsl_standalone_args_finish() {
             let arg = &state.args[i];
             // Only warn about flag-looking tokens; skip values that follow unknown flags
             if arg.starts_with('-') {
-                eprintln!(
-                    "nsl: warning: unrecognized argument '{}' (use --help for usage)",
+                crate::nsl_log!(WARN, "nsl", "nsl: warning: unrecognized argument '{}' (use --help for usage)",
                     arg
                 );
             }
@@ -563,7 +553,7 @@ pub extern "C" fn nsl_standalone_arg_str(name_ptr: i64, name_len: i64) -> i64 {
         }
         None => {
             check_help_flag(&state);
-            eprintln!("nsl: missing required argument --{}", name);
+            crate::nsl_log!(ERROR, "nsl", "nsl: missing required argument --{}", name);
             print_usage(&state);
             std::process::exit(1);
         }
@@ -619,7 +609,7 @@ pub extern "C" fn nsl_standalone_arg_int(name_ptr: i64, name_len: i64) -> i64 {
     match find_arg(&state, &name) {
         Some((val, flag_idx)) => {
             let parsed = val.parse::<i64>().unwrap_or_else(|_| {
-                eprintln!("nsl: --{} requires an integer value, got '{}'", name, val);
+                crate::nsl_log!(ERROR, "nsl", "nsl: --{} requires an integer value, got '{}'", name, val);
                 print_usage(&state);
                 std::process::exit(1);
             });
@@ -628,7 +618,7 @@ pub extern "C" fn nsl_standalone_arg_int(name_ptr: i64, name_len: i64) -> i64 {
         }
         None => {
             check_help_flag(&state);
-            eprintln!("nsl: missing required argument --{}", name);
+            crate::nsl_log!(ERROR, "nsl", "nsl: missing required argument --{}", name);
             print_usage(&state);
             std::process::exit(1);
         }
@@ -650,7 +640,7 @@ pub extern "C" fn nsl_standalone_arg_int_default(
     match find_arg(&state, &name) {
         Some((val, flag_idx)) => {
             let parsed = val.parse::<i64>().unwrap_or_else(|_| {
-                eprintln!("nsl: --{} requires an integer value, got '{}'", name, val);
+                crate::nsl_log!(ERROR, "nsl", "nsl: --{} requires an integer value, got '{}'", name, val);
                 print_usage(&state);
                 std::process::exit(1);
             });
@@ -677,7 +667,7 @@ pub extern "C" fn nsl_standalone_arg_float(name_ptr: i64, name_len: i64) -> i64 
     match find_arg(&state, &name) {
         Some((val, flag_idx)) => {
             let parsed = val.parse::<f64>().unwrap_or_else(|_| {
-                eprintln!("nsl: --{} requires a float value, got '{}'", name, val);
+                crate::nsl_log!(ERROR, "nsl", "nsl: --{} requires a float value, got '{}'", name, val);
                 print_usage(&state);
                 std::process::exit(1);
             });
@@ -686,7 +676,7 @@ pub extern "C" fn nsl_standalone_arg_float(name_ptr: i64, name_len: i64) -> i64 
         }
         None => {
             check_help_flag(&state);
-            eprintln!("nsl: missing required argument --{}", name);
+            crate::nsl_log!(ERROR, "nsl", "nsl: missing required argument --{}", name);
             print_usage(&state);
             std::process::exit(1);
         }
@@ -713,7 +703,7 @@ pub extern "C" fn nsl_standalone_arg_float_default(
     match find_arg(&state, &name) {
         Some((val, flag_idx)) => {
             let parsed = val.parse::<f64>().unwrap_or_else(|_| {
-                eprintln!("nsl: --{} requires a float value, got '{}'", name, val);
+                crate::nsl_log!(ERROR, "nsl", "nsl: --{} requires a float value, got '{}'", name, val);
                 print_usage(&state);
                 std::process::exit(1);
             });

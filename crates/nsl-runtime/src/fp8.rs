@@ -136,8 +136,7 @@ pub fn dequantize_fp8(fp8_value: f64, scale: f64) -> f64 {
 fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
     let t = NslTensor::from_ptr_ref(tensor_ptr);
     if t.dtype != 0 && t.dtype != 1 {
-        eprintln!(
-            "nsl: {ctx}: unsupported dtype {} — the fp8 host path reads only f32 (1) and f64 (0)",
+        crate::nsl_log!(ERROR, "nsl", "nsl: {ctx}: unsupported dtype {} — the fp8 host path reads only f32 (1) and f64 (0)",
             t.dtype
         );
         std::process::abort();
@@ -575,8 +574,7 @@ pub extern "C" fn nsl_fp8_update_calibration(
         // (device) or read at the wrong stride (dtype). No in-tree caller
         // creates one — refuse loudly rather than corrupt calibration.
         if rm.device != 0 || (rm.dtype != 0 && rm.dtype != 1) {
-            eprintln!(
-                "nsl: nsl_fp8_update_calibration: running-max state must be a CPU f32/f64 \
+            crate::nsl_log!(ERROR, "nsl", "nsl: nsl_fp8_update_calibration: running-max state must be a CPU f32/f64 \
                  tensor (device={}, dtype={}); keep FP8 calibration state on the host",
                 rm.device, rm.dtype
             );
