@@ -37,6 +37,12 @@ pub(crate) fn has_train_block(module: &nsl_ast::Module) -> bool {
 
 
 fn main() {
+    // `NSL_EVENTS` is the compiled program's stream, not the compiler's: the
+    // CLI inherits the variable it passes through to `nsl run`'s child, and
+    // its compile-time diagnostics go through `nsl_log!` like the runtime's,
+    // so without this the two processes would interleave their own `seq`
+    // sequences in one file (`events_stream_gate` pins single-writer seq).
+    nsl_runtime::events::opt_out_this_process();
     // Windows debug builds easily overflow the 1MB main-thread stack
     // because NSL's compile pipeline has deeply-nested passes (WRGA +
     // WGGO + source-AD + Cranelift lowering).  Run the real entry

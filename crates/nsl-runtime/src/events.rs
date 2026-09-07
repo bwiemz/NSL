@@ -26,6 +26,10 @@
 //! - Emission is best-effort and NEVER aborts or panics: a training run must
 //!   not die because an events path is unwritable. The first failure prints
 //!   one `[nsl] warning:` line and further emission is disabled.
+//! - The writer is the compiled program (one process per rank). The `nsl`
+//!   CLI, which passes `NSL_EVENTS` through to the program it spawns and
+//!   whose own diagnostics also go through `nsl_log!`, opts itself out with
+//!   [`opt_out_this_process`] so the file has one writer per rank.
 //! - The stderr markers are UNCHANGED, byte for byte, and stay gated by
 //!   their own env vars; `NSL_EVENTS` gates only this file. Both renderings
 //!   are built from a single snapshot of the underlying counters at each
@@ -50,6 +54,21 @@ pub const EVENTS_VERSION: u32 = 1;
 static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static FAILED: AtomicBool = AtomicBool::new(false);
+static OPTED_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Keep this process out of the stream, whatever `NSL_EVENTS` says.
+///
+/// The stream belongs to the compiled program: `seq` is a per-process
+/// counter and `rank` a process identity, so its consumers assume one
+/// writer per rank. The `nsl` CLI calls this first thing in `main` — it
+/// inherits the variable it passes to the program it spawns, and since its
+/// compile-time diagnostics go through `nsl_log!` too, without this the
+/// compiler's `log` events would land in the program's file with a second
+/// `seq` sequence starting at 0 (the events gate pins this). The file is
+/// not opened or created by an opted-out process.
+pub fn opt_out_this_process() {
+    OPTED_OUT.store(true, Ordering::Relaxed);
+}
 
 fn sink() -> &'static Option<Mutex<std::fs::File>> {
     if let Some(s) = SINK.get() {
@@ -84,7 +103,7 @@ fn sink() -> &'static Option<Mutex<std::fs::File>> {
 /// True when `NSL_EVENTS` is set to a writable path. Callers use this to
 /// decide whether to take a snapshot at all on hot paths.
 pub fn enabled() -> bool {
-    sink().is_some() && !FAILED.load(Ordering::Relaxed)
+    !OPTED_OUT.load(Ordering::Relaxed) && sink().is_some() && !FAILED.load(Ordering::Relaxed)
 }
 
 /// This process's rank for the event envelope: `NSL_LOCAL_RANK`, 0 when
@@ -104,6 +123,9 @@ fn rank() -> i64 {
 /// Best-effort: errors disable the stream with one warning, never panic —
 /// this runs inside `extern "C"` atexit hooks where unwinding aborts.
 pub fn emit(kind: &str, step: Option<i64>, fields: &[(&str, serde_json::Value)]) {
+    if OPTED_OUT.load(Ordering::Relaxed) {
+        return;
+    }
     let Some(file) = sink() else { return };
     if FAILED.load(Ordering::Relaxed) {
         return;

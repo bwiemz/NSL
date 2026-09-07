@@ -37,6 +37,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   file (and reports an unopenable path) outside its `OnceLock`
   initializer, since the warning now reaches the subscriber, which asks the
   same sink whether to mirror the line.
+- Runtime logging, step 4 (roadmap C3): nsl-codegen's 371 compile-time
+  diagnostic `eprintln!` sites go through `nsl_runtime::nsl_log!` — target
+  `codegen` for the `warning:` / `error:` / `note:` lines, the subsystem
+  otherwise (`autotune`, `ccr`, `source-ad`, `wggo`, `cpdt`, `arena`,
+  `weight-stream`, `fusion-report`, …; a line that starts with its own
+  `[marker]` uses that marker). stderr is byte-identical. The macro reaches
+  `tracing` through a re-export in `nsl_runtime::log`, so a calling crate
+  needs no dependency of its own. The `eprint!` report dumps and the
+  dev-tool binaries under `src/bin/` keep raw prints. The `nsl` CLI now
+  opts its own process out of the `NSL_EVENTS` stream
+  (`nsl_runtime::events::opt_out_this_process`): the stream belongs to the
+  compiled program (one writer per rank), and a compile-time diagnostic
+  mirrored from the compiler would have added a second `seq` sequence.
 
 ### Fixed
 
