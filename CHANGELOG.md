@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   derived two `&mut` for aliasing inputs (`matmul(x, x)`); `nsl_tensor_reshape`
   read its input through a reference held across `new_view_i64`; the sparse
   value buffer was a byte allocation read as `&[f64]` (now an f64
-  allocation, freed with the same layout); the KV-transfer header was written
+  allocation at all ten construction sites, freed with the same layout); the KV-transfer header was written
   to the socket as the struct's raw bytes, four uninitialized padding bytes
   included (now serialized field by field, same 48-byte layout);
   `nsl_tensor_to_dlpack_owned` held a `&mut` to the tensor across
