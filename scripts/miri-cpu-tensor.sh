@@ -61,9 +61,12 @@ export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation -Zmiri-permissive-proven
 #   profiler         `atexit`
 #   profiling        `atexit`
 # `tensor` is the default filter's own module and `cuda`/`onnx*`/`huggingface`
-# are feature-gated or network-bound; `fase_step` and `host_profile` exceed
-# the per-module cap and are skipped for time, not for a Miri limitation.
-SWEEP_SKIP="c_api data_source dataloader kernel_profiler profiler profiling cuda onnx onnx_rt_op huggingface fase_step host_profile"
+# are feature-gated or network-bound; `fase_step`, `host_profile` and `fuzz`
+# exceed the per-module cap and are skipped for time, not for a Miri
+# limitation (`fuzz`'s two seeded loops interpret 15,000 and ~5,000 tensor
+# ops each and do not finish in ten minutes apiece; its four small tests
+# are clean under `--each fuzz::`).
+SWEEP_SKIP="c_api data_source dataloader kernel_profiler profiler profiling cuda onnx onnx_rt_op huggingface fase_step host_profile fuzz"
 
 if [[ "${1:-}" == "--sweep" ]]; then
   fail=0

@@ -668,7 +668,10 @@ tests holding a handle across a call, an unaligned test buffer for
 `ShmHeader`, stack tensors handed out through `&T` rather than `&mut T`.
 Three `tensor::activation` / `flash_attention` / `context_parallel` tests
 assert bit-exact float results and fail under Miri's deliberately
-perturbed float operations; those are not findings. The script passes
+perturbed float operations; those are not findings.
+`fase_step`, `host_profile` and the two seeded `fuzz` loops exceed the
+per-module time cap and are skipped for time, not for a limitation of
+Miri (the four small `fuzz` tests are clean). The script passes
 `-Zmiri-ignore-leaks`: the tests leak shape lists and tensors on purpose
 (110 allocations at exit), which is test hygiene, not the aliasing
 question. Not in CI only because it needs a nightly toolchain: once the
