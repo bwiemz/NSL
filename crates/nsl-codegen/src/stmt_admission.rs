@@ -102,7 +102,7 @@ impl Compiler<'_> {
         // envelope at the per-layer update sites, with a drain after
         // each group update. The window's own accumulate hook stays
         // device-resident (wrap_offload=false at the hook site).
-        if self.compile_options.checkpoint_compress.is_some() {
+        if self.compile_options.checkpoint.compress.is_some() {
             return Err(CodegenError::new(
                 "--layerwise-accum is incompatible with --checkpoint-compress: \
                  the layerwise gate is bit-exact and compressed saves are not",

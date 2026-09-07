@@ -433,19 +433,19 @@ snapshots! {
         ..source_ad()
     };
     dataloader_checkpoint_cuda_graphs: "dataloader_checkpoint", CompileOptions { cuda_graphs: true, ..source_ad() };
-    csla_ffn_checkpoint_blocks: "csla_ffn", CompileOptions { checkpoint_blocks: true, ..source_ad() };
+    csla_ffn_checkpoint_blocks: "csla_ffn", CompileOptions { checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() }, ..source_ad() };
     csla_ffn_layerwise_accum: "csla_ffn", CompileOptions {
-        checkpoint_blocks: true,
+        checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
         layerwise_accum: true,
         ..source_ad()
     };
     csla_ffn_muon_layerwise_accum: "csla_ffn_muon", CompileOptions {
-        checkpoint_blocks: true,
+        checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
         layerwise_accum: true,
         ..source_ad()
     };
     csla_ffn_muon_state_bf16: "csla_ffn_muon", CompileOptions {
-        checkpoint_blocks: true,
+        checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
         layerwise_accum: true,
         muon_state_bf16: true,
         ..source_ad()

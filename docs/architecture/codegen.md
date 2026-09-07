@@ -240,14 +240,17 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 78 `pub` fields today. The decomposition into cohesive
+The struct has 73 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
 (`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
 `CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
 data path, mode, sample/batch/timeout budgets, the AWQ `retention` and
 WGGO `grad_retention` plans, `batch_seq`, the subprocess `compile_bundle`
-and the `sidecar` the harness writes back), plus `MatmulConfig`
+and the `sidecar` the harness writes back), `CheckpointOptions`
+(`opts.checkpoint`: the CCR flags `blocks` / `selective` / `budget_mib` /
+`stride` / `compress`, plus the decorator-derived per-function `policies`
+map the CLI publishes after semantic analysis), plus `MatmulConfig`
 (`opts.matmul`) and `WrgaCheckContext` (`opts.wrga_check`, which retired
 the CLI's WRGA thread-locals — see compiler-state.md Phase 2). Everything
 else is still a flat field (`source_ad`, `deterministic`, `target`,
@@ -759,8 +762,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 
 1. Add the field to `CompileOptions` in `src/lib.rs` — inside the matching
    sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`, `ZkOptions`,
-   `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `MatmulConfig`) when
-   one exists — with its
+   `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `CheckpointOptions`,
+   `MatmulConfig`) when one exists — with its
    default in `impl Default for CompileOptions` (or the sub-struct's).
 2. Declare the clap flag in `crates/nsl-cli/src/args.rs`. Shared flags are
    declared twice (`BuildArgs`, `RunArgs`) and must be identical; a flag

@@ -82,7 +82,7 @@ pub fn analysis_to_csha_configs(
 
 /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6): expose
 /// `EffectChecker::checkpoint_policies()` in the
-/// `HashMap<String, CheckpointPolicy>` shape `CompileOptions.checkpoint_policies`
+/// `HashMap<String, CheckpointPolicy>` shape `CompileOptions.checkpoint.policies`
 /// expects. Empty when no `@checkpoint(policy="...")` decorators are present.
 pub fn analysis_to_checkpoint_policies(
     a: &nsl_semantic::AnalysisResult,

@@ -14,6 +14,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   retention, batch_seq, compile_bundle, grad_retention}`). Defaults are
   unchanged; `HarnessConfig` and the CLI `BuildArgs` keep their own
   `calibration_data` fields. 87 → 78 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the six
+  `checkpoint_*` fields moved into `CheckpointOptions`
+  (`opts.checkpoint.{blocks, selective, budget_mib, stride, compress,
+  policies}`). Defaults unchanged; `AnalysisResult`, `ModuleData` and
+  `WengertExtractor` keep their own `checkpoint_policies`; the CLI's
+  training-reference override macro now takes a field path. 78 → 73 flat
+  fields.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

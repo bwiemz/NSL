@@ -66,7 +66,7 @@ pub struct ModuleData {
     /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
     /// per-function `@checkpoint(policy=...)` policies harvested from
     /// `EffectChecker::checkpoint_policies()` at the `analyze_with_imports`
-    /// call site below. Routed into `CompileOptions.checkpoint_policies`
+    /// call site below. Routed into `CompileOptions.checkpoint.policies`
     /// so the codegen-side `WengertExtractor::with_checkpoint_policies`
     /// installer can stamp the prologue + emit a `PrologueRecompute` marker.
     /// Empty map = no checkpointing = byte-identity preserved.
@@ -464,7 +464,7 @@ pub fn load_all_modules(
             // route EffectChecker::checkpoint_policies() output collected
             // by the just-completed `analyze_with_imports` call into
             // ModuleData so the command handlers can publish it onto
-            // `CompileOptions.checkpoint_policies` for codegen to read.
+            // `CompileOptions.checkpoint.policies` for codegen to read.
             checkpoint_policies: analysis.checkpoint_policies,
             pca_configs: analysis.pca_configs,
         });

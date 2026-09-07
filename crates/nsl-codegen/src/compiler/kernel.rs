@@ -970,7 +970,7 @@ impl Compiler<'_> {
             .resolve_csha_d_model_from_stmts(stmts)
             .unwrap_or(base_config.head_dim as u32);
         // Cycle-12 T1 wire-up: derive @checkpoint(policy=Full) presence
-        // from `compile_options.checkpoint_policies`. v1 ships a single
+        // from `compile_options.checkpoint.policies`. v1 ships a single
         // policy variant (Full) per cycle-10 Refuter 3; we use ANY entry
         // in the map as the trigger for routing the backward through
         // `synthesize_backward_with_recompute`. The map being non-empty
@@ -988,7 +988,7 @@ impl Compiler<'_> {
         let checkpoint_full_active = !self.compile_options.training_reference
             && self
                 .compile_options
-                .checkpoint_policies
+                .checkpoint.policies
                 .values()
                 .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Full));
         let training_checkpoint = if checkpoint_full_active {
