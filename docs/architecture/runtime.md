@@ -669,6 +669,15 @@ tests holding a handle across a call, an unaligned test buffer for
 Three `tensor::activation` / `flash_attention` / `context_parallel` tests
 assert bit-exact float results and fail under Miri's deliberately
 perturbed float operations; those are not findings.
+`tensor::alias_tests` is the standing gate that came out of it: one
+probe per multi-input CPU op, each passing the same handle for every
+input (`cat([x, x])`, `x == x`, `where(x, x, x)`, `x += x`, the
+activation backwards with `grad` and `x` aliased, …), which is exactly
+the pattern that makes two `&mut` derivations from one handle observable.
+Twelve of the sixteen ops it covers reported undefined behaviour on the
+first run and now take shared references; run it with
+`scripts/miri-cpu-tensor.sh --each tensor::alias_tests` after touching a
+multi-input op.
 `fase_step`, `host_profile` and the two seeded `fuzz` loops exceed the
 per-module time cap and are skipped for time, not for a limitation of
 Miri (the four small `fuzz` tests are clean). The script passes

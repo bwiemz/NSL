@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Aliasing-input probes (`tensor::alias_tests`, roadmap C2): every CPU
+  entry point that takes two or more tensor handles is called with the same
+  handle for all of them — `cat([x, x])`, `x == x`, `where(x, x, x)`,
+  `x += x`, `layernorm(x, x, x)`, the activation backwards with `grad` and
+  `x` aliased, and so on — natively and under Miri. Twelve of sixteen
+  reported undefined behaviour: each op derived a `&mut NslTensor` per
+  input, so the second derivation invalidated the first before it was
+  read. `compare`, `where`, `cat`, `stack`, `copy_data`, `add_inplace`,
+  `scalar_mul_add_inplace`, `wgrad_accum`, `reduce_to_shape`, `layernorm`,
+  `rmsnorm`, `mse_backward` and the silu/gelu/sigmoid/tanh backwards now
+  take shared references to their inputs (the in-place ops write through
+  the data pointer, never the header).
 - Miri sweep of every nsl-runtime module (`scripts/miri-cpu-tensor.sh
   --sweep`, roadmap C2) and its production findings: `nsl_tensor_matmul`
   derived two `&mut` for aliasing inputs (`matmul(x, x)`); `nsl_tensor_reshape`

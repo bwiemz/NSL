@@ -1148,8 +1148,8 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
 /// falls back to the exact decomposed two-op path.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f64) {
-    let m = NslTensor::from_ptr(m_ptr);
-    let g = NslTensor::from_ptr(g_ptr);
+    let m = NslTensor::from_ptr_ref(m_ptr);
+    let g = NslTensor::from_ptr_ref(g_ptr);
     if m.device == g.device
         && m.dtype == g.dtype
         && m.len == g.len
@@ -1268,9 +1268,9 @@ pub extern "C" fn nsl_wgrad_fallback_count() -> i64 {
 /// fallen back — testing the decomposed chain against itself.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: f64) {
-    let m = NslTensor::from_ptr(m_ptr);
-    let x = NslTensor::from_ptr(x_ptr);
-    let g = NslTensor::from_ptr(g_ptr);
+    let m = NslTensor::from_ptr_ref(m_ptr);
+    let x = NslTensor::from_ptr_ref(x_ptr);
+    let g = NslTensor::from_ptr_ref(g_ptr);
 
     let xs = shape_vec(x);
     let gs = shape_vec(g);
