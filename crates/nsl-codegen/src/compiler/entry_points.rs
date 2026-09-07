@@ -69,16 +69,16 @@ fn run_profile_pre_pass(
     // Source-text priority: explicit options → disk fallback → empty.  Runs
     // before walk_ops so source context is ready even if the walker fails,
     // and before any fusion decisions are made.
-    compiler.source_text = match &options.profile_source_text {
+    compiler.source_text = match &options.dev_tools.profile_source_text {
         Some(s) => s.clone(),
         None => options
-            .profile_source_file_name
+            .dev_tools.profile_source_file_name
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_default(),
     };
     compiler.source_file_name = options
-        .profile_source_file_name
+        .dev_tools.profile_source_file_name
         .clone()
         .unwrap_or_default();
 
@@ -158,7 +158,7 @@ fn install_per_compile_program_facts(
 
 /// Dev Tools Phase 2, Task 6: drain `Compiler.manifest_builder` (if set) and
 /// write the resulting kernel-profile manifest to
-/// `options.manifest_output_path`.  Non-fatal on any failure — profiling is
+/// `options.dev_tools.manifest_output_path`.  Non-fatal on any failure — profiling is
 /// advisory and must never break a build.  Called from each codegen entry
 /// function's latest reliable success path.
 fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::CompileOptions) {
@@ -166,7 +166,7 @@ fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::Compil
         return;
     };
     let manifest = mb.finish();
-    if let Some(out_path) = &options.manifest_output_path {
+    if let Some(out_path) = &options.dev_tools.manifest_output_path {
         match crate::profiling::instrument::write_manifest(out_path, &manifest) {
             Ok(_) => {
                 if std::env::var("NSL_DEBUG").is_ok() {
@@ -713,7 +713,7 @@ fn compile_returning_plan_impl(
     // Dev Tools Phase 2, Task 4/6: run the kernel-profile pre-pass before any
     // body codegen so downstream kernel-launch sites can record manifest
     // entries keyed by `NodeId`.
-    if options.profile_kernels {
+    if options.dev_tools.profile_kernels {
         run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
     }
 
@@ -1430,7 +1430,7 @@ pub fn compile_module_with_imports_best_effort_plans(
     // Dev Tools Phase 2, Task 4: run the kernel-profile pre-pass once at the
     // start of codegen so downstream kernel-launch sites can attach
     // compile-time predictions by `NodeId`.
-    if options.profile_kernels {
+    if options.dev_tools.profile_kernels {
         run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
     }
 
@@ -1666,7 +1666,7 @@ fn compile_entry_impl(
 
     // Dev Tools Phase 2, Task 4/6: run the kernel-profile pre-pass before any
     // body codegen.
-    if options.profile_kernels {
+    if options.dev_tools.profile_kernels {
         run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
     }
 
