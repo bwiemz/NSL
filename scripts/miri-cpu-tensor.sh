@@ -25,7 +25,10 @@
 # tensors that are never freed — 110 allocations across the module). Drop
 # that flag to audit test hygiene instead.
 #
-# Usage:  scripts/miri-cpu-tensor.sh                  # tensor::tests, one process
+# Usage:  scripts/miri-cpu-tensor.sh --sweep          # every module of the crate,
+#                                                     # one process each, one
+#                                                     # summary line per module
+#         scripts/miri-cpu-tensor.sh                  # tensor::tests, one process
 #         scripts/miri-cpu-tensor.sh --each           # one process per test, so an
 #                                                     # error in one test does not
 #                                                     # hide the rest (slower)
@@ -48,6 +51,40 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks}"
+# Modules whose tests cannot run under Miri at all, with the operation that
+# stops them (the first such test aborts the whole process, so they are
+# skipped by `--sweep` rather than reported as findings):
+#   c_api            re-exec tests spawn a child (`posix_spawnattr_init`)
+#   data_source      file-backed memory mappings
+#   dataloader       file-backed memory mappings
+#   kernel_profiler  `atexit`
+#   profiler         `atexit`
+#   profiling        `atexit`
+# `tensor` is the default filter's own module and `cuda`/`onnx*`/`huggingface`
+# are feature-gated or network-bound; `fase_step`, `host_profile` and `fuzz`
+# exceed the per-module cap and are skipped for time, not for a Miri
+# limitation (`fuzz`'s two seeded loops interpret 15,000 and ~5,000 tensor
+# ops each and do not finish in ten minutes apiece; its four small tests
+# are clean under `--each fuzz::`).
+SWEEP_SKIP="c_api data_source dataloader kernel_profiler profiler profiling cuda onnx onnx_rt_op huggingface fase_step host_profile fuzz"
+
+if [[ "${1:-}" == "--sweep" ]]; then
+  fail=0
+  for f in crates/nsl-runtime/src/*.rs crates/nsl-runtime/src/*/mod.rs; do
+    m=${f#crates/nsl-runtime/src/}; m=${m%/mod.rs}; m=${m%.rs}
+    [[ "$m" == lib ]] && continue
+    case " $SWEEP_SKIP " in *" $m "*) continue;; esac
+    n=$(cargo +nightly miri test -p nsl-runtime --lib -- "${m}::" --list 2>/dev/null | grep -c ": test$" || true)
+    [[ "$n" == 0 ]] && continue
+    out=$(timeout "${MIRI_MODULE_TIMEOUT:-1200}" cargo +nightly miri test -p nsl-runtime --lib -- "${m}::" 2>&1 || true)
+    res=$(printf '%s\n' "$out" | grep -E "^test result" | tail -1)
+    ub=$(printf '%s\n' "$out" | grep -m1 -E "Undefined Behavior|unsupported operation" | cut -c1-160)
+    if [[ -n "$ub" ]]; then fail=1; fi
+    echo "$m ($n tests): ${res:-no summary}${ub:+ | $ub}"
+  done
+  exit $fail
+fi
+
 each=0
 if [[ "${1:-}" == "--each" ]]; then each=1; shift; fi
 filter="${1:-tensor::tests}"

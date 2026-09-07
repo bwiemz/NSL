@@ -54,6 +54,55 @@ impl KvTransferHeader {
     pub fn is_valid(&self) -> bool {
         self.magic == KV_TRANSFER_MAGIC
     }
+
+    /// Size of the header on the wire: the `#[repr(C)]` layout, 48 bytes,
+    /// with its four padding bytes after `magic` written as zeros.
+    pub const WIRE_SIZE: usize = 48;
+
+    /// The header as it goes on the wire — field by field, native byte order
+    /// (the format the receiver's `from_wire_bytes` reads and that every
+    /// existing peer on the same architecture already speaks), padding
+    /// zeroed. Writing the struct's bytes with `from_raw_parts` instead sent
+    /// the four uninitialized padding bytes after `magic`: undefined
+    /// behaviour by the language, stack garbage on the wire in practice
+    /// (Miri, roadmap C2).
+    pub fn to_wire_bytes(&self) -> [u8; Self::WIRE_SIZE] {
+        let mut b = [0u8; Self::WIRE_SIZE];
+        b[0..4].copy_from_slice(&self.magic.to_ne_bytes());
+        // 4..8: padding
+        b[8..16].copy_from_slice(&self.request_id.to_ne_bytes());
+        b[16..20].copy_from_slice(&self.num_layers.to_ne_bytes());
+        b[20..24].copy_from_slice(&self.num_kv_heads.to_ne_bytes());
+        b[24..28].copy_from_slice(&self.head_dim.to_ne_bytes());
+        b[28..32].copy_from_slice(&self.block_size.to_ne_bytes());
+        b[32..36].copy_from_slice(&self.num_blocks.to_ne_bytes());
+        b[36..38].copy_from_slice(&self.dtype.to_ne_bytes());
+        b[38] = self.compressed;
+        b[39] = self._padding;
+        b[40..48].copy_from_slice(&self.total_bytes.to_ne_bytes());
+        b
+    }
+
+    /// Inverse of [`to_wire_bytes`](Self::to_wire_bytes).
+    pub fn from_wire_bytes(b: &[u8; Self::WIRE_SIZE]) -> Self {
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64_at = |o: usize| {
+            u64::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]])
+        };
+        KvTransferHeader {
+            magic: u32_at(0),
+            request_id: u64_at(8),
+            num_layers: u32_at(16),
+            num_kv_heads: u32_at(20),
+            head_dim: u32_at(24),
+            block_size: u32_at(28),
+            num_blocks: u32_at(32),
+            dtype: u16::from_ne_bytes([b[36], b[37]]),
+            compressed: b[38],
+            _padding: b[39],
+            total_bytes: u64_at(40),
+        }
+    }
 }
 
 /// Per-block metadata in the transfer.
@@ -425,14 +474,11 @@ impl TcpBackend {
         let mut stream = stream;
 
         // Read header (fixed size)
-        let header_size = std::mem::size_of::<KvTransferHeader>();
-        let mut header_bytes = vec![0u8; header_size];
+        let mut header_bytes = [0u8; KvTransferHeader::WIRE_SIZE];
         if stream.read_exact(&mut header_bytes).is_err() {
             return None;
         }
-        let header: KvTransferHeader = unsafe {
-            std::ptr::read_unaligned(header_bytes.as_ptr() as *const KvTransferHeader)
-        };
+        let header = KvTransferHeader::from_wire_bytes(&header_bytes);
         if !header.is_valid() {
             return None;
         }
@@ -483,14 +529,8 @@ impl TcpBackend {
     ) -> std::io::Result<()> {
         use std::io::Write;
 
-        // Write header
-        let header_bytes = unsafe {
-            std::slice::from_raw_parts(
-                header as *const KvTransferHeader as *const u8,
-                std::mem::size_of::<KvTransferHeader>(),
-            )
-        };
-        stream.write_all(header_bytes)?;
+        // Write header (field by field: never the struct's padding bytes).
+        stream.write_all(&header.to_wire_bytes())?;
 
         // Write block entries
         if !block_entries.is_empty() {
@@ -1942,6 +1982,32 @@ mod tests {
             _padding: 0,
             total_bytes: 0,
         }
+    }
+
+    /// The wire encoding is the `#[repr(C)]` layout with zeroed padding,
+    /// and it round-trips. Pins WIRE_SIZE to the struct so a field change
+    /// cannot silently desynchronize the two.
+    #[test]
+    fn header_wire_bytes_match_repr_c_layout_with_zero_padding() {
+        assert_eq!(std::mem::size_of::<KvTransferHeader>(), KvTransferHeader::WIRE_SIZE);
+        let h = make_test_header(0x1122_3344_5566_7788);
+        let b = h.to_wire_bytes();
+        assert_eq!(&b[4..8], &[0, 0, 0, 0], "padding after `magic` is zero on the wire");
+        assert_eq!(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]), KV_TRANSFER_MAGIC);
+        assert_eq!(u64::from_ne_bytes(b[8..16].try_into().unwrap()), 0x1122_3344_5566_7788);
+        assert_eq!(u32::from_ne_bytes(b[24..28].try_into().unwrap()), 4, "head_dim at offset 24");
+        assert_eq!(u16::from_ne_bytes([b[36], b[37]]), 1, "dtype at offset 36");
+        let back = KvTransferHeader::from_wire_bytes(&b);
+        assert_eq!(back.request_id, h.request_id);
+        assert_eq!(back.num_layers, h.num_layers);
+        assert_eq!(back.num_kv_heads, h.num_kv_heads);
+        assert_eq!(back.head_dim, h.head_dim);
+        assert_eq!(back.block_size, h.block_size);
+        assert_eq!(back.num_blocks, h.num_blocks);
+        assert_eq!(back.dtype, h.dtype);
+        assert_eq!(back.compressed, h.compressed);
+        assert_eq!(back.total_bytes, h.total_bytes);
+        assert!(back.is_valid());
     }
 
     fn make_empty_header() -> KvTransferHeader {

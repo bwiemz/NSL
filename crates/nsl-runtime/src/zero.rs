@@ -4142,7 +4142,7 @@ mod tests {
         let shape = vec![4i64];
         let strides = vec![1i64];
 
-        let tensor = NslTensor {
+        let mut tensor = NslTensor {
             magic: crate::tensor::TENSOR_MAGIC,
             data: data.as_mut_ptr() as *mut c_void,
             shape: shape.as_ptr() as *mut i64,
@@ -4158,7 +4158,7 @@ mod tests {
             tape_id: 0,
         };
 
-        let tensor_ptr = &tensor as *const NslTensor as i64;
+        let tensor_ptr = &mut tensor as *mut NslTensor as i64;
         assert_eq!(nsl_grad_zero(tensor_ptr, 4), 0);
         assert_eq!(data, vec![0.0, 0.0, 0.0, 0.0]);
     }
@@ -4170,7 +4170,7 @@ mod tests {
         let shape = vec![4i64];
         let strides = vec![1i64];
 
-        let dst_tensor = NslTensor {
+        let mut dst_tensor = NslTensor {
             magic: crate::tensor::TENSOR_MAGIC,
             data: dst_data.as_mut_ptr() as *mut c_void,
             shape: shape.as_ptr() as *mut i64,
@@ -4186,7 +4186,7 @@ mod tests {
             tape_id: 0,
         };
 
-        let src_tensor = NslTensor {
+        let mut src_tensor = NslTensor {
             magic: crate::tensor::TENSOR_MAGIC,
             data: src_data.as_ptr() as *mut c_void,
             shape: shape.as_ptr() as *mut i64,
@@ -4202,8 +4202,8 @@ mod tests {
             tape_id: 0,
         };
 
-        let dst_ptr = &dst_tensor as *const NslTensor as i64;
-        let src_ptr = &src_tensor as *const NslTensor as i64;
+        let dst_ptr = &mut dst_tensor as *mut NslTensor as i64;
+        let src_ptr = &mut src_tensor as *mut NslTensor as i64;
         assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), 0);
         assert_eq!(dst_data, vec![11.0, 22.0, 33.0, 44.0]);
     }
@@ -4244,14 +4244,14 @@ mod tests {
         let mut shape = vec![4i64];
         let mut strides = vec![1i64];
 
-        let dst_tensor = borrowed_cpu_tensor(
+        let mut dst_tensor = borrowed_cpu_tensor(
             dst_data.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
             4,
             0,
         );
-        let src_tensor = borrowed_cpu_tensor(
+        let mut src_tensor = borrowed_cpu_tensor(
             src_data.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
@@ -4259,8 +4259,8 @@ mod tests {
             1,
         );
 
-        let dst_ptr = &dst_tensor as *const NslTensor as i64;
-        let src_ptr = &src_tensor as *const NslTensor as i64;
+        let dst_ptr = &mut dst_tensor as *mut NslTensor as i64;
+        let src_ptr = &mut src_tensor as *mut NslTensor as i64;
         assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), 0);
         assert_eq!(dst_data, vec![1.5, 3.5, 5.5, 7.5]);
         // src untouched
@@ -4276,14 +4276,14 @@ mod tests {
         let mut shape = vec![4i64];
         let mut strides = vec![1i64];
 
-        let dst_tensor = borrowed_cpu_tensor(
+        let mut dst_tensor = borrowed_cpu_tensor(
             dst_data.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
             4,
             1,
         );
-        let src_tensor = borrowed_cpu_tensor(
+        let mut src_tensor = borrowed_cpu_tensor(
             src_data.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
@@ -4291,8 +4291,8 @@ mod tests {
             0,
         );
 
-        let dst_ptr = &dst_tensor as *const NslTensor as i64;
-        let src_ptr = &src_tensor as *const NslTensor as i64;
+        let dst_ptr = &mut dst_tensor as *mut NslTensor as i64;
+        let src_ptr = &mut src_tensor as *mut NslTensor as i64;
         assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), 0);
         assert_eq!(dst_data, vec![11.0f32, 22.0, 33.0, 44.0]);
     }
@@ -4306,14 +4306,14 @@ mod tests {
         let mut shape = vec![4i64];
         let mut strides = vec![1i64];
 
-        let dst_tensor = borrowed_cpu_tensor(
+        let mut dst_tensor = borrowed_cpu_tensor(
             dst_data.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
             4,
             2, // f16
         );
-        let src_tensor = borrowed_cpu_tensor(
+        let mut src_tensor = borrowed_cpu_tensor(
             src_data.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
@@ -4321,8 +4321,8 @@ mod tests {
             0,
         );
 
-        let dst_ptr = &dst_tensor as *const NslTensor as i64;
-        let src_ptr = &src_tensor as *const NslTensor as i64;
+        let dst_ptr = &mut dst_tensor as *mut NslTensor as i64;
+        let src_ptr = &mut src_tensor as *mut NslTensor as i64;
         assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), -1);
         assert_eq!(dst_data, vec![0x3C00, 0x4000, 0x4200, 0x4400]);
     }
@@ -4339,7 +4339,7 @@ mod tests {
         let mut shape = vec![4i64];
         let mut strides = vec![1i64];
 
-        let tensor = borrowed_cpu_tensor(
+        let mut tensor = borrowed_cpu_tensor(
             data.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
@@ -4347,7 +4347,7 @@ mod tests {
             1,
         );
 
-        let tensor_ptr = &tensor as *const NslTensor as i64;
+        let tensor_ptr = &mut tensor as *mut NslTensor as i64;
         assert_eq!(nsl_grad_zero(tensor_ptr, 4), 0);
         assert_eq!(data, vec![0.0f32, 0.0, 0.0, 0.0]);
     }
@@ -4520,13 +4520,13 @@ mod tests {
         let mut theta = vec![0.5f64, -1.25, 2.0, 3.75];
         let mut shape = vec![4i64];
         let mut strides = vec![1i64];
-        let t = owned_cpu_tensor(
+        let mut t = owned_cpu_tensor(
             theta.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
             4,
         );
-        let tp = &t as *const NslTensor as i64;
+        let tp = &mut t as *mut NslTensor as i64;
 
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
         assert_eq!(nsl_zero3_mark_elementwise(tp, 0, 0), 0);
@@ -4734,13 +4734,13 @@ mod tests {
         let mut theta = full0.to_vec();
         let mut shape = vec![8i64];
         let mut strides = vec![1i64];
-        let t = owned_cpu_tensor(
+        let mut t = owned_cpu_tensor(
             theta.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
             8,
         );
-        let tp = &t as *const NslTensor as i64;
+        let tp = &mut t as *mut NslTensor as i64;
 
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
         // `sr = 0`: plain f32 elementwise storage. #493 widened this call to
@@ -4918,13 +4918,13 @@ mod tests {
         let mut theta = vec![1.0f64, 2.0];
         let mut shape = vec![2i64];
         let mut strides = vec![1i64];
-        let t = owned_cpu_tensor(
+        let mut t = owned_cpu_tensor(
             theta.as_mut_ptr() as *mut c_void,
             shape.as_mut_ptr(),
             strides.as_mut_ptr(),
             2,
         );
-        let tp = &t as *const NslTensor as i64;
+        let tp = &mut t as *mut NslTensor as i64;
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
         assert_eq!(nsl_zero3_mark_elementwise(tp, 0, 0), 0);
         zero3_register(tp);
@@ -5032,8 +5032,8 @@ mod tests {
         let mut strides = vec![1i64];
 
         // ── Composed side: SR note + elementwise mark + carve ──────────────
-        let t = gpu_f32_tensor(&init, shape.as_mut_ptr(), strides.as_mut_ptr());
-        let tp = &t as *const NslTensor as i64;
+        let mut t = gpu_f32_tensor(&init, shape.as_mut_ptr(), strides.as_mut_ptr());
+        let tp = &mut t as *mut NslTensor as i64;
         crate::sr_bf16::nsl_sr_bf16_note_param(tp, 0);
         assert_eq!(nsl_zero3_note_param(tp, 0), 0);
         // sr=1: the plan's storage decision travels with the mark.

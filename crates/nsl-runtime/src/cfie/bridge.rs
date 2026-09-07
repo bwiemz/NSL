@@ -274,7 +274,11 @@ mod tests {
             let live = t.magic;
             t.magic = 0x0000DEAD;
             assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4), -1);
-            t.magic = live;
+            // Restore through the raw pointer: the call above reborrowed
+            // `tptr` and invalidated `t` under Stacked Borrows (Miri,
+            // roadmap C2), and `from_ptr` cannot be used here because the
+            // magic is currently poisoned and it would refuse the handle.
+            unsafe { (*(tptr as *mut NslTensor)).magic = live };
         }
         // Non-f64 dtype (the encode ABI is f64; refuse f32 rather than
         // silently reinterpret the bytes).
@@ -282,14 +286,15 @@ mod tests {
             let t = NslTensor::from_ptr(tptr);
             t.dtype = 1;
             assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4), -1);
-            t.dtype = 0;
+            // Re-derive (same reason); the magic is intact here.
+            NslTensor::from_ptr(tptr).dtype = 0;
         }
         // Non-1-D.
         {
             let t = NslTensor::from_ptr(tptr);
             t.ndim = 2;
             assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4), -1);
-            t.ndim = 1;
+            NslTensor::from_ptr(tptr).ndim = 1;
         }
         nsl_tensor_free(tptr);
     }

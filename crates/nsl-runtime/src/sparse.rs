@@ -82,11 +82,14 @@ pub extern "C" fn nsl_sparse_coo(
     // Copy index arrays (sparse tensor owns its data)
     let mut row_copy = vec![0i64; n];
     let mut col_copy = vec![0i64; n];
-    let mut val_copy = vec![0u8; n * 8]; // f64 = 8 bytes
+    // The value buffer is an f64 array (8-aligned): every reader takes it as
+    // `&[f64]`, which is undefined behaviour on a byte allocation (Miri:
+    // "unaligned reference (required 8 byte alignment but found 1)").
+    let mut val_copy = vec![0f64; n];
     unsafe {
         std::ptr::copy_nonoverlapping(rows_ptr as *const i64, row_copy.as_mut_ptr(), n);
         std::ptr::copy_nonoverlapping(cols_ptr as *const i64, col_copy.as_mut_ptr(), n);
-        std::ptr::copy_nonoverlapping(vals_ptr as *const u8, val_copy.as_mut_ptr(), n * 8);
+        std::ptr::copy_nonoverlapping(vals_ptr as *const f64, val_copy.as_mut_ptr(), n);
     }
 
     let sparse = Box::new(NslSparseTensor {
@@ -194,7 +197,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
         }
 
         let num_blocks = block_col_indices.len();
-        let val_bytes: Vec<u8> = block_values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let val_bytes: Vec<f64> = block_values.to_vec();
 
         let sparse = Box::new(NslSparseTensor {
             format: SparseFmtId::Bsr as u8,
@@ -220,9 +223,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
             row_ptr[i] += row_ptr[i - 1];
         }
 
-        let val_bytes: Vec<u8> = values.iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect();
+        let val_bytes: Vec<f64> = values.to_vec();
 
         let sparse = Box::new(NslSparseTensor {
             format: SparseFmtId::Csr as u8,
@@ -238,9 +239,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
         Box::into_raw(sparse) as i64
     } else {
         // COO format
-        let val_bytes: Vec<u8> = values.iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect();
+        let val_bytes: Vec<f64> = values.to_vec();
 
         let sparse = Box::new(NslSparseTensor {
             format: SparseFmtId::Coo as u8,
@@ -497,7 +496,11 @@ pub extern "C" fn nsl_sparse_free(sparse_ptr: i64) -> i64 {
             let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.indices_1, idx1_len)) };
         }
         if !sparse.data.is_null() && data_bytes > 0 {
-            let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.data, data_bytes)) };
+            // Allocated as `Box<[f64]>` (see the value-buffer note in
+            // `nsl_sparse_coo`); free with the same layout.
+            let _ = unsafe {
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.data as *mut f64, data_bytes / 8))
+            };
         }
     }
     // Box::from_raw above already freed the NslSparseTensor struct
@@ -558,7 +561,7 @@ pub extern "C" fn nsl_sparse_coo_to_csr(coo_ptr: i64) -> i64 {
         row_ptr[i] += row_ptr[i - 1];
     }
 
-    let val_bytes: Vec<u8> = sorted_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let val_bytes: Vec<f64> = sorted_vals.to_vec();
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Csr as u8,
         device: coo.device, dtype: coo.dtype, ndim: 2,
@@ -621,7 +624,7 @@ pub extern "C" fn nsl_sparse_coo_to_csc(coo_ptr: i64) -> i64 {
         col_ptr[i] += col_ptr[i - 1];
     }
 
-    let val_bytes: Vec<u8> = sorted_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let val_bytes: Vec<f64> = sorted_vals.to_vec();
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Csc as u8,
         device: coo.device, dtype: coo.dtype, ndim: 2,
@@ -699,7 +702,7 @@ pub extern "C" fn nsl_sparse_csr_to_csc(csr_ptr: i64) -> i64 {
         }
     }
 
-    let val_bytes: Vec<u8> = out_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let val_bytes: Vec<f64> = out_vals;
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Csc as u8,
         device: csr.device, dtype: csr.dtype, ndim: 2,
@@ -773,7 +776,7 @@ pub extern "C" fn nsl_sparse_csc_to_csr(csc_ptr: i64) -> i64 {
         }
     }
 
-    let val_bytes: Vec<u8> = out_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let val_bytes: Vec<f64> = out_vals;
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Csr as u8,
         device: csc.device, dtype: csc.dtype, ndim: 2,
@@ -809,7 +812,7 @@ pub extern "C" fn nsl_sparse_csr_to_coo(csr_ptr: i64) -> i64 {
         }
     }
 
-    let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let val_bytes: Vec<f64> = vals.to_vec();
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Coo as u8,
         device: csr.device, dtype: csr.dtype, ndim: 2,
@@ -845,7 +848,7 @@ pub extern "C" fn nsl_sparse_csc_to_coo(csc_ptr: i64) -> i64 {
         }
     }
 
-    let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let val_bytes: Vec<f64> = vals.to_vec();
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Coo as u8,
         device: csc.device, dtype: csc.dtype, ndim: 2,
@@ -1129,7 +1132,7 @@ fn sparse_to_triples(s: &NslSparseTensor) -> Vec<(i64, i64, f64)> {
 /// Build a COO NslSparseTensor from triples.
 fn build_coo_from_triples(rows: i64, cols: i64, r: &[i64], c: &[i64], v: &[f64]) -> i64 {
     let nnz = v.len();
-    let val_bytes: Vec<u8> = v.iter().flat_map(|val| val.to_ne_bytes()).collect();
+    let val_bytes: Vec<f64> = v.to_vec();
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Coo as u8,
         device: 0, dtype: 0, ndim: 2,

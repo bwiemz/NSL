@@ -647,10 +647,31 @@ themselves: a `&'static mut` from `from_ptr` held across an op that
 re-derives the same handle, then read again. No production op tripped
 it, which is consistent with each op deriving its own reference and
 using it within the call. Those ten tests now re-derive after the call.
-The measured gap that remains is the one the paragraph above describes:
-an op that takes two handles which alias (`add(x, x)`, an in-place op
-whose `dst` is one of its inputs) derives two `&mut` to one tensor, and
-nothing in the suite exercises that under Miri yet. The script passes
+The follow-up runs widened the filter to the whole `tensor::` namespace
+and then (`--sweep`) to every module of the crate, one process each: 69
+modules, 50 clean, 8 with reports, 6 that Miri cannot run (process
+spawn, file-backed mmap, `atexit`; listed in the script). The production
+findings, each fixed with the run that found it: `tensor_elementwise_op`
+and `nsl_tensor_matmul` derived two `&mut` for their two inputs, so
+`mul(y, y)` / `matmul(x, x)` aliased them (now shared references);
+blockwise-int8 tensors were freed and cloned as `len` bytes while their
+buffer is padded values plus per-block scales (now their own dtype tag);
+`nsl_tensor_reshape` read its input through a reference it had held
+across `new_view_i64` (now re-derived); the sparse value buffer was a
+byte allocation read as `&[f64]` (now an f64 allocation); and the KV
+transfer header was written to the socket as the struct's raw bytes,
+padding included (now field by field); and the owned DLPack export held
+a `&mut` to the tensor across `storage_is_nsl_owned`, which re-derived
+the same handle (the export entry points now take shared references).
+Everything else was test-side:
+tests holding a handle across a call, an unaligned test buffer for
+`ShmHeader`, stack tensors handed out through `&T` rather than `&mut T`.
+Three `tensor::activation` / `flash_attention` / `context_parallel` tests
+assert bit-exact float results and fail under Miri's deliberately
+perturbed float operations; those are not findings.
+`fase_step`, `host_profile` and the two seeded `fuzz` loops exceed the
+per-module time cap and are skipped for time, not for a limitation of
+Miri (the four small `fuzz` tests are clean). The script passes
 `-Zmiri-ignore-leaks`: the tests leak shape lists and tensors on purpose
 (110 allocations at exit), which is test hygiene, not the aliasing
 question. Not in CI only because it needs a nightly toolchain: once the
