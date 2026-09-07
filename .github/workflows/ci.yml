@@ -113,6 +113,19 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --no-fail-fast -- --skip e2e_
 
+      # 28 nsl-codegen integration test files are `#![cfg(feature =
+      # "test-helpers")]` and three more are `required-features` targets.
+      # The step above builds the first group as EMPTY binaries and skips
+      # the second, so it had been reporting them green while running
+      # nothing — long enough for the fused-CE dtype-hint witnesses and the
+      # cycle-11/15/16 RoPE probes to rot against the code unnoticed.
+      # `scripts/gated-tests.sh` derives both lists from the tree. Linux
+      # only: the targets are platform-free structural tests (the ptxas
+      # ones skip themselves when the toolkit is absent).
+      - name: Unit tests (test-helpers-gated nsl-codegen targets)
+        if: runner.os == 'Linux'
+        run: bash scripts/gated-tests.sh
+
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
@@ -407,7 +420,8 @@ jobs:
       # the NUL-terminator bug survived.
       - name: PTX emitter ptxas validation
         run: |
-          cargo test -p nsl-codegen --test csha_ptx_ptxas_validation
+          cargo test -p nsl-codegen --features test-helpers --test csha_ptx_ptxas_validation
+          cargo test -p nsl-codegen --features test-helpers --test csha_ptx_ptxas_backward_validation
           cargo test -p nsl-codegen --test fused_linear_ce_bf16_ptxas
           cargo test -p nsl-codegen --test fused_linear_ce_fp16_ptxas
           cargo test -p nsl-codegen --test fused_linear_ce_large_vocab_ptxas
