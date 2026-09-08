@@ -419,7 +419,7 @@ snapshots! {
     // source-AD lowering of the program that exercises it.
     mlp_adamw_deterministic: "mlp_adamw", CompileOptions { deterministic: true, ..source_ad() };
     mlp_adamw_cuda_graphs: "mlp_adamw", CompileOptions { cuda_graphs: true, ..source_ad() };
-    mlp_adamw_transient_arena: "mlp_adamw", CompileOptions { transient_arena: true, ..source_ad() };
+    mlp_adamw_transient_arena: "mlp_adamw", CompileOptions { memory: nsl_codegen::MemoryOptions { transient_arena: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_fuse_wgrad_accum: "mlp_adamw", CompileOptions { fusion: nsl_codegen::FusionOptions { wgrad_accum: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_grad_integrity: "mlp_adamw", CompileOptions { diagnostics: nsl_codegen::DiagnosticsOptions { grad_integrity: true, ..Default::default() }, ..source_ad() };
     // Over the tape lowering: on the source-AD path the FASE hook owns the

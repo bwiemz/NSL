@@ -809,12 +809,12 @@ fn compile_returning_plan_impl(
                     .finish(&compiler.bus)
                     .map_err(crate::error::CodegenError::new)?;
 
-                if options.memory_report || plan.total_bytes > 0 {
+                if options.memory.report || plan.total_bytes > 0 {
                     let report = format_memory_report(&allocs, &plan);
                     nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] {}", report);
                 }
 
-                if let Some(budget) = options.vram_budget
+                if let Some(budget) = options.memory.vram_budget
                     && let Some(err_msg) = check_vram_budget(&plan, budget)
                 {
                     return Err(crate::error::CodegenError::new(err_msg));
@@ -831,7 +831,7 @@ fn compile_returning_plan_impl(
                 }
                 compiler.memory.slab_plan = Some(plan);
             }
-        } else if options.memory_report {
+        } else if options.memory.report {
             nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Memory plan: no static-shape tensor allocations found");
         }
     }
@@ -985,13 +985,13 @@ fn compile_with_zk_info_best_effort_plan(
         compiler.compile_main(&ast.stmts)?;
         compiler.compile_pending_lambdas()?;
 
-        if let Some(budget) = options.vram_budget {
+        if let Some(budget) = options.memory.vram_budget {
             nsl_runtime::nsl_log!(INFO, "nsl", 
                 "[nsl] --vram-budget set to {} bytes (planner integration in progress)",
                 budget
             );
         }
-        if options.memory_report {
+        if options.memory.report {
             nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] --memory-report requested (planner integration in progress)");
         }
 
@@ -1631,7 +1631,7 @@ fn compile_entry_impl(
     // guard-rail did nothing on exactly the builds real models use. Refuse
     // until the planner integration reaches this path; lifting this is the
     // integration's one-line job.
-    if let Some(budget) = options.vram_budget {
+    if let Some(budget) = options.memory.vram_budget {
         return Err(CodegenError::new(format!(
             "--vram-budget ({budget} bytes) is enforced only on single-file \
              builds today — the whole-program memory planner does not run on \

@@ -142,6 +142,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  memory-planning knobs moved into `MemoryOptions` (`opts.memory.{vram_budget,
+  report, transient_arena}` for `--vram-budget` / `--memory-report` /
+  `--transient-arena`). Pure rename; defaults unchanged; the execution
+  fingerprint reads `arena` through the new path. 43 → 41 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the training
   diagnostics moved into `DiagnosticsOptions` (`opts.diagnostics.{trace_ops,
   nan_analysis, debug_training, grad_integrity, training_reference}` for

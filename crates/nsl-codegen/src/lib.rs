@@ -1725,6 +1725,31 @@ pub struct DiagnosticsOptions {
     pub training_reference: bool,
 }
 
+/// Memory-planning options: the M36 VRAM budget and plan report, and the
+/// transient-arena placement (`--vram-budget`, `--memory-report`,
+/// `--transient-arena`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct MemoryOptions {
+    /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
+    pub vram_budget: Option<u64>,
+    /// M36: Print memory plan report to stderr
+    pub report: bool,
+    /// Item 5 (`--transient-arena`): place admitted backward temporaries at
+    /// fixed arena offsets instead of letting the caching allocator choose.
+    ///
+    /// Default OFF, and it will stay off until the byte-identity validation in
+    /// `scripts/arena-parity.sh` is green on a scale that matters. The payoff
+    /// is stable addresses for CUDA-graph capture; the risk, in the design
+    /// note's words, is that "a liveness error → silent memory corruption".
+    /// Turning this on by default before the parity gate would be exactly the
+    /// jump from lower-bound analysis to placement that the staging exists to
+    /// prevent.
+    pub transient_arena: bool,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1737,10 +1762,9 @@ pub struct CompileOptions {
     pub fusion: FusionOptions,
     /// Training diagnostics and reference modes; see [`DiagnosticsOptions`].
     pub diagnostics: DiagnosticsOptions,
-    /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
-    pub vram_budget: Option<u64>,
-    /// M36: Print memory plan report to stderr
-    pub memory_report: bool,
+    /// Memory planning: the VRAM budget, the plan report and the transient
+    /// arena; see [`MemoryOptions`].
+    pub memory: MemoryOptions,
     /// M47: GPU compilation target name.
     pub target: String,
     /// M40: Use compile-time source-to-source AD for training (default: false = tape AD).
@@ -1798,17 +1822,6 @@ pub struct CompileOptions {
     /// Forced `Off` under `--training-reference`, alongside the decorator, so
     /// the reference arm's numerics stay a single composite path.
     pub lm_head_fusion: crate::lm_head_inference::LmHeadFusion,
-    /// Item 5 (`--transient-arena`): place admitted backward temporaries at
-    /// fixed arena offsets instead of letting the caching allocator choose.
-    ///
-    /// Default OFF, and it will stay off until the byte-identity validation in
-    /// `scripts/arena-parity.sh` is green on a scale that matters. The payoff
-    /// is stable addresses for CUDA-graph capture; the risk, in the design
-    /// note's words, is that "a liveness error → silent memory corruption".
-    /// Turning this on by default before the parity gate would be exactly the
-    /// jump from lower-bound analysis to placement that the staging exists to
-    /// prevent.
-    pub transient_arena: bool,
     /// Shape/value facts about model fields declared in imported modules
     /// (the multi-file build's dims/ranks/values channel); see
     /// [`ImportedModelOptions`].
@@ -2041,7 +2054,7 @@ impl CompileOptions {
             format!("fase_sumsq={}", on_unless_zero("NSL_FASE_BATCH_SUMSQ")),
             format!("fase_override={}", text("NSL_FASE_FUSED_OVERRIDE", "none")),
             format!("csha_save={}", text("NSL_CSHA_DUMP_SAVE_STATE", "off")),
-            format!("arena={}", b(self.transient_arena)),
+            format!("arena={}", b(self.memory.transient_arena)),
             format!("graphs={}", b(self.cuda_graphs)),
             format!("ckpt={ckpt}"),
             format!("offload={}", b(self.optim_state_offload)),
@@ -2073,10 +2086,9 @@ impl Default for CompileOptions {
         Self {
             autotune: AutotuneOptions::default(),
             world_size: 1,
+            memory: MemoryOptions::default(),
             diagnostics: DiagnosticsOptions::default(),
             fusion: FusionOptions::default(),
-            vram_budget: None,
-            memory_report: false,
             target: "cuda".to_string(),
             source_ad: false,
             deterministic: false,
@@ -2092,7 +2104,6 @@ impl Default for CompileOptions {
             muon: MuonOptions::default(),
             cuda_graphs: false,
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
-            transient_arena: false,
             imported_model: ImportedModelOptions::default(),
             shared_lib: false,
             emit_export_table: false,

@@ -165,7 +165,9 @@ The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
-`WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, …). The training
+`WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, `MemoryOptions`, …). The
+memory-planning knobs moved into `MemoryOptions` (`opts.memory.{vram_budget,
+report, transient_arena}`). The training
 diagnostics moved into `DiagnosticsOptions` (`opts.diagnostics.{trace_ops,
 nan_analysis, debug_training, grad_integrity, training_reference}`). The fusion flags moved into
 `FusionOptions` (`opts.fusion.{disabled, report, rmsnorm_backward, wgrad_accum,
