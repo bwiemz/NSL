@@ -323,15 +323,15 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "[wgrad-fusion]",
         &[
             "crates/nsl-codegen/src/wengert_lower.rs",
-            // stmt.rs: the `declined:` note. Registered separately because the
+            // stmt_train/driver.rs: the `declined:` note. Registered separately because the
             // two lines are mutually exclusive by construction — the COUNT is
             // gated on the FASE-Deferred hook, so a build without that hook
             // emitted nothing at all and the feature was invisibly inert on
             // exactly the shipped pretraining configuration. Pinning only
             // wengert_lower.rs would let the decline be renamed silently.
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
             // compiler/mod.rs: the SAME `declined:` note for the one case
-            // stmt.rs structurally cannot reach — a program with no train
+            // stmt_train/driver.rs structurally cannot reach — a program with no train
             // block, where `compile_train_block_inner` never runs, so
             // `finish_wgrad_admission` is the only thing left to say the flag
             // did nothing.
@@ -345,7 +345,7 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[ccr]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
             // The per-segment early-free note (forward lowering).
             "crates/nsl-codegen/src/stmt_train/forward_lowering.rs",
             // The CCR planning notes: stride dp / auto, periodic
@@ -358,9 +358,9 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[fused-lm-ce]",
         &[
-            // stmt.rs: the partial-decline warning, and the
+            // stmt_train/driver.rs: the partial-decline warning, and the
             // extraction-failed warning.
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
             // source_ad.rs: the explicit `fused_linear_ce(...)` call
             // diagnostics (no decorator / disabled / missing hints). Listed
             // because pinning only one emitting file lets the others be
@@ -388,7 +388,7 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[lm-head-fusion]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
         ],
         "item 4 reported what `--fuse-lm-head` decided: `inferred:` names the \
          four dims of a fused LM head the compiler installed with no \
@@ -586,7 +586,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         // `[lm-head-fusion]` line AT ALL, neither `inferred:` nor `declined:`,
         // because "inference never ran" and "inference ran and passed" have to
         // be distinguishable. One emitting file — the train-block lowering.
-        parts: &[("[lm-head-fusion]", "crates/nsl-codegen/src/stmt.rs")],
+        parts: &[("[lm-head-fusion]", "crates/nsl-codegen/src/stmt_train/driver.rs")],
     },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/mse_leak_gate.rs",
@@ -690,13 +690,13 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
                   fused linear-CE fallback diagnostic",
         // Both assertions are `!stderr.contains("[fused-lm-ce]")`, so the bare
         // token is the whole needle. Two emitting files: the partial-decline /
-        // extraction-failed warnings in stmt.rs and the explicit-call
+        // extraction-failed warnings in stmt_train/driver.rs and the explicit-call
         // diagnostics in source_ad.rs. Rename either prefix and BOTH negative
         // assertions become permanently true while the positive assertions in
         // the same file still pass — which is why the token is pinned per
         // file rather than once.
         parts: &[
-            ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt.rs"),
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt_train/driver.rs"),
             ("[fused-lm-ce]", "crates/nsl-codegen/src/source_ad.rs"),
         ],
     },
@@ -711,7 +711,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         // it is what stops a false-positive control from passing vacuously
         // against a program that never engaged the kernel at all.
         parts: &[
-            ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt.rs"),
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt_train/driver.rs"),
             ("[fused-lm-ce]", "crates/nsl-codegen/src/source_ad.rs"),
         ],
     },

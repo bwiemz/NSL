@@ -1,5 +1,5 @@
 //! The pipelined train block: the `pipeline(...)` sibling of
-//! `stmt.rs::compile_train_block_inner`, moved out of `stmt.rs` byte-for-byte
+//! `driver::compile_train_block_inner`, moved out of `stmt.rs` byte-for-byte
 //! (roadmap A1). `compile_train_block_pipelined` is the entry point the
 //! train-block dispatch calls (it installs the fused-CE decorator config
 //! around the lowering, like `compile_train_block` does);

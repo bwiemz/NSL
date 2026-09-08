@@ -116,6 +116,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The train-block driver moved out of `stmt.rs` whole (roadmap A1):
+  `compile_train_block` (the phase scope, the composition refusals, the
+  CPDT offer, the dependency-order check, the fused-CE config bracket)
+  and `compile_train_block_inner` (the epoch and batch loops and the
+  bindings between the peeled phases) now live in
+  `stmt_train/driver.rs`, byte-for-byte; the one `stmt.rs` helper it calls
+  is `pub(crate)`. 2,630 lines out of `stmt.rs` (~4.7k lines now, under
+  the roadmap's Phase 1 exit criterion of 5k); the train-block CLIF
+  snapshots are unchanged. The marker registry, the pass-manager and
+  pass-registry drift scans name the new file.
+
 - The `grad` block drivers moved out of `stmt.rs` whole (roadmap A1):
   `compile_grad_block`, `compile_source_ad_grad_block`,
   `compile_tape_grad_block` and `compile_tape_backward` now live in

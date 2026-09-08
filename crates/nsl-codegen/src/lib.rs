@@ -1845,7 +1845,7 @@ pub struct AnalysisOptions {
     /// captured by the semantic checker, keyed by the decorated model's name
     /// (the `<Type>` in `model <Type>:` or the LHS binding name in
     /// `@csha let m = SomeModel()`).  The CSHA hook in
-    /// `nsl-codegen/src/stmt.rs::compile_train_block` looks up the current
+    /// `nsl-codegen/src/stmt_train/driver.rs::compile_train_block` looks up the current
     /// `model_type_name` in this map and:
     ///   * `disabled = true` -> skip the CSHA pipeline for that compile.
     ///   * `level    = Some(L)` -> clamp the planner's `mode_str` to L.
