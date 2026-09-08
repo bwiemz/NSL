@@ -290,7 +290,7 @@ pub fn compile_wengert_ops_range(
     // every step, letting the runtime accumulate digest history per region.
     // Weight-stream transfers and optimizer updates are emitted by the
     // CALLERS around this function, so they land outside the region.
-    let graph_region_id = if compiler.compile_options.cuda_graphs {
+    let graph_region_id = if compiler.compile_options.train.cuda_graphs {
         let id = compiler.next_cuda_graph_region_id;
         compiler.next_cuda_graph_region_id += 1;
         let idv = builder.ins().iconst(cl_types::I64, id);

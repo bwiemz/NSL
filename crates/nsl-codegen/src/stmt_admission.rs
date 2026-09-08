@@ -50,7 +50,7 @@ impl Compiler<'_> {
     // paths it was validated on; everything else refuses loudly (the
     // repo's deferral-must-refuse rule) instead of silently running the
     // interleaved baseline under a flag that claims otherwise.
-    let csla_active = self.compile_options.layerwise_accum;
+    let csla_active = self.compile_options.train.layerwise_accum;
     if self.compile_options.weight_stream.enabled && !csla_active {
         return Err(CodegenError::new(
             "--weight-stream requires --layerwise-accum (the window-scoped \
@@ -172,7 +172,7 @@ impl Compiler<'_> {
                  or use --zero-stage 2",
             ));
         }
-        if s == 3 && self.compile_options.optim_state_offload {
+        if s == 3 && self.compile_options.train.optim_state_offload {
             return Err(CodegenError::new(
                 "--zero-stage 3 with --optim-state-offload is not lowered: \
                  host-resident moments x owner-gated sharded updates is an \
@@ -248,7 +248,7 @@ impl Compiler<'_> {
                      the per-parameter loop. Drop one",
                 ));
             }
-            if self.compile_options.optim_state_offload {
+            if self.compile_options.train.optim_state_offload {
                 return Err(CodegenError::new(
                     "no_decay=[...] is not supported with --optim-state-offload \
                      yet (the staged host/device envelope is untested against \

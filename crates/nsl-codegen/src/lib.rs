@@ -1725,6 +1725,53 @@ pub struct DiagnosticsOptions {
     pub training_reference: bool,
 }
 
+/// Training-execution options: how a train block's step runs on the device
+/// — optimizer-state offload (`--optim-state-offload`), the CSLA
+/// window-buffered schedule (`--layerwise-accum`), BF16 stochastic-rounding
+/// parameter storage (`--param-dtype bf16-sr`) and per-region CUDA graph
+/// capture (`--cuda-graphs`). All four are execution-fingerprint keys.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct TrainOptions {
+    /// Optimizer-state offload (scaling campaign item 4, the single-GPU
+    /// ZeRO-Offload analog): allocate m/v HOST-resident (CPU f32) and wrap
+    /// every optimizer step in a stage-in → GPU-f32 update → copy-back
+    /// envelope. The update math runs on the device exactly as without the
+    /// flag (same kernels, same dtype), so FASE≡AdamW exactness is
+    /// preserved; the cost is one HtoD+DtoH round-trip of the optimizer
+    /// state per step. Frees 2×param bytes of VRAM for Adam-family
+    /// optimizers (1× for momentum-SGD/Lion/Muon). Mutually exclusive with
+    /// reduced-precision moments (`nsl_tensor_cast_into` cannot cross
+    /// devices) — enforced with a loud compile error in stmt.rs.
+    pub optim_state_offload: bool,
+    /// CSLA Stage-2 (`--layerwise-accum`): window-buffered training schedule.
+    /// The N micro-batches of a FASE-Deferred accumulation window run their
+    /// forwards first (saving only the adjoint-read, batch-dependent tensors
+    /// plus the batch dicts), then the backward phase replays the whole window
+    /// through a runtime loop over the buffered micro-batches. Bit-exact with
+    /// the interleaved baseline (same kernels, same inputs, same per-parameter
+    /// accumulation order). Requires `--source-ad`, `--checkpoint-blocks`, and
+    /// a FASE-Deferred plan (AdamW/Adam + grad_accumulation >= 2); refuses
+    /// loudly on grad_clip, WGGO mode tables, `--optim-state-offload`,
+    /// `--checkpoint-compress`, and the pipelined/tape paths.
+    pub layerwise_accum: bool,
+    /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
+    /// storage with counter-based stochastic rounding on the fused AdamW
+    /// update — no FP32 master copy. Rides the weight-stream residency
+    /// schedule (bf16 device mirrors, transient f32 working views).
+    pub param_dtype_bf16sr: bool,
+    /// P5 item 19 (`--cuda-graphs`): opportunistic per-region CUDA graph
+    /// capture/replay. Each Wengert lowering (forward CCR slice, CSLA
+    /// backward layer range, recompute segment) is bracketed with runtime
+    /// region markers; the runtime records the launch sequence, captures it
+    /// as a CUDA graph once it proves stable across steps, and replays it
+    /// with per-launch verification and eager self-repair on any divergence.
+    /// Optimizer updates and weight-stream transfers stay outside regions.
+    pub cuda_graphs: bool,
+}
+
 /// Shared-library export options (`--shared-lib`): the PIC / shared-object
 /// build switch, which compilation unit emits the C export table, and the
 /// `@export` list slot the CLI reads back to emit the matching C header.
@@ -1893,22 +1940,9 @@ pub struct CompileOptions {
     /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
     /// [`ZeroOptions`].
     pub zero: ZeroOptions,
-    /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
-    /// storage with counter-based stochastic rounding on the fused AdamW
-    /// update — no FP32 master copy. Rides the weight-stream residency
-    /// schedule (bf16 device mirrors, transient f32 working views).
-    pub param_dtype_bf16sr: bool,
     /// Muon optimizer knobs (`--muon-batch-ns`, `--muon-resident-momentum`,
     /// `--muon-state-dtype`); see [`MuonOptions`].
     pub muon: MuonOptions,
-    /// P5 item 19 (`--cuda-graphs`): opportunistic per-region CUDA graph
-    /// capture/replay. Each Wengert lowering (forward CCR slice, CSLA
-    /// backward layer range, recompute segment) is bracketed with runtime
-    /// region markers; the runtime records the launch sequence, captures it
-    /// as a CUDA graph once it proves stable across steps, and replays it
-    /// with per-launch verification and eager self-repair on any divergence.
-    /// Optimizer updates and weight-stream transfers stay outside regions.
-    pub cuda_graphs: bool,
     /// Item 4 (`--fuse-lm-head`): whether the compiler may install a fused LM
     /// head that no `@fused_lm_ce` decorator asked for.
     ///
@@ -1945,30 +1979,11 @@ pub struct CompileOptions {
     /// Promoted from the `NSL_MATMUL_BF16*` family so it reaches the
     /// execution fingerprint; the env vars remain as a deprecated fallback.
     pub matmul: MatmulConfig,
-    /// Optimizer-state offload (scaling campaign item 4, the single-GPU
-    /// ZeRO-Offload analog): allocate m/v HOST-resident (CPU f32) and wrap
-    /// every optimizer step in a stage-in → GPU-f32 update → copy-back
-    /// envelope. The update math runs on the device exactly as without the
-    /// flag (same kernels, same dtype), so FASE≡AdamW exactness is
-    /// preserved; the cost is one HtoD+DtoH round-trip of the optimizer
-    /// state per step. Frees 2×param bytes of VRAM for Adam-family
-    /// optimizers (1× for momentum-SGD/Lion/Muon). Mutually exclusive with
-    /// reduced-precision moments (`nsl_tensor_cast_into` cannot cross
-    /// devices) — enforced with a loud compile error in stmt.rs.
-    pub optim_state_offload: bool,
+    /// Training-execution knobs (`--optim-state-offload`, `--layerwise-accum`,
+    /// `--param-dtype bf16-sr`, `--cuda-graphs`); see [`TrainOptions`].
+    pub train: TrainOptions,
     /// Activation checkpointing (CCR flags + decorator-derived policies).
     pub checkpoint: CheckpointOptions,
-    /// CSLA Stage-2 (`--layerwise-accum`): window-buffered training schedule.
-    /// The N micro-batches of a FASE-Deferred accumulation window run their
-    /// forwards first (saving only the adjoint-read, batch-dependent tensors
-    /// plus the batch dicts), then the backward phase replays the whole window
-    /// through a runtime loop over the buffered micro-batches. Bit-exact with
-    /// the interleaved baseline (same kernels, same inputs, same per-parameter
-    /// accumulation order). Requires `--source-ad`, `--checkpoint-blocks`, and
-    /// a FASE-Deferred plan (AdamW/Adam + grad_accumulation >= 2); refuses
-    /// loudly on grad_clip, WGGO mode tables, `--optim-state-offload`,
-    /// `--checkpoint-compress`, and the pipelined/tape paths.
-    pub layerwise_accum: bool,
     /// Layer weight streaming (`--weight-stream` and its `--stream-*`
     /// refinements); see [`WeightStreamOptions`].
     pub weight_stream: WeightStreamOptions,
@@ -2100,9 +2115,9 @@ impl CompileOptions {
             format!("fase_override={}", text("NSL_FASE_FUSED_OVERRIDE", "none")),
             format!("csha_save={}", text("NSL_CSHA_DUMP_SAVE_STATE", "off")),
             format!("arena={}", b(self.memory.transient_arena)),
-            format!("graphs={}", b(self.cuda_graphs)),
+            format!("graphs={}", b(self.train.cuda_graphs)),
             format!("ckpt={ckpt}"),
-            format!("offload={}", b(self.optim_state_offload)),
+            format!("offload={}", b(self.train.optim_state_offload)),
         ]
         .join(",")
     }
@@ -2145,9 +2160,7 @@ impl Default for CompileOptions {
             analysis: AnalysisOptions::default(),
             zk: ZkOptions::default(),
             zero: ZeroOptions::default(),
-            param_dtype_bf16sr: false,
             muon: MuonOptions::default(),
-            cuda_graphs: false,
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
             imported_model: ImportedModelOptions::default(),
             export: ExportOptions::default(),
@@ -2158,9 +2171,8 @@ impl Default for CompileOptions {
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
             matmul: MatmulConfig::default(),
-            optim_state_offload: false,
+            train: TrainOptions::default(),
             checkpoint: CheckpointOptions::default(),
-            layerwise_accum: false,
             weight_stream: WeightStreamOptions::default(),
             csha: CshaOptions::default(),
             cpdt: CpdtOptions::default(),

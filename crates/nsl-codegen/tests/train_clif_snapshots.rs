@@ -418,35 +418,47 @@ snapshots! {
     // its own (plus the flags it refuses to run without) over the
     // source-AD lowering of the program that exercises it.
     mlp_adamw_deterministic: "mlp_adamw", CompileOptions { deterministic: true, ..source_ad() };
-    mlp_adamw_cuda_graphs: "mlp_adamw", CompileOptions { cuda_graphs: true, ..source_ad() };
+    mlp_adamw_cuda_graphs: "mlp_adamw", CompileOptions { train: nsl_codegen::TrainOptions { cuda_graphs: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_transient_arena: "mlp_adamw", CompileOptions { memory: nsl_codegen::MemoryOptions { transient_arena: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_fuse_wgrad_accum: "mlp_adamw", CompileOptions { fusion: nsl_codegen::FusionOptions { wgrad_accum: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_grad_integrity: "mlp_adamw", CompileOptions { diagnostics: nsl_codegen::DiagnosticsOptions { grad_integrity: true, ..Default::default() }, ..source_ad() };
     // Over the tape lowering: on the source-AD path the FASE hook owns the
     // gradients and the checksum this flag adds is skipped (inert variant).
     mlp_adamw_debug_training: "mlp_adamw", CompileOptions { diagnostics: nsl_codegen::DiagnosticsOptions { debug_training: true, ..Default::default() }, ..tape() };
-    mlp_adamw_optim_state_offload: "mlp_adamw", CompileOptions { optim_state_offload: true, ..source_ad() };
-    muon_optim_state_offload: "muon", CompileOptions { optim_state_offload: true, ..source_ad() };
+    mlp_adamw_optim_state_offload: "mlp_adamw", CompileOptions { train: nsl_codegen::TrainOptions { optim_state_offload: true, ..Default::default() }, ..source_ad() };
+    muon_optim_state_offload: "muon", CompileOptions { train: nsl_codegen::TrainOptions { optim_state_offload: true, ..Default::default() }, ..source_ad() };
     muon_resident_momentum: "muon", CompileOptions {
-        optim_state_offload: true,
+        train: nsl_codegen::TrainOptions {
+            optim_state_offload: true,
+            ..Default::default()
+        },
         muon: nsl_codegen::MuonOptions { resident_momentum: true, ..Default::default() },
         ..source_ad()
     };
-    dataloader_checkpoint_cuda_graphs: "dataloader_checkpoint", CompileOptions { cuda_graphs: true, ..source_ad() };
+    dataloader_checkpoint_cuda_graphs: "dataloader_checkpoint", CompileOptions { train: nsl_codegen::TrainOptions { cuda_graphs: true, ..Default::default() }, ..source_ad() };
     csla_ffn_checkpoint_blocks: "csla_ffn", CompileOptions { checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() }, ..source_ad() };
     csla_ffn_layerwise_accum: "csla_ffn", CompileOptions {
         checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
-        layerwise_accum: true,
+        train: nsl_codegen::TrainOptions {
+            layerwise_accum: true,
+            ..Default::default()
+        },
         ..source_ad()
     };
     csla_ffn_muon_layerwise_accum: "csla_ffn_muon", CompileOptions {
         checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
-        layerwise_accum: true,
+        train: nsl_codegen::TrainOptions {
+            layerwise_accum: true,
+            ..Default::default()
+        },
         ..source_ad()
     };
     csla_ffn_muon_state_bf16: "csla_ffn_muon", CompileOptions {
         checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
-        layerwise_accum: true,
+        train: nsl_codegen::TrainOptions {
+            layerwise_accum: true,
+            ..Default::default()
+        },
         muon: nsl_codegen::MuonOptions { state_bf16: true, ..Default::default() },
         ..source_ad()
     };

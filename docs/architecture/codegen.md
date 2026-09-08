@@ -266,7 +266,7 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 33 `pub` fields today. The decomposition into cohesive
+The struct has 30 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
 (`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
@@ -314,7 +314,10 @@ facts the CLI bridge copies out of `nsl_semantic::AnalysisResult` —
 `fused_kl_ce_configs` / `pca_user_strategies` decorator configs; not user
 flags), `ExportOptions` (`opts.export`: the `--shared-lib` PIC switch
 `shared_lib`, the export-table emitter decision `emit_table`, and the
-`@export` header slot `functions_out`), plus `MatmulConfig`
+`@export` header slot `functions_out`), `TrainOptions` (`opts.train`: the
+training-execution knobs `optim_state_offload`, `layerwise_accum`,
+`param_dtype_bf16sr` and `cuda_graphs`, all execution-fingerprint keys),
+plus `MatmulConfig`
 (`opts.matmul`). Everything else is still a
 flat field (`source_ad`, `deterministic`, `target`, `world_size`,
 `target_gpu`, `dtype`, …). New options
@@ -845,7 +848,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
    `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,
    `MemoryOptions`, `WrgaOptions`, `AnalysisOptions`, `ExportOptions`,
-   `MatmulConfig`) when one exists — with its
+   `TrainOptions`, `MatmulConfig`) when one exists — with its
    default in `impl Default for CompileOptions` (or the sub-struct's).
 2. Declare the clap flag in `crates/nsl-cli/src/args.rs`. Shared flags are
    declared twice (`BuildArgs`, `RunArgs`) and must be identical; a flag
