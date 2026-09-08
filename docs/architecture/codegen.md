@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~3.2k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~2.9k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -138,7 +138,8 @@ driver runs it:
    `PassScheduler::schedule`: CPKD, WGGO (with the tape;
    `src/stmt_train/plan_wggo.rs`: `plan_wggo`, which also folds the
    wrapper's pre-plan and publishes the `WggoOverrides`), CSHA, WRGA (with
-   the tape), CPDT, CCR (the WRGA fork into the effective primal and the
+   the tape) and CPDT (both in `src/stmt_train/plan_wrga_cpdt.rs`:
+   `run_wrga_and_plan_cpdt`), CCR (the WRGA fork into the effective primal and the
    CCR plan — blocks, stride, budget, compression — in
    `src/stmt_train/plan_ccr.rs`: `fork_wrga_and_plan_ccr`), and the
    transient-arena `MemoryPlanner` (with the
