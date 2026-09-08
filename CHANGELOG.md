@@ -116,6 +116,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The assignment lowering moved out of `stmt.rs` whole (roadmap A1):
+  `compile_assign`, the destructuring-pattern lowering and its typing
+  helpers, the slab-tensor fast path, the pattern-bound-symbol and
+  assignment-target collectors, the non-owning-binding update and the
+  binding-ownership facts (`sym_bindings_all_owning_in_*`,
+  `pattern_binds_sym`, `loop_binding_rhs_is_owning`) now live in
+  `stmt_assign.rs`, byte-for-byte; the two `stmt.rs` handle predicates
+  they call are `pub(crate)`. 1,160 lines out of `stmt.rs` (~7.7k lines
+  now, under the roadmap's 8k target); the train-block CLIF snapshots are
+  unchanged.
+
 - The control-flow statement lowerings moved out of `stmt.rs` whole
   (roadmap A1): `compile_if_stmt`, `compile_while`, `compile_while_let`,
   `compile_for`, `compile_for_model_array`, `compile_for_dataloader`,
