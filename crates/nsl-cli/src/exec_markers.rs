@@ -58,7 +58,8 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[wggo]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            // The WGGO planning site (pre-plan reuse, plan summary, prune).
+            "crates/nsl-codegen/src/stmt_train/plan_wggo.rs",
             "crates/nsl-codegen/src/wggo.rs",
             "crates/nsl-codegen/src/compiler/kernel.rs",
             // The pre-pass's "no pre-plan for training block #N (distill
@@ -157,7 +158,8 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[pca]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            // The WGGO planning site's packing-mode notes.
+            "crates/nsl-codegen/src/stmt_train/plan_wggo.rs",
             "crates/nsl-codegen/src/compiler/kernel.rs",
         ],
         "packed-context attention engaged",

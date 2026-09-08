@@ -116,6 +116,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the WGGO
+  planning site of the source-AD arm — the wrapper pre-plan reuse under its
+  tape fingerprint, the planner run under `PassScheduler::schedule`, the
+  applied-plan derivation and the `WggoOverrides` publication — moved
+  byte-for-byte into `stmt_train/plan_wggo.rs` (`plan_wggo`, fed by a
+  `WggoPlanningInputs` and returning a `WggoPlanning`: the applied plan and
+  the pre-plan offered / rejected facts the CPDT site consults). 348
+  lines out of the driver; the train-block CLIF snapshots are unchanged. The
+  execution-marker registry now attributes `[wggo]` and `[pca]` to the new
+  file, and the pass-bus channel inventory lists it as a `wggo_preplans`
+  consumer.
 - `compile_train_block_inner` peel continued (roadmap A1): the forward
   lowering of the source-AD arm — the memory-planner tape-unchanged
   assertion, the Item 11 per-segment early-free plan and the primal
