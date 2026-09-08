@@ -53,6 +53,11 @@
 //!     ranges and update grouping, and the `--weight-stream` sliced-forward
 //!     plan, fed by a [`csla_precompute::CslaPrecomputeInputs`] and
 //!     returning the `CslaPre` / `WsForwardPlan` pair; pure analysis.
+//!   - [`forward_lowering`] — the forward lowering of the source-AD arm:
+//!     the memory-planner tape-unchanged assertion, the Item 11
+//!     per-segment early-free plan and the monolithic or segment-streamed
+//!     primal lowering, fed by a [`forward_lowering::ForwardLoweringInputs`]
+//!     and returning the early-free plan and the lowered forward.
 //!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
 //!     source-AD arm: the adjoint lowering with the per-parameter
 //!     accumulate callback and the grad-integrity bracket, fed by a
@@ -91,6 +96,7 @@ pub(crate) mod csla_precompute;
 pub(crate) mod csla_window;
 pub(crate) mod epoch_close;
 pub(crate) mod fase_hook_lowering;
+pub(crate) mod forward_lowering;
 pub(crate) mod identity;
 pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;

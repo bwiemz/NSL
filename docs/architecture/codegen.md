@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~4.2k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~3.9k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -159,7 +159,11 @@ driver runs it:
    declarations; the CSLA schedule precompute
    (`src/stmt_train/csla_precompute.rs`: `precompute_csla_schedule`) then
    derives, on that final adjoint, the layerwise plan the save phase and the
-   window backward share and the `--weight-stream` sliced-forward plan. Under
+   window backward share and the `--weight-stream` sliced-forward plan; the
+   forward lowering (`src/stmt_train/forward_lowering.rs`:
+   `emit_forward_lowering`) — the tape-unchanged assertion, the per-segment
+   early-free plan and the monolithic or segment-streamed primal lowering —
+   follows. Under
    `--layerwise-accum` the adjoint is
    instead buffered per micro-batch (`src/stmt_train/csla_window.rs`:
    `emit_csla_window_save`, the `csla_active` arm of that site, which
