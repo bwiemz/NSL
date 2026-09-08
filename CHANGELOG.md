@@ -116,6 +116,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The pipelined train block moved out of `stmt.rs` whole (roadmap A1):
+  `compile_train_block_pipelined` (the dispatch entry point) and
+  `compile_train_block_pipelined_inner` (the stage loop) now live in
+  `stmt_train/pipelined.rs`, byte-for-byte. 699 lines out of `stmt.rs`
+  (~10.5k lines now); the train-block CLIF snapshots are unchanged.
+
 - `compile_train_block_inner` peel continued (roadmap A1): the WRGA
   adapter sites of the source-AD arm — the override-rejected diagnostics,
   the adapter init side-table and the adapter-tensor loads into the VarMap

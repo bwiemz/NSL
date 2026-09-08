@@ -29,7 +29,7 @@ facade map first, then this, then:
   `fusion_graph.rs` were deleted — `ARCHITECTURE.md` still names the first
   two in its `analysis` row, which is a doc bug, not a hidden module).
 
-Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~15k,
+Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~10.5k,
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
 `src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
 `tests/` and ~200 modules at the crate root.
@@ -199,8 +199,9 @@ driver runs it:
 `src/stmt_train/mod.rs` documents the rule for these peels: each is a
 byte-for-byte move under the train-block CLIF snapshots
 (`crates/nsl-codegen/tests/train_clif_snapshots.rs`). `compile_train_block_pipelined_inner`
-(same file) is the separate `@pipeline` path; it shares none of the scheduled
-passes.
+(`src/stmt_train/pipelined.rs`, with its `compile_train_block_pipelined`
+entry point) is the separate `@pipeline` path; it shares none of the
+scheduled passes.
 
 ### Pass scheduling: `PassManager`, `PassScheduler`, `PassBus`
 
