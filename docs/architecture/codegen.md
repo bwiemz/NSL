@@ -29,8 +29,9 @@ facade map first, then this, then:
   `fusion_graph.rs` were deleted — `ARCHITECTURE.md` still names the first
   two in its `analysis` row, which is a doc bug, not a hidden module).
 
-Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~7.7k
-(plus `src/stmt_control.rs` and `src/stmt_assign.rs`, ~1.2k each),
+Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~7.3k
+(plus `src/stmt_control.rs` and `src/stmt_assign.rs`, ~1.2k each, and
+`src/stmt_grad.rs`, ~0.4k),
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
 `src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
 `tests/` and ~200 modules at the crate root.
@@ -101,9 +102,12 @@ is the shortest readable copy of the sequence.
   the non-owning-alias materialization before a branch or loop — live in
   `src/stmt_control.rs`; the assignment lowering (`compile_assign`, the
   destructuring patterns, the slab-tensor fast path) and the binding facts
-  the ownership sweep reads live in `src/stmt_assign.rs`. `stmt.rs` is the
-  file that also owns the train block (below), the `serve`/`distill`
-  lowering, and most feature-specific refusals. `FuncState`
+  the ownership sweep reads live in `src/stmt_assign.rs`; the `grad` block
+  drivers (the source-AD arm's compile-time backward and the tape-AD arm's
+  runtime backward, which the train block's tape-AD path shares) live in
+  `src/stmt_grad.rs`. `stmt.rs` is the file that also owns the train block
+  (below), the `serve`/`distill` lowering, and most feature-specific
+  refusals. `FuncState`
   (`src/context.rs`) is the per-function state: variables, types, loop
   context, tensor cleanup bookkeeping, ownership state.
 - `Compiler::compile_expr` (`src/expr/mod.rs`) dispatches to `expr/access.rs`

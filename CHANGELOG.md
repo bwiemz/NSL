@@ -116,6 +116,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The `grad` block drivers moved out of `stmt.rs` whole (roadmap A1):
+  `compile_grad_block`, `compile_source_ad_grad_block`,
+  `compile_tape_grad_block` and `compile_tape_backward` now live in
+  `stmt_grad.rs`, byte-for-byte; the two `stmt.rs` source-AD helpers they
+  call are `pub(crate)`. 382 lines out of `stmt.rs` (~7.3k lines now);
+  the train-block CLIF snapshots are unchanged.
+
 - The assignment lowering moved out of `stmt.rs` whole (roadmap A1):
   `compile_assign`, the destructuring-pattern lowering and its typing
   helpers, the slab-tensor fast path, the pattern-bound-symbol and
