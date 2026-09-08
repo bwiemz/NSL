@@ -714,6 +714,7 @@ pub(crate) fn invoke_csha_if_enabled(
     // mode_str / target / disable HERE so the rest of the hook stays uniform.
     let per_model_cfg = compiler
         .compile_options
+        .analysis
         .csha_configs
         .get(model_type_name)
         .cloned();

@@ -1725,6 +1725,52 @@ pub struct DiagnosticsOptions {
     pub training_reference: bool,
 }
 
+/// Facts forwarded from semantic analysis: what the CLI bridge
+/// (`analysis_to_*` / `module_data_to_*` in `nsl-cli`) copies out of
+/// `nsl_semantic::AnalysisResult` for codegen — the per-function ownership
+/// metadata and the decorator configs (`@csha`, `@fused_lm_ce`,
+/// `@fused_kl_ce`, `@pca`). Not user flags: every field is empty on a
+/// hand-built `CompileOptions` and filled by the build paths before
+/// compile.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct AnalysisOptions {
+    /// M38a: Per-function ownership metadata from semantic analysis.
+    /// Keys are function names, values have linear_params and shared_params.
+    pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
+    /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
+    /// captured by the semantic checker, keyed by the decorated model's name
+    /// (the `<Type>` in `model <Type>:` or the LHS binding name in
+    /// `@csha let m = SomeModel()`).  The CSHA hook in
+    /// `nsl-codegen/src/stmt.rs::compile_train_block` looks up the current
+    /// `model_type_name` in this map and:
+    ///   * `disabled = true` -> skip the CSHA pipeline for that compile.
+    ///   * `level    = Some(L)` -> clamp the planner's `mode_str` to L.
+    ///   * `target   = Some(T)` -> override `csha::run_on_wengert`'s target.
+    /// Empty map = no `@csha` decorators in the program (the default), which
+    /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
+    pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
+    /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
+    /// nsl-semantic.  Empty when no decorator is present; codegen consults
+    /// the first `enabled = true` entry to gate the fused linear-CE
+    /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
+    pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
+    /// CPKD: `@fused_kl_ce(...)` decorator configs, one per decorated
+    /// distill block. Empty when no decorator is present.
+    pub fused_kl_ce_configs: Vec<FusedKlCeDecoratorConfig>,
+    /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca(strategy=...)` strategies
+    /// forwarded from nsl-semantic. Empty when no `@pca` decorator is
+    /// present. The CSHA training-PTX synthesis site consults this list
+    /// to flip `PerDocAdmitConfig::enable_per_doc_cta=true` when at least
+    /// one entry requests `PerDocument`.
+    /// Stored as the codegen-local `PcaUserStrategy` enum so nsl-codegen
+    /// does not depend directly on nsl-semantic types (mirrors the
+    /// `FusedCeDecoratorConfig` / `WrgaInputs` pattern).
+    pub pca_user_strategies: Vec<PcaUserStrategy>,
+}
+
 /// WRGA options: the decorator configs the CLI bridge forwards from
 /// nsl-semantic, the Milestone B.2 allocation folding switch, and the
 /// `nsl check --wrga-analyze | --wrga-compare` override context.
@@ -1807,9 +1853,10 @@ pub struct CompileOptions {
     pub wcet: WcetOptions,
     /// M38a: Enable linear types ownership checking.
     pub linear_types_enabled: bool,
-    /// M38a: Per-function ownership metadata from semantic analysis.
-    /// Keys are function names, values have linear_params and shared_params.
-    pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
+    /// Facts forwarded from semantic analysis (ownership metadata, the
+    /// `@csha` / `@fused_lm_ce` / `@fused_kl_ce` / `@pca` decorator configs);
+    /// see [`AnalysisOptions`].
+    pub analysis: AnalysisOptions,
     /// M55: Zero-knowledge proof-circuit emission options.
     pub zk: ZkOptions,
     /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
@@ -1864,23 +1911,6 @@ pub struct CompileOptions {
     /// WRGA: the forwarded decorator configs, the allocation folding switch
     /// and the check-mode override context; see [`WrgaOptions`].
     pub wrga: WrgaOptions,
-    /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
-    /// nsl-semantic.  Empty when no decorator is present; codegen consults
-    /// the first `enabled = true` entry to gate the fused linear-CE
-    /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
-    pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
-    /// CPKD: `@fused_kl_ce(...)` decorator configs, one per decorated
-    /// distill block. Empty when no decorator is present.
-    pub fused_kl_ce_configs: Vec<FusedKlCeDecoratorConfig>,
-    /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca(strategy=...)` strategies
-    /// forwarded from nsl-semantic. Empty when no `@pca` decorator is
-    /// present. The CSHA training-PTX synthesis site consults this list
-    /// to flip `PerDocAdmitConfig::enable_per_doc_cta=true` when at least
-    /// one entry requests `PerDocument`.
-    /// Stored as the codegen-local `PcaUserStrategy` enum so nsl-codegen
-    /// does not depend directly on nsl-semantic types (mirrors the
-    /// `FusedCeDecoratorConfig` / `WrgaInputs` pattern).
-    pub pca_user_strategies: Vec<PcaUserStrategy>,
     /// WGGO: weight-graph global-optimization options.
     pub wggo: WggoOptions,
     /// CFIE: compiler-fused inference-engine options.
@@ -1925,18 +1955,6 @@ pub struct CompileOptions {
     pub weight_stream: WeightStreamOptions,
     /// CSHA (compiler-specialized hardware attention) codegen options.
     pub csha: CshaOptions,
-    /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
-    /// captured by the semantic checker, keyed by the decorated model's name
-    /// (the `<Type>` in `model <Type>:` or the LHS binding name in
-    /// `@csha let m = SomeModel()`).  The CSHA hook in
-    /// `nsl-codegen/src/stmt.rs::compile_train_block` looks up the current
-    /// `model_type_name` in this map and:
-    ///   * `disabled = true` -> skip the CSHA pipeline for that compile.
-    ///   * `level    = Some(L)` -> clamp the planner's `mode_str` to L.
-    ///   * `target   = Some(T)` -> override `csha::run_on_wengert`'s target.
-    /// Empty map = no `@csha` decorators in the program (the default), which
-    /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
-    pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
     /// CPDT (compiler-planned distributed training) options.
     pub cpdt: CpdtOptions,
     /// M62: shared output slot the CLI reads after compile returns so it can
@@ -2111,7 +2129,7 @@ impl Default for CompileOptions {
             unikernel_config: None,
             wcet: WcetOptions::default(),
             linear_types_enabled: false,
-            ownership_info: HashMap::new(),
+            analysis: AnalysisOptions::default(),
             zk: ZkOptions::default(),
             zero: ZeroOptions::default(),
             param_dtype_bf16sr: false,
@@ -2122,9 +2140,6 @@ impl Default for CompileOptions {
             shared_lib: false,
             emit_export_table: false,
             wrga: WrgaOptions::default(),
-            fused_ce_configs: Vec::new(),
-            fused_kl_ce_configs: Vec::new(),
-            pca_user_strategies: Vec::new(),
             wggo: WggoOptions::default(),
             cfie: CfieOptions::default(),
             dev_tools: DevToolsOptions::default(),
@@ -2136,7 +2151,6 @@ impl Default for CompileOptions {
             layerwise_accum: false,
             weight_stream: WeightStreamOptions::default(),
             csha: CshaOptions::default(),
-            csha_configs: HashMap::new(),
             cpdt: CpdtOptions::default(),
             export_functions_out: None,
             calibration: CalibrationOptions::default(),

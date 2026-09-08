@@ -630,7 +630,7 @@ impl FeatureConfigs {
             export_wrappers: Vec::new(),
             quant_configs: HashMap::new(),
             linear_types_enabled: options.linear_types_enabled,
-            ownership_info: options.ownership_info.clone(),
+            ownership_info: options.analysis.ownership_info.clone(),
             vmap_configs: HashMap::new(),
             source_ad_enabled: options.source_ad,
             packing_supported_in_module: false,
@@ -920,7 +920,7 @@ pub struct Compiler<'a> {
 
     // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
     /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
-    /// from `CompileOptions.fused_ce_configs`.  Empty when no decorator
+    /// from `CompileOptions.analysis.fused_ce_configs`.  Empty when no decorator
     /// is present.  CFTP v10 (item 3) allows multiple entries — one per
     /// decorated `train` block, each tagged with its
     /// `train_block_stmt_id`.  Codegen looks up the right entry via
@@ -1293,8 +1293,8 @@ impl<'a> Compiler<'a> {
             cfie_decorator_mode: None,
             fase_decorator: None,
             cfie_decorator_target: None,
-            fused_ce_configs: options.fused_ce_configs.clone(),
-            fused_kl_ce_configs: options.fused_kl_ce_configs.clone(),
+            fused_ce_configs: options.analysis.fused_ce_configs.clone(),
+            fused_kl_ce_configs: options.analysis.fused_kl_ce_configs.clone(),
             active_fused_ce_config: None,
             lm_head_loader_scan: crate::lm_head_inference::LoaderScan::Unproven(
                 "the compilation unit was never scanned for its DataLoader shape"
@@ -1303,7 +1303,7 @@ impl<'a> Compiler<'a> {
             arena_placements: HashMap::new(),
             packing_meta_vars: None,
             active_distill_context: None,
-            pca_user_strategies: options.pca_user_strategies.clone(),
+            pca_user_strategies: options.analysis.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
             cpdt_cluster: options.cpdt.cluster.clone(),
             cpdt_report_requested: options.cpdt.report_requested,

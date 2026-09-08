@@ -106,12 +106,12 @@ fn run_build_single(
     let mut options = options.clone();
     options.wrga.inputs =
         Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga.check));
-    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
-    options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
-    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
+    options.analysis.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.analysis.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
+    options.analysis.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the multi-module path.
-    options.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
+    options.analysis.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
     // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
     // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
     // can stamp the prologue + emit a PrologueRecompute marker.
@@ -435,13 +435,13 @@ fn run_build_multi(
                 mod_data,
                 &entry_options.wrga.check,
             ));
-            entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
-            entry_options.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
-            entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
+            entry_options.analysis.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
+            entry_options.analysis.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
+            entry_options.analysis.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             // Sprint 2 (paper §6.2): forward entry-module @csha decorator
             // configs so per-model disable/level/target overrides take
             // effect on the multi-file standalone path.
-            entry_options.csha_configs = crate::pipeline::module_data_to_csha_configs(mod_data);
+            entry_options.analysis.csha_configs = crate::pipeline::module_data_to_csha_configs(mod_data);
             // Cycle-10 §5.3 Task 6: forward @checkpoint(policy=...) policies
             // from the entry module's semantic analysis into CompileOptions.
             entry_options.checkpoint.policies =

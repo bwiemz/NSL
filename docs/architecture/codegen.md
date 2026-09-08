@@ -259,7 +259,7 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 39 `pub` fields today. The decomposition into cohesive
+The struct has 35 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
 (`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
@@ -301,7 +301,11 @@ kernel path reads the first two through `FusionState`), `DiagnosticsOptions`
 decorator-config `inputs` the CLI bridge forwards from nsl-semantic, the
 Milestone B.2 `fold_allocations` switch, and the `nsl check` override
 `check` — a `WrgaCheckContext`, which retired the CLI's WRGA thread-locals;
-see compiler-state.md Phase 2), plus `MatmulConfig`
+see compiler-state.md Phase 2), `AnalysisOptions` (`opts.analysis`: the
+facts the CLI bridge copies out of `nsl_semantic::AnalysisResult` —
+`ownership_info` and the `csha_configs` / `fused_ce_configs` /
+`fused_kl_ce_configs` / `pca_user_strategies` decorator configs; not user
+flags), plus `MatmulConfig`
 (`opts.matmul`). Everything else is still a
 flat field (`source_ad`, `deterministic`, `target`, `world_size`,
 `shared_lib`, `emit_export_table`, `target_gpu`, `dtype`, …). New options
@@ -831,7 +835,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
    `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
    `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,
-   `MemoryOptions`, `WrgaOptions`, `MatmulConfig`) when one exists — with its
+   `MemoryOptions`, `WrgaOptions`, `AnalysisOptions`, `MatmulConfig`) when one exists — with its
    default in `impl Default for CompileOptions` (or the sub-struct's).
 2. Declare the clap flag in `crates/nsl-cli/src/args.rs`. Shared flags are
    declared twice (`BuildArgs`, `RunArgs`) and must be identical; a flag

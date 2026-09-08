@@ -350,7 +350,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                             );
                             // Forward @csha decorator configs (Sprint 2)
                             // exactly the way `run_build_single` does.
-                            opts.csha_configs = crate::pipeline::analysis_to_csha_configs(&csha_analysis);
+                            opts.analysis.csha_configs = crate::pipeline::analysis_to_csha_configs(&csha_analysis);
                             // The planner runs as a side-effect inside
                             // `compile_train_block` (which sits inside
                             // `compile_user_functions` → `compile_main`)

@@ -166,7 +166,10 @@ The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
 `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, `MemoryOptions`,
-`WrgaOptions`, …). The WRGA cluster moved into `WrgaOptions` (`opts.wrga.{inputs,
+`WrgaOptions`, `AnalysisOptions`, …). The semantic-analysis facts moved into
+`AnalysisOptions` (`opts.analysis.{ownership_info, csha_configs,
+fused_ce_configs, fused_kl_ce_configs, pca_user_strategies}`). The WRGA
+cluster moved into `WrgaOptions` (`opts.wrga.{inputs,
 fold_allocations, check}`). The
 memory-planning knobs moved into `MemoryOptions` (`opts.memory.{vram_budget,
 report, transient_arena}`). The training
