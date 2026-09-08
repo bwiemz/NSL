@@ -118,6 +118,9 @@ const STMT_ADMISSION: &str = "crates/nsl-codegen/src/stmt_admission.rs";
 const STMT_MODEL_PARAMS: &str = "crates/nsl-codegen/src/stmt_train/model_params.rs";
 /// Sections 7e4–7g of the train block — the optimizer step (roadmap A1).
 const STMT_OPTIMIZER_STEP: &str = "crates/nsl-codegen/src/stmt_train/optimizer_step.rs";
+/// Section 7e3b, the CSLA window backward, peeled out of the driver
+/// (roadmap A1).
+const STMT_CSLA_WINDOW: &str = "crates/nsl-codegen/src/stmt_train/csla_window.rs";
 /// Section 2 of the train block — the optimizer/scheduler contract and the
 /// Muon perf-flag compositions (roadmap A1).
 const STMT_CONTRACT: &str = "crates/nsl-codegen/src/stmt_train/contract.rs";
@@ -237,7 +240,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--optim-state-offload",
         RuleKind::Conflicts,
         "CPDT reduced-precision moment plan",
-        STMT,
+        STMT_CSLA_WINDOW,
         "--layerwise-accum with --optim-state-offload does not yet support a CPDT reduced-precision moment plan",
     ),
     // ── ZeRO ───────────────────────────────────────────────────────────────
@@ -298,7 +301,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--zero-elementwise",
         RuleKind::Conflicts,
         "--training-reference",
-        STMT,
+        STMT_CSLA_WINDOW,
         "--zero-elementwise does not compose with a CPDT reduced-precision moment plan or --training-reference",
     ),
     // ── SR-BF16 (`--param-dtype bf16-sr`) envelope ─────────────────────────
@@ -725,7 +728,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--fuse-wgrad-accum",
         RuleKind::Conflicts,
         "CSLA window replay",
-        STMT,
+        STMT_CSLA_WINDOW,
         "--fuse-wgrad-accum fired inside the CSLA window replay",
     ),
     src_rule(
