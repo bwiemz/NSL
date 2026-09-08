@@ -417,7 +417,7 @@ snapshots! {
     // The flags that take the train block down a different path, each on
     // its own (plus the flags it refuses to run without) over the
     // source-AD lowering of the program that exercises it.
-    mlp_adamw_deterministic: "mlp_adamw", CompileOptions { deterministic: true, ..source_ad() };
+    mlp_adamw_deterministic: "mlp_adamw", CompileOptions { determinism: nsl_codegen::DeterminismOptions { enabled: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_cuda_graphs: "mlp_adamw", CompileOptions { train: nsl_codegen::TrainOptions { cuda_graphs: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_transient_arena: "mlp_adamw", CompileOptions { memory: nsl_codegen::MemoryOptions { transient_arena: true, ..Default::default() }, ..source_ad() };
     mlp_adamw_fuse_wgrad_accum: "mlp_adamw", CompileOptions { fusion: nsl_codegen::FusionOptions { wgrad_accum: true, ..Default::default() }, ..source_ad() };

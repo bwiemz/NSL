@@ -1680,7 +1680,7 @@ fn lower_single_op(
             };
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
             // M46b: Route to deterministic sort-based reduction when --deterministic is active.
-            if compiler.compile_options.deterministic {
+            if compiler.compile_options.determinism.enabled {
                 call(
                     compiler,
                     builder,
@@ -1709,7 +1709,7 @@ fn lower_single_op(
             };
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
             // M46b: Route to deterministic sort-based reduction when --deterministic is active.
-            if compiler.compile_options.deterministic {
+            if compiler.compile_options.determinism.enabled {
                 call(
                     compiler,
                     builder,
@@ -1812,7 +1812,7 @@ fn lower_single_op(
             let d = builder.ins().iconst(cl_types::I64, *dim);
             // M46: Route to deterministic sort-accumulate variant when --deterministic is active.
             // The deterministic FFI takes (input, indices, src) — dim is implicit (0).
-            if compiler.compile_options.deterministic {
+            if compiler.compile_options.determinism.enabled {
                 call(
                     compiler,
                     builder,
