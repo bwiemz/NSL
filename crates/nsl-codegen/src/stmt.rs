@@ -5715,7 +5715,7 @@ impl Compiler<'_> {
         );
         // M43b: Pipeline parallel detection
         if self.features.pipeline_config.is_some() {
-            if self.compile_options.layerwise_accum {
+            if self.compile_options.train.layerwise_accum {
                 return Err(CodegenError::new(
                     "--layerwise-accum is not supported on the pipelined train \
                      path (@pipeline): the window-buffered schedule was built \
@@ -5753,7 +5753,7 @@ impl Compiler<'_> {
             // P5 item 19: the pipelined path lowers its stages outside the
             // region-marker emission — the flag would silently train eager
             // while the user believes graphs are active.
-            if self.compile_options.cuda_graphs {
+            if self.compile_options.train.cuda_graphs {
                 return Err(CodegenError::new(
                     "--cuda-graphs is not supported on the pipelined train \
                      path (@pipeline): capture regions are not emitted \
@@ -5849,7 +5849,7 @@ impl Compiler<'_> {
         // Regions only exist in Wengert lowerings (source-AD); the tape
         // path would silently ignore the flag. Multi-rank collectives wait
         // on their own streams mid-backward — unvalidated with capture.
-        if self.compile_options.cuda_graphs {
+        if self.compile_options.train.cuda_graphs {
             if !self.features.source_ad_enabled {
                 return Err(CodegenError::new(
                     "--cuda-graphs requires --source-ad: capture regions \
@@ -8692,7 +8692,7 @@ impl Compiler<'_> {
                 let ccr_segment_free: Option<CcrSegmentFree> = match &ccr_plan {
                     Some(plan)
                         if ws_fwd_plan.is_none()
-                            && !self.compile_options.layerwise_accum
+                            && !self.compile_options.train.layerwise_accum
                             && std::env::var("NSL_CCR_SEGMENT_FREE").as_deref()
                                 != Ok("0") =>
                     {
@@ -9592,7 +9592,7 @@ impl Compiler<'_> {
                 // Deferred path
                 builder.switch_to_block(ga_deferred);
                 builder.seal_block(ga_deferred);
-                let off = self.compile_options.optim_state_offload;
+                let off = self.compile_options.train.optim_state_offload;
                 self.fase_emit_accumulate(
                     builder,
                     accum_buf,
@@ -9628,7 +9628,7 @@ impl Compiler<'_> {
             } else if fase_deferred {
                 // Pre-Phase-2 monolithic Deferred path (byte-identical when no overrides).
                 // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
-                let off = self.compile_options.optim_state_offload;
+                let off = self.compile_options.train.optim_state_offload;
                 self.fase_emit_accumulate(
                     builder,
                     accum_buf,
@@ -10835,7 +10835,7 @@ impl Compiler<'_> {
         // Optimizer-state offload is NOT wired on the pipelined path (its
         // optimizer emission does not run through the shared envelope
         // helpers) — refuse rather than silently keeping state on-device.
-        if self.compile_options.optim_state_offload {
+        if self.compile_options.train.optim_state_offload {
             return Err(CodegenError::new(
                 "--optim-state-offload is not supported for pipelined train \
                  blocks yet; remove the flag or use the non-pipelined path.",

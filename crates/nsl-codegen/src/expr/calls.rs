@@ -1716,7 +1716,7 @@ impl Compiler<'_> {
                 let dim = self.compile_nested_expr(builder, state, &args[1].value)?;
                 let keepdim = self.compile_nested_expr(builder, state, &args[2].value)?;
                 // M46: Swap to deterministic kernel variants when deterministic mode is active
-                let rt_name = if self.compile_options.deterministic {
+                let rt_name = if self.compile_options.determinism.enabled {
                     match func_name.as_str() {
                         "sum" => "nsl_tensor_reduce_sum_deterministic".to_string(),
                         "mean" => "nsl_tensor_reduce_mean_deterministic".to_string(),
