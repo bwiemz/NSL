@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~2.6k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~2.4k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -196,7 +196,9 @@ driver runs it:
    CSLA window emitters (`src/stmt_csla.rs`: `emit_csla_accum_alloc`,
    `emit_csla_group_update`) or the FASE Deferred emitters
    (`src/stmt_fase.rs`: `fase_emit_accumulate`, `fase_emit_final_step`,
-   `match_adamw_program`).
+   `match_adamw_program`); then the scheduler call, the step-count
+   increment and the periodic full-state checkpoint
+   (`src/stmt_train/scheduler_step.rs`: `emit_scheduler_step`).
 8. Teardown after the epoch loop (`src/stmt_train/teardown.rs`:
    `emit_train_teardown`).
 

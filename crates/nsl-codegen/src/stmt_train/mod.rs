@@ -33,6 +33,10 @@
 //!     mode-table / FASE-deferred / stdlib step arms, the ZeRO reduce and
 //!     sync, and the post-optimizer cleanup, fed by an
 //!     [`optimizer_step::OptimizerStepInputs`].
+//!   - [`scheduler_step`] — sections 7g2–7h, after the optimizer step: the
+//!     scheduler call that redefines the learning rate, the step-count
+//!     increment and the periodic full-train-state checkpoint, fed by a
+//!     [`scheduler_step::SchedulerStepInputs`].
 //!   - [`adjoint_tape_opt`] — sections 6a–6b.5 of the source-AD arm: the
 //!     WRGA backward-live filter, dead-gradient elimination, the bit-exact
 //!     backward folds and the CSLA schedule report, fed by an
@@ -133,6 +137,7 @@ pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;
 pub(crate) mod pipelined;
 pub(crate) mod primal_vars;
+pub(crate) mod scheduler_step;
 pub(crate) mod source_ad_grads;
 pub(crate) mod teardown;
 pub(crate) mod transient_arena_projection;
