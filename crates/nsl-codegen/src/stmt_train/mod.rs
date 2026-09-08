@@ -33,6 +33,11 @@
 //!     mode-table / FASE-deferred / stdlib step arms, the ZeRO reduce and
 //!     sync, and the post-optimizer cleanup, fed by an
 //!     [`optimizer_step::OptimizerStepInputs`].
+//!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
+//!     source-AD arm: the adjoint lowering with the per-parameter
+//!     accumulate callback and the grad-integrity bracket, fed by a
+//!     [`fase_hook_lowering::FaseHookLoweringInputs`] and returning the
+//!     lowered adjoint.
 //!   - [`primal_vars`] — section 3 of the source-AD arm: the initial
 //!     `VarMap` (named inputs / parameters to their Cranelift values, the
 //!     input device guards, the nested parameter and frozen teacher loads,
@@ -62,6 +67,7 @@ pub(crate) mod optimizer_state;
 pub(crate) mod contract;
 pub(crate) mod csla_window;
 pub(crate) mod epoch_close;
+pub(crate) mod fase_hook_lowering;
 pub(crate) mod identity;
 pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;
