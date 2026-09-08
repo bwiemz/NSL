@@ -267,7 +267,9 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[arena]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            // The transient-memory arena projection (section 6e of the
+            // train block's source-AD arm) — the report and the placement.
+            "crates/nsl-codegen/src/stmt_train/transient_arena_projection.rs",
         ],
         "the transient-memory arena was used",
     ),

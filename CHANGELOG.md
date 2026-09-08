@@ -116,6 +116,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): section 6e of
+  the source-AD arm — the Milestone C·p2 transient-memory arena projection
+  over the final tape (the Stage-2A element hints, the `--memory-report` /
+  `NSL_ARENA_REPORT=1` arena report, and the `--transient-arena` Stage-2B
+  placement with its `nsl_arena_init` / `nsl_arena_declare_slot`
+  declarations) — moved byte-for-byte into
+  `stmt_train/transient_arena_projection.rs`
+  (`emit_transient_arena_projection`, fed by a `TransientArenaInputs` and
+  returning the element hints the CSLA schedule precompute shares).
+  573 lines out of the driver; the train-block CLIF snapshots are
+  unchanged. The execution-marker registry now attributes `[arena]` to the
+  new file.
 - `compile_train_block_inner` peel continued (roadmap A1): sections 6a–6b.5
   of the source-AD arm — the adjoint tape optimizations between adjoint
   generation and the CCR splice (the WRGA backward-live filter,
