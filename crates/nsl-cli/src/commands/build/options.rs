@@ -508,8 +508,10 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 },
                 target,
                 source_ad: _source_ad,
-                deterministic: _deterministic,
-                rng_seed: seed,
+                determinism: nsl_codegen::DeterminismOptions {
+                    enabled: _deterministic,
+                    seed,
+                },
                 // M52: When --standalone, weights are handled by standalone pipeline;
                 // otherwise pass through the four-case-resolved weight file from
                 // above (AST auto-detect + --weights flag decision table).

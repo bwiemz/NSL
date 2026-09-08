@@ -54,7 +54,7 @@ cohesive sub-structs (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`,
 `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
 `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,
 `MemoryOptions`, `WrgaOptions`, `AnalysisOptions`, `ExportOptions`,
-`TrainOptions`, …) as part of the
+`TrainOptions`, `DeterminismOptions`, …) as part of the
 same hardening effort.
 
 A future `CompileSession { options, diagnostics, … }` wrapper could formalize

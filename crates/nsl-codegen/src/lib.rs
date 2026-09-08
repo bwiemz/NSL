@@ -1725,6 +1725,26 @@ pub struct DiagnosticsOptions {
     pub training_reference: bool,
 }
 
+/// Determinism options (`--deterministic` / `--seed`): the M46 deterministic
+/// mode switch and the program-start RNG seed. `enabled` is an
+/// execution-fingerprint key (`det=`); `seed` is not (it changes which
+/// numbers come out, not which arithmetic runs).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct DeterminismOptions {
+    /// M46: Enable deterministic mode.
+    pub enabled: bool,
+    /// P0 certification: RNG seed for `randn`/`rand`/stochastic ops.
+    /// `None` keeps the historical behavior (seed 42 under
+    /// --deterministic, unseeded otherwise). `Some(s)` seeds the RNG at
+    /// program start regardless of --deterministic (multi-seed training
+    /// campaigns need distinct reproducible inits; bit-reproducibility of
+    /// the DEVICE path still requires --deterministic).
+    pub seed: Option<u64>,
+}
+
 /// Training-execution options: how a train block's step runs on the device
 /// — optimizer-state offload (`--optim-state-offload`), the CSLA
 /// window-buffered schedule (`--layerwise-accum`), BF16 stochastic-rounding
@@ -1913,15 +1933,8 @@ pub struct CompileOptions {
     pub target: String,
     /// M40: Use compile-time source-to-source AD for training (default: false = tape AD).
     pub source_ad: bool,
-    /// M46: Enable deterministic mode.
-    pub deterministic: bool,
-    /// P0 certification: RNG seed for `randn`/`rand`/stochastic ops.
-    /// `None` keeps the historical behavior (seed 42 under
-    /// --deterministic, unseeded otherwise). `Some(s)` seeds the RNG at
-    /// program start regardless of --deterministic (multi-seed training
-    /// campaigns need distinct reproducible inits; bit-reproducibility of
-    /// the DEVICE path still requires --deterministic).
-    pub rng_seed: Option<u64>,
+    /// Determinism (`--deterministic` / `--seed`); see [`DeterminismOptions`].
+    pub determinism: DeterminismOptions,
     /// Weight-aware compilation (`--weights`, the M52 config, the analysis
     /// report) and the `@export` weight-index map; see [`WeightsOptions`].
     pub weights: WeightsOptions,
@@ -2086,7 +2099,7 @@ impl CompileOptions {
         let mm = self.matmul.clamped();
         [
             format!("ad={}", if self.source_ad { "source" } else { "tape" }),
-            format!("det={}", b(self.deterministic)),
+            format!("det={}", b(self.determinism.enabled)),
             format!("dtype={dtype}"),
             format!("fusion={}", if self.fusion.disabled { "off" } else { "on" }),
             format!("fuse_rms={}", b(self.fusion.rmsnorm_backward)),
@@ -2151,8 +2164,7 @@ impl Default for CompileOptions {
             fusion: FusionOptions::default(),
             target: "cuda".to_string(),
             source_ad: false,
-            deterministic: false,
-            rng_seed: None,
+            determinism: DeterminismOptions::default(),
             weights: WeightsOptions::default(),
             unikernel_config: None,
             wcet: WcetOptions::default(),
@@ -2715,7 +2727,10 @@ mod exec_fingerprint_tests {
     fn ad_and_determinism_are_reflected() {
         let o = CompileOptions {
             source_ad: true,
-            deterministic: true,
+            determinism: DeterminismOptions {
+                enabled: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let fp = o.exec_fingerprint();

@@ -447,8 +447,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 },
                 target,
                 source_ad,
-                deterministic,
-                rng_seed: seed,
+                determinism: nsl_codegen::DeterminismOptions {
+                    enabled: deterministic,
+                    seed,
+                },
                 // CPDT: pass through the four-case-resolved weight file so the
                 // weight-aware tier assignment runs during train-block codegen.
                 weights: nsl_codegen::WeightsOptions {

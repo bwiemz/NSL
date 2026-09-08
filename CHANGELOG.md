@@ -174,6 +174,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  determinism pair moved into `DeterminismOptions`
+  (`opts.determinism.{enabled, seed}` for `--deterministic` / `--seed`;
+  formerly the flat `deterministic` / `rng_seed`). Pure rename; defaults
+  unchanged; the execution fingerprint reads `det` through the new path.
+  30 → 29 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
   training-execution knobs moved into `TrainOptions`
   (`opts.train.{optim_state_offload, layerwise_accum, param_dtype_bf16sr,
   cuda_graphs}` for `--optim-state-offload` / `--layerwise-accum` /
