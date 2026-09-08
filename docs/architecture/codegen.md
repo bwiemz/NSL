@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~6k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~5.5k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -130,7 +130,11 @@ driver runs it:
 4. Parameter lists (`src/stmt_train/param_lists.rs`: `muon_route_flags`,
    `decay_exempt_flags`, `alloc_grad_accum_buffers`).
 5. Epoch/batch loops; forward extraction into a `WengertList` by
-   `WengertExtractor` (`src/source_ad.rs`); the in-pipeline passes, each under
+   `WengertExtractor` (`src/source_ad.rs`), then the initial primal
+   `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named
+   inputs / parameters to their Cranelift values, the input device guards,
+   the nested parameter and frozen teacher loads, the CPKD report facts);
+   the in-pipeline passes, each under
    `PassScheduler::schedule`: CPKD, WGGO (with the tape), CSHA, WRGA (with
    the tape), CPDT, CCR, and the transient-arena `MemoryPlanner` (with the
    adjoint). PCA and WGGO's prepass run earlier, in
@@ -147,6 +151,9 @@ driver runs it:
    seeding, per-range lowering with the fused per-layer update, the
    weight-stream prefetch belt, the window cleanup; the `CslaPre` /
    `CslaPending` / `CslaSchedule` carriers live there too).
+   After the adjoint is lowered, section 8 (`src/stmt_train/source_ad_grads.rs`:
+   `emit_source_ad_grads`) builds the parameter-gradient list (a null
+   sentinel under the FASE hook) and sweeps the lowering's intermediates.
 7. Optimizer step (`src/stmt_train/optimizer_step.rs`: `emit_optimizer_step`
    — the accumulation gate, the mode-table / FASE-deferred / stdlib step
    arms, the ZeRO reduce and sync, the post-optimizer cleanup), calling the
