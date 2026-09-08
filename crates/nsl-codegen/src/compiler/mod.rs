@@ -1206,7 +1206,7 @@ impl<'a> Compiler<'a> {
         // policy in `calibration/binary_codegen.rs::new_calibration_object_module`.
         // COFF/PE (Windows) does NOT use ELF-style GOT, so do not set is_pic
         // there — it can produce link failures on the MSVC linker.
-        if options.shared_lib || cfg!(target_os = "macos") {
+        if options.export.shared_lib || cfg!(target_os = "macos") {
             flag_builder
                 .set("is_pic", "true")
                 .map_err(|e| CodegenError::new(format!("failed to enable PIC: {e}")))?;
@@ -2019,7 +2019,7 @@ impl<'a> Compiler<'a> {
     ///
     /// Also emits the runtime export-table FFIs (`nsl_get_num_exports` and
     /// `nsl_get_export_name`) — but only for the compilation unit that owns
-    /// them (`compile_options.emit_export_table == true`). Every object
+    /// them (`compile_options.export.emit_table == true`). Every object
     /// linked into a shared library needs `shared_lib` (PIC) set, but only
     /// one object may define these two `Linkage::Export` symbols: on the
     /// multi-file shared-lib path every non-entry module also has
@@ -2048,7 +2048,7 @@ impl<'a> Compiler<'a> {
             crate::c_wrapper::emit_c_abi_dispatch_wrapper(self, wrapper)?;
         }
 
-        if self.compile_options.emit_export_table {
+        if self.compile_options.export.emit_table {
             let exports = self.features.export_functions.clone();
             crate::c_export_table::emit_export_table(self, &exports)?;
         }
@@ -2178,7 +2178,7 @@ impl<'a> Compiler<'a> {
         // M62: publish @export functions to the CLI-owned output slot so
         // `nsl build --shared-lib` can emit a matching C header without
         // threading the list through every entry-point's return tuple.
-        if let Some(slot) = self.compile_options.export_functions_out.as_ref()
+        if let Some(slot) = self.compile_options.export.functions_out.as_ref()
             && let Ok(mut guard) = slot.lock()
         {
             *guard = Some(self.features.export_functions.clone());
