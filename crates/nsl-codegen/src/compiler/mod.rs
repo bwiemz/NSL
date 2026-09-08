@@ -618,7 +618,7 @@ impl FeatureConfigs {
             parallelism_config: None,
             zero_stage: options.zero.stage,
             zero_elementwise: options.zero.elementwise,
-            param_dtype_bf16sr: options.param_dtype_bf16sr,
+            param_dtype_bf16sr: options.train.param_dtype_bf16sr,
             muon_state_bf16: options.muon.state_bf16,
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),

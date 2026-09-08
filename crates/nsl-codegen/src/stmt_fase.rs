@@ -1006,7 +1006,7 @@ impl Compiler<'_> {
     ) -> Result<Option<cranelift_codegen::ir::Block>, crate::error::CodegenError> {
         use cranelift_codegen::ir::condcodes::FloatCC;
 
-        let offload = self.compile_options.optim_state_offload;
+        let offload = self.compile_options.train.optim_state_offload;
         let Some((exempt_list, exempt_non_rank2)) = groups else {
             self.fase_emit_final_step(
                 builder, theta, m, m_partial, v, recipe, lr_runtime, Some(bc), wrap_precision, offload,
@@ -1734,7 +1734,7 @@ impl Compiler<'_> {
             step_count_var,
             cpdt_precision_dtypes.is_some(),
             fullbuf_t_override,
-            self.compile_options.optim_state_offload,
+            self.compile_options.train.optim_state_offload,
             // Muon FASE-plans as FullBuffer with NO mode table, so the
             // unified dispatch never routes it here.
             None,
@@ -1766,7 +1766,7 @@ impl Compiler<'_> {
         // Offload P0.2: ONE drain per optimizer step, after the per-param
         // loop exits — synchronizes the transfer stream and frees the
         // drain-deferred staged tensors whose async DtoH was in flight.
-        if self.compile_options.optim_state_offload {
+        if self.compile_options.train.optim_state_offload {
             self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
         }
 

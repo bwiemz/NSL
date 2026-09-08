@@ -373,7 +373,7 @@ impl Compiler<'_> {
                     // batching to the per-param loop with no diagnostic
                     // anywhere — a shipped optimization that was 100% off in
                     // a supported configuration.
-                    && !self.compile_options.optim_state_offload
+                    && !self.compile_options.train.optim_state_offload
                     // Belt only: bf16-sr structurally cannot reach this
                     // FullBuffer path (it requires --weight-stream, which
                     // clap-requires --layerwise-accum, so SR always takes the
@@ -444,7 +444,7 @@ impl Compiler<'_> {
                             "nsl_list_get",
                             &[grads_list, pa_i],
                         )?;
-                        let off = self.compile_options.optim_state_offload;
+                        let off = self.compile_options.train.optim_state_offload;
                         self.fase_emit_accumulate(
                             builder,
                             pa_mpart,
@@ -611,7 +611,7 @@ impl Compiler<'_> {
                         lr,
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
-                        self.compile_options.optim_state_offload,
+                        self.compile_options.train.optim_state_offload,
                         Some(opt_step),
                     )?;
                     if let Some(pb_join) = pb_zero_blocks {
@@ -632,7 +632,7 @@ impl Compiler<'_> {
                     // stream sync + deferred frees of the staged tensors).
                     // (Unreachable from the multi arm: its admission requires
                     // optim_state_offload == false.)
-                    if self.compile_options.optim_state_offload {
+                    if self.compile_options.train.optim_state_offload {
                         self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
                     }
                 } else {
@@ -780,7 +780,7 @@ impl Compiler<'_> {
                     // (Structurally unreachable on the multi path — offload
                     // is excluded from its admission — kept outside the
                     // else for byte-stability of the legacy arm.)
-                    if self.compile_options.optim_state_offload {
+                    if self.compile_options.train.optim_state_offload {
                         self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
                     }
                 }
@@ -979,7 +979,7 @@ impl Compiler<'_> {
                 step_count_var,
                 false,
                 None,
-                self.compile_options.optim_state_offload,
+                self.compile_options.train.optim_state_offload,
                 muon_extra,
             )?;
 
@@ -1007,7 +1007,7 @@ impl Compiler<'_> {
 
             // Offload P0.2: one drain per optimizer step (transfer-stream
             // sync + deferred frees of the staged tensors).
-            if self.compile_options.optim_state_offload {
+            if self.compile_options.train.optim_state_offload {
                 self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
             }
         }
