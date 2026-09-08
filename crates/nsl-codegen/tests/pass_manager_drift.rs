@@ -49,7 +49,7 @@ fn every_compiler_anchors_a_compile_epoch() {
 
 #[test]
 fn the_train_block_wrapper_consults_the_ordering_decision() {
-    let code = code_only(&src("src/stmt.rs"));
+    let code = code_only(&src("src/stmt_train/driver.rs"));
     assert!(
         code.contains(".enforce_dependency_order()"),
         "compile_train_block no longer consults \

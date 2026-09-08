@@ -467,7 +467,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         producer: "CSHA",
         carries: "crate::source_ad::CshaBackwardClaims",
         consumers: &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
             "crates/nsl-codegen/src/stmt_train/plan_ccr.rs",
             "crates/nsl-codegen/src/wengert_lower.rs",
         ],
@@ -678,7 +678,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         producer: "WGGO",
         carries: "Vec<crate::wggo_prepass::WggoPrePlan>",
         consumers: &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
             "crates/nsl-codegen/src/stmt_train/plan_wggo.rs",
             "crates/nsl-codegen/src/compiler/kernel.rs",
         ],

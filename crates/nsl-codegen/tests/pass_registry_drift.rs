@@ -1115,7 +1115,7 @@ fn every_phase_owning_function_establishes_its_scope() {
         // will ambiently inherit their Some(TrainBlock) — declare its real
         // phase and narrow the blanket then, rather than adding TrainBlock
         // to its declaration to make the check pass.
-        ("crates/nsl-codegen/src/stmt.rs",
+        ("crates/nsl-codegen/src/stmt_train/driver.rs",
          "fn compile_train_block(", "TrainBlock"),
     ];
     for (file, sig, phase) in OWNERS {

@@ -107,7 +107,9 @@ const fn src_rule(
     }
 }
 
-const STMT: &str = "crates/nsl-codegen/src/stmt.rs";
+/// The train-block driver (`compile_train_block` and its body), moved out
+/// of `stmt.rs` whole (roadmap A1).
+const STMT_DRIVER: &str = "crates/nsl-codegen/src/stmt_train/driver.rs";
 /// Refusals raised once per COMPILE rather than per train block — see
 /// `Compiler::finish_wgrad_admission`.
 const CODEGEN_COMPILER: &str = "crates/nsl-codegen/src/compiler/mod.rs";
@@ -194,7 +196,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--layerwise-accum",
         RuleKind::Requires,
         "--checkpoint-blocks",
-        STMT,
+        STMT_DRIVER,
         "--layerwise-accum requires an active checkpoint plan: pass --checkpoint-blocks",
     ),
     src_rule(
@@ -696,14 +698,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--cuda-graphs",
         RuleKind::Requires,
         "--source-ad",
-        STMT,
+        STMT_DRIVER,
         "--cuda-graphs requires --source-ad",
     ),
     src_rule(
         "--cuda-graphs",
         RuleKind::Conflicts,
         "--zero-stage",
-        STMT,
+        STMT_DRIVER,
         "--cuda-graphs does not compose with --zero-stage",
     ),
     src_rule(
@@ -778,7 +780,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "@fp8_compute",
         RuleKind::Conflicts,
         "--source-ad",
-        STMT,
+        STMT_DRIVER,
         "@fp8_compute has no effect under --source-ad",
     ),
 ];
