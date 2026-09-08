@@ -99,7 +99,7 @@ impl Compiler<'_> {
         // micro-batch phase within a window has its own self-consistent
         // allocator state, so the runtime captures one graph per
         // (region, phase) instead of requiring a phase-free digest.
-        if self.compile_options.cuda_graphs {
+        if self.compile_options.train.cuda_graphs {
             let win = builder
                 .ins()
                 .iconst(cl_types::I64, grad_accumulation_steps.max(1));

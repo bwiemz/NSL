@@ -172,13 +172,13 @@ impl Compiler<'_> {
             // and also seeds NON-deterministic runs (distinct reproducible
             // inits for multi-seed campaigns; device bit-reproducibility
             // still requires --deterministic).
-            if self.compile_options.deterministic {
+            if self.compile_options.determinism.enabled {
                 let one = builder.ins().iconst(cl_types::I64, 1);
                 self.compile_call_by_name(&mut builder, "nsl_set_deterministic", &[one])?;
-                let seed_val = self.compile_options.rng_seed.unwrap_or(42);
+                let seed_val = self.compile_options.determinism.seed.unwrap_or(42);
                 let seed = builder.ins().iconst(cl_types::I64, seed_val as i64);
                 self.compile_call_by_name(&mut builder, "nsl_rng_seed", &[seed])?;
-            } else if let Some(seed_val) = self.compile_options.rng_seed {
+            } else if let Some(seed_val) = self.compile_options.determinism.seed {
                 let seed = builder.ins().iconst(cl_types::I64, seed_val as i64);
                 self.compile_call_by_name(&mut builder, "nsl_rng_seed", &[seed])?;
             }
