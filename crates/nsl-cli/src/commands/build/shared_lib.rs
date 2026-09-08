@@ -64,7 +64,7 @@ fn run_build_shared_single(
     let exports_slot: std::sync::Arc<
         std::sync::Mutex<Option<Vec<nsl_codegen::c_header::ExportInfo>>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    options.export_functions_out = Some(exports_slot.clone());
+    options.export.functions_out = Some(exports_slot.clone());
     let options = &options;
 
     // Codegen with PIC enabled (shared_lib=true in options)
@@ -408,7 +408,7 @@ fn run_build_shared_multi(
             // from the entry module's semantic analysis into CompileOptions.
             entry_options.checkpoint.policies =
                 crate::pipeline::module_data_to_checkpoint_policies(mod_data);
-            entry_options.export_functions_out = Some(exports_slot.clone());
+            entry_options.export.functions_out = Some(exports_slot.clone());
             // M62: route entry-module weight_index_map so @export model methods
             // can resolve `self.<field>` → weight index on the multi-file path.
             entry_options.weights.index_map = mod_data.weight_index_map.clone();
@@ -458,10 +458,10 @@ fn run_build_shared_multi(
             // FFIs (`nsl_get_num_exports` / `nsl_get_export_name`); this
             // module still needs `shared_lib` (PIC) since its object is
             // linked into the same shared library. See
-            // `CompileOptions::emit_export_table` for why the two are
+            // `ExportOptions::emit_table` for why the two are
             // separate flags.
             let mut import_options = options.clone();
-            import_options.emit_export_table = false;
+            import_options.export.emit_table = false;
             match nsl_codegen::compile_module(
                 &mod_data.ast,
                 &interner,
