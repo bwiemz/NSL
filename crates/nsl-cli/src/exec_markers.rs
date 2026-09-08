@@ -238,6 +238,7 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
             // moment-precision arbitration arms (active / NOT lowered), the
             // stale-plan refusal's neighbors, and the no-WGGO skip notice.
             "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/plan_wrga_cpdt.rs",
             // Decorator, MoE capacity, and expert-prune diagnostics.
             "crates/nsl-codegen/src/cpdt_decorator.rs",
             "crates/nsl-codegen/src/cpdt_moe_capacity.rs",

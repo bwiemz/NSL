@@ -562,7 +562,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         producer: "CPDT",
         carries: "crate::cpdt::CpdtPlan",
         consumers: &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/plan_wrga_cpdt.rs",
             // Section 3 of the train block (the CPDT precision-plan resolution) lives in `stmt_train/model_params.rs` (A1).
             "crates/nsl-codegen/src/stmt_train/model_params.rs",
         ],
@@ -619,6 +619,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         carries: "crate::wggo_overrides::WggoOverrides",
         consumers: &[
             "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/plan_wrga_cpdt.rs",
             // Section 3 of the train block (the CPDT precision-plan resolution) lives in `stmt_train/model_params.rs` (A1).
             "crates/nsl-codegen/src/stmt_train/model_params.rs",
             // Section 2 of the train block (the FASE plan reads the per-layer

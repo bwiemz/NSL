@@ -63,6 +63,11 @@
 //!     CCR plan (blocks, stride, budget, compression, the owned-tensor
 //!     restriction), fed by a [`plan_ccr::PreForwardPlanInputs`] and
 //!     returning a [`plan_ccr::PreForwardPlans`]; pure planning.
+//!   - [`plan_wrga_cpdt`] — the WRGA driver run and the CPDT planning
+//!     site of the source-AD arm (tier agreement, moment-precision
+//!     arbitration, the stale-plan refusal), fed by a
+//!     [`plan_wrga_cpdt::WrgaCpdtInputs`] and returning the WRGA plan;
+//!     pure planning.
 //!   - [`plan_wggo`] — the WGGO planning site of the source-AD arm:
 //!     pre-plan reuse, the planner run, the applied-plan derivation and the
 //!     `WggoOverrides` publication, fed by a
@@ -116,3 +121,4 @@ pub(crate) mod teardown;
 pub(crate) mod transient_arena_projection;
 pub(crate) mod plan_ccr;
 pub(crate) mod plan_wggo;
+pub(crate) mod plan_wrga_cpdt;

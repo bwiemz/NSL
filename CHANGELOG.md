@@ -116,6 +116,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the WRGA driver
+  run and the CPDT planning site of the source-AD arm — the WRGA driver
+  under `PassScheduler::schedule` (pruning / rank allocation / fusion), the
+  CPDT tier agreement with the wrapper's pre-plan, the optimizer-moment
+  precision arbitration, the stale-plan refusal and the no-WGGO skip
+  notice — moved byte-for-byte into `stmt_train/plan_wrga_cpdt.rs`
+  (`run_wrga_and_plan_cpdt`, fed by a `WrgaCpdtInputs` and returning the
+  WRGA plan). 294 lines out of the driver; the train-block CLIF
+  snapshots are unchanged. The execution-marker registry lists the new
+  file among the `[cpdt]` emitters, and the pass-bus channel inventory
+  lists it as the `cpdt_plan` consumer and a `wggo_overrides` consumer.
 - `compile_train_block_inner` peel continued (roadmap A1): the WRGA fork
   and the CCR planning of the source-AD arm — the positional-reference
   guard, the fork of the extractor's list onto the WRGA plan (the effective
