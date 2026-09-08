@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Nightly frontend fuzzing (roadmap T1): `.github/workflows/fuzz-nightly.yml`
+  runs the `lex` and `parse` cargo-fuzz targets from `fuzz/` every night
+  (06:30 UTC, and on `workflow_dispatch` with a per-target time budget)
+  on the nightly toolchain, seeded from `fuzz/corpus/<target>/`, with the
+  documented `-max_len=4096 -timeout=10 -rss_limit_mb=4096` flags. A
+  reproducer fails the lane and is uploaded with the fuzzer log. The
+  `fuzz_seeds` stable test remains the per-PR gate; this is the
+  coverage-guided search that feeds it.
 - Runtime logging front door (roadmap C3): `nsl_log!(LEVEL, "target", …)`
   in nsl-runtime emits a `tracing` event per diagnostic line; the crate's own
   subscriber (`src/log.rs`) keeps stderr byte-identical to the `eprintln!` it

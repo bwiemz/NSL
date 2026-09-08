@@ -701,6 +701,17 @@ crash becomes a regression test by copying its reproducer into the corpus
 under a `.nsl` name. Only `.nsl` files are tracked — the hash-named inputs
 libFuzzer adds are ignored.
 
+Both targets also run nightly: the `frontend-fuzz` job in
+`.github/workflows/fuzz-nightly.yml` (06:30 UTC and `workflow_dispatch`,
+one matrix lane per target) fuzzes each for a bounded
+`-max_total_time` (600 s by default; the manual trigger takes a longer
+budget) with the flags above, on the nightly toolchain, seeded from
+`fuzz/corpus/<target>/`. A crash, timeout or out-of-memory reproducer
+fails the lane, and the `fuzz/artifacts/<target>/` directory plus the
+fuzzer log are uploaded as the `fuzz-<target>-artifacts` workflow artifact;
+the finding becomes a regression test the same way as a local one, by
+copying the reproducer into the corpus.
+
 **`nsl fmt` round-trip** — `crates/nsl-cli/tests/fmt_roundtrip.rs`
 (`cargo test -p nsl-cli --test fmt_roundtrip`): for every `.nsl` under
 `CORPUS_DIRS` that parses clean, and for three de-formatted spellings of it

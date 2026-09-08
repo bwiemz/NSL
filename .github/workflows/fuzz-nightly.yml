@@ -1,0 +1,101 @@
+name: fuzz-nightly
+
+# Coverage-guided fuzzing of the frontend (roadmap T1). The `lex` and `parse`
+# targets in fuzz/ run under libFuzzer for a bounded wall-clock budget every
+# night; a crash, timeout or out-of-memory reproducer fails the target's lane
+# and is uploaded so it can be copied into fuzz/corpus/<target>/ under a
+# `.nsl` name, where crates/nsl-parser/tests/fuzz_seeds.rs replays it on
+# stable in the per-PR CI.
+#
+# The flags mirror the documented local invocation in fuzz/Cargo.toml:
+# `-max_len=4096 -timeout=10 -rss_limit_mb=4096`. `-max_total_time` bounds
+# the run (seconds per target; the manual trigger can raise it).
+
+on:
+  schedule:
+    - cron: '30 6 * * *'  # daily at 06:30 UTC, after fpga-nightly
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 'libFuzzer -max_total_time, in seconds, per target'
+        required: false
+        default: '600'
+
+jobs:
+  frontend-fuzz:
+    name: Frontend fuzz — ${{ matrix.target }} (libFuzzer, nightly toolchain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [lex, parse]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # cargo-fuzz needs a nightly toolchain (-Zsanitizer=address); the
+      # workspace itself stays on 1.95.0 and never sees libfuzzer-sys because
+      # fuzz/ is its own cargo workspace.
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            fuzz/target/
+          key: ${{ runner.os }}-cargo-fuzz-nightly-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: |
+          if ! command -v cargo-fuzz >/dev/null; then
+            cargo install cargo-fuzz --locked
+          fi
+          cargo fuzz --version
+
+      - name: Record toolchain (provenance)
+        run: rustc +nightly --version --verbose
+
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          MAX_TOTAL_TIME: ${{ inputs.max_total_time || '600' }}
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_len=4096 -timeout=10 -rss_limit_mb=4096 \
+            -max_total_time="${MAX_TOTAL_TIME}" \
+            2>&1 | tee fuzz-${{ matrix.target }}.log
+          # `tee` masks the fuzzer's exit status; re-check it explicitly.
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## fuzz \`${{ matrix.target }}\`"
+            echo
+            echo "Seeds: $(ls fuzz/corpus/${{ matrix.target }}/*.nsl 2>/dev/null | wc -l | tr -d ' ')"
+            echo "Budget: ${{ inputs.max_total_time || '600' }} s"
+            echo
+            echo '```'
+            grep -E '^#[0-9]+ +DONE|^Done|^==[0-9]+==ERROR|^SUMMARY:|^Executed|^MS: |^artifact_prefix|^Test unit written' \
+              fuzz-${{ matrix.target }}.log | tail -n 20 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A reproducer is the finding; keep it (and the full log) even though the
+      # lane is red. The copy under fuzz/corpus/<target>/<name>.nsl is what
+      # turns it into a regression test.
+      - name: Upload reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz-${{ matrix.target }}.log
+          if-no-files-found: warn
+          retention-days: 30
