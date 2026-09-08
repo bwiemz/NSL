@@ -98,7 +98,7 @@ impl Compiler<'_> {
             let _ = plist;
             let m_partial =
                 c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
-            let off = c.compile_options.optim_state_offload;
+            let off = c.compile_options.train.optim_state_offload;
             // Item 7: the fused chain never materializes a
             // gradient tensor — emit the accumulating GEMM over
             // the chain's operands and we are done. There is

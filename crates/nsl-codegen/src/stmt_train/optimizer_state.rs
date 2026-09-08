@@ -84,7 +84,7 @@ impl Compiler<'_> {
         // nsl_tensor_cast_into requant that used to force a hard refusal
         // here. The pipelined train path still refuses offload outright
         // (see compile_train_block_pipelined).
-        if self.compile_options.optim_state_offload {
+        if self.compile_options.train.optim_state_offload {
             if cpdt_precision_dtypes.is_some() {
                 nsl_runtime::nsl_log!(INFO, "offload", 
                     "[offload] optimizer state (m/v) is HOST-resident at the \
@@ -263,7 +263,7 @@ impl Compiler<'_> {
                 .zero_stage
                 .filter(|&s| (1..=2).contains(&s))
                 .is_some();
-            let offload = self.compile_options.optim_state_offload;
+            let offload = self.compile_options.train.optim_state_offload;
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` (Value: Copy),
             // so projecting each moment's dtype-code list by value is fine.
             let m_list = cpdt_precision_dtypes.map(|(m, _)| m).or(muon_state_m_codes);
