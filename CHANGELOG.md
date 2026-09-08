@@ -116,6 +116,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the FASE-hook
+  arm of the adjoint lowering (section 7 of the source-AD arm) — the
+  per-parameter accumulate callback (`m_partial` accumulate or the fused
+  `--fuse-wgrad-accum` GEMM, the grad-integrity note, the deferred free),
+  the P0.3 grad-integrity bracket and the guarded `compile_wengert_ops`
+  call — moved byte-for-byte into `stmt_train/fase_hook_lowering.rs`
+  (`emit_fase_hook_adjoint_lowering`, fed by a `FaseHookLoweringInputs`,
+  returning the lowered adjoint). 163 lines out of the driver; the
+  train-block CLIF snapshots are unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): section 3 of
   the source-AD arm — the initial primal `VarMap` (the two name-order
   passes, the input device guards, the step parameter, the nested
