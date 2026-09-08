@@ -704,9 +704,10 @@ libFuzzer adds are ignored.
 Both targets also run nightly: the `frontend-fuzz` job in
 `.github/workflows/fuzz-nightly.yml` (06:30 UTC and `workflow_dispatch`,
 one matrix lane per target) fuzzes each for a bounded
-`-max_total_time` (600 s by default; the manual trigger takes a longer
-budget) with the flags above, on the nightly toolchain, seeded from
-`fuzz/corpus/<target>/`. A crash, timeout or out-of-memory reproducer
+`-max_total_time` (600 s; the manual trigger takes any budget) with the
+flags above, on the nightly toolchain, seeded from `fuzz/corpus/<target>/`.
+The same job runs as a 120 s smoke on a pull request that touches `fuzz/`
+or the workflow file, so a broken target is caught before it lands. A crash, timeout or out-of-memory reproducer
 fails the lane, and the `fuzz/artifacts/<target>/` directory plus the
 fuzzer log are uploaded as the `fuzz-<target>-artifacts` workflow artifact;
 the finding becomes a regression test the same way as a local one, by

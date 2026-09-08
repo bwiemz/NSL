@@ -10,7 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - Nightly frontend fuzzing (roadmap T1): `.github/workflows/fuzz-nightly.yml`
   runs the `lex` and `parse` cargo-fuzz targets from `fuzz/` every night
-  (06:30 UTC, and on `workflow_dispatch` with a per-target time budget)
+  (06:30 UTC; on `workflow_dispatch` with a per-target time budget; and
+  as a 120 s smoke on a pull request that touches `fuzz/` or the workflow)
   on the nightly toolchain, seeded from `fuzz/corpus/<target>/`, with the
   documented `-max_len=4096 -timeout=10 -rss_limit_mb=4096` flags. A
   reproducer fails the lane and is uploaded with the fuzzer log. The

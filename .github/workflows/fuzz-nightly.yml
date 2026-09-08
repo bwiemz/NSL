@@ -9,11 +9,17 @@ name: fuzz-nightly
 #
 # The flags mirror the documented local invocation in fuzz/Cargo.toml:
 # `-max_len=4096 -timeout=10 -rss_limit_mb=4096`. `-max_total_time` bounds
-# the run (seconds per target; the manual trigger can raise it).
+# the run: 600 s per target on the schedule, 120 s on a pull request that
+# touches the fuzz targets or this file (a smoke run, so a broken target or
+# workflow is caught before it lands), and whatever the manual trigger asks.
 
 on:
   schedule:
     - cron: '30 6 * * *'  # daily at 06:30 UTC, after fpga-nightly
+  pull_request:
+    paths:
+      - '.github/workflows/fuzz-nightly.yml'
+      - 'fuzz/**'
   workflow_dispatch:
     inputs:
       max_total_time:
@@ -62,7 +68,7 @@ jobs:
 
       - name: Fuzz ${{ matrix.target }}
         env:
-          MAX_TOTAL_TIME: ${{ inputs.max_total_time || '600' }}
+          MAX_TOTAL_TIME: ${{ inputs.max_total_time || (github.event_name == 'pull_request' && '120' || '600') }}
         run: |
           cargo +nightly fuzz run ${{ matrix.target }} -- \
             -max_len=4096 -timeout=10 -rss_limit_mb=4096 \
@@ -78,7 +84,7 @@ jobs:
             echo "## fuzz \`${{ matrix.target }}\`"
             echo
             echo "Seeds: $(ls fuzz/corpus/${{ matrix.target }}/*.nsl 2>/dev/null | wc -l | tr -d ' ')"
-            echo "Budget: ${{ inputs.max_total_time || '600' }} s"
+            echo "Budget: ${{ inputs.max_total_time || (github.event_name == 'pull_request' && '120' || '600') }} s (${{ github.event_name }})"
             echo
             echo '```'
             grep -E '^#[0-9]+ +DONE|^Done|^==[0-9]+==ERROR|^SUMMARY:|^Executed|^MS: |^artifact_prefix|^Test unit written' \
