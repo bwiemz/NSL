@@ -33,6 +33,11 @@
 //!     mode-table / FASE-deferred / stdlib step arms, the ZeRO reduce and
 //!     sync, and the post-optimizer cleanup, fed by an
 //!     [`optimizer_step::OptimizerStepInputs`].
+//!   - [`adjoint_tape_opt`] — sections 6a–6b.5 of the source-AD arm: the
+//!     WRGA backward-live filter, dead-gradient elimination, the bit-exact
+//!     backward folds and the CSLA schedule report, fed by an
+//!     [`adjoint_tape_opt::AdjointTapeOptInputs`] and returning the
+//!     parameter-gradient adjoint set; a pure tape rewrite.
 //!   - [`ccr_adjoint_frees`] — section 6d of the source-AD arm: CCR's
 //!     adjoint-region last-use freeing (the protected gradient set, the
 //!     pre-insertion wgrad fusion plan, the in-place `FreeTensor`
@@ -66,6 +71,7 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod adjoint_tape_opt;
 pub(crate) mod ccr_adjoint_frees;
 pub(crate) mod config;
 pub(crate) mod model_params;
