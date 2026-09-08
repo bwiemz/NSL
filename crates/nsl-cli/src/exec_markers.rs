@@ -128,7 +128,9 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[fuse]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            // The adjoint tape optimizations (sections 6a–6b.5 of the
+            // train block's source-AD arm) — the fold / fusion counts.
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
         ],
         "a fusion peephole fired",
     ),
@@ -635,7 +637,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         asserts: "the rmsnorm dx+residual fold did NOT fire with the flag off",
         parts: &[(
             "[fuse] rmsnorm dx+residual folds:",
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
         )],
     },
     NegativeNeedle {
@@ -645,7 +647,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
                   --layerwise-accum)",
         parts: &[(
             "[fuse] elementwise backward chains:",
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
         )],
     },
     NegativeNeedle {
@@ -654,7 +656,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
                   NSL_FUSE_SCALAR_IMM=0",
         parts: &[(
             "[fuse] scalar immediates:",
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
         )],
     },
     NegativeNeedle {
@@ -662,7 +664,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         asserts: "the RoPE backward fold did NOT fire with NSL_FUSE_ROPE_NEG=0",
         parts: &[(
             "[fuse] rope backward folds:",
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
         )],
     },
     NegativeNeedle {

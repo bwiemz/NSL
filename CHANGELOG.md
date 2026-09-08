@@ -116,6 +116,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): sections 6a–6b.5
+  of the source-AD arm — the adjoint tape optimizations between adjoint
+  generation and the CCR splice (the WRGA backward-live filter,
+  dead-gradient elimination, the SwiGLU / RMSNorm-residual /
+  elementwise-chain backward folds, the RoPE fold witness count and the
+  `NSL_CSLA_REPORT` schedule report) — moved byte-for-byte into
+  `stmt_train/adjoint_tape_opt.rs` (`optimize_adjoint_tape`, fed by an
+  `AdjointTapeOptInputs` and returning the parameter-gradient adjoint set
+  the gradient-integrity guard reuses; a pure tape rewrite). 120 lines
+  out of the driver; the train-block CLIF snapshots are unchanged. The
+  execution-marker registry (`nsl-cli/src/exec_markers.rs`) now attributes
+  `[fuse]` and its four negative needles to the new file.
 - `compile_train_block_inner` peel continued (roadmap A1): section 6d of
   the source-AD arm — CCR's adjoint-region last-use freeing (the protected
   parameter-gradient set, the pre-insertion weight-gradient fusion plan,

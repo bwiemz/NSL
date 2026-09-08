@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~5.2k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~5.1k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -144,7 +144,11 @@ driver runs it:
    `compile_wengert_ops_range`; under the FASE hook through
    `src/stmt_train/fase_hook_lowering.rs`: `emit_fase_hook_adjoint_lowering`,
    the per-parameter accumulate callback inside the grad-integrity
-   bracket). Between the two, under CCR, section 6d
+   bracket). Between the two, sections 6a–6b.5
+   (`src/stmt_train/adjoint_tape_opt.rs`: `optimize_adjoint_tape`) rewrite
+   the tape — the WRGA backward-live filter, dead-gradient elimination, the
+   bit-exact backward folds and the CSLA schedule report — and return the
+   parameter-gradient adjoint set; then, under CCR, section 6d
    (`src/stmt_train/ccr_adjoint_frees.rs`: `insert_ccr_adjoint_frees`)
    inserts the adjoint-region last-use frees on the tape, protecting the
    parameter-gradient adjoints and the planned wgrad fusion chains. Under
