@@ -63,6 +63,10 @@
 //!     CCR plan (blocks, stride, budget, compression, the owned-tensor
 //!     restriction), fed by a [`plan_ccr::PreForwardPlanInputs`] and
 //!     returning a [`plan_ccr::PreForwardPlans`]; pure planning.
+//!   - [`adapter_sites`] — the WRGA adapter sites of the source-AD arm:
+//!     the override-rejected diagnostics, the adapter init side-table and
+//!     the adapter-tensor loads into the VarMap, fed by an
+//!     [`adapter_sites::AdapterSitesInputs`].
 //!   - [`plan_wrga_cpdt`] — the WRGA driver run and the CPDT planning
 //!     site of the source-AD arm (tier agreement, moment-precision
 //!     arbitration, the stale-plan refusal), fed by a
@@ -101,6 +105,7 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod adapter_sites;
 pub(crate) mod adjoint_tape_opt;
 pub(crate) mod ccr_adjoint_frees;
 pub(crate) mod config;
