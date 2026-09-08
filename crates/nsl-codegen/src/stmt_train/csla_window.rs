@@ -777,7 +777,7 @@ impl Compiler<'_> {
                     // `muon_resident_m` needs --optim-state-offload, which
                     // stage 3 refuses outright, so the m side has no Muon arm.
                     let muon_v_gate = if optimizer_name == "muon"
-                        && !self.compile_options.optim_state_offload
+                        && !self.compile_options.train.optim_state_offload
                         && cpdt_precision_dtypes.is_none()
                     {
                         muon_route_list
@@ -795,7 +795,7 @@ impl Compiler<'_> {
                         m_codes,
                         v_codes,
                         muon_v_gate,
-                        self.compile_options.optim_state_offload,
+                        self.compile_options.train.optim_state_offload,
                         moment_fill_latch.expect("latch allocated under stage 3"),
                     )?;
                 }
@@ -827,7 +827,7 @@ impl Compiler<'_> {
             // offload refusal narrowed. The walk-through found no defect,
             // but zero gates cover the combination — refuse until a parity
             // gate exists (deferral-must-refuse).
-            if wrap_precision && self.compile_options.optim_state_offload {
+            if wrap_precision && self.compile_options.train.optim_state_offload {
                 return Err(CodegenError::new(
                     "--layerwise-accum with --optim-state-offload does not yet \
                      support a CPDT reduced-precision moment plan (the P0.3 \
@@ -909,7 +909,7 @@ impl Compiler<'_> {
             let csla_multi_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
                 if muon_csla_ctx.is_none()
                     && !wrap_precision
-                    && !self.compile_options.optim_state_offload
+                    && !self.compile_options.train.optim_state_offload
                     // bf16-sr admits (item 8, SR arm): the group update
                     // selects the SR twin of the multi_idx launch, which
                     // performs the identical per-member SR step and coherence
@@ -1642,7 +1642,7 @@ impl Compiler<'_> {
                     csla_lr,
                     (bc1_inv, bc2_inv),
                     wrap_precision,
-                    self.compile_options.optim_state_offload,
+                    self.compile_options.train.optim_state_offload,
                     muon_csla_ctx.as_ref(),
                     zero3_streamed.as_ref(),
                     zero3_elem.as_ref(),
@@ -1723,7 +1723,7 @@ impl Compiler<'_> {
                 csla_lr,
                 (bc1_inv, bc2_inv),
                 wrap_precision,
-                self.compile_options.optim_state_offload,
+                self.compile_options.train.optim_state_offload,
                 muon_csla_ctx.as_ref(),
                 zero3_streamed.as_ref(),
                 zero3_elem.as_ref(),

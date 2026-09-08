@@ -447,8 +447,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 },
                 target,
                 source_ad,
-                deterministic,
-                rng_seed: seed,
+                determinism: nsl_codegen::DeterminismOptions {
+                    enabled: deterministic,
+                    seed,
+                },
                 // CPDT: pass through the four-case-resolved weight file so the
                 // weight-aware tier assignment runs during train-block codegen.
                 weights: nsl_codegen::WeightsOptions {
@@ -480,7 +482,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     stage: zero_stage.map(|s| s as u8),
                     elementwise: zero_elementwise,
                 },
-                optim_state_offload,
+                train: nsl_codegen::TrainOptions {
+                    optim_state_offload,
+                    layerwise_accum,
+                    param_dtype_bf16sr: param_dtype == "bf16-sr",
+                    cuda_graphs,
+                },
                 checkpoint: nsl_codegen::CheckpointOptions {
                     blocks: checkpoint_blocks,
                     selective: checkpoint_selective,
@@ -499,15 +506,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     wgrad_accum: fuse_wgrad_accum,
                     wgrad_accum_from_bundle: fuse_wgrad_accum_from_bundle,
                 },
-                layerwise_accum,
                 weight_stream: nsl_codegen::WeightStreamOptions {
                     enabled: weight_stream,
                     arena: stream_arena,
                     prefetch: stream_prefetch,
                     async_writeback: stream_async_writeback,
                 },
-                param_dtype_bf16sr: param_dtype == "bf16-sr",
-                cuda_graphs,
                 muon: nsl_codegen::MuonOptions {
                     batch_ns: muon_batch_ns,
                     resident_momentum: muon_resident_momentum,

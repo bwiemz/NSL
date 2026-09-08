@@ -166,7 +166,12 @@ The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
 `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, `MemoryOptions`,
-`WrgaOptions`, `AnalysisOptions`, `ExportOptions`, …). The shared-library
+`WrgaOptions`, `AnalysisOptions`, `ExportOptions`, `TrainOptions`,
+`DeterminismOptions`, …). The determinism pair moved into `DeterminismOptions`
+(`opts.determinism.{enabled, seed}`, formerly the flat `deterministic` /
+`rng_seed`). The
+training-execution knobs moved into `TrainOptions` (`opts.train.{optim_state_offload,
+layerwise_accum, param_dtype_bf16sr, cuda_graphs}`). The shared-library
 export trio moved into `ExportOptions` (`opts.export.{shared_lib, emit_table,
 functions_out}`). The semantic-analysis facts moved into
 `AnalysisOptions` (`opts.analysis.{ownership_info, csha_configs,
