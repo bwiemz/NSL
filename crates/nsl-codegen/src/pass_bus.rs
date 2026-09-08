@@ -468,6 +468,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         carries: "crate::source_ad::CshaBackwardClaims",
         consumers: &[
             "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/plan_ccr.rs",
             "crates/nsl-codegen/src/wengert_lower.rs",
         ],
         empty_means: "the reverse walk applies per-op AD rules instead of \
