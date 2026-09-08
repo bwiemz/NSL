@@ -1725,6 +1725,37 @@ pub struct DiagnosticsOptions {
     pub training_reference: bool,
 }
 
+/// Shared-library export options (`--shared-lib`): the PIC / shared-object
+/// build switch, which compilation unit emits the C export table, and the
+/// `@export` list slot the CLI reads back to emit the matching C header.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct ExportOptions {
+    /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
+    /// Also controls PIC codegen (`is_pic`), which every object linked into
+    /// the shared library needs — including non-entry modules on the
+    /// multi-file path. See `emit_table` for the (distinct) decision
+    /// of which compilation unit emits the `nsl_get_num_exports` /
+    /// `nsl_get_export_name` C ABI, since only one may define them.
+    pub shared_lib: bool,
+    /// Whether *this* compilation unit should emit the shared-library
+    /// export-table FFIs (`nsl_get_num_exports` / `nsl_get_export_name`).
+    /// On the single-file shared-lib path this mirrors `shared_lib`. On the
+    /// multi-file path every module needs `shared_lib = true` for PIC, but
+    /// only the entry module's object may define these symbols — every
+    /// other module defining them too causes a "multiple definition"
+    /// linker error when the objects are joined. Defaults to `false`.
+    pub emit_table: bool,
+    /// M62: shared output slot the CLI reads after compile returns so it can
+    /// emit a matching C header alongside the shared library. Populated by
+    /// `Compiler::finalize` from `features.export_functions`.
+    pub functions_out: Option<
+        std::sync::Arc<std::sync::Mutex<Option<Vec<crate::c_header::ExportInfo>>>>,
+    >,
+}
+
 /// Facts forwarded from semantic analysis: what the CLI bridge
 /// (`analysis_to_*` / `module_data_to_*` in `nsl-cli`) copies out of
 /// `nsl_semantic::AnalysisResult` for codegen — the per-function ownership
@@ -1893,21 +1924,9 @@ pub struct CompileOptions {
     /// (the multi-file build's dims/ranks/values channel); see
     /// [`ImportedModelOptions`].
     pub imported_model: ImportedModelOptions,
-    /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
-    /// Also controls PIC codegen (`is_pic`), which every object linked into
-    /// the shared library needs — including non-entry modules on the
-    /// multi-file path. See `emit_export_table` for the (distinct) decision
-    /// of which compilation unit emits the `nsl_get_num_exports` /
-    /// `nsl_get_export_name` C ABI, since only one may define them.
-    pub shared_lib: bool,
-    /// Whether *this* compilation unit should emit the shared-library
-    /// export-table FFIs (`nsl_get_num_exports` / `nsl_get_export_name`).
-    /// On the single-file shared-lib path this mirrors `shared_lib`. On the
-    /// multi-file path every module needs `shared_lib = true` for PIC, but
-    /// only the entry module's object may define these symbols — every
-    /// other module defining them too causes a "multiple definition"
-    /// linker error when the objects are joined. Defaults to `false`.
-    pub emit_export_table: bool,
+    /// Shared-library export options (`--shared-lib`, the export-table
+    /// emitter, the `@export` header slot); see [`ExportOptions`].
+    pub export: ExportOptions,
     /// WRGA: the forwarded decorator configs, the allocation folding switch
     /// and the check-mode override context; see [`WrgaOptions`].
     pub wrga: WrgaOptions,
@@ -1957,12 +1976,6 @@ pub struct CompileOptions {
     pub csha: CshaOptions,
     /// CPDT (compiler-planned distributed training) options.
     pub cpdt: CpdtOptions,
-    /// M62: shared output slot the CLI reads after compile returns so it can
-    /// emit a matching C header alongside the shared library. Populated by
-    /// `Compiler::finalize` from `features.export_functions`.
-    pub export_functions_out: Option<
-        std::sync::Arc<std::sync::Mutex<Option<Vec<crate::c_header::ExportInfo>>>>,
-    >,
     /// Calibration-harness options (data path, mode, budgets, retention
     /// plans, the subprocess compile bundle and the sidecar written back).
     pub calibration: CalibrationOptions,
@@ -2137,8 +2150,7 @@ impl Default for CompileOptions {
             cuda_graphs: false,
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
             imported_model: ImportedModelOptions::default(),
-            shared_lib: false,
-            emit_export_table: false,
+            export: ExportOptions::default(),
             wrga: WrgaOptions::default(),
             wggo: WggoOptions::default(),
             cfie: CfieOptions::default(),
@@ -2152,7 +2164,6 @@ impl Default for CompileOptions {
             weight_stream: WeightStreamOptions::default(),
             csha: CshaOptions::default(),
             cpdt: CpdtOptions::default(),
-            export_functions_out: None,
             calibration: CalibrationOptions::default(),
         }
     }
