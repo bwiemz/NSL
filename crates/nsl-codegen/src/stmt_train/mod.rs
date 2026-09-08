@@ -97,6 +97,11 @@
 //!     installs the fused-CE decorator config around the lowering) and
 //!     `compile_train_block_pipelined_inner` (the stage loop with logical
 //!     stage-to-stage communication in one process).
+//!   - [`health_hooks`] — sections 7e1b–7e1c, after the backward: the
+//!     `--debug-training` gradient checksum, the P0.3 grad-integrity scan
+//!     and the health-monitor hooks (loss record, per-parameter gradient
+//!     and weight norms, snapshot flush), fed by a
+//!     [`health_hooks::HealthHooksInputs`].
 //!   - [`param_lists`] — the per-parameter runtime lists built at setup:
 //!     the Muon/AdamW route flags, the weight-decay exemption flags and
 //!     the gradient-accumulation buffers.
@@ -122,6 +127,7 @@ pub(crate) mod csla_window;
 pub(crate) mod epoch_close;
 pub(crate) mod fase_hook_lowering;
 pub(crate) mod forward_lowering;
+pub(crate) mod health_hooks;
 pub(crate) mod identity;
 pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;

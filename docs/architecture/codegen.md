@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~2.8k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~2.6k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -186,7 +186,11 @@ driver runs it:
    After the adjoint is lowered, section 8 (`src/stmt_train/source_ad_grads.rs`:
    `emit_source_ad_grads`) builds the parameter-gradient list (a null
    sentinel under the FASE hook) and sweeps the lowering's intermediates.
-7. Optimizer step (`src/stmt_train/optimizer_step.rs`: `emit_optimizer_step`
+7. Per-step diagnostics (`src/stmt_train/health_hooks.rs`:
+   `emit_train_health_hooks` — the `--debug-training` gradient checksum,
+   the grad-integrity scan, the health-monitor loss / gradient-norm /
+   weight-norm records and snapshot flush), then gradient clipping and
+   accumulation, then the optimizer step (`src/stmt_train/optimizer_step.rs`: `emit_optimizer_step`
    — the accumulation gate, the mode-table / FASE-deferred / stdlib step
    arms, the ZeRO reduce and sync, the post-optimizer cleanup), calling the
    CSLA window emitters (`src/stmt_csla.rs`: `emit_csla_accum_alloc`,
