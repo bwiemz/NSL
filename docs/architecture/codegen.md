@@ -29,7 +29,8 @@ facade map first, then this, then:
   `fusion_graph.rs` were deleted — `ARCHITECTURE.md` still names the first
   two in its `analysis` row, which is a doc bug, not a hidden module).
 
-Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~10.5k,
+Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~8.9k
+(plus `src/stmt_control.rs`, ~1.2k),
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
 `src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
 `tests/` and ~200 modules at the crate root.
@@ -94,9 +95,13 @@ is the shortest readable copy of the sequence.
 
 ### Statement and expression lowering
 
-- `Compiler::compile_stmt` (`src/stmt.rs`) dispatches on `StmtKind`; it is
-  the file that also owns the train block (below), the `serve`/`distill`
-  lowering, and most feature-specific refusals. `FuncState`
+- `Compiler::compile_stmt` (`src/stmt.rs`) dispatches on `StmtKind`; the
+  control-flow lowerings it dispatches to — `if`, `while`, `while let`,
+  `for` (ranges and lists, model arrays, a DataLoader) and `match`, with
+  the non-owning-alias materialization before a branch or loop — live in
+  `src/stmt_control.rs`. `stmt.rs` is the file that also owns the train
+  block (below), the `serve`/`distill` lowering, and most feature-specific
+  refusals. `FuncState`
   (`src/context.rs`) is the per-function state: variables, types, loop
   context, tensor cleanup bookkeeping, ownership state.
 - `Compiler::compile_expr` (`src/expr/mod.rs`) dispatches to `expr/access.rs`
@@ -423,7 +428,7 @@ after vmap dispatch), then `registry.runtime_fns`, then a
 `builder.ins().call`, returns `iconst 0` for void callees, and records the
 emission in `last_ffi_emission` for the FFI-ownership classifier. Direct
 `registry.runtime_fns.get(...)` lookups exist for a few hand-built signatures
-(e.g. the health hooks in `stmt.rs`) but the by-name path is the norm.
+(e.g. the health hooks in `src/stmt_train/health_hooks.rs`) but the by-name path is the norm.
 
 **Drift gates.** The table and the runtime are linked by symbol name only, so
 `crates/nsl-abi` (a dependency-free crate, a dev-dependency here) parses every
