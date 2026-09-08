@@ -72,7 +72,10 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[csla]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            // The NSL_CSLA_REPORT schedule report (adjoint tape optimizations)
+            // and the layerwise plan's own report (schedule precompute).
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
+            "crates/nsl-codegen/src/stmt_train/csla_precompute.rs",
         ],
         "the CSLA window-buffered schedule was lowered or executed",
     ),
@@ -301,6 +304,8 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "[weight-stream]",
         &[
             "crates/nsl-codegen/src/stmt.rs",
+            // The sliced-forward plan's residency / arena-mode notes.
+            "crates/nsl-codegen/src/stmt_train/csla_precompute.rs",
             "crates/nsl-runtime/src/weight_stream.rs",
             "crates/nsl-runtime/src/args.rs",
         ],
