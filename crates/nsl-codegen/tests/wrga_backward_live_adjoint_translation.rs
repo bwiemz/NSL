@@ -27,13 +27,16 @@ fn main():
 fn backward_live_filter_drops_adjoint_ops_for_frozen_param() {
     let opts = CompileOptions {
         source_ad: true,
-        wrga_inputs: Some(WrgaInputs {
-            freeze: vec![FreezeDecoratorConfig {
-                include: vec!["m.w".into()],
-                exclude: vec![],
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                freeze: vec![FreezeDecoratorConfig {
+                    include: vec!["m.w".into()],
+                    exclude: vec![],
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         ..Default::default()
     };
 

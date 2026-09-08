@@ -53,13 +53,16 @@ fn wrga_memory_hints_reduce_or_maintain_slot_count() {
 
     let opts = CompileOptions {
         source_ad: true,
-        wrga_inputs: Some(WrgaInputs {
-            freeze: vec![FreezeDecoratorConfig {
-                include: vec!["m.w1".into(), "m.w2".into()],
-                exclude: vec![],
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                freeze: vec![FreezeDecoratorConfig {
+                    include: vec!["m.w1".into(), "m.w2".into()],
+                    exclude: vec![],
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         ..Default::default()
     };
 

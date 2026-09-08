@@ -232,9 +232,9 @@ fn try_capture_real(
         target: target.to_string(),
         ..Default::default()
     };
-    options.wrga_inputs = Some(crate::analysis_bridges::analysis_to_wrga_inputs(
+    options.wrga.inputs = Some(crate::analysis_bridges::analysis_to_wrga_inputs(
         analysis,
-        &options.wrga_check,
+        &options.wrga.check,
     ));
     options.fused_ce_configs = crate::analysis_bridges::analysis_to_fused_ce_configs(analysis);
     options.fused_kl_ce_configs = crate::analysis_bridges::analysis_to_fused_kl_ce_configs(analysis);

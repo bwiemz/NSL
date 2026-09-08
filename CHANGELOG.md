@@ -149,6 +149,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the WRGA
+  cluster moved into `WrgaOptions` (`opts.wrga.{inputs, fold_allocations,
+  check}`: the decorator configs the CLI bridge forwards from nsl-semantic,
+  `--wrga-fold-allocations`, and the `nsl check --wrga-analyze |
+  --wrga-compare` override context). Pure rename; defaults unchanged.
+  41 → 39 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the
   memory-planning knobs moved into `MemoryOptions` (`opts.memory.{vram_budget,
   report, transient_arena}` for `--vram-budget` / `--memory-report` /

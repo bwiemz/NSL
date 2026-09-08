@@ -1289,7 +1289,7 @@ impl<'a> Compiler<'a> {
             dropout_fwd_out: HashMap::new(),
             fused_kl_ce_fwd_saves: HashMap::new(),
             fused_kl_ce_bwd_cache: HashMap::new(),
-            wrga_inputs: options.wrga_inputs.clone(),
+            wrga_inputs: options.wrga.inputs.clone(),
             cfie_decorator_mode: None,
             fase_decorator: None,
             cfie_decorator_target: None,

@@ -45,8 +45,8 @@ pub(crate) fn run_build_standalone(
     // present without `--source-ad`.
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs =
-        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
+    options.wrga.inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga.check));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
     options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
@@ -94,7 +94,7 @@ pub(crate) fn run_build_standalone(
         false,
         options,
     );
-    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga_check);
+    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga.check);
     let obj_bytes = bytes_res
         .unwrap_or_else(|e| crate::pipeline::exit_on_codegen_error(&source_map, &e, None));
 

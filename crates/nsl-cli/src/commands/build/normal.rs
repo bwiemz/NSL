@@ -104,8 +104,8 @@ fn run_build_single(
 
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
-    options.wrga_inputs =
-        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
+    options.wrga.inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga.check));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
     options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
@@ -168,7 +168,7 @@ fn run_build_single(
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
     // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
-    capture_wrga_plan(&wrga_plan, &options.wrga_check);
+    capture_wrga_plan(&wrga_plan, &options.wrga.check);
     if let Some(report_path) = wrga_report {
         match &wrga_plan {
             Some(p) => {
@@ -431,9 +431,9 @@ fn run_build_multi(
                 }
             }
             let mut entry_options = options.clone();
-            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
+            entry_options.wrga.inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
                 mod_data,
-                &entry_options.wrga_check,
+                &entry_options.wrga.check,
             ));
             entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
             entry_options.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
@@ -633,7 +633,7 @@ fn run_build_multi(
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
     // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
-    capture_wrga_plan(&entry_wrga_plan, &options.wrga_check);
+    capture_wrga_plan(&entry_wrga_plan, &options.wrga.check);
     if let Some(report_path) = wrga_report {
         match &entry_wrga_plan {
             Some(p) => {

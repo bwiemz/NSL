@@ -1456,7 +1456,7 @@ pub fn run_on_wengert_with_weights(
     // are pure modeled cost) and the paper's mode=auto could never
     // materialize.
     if compile_options.is_some_and(|o| {
-        o.wrga_inputs
+        o.wrga.inputs
             .as_ref()
             .is_some_and(|w| !w.wrga.is_empty() || !w.adapter.is_empty())
     }) {
