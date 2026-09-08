@@ -19,6 +19,8 @@ use crate::stmt_train::csla_window::{
     CslaWindowSave,
 };
 use crate::stmt_train::model_params::ModelParams;
+use crate::stmt_train::ccr_adjoint_frees::CcrAdjointFreesInputs;
+use crate::stmt_train::fase_hook_lowering::FaseHookLoweringInputs;
 use crate::stmt_train::primal_vars::PrimalVarsInputs;
 use crate::stmt_train::source_ad_grads::SourceAdGradsInputs;
 use crate::stmt_train::optimizer_state::OptimizerState;
@@ -8579,122 +8581,20 @@ impl Compiler<'_> {
                     }
                 }
 
-                // 6d. CCR: adjoint-region last-use freeing. The 500M/seq1024
-                // per-surface OOM decomposition showed adjoint intermediates
-                // (dx-chain temporaries) are the binding activation wall —
-                // they all lived to the end-of-backward bulk free. Insert a
-                // FreeTensor after each adjoint var's last use. Protected:
-                // every param-gradient adjoint (consumed by the FASE hook or
-                // by post-lowering grad collection) plus the inputs of the
-                // ops producing them (the hook's reduce_to_shape identity
-                // path emits its own extra free for those raw grads).
-                if ccr_plan.is_some() {
-                    let mut ccr_protect: std::collections::HashSet<crate::wengert::VarId> =
-                        std::collections::HashSet::new();
-                    for (param_name, primal_vid) in extractor.named_param_var_ids() {
-                        if !self.is_trainable_param_name(param_name) {
-                            continue;
-                        }
-                        if let Some(adj_vid) = generator.adjoint_of(*primal_vid) {
-                            ccr_protect.insert(adj_vid);
-                        }
-                    }
-                    // Item 7 x CCR: the fusable weight-gradient chains, planned
-                    // on the adjoint BEFORE last-use freeing rewrites it.
-                    // `wgrad_fusion::plan` requires the chain's three ops to be
-                    // contiguous, and last-use freeing lands `FreeTensor(a_t)`
-                    // between the matmul and the reduce — which silently took
-                    // the fusion count to ZERO on every `--checkpoint-blocks`
-                    // build. Planning here, on the pre-insertion tape, is what
-                    // lets the inserter keep those chains adjacent; the lowerer
-                    // re-derives the same plan from VarIds afterwards.
-                    //
-                    // GATED ON `fase_hook_active` TOO, mirroring the lowerer:
-                    // it plans only when `on_param_grad` is present
-                    // (wengert_lower.rs), which requires the FASE hook. Without
-                    // this the two sides diverge on any `--checkpoint-blocks`
-                    // build that will NOT fuse — accumulation == 1 makes FASE
-                    // Passthrough for EVERY optimizer, and
-                    // `--pretrain-optimized` turns `fuse_wgrad_accum` on with no
-                    // accumulation precondition — and CCR would then delete
-                    // `FreeTensor(a_t)` markers for chains nobody fuses. That is
-                    // not a leak (the transpose result is a view, swept by the
-                    // end-of-backward bulk free) but it pins the base
-                    // activation's buffer until then, a regression in exactly
-                    // the pass whose purpose is cutting the adjoint peak.
-                    // Found by adversarial review, measured at 3 lost markers on
-                    // an SGD/no-accumulation build.
-                    //
-                    // The seed is still the param-adjoint set (before the input
-                    // expansion below widens it), a SUPERSET of the hook's
-                    // `param_adj_set`, which additionally requires an accum slot
-                    // and a primal value — both built later. That residual
-                    // over-inclusion is bounded and one-directional: at worst a
-                    // param with no accum slot loses its `a_t` marker to the
-                    // bulk free. It cannot mis-fuse anything, because the
-                    // lowerer's plan — not this one — decides what is elided.
-                    let wgrad_chains = if self.compile_options.fusion.wgrad_accum
-                        && fase_hook_active
-                    {
-                        Some(crate::wgrad_fusion::plan(&adjoint, &ccr_protect))
-                    } else {
-                        None
-                    };
-                    for op in &adjoint.ops {
-                        if ccr_protect.contains(&op.result) {
-                            for input in &op.inputs {
-                                ccr_protect.insert(*input);
-                            }
-                        }
-                    }
-                    ccr_fresh = ccr_fresh.max(
-                        effective_primal
-                            .ops
-                            .iter()
-                            .map(|o| o.result)
-                            .chain(adjoint.ops.iter().map(|o| o.result))
-                            .max()
-                            .unwrap_or(0)
-                            + 1,
-                    );
-                    let n = crate::ccr::insert_adjoint_last_use_frees(
-                        &mut adjoint,
-                        &ccr_protect,
-                        &mut ccr_fresh,
-                        wgrad_chains.as_ref(),
-                    );
-                    if std::env::var("NSL_CCR_DEBUG").is_ok() {
-                        nsl_runtime::nsl_log!(INFO, "ccr", "[ccr] adjoint last-use frees inserted: {n}");
-                        if let Some(ref chains) = wgrad_chains {
-                            nsl_runtime::nsl_log!(INFO, "ccr", 
-                                "[ccr] wgrad chains kept contiguous: {}",
-                                chains.by_reduce_result.len()
-                            );
-                        }
-                    }
-                    // The invariant this protection exists to hold: a chain the
-                    // pre-insertion plan admitted must still be admissible
-                    // afterwards. A drop here is exactly the silent-inertness
-                    // defect that motivated the fix (the lowerer would re-plan,
-                    // find fewer chains, and report a smaller count with no
-                    // error), so say so loudly rather than losing a fusion to a
-                    // future free-placement change.
-                    if let Some(ref before) = wgrad_chains {
-                        let after = crate::wgrad_fusion::plan(&adjoint, &ccr_protect);
-                        if after.by_reduce_result.len() < before.by_reduce_result.len() {
-                            nsl_runtime::nsl_log!(WARN, "codegen", 
-                                "warning: [ccr] last-use freeing broke {} weight-gradient \
-                                 fusion chain(s) ({} admissible before, {} after) — \
-                                 --fuse-wgrad-accum will silently fuse fewer chains on \
-                                 this build. This is a compiler defect, not a property \
-                                 of your program; please report it.",
-                                before.by_reduce_result.len() - after.by_reduce_result.len(),
-                                before.by_reduce_result.len(),
-                                after.by_reduce_result.len(),
-                            );
-                        }
-                    }
-                }
+                // 6d. CCR: adjoint-region last-use freeing.
+                // Moved to `stmt_train/ccr_adjoint_frees.rs` byte-for-byte (roadmap A1):
+                // the protected param-gradient set, the pre-insertion wgrad
+                // fusion plan, the fresh-VarId advance and the FreeTensor
+                // insertion after each adjoint var's last use.
+                self.insert_ccr_adjoint_frees(CcrAdjointFreesInputs {
+                    adjoint: &mut adjoint,
+                    ccr_fresh,
+                    ccr_plan: &ccr_plan,
+                    effective_primal: &effective_primal,
+                    extractor: &extractor,
+                    fase_hook_active,
+                    generator: &generator,
+                });
 
                 // 6d.5 P0.2 gradient-integrity guard: compute the LIVE adjoint
                 // result-VarId set over the FINAL adjoint (post dead-grad
@@ -10326,169 +10226,24 @@ impl Compiler<'_> {
                     None
                 } else if fase_hook_active && !param_adj_set.is_empty() {
                     // FASE Deferred: consume each param gradient immediately.
-                    // The callback receives &mut Compiler explicitly so no
-                    // double-borrow occurs.
-                    let accum_val = accum_list.ok_or_else(|| {
-                        CodegenError::new(
-                            "fase_hook_active requires accum_list to be Some",
-                        )
-                    })?;
-                    let accum_scale = fase_plan.recipe.accum_scale;
-                    let num_params = num_params_val;
-                    let hook_map = &adj_vid_to_hook_entry;
-                    let plist = param_list;
-                    let mut fase_cb = |c: &mut Compiler,
-                                       var_id: crate::wengert::VarId,
-                                       grad_src: crate::wengert_lower::ParamGradSource,
-                                       still_needed: bool,
-                                       b: &mut cranelift_frontend::FunctionBuilder|
-                     -> Result<(), CodegenError> {
-                        let Some(entry) = hook_map.get(&var_id) else {
-                            return Ok(());
-                        };
-                        // Runtime pointer-scan: find the index in param_list that
-                        // matches the primal param pointer, then use the same index
-                        // for accum_list.  This is necessary because param_list and
-                        // accum_list are both indexed by param_paths order, but a
-                        // given primal_val may appear at any runtime slot if the
-                        // model has shared/aliased weights.
-                        //
-                        // Fast path: use the compile-time accum_idx directly.
-                        // accum_list[accum_idx] == the m_partial for this param
-                        // (both are param_paths-ordered).
-                        let _ = entry.primal_val; // present for future alias detection
-                        let idx_val = b.ins().iconst(cranelift_codegen::ir::types::I64, entry.accum_idx);
-                        let _ = num_params; // captured for guard assertions if needed
-                        let _ = plist;
-                        let m_partial =
-                            c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
-                        let off = c.compile_options.train.optim_state_offload;
-                        // Item 7: the fused chain never materializes a
-                        // gradient tensor — emit the accumulating GEMM over
-                        // the chain's operands and we are done. There is
-                        // nothing to note for grad-integrity and nothing to
-                        // free.
-                        //
-                        // These used to be `debug_assert!`s justified by "both
-                        // compositions are refused at option validation". That
-                        // held only while clap was the sole route here: clap
-                        // conflicts `--fuse-wgrad-accum` with both flags at
-                        // PARSE time. `--pretrain-optimized` now enables the
-                        // fusion from `expand_pretrain_optimized`, which runs
-                        // after parsing and is therefore invisible to clap, so
-                        // the bundle's own blocker list is the only thing
-                        // keeping this state unreachable. A debug_assert is a
-                        // no-op in release (the workspace sets no
-                        // `[profile.release] debug-assertions`), so a lapse in
-                        // that list would not abort — it would silently emit a
-                        // grad-integrity report attesting parameters whose
-                        // gradients were never observed, or aim the device GEMM
-                        // at a host-resident `m_partial`. Fail loudly instead;
-                        // this is unreachable by construction, so the cost is
-                        // zero and the value is that it stays that way.
-                        let grad_ptr = match grad_src {
-                            crate::wengert_lower::ParamGradSource::FusedWgrad { x, g } => {
-                                if c.compile_options.diagnostics.grad_integrity {
-                                    return Err(CodegenError::new(
-                                        "internal: --fuse-wgrad-accum reached lowering with \
-                                         --grad-integrity active. The fused chain never \
-                                         materializes a gradient tensor, so the integrity gate \
-                                         would attest parameters it never observed. Whatever \
-                                         enabled the fusion (clap conflict, or the \
-                                         --pretrain-optimized blocker list in \
-                                         crates/nsl-cli/src/meta_flags.rs) has a gap.",
-                                    ));
-                                }
-                                if off {
-                                    return Err(CodegenError::new(
-                                        "internal: --fuse-wgrad-accum reached lowering with \
-                                         --optim-state-offload active. `m_partial` is \
-                                         host-resident under offload and the fused device GEMM \
-                                         cannot write it. Whatever enabled the fusion (clap \
-                                         conflict, or the --pretrain-optimized blocker list in \
-                                         crates/nsl-cli/src/meta_flags.rs) has a gap.",
-                                    ));
-                                }
-                                let scale_val = b.ins().f64const(accum_scale);
-                                c.compile_call_by_name(
-                                    b,
-                                    "nsl_tensor_wgrad_accum",
-                                    &[m_partial, x, g, scale_val],
-                                )?;
-                                return Ok(());
-                            }
-                            crate::wengert_lower::ParamGradSource::Materialized(v) => v,
-                        };
-                        // P0.3: note this parameter's gradient BEFORE accumulate
-                        // frees/consumes it. accum_idx == the param_paths index.
-                        if c.compile_options.diagnostics.grad_integrity {
-                            c.compile_call_by_name(
-                                b,
-                                "nsl_grad_integrity_note",
-                                &[grad_ptr, idx_val],
-                            )?;
-                        }
-                        c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, off)?;
-                        // Free the raw gradient now ONLY if no later adjoint op
-                        // still reads it. When this param's grad adjoint is a
-                        // shared intermediate (a bias whose grad == d_out, which
-                        // the weight-grad matmul also consumes), the free is
-                        // DEFERRED to end-of-backward cleanup — freeing here
-                        // would drop the weight gradient (silently, pre-#396).
-                        // `fase_emit_accumulate` leaves grad_ptr intact (rc
-                        // unchanged), so the later op reads live data.
-                        if !still_needed {
-                            c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
-                        }
-                        Ok(())
-                    };
-                    // P0.3: bracket the FASE backward with a grad-integrity step
-                    // (the hook notes each parameter's gradient between these).
-                    // This bracket wraps ONE micro-batch's adjoint lowering, so
-                    // every trainable param must be noted exactly once inside
-                    // it — anything else is a dropped or double-consumed
-                    // gradient, which is what the declared expectation catches.
-                    let gi = self.compile_options.diagnostics.grad_integrity;
-                    if gi {
-                        let one_note = builder.ins().iconst(cl_types::I64, 1);
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_grad_integrity_step_begin",
-                            &[num_params_val, one_note],
-                        )?;
-                    }
-                    // P0.2: arm the gradient-integrity guard for the FASE
-                    // adjoint lowering, then disarm before the match so it
-                    // never leaks into a later (forward / free-list) lowering.
-                    self.grad_live_results = grad_live_set.clone();
-                    let fase_lowered = crate::wengert_lower::compile_wengert_ops(
-                        self,
+                    // Moved to `stmt_train/fase_hook_lowering.rs` byte-for-byte
+                    // (roadmap A1): the per-parameter accumulate callback, the
+                    // grad-integrity bracket and the guarded adjoint lowering.
+                    self.emit_fase_hook_adjoint_lowering(
                         builder,
                         state,
-                        &adjoint,
-                        full_vars,
-                        Some((&param_adj_set, &mut fase_cb)),
-                    );
-                    self.grad_live_results = None;
-                    let fase_out = match fase_lowered {
-                        Ok(gv) => Some(gv),
-                        Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", 
-                                "[nsl] source AD lowering (FASE hook) failed ({}), \
-                                 rerun without --source-ad",
-                                e
-                            );
-                            return Err(e);
-                        }
-                    };
-                    if gi {
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_grad_integrity_step_end",
-                            &[],
-                        )?;
-                    }
-                    fase_out
+                        FaseHookLoweringInputs {
+                            accum_list,
+                            adj_vid_to_hook_entry: &adj_vid_to_hook_entry,
+                            adjoint: &adjoint,
+                            fase_plan: &fase_plan,
+                            full_vars,
+                            grad_live_set: &grad_live_set,
+                            num_params_val,
+                            param_adj_set: &param_adj_set,
+                            param_list,
+                        },
+                    )?
                 } else {
                     self.grad_live_results = grad_live_set.clone();
                     let full_lowered = crate::wengert_lower::compile_wengert_ops(

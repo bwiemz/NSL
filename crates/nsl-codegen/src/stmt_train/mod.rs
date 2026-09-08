@@ -33,6 +33,16 @@
 //!     mode-table / FASE-deferred / stdlib step arms, the ZeRO reduce and
 //!     sync, and the post-optimizer cleanup, fed by an
 //!     [`optimizer_step::OptimizerStepInputs`].
+//!   - [`ccr_adjoint_frees`] — section 6d of the source-AD arm: CCR's
+//!     adjoint-region last-use freeing (the protected gradient set, the
+//!     pre-insertion wgrad fusion plan, the in-place `FreeTensor`
+//!     insertion), fed by a [`ccr_adjoint_frees::CcrAdjointFreesInputs`];
+//!     a pure tape rewrite.
+//!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
+//!     source-AD arm: the adjoint lowering with the per-parameter
+//!     accumulate callback and the grad-integrity bracket, fed by a
+//!     [`fase_hook_lowering::FaseHookLoweringInputs`] and returning the
+//!     lowered adjoint.
 //!   - [`primal_vars`] — section 3 of the source-AD arm: the initial
 //!     `VarMap` (named inputs / parameters to their Cranelift values, the
 //!     input device guards, the nested parameter and frozen teacher loads,
@@ -56,12 +66,14 @@
 //! window helpers live beside this module in `stmt_csla.rs`; the FASE
 //! optimizer-step emitters in `stmt_fase.rs`.
 
+pub(crate) mod ccr_adjoint_frees;
 pub(crate) mod config;
 pub(crate) mod model_params;
 pub(crate) mod optimizer_state;
 pub(crate) mod contract;
 pub(crate) mod csla_window;
 pub(crate) mod epoch_close;
+pub(crate) mod fase_hook_lowering;
 pub(crate) mod identity;
 pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;
