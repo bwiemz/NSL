@@ -116,6 +116,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the WRGA fork
+  and the CCR planning of the source-AD arm — the positional-reference
+  guard, the fork of the extractor's list onto the WRGA plan (the effective
+  primal), and the CCR plan under `PassScheduler::schedule` (checkpoint
+  blocks, the fixed / `dp` / `auto` stride, the VRAM budget flips, the
+  compressed saves, the owned-tensor restriction) — moved byte-for-byte
+  into `stmt_train/plan_ccr.rs` (`fork_wrga_and_plan_ccr`, fed by a
+  `PreForwardPlanInputs` and returning a `PreForwardPlans`: the effective
+  primal, the CCR plan, the next fresh VarId and the compressed-save map).
+  390 lines out of the driver; the train-block CLIF snapshots are
+  unchanged. The execution-marker registry lists the new file among the
+  `[ccr]` emitters, and the pass-bus channel inventory lists it as a
+  `csha_backward_claims` consumer.
 - `compile_train_block_inner` peel continued (roadmap A1): the WGGO
   planning site of the source-AD arm — the wrapper pre-plan reuse under its
   tape fingerprint, the planner run under `PassScheduler::schedule`, the
