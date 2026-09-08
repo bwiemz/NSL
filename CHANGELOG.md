@@ -116,6 +116,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): section 6d of
+  the source-AD arm — CCR's adjoint-region last-use freeing (the protected
+  parameter-gradient set, the pre-insertion weight-gradient fusion plan,
+  the fresh-VarId advance, the in-place `FreeTensor` insertion and its
+  chain-preservation check) — moved byte-for-byte into
+  `stmt_train/ccr_adjoint_frees.rs` (`insert_ccr_adjoint_frees`, fed by a
+  `CcrAdjointFreesInputs`; a pure tape rewrite). 116 lines out of the
+  driver; the train-block CLIF snapshots are unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): the FASE-hook
   arm of the adjoint lowering (section 7 of the source-AD arm) — the
   per-parameter accumulate callback (`m_partial` accumulate or the fused
