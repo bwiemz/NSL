@@ -108,7 +108,7 @@ impl Compiler<'_> {
         // better patterns first; skipped under --layerwise-accum
         // (the CSLA range partition is positional over this tape —
         // v1 defers, see ew_chain_fusion module docs).
-        if !self.compile_options.layerwise_accum {
+        if !self.compile_options.train.layerwise_accum {
             let ew_stats = crate::ew_chain_fusion::run_backward_ew_fusion(
                 &mut adjoint.ops,
                 &adjoint_needed,

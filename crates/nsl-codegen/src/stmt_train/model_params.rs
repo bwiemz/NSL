@@ -529,7 +529,7 @@ impl Compiler<'_> {
                     }
                     None => {}
                 }
-                if self.compile_options.optim_state_offload {
+                if self.compile_options.train.optim_state_offload {
                     return Err(CodegenError::new(
                         "--param-dtype bf16-sr does not compose with \
                          --optim-state-offload (m/v must be plain device f32 \
@@ -578,7 +578,7 @@ impl Compiler<'_> {
                          flag or switch to Muon",
                     ));
                 }
-                if !self.compile_options.layerwise_accum {
+                if !self.compile_options.train.layerwise_accum {
                     return Err(CodegenError::new(
                         "--muon-state-dtype bf16 requires --layerwise-accum: \
                          the dequant->step->SR-quant envelope lives in the \
@@ -593,7 +593,7 @@ impl Compiler<'_> {
                          the envelope). Drop one of the flags",
                     ));
                 }
-                if self.compile_options.optim_state_offload {
+                if self.compile_options.train.optim_state_offload {
                     return Err(CodegenError::new(
                         "--muon-state-dtype bf16 does not compose with \
                          --optim-state-offload (host-resident momentum would \
