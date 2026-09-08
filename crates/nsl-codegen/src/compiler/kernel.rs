@@ -985,7 +985,7 @@ impl Compiler<'_> {
         // P1.7 --training-reference: ignore @checkpoint decorators so the
         // flash-attention kernels are not staged for recompute (keeps the
         // reference path free of the checkpoint-preset forward staging).
-        let checkpoint_full_active = !self.compile_options.training_reference
+        let checkpoint_full_active = !self.compile_options.diagnostics.training_reference
             && self
                 .compile_options
                 .checkpoint.policies

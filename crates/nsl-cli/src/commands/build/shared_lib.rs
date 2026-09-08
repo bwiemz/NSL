@@ -45,14 +45,14 @@ fn run_build_shared_single(
     // with decorators but without --source-ad.
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs =
-        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
-    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
-    options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
-    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
+    options.wrga.inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga.check));
+    options.analysis.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.analysis.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
+    options.analysis.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the shared-library path.
-    options.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
+    options.analysis.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
     // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
     // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
     // can stamp the prologue + emit a PrologueRecompute marker.
@@ -79,7 +79,7 @@ fn run_build_shared_single(
         Err(e) => crate::pipeline::exit_on_codegen_error(&source_map, &e, None),
     };
 
-    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga_check);
+    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga.check);
 
     let stem = file
         .file_stem()
@@ -393,17 +393,17 @@ fn run_build_shared_multi(
                 }
             }
             let mut entry_options = options.clone();
-            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
+            entry_options.wrga.inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
                 mod_data,
-                &entry_options.wrga_check,
+                &entry_options.wrga.check,
             ));
-            entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
-            entry_options.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
-            entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
+            entry_options.analysis.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
+            entry_options.analysis.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
+            entry_options.analysis.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             // Sprint 2 (paper §6.2): forward entry-module @csha decorator
             // configs so per-model disable/level/target overrides take
             // effect on the multi-file shared-lib path.
-            entry_options.csha_configs = crate::pipeline::module_data_to_csha_configs(mod_data);
+            entry_options.analysis.csha_configs = crate::pipeline::module_data_to_csha_configs(mod_data);
             // Cycle-10 §5.3 Task 6: forward @checkpoint(policy=...) policies
             // from the entry module's semantic analysis into CompileOptions.
             entry_options.checkpoint.policies =
@@ -486,7 +486,7 @@ fn run_build_shared_multi(
         obj_files.push(obj_path);
     }
 
-    emit_wrga_report(&entry_wrga_plan, wrga_report, &options.wrga_check);
+    emit_wrga_report(&entry_wrga_plan, wrga_report, &options.wrga.check);
 
     let lib_path = if let Some(out) = output {
         out

@@ -488,25 +488,26 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
                 // Milestone A: an unparseable budget must refuse, not
                 // silently become "no budget" — the flag is a guard rail.
-                vram_budget: match vram_budget.as_deref() {
-                    None => None,
-                    Some(s) => match nsl_codegen::memory_planner::parse_vram_budget(s) {
-                        Some(b) => Some(b),
-                        None => {
-                            nsl_runtime::nsl_log!(ERROR, "cli", 
-                                "error: --vram-budget '{s}' is not a size; \
-                                 accepted forms: <n>GB/<n>GiB/<n>MB/<n>MiB/\
-                                 <n>KB/<n>KiB/<n>B (1024-based)"
-                            );
-                            process::exit(1);
-                        }
+                memory: nsl_codegen::MemoryOptions {
+                    vram_budget: match vram_budget.as_deref() {
+                        None => None,
+                        Some(s) => match nsl_codegen::memory_planner::parse_vram_budget(s) {
+                            Some(b) => Some(b),
+                            None => {
+                                nsl_runtime::nsl_log!(ERROR, "cli", 
+                                    "error: --vram-budget '{s}' is not a size; \
+                                     accepted forms: <n>GB/<n>GiB/<n>MB/<n>MiB/\
+                                     <n>KB/<n>KiB/<n>B (1024-based)"
+                                );
+                                process::exit(1);
+                            }
+                        },
                     },
+                    report: memory_report,
+                    transient_arena,
                 },
-                memory_report,
                 target,
                 source_ad: _source_ad,
-                trace_ops: false,
-                nan_analysis,
                 deterministic: _deterministic,
                 rng_seed: seed,
                 // M52: When --standalone, weights are handled by standalone pipeline;
@@ -545,7 +546,13 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     weights_path: zk_weights.clone(),
                 },
                 linear_types_enabled: linear_types,
-                ownership_info: std::collections::HashMap::new(), // populated by loader
+                // Semantic-analysis facts: all empty here. The loader fills
+                // `ownership_info`; the six build-path entry points
+                // (run_build_shared_single, run_build_shared_multi,
+                // run_build_zk, run_build_standalone, run_build_single,
+                // run_build_multi) overwrite the decorator configs from
+                // semantic analysis via pipeline::{analysis,module_data}_to_*.
+                analysis: nsl_codegen::AnalysisOptions::default(),
                 zero: nsl_codegen::ZeroOptions {
                     stage: zero_stage.map(|s| s as u8),
                     elementwise: zero_elementwise,
@@ -594,10 +601,13 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                         }
                     },
                 },
-                debug_training,
-                grad_integrity,
-                training_reference,
-                transient_arena,
+                diagnostics: nsl_codegen::DiagnosticsOptions {
+                    debug_training,
+                    grad_integrity,
+                    training_reference,
+                    trace_ops: false,
+                    nan_analysis,
+                },
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
                 // come from `collect_models` directly.
@@ -611,11 +621,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     .unwrap_or_default(),
                 shared_lib,
                 emit_export_table: shared_lib,
-                wrga_inputs: None,
-                fused_ce_configs: Vec::new(),
-                fused_kl_ce_configs: Vec::new(),
-                pca_user_strategies: Vec::new(),
-                wrga_fold_allocations,
                 wggo: nsl_codegen::WggoOptions {
                     mode: wggo.clone(),
                     report: wggo_report,
@@ -638,12 +643,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     mode: csha.clone(),
                     report: csha_report,
                 },
-                // CSHA Sprint 2: default to empty here; the six build-path
-                // entry points (run_build_shared_single, run_build_shared_multi,
-                // run_build_zk, run_build_standalone, run_build_single,
-                // run_build_multi) overwrite this from semantic analysis via
-                // pipeline::{analysis,module_data}_to_csha_configs.
-                csha_configs: std::collections::HashMap::new(),
                 cpdt: nsl_codegen::CpdtOptions {
                     mode: cpdt_mode,
                     cluster: cpdt_cluster.clone(),
@@ -651,10 +650,15 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     moe_roofline_slack: 0.0,
                     plan_out: cpdt_plan_out.clone(),
                 },
-                // Normal `nsl build` never sets WRGA check-mode overrides;
-                // `nsl check --wrga-analyze | --wrga-compare` builds its own
-                // CompileOptions with a populated `wrga_check` (wrga_check.rs).
-                wrga_check: nsl_codegen::WrgaCheckContext::default(),
+                wrga: nsl_codegen::WrgaOptions {
+                    // Filled by the build paths from semantic analysis.
+                    inputs: None,
+                    fold_allocations: wrga_fold_allocations,
+                    // Normal `nsl build` never sets WRGA check-mode overrides;
+                    // `nsl check --wrga-analyze | --wrga-compare` builds its own
+                    // CompileOptions with a populated `wrga.check` (wrga_check.rs).
+                    check: nsl_codegen::WrgaCheckContext::default(),
+                },
                 export_functions_out: None,
                 calibration: nsl_codegen::CalibrationOptions {
                     data: calibration_data.clone(),
@@ -682,7 +686,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated
-            // in codegen on compile_opts.training_reference).
+            // in codegen on compile_opts.diagnostics.training_reference).
             crate::meta_flags::apply_training_reference(&mut compile_opts);
 
             // Validate WGGO mode string early so users get a clear error

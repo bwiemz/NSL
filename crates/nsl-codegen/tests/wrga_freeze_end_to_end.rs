@@ -56,13 +56,16 @@ fn compile_with(opts: CompileOptions) -> Option<WrgaPlan> {
 fn freeze_eliminates_frozen_param_from_backward_live() {
     let opts = CompileOptions {
         source_ad: true,
-        wrga_inputs: Some(WrgaInputs {
-            freeze: vec![FreezeDecoratorConfig {
-                include: vec!["m.w".into()],
-                exclude: vec![],
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                freeze: vec![FreezeDecoratorConfig {
+                    include: vec!["m.w".into()],
+                    exclude: vec![],
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         ..Default::default()
     };
     let plan = compile_with(opts).expect("wrga::run must fire for @train");
@@ -121,7 +124,10 @@ fn main():
 "#;
 
     let opts = nsl_codegen::CompileOptions {
-        wrga_inputs: Some(nsl_codegen::WrgaInputs::default()),
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(nsl_codegen::WrgaInputs::default()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut interner = nsl_lexer::Interner::new();
@@ -180,7 +186,10 @@ fn main():
 "#;
 
     let opts = nsl_codegen::CompileOptions {
-        wrga_inputs: Some(nsl_codegen::WrgaInputs::default()),
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(nsl_codegen::WrgaInputs::default()),
+            ..Default::default()
+        },
         source_ad: true,
         ..Default::default()
     };

@@ -440,12 +440,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // Clamp like `nsl build` (build/options.rs) — `--devices 0` must not
                 // produce world_size=0 (WGGO ZeRO/TP math assumes >= 1 rank).
                 world_size: (devices as usize).max(1),
-                vram_budget: None,
-                memory_report: false,
+                memory: nsl_codegen::MemoryOptions {
+                    vram_budget: None,
+                    report: false,
+                    transient_arena,
+                },
                 target,
                 source_ad,
-                trace_ops,
-                nan_analysis: false,
                 deterministic,
                 rng_seed: seed,
                 // CPDT: pass through the four-case-resolved weight file so the
@@ -470,7 +471,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // M55: ZK flags not exposed on `run`; use defaults.
                 zk: nsl_codegen::ZkOptions::default(),
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
-                ownership_info: std::collections::HashMap::new(),
+                // Semantic-analysis facts: all empty here. `run_build_inner` /
+                // `run_run` route through `run_build_single` (build.rs) which
+                // overwrites them from semantic analysis via
+                // pipeline::analysis_to_*.
+                analysis: nsl_codegen::AnalysisOptions::default(),
                 zero: nsl_codegen::ZeroOptions {
                     stage: zero_stage.map(|s| s as u8),
                     elementwise: zero_elementwise,
@@ -519,10 +524,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         }
                     },
                 },
-                debug_training,
-                grad_integrity,
-                training_reference,
-                transient_arena,
+                diagnostics: nsl_codegen::DiagnosticsOptions {
+                    debug_training,
+                    grad_integrity,
+                    training_reference,
+                    trace_ops,
+                    nan_analysis: false,
+                },
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
                 // come from `collect_models` directly.
@@ -536,11 +544,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     .unwrap_or_default(),
                 shared_lib: false,
                 emit_export_table: false,
-                wrga_inputs: None,
-                fused_ce_configs: Vec::new(),
-                fused_kl_ce_configs: Vec::new(),
-                pca_user_strategies: Vec::new(),
-                wrga_fold_allocations: false,
                 // S3: thread the `--wggo*` surface through so the WGGO
                 // mode-table dispatch reaches `emit_unified_optim_step_dispatch`
                 // via `nsl run` (previously hardcoded to defaults, which
@@ -590,11 +593,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     mode: csha.clone(),
                     report: csha_report,
                 },
-                // CSHA Sprint 2: default to empty here; `run_build_inner` /
-                // `run_run` route through `run_build_single` (build.rs) which
-                // overwrites this from semantic analysis via
-                // pipeline::analysis_to_csha_configs.
-                csha_configs: std::collections::HashMap::new(),
                 // Cycle-10 §5.3 Task 6: default to empty here; overwritten
                 // downstream in `run_build_single` via
                 // pipeline::analysis_to_checkpoint_policies. Empty = byte-identity.
@@ -611,8 +609,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     moe_roofline_slack: 0.0,
                     plan_out: cpdt_plan_out.clone(),
                 },
-                // `nsl run` never sets WRGA check-mode overrides.
-                wrga_check: nsl_codegen::WrgaCheckContext::default(),
+                // `nsl run` never drives WRGA: no forwarded decorator configs,
+                // no allocation folding, no check-mode overrides.
+                wrga: nsl_codegen::WrgaOptions::default(),
                 export_functions_out: None,
                 // `nsl run` never drives calibration: no data path, no
                 // compile bundle, no retention plans (the defaults).
@@ -620,7 +619,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated
-            // in codegen on compile_opts.training_reference).
+            // in codegen on compile_opts.diagnostics.training_reference).
             crate::meta_flags::apply_training_reference(&mut compile_opts);
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

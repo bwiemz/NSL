@@ -353,7 +353,7 @@ impl FusionState {
             events: Vec::new(),
             barriers: Vec::new(),
             report_enabled: options.fusion.report,
-            disabled: options.fusion.disabled || options.debug_training,
+            disabled: options.fusion.disabled || options.diagnostics.debug_training,
             fused_fns: std::collections::HashMap::new(),
         }
     }
@@ -630,7 +630,7 @@ impl FeatureConfigs {
             export_wrappers: Vec::new(),
             quant_configs: HashMap::new(),
             linear_types_enabled: options.linear_types_enabled,
-            ownership_info: options.ownership_info.clone(),
+            ownership_info: options.analysis.ownership_info.clone(),
             vmap_configs: HashMap::new(),
             source_ad_enabled: options.source_ad,
             packing_supported_in_module: false,
@@ -920,7 +920,7 @@ pub struct Compiler<'a> {
 
     // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
     /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
-    /// from `CompileOptions.fused_ce_configs`.  Empty when no decorator
+    /// from `CompileOptions.analysis.fused_ce_configs`.  Empty when no decorator
     /// is present.  CFTP v10 (item 3) allows multiple entries — one per
     /// decorated `train` block, each tagged with its
     /// `train_block_stmt_id`.  Codegen looks up the right entry via
@@ -1289,12 +1289,12 @@ impl<'a> Compiler<'a> {
             dropout_fwd_out: HashMap::new(),
             fused_kl_ce_fwd_saves: HashMap::new(),
             fused_kl_ce_bwd_cache: HashMap::new(),
-            wrga_inputs: options.wrga_inputs.clone(),
+            wrga_inputs: options.wrga.inputs.clone(),
             cfie_decorator_mode: None,
             fase_decorator: None,
             cfie_decorator_target: None,
-            fused_ce_configs: options.fused_ce_configs.clone(),
-            fused_kl_ce_configs: options.fused_kl_ce_configs.clone(),
+            fused_ce_configs: options.analysis.fused_ce_configs.clone(),
+            fused_kl_ce_configs: options.analysis.fused_kl_ce_configs.clone(),
             active_fused_ce_config: None,
             lm_head_loader_scan: crate::lm_head_inference::LoaderScan::Unproven(
                 "the compilation unit was never scanned for its DataLoader shape"
@@ -1303,7 +1303,7 @@ impl<'a> Compiler<'a> {
             arena_placements: HashMap::new(),
             packing_meta_vars: None,
             active_distill_context: None,
-            pca_user_strategies: options.pca_user_strategies.clone(),
+            pca_user_strategies: options.analysis.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
             cpdt_cluster: options.cpdt.cluster.clone(),
             cpdt_report_requested: options.cpdt.report_requested,
@@ -1378,7 +1378,7 @@ impl<'a> Compiler<'a> {
         // config, so the substitution never fires and the composite
         // cross-entropy path runs — an independent baseline for the fused-CE
         // numerics.
-        self.active_fused_ce_config = if self.compile_options.training_reference {
+        self.active_fused_ce_config = if self.compile_options.diagnostics.training_reference {
             None
         } else {
             self.fused_ce_configs
@@ -1411,7 +1411,7 @@ impl<'a> Compiler<'a> {
         if !self.compile_options.lm_head_fusion.is_on() {
             return None;
         }
-        if self.compile_options.training_reference {
+        if self.compile_options.diagnostics.training_reference {
             return None;
         }
         if self

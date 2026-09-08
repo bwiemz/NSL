@@ -104,14 +104,14 @@ fn run_build_single(
 
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
-    options.wrga_inputs =
-        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
-    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
-    options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
-    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
+    options.wrga.inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga.check));
+    options.analysis.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.analysis.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
+    options.analysis.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the multi-module path.
-    options.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
+    options.analysis.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
     // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
     // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
     // can stamp the prologue + emit a PrologueRecompute marker.
@@ -133,7 +133,7 @@ fn run_build_single(
     let options = &options;
 
     // M45: Run compile-time NaN risk analysis before codegen if --nan-analysis is set.
-    if options.nan_analysis {
+    if options.diagnostics.nan_analysis {
         let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
         analyzer.analyze_module(&parse_result.module, &interner);
         if analyzer.diagnostics.is_empty() {
@@ -168,7 +168,7 @@ fn run_build_single(
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
     // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
-    capture_wrga_plan(&wrga_plan, &options.wrga_check);
+    capture_wrga_plan(&wrga_plan, &options.wrga.check);
     if let Some(report_path) = wrga_report {
         match &wrga_plan {
             Some(p) => {
@@ -270,7 +270,7 @@ fn run_build_multi(
     // warnings the user cannot act on and bleeds module-level value
     // constraints across modules (NanAnalyzer saves/restores state per fn
     // body, not per module).
-    if options.nan_analysis {
+    if options.diagnostics.nan_analysis {
         let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
         analyzer.analyze_module(&graph.modules[&graph.entry].ast, &interner);
         if analyzer.diagnostics.is_empty() {
@@ -431,17 +431,17 @@ fn run_build_multi(
                 }
             }
             let mut entry_options = options.clone();
-            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
+            entry_options.wrga.inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
                 mod_data,
-                &entry_options.wrga_check,
+                &entry_options.wrga.check,
             ));
-            entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
-            entry_options.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
-            entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
+            entry_options.analysis.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
+            entry_options.analysis.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
+            entry_options.analysis.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             // Sprint 2 (paper §6.2): forward entry-module @csha decorator
             // configs so per-model disable/level/target overrides take
             // effect on the multi-file standalone path.
-            entry_options.csha_configs = crate::pipeline::module_data_to_csha_configs(mod_data);
+            entry_options.analysis.csha_configs = crate::pipeline::module_data_to_csha_configs(mod_data);
             // Cycle-10 §5.3 Task 6: forward @checkpoint(policy=...) policies
             // from the entry module's semantic analysis into CompileOptions.
             entry_options.checkpoint.policies =
@@ -633,7 +633,7 @@ fn run_build_multi(
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
     // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
-    capture_wrga_plan(&entry_wrga_plan, &options.wrga_check);
+    capture_wrga_plan(&entry_wrga_plan, &options.wrga.check);
     if let Some(report_path) = wrga_report {
         match &entry_wrga_plan {
             Some(p) => {

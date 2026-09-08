@@ -168,7 +168,10 @@ fn lower_to_function(hint: Option<FusedCeDtypeHint>) -> Function {
     let interner = Interner::new();
     let type_map: TypeMap = HashMap::new();
     let opts = CompileOptions {
-        fused_ce_configs: vec![cfg_for_dtype_hint(hint)],
+        analysis: nsl_codegen::AnalysisOptions {
+            fused_ce_configs: vec![cfg_for_dtype_hint(hint)],
+            ..Default::default()
+        },
         ..CompileOptions::default()
     };
 
@@ -300,7 +303,10 @@ fn lower_and_resolve(
     let interner = Interner::new();
     let type_map: TypeMap = HashMap::new();
     let opts = CompileOptions {
-        fused_ce_configs: vec![cfg_for_dtype_hint(hint)],
+        analysis: nsl_codegen::AnalysisOptions {
+            fused_ce_configs: vec![cfg_for_dtype_hint(hint)],
+            ..Default::default()
+        },
         ..CompileOptions::default()
     };
 
@@ -641,7 +647,10 @@ fn lower_with_backward_and_resolve(
     let interner = Interner::new();
     let type_map: TypeMap = HashMap::new();
     let opts = CompileOptions {
-        fused_ce_configs: vec![cfg_for_dtype_hint(hint)],
+        analysis: nsl_codegen::AnalysisOptions {
+            fused_ce_configs: vec![cfg_for_dtype_hint(hint)],
+            ..Default::default()
+        },
         ..CompileOptions::default()
     };
 

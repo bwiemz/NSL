@@ -16,7 +16,7 @@
 //!
 //! Live regression gate. Test A uses `@csha(disable=true)` as an observable
 //! decorator effect. The codegen-side hook in `nsl-codegen/src/stmt.rs` reads
-//! `compile_options.csha_configs[model_type_name]` and, when `disabled=true`,
+//! `compile_options.analysis.csha_configs[model_type_name]` and, when `disabled=true`,
 //! skips the CSHA planner entirely. The CSHA planner emits a `[csha]` summary
 //! to stderr on every run AND a full "CSHA Compilation Report" when
 //! `--csha-report` is set. So:

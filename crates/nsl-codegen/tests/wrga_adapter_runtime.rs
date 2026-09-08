@@ -25,15 +25,18 @@ fn main():
 #[test]
 fn adapter_inject_emits_lora_a_b_fields_with_expected_shapes() {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            adapter: vec![AdapterDecoratorConfig {
-                kind: AdapterKind::Lora,
-                targets: vec!["m.w".into()],
-                rank: Some(4),
-                alpha: Some(4),
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                adapter: vec![AdapterDecoratorConfig {
+                    kind: AdapterKind::Lora,
+                    targets: vec!["m.w".into()],
+                    rank: Some(4),
+                    alpha: Some(4),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         ..Default::default()
     };
@@ -152,15 +155,18 @@ fn main():
 #[test]
 fn lora_constructor_allocates_a_and_b_with_expected_shapes() {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            adapter: vec![AdapterDecoratorConfig {
-                kind: AdapterKind::Lora,
-                targets: vec!["m.w".into()],
-                rank: Some(2),
-                alpha: Some(2),
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                adapter: vec![AdapterDecoratorConfig {
+                    kind: AdapterKind::Lora,
+                    targets: vec!["m.w".into()],
+                    rank: Some(2),
+                    alpha: Some(2),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         ..Default::default()
     };
@@ -182,15 +188,18 @@ fn lora_constructor_allocates_a_and_b_with_expected_shapes() {
 #[test]
 fn ia3_constructor_emits_scale_field() {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            adapter: vec![AdapterDecoratorConfig {
-                kind: AdapterKind::Ia3,
-                targets: vec!["m.w".into()],
-                rank: None,
-                alpha: None,
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                adapter: vec![AdapterDecoratorConfig {
+                    kind: AdapterKind::Ia3,
+                    targets: vec!["m.w".into()],
+                    rank: None,
+                    alpha: None,
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         ..Default::default()
     };
@@ -219,15 +228,18 @@ fn ia3_constructor_emits_scale_field() {
 #[test]
 fn task_2_5_lora_init_emits_cleanly() {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            adapter: vec![AdapterDecoratorConfig {
-                kind: AdapterKind::Lora,
-                targets: vec!["m.w".into()],
-                rank: Some(4),
-                alpha: Some(4),
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                adapter: vec![AdapterDecoratorConfig {
+                    kind: AdapterKind::Lora,
+                    targets: vec!["m.w".into()],
+                    rank: Some(4),
+                    alpha: Some(4),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         ..Default::default()
     };
@@ -246,15 +258,18 @@ fn task_2_5_lora_init_emits_cleanly() {
 #[test]
 fn task_2_5_ia3_init_emits_cleanly() {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            adapter: vec![AdapterDecoratorConfig {
-                kind: AdapterKind::Ia3,
-                targets: vec!["m.w".into()],
-                rank: None,
-                alpha: None,
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                adapter: vec![AdapterDecoratorConfig {
+                    kind: AdapterKind::Ia3,
+                    targets: vec!["m.w".into()],
+                    rank: None,
+                    alpha: None,
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         ..Default::default()
     };
@@ -272,15 +287,18 @@ fn task_2_5_ia3_init_emits_cleanly() {
 #[test]
 fn task_2_5_gatedlora_init_emits_cleanly() {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            adapter: vec![AdapterDecoratorConfig {
-                kind: AdapterKind::GatedLora,
-                targets: vec!["m.w".into()],
-                rank: Some(4),
-                alpha: Some(4),
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                adapter: vec![AdapterDecoratorConfig {
+                    kind: AdapterKind::GatedLora,
+                    targets: vec!["m.w".into()],
+                    rank: Some(4),
+                    alpha: Some(4),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         ..Default::default()
     };
@@ -302,15 +320,18 @@ fn task_2_5_gatedlora_init_emits_cleanly() {
 #[test]
 fn gatedlora_constructor_emits_a_b_and_gate() {
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            adapter: vec![AdapterDecoratorConfig {
-                kind: AdapterKind::GatedLora,
-                targets: vec!["m.w".into()],
-                rank: Some(2),
-                alpha: Some(2),
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                adapter: vec![AdapterDecoratorConfig {
+                    kind: AdapterKind::GatedLora,
+                    targets: vec!["m.w".into()],
+                    rank: Some(2),
+                    alpha: Some(2),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         ..Default::default()
     };
@@ -352,15 +373,18 @@ fn main():
             let loss = mse_loss(pred, y)
 "#;
     let opts = nsl_codegen::CompileOptions {
-        wrga_inputs: Some(nsl_codegen::WrgaInputs {
-            adapter: vec![nsl_codegen::AdapterDecoratorConfig {
-                kind: nsl_codegen::AdapterKind::Lora,
-                targets: vec!["m.w".into()],
-                rank: Some(2),
-                alpha: Some(2),
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(nsl_codegen::WrgaInputs {
+                adapter: vec![nsl_codegen::AdapterDecoratorConfig {
+                    kind: nsl_codegen::AdapterKind::Lora,
+                    targets: vec!["m.w".into()],
+                    rank: Some(2),
+                    alpha: Some(2),
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         source_ad: true,
         target: "cuda".into(),
         ..Default::default()

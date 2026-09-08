@@ -363,7 +363,7 @@ impl Compiler<'_> {
                 // Kill-switches NSL_FASE_FUSED_STEP=0 / NSL_FASE_MULTI_STEP=0
                 // (compile-time).
                 let multi_scalars = if cpdt_precision_dtypes.is_none()
-                    && !self.compile_options.training_reference
+                    && !self.compile_options.diagnostics.training_reference
                     && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
                     && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
                     // ZeRO 1/2 no longer excludes: the launch below goes

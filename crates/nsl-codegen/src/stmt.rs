@@ -337,7 +337,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // blend needs a layer->function map that AppliedPlan does not carry.
     // P1.7 --training-reference: report no checkpointing in the memory estimate,
     // matching codegen (which ignores @checkpoint decorators in that mode).
-    model.activation_checkpointing = !compiler.compile_options.training_reference
+    model.activation_checkpointing = !compiler.compile_options.diagnostics.training_reference
         && !compiler.compile_options.checkpoint.policies.is_empty();
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
@@ -716,6 +716,7 @@ pub(crate) fn invoke_csha_if_enabled(
     // mode_str / target / disable HERE so the rest of the hook stays uniform.
     let per_model_cfg = compiler
         .compile_options
+        .analysis
         .csha_configs
         .get(model_type_name)
         .cloned();
@@ -6484,7 +6485,7 @@ impl Compiler<'_> {
                     // substitution so the composite KL-CE baseline runs instead
                     // (mirrors the @fused_lm_ce gate on active_fused_ce_config).
                     // The composite distill loss (alpha/temperature) still runs.
-                    if self.compile_options.training_reference {
+                    if self.compile_options.diagnostics.training_reference {
                         None
                     } else {
                         d.fused_kl_ce.clone()
@@ -6497,7 +6498,7 @@ impl Compiler<'_> {
                 None => (None, None, None),
             };
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-                .with_checkpoint_policies(if self.compile_options.training_reference {
+                .with_checkpoint_policies(if self.compile_options.diagnostics.training_reference {
                     Default::default() // P1.7: ignore @checkpoint decorators in the reference path
                 } else {
                     self.compile_options.checkpoint.policies.clone()
@@ -7917,7 +7918,7 @@ impl Compiler<'_> {
                 // tasks; this branch exists so the flag has observable
                 // effect today.
                 if let Some(plan) = &wrga_plan {
-                    if self.compile_options.wrga_fold_allocations {
+                    if self.compile_options.wrga.fold_allocations {
                         let mut transient = crate::memory_planner::LivenessAnalyzer::new();
                         for a in &plan.memory.assignments {
                             transient.record_activation_alloc(a.var, a.size_bytes);
@@ -7937,7 +7938,7 @@ impl Compiler<'_> {
                 // P1.7 --training-reference: ignore @checkpoint decorators so a
                 // decorated program still runs the un-checkpointed reference
                 // path (the --checkpoint-blocks flag is already forced off).
-                let ccr_selective_decorated = !self.compile_options.training_reference
+                let ccr_selective_decorated = !self.compile_options.diagnostics.training_reference
                     && self
                         .compile_options
                         .checkpoint.policies
@@ -8635,8 +8636,8 @@ impl Compiler<'_> {
                 //      gradient transients, the surface the arena exists
                 //      to place.
                 // Symbolic/computed dims stay unsized; nothing is guessed.
-                let arena_place_on = self.compile_options.transient_arena;
-                let arena_report_on = self.compile_options.memory_report
+                let arena_place_on = self.compile_options.memory.transient_arena;
+                let arena_report_on = self.compile_options.memory.report
                     || arena_place_on
                     || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1");
                 let elem_hints: std::collections::HashMap<crate::wengert::VarId, u64> =
@@ -10405,7 +10406,7 @@ impl Compiler<'_> {
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
         // Skip when hook active — grads_list is a null sentinel.
-        if self.compile_options.debug_training && !fase_hook_active {
+        if self.compile_options.diagnostics.debug_training && !fase_hook_active {
             self.compile_call_by_name(
                 builder,
                 "nsl_debug_grad_checksum",
@@ -10417,7 +10418,7 @@ impl Compiler<'_> {
         // scan the materialized grads list once per step. Skipped when the
         // FASE hook is active (grads_list is a null sentinel) — that path is
         // instrumented per-parameter inside the hook (step_begin/note/step_end).
-        if self.compile_options.grad_integrity && !fase_hook_active {
+        if self.compile_options.diagnostics.grad_integrity && !fase_hook_active {
             self.compile_call_by_name(
                 builder,
                 "nsl_grad_integrity_check",
@@ -11175,7 +11176,7 @@ impl Compiler<'_> {
         // Stage-2C canary: verify every red zone after the step's kernels
         // have all run. Runtime-gated by NSL_ARENA_CHECK=1, so one binary
         // serves both the validation runs and production.
-        if self.compile_options.transient_arena {
+        if self.compile_options.memory.transient_arena {
             let step_val = builder.use_var(step_count_var);
             self.compile_call_by_name(builder, "nsl_arena_check_step", &[step_val])?;
         }
@@ -12503,7 +12504,7 @@ impl Compiler<'_> {
         // @checkpoint(policy=...) policies into the extractor. Empty map
         // = byte-identity preserved.
         let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-            .with_checkpoint_policies(if self.compile_options.training_reference {
+            .with_checkpoint_policies(if self.compile_options.diagnostics.training_reference {
                     Default::default() // P1.7: ignore @checkpoint decorators in the reference path
                 } else {
                     self.compile_options.checkpoint.policies.clone()

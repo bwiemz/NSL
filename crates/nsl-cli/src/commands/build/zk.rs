@@ -29,14 +29,14 @@ pub(crate) fn run_build_zk(
     // present without `--source-ad` (mirroring the single/multi build paths).
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs =
-        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
-    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
-    options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
-    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
+    options.wrga.inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga.check));
+    options.analysis.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.analysis.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
+    options.analysis.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the ZK build path.
-    options.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
+    options.analysis.csha_configs = crate::pipeline::analysis_to_csha_configs(&analysis);
     // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
     // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
     // can stamp the prologue + emit a PrologueRecompute marker.
@@ -57,7 +57,7 @@ pub(crate) fn run_build_zk(
         );
 
     // Emit the WRGA report (if requested) before reporting any codegen error.
-    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga_check);
+    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga.check);
 
     let obj_bytes = match bytes_res {
         Ok(bytes) => bytes,

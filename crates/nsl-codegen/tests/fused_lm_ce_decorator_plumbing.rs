@@ -97,10 +97,10 @@ train(model = m, epochs = 5):
     // Compiler constructor that reads the field is exercised by every
     // nsl-codegen lib test that builds an ObjectModule.
     let mut opts = nsl_codegen::CompileOptions::default();
-    opts.fused_ce_configs = cli_bridged;
-    assert_eq!(opts.fused_ce_configs.len(), 1);
-    assert!(opts.fused_ce_configs[0].enabled);
-    assert_eq!(opts.fused_ce_configs[0].vocab_tile, Some(256));
+    opts.analysis.fused_ce_configs = cli_bridged;
+    assert_eq!(opts.analysis.fused_ce_configs.len(), 1);
+    assert!(opts.analysis.fused_ce_configs[0].enabled);
+    assert_eq!(opts.analysis.fused_ce_configs[0].vocab_tile, Some(256));
 }
 
 #[test]
