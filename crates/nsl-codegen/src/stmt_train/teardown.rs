@@ -258,7 +258,7 @@ pub(crate) fn emit_train_teardown(
 
     // P5 item 19: capture/replay counter banner (anti-vacuity evidence
     // for the gates; harmless no-op when the runtime declined to arm).
-    if c.compile_options.cuda_graphs {
+    if c.compile_options.train.cuda_graphs {
         c.compile_call_by_name(builder, "nsl_cuda_graphs_report", &[])?;
     }
 

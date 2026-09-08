@@ -191,7 +191,10 @@ fn write_matching_weights() -> PathBuf {
 fn offload_only_emits_async_copy_back_and_drain() {
     let opts = CompileOptions {
         source_ad: true,
-        optim_state_offload: true,
+        train: nsl_codegen::TrainOptions {
+            optim_state_offload: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let bytes = compile_src(TRAIN_SRC, &opts)
@@ -228,7 +231,10 @@ fn offload_composes_with_cpdt_precision_plan() {
     let plan_slot: Arc<Mutex<Option<nsl_codegen::cpdt::CpdtPlan>>> = Arc::new(Mutex::new(None));
     let opts = CompileOptions {
         source_ad: true,
-        optim_state_offload: true,
+        train: nsl_codegen::TrainOptions {
+            optim_state_offload: true,
+            ..Default::default()
+        },
         weights: nsl_codegen::WeightsOptions { file: Some(weights.clone()), ..Default::default() },
         wggo: nsl_codegen::WggoOptions {
             // CPDT only runs when WGGO produced an AppliedPlan.
