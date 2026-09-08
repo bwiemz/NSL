@@ -677,6 +677,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         carries: "Vec<crate::wggo_prepass::WggoPrePlan>",
         consumers: &[
             "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_train/plan_wggo.rs",
             "crates/nsl-codegen/src/compiler/kernel.rs",
         ],
         empty_means: "the WGGO pre-pass produced no plan, so kernel synthesis \

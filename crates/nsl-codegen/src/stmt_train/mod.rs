@@ -58,6 +58,11 @@
 //!     per-segment early-free plan and the monolithic or segment-streamed
 //!     primal lowering, fed by a [`forward_lowering::ForwardLoweringInputs`]
 //!     and returning the early-free plan and the lowered forward.
+//!   - [`plan_wggo`] — the WGGO planning site of the source-AD arm:
+//!     pre-plan reuse, the planner run, the applied-plan derivation and the
+//!     `WggoOverrides` publication, fed by a
+//!     [`plan_wggo::WggoPlanningInputs`] and returning a
+//!     [`plan_wggo::WggoPlanning`]; pure planning.
 //!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
 //!     source-AD arm: the adjoint lowering with the per-parameter
 //!     accumulate callback and the grad-integrity bracket, fed by a
@@ -104,3 +109,4 @@ pub(crate) mod primal_vars;
 pub(crate) mod source_ad_grads;
 pub(crate) mod teardown;
 pub(crate) mod transient_arena_projection;
+pub(crate) mod plan_wggo;
