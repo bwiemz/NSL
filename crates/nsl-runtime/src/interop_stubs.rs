@@ -5,9 +5,9 @@
 //! clear message if called at runtime.
 
 fn interop_panic() -> ! {
-    eprintln!("error: this NSL program uses interop features (safetensors/HuggingFace/ONNX)");
-    eprintln!("but the runtime was built without the 'interop' feature.");
-    eprintln!("Rebuild with: cargo build -p nsl-runtime --features interop");
+    crate::nsl_log!(ERROR, "interop-stubs", "error: this NSL program uses interop features (safetensors/HuggingFace/ONNX)");
+    crate::nsl_log!(ERROR, "interop-stubs", "but the runtime was built without the 'interop' feature.");
+    crate::nsl_log!(ERROR, "interop-stubs", "Rebuild with: cargo build -p nsl-runtime --features interop");
     std::process::exit(1);
 }
 

@@ -125,8 +125,8 @@ pub fn report_and_reset(label: &str) {
     if total == 0 {
         return;
     }
-    eprintln!("[host-profile] {label}: {:.1} ms attributed", total as f64 / 1e6);
-    eprintln!(
+    crate::nsl_log!(INFO, "host-profile", "[host-profile] {label}: {:.1} ms attributed", total as f64 / 1e6);
+    crate::nsl_log!(INFO, "host-profile", 
         "  {:<14} h2d={:.1} MiB  d2h={:.1} MiB  total={:.1} MiB",
         "pcie",
         h2d as f64 / 1048576.0,
@@ -139,7 +139,7 @@ pub fn report_and_reset(label: &str) {
         .collect();
     rows.sort_by_key(|(_, nanos, _)| std::cmp::Reverse(*nanos));
     for (i, nanos, calls) in rows {
-        eprintln!(
+        crate::nsl_log!(INFO, "host-profile", 
             "  {:<14} {:>9.1} ms  {:>7} calls  {:>8.2} us/call  {:>5.1}%",
             NAMES[i],
             nanos as f64 / 1e6,

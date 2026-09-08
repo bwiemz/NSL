@@ -29,7 +29,7 @@ facade map first, then this, then:
   `fusion_graph.rs` were deleted — `ARCHITECTURE.md` still names the first
   two in its `analysis` row, which is a doc bug, not a hidden module).
 
-Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~19k,
+Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~15k,
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
 `src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
 `tests/` and ~200 modules at the crate root.
@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~8k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~6k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -137,7 +137,16 @@ driver runs it:
    `compile_flash_attention_kernels` (`src/compiler/kernel.rs`).
 6. Adjoint generation (`AdjointGenerator::generate`, `ad_rules::apply_ad_rule`)
    and lowering (`wengert_lower::compile_wengert_ops` /
-   `compile_wengert_ops_range`).
+   `compile_wengert_ops_range`). Under `--layerwise-accum` the adjoint is
+   instead buffered per micro-batch (`src/stmt_train/csla_window.rs`:
+   `emit_csla_window_save`, the `csla_active` arm of that site, which
+   pushes every adjoint-read primal value into the window's slot list and
+   returns the `CslaPending` carrier) and replayed on the accumulation
+   boundary by the CSLA window backward (same file:
+   `emit_csla_window_backward` — the D1b layer-major schedule, per-b
+   seeding, per-range lowering with the fused per-layer update, the
+   weight-stream prefetch belt, the window cleanup; the `CslaPre` /
+   `CslaPending` / `CslaSchedule` carriers live there too).
 7. Optimizer step (`src/stmt_train/optimizer_step.rs`: `emit_optimizer_step`
    — the accumulation gate, the mode-table / FASE-deferred / stdlib step
    arms, the ZeRO reduce and sync, the post-optimizer cleanup), calling the
@@ -603,6 +612,20 @@ refusals that write no artifact), and the WGGO unit test
 `infeasible_budget_is_a_returned_compile_error_not_an_exit` (`src/wggo.rs`)
 pins the site that used to exit. Diagnostic *messages* on stderr are a
 different thing: they are the execution markers (below) and are fine.
+
+**Diagnostics go through `nsl_runtime::nsl_log!`** (roadmap C3; the front
+door and its byte-identical stderr subscriber are described in
+runtime.md, "Logging"). A compile-time warning, note or marker line is
+`nsl_runtime::nsl_log!(LEVEL, "target", "…")` rather than `eprintln!`: the
+`warning:` / `error:` / `note:` lines use target `codegen`, a line that
+starts with its own `[marker]` uses that marker (`autotune`, `ccr`,
+`source-ad`, `wggo`, `cpdt`, `arena`, `weight-stream`, …), and the levels
+follow the runtime's rule (`ERROR` for a lost result, `WARN` for a refusal
+or fallback, `INFO` for reports and traces). The macro reaches `tracing`
+through nsl-runtime's re-export, so nsl-codegen carries no dependency of
+its own. The multi-line report dumps that `eprint!` a pre-rendered string
+(`plan.render_report()`, the linker's tool output) and the dev-tool
+binaries under `src/bin/` are the only raw prints left.
 
 ## Experimental subsystems
 

@@ -87,7 +87,7 @@ pub extern "C" fn nsl_pca_packing_mismatch_check(had_segments: i64) {
         && !SAW_SEGMENTS.load(Ordering::Relaxed)
         && !WARNED.swap(true, Ordering::Relaxed)
     {
-        eprintln!(
+        crate::nsl_log!(WARN, "nsl-pca", 
             "[nsl-pca] packing was declared (segment masking active) but no \
              segment_ids appeared in the first {WARN_AFTER_N_STEPS} steps — the \
              masked kernel is running UNMASKED (identity). Check that your \

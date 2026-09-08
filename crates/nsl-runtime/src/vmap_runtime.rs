@@ -23,7 +23,7 @@ pub extern "C" fn nsl_vmap_check_batch(
     let tensor = crate::tensor::NslTensor::from_ptr_ref(tensor_ptr);
     let dim = batch_dim as usize;
     if dim >= tensor.ndim as usize {
-        eprintln!(
+        crate::nsl_log!(WARN, "vmap-runtime", 
             "vmap: batch_dim {} out of range for tensor with ndim {}",
             dim, tensor.ndim
         );
@@ -32,7 +32,7 @@ pub extern "C" fn nsl_vmap_check_batch(
     let shape = unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) };
     let actual = shape[dim];
     if actual != expected_batch {
-        eprintln!(
+        crate::nsl_log!(WARN, "vmap-runtime", 
             "vmap batch size mismatch: expected {} at dim {}, got {}",
             expected_batch, dim, actual
         );

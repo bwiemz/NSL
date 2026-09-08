@@ -2061,7 +2061,7 @@ pub(crate) fn run_backward_core_strict(
         if debug_dump {
             let t = crate::tensor::NslTensor::from_ptr(*ptr);
             let glen = grad_map.get(&key).map(|g| crate::tensor::NslTensor::from_ptr(*g).len);
-            eprintln!("[tape-dump] param ptr={ptr:#x} tape_id={} len={} -> grad len={:?}", t.tape_id, t.len, glen);
+            crate::nsl_log!(INFO, "tape-dump", "[tape-dump] param ptr={ptr:#x} tape_id={} len={} -> grad len={:?}", t.tape_id, t.len, glen);
         }
         if let Some(grad) = grad_map.remove(&key) {
             crate::list::nsl_list_push(result_list, grad);
@@ -2081,7 +2081,7 @@ pub(crate) fn run_backward_core_strict(
         && zeros_fallbacks == param_ptrs.len()
         && std::env::var("NSL_TAPE_ALLOW_DISCONNECTED").ok().as_deref() != Some("1")
     {
-        eprintln!(
+        crate::nsl_log!(ERROR, "tape-ad", 
             "[tape-ad] FATAL: backward produced a gradient for NONE of the {} parameters — \
              the recorded graph is disconnected from the loss ({} tape ops). Either the loss \
              does not depend on the model, or a forward op skipped tape recording. Training \
@@ -2113,11 +2113,11 @@ pub(crate) fn run_backward_core_strict(
 pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
     let grads = NslList::from_ptr(grads_list);
     let n = num_params as usize;
-    eprintln!("[debug-training] gradient checksums ({} params):", n);
+    crate::nsl_log!(INFO, "debug-training", "[debug-training] gradient checksums ({} params):", n);
     for i in 0..n {
         let grad_ptr = unsafe { *grads.data.add(i) };
         if grad_ptr == 0 {
-            eprintln!("  param[{}]: NULL gradient", i);
+            crate::nsl_log!(WARN, "autodiff", "  param[{}]: NULL gradient", i);
             continue;
         }
         let grad = NslTensor::from_ptr(grad_ptr);
@@ -2170,7 +2170,7 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
         } else {
             "ok"
         };
-        eprintln!(
+        crate::nsl_log!(INFO, "autodiff", 
             "  param[{}]: sum|grad|={:.6e}  sum(grad)={:.9e}  len={}  [{}]",
             i, sum_abs, sum_signed, len, status
         );

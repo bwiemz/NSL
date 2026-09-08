@@ -21,6 +21,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   and `WARN` where the entry point returns) are migrated; the stderr path
   allocates nothing, so the out-of-memory line still prints. New dependency
   `tracing` (std only, with `tracing-core`).
+- Runtime logging, step 3 (roadmap C3): the remaining 387 diagnostic
+  `eprintln!` sites in nsl-runtime go through `nsl_log!` — the `[nsl] …`
+  lines (target `nsl`), the `CFIE: …` refusals (`cfie`), FlashAttention
+  (`flash-attention` / `flash-bwd` / the `csha-dump*` probes), the fused
+  losses (`fused-linear-ce`, `fused-kl-ce`), `cuda`, `tensor`,
+  `huggingface`, `safetensors-io`, `grad-integrity`, `param-plan`, … A line
+  that starts with its own `[marker]` uses that marker as its target.
+  Levels: `ERROR` before an abort/exit or for a lost result (a failed
+  launch, a contract violation), `WARN` for a refusal or fallback, `INFO`
+  for reports and traces. stderr is byte-identical; every line now also
+  reaches the `NSL_EVENTS` stream and a host subscriber. Program output
+  (`print.rs`, the tensor printer, the health JSON) stays on `println!`.
+  No `eprintln!` remains in nsl-runtime. The `NSL_EVENTS` sink opens its
+  file (and reports an unopenable path) outside its `OnceLock`
+  initializer, since the warning now reaches the subscriber, which asks the
+  same sink whether to mirror the line.
+- Runtime logging, step 4 (roadmap C3): nsl-codegen's 371 compile-time
+  diagnostic `eprintln!` sites go through `nsl_runtime::nsl_log!` — target
+  `codegen` for the `warning:` / `error:` / `note:` lines, the subsystem
+  otherwise (`autotune`, `ccr`, `source-ad`, `wggo`, `cpdt`, `arena`,
+  `weight-stream`, `fusion-report`, …; a line that starts with its own
+  `[marker]` uses that marker). stderr is byte-identical. The macro reaches
+  `tracing` through a re-export in `nsl_runtime::log`, so a calling crate
+  needs no dependency of its own. The `eprint!` report dumps and the
+  dev-tool binaries under `src/bin/` keep raw prints. The `nsl` CLI now
+  opts its own process out of the `NSL_EVENTS` stream
+  (`nsl_runtime::events::opt_out_this_process`): the stream belongs to the
+  compiled program (one writer per rank), and a compile-time diagnostic
+  mirrored from the compiler would have added a second `seq` sequence.
+- Runtime logging, step 5 (roadmap C3): nsl-cli's 274 diagnostic
+  `eprintln!` sites go through `nsl_runtime::nsl_log!` as well — target
+  `cli` for the `error:` / `warning:` / `note:` lines (`ERROR` where the
+  command exits or returns failure), `nsl` for the `nsl: …` and `[nsl] …`
+  launcher lines, `zk` / `tokenize` / `autotune` / `inspect` for the
+  marker-prefixed ones. stderr is byte-identical; stdout output
+  (`println!`) and the `eprint!` report dumps are untouched. With this,
+  every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
 
@@ -79,6 +116,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the CSLA window
+  save phase — the `csla_active` arm of the adjoint-lowering site: the
+  side-channel refusals, the per-micro-batch slot push of every
+  adjoint-read primal value (plus the LSE / fused-CE tape-carries) and the
+  pending carrier — moved into `stmt_train/csla_window.rs`
+  (`emit_csla_window_save`, fed by a `CslaSaveInputs`, returning the three
+  window carriers as a `CslaWindowSave`), together with the `CslaPre`
+  carrier; `ParamHookEntry` moves from the driver's local scope to
+  `stmt.rs` module scope. 347 lines out of the driver; the train-block
+  CLIF snapshots are unchanged.
+- `compile_train_block_inner` peel continued (roadmap A1): section 7e3b,
+  the CSLA (`--layerwise-accum`) window backward — the D1b layer-major
+  schedule replay, per-micro-batch seeding, per-range lowering with the
+  fused per-layer update, the weight-stream prefetch belt and the window
+  cleanup — moved byte-for-byte into `stmt_train/csla_window.rs`
+  (`emit_csla_window_backward`, fed by a `CslaWindowInputs`), together
+  with the `CslaPending` / `CslaSchedule` / `CslaParam` / `CslaSlotKind`
+  carriers that were local to the driver. 1,527 lines out of the driver,
+  no escaping binding; the train-block CLIF snapshots are unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): sections 7e4–7g,
   the optimizer step — the accumulation gate, the mode-table / FASE-deferred
   / stdlib step arms, the ZeRO reduce and param sync, the post-optimizer

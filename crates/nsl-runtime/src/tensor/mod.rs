@@ -115,7 +115,7 @@ pub extern "C" fn nsl_fbip_report() {
     let total = reuse + alloc;
     if total > 0 {
         let pct = (reuse as f64 / total as f64) * 100.0;
-        eprintln!("FBIP: {reuse}/{total} operations reused in-place ({pct:.1}%)");
+        crate::nsl_log!(INFO, "tensor", "FBIP: {reuse}/{total} operations reused in-place ({pct:.1}%)");
     }
 }
 
@@ -248,7 +248,7 @@ fn bad_handle(ptr: i64, why: BadHandle) -> ! {
     };
     crate::nsl_log!(WARN, "nsl", "nsl: invalid tensor handle 0x{ptr:X}: {what}");
     if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| v != "0") {
-        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        crate::nsl_log!(ERROR, "tensor", "{}", std::backtrace::Backtrace::force_capture());
     }
     let _ = std::io::stderr().flush();
     std::process::abort();
@@ -607,7 +607,7 @@ impl NslTensor {
         let ptr = Box::into_raw(tensor) as i64;
         if tensor_trace_on() {
             let t = NslTensor::from_ptr(ptr);
-            eprintln!(
+            crate::nsl_log!(INFO, "tensor-trace", 
                 "[tensor-trace] new t={:#x} data={:p} len={} ndim={} dev={} owner={:#x}",
                 ptr, t.data, t.len, t.ndim, t.device, t.data_owner
             );
@@ -1370,7 +1370,7 @@ pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let prev = tensor.refcount.fetch_add(1, Ordering::SeqCst);
     if tensor_trace_on() {
-        eprintln!(
+        crate::nsl_log!(INFO, "tensor-trace", 
             "[tensor-trace] retain t={:#x} data={:p} rc_pre={}",
             tensor_ptr, tensor.data, prev
         );
@@ -1384,7 +1384,7 @@ pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let prev = tensor.refcount.fetch_sub(1, Ordering::SeqCst);
     if tensor_trace_on() {
-        eprintln!(
+        crate::nsl_log!(INFO, "tensor-trace", 
             "[tensor-trace] release t={:#x} data={:p} rc_pre={}",
             tensor_ptr, tensor.data, prev
         );
@@ -1422,7 +1422,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data, data_owner, slab_managed) = {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor_trace_on() {
-            eprintln!(
+            crate::nsl_log!(INFO, "tensor-trace", 
                 "[tensor-trace] free t={:#x} data={:p} rc_pre={} dev={}",
                 tensor_ptr,
                 tensor.data,
@@ -1458,7 +1458,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                 let owner = NslTensor::from_ptr(data_owner);
                 let owner_prev = owner.refcount.fetch_sub(1, Ordering::SeqCst);
                 if tensor_trace_on() {
-                    eprintln!(
+                    crate::nsl_log!(INFO, "tensor-trace", 
                         "[tensor-trace] deref-owner t={data_owner:#x} data={:p} rc_pre={owner_prev}",
                         owner.data
                     );
@@ -1903,7 +1903,7 @@ pub(crate) fn alloc_host_state_buffer(bytes: usize) -> *mut u8 {
                 // aborting a multi-GB run. Warn once per process.
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
-                    eprintln!(
+                    crate::nsl_log!(WARN, "offload", 
                         "[offload] cuMemAllocHost failed for a {} MB state buffer — \
                          falling back to PAGEABLE host memory (sync copy-back). \
                          Raise the process page-lock limit (ulimit -l) to restore \
@@ -1993,7 +1993,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
                 let dims: Vec<i64> = (0..src_probe.ndim as usize)
                     .map(|i| unsafe { *src_probe.shape.add(i) })
                     .collect();
-                eprintln!(
+                crate::nsl_log!(INFO, "nsl", 
                     "[nsl] add_inplace: reconciling src (device {} -> {}, dtype {} -> {}, \
                      contiguous={}, shape={dims:?}) — repeated reconciliation is a perf \
                      smell (CPU-lowered producer on a GPU run?)",
@@ -2095,7 +2095,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
             .map(|i| unsafe { *t.shape.add(i) }.to_string())
             .collect::<Vec<_>>()
             .join("x");
-        eprintln!(
+        crate::nsl_log!(WARN, "align-debug", 
             "[align-debug] add_inplace mismatch: dst dev={} dtype={} shape={} | src dev={} dtype={} shape={} contig={}",
             dst.device, dst.dtype, shp(dst), src.device, src.dtype, shp(src), src.is_contiguous()
         );
@@ -2444,7 +2444,7 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
             unsafe { *staging.add(i) = 1.0f32; }
         }
         if byte_size == 12_582_912 {
-            eprintln!(
+            crate::nsl_log!(INFO, "nsl", 
                 "[nsl] memcpy_htod@ones_like shape={:?} device={} dst_ptr={:?} src_ptr={:?}",
                 get_shape_vec(result_t),
                 result_t.device,
@@ -2704,7 +2704,7 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
+                crate::nsl_log!(WARN, "nsl", 
                     "[nsl] warning: clip_grad_norm received a NON-CONTIGUOUS gradient \
                      (slot {g}, ndim {}); the host write-back is stride-blind and would \
                      scale the wrong elements of the shared buffer. Skipping this \
@@ -4214,7 +4214,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                     std::slice::from_raw_parts(transfer_src.shape, transfer_src.ndim as usize)
                 }
                 .to_vec();
-                eprintln!(
+                crate::nsl_log!(INFO, "nsl", 
                     "[nsl] to_device HtoD 12582912 bytes: shape={:?} dtype={} source_device={} contiguous_src={} target_device={} owns_data={} data_owner={} data_ptr={:?}",
                     shape,
                     transfer_src.dtype,
@@ -4503,7 +4503,7 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
             if t.device as i64 == device { continue; }
             let new_ptr = nsl_tensor_to_device(field_val, device);
             if new_ptr == 0 {
-                eprintln!("[nsl] WARNING: failed to transfer tensor field {} to device {}", i, device);
+                crate::nsl_log!(WARN, "nsl", "[nsl] WARNING: failed to transfer tensor field {} to device {}", i, device);
                 continue;
             }
             unsafe { *field_addr = new_ptr; }
@@ -4520,7 +4520,7 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
         unsafe {
             let result = cudarc::driver::sys::cuCtxSynchronize();
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("[nsl] WARNING: CUDA error after model transfer to device {}: {:?}",
+                crate::nsl_log!(WARN, "nsl", "[nsl] WARNING: CUDA error after model transfer to device {}: {:?}",
                     device, result);
             }
         }
@@ -6290,7 +6290,7 @@ pub extern "C" fn nsl_debug_train_step(
     let n_grads = crate::list::nsl_list_len(grads_list);
     if step != 0 { return; } // only print on first step
 
-    eprintln!("[debug] step={} params={} grads={}", step, n_params, n_grads);
+    crate::nsl_log!(INFO, "debug", "[debug] step={} params={} grads={}", step, n_params, n_grads);
 
     let show = n_params.min(n_grads);
     for i in 0..show {
@@ -6307,7 +6307,7 @@ pub extern "C" fn nsl_debug_train_step(
         let p_len = p.len;
         let g_len = g.len;
 
-        eprintln!(
+        crate::nsl_log!(INFO, "tensor", 
             "  [{}] param: len={} dev={} norm={:.6}  grad: len={} dev={} norm={:.6}",
             i, p_len, p_device, p_norm, g_len, g_device, g_norm,
         );
@@ -6532,7 +6532,7 @@ pub extern "C" fn nsl_gpu_drain_cache() {
             let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
             let freed = alloc.drain_all();
             if freed > 0 {
-                eprintln!("[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
+                crate::nsl_log!(INFO, "gpu-drain", "[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
             }
         }
     }
@@ -6563,10 +6563,10 @@ pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
     {
         let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
         let summary = alloc.allocated_block_summary();
-        eprintln!("[gpu-alloc-summary] step={} live blocks:", step);
+        crate::nsl_log!(INFO, "gpu-alloc-summary", "[gpu-alloc-summary] step={} live blocks:", step);
         for (ctx, count, bytes) in &summary {
             if *bytes > 1024 {
-                eprintln!("  {} — {} blocks, {}KB", ctx, count, bytes / 1024);
+                crate::nsl_log!(INFO, "tensor", "  {} — {} blocks, {}KB", ctx, count, bytes / 1024);
             }
         }
     }
@@ -6662,7 +6662,7 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                 return;
             }
             let mb = |b: usize| b / (1024 * 1024);
-            eprintln!(
+            crate::nsl_log!(INFO, "gpu-mem", 
                 "[gpu-mem] step={} driver={}MB alloc={}MB reserved={}MB live_blocks={} persistent_blocks={} drv_allocs={} drv_frees={}",
                 step, used_mb,
                 mb(stats.allocated_bytes),
@@ -6670,7 +6670,7 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                 stats.num_allocs, stats.num_allocs_persistent,
                 stats.num_driver_allocs, stats.num_driver_frees,
             );
-            eprintln!(
+            crate::nsl_log!(INFO, "gpu-mem", 
                 "[gpu-mem]    persistent={}MB ({} segs)  transient={}MB ({} segs)  free_blocks={} hits={} misses={} splits={} coalesces={}",
                 mb(p_b), p_s, mb(t_b), t_s,
                 stats.num_free_blocks,
@@ -6690,11 +6690,11 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                     ));
                 }
             }
-            eprintln!("{}", surface_line);
+            crate::nsl_log!(INFO, "tensor", "{}", surface_line);
             // A1: external (non-pooled) allocation breakdown — async /
             // direct-device / identity coverage. Only when any exist.
             if ext.total_count > 0 {
-                eprintln!(
+                crate::nsl_log!(INFO, "gpu-mem", 
                     "[gpu-mem]    external: async={}MB direct={}MB persistent={}MB \
                      ({} allocs, {} with op/tensor identity)",
                     ext.async_bytes / (1024 * 1024),
@@ -6710,7 +6710,7 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             // drain runs. Surface the count so the report distinguishes this
             // transient hold-over from a genuine leak.
             if pending > 0 {
-                eprintln!("[gpu-mem]    deferred-free pending: {} buffer(s)", pending);
+                crate::nsl_log!(INFO, "gpu-mem", "[gpu-mem]    deferred-free pending: {} buffer(s)", pending);
             }
         }
     }

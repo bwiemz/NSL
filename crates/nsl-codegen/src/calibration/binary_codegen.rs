@@ -1381,7 +1381,7 @@ fn emit_model_backward_bridge(
             });
         }
         // Extraction failed — emit trivial stub, log warning.
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "nsl", 
             "[nsl] model_backward: WengertExtractor failed for '{model_name}' — emitting stub"
         );
         let mut ctx = Context::for_function(Function::with_name_signature(

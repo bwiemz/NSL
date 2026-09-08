@@ -27,13 +27,13 @@ use nsl_lexer::Interner;
 
 pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) {
     if elements == 0 {
-        eprintln!("error: --elements must be at least 1 (0 elements benches nothing)");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: --elements must be at least 1 (0 elements benches nothing)");
         process::exit(1);
     }
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: could not read file '{}': {e}", file.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
             process::exit(1);
         }
     };
@@ -54,7 +54,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
         .chain(parse_result.diagnostics.iter())
         .any(|d| d.level == nsl_errors::Level::Error);
     if has_errors {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: '{}' does not parse — fix the errors above first",
             file.display()
         );
@@ -76,7 +76,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
         }
     });
     if !has_autotune_kernel {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: no @autotune kernels in '{}' — nothing to measure",
             file.display()
         );
@@ -85,7 +85,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
 
     let device = nsl_codegen::autotune::DeviceIdentity::local();
     if !device.is_real_device() {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: nsl autotune measures real kernels and needs a CUDA device \
              (detected: {}). The cost-model path needs no GPU and runs at \
              every compile automatically.",
@@ -104,7 +104,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
         for diag in &analysis.diagnostics {
             source_map.emit_diagnostic(diag);
         }
-        eprintln!("error: '{}' does not type-check", file.display());
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: '{}' does not type-check", file.display());
         process::exit(1);
     }
 
@@ -122,7 +122,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
         false,
         &opts,
     ) {
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "cli", 
             "note: compile pipeline stopped after kernel selection ({}) — \
              the @autotune capture is unaffected",
             e.message
@@ -130,7 +130,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
     }
     let captured = nsl_codegen::autotune::take_capture();
     if captured.is_empty() {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: the compile captured no @autotune kernels from '{}' — \
              kernel selection never ran (the kernels may be unreachable from \
              this file's compile)",
@@ -167,7 +167,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
                         frozen.push(rec);
                     }
                     other => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(ERROR, "autotune", 
                             "[autotune] '{}': no Measured record after tuning \
                              ({other:?}) — every variant failed to benchmark, so \
                              the selection fell back to an estimate; nothing to \
@@ -179,7 +179,7 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
                 }
             }
             Err(e) => {
-                eprintln!("[autotune] '{}': measurement failed: {e}", cap.name);
+                nsl_runtime::nsl_log!(ERROR, "autotune", "[autotune] '{}': measurement failed: {e}", cap.name);
                 failures += 1;
             }
         }
@@ -187,12 +187,12 @@ pub(crate) fn run_autotune(file: &Path, elements: usize, freeze: Option<&Path>) 
 
     if let Some(out) = freeze {
         if frozen.is_empty() {
-            eprintln!("error: --freeze: no measured records to write");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: --freeze: no measured records to write");
             process::exit(1);
         }
         let (json, sha) = nsl_codegen::autotune::freeze_records(&mut frozen);
         if let Err(e) = std::fs::write(out, &json) {
-            eprintln!("error: --freeze {}: {e}", out.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: --freeze {}: {e}", out.display());
             process::exit(1);
         }
         println!(

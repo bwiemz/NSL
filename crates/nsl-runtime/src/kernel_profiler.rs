@@ -238,7 +238,7 @@ extern "C" fn kernel_profiler_atexit() {
         let ptr = path.as_ptr();
         let len = path.len() as i64;
         unsafe { nsl_kernel_profiler_flush(ptr, len); }
-        eprintln!("[nsl] kernel profile written to {}", path);
+        crate::nsl_log!(INFO, "nsl", "[nsl] kernel profile written to {}", path);
     }
 }
 
@@ -273,7 +273,7 @@ pub(crate) fn kernel_profiler_pop_events() -> Option<(u64, u64, usize)> {
     let mut cursor = KERNEL_PROFILER.pool_cursor.lock().unwrap();
 
     if *cursor >= pool.len() {
-        eprintln!(
+        crate::nsl_log!(INFO, "nsl", 
             "[nsl] kernel profiler: event pool exhausted ({} events recorded), flushing and recycling",
             pool.len()
         );
@@ -402,7 +402,7 @@ pub(crate) fn flush_traces_gpu(path: &str) {
     // "0.00 ms" as a result.
     let timing_valid = timing_failures == 0;
     if !timing_valid {
-        eprintln!(
+        crate::nsl_log!(ERROR, "nsl", 
             "[nsl] kernel profiler: {} of {} timing queries FAILED ({:?}) — \
              every duration and timestamp in '{}' is unresolved, NOT measured. \
              cuEventElapsedTime leaves its out-param untouched on failure, so \

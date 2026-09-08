@@ -1449,7 +1449,7 @@ pub(crate) fn print_memory_summary() {
     } else {
         ""
     };
-    eprintln!(
+    crate::nsl_log!(INFO, "nsl", 
         "\n[nsl] GPU Memory Summary\n\
          ========================\n\
          Allocated:        {} ({} blocks)\n\

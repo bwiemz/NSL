@@ -7855,7 +7855,7 @@ mod tests {
             })
             .copied();
         let Some(ptxas) = ptxas else {
-            eprintln!("ptxas not found; skipping assembly gate");
+            nsl_runtime::nsl_log!(WARN, "flash-attention", "ptxas not found; skipping assembly gate");
             return;
         };
         for gpu_sm in [52u32, 80] {

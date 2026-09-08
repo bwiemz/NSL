@@ -1286,7 +1286,7 @@ mod tests {
             match crate::ptxas_validation::validate_ptx(&ptx) {
                 Ok(()) => {}
                 Err(msg) if msg.contains("nvcc not available") => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "skip", 
                         "[skip] cfie fused-sample ptxas validation - no validator: {msg}"
                     );
                 }

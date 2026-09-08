@@ -278,6 +278,14 @@ has not drifted.
   baselines are byte-exact (CRLF is normalised on Windows, nothing else).
 - **The frontend exits before codegen on any error**; commands may assume a
   clean `AnalysisResult`.
+- **Diagnostics go through `nsl_runtime::nsl_log!`** (roadmap C3): the
+  `error:` / `warning:` / `note:` lines and the `[nsl] …` launcher lines
+  are `tracing` events (target `cli`, `nsl`, or the line's own marker)
+  rendered byte-identically to stderr by the runtime's subscriber
+  (runtime.md, "Logging"). Command output on stdout stays `println!`, and
+  the `nsl` process opts itself out of `NSL_EVENTS`
+  (`events::opt_out_this_process`, first thing in `main`) because that
+  stream belongs to the program it spawns.
 - **Version strings and doc claims agree with the tree** (the two
   `scripts/check-*-agreement.sh` gates).
 

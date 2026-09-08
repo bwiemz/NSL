@@ -506,11 +506,11 @@ fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
             return;
         };
         match detected {
-            Some(s) => eprintln!(
+            Some(s) => nsl_runtime::nsl_log!(INFO, "csha", 
                 "[csha] gpu spec: {} (auto-detected from local device \"{name}\")",
                 s.name
             ),
-            None => eprintln!(
+            None => nsl_runtime::nsl_log!(WARN, "csha", 
                 "[csha] gpu spec: local device \"{name}\" has no exact GPU-database \
                  entry — falling back to {} (add a GpuSpec entry for honest smem budgets)",
                 default_gpu().name
@@ -707,7 +707,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         input.shape.head_dim as i64,
         &mut diags,
     );
-    for d in diags { eprintln!("warning: {d}"); }
+    for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
 
     // The rewrite unit is the per-layer KERNEL SPEC the apply-bridge produced,
     // not the number of boundary chains scanned: a chain that no fusion level

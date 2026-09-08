@@ -91,11 +91,11 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
                 }
             }
             if found_ptr == 0 {
-                eprintln!(
+                crate::nsl_log!(ERROR, "nsl", 
                     "[nsl] hf_load error: no weight found for model field '{}'",
                     field_name
                 );
-                eprintln!("[nsl] available weights in safetensors file:");
+                crate::nsl_log!(ERROR, "nsl", "[nsl] available weights in safetensors file:");
                 let keys_list = crate::dict::nsl_dict_keys(dict_ptr);
                 let n_keys = crate::list::nsl_list_len(keys_list);
                 for k in 0..n_keys {
@@ -103,7 +103,7 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
                     let k_str = unsafe { std::ffi::CStr::from_ptr(k_ptr as *const std::ffi::c_char) }
                         .to_str()
                         .unwrap_or("?");
-                    eprintln!("  - {}", k_str);
+                    crate::nsl_log!(ERROR, "huggingface", "  - {}", k_str);
                 }
                 std::process::abort();
             }
@@ -114,7 +114,7 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
         if !meta.shape_ptr.is_null() && meta.ndim > 0 {
             let tensor = NslTensor::from_ptr(tensor_ptr);
             if tensor.ndim != meta.ndim {
-                eprintln!(
+                crate::nsl_log!(ERROR, "nsl", 
                     "[nsl] hf_load: shape mismatch for '{}': expected ndim={}, got ndim={}",
                     field_name, meta.ndim, tensor.ndim
                 );
@@ -127,7 +127,7 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
                 }
                 let actual = unsafe { *tensor.shape.add(d) };
                 if actual != expected {
-                    eprintln!(
+                    crate::nsl_log!(ERROR, "nsl", 
                         "[nsl] hf_load: shape mismatch for '{}' dim {}: expected {}, got {}",
                         field_name, d, expected, actual
                     );
@@ -182,7 +182,7 @@ pub extern "C" fn nsl_hf_load(
             let slice =
                 std::slice::from_raw_parts(repo_id_ptr as *const u8, repo_id_len as usize);
             std::str::from_utf8(slice).unwrap_or_else(|_| {
-                eprintln!("[nsl] hf_load: repo_id is not valid UTF-8");
+                crate::nsl_log!(ERROR, "nsl", "[nsl] hf_load: repo_id is not valid UTF-8");
                 std::process::abort();
             })
         };
@@ -193,7 +193,7 @@ pub extern "C" fn nsl_hf_load(
         // ignores the variable — wrong cache directory, wrong token file.
         // `from_env` reads `HF_HOME` and `HF_ENDPOINT`.
         let api = ApiBuilder::from_env().build().unwrap_or_else(|e| {
-            eprintln!("[nsl] hf_load: failed to create hf-hub Api: {}", e);
+            crate::nsl_log!(ERROR, "nsl", "[nsl] hf_load: failed to create hf-hub Api: {}", e);
             std::process::abort();
         });
 
@@ -203,7 +203,7 @@ pub extern "C" fn nsl_hf_load(
             Ok(local_path) => {
                 // Single-file model
                 let path_str = local_path.to_str().unwrap_or_else(|| {
-                    eprintln!("[nsl] hf_load: downloaded path is not valid UTF-8");
+                    crate::nsl_log!(ERROR, "nsl", "[nsl] hf_load: downloaded path is not valid UTF-8");
                     std::process::abort();
                 });
                 crate::safetensors_io::nsl_safetensors_load(
@@ -217,7 +217,7 @@ pub extern "C" fn nsl_hf_load(
                 let index_path = model_repo
                     .get("model.safetensors.index.json")
                     .unwrap_or_else(|e| {
-                        eprintln!(
+                        crate::nsl_log!(ERROR, "nsl", 
                             "[nsl] hf_load: no model.safetensors or index found for '{}': {}",
                             repo_id, e
                         );
@@ -225,13 +225,13 @@ pub extern "C" fn nsl_hf_load(
                     });
 
                 let index_content = std::fs::read_to_string(&index_path).unwrap_or_else(|e| {
-                    eprintln!("[nsl] hf_load: failed to read index JSON: {}", e);
+                    crate::nsl_log!(ERROR, "nsl", "[nsl] hf_load: failed to read index JSON: {}", e);
                     std::process::abort();
                 });
 
                 let index_json: serde_json::Value =
                     serde_json::from_str(&index_content).unwrap_or_else(|e| {
-                        eprintln!("[nsl] hf_load: failed to parse index JSON: {}", e);
+                        crate::nsl_log!(ERROR, "nsl", "[nsl] hf_load: failed to parse index JSON: {}", e);
                         std::process::abort();
                     });
 
@@ -240,7 +240,7 @@ pub extern "C" fn nsl_hf_load(
                     .get("weight_map")
                     .and_then(|v| v.as_object())
                     .unwrap_or_else(|| {
-                        eprintln!("[nsl] hf_load: index JSON missing 'weight_map' object");
+                        crate::nsl_log!(ERROR, "nsl", "[nsl] hf_load: index JSON missing 'weight_map' object");
                         std::process::abort();
                     });
 
@@ -251,7 +251,7 @@ pub extern "C" fn nsl_hf_load(
                 shard_names.sort();
                 shard_names.dedup();
 
-                eprintln!(
+                crate::nsl_log!(INFO, "nsl", 
                     "[nsl] hf_load: sharded model detected for '{}', downloading {} shard(s)...",
                     repo_id,
                     shard_names.len()
@@ -261,10 +261,10 @@ pub extern "C" fn nsl_hf_load(
                 let merged_dict = crate::dict::nsl_dict_new();
 
                 for shard_name in &shard_names {
-                    eprintln!("[nsl] hf_load: downloading shard '{}'...", shard_name);
+                    crate::nsl_log!(INFO, "nsl", "[nsl] hf_load: downloading shard '{}'...", shard_name);
                     let shard_path =
                         model_repo.get(shard_name).unwrap_or_else(|e| {
-                            eprintln!(
+                            crate::nsl_log!(ERROR, "nsl", 
                                 "[nsl] hf_load: failed to download shard '{}': {}",
                                 shard_name, e
                             );
@@ -272,7 +272,7 @@ pub extern "C" fn nsl_hf_load(
                         });
 
                     let shard_path_str = shard_path.to_str().unwrap_or_else(|| {
-                        eprintln!("[nsl] hf_load: shard path is not valid UTF-8");
+                        crate::nsl_log!(ERROR, "nsl", "[nsl] hf_load: shard path is not valid UTF-8");
                         std::process::abort();
                     });
 
@@ -295,7 +295,7 @@ pub extern "C" fn nsl_hf_load(
                     crate::dict::nsl_dict_free(shard_dict);
                 }
 
-                eprintln!(
+                crate::nsl_log!(INFO, "nsl", 
                     "[nsl] hf_load: loaded {} tensors from {} shard(s)",
                     crate::dict::nsl_dict_len(merged_dict),
                     shard_names.len()
@@ -318,7 +318,7 @@ pub extern "C" fn nsl_hf_load(
     #[cfg(not(feature = "interop"))]
     {
         let _ = (model_ptr, metadata_ptr, metadata_len, repo_id_ptr, repo_id_len, device);
-        eprintln!("[nsl] nsl_hf_load: requires 'interop' feature");
+        crate::nsl_log!(ERROR, "nsl", "[nsl] nsl_hf_load: requires 'interop' feature");
         std::process::abort();
     }
 }

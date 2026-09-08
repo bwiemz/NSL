@@ -223,7 +223,7 @@ pub fn apply_budget(plan: &mut CcrPlan, primal: &WengertList, budget: &CcrBudget
     }
     if items.is_empty() || budget.budget_bytes < BUDGET_QUANTUM {
         if items.is_empty() {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "ccr", 
                 "[ccr] budget arbitration: no recompute victims carry static \
                  size hints (symbolic shapes?) — keeping full recompute"
             );
@@ -600,7 +600,7 @@ fn plan_impl(
         }
     }
     if block_keys.is_empty() {
-        eprintln!(
+        nsl_runtime::nsl_log!(WARN, "ccr", 
             "[ccr] --checkpoint-blocks requested but the tape has no \
              `blocks.N`-style parameters; running without checkpointing"
         );
@@ -632,7 +632,7 @@ fn plan_impl(
         }
     }
     if anchors.is_empty() {
-        eprintln!("[ccr] no block params are consumed; running without checkpointing");
+        nsl_runtime::nsl_log!(WARN, "ccr", "[ccr] no block params are consumed; running without checkpointing");
         crate::pass_trace::record_disposition("CCR", PassDisposition::Declined {
             reason: DeclineReason::NoCandidates("no block params are consumed"),
         });
@@ -640,7 +640,7 @@ fn plan_impl(
     }
     for w in anchors.windows(2) {
         if w[1].1 <= w[0].1 {
-            eprintln!(
+            nsl_runtime::nsl_log!(WARN, "ccr", 
                 "[ccr] block anchors are not strictly increasing ({} at op {} \
                  vs {} at op {}) — the tape is not sequentially inlined as \
                  expected; refusing to checkpoint (running unchanged)",
@@ -752,7 +752,7 @@ fn plan_impl(
             }
         }
         if !claim_saved.is_empty() {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "ccr", 
                 "[ccr] segment {key}: CSHA-claimed attention chain — force-saving \
                  {} chain tensors, recompute continues for the rest of the block",
                 claim_saved.len()
@@ -818,7 +818,7 @@ fn plan_impl(
     }
 
     if recompute.is_empty() && compress.is_empty() {
-        eprintln!("[ccr] nothing recomputable found; running without checkpointing");
+        nsl_runtime::nsl_log!(WARN, "ccr", "[ccr] nothing recomputable found; running without checkpointing");
         crate::pass_trace::record_disposition("CCR", PassDisposition::Declined {
             reason: DeclineReason::NoCandidates("nothing recomputable in any block segment"),
         });

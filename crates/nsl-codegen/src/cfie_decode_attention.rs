@@ -669,7 +669,7 @@ mod tests {
         match crate::ptxas_validation::validate_ptx(&ptx) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                eprintln!("[skip] cfie decode-attn ptxas validation - no validator: {msg}");
+                nsl_runtime::nsl_log!(INFO, "skip", "[skip] cfie decode-attn ptxas validation - no validator: {msg}");
             }
             Err(msg) => panic!(
                 "cfie decode-attn PTX rejected for paper config:\n{msg}\n\nEmitted PTX:\n{ptx}"

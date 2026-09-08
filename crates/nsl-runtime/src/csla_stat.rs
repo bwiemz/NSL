@@ -81,7 +81,7 @@ pub extern "C" fn nsl_csla_assert_params_unaliased(list_ptr: i64) {
                 ti.data_owner == sj || tj.data_owner == slots[i];
             let overlap = start_i < end_j && start_j < end_i;
             if same_tensor || shared_owner || view_of_each_other || overlap {
-                eprintln!(
+                crate::nsl_log!(ERROR, "csla", 
                     "[csla] FATAL: model parameters {i} and {j} alias the same \
                      storage (tensor {} vs {}, data [{start_i:#x},{end_i:#x}) vs \
                      [{start_j:#x},{end_j:#x}), owners {} / {}). Pointer-tied or \

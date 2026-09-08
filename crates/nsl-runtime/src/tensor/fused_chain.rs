@@ -117,7 +117,7 @@ pub extern "C" fn nsl_fused_ew_counters_report() {
         ],
     );
     if std::env::var("NSL_FUSED_EW_COUNTER").ok().as_deref() == Some("1") {
-        eprintln!("[fused-ew] fused launches: {launches}, decomposed fallbacks: {fallbacks}");
+        crate::nsl_log!(WARN, "fused-ew", "[fused-ew] fused launches: {launches}, decomposed fallbacks: {fallbacks}");
     }
 }
 
@@ -133,7 +133,7 @@ struct ChainStep {
 }
 
 fn desc_abort(msg: &str) -> ! {
-    eprintln!(
+    crate::nsl_log!(ERROR, "tensor", 
         "nsl_fused_ew_chain: malformed descriptor: {msg} \
          (descriptor v1 is a pinned compiler contract — this is a codegen \
          bug, not a data condition)"
@@ -270,7 +270,7 @@ fn parse_descriptor(desc: *const u8, desc_len: u64) -> (Vec<ChainStep>, usize) {
 fn warn_fallback_once(reason: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("[fused-ew] falling back to decomposed replay ({reason})");
+        crate::nsl_log!(WARN, "fused-ew", "[fused-ew] falling back to decomposed replay ({reason})");
     }
 }
 

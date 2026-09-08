@@ -232,13 +232,13 @@ fn lt_handle() -> Option<lt::cublasLtHandle_t> {
             // SAFETY: out-pointer to a live local; checked before use.
             let st = unsafe { lt::cublasLtCreate(&mut h) };
             if st != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || h.is_null() {
-                eprintln!(
+                crate::nsl_log!(ERROR, "nsl-matmul", 
                     "[nsl-matmul] cublasLtCreate failed ({st:?}) — \
                      NSL_MATMUL_BF16_LT=1 falls back to cublasGemmEx for this run"
                 );
                 return None;
             }
-            eprintln!(
+            crate::nsl_log!(INFO, "nsl-matmul", 
                 "[nsl-matmul] bf16 GEMMs via cublasLt heuristics \
                  (NSL_MATMUL_BF16_LT=1): workspace {} MiB, autotune {}",
                 workspace_bytes_configured() >> 20,
@@ -274,7 +274,7 @@ fn workspace() -> (u64, usize) {
         }
         let ptr = raw_device_alloc(bytes);
         if ptr == 0 {
-            eprintln!(
+            crate::nsl_log!(WARN, "nsl-matmul", 
                 "[nsl-matmul] cublasLt workspace alloc ({} MiB) failed — \
                  continuing with zero workspace (kernel choice degrades)",
                 bytes >> 20
@@ -289,7 +289,7 @@ fn workspace() -> (u64, usize) {
 fn print_fallback_once(what: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        crate::nsl_log!(INFO, "nsl-matmul", 
             "[nsl-matmul] cublasLt path fell back to cublasGemmEx ({what}); \
              counted in the bf16_lt teardown counters — first occurrence only"
         );
@@ -553,7 +553,7 @@ unsafe fn build_plan(
                 std::env::var("NSL_MATMUL_BF16_LT_VERBOSE").ok().as_deref() == Some("1")
             }) {
                 let h0 = timings.first().copied().unwrap_or(f64::INFINITY);
-                eprintln!(
+                crate::nsl_log!(INFO, "bf16-lt", 
                     "[bf16-lt] tune opa={opa} opb={opb} m={m} n={n} k={k}: \
                      winner #{chosen} {:.3} ms, heuristic[0] {:.3} ms, \
                      {} candidates",
