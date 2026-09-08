@@ -5783,7 +5783,7 @@ impl Compiler<'_> {
             // Provenance-split rather than the flat refusal its seven siblings
             // above use, for the same reason the main admission is: the bundle
             // sets this flag on programs that never asked for it.
-            if self.compile_options.fuse_wgrad_accum {
+            if self.compile_options.fusion.wgrad_accum {
                 let reason = "the pipelined train path (@pipeline) passes no \
                               on_param_grad hook to its Wengert lowerings, so \
                               there is no FASE accumulate for the fused GEMM \
@@ -5796,7 +5796,7 @@ impl Compiler<'_> {
                     reason.to_string(),
                     "Drop @pipeline, or drop --fuse-wgrad-accum.",
                 ));
-                if !self.compile_options.fuse_wgrad_accum_from_bundle {
+                if !self.compile_options.fusion.wgrad_accum_from_bundle {
                     return Err(CodegenError::new(format!(
                         "--fuse-wgrad-accum is not supported on the pipelined \
                          train path (@pipeline): {reason}. Drop one"
@@ -8015,7 +8015,7 @@ impl Compiler<'_> {
                                 // #403 measured −37% backward launches from the
                                 // dx fusion alone; gamma fusion (P5 slice A)
                                 // removes the remaining norm decompositions.
-                                bwd_launch_factor: if self.compile_options.fuse_rmsnorm_backward {
+                                bwd_launch_factor: if self.compile_options.fusion.rmsnorm_backward {
                                     1.3
                                 } else {
                                     2.0
@@ -8375,7 +8375,7 @@ impl Compiler<'_> {
                     generator.set_csha_claims(claims);
                 }
                 // Item 9: opt-in fused RMSNorm input-gradient lowering.
-                generator.set_fuse_rmsnorm_backward(self.compile_options.fuse_rmsnorm_backward);
+                generator.set_fuse_rmsnorm_backward(self.compile_options.fusion.rmsnorm_backward);
                 let mut adjoint = generator.generate(&effective_primal);
                 // Item 9 profiling (`NSL_PROFILE_ADJOINT=1`): a launch-count
                 // histogram of the generated backward ops. Norm/activation
@@ -8632,7 +8632,7 @@ impl Compiler<'_> {
                     // param with no accum slot loses its `a_t` marker to the
                     // bulk free. It cannot mis-fuse anything, because the
                     // lowerer's plan — not this one — decides what is elided.
-                    let wgrad_chains = if self.compile_options.fuse_wgrad_accum
+                    let wgrad_chains = if self.compile_options.fusion.wgrad_accum
                         && fase_hook_active
                     {
                         Some(crate::wgrad_fusion::plan(&adjoint, &ccr_protect))

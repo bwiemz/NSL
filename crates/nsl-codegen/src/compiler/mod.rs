@@ -352,8 +352,8 @@ impl FusionState {
         Self {
             events: Vec::new(),
             barriers: Vec::new(),
-            report_enabled: options.fusion_report,
-            disabled: options.disable_fusion || options.debug_training,
+            report_enabled: options.fusion.report,
+            disabled: options.fusion.disabled || options.debug_training,
             fused_fns: std::collections::HashMap::new(),
         }
     }
@@ -2111,7 +2111,7 @@ impl<'a> Compiler<'a> {
     }
 
     pub(crate) fn finish_wgrad_admission(&self) -> Result<(), CodegenError> {
-        if !self.compile_options.fuse_wgrad_accum || self.wgrad_hook_blocks > 0 {
+        if !self.compile_options.fusion.wgrad_accum || self.wgrad_hook_blocks > 0 {
             return Ok(());
         }
         // Dedup: an N-block program that declines for one repeated reason
@@ -2143,7 +2143,7 @@ impl<'a> Compiler<'a> {
         }
         let reason = reasons.join("; also: ");
         let remedy = remedies.join(" ");
-        if self.compile_options.fuse_wgrad_accum_from_bundle {
+        if self.compile_options.fusion.wgrad_accum_from_bundle {
             // Bundle provenance: WARN. `--pretrain-optimized` sets the flag on
             // programs that never asked for it — including both shipped
             // `models/coder50m/pretrain*.nsl`, which declare no

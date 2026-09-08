@@ -132,7 +132,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
     if vram_budget.is_some()
         && (standalone || super::normal::needs_multi_file(&file))
     {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: --vram-budget is enforced only on single-file builds \
              today — the whole-program memory planner does not run on the \
              {} path, so the budget would be silently ignored. Remove the \
@@ -155,7 +155,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
         // that prints "frozen db loaded" and then discards every pinned
         // winner is worse than one that refuses (review MEDIUM).
         if autotune_fresh {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "cli", 
                 "error: --autotune-db does not compose with --autotune-fresh — \
                  fresh mode bypasses every cache lookup, so the pinned winners \
                  would be silently ignored"
@@ -163,16 +163,16 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             process::exit(1);
         }
         if no_autotune {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "cli", 
                 "error: --autotune-db does not compose with --no-autotune — \
                  middle-value mode never consults tuning records"
             );
             process::exit(1);
         }
         match nsl_codegen::autotune::load_frozen_db(db, autotune_db_sha256.as_deref()) {
-            Ok(n) => eprintln!("[autotune] frozen db: {} record(s) from {}", n, db.display()),
+            Ok(n) => nsl_runtime::nsl_log!(ERROR, "autotune", "[autotune] frozen db: {} record(s) from {}", n, db.display()),
             Err(e) => {
-                eprintln!("error: {e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
                 process::exit(1);
             }
         }
@@ -224,7 +224,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             // sub-struct is constructed there. (Mirrors `nsl run`.)
             let wggo_memory_budget_bytes = match wggo_memory_budget {
                 Some(0) => {
-                    eprintln!("error: --wggo-memory-budget must be > 0 MiB");
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: --wggo-memory-budget must be > 0 MiB");
                     process::exit(1);
                 }
                 Some(mib) => Some(mib.saturating_mul(1024 * 1024)),
@@ -234,7 +234,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 wggo_moment_precision || wggo_memory_budget_bytes.is_some();
 
             if cep_prune && cep_joint {
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "cli", 
                     "error: --cep-prune and --cep-joint are mutually exclusive (use one)"
                 );
                 std::process::exit(1);
@@ -268,9 +268,9 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
                 if cache_dir.exists() {
                     std::fs::remove_dir_all(cache_dir).ok();
-                    eprintln!("[nsl] autotune cache cleaned");
+                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] autotune cache cleaned");
                 } else {
-                    eprintln!("[nsl] no autotune cache to clean");
+                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] no autotune cache to clean");
                 }
                 return;
             }
@@ -280,7 +280,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 let listen_addr = match nsl_codegen::unikernel::parse_listen_addr(&listen) {
                     Ok(addr) => addr,
                     Err(e) => {
-                        eprintln!("error: invalid --listen value: {e}");
+                        nsl_runtime::nsl_log!(ERROR, "cli", "error: invalid --listen value: {e}");
                         process::exit(1);
                     }
                 };
@@ -288,7 +288,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     Some(s) => match nsl_codegen::unikernel::parse_memory_size(s) {
                         Ok(n) => n,
                         Err(e) => {
-                            eprintln!("error: invalid --memory value: {e}");
+                            nsl_runtime::nsl_log!(ERROR, "cli", "error: invalid --memory value: {e}");
                             process::exit(1);
                         }
                     },
@@ -307,7 +307,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
 
             // Calibration-flag validation per spec §8.
             if calibration_data.is_none() && calibrate.as_str() != "required" {
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "cli", 
                     "error: --calibrate={} requires --calibration-data <PATH>",
                     calibrate
                 );
@@ -316,7 +316,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             match calibrate.as_str() {
                 "required" | "best-effort" => {}
                 other => {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(ERROR, "cli", 
                         "error: --calibrate value '{}' is not one of required|best-effort",
                         other
                     );
@@ -325,14 +325,14 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             }
             if let Some(ref p) = calibration_data {
                 if !p.exists() {
-                    eprintln!("error: --calibration-data path does not exist: {}", p.display());
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: --calibration-data path does not exist: {}", p.display());
                     process::exit(1);
                 }
                 let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
                 match ext.as_deref() {
                     Some("bin") | Some("safetensors") => {}
                     other => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(ERROR, "cli", 
                             "error: --calibration-data extension {:?} is not one of .bin|.safetensors",
                             other
                         );
@@ -355,7 +355,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // corpus and silently ignoring it is the one behaviour with no
                 // defence. `calibration_pipeline_integration.rs` holds the
                 // contract test, ignored until the wiring lands.
-                eprintln!(
+                nsl_runtime::nsl_log!(WARN, "cli", 
                     "warning: --calibration-data is validated but NOT consumed by `nsl build`.\n\
                      \x20        {} is ignored: no calibration hooks run, no sidecar is\n\
                      \x20        written, and --wggo-importance=grad stays unavailable.\n\
@@ -364,15 +364,15 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 );
             }
             if calibration_samples == 0 {
-                eprintln!("error: --calibration-samples must be > 0");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: --calibration-samples must be > 0");
                 process::exit(1);
             }
             if calibration_batch_size == 0 {
-                eprintln!("error: --calibration-batch-size must be > 0");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: --calibration-batch-size must be > 0");
                 process::exit(1);
             }
             if calibration_timeout == 0 {
-                eprintln!("error: --calibration-timeout must be > 0");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: --calibration-timeout must be > 0");
                 process::exit(1);
             }
 
@@ -387,7 +387,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 Some(s) => match nsl_codegen::cpdt::CpdtMode::parse(s) {
                     Some(m) => m,
                     None => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(ERROR, "cli", 
                             "error: --cpdt value '{}' is not one of full|zero_only|off",
                             s
                         );
@@ -399,11 +399,11 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 let n = match cpdt_num_gpus {
                     Some(n) if n >= 1 => n,
                     Some(_) => {
-                        eprintln!("nsl: --cpdt-num-gpus must be >= 1");
+                        nsl_runtime::nsl_log!(ERROR, "nsl", "nsl: --cpdt-num-gpus must be >= 1");
                         process::exit(2);
                     }
                     None => {
-                        eprintln!("nsl: --cpdt requires --cpdt-num-gpus N");
+                        nsl_runtime::nsl_log!(ERROR, "nsl", "nsl: --cpdt requires --cpdt-num-gpus N");
                         process::exit(2);
                     }
                 };
@@ -443,7 +443,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
 
                 match (&weights, &ast_weight_ref) {
                     (Some(flag_path), Some(ast_path)) => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(WARN, "cli", 
                             "warning: --weights {} overrides AST-declared load_safetensors({:?}).",
                             flag_path.display(),
                             ast_path.display(),
@@ -462,7 +462,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                         // specific error. If a future refactor moves the
                         // standalone check earlier, this guard can be dropped.
                         if cpdt_enabled && weight_aware && !standalone {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(ERROR, "cli", 
                                 "error: --cpdt {} requires weights. Resolve by ONE of:\n\
                                  \n\
                                  1. Add --weights <path.safetensors> to this invocation.\n\
@@ -486,7 +486,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 matmul: matmul.to_config(),
                 autotune: nsl_codegen::AutotuneOptions { disabled: no_autotune, fresh: autotune_fresh },
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
-                fusion_report,
                 // Milestone A: an unparseable budget must refuse, not
                 // silently become "no budget" — the flag is a guard rail.
                 vram_budget: match vram_budget.as_deref() {
@@ -494,7 +493,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     Some(s) => match nsl_codegen::memory_planner::parse_vram_budget(s) {
                         Some(b) => Some(b),
                         None => {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(ERROR, "cli", 
                                 "error: --vram-budget '{s}' is not a size; \
                                  accepted forms: <n>GB/<n>GiB/<n>MB/<n>MiB/\
                                  <n>KB/<n>KiB/<n>B (1024-based)"
@@ -505,7 +504,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 },
                 memory_report,
                 target,
-                disable_fusion,
                 source_ad: _source_ad,
                 trace_ops: false,
                 nan_analysis,
@@ -564,9 +562,13 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // once the semantic checker has run. Empty = byte-identity.
                     policies: std::collections::HashMap::new(),
                 },
-                fuse_rmsnorm_backward,
-                fuse_wgrad_accum,
-                fuse_wgrad_accum_from_bundle,
+                fusion: nsl_codegen::FusionOptions {
+                    disabled: disable_fusion,
+                    report: fusion_report,
+                    rmsnorm_backward: fuse_rmsnorm_backward,
+                    wgrad_accum: fuse_wgrad_accum,
+                    wgrad_accum_from_bundle: fuse_wgrad_accum_from_bundle,
+                },
                 layerwise_accum,
                 weight_stream: nsl_codegen::WeightStreamOptions {
                     enabled: weight_stream,
@@ -583,7 +585,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                         "f32" => false,
                         "bf16" => true,
                         other => {
-                            eprintln!(
+                            nsl_runtime::nsl_log!(ERROR, "cli", 
                                 "error: --muon-state-dtype {other}: ladder rung not \
                                  implemented yet (P4 item 18 order: f32 -> bf16 -> \
                                  blockwise 8-bit -> 4-bit experimental). Use f32 or bf16"
@@ -688,7 +690,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             if let Some(ref m) = wggo
                 && nsl_codegen::wggo::WggoMode::parse(m).is_none()
             {
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "cli", 
                     "error: --wggo value '{}' is not one of full|greedy|off|auto",
                     m
                 );
@@ -701,7 +703,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             if let Some(f) = wggo_prune_fraction
                 && !(0.0..=0.9).contains(&f)
             {
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "cli", 
                     "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
                     f
                 );
@@ -710,7 +712,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             if let Some(ref p) = wggo_weights
                 && !p.exists()
             {
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "cli", 
                     "error: --wggo-weights path does not exist: {}",
                     p.display()
                 );
@@ -720,7 +722,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             if let Some(ref m) = csha
                 && nsl_codegen::csha::CshaMode::parse(m).is_none()
             {
-                eprintln!(
+                nsl_runtime::nsl_log!(ERROR, "cli", 
                     "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
                     m
                 );
@@ -729,7 +731,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
 
             if standalone {
                 if weights.is_none() {
-                    eprintln!("error: --standalone requires -w/--weights <path>");
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: --standalone requires -w/--weights <path>");
                     process::exit(1);
                 }
                 let embed_mode = match embed_weights.to_lowercase().as_str() {
@@ -737,7 +739,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     "always" => crate::standalone::EmbedMode::Always,
                     "never" => crate::standalone::EmbedMode::Never,
                     other => {
-                        eprintln!(
+                        nsl_runtime::nsl_log!(ERROR, "cli", 
                             "error: unknown --embed-weights value '{}'. \
                              Expected: auto, always, never",
                             other
@@ -776,7 +778,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 && let Some(plan) = slot.lock().ok().and_then(|g| g.clone())
             {
                 for diag in &plan.override_diagnostics {
-                    eprintln!(
+                    nsl_runtime::nsl_log!(INFO, "cpdt", 
                         "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
                         diag.requested, diag.applied, diag.reason
                     );

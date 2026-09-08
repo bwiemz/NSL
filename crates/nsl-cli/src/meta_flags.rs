@@ -59,7 +59,7 @@ pub(crate) fn parse_checkpoint_stride(s: &str) -> nsl_codegen::CheckpointStride 
     match t.parse::<usize>() {
         Ok(n) if n >= 1 => CheckpointStride::Fixed(n),
         _ => {
-            eprintln!(
+            nsl_runtime::nsl_log!(INFO, "cli", 
                 "note: --checkpoint-stride '{s}' is not 'auto', 'dp' or a \
                  positive integer; using stride 1 (per-block checkpointing)"
             );
@@ -182,7 +182,7 @@ pub(crate) fn expand_pretrain_optimized(
     // the bundle a worse citizen than the flags it expands to.
     match fuse_lm_head.as_deref() {
         None => *fuse_lm_head = Some("auto".to_string()),
-        Some("off") => eprintln!(
+        Some("off") => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: \
              --fuse-lm-head off (explicit flag wins; the [batch*seq, vocab] \
              logits surface will be materialized unless a @fused_lm_ce \
@@ -233,7 +233,7 @@ pub(crate) fn expand_pretrain_optimized(
             *fuse_wgrad_accum_from_bundle = !*fuse_wgrad_accum;
             *fuse_wgrad_accum = true;
         }
-        Some(flag) => eprintln!(
+        Some(flag) => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: \
              --fuse-wgrad-accum not enabled because {flag} is set ({flag} needs \
              the raw gradient this fusion never materializes; the rest of the \
@@ -242,7 +242,7 @@ pub(crate) fn expand_pretrain_optimized(
     }
     match wggo.as_deref() {
         None => *wggo = Some("greedy".to_string()),
-        Some("off") => eprintln!(
+        Some("off") => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: --wggo off \
              (explicit flag wins; no WGGO plan will drive CSHA/FASE/PCA)"
         ),
@@ -250,7 +250,7 @@ pub(crate) fn expand_pretrain_optimized(
     }
     match csha.as_deref() {
         None => *csha = Some("auto".to_string()),
-        Some("off") => eprintln!(
+        Some("off") => nsl_runtime::nsl_log!(WARN, "cli", 
             "note: --pretrain-optimized bundle partially disabled: --csha off \
              (explicit flag wins)"
         ),
@@ -292,8 +292,8 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     // Both change the ARITHMETIC, not just the schedule — a reference run must
     // not silently keep a deliberately non-bit-exact fusion. (`--fuse-rmsnorm-backward`
     // was missing here too; same reason, same fix.)
-    off_bool!(fuse_wgrad_accum, "--fuse-wgrad-accum (non-bit-exact)");
-    off_bool!(fuse_rmsnorm_backward, "--fuse-rmsnorm-backward (non-bit-exact)");
+    off_bool!(fusion.wgrad_accum, "--fuse-wgrad-accum (non-bit-exact)");
+    off_bool!(fusion.rmsnorm_backward, "--fuse-rmsnorm-backward (non-bit-exact)");
     if opts.checkpoint.budget_mib.is_some() {
         opts.checkpoint.budget_mib = None;
         disabled.push("--checkpoint-budget-mib (CCR)");
@@ -316,8 +316,8 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
         opts.lm_head_fusion = nsl_codegen::lm_head_inference::LmHeadFusion::Off;
         disabled.push("--fuse-lm-head (compiler-inferred fused LM head)");
     }
-    if !opts.disable_fusion {
-        opts.disable_fusion = true;
+    if !opts.fusion.disabled {
+        opts.fusion.disabled = true;
         disabled.push("kernel @fuse fusion");
     }
     // WGGO + reduced-precision moments.
@@ -347,7 +347,7 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
         disabled.push("CSHA attention fusion (mode + @csha)");
     }
 
-    eprintln!(
+    nsl_runtime::nsl_log!(WARN, "cli", 
         "note: --training-reference forces the simplest correct training path. \
          Disabled: {}. Also disabled in codegen: FBIP in-place, the fused FASE \
          optimizer step, and @fused_lm_ce / @fused_kl_ce / @checkpoint decorators.",
@@ -376,7 +376,7 @@ mod tests {
                 async_writeback: true,
             },
             optim_state_offload: true,
-            disable_fusion: false,
+            fusion: nsl_codegen::FusionOptions { disabled: false, ..Default::default() },
             ..Default::default()
         };
         opts.wggo.mode = Some("greedy".to_string());
@@ -389,7 +389,7 @@ mod tests {
         assert!(!opts.weight_stream.prefetch);
         assert!(!opts.weight_stream.async_writeback);
         assert!(!opts.optim_state_offload);
-        assert!(opts.disable_fusion, "kernel fusion disabled");
+        assert!(opts.fusion.disabled, "kernel fusion disabled");
         assert_eq!(opts.wggo.mode.as_deref(), Some("off"));
         assert!(!opts.wggo.moment_precision);
         assert_eq!(opts.cpdt.mode, nsl_codegen::cpdt::CpdtMode::Off);
@@ -594,13 +594,16 @@ mod tests {
         assert!(fr && fw);
         let mut opts = nsl_codegen::CompileOptions {
             training_reference: true,
-            fuse_rmsnorm_backward: fr,
-            fuse_wgrad_accum: fw,
+            fusion: nsl_codegen::FusionOptions {
+                rmsnorm_backward: fr,
+                wgrad_accum: fw,
+                ..Default::default()
+            },
             ..Default::default()
         };
         apply_training_reference(&mut opts);
         assert!(
-            !opts.fuse_rmsnorm_backward && !opts.fuse_wgrad_accum,
+            !opts.fusion.rmsnorm_backward && !opts.fusion.wgrad_accum,
             "reference mode must disable both bundle-enabled fusions"
         );
     }

@@ -50,6 +50,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`nsl_runtime::events::opt_out_this_process`): the stream belongs to the
   compiled program (one writer per rank), and a compile-time diagnostic
   mirrored from the compiler would have added a second `seq` sequence.
+- Runtime logging, step 5 (roadmap C3): nsl-cli's 274 diagnostic
+  `eprintln!` sites go through `nsl_runtime::nsl_log!` as well — target
+  `cli` for the `error:` / `warning:` / `note:` lines (`ERROR` where the
+  command exits or returns failure), `nsl` for the `nsl: …` and `[nsl] …`
+  launcher lines, `zk` / `tokenize` / `autotune` / `inspect` for the
+  marker-prefixed ones. stderr is byte-identical; stdout output
+  (`println!`) and the `eprint!` report dumps are untouched. With this,
+  every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
 
@@ -148,6 +156,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the fusion
+  flags moved into `FusionOptions` (`opts.fusion.{disabled, report,
+  rmsnorm_backward, wgrad_accum, wgrad_accum_from_bundle}` for
+  `--disable-fusion` / `--fusion-report` / `--fuse-rmsnorm-backward` /
+  `--fuse-wgrad-accum` and its bundle provenance). Pure rename; defaults
+  unchanged; the execution fingerprint reads `fusion` / `fuse_rms` /
+  `fuse_wgrad` through the new path and `--training-reference` clears the
+  same three knobs. 51 → 47 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the
   autotune flags moved into `AutotuneOptions` (`opts.autotune.{disabled,
   fresh}` for `--no-autotune` / `--autotune-fresh`) and the weight-aware
