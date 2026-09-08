@@ -116,6 +116,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the per-step
+  diagnostics after the backward — the `--debug-training` gradient
+  checksum, the P0.3 grad-integrity scan and the health-monitor hooks
+  (loss record, per-parameter gradient and weight norms, snapshot flush)
+  — moved byte-for-byte into `stmt_train/health_hooks.rs`
+  (`emit_train_health_hooks`, fed by a `HealthHooksInputs`). 195
+  lines out of the driver (now ~2.6k lines); the train-block CLIF
+  snapshots are unchanged.
 - The pipelined train block moved out of `stmt.rs` whole (roadmap A1):
   `compile_train_block_pipelined` (the dispatch entry point) and
   `compile_train_block_pipelined_inner` (the stage loop) now live in
