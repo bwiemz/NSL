@@ -116,6 +116,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the forward
+  lowering of the source-AD arm — the memory-planner tape-unchanged
+  assertion, the Item 11 per-segment early-free plan and the primal
+  lowering (monolithic, or segment-streamed under `--weight-stream` with
+  the upload / evict or arena-pack calls between slices) inside the
+  in-place-suppress window — moved byte-for-byte into
+  `stmt_train/forward_lowering.rs` (`emit_forward_lowering`, fed by a
+  `ForwardLoweringInputs` and returning the early-free plan and the lowered
+  forward; `CcrSegmentFree` is now a module-level `pub(crate)` struct).
+  294 lines out of the driver; the train-block CLIF snapshots are
+  unchanged. The execution-marker registry lists the new file among the
+  `[ccr]` emitters.
 - `compile_train_block_inner` peel continued (roadmap A1): the D2b part 2
   CSLA schedule precompute of the source-AD arm — the layerwise plan,
   per-param facts, replay ranges and update grouping computed on the final

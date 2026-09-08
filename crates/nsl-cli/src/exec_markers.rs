@@ -341,7 +341,11 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     ),
     m(
         "[ccr]",
-        &["crates/nsl-codegen/src/stmt.rs"],
+        &[
+            "crates/nsl-codegen/src/stmt.rs",
+            // The per-segment early-free note (forward lowering).
+            "crates/nsl-codegen/src/stmt_train/forward_lowering.rs",
+        ],
         "CCR reported its adjoint last-use free placement (NSL_CCR_DEBUG=1), \
          and warns when that placement broke a weight-gradient fusion chain",
     ),
