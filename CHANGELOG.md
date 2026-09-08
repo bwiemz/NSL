@@ -116,6 +116,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the D2b part 2
+  CSLA schedule precompute of the source-AD arm — the layerwise plan,
+  per-param facts, replay ranges and update grouping computed on the final
+  adjoint, and the `--weight-stream` sliced-forward plan (register / upload
+  / evict per primal-op slice, or the per-layer arena packs) with the
+  parameter plan it derives from — moved byte-for-byte into
+  `stmt_train/csla_precompute.rs` (`precompute_csla_schedule`, fed by a
+  `CslaPrecomputeInputs` and returning the `CslaPre` / `WsForwardPlan`
+  pair; `WsForwardPlan` is now a module-level `pub(crate)` struct). 450
+  lines out of the driver; the train-block CLIF snapshots are unchanged. The
+  execution-marker registry now attributes `[csla]` to the two peeled files
+  that emit it.
 - `compile_train_block_inner` peel continued (roadmap A1): section 6e of
   the source-AD arm — the Milestone C·p2 transient-memory arena projection
   over the final tape (the Stage-2A element hints, the `--memory-report` /

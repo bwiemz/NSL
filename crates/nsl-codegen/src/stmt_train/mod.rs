@@ -48,6 +48,11 @@
 //!     `--transient-arena` placement with its runtime slot declarations,
 //!     fed by a [`transient_arena_projection::TransientArenaInputs`] and
 //!     returning the element hints.
+//!   - [`csla_precompute`] — the D2b part 2 CSLA schedule precompute of
+//!     the source-AD arm: the layerwise plan, per-param facts, replay
+//!     ranges and update grouping, and the `--weight-stream` sliced-forward
+//!     plan, fed by a [`csla_precompute::CslaPrecomputeInputs`] and
+//!     returning the `CslaPre` / `WsForwardPlan` pair; pure analysis.
 //!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
 //!     source-AD arm: the adjoint lowering with the per-parameter
 //!     accumulate callback and the grad-integrity bracket, fed by a
@@ -82,6 +87,7 @@ pub(crate) mod config;
 pub(crate) mod model_params;
 pub(crate) mod optimizer_state;
 pub(crate) mod contract;
+pub(crate) mod csla_precompute;
 pub(crate) mod csla_window;
 pub(crate) mod epoch_close;
 pub(crate) mod fase_hook_lowering;
