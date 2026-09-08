@@ -29,6 +29,7 @@ use crate::stmt_train::primal_vars::PrimalVarsInputs;
 use crate::stmt_train::scheduler_step::SchedulerStepInputs;
 use crate::stmt_train::source_ad_grads::SourceAdGradsInputs;
 use crate::stmt_train::transient_arena_projection::TransientArenaInputs;
+use crate::stmt_train::plan_csha_prune::CshaPruneInputs;
 use crate::stmt_train::plan_ccr::{PreForwardPlanInputs, PreForwardPlans};
 use crate::stmt_train::plan_wggo::{WggoPlanning, WggoPlanningInputs};
 use crate::stmt_train::plan_wrga_cpdt::WrgaCpdtInputs;
@@ -6940,158 +6941,19 @@ impl Compiler<'_> {
                     train_block_stmt_id,
                 })?;
 
-                // CSHA: Compiler-Synthesized Holistic Attention planner.
-                // Runs the boundary-fusion scan, SMEM feasibility model,
-                // and weight-informed specialization.  Emits either the
-                // full paper-§6.3 report or a compact one-line summary
-                // gated by the `--csha` / `--csha-report` flags.  The
-                // planner is pure data-in/data-out; wiring the kernel
-                // decisions back into codegen is a follow-up step.
-                //
-                // Pass order: Calibration → WGGO → CSHA.
-                // CSHA receives WGGO's AppliedPlan (if any) as WggoOverrides
-                // (via bus.wggo_overrides) so that per-layer fusion-level
-                // decisions from WGGO are honoured (or rejected with a
-                // diagnostic) by CSHA.
-                //
-                // Milestone C: SCHEDULED — the body (hoisted to
-                // `invoke_csha_if_enabled`, mirroring WRGA's bridge) contains
-                // the planner run AND all three bus publishes, so finish()'s
-                // applied⇒published check on `csha_bridge` (Enforced) judges
-                // a settled state. tape=None deliberately: NO
-                // assert_tape_unchanged_since exists for CSHA anywhere
-                // (`pass_scheduler_coverage.rs` records the exemption) —
-                // its positional chain fields are converted to OpIds AT the
-                // scan boundary inside this window (`collect_claimed_ops` /
-                // the dispatch-map build), OpIds are stable across the
-                // deletions `wggo_prune` makes right after this, and an
-                // assert against the post-prune list would refuse every
-                // prune+CSHA composition for a mutation that invalidates
-                // nothing the pass retained. A digest nobody can ever read
-                // is a full-tape hash per train block buying only a trace
-                // token, so none is captured.
-                let sched = self.passes.scheduler();
-                sched
-                    .schedule("CSHA", None, || {
-                        crate::stmt::invoke_csha_if_enabled(
-                            self,
-                            extractor.wengert_list(),
-                            &model_type_name,
-                        );
-                    })
-                    .map_err(CodegenError::new)?
-                    .finish(&self.bus)
-                    .map_err(CodegenError::new)?;
-
-                // 5. Lower PRIMAL Wengert list to Cranelift IR.
-                //    This IS the forward pass — each WengertOp is compiled to
-                //    its runtime FFI call, and ALL intermediate VarId → Value
-                //    mappings are recorded in full_vars.
-                // ELTLS: free tape-held tensors before clearing the tape flag.
-                self.free_tape_held_tensors(builder, state);
-                state.flags.in_tape_region = false;
-                // Debug: dump primal Wengert ops
-                if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
-                    nsl_runtime::nsl_log!(INFO, "wengert", 
-                        "[wengert] primal_vars: {:?}",
-                        primal_vars.keys().collect::<Vec<_>>()
-                    );
-                    for op in &extractor.wengert_list().ops {
-                        let name = extractor
-                            .wengert_list()
-                            .var_names
-                            .get(&op.result)
-                            .cloned()
-                            .unwrap_or_default();
-                        nsl_runtime::nsl_log!(INFO, "wengert", 
-                            "[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
-                            op.result,
-                            name,
-                            op.op,
-                            op.inputs,
-                            primal_vars.contains_key(&op.result)
-                        );
-                    }
-                }
-                // --- NEW: spec §4 WGGO Prune, runs BEFORE wrga so WRGA sees reduced forward ---
-                // When WGGO produced a plan, run the prune IR rewriter. On any refusal the
-                // whole plan is rejected (spec §5.3 dry-run-then-commit contract) and
-                // compilation fails with a CodegenError. On success each rewritten layer
-                // gets a stderr marker that Task 15 will upgrade to format_refusal output.
-                if let Some(ref applied_plan) = wggo_applied {
-                    // Milestone C: THE positional consumption fork — the
-                    // plan's indices are applied to the tape here, and they
-                    // are valid only against the list state the plan was
-                    // produced from (planned in place, or fingerprint-matched
-                    // to the pre-plan's extraction). Prove nothing moved the
-                    // list since the scheduled WGGO retained its digest
-                    // (CSHA in between is Reads-only). Assert at ENTRY of the
-                    // consumption; after the prune the digest is stale BY
-                    // DESIGN (the prune is WGGO's declared mutation) and
-                    // nothing may re-assert it — WRGA's own schedule
-                    // re-digests the post-prune list.
-                    {
-                        let sched = self.passes.scheduler();
-                        sched
-                            .assert_tape_unchanged_since("WGGO", extractor.wengert_list())
-                            .map_err(CodegenError::new)?;
-                    }
-                    let empty_weight_map = crate::weight_aware::WeightMap::default();
-                    let weight_map_ref = self.features.weight_map.as_ref().unwrap_or(&empty_weight_map);
-                    let wggo_prune_result = crate::wggo_prune::run(
-                        extractor.wengert_list_mut(),
-                        applied_plan,
-                        weight_map_ref,
-                    );
-                    if !wggo_prune_result.refusals.is_empty() {
-                        // Spec §3 / §6: emit three-part refusal text per variant.
-                        // diagnostic_code() provides the structured OverrideRejectReason
-                        // for any future attach-reason API once diagnostic infrastructure
-                        // exposes it. For now, the stderr text + CodegenError is the
-                        // diagnostic contract.
-                        for refusal in &wggo_prune_result.refusals {
-                            let text = crate::wggo_prune::format_refusal(refusal);
-                            nsl_runtime::nsl_log!(INFO, "codegen", "{text}");
-                        }
-                        return Err(crate::error::CodegenError::new(
-                            "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
-                        ));
-                    }
-                    // Item 3: supersede WGGO's own layer-decision count with
-                    // the number of layers whose ops this prune actually
-                    // deleted. This is the ONLY place WGGO mutates the tape,
-                    // so it is the honest answer to "what did WGGO do".
-                    //
-                    // Guarded on non-empty on purpose. A plan with no `Prune`
-                    // decisions reaches here with zero rewrites, and recording
-                    // that would erase the true statement that N per-layer
-                    // decisions were applied (which CSHA / WRGA / FASE then
-                    // read) in exchange for a zero that is already implied by
-                    // the absence of `[prune]` lines. The refusal path above
-                    // needs no disposition: it returns a `CodegenError`, so
-                    // there is no build left to report on.
-                    if !wggo_prune_result.rewrites.is_empty() {
-                        crate::pass_trace::record_disposition("WGGO", crate::pass_trace::PassDisposition::Applied {
-                            rewrites: wggo_prune_result.rewrites.len(),
-                        });
-                    }
-                    // Success path: spec §6.1 format per rewrite.
-                    // layer_index is looked up from applied_plan.layers by name match
-                    // so we report the index the planner assigned, not the Vec position.
-                    for rewrite in &wggo_prune_result.rewrites {
-                        let layer_index = applied_plan.layers.iter()
-                            .find(|l| l.layer_name == rewrite.layer_name)
-                            .map(|l| l.layer_index)
-                            .unwrap_or(0);
-                        let line = crate::wggo_prune::format_success_stderr(
-                            rewrite,
-                            layer_index,
-                            rewrite.ops_deleted,  // per-rewrite, not aggregate
-                        );
-                        nsl_runtime::nsl_log!(INFO, "codegen", "{line}");
-                    }
-                }
-                // --- END NEW ---
+                // CSHA planner schedule, the ELTLS tape-held free, the
+                // NSL_DEBUG_WENGERT dump and the spec §4 WGGO prune.
+                // Moved to `stmt_train/plan_csha_prune.rs` byte-for-byte (roadmap A1).
+                let sched = self.run_csha_and_wggo_prune(
+                    builder,
+                    state,
+                    CshaPruneInputs {
+                        extractor: &mut extractor,
+                        model_type_name: &model_type_name,
+                        primal_vars: &primal_vars,
+                        wggo_applied: &wggo_applied,
+                    },
+                )?;
 
                 // Task 4: WRGA driver + CPDT planning.
                 // Moved to `stmt_train/plan_wrga_cpdt.rs` byte-for-byte (roadmap A1):

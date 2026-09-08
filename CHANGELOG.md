@@ -116,6 +116,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the CSHA
+  planner schedule and the spec §4 WGGO prune of the source-AD arm (with
+  the ELTLS tape-held free and the `NSL_DEBUG_WENGERT` dump between them)
+  moved byte-for-byte into `stmt_train/plan_csha_prune.rs`
+  (`run_csha_and_wggo_prune`, fed by a `CshaPruneInputs`). 152 lines
+  out of the driver (now ~2.3k lines); the train-block CLIF snapshots are
+  unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): the tail of
   the step after the optimizer — the scheduler call that redefines the
   learning rate, the step-count increment and the periodic
