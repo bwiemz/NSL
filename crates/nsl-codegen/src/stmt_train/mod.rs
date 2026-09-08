@@ -81,6 +81,11 @@
 //!     `WggoOverrides` publication, fed by a
 //!     [`plan_wggo::WggoPlanningInputs`] and returning a
 //!     [`plan_wggo::WggoPlanning`]; pure planning.
+//!   - [`plan_csha_prune`] — the CSHA planner schedule and the WGGO prune
+//!     of the source-AD arm (with the ELTLS tape-held free and the
+//!     `NSL_DEBUG_WENGERT` dump between them), fed by a
+//!     [`plan_csha_prune::CshaPruneInputs`]; the prune is the one place
+//!     WGGO mutates the tape.
 //!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
 //!     source-AD arm: the adjoint lowering with the per-parameter
 //!     accumulate callback and the grad-integrity bracket, fed by a
@@ -142,5 +147,6 @@ pub(crate) mod source_ad_grads;
 pub(crate) mod teardown;
 pub(crate) mod transient_arena_projection;
 pub(crate) mod plan_ccr;
+pub(crate) mod plan_csha_prune;
 pub(crate) mod plan_wggo;
 pub(crate) mod plan_wrga_cpdt;
