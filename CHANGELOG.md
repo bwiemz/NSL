@@ -116,6 +116,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- Runtime fatal exits are typed (roadmap C1): `nsl_runtime::fatal::die(kind,
+  msg)` is the one chokepoint for a condition the runtime cannot continue
+  from, and each `Fatal` kind has its own exit code — `GpuOom` **12**
+  (unchanged), `CudaDriver` **13**, `CudaAsync` **14**, `Cublas` **15** — so
+  a supervisor can tell them apart from each other and from a crash. The
+  nine `panic!` sites in `cuda/mod.rs` that sat under `extern "C"` entry
+  points (a non-OOM `cuMemAlloc` failure, a failed `cuMemcpyHtoD`, the
+  `--cuda-sync` post-launch and post-cuBLAS async errors, the fused wgrad
+  accumulate's cuBLAS failure) now print, flush and exit with those codes
+  instead of aborting with a core dump; the message text is unchanged. The
+  codes are documented in `docs/architecture/runtime.md` and pinned by
+  `fatal::tests`.
 - The `grad` block drivers moved out of `stmt.rs` whole (roadmap A1):
   `compile_grad_block`, `compile_source_ad_grad_block`,
   `compile_tape_grad_block` and `compile_tape_backward` now live in

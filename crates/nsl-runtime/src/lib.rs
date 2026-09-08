@@ -87,6 +87,7 @@ pub mod file_io;
 pub mod args;
 pub mod events;
 pub mod log;
+pub mod fatal;
 pub mod tensor;
 pub(crate) mod cpu;
 pub(crate) mod cuda;
