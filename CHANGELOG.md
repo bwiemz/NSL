@@ -116,6 +116,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The control-flow statement lowerings moved out of `stmt.rs` whole
+  (roadmap A1): `compile_if_stmt`, `compile_while`, `compile_while_let`,
+  `compile_for`, `compile_for_model_array`, `compile_for_dataloader`,
+  `compile_match` and the two non-owning-alias materialization helpers
+  now live in `stmt_control.rs`, byte-for-byte; the five `stmt.rs` helpers
+  they call are `pub(crate)`. 1,211 lines out of `stmt.rs` (~8.9k lines
+  now); the train-block CLIF snapshots are unchanged.
+
 - `compile_train_block_inner` peel continued (roadmap A1): the CSHA
   planner schedule and the spec §4 WGGO prune of the source-AD arm (with
   the ELTLS tape-held free and the `NSL_DEBUG_WENGERT` dump between them)
