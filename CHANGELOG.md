@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Design spec for the roadmap A1 endgame,
+  `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`: the
+  `TrainPlan` mid-level IR (configuration, parameter facts, tapes and
+  technique plans as plain data; Cranelift handles kept apart in an
+  `EmitState`), the `TrainPass` trait with a single `PASS_ORDER` table
+  mapped onto today's seventeen planning sites, the technique-free
+  `emit_train_plan`, and the five snapshot-gated steps from the peeled
+  driver to that shape.
+
 - Runtime logging front door (roadmap C3): `nsl_log!(LEVEL, "target", …)`
   in nsl-runtime emits a `tracing` event per diagnostic line; the crate's own
   subscriber (`src/log.rs`) keeps stderr byte-identical to the `eprintln!` it
