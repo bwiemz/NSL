@@ -92,6 +92,11 @@
 //!     ownership sweep of the lowering's intermediates, fed by a
 //!     [`source_ad_grads::SourceAdGradsInputs`] and returning the arm's
 //!     value.
+//!   - [`pipelined`] — the `pipeline(...)` sibling of the driver, whole:
+//!     `compile_train_block_pipelined` (the dispatch entry point, which
+//!     installs the fused-CE decorator config around the lowering) and
+//!     `compile_train_block_pipelined_inner` (the stage loop with logical
+//!     stage-to-stage communication in one process).
 //!   - [`param_lists`] — the per-parameter runtime lists built at setup:
 //!     the Muon/AdamW route flags, the weight-decay exemption flags and
 //!     the gradient-accumulation buffers.
@@ -120,6 +125,7 @@ pub(crate) mod forward_lowering;
 pub(crate) mod identity;
 pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;
+pub(crate) mod pipelined;
 pub(crate) mod primal_vars;
 pub(crate) mod source_ad_grads;
 pub(crate) mod teardown;
