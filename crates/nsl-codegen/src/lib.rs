@@ -1689,70 +1689,19 @@ pub struct FusionOptions {
     pub wgrad_accum_from_bundle: bool,
 }
 
-/// Compiler configuration flags passed from CLI.
-#[derive(Clone)]
-pub struct CompileOptions {
-    /// Kernel autotuning (`--no-autotune` / `--autotune-fresh`); see
-    /// [`AutotuneOptions`].
-    pub autotune: AutotuneOptions,
-    pub world_size: usize,
-    /// Fusion: the kill switch, `--fusion-report`, and the opt-in source-AD
-    /// fusions; see [`FusionOptions`].
-    pub fusion: FusionOptions,
-    /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
-    pub vram_budget: Option<u64>,
-    /// M36: Print memory plan report to stderr
-    pub memory_report: bool,
-    /// M47: GPU compilation target name.
-    pub target: String,
-    /// M40: Use compile-time source-to-source AD for training (default: false = tape AD).
-    pub source_ad: bool,
+/// Training diagnostics and reference modes: the observation-only gates
+/// (`--trace-ops`, `--nan-analysis`, `--grad-integrity`) and the two modes
+/// that change what is lowered (`--debug-training`, `--training-reference`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). Field names are
+/// the old flat names, so a read site only gains the `diagnostics.` hop.
+#[derive(Clone, Default)]
+pub struct DiagnosticsOptions {
     /// M45: Enable tensor operation tracing.
     pub trace_ops: bool,
     /// M45: Enable compile-time NaN risk analysis.
     pub nan_analysis: bool,
-    /// M46: Enable deterministic mode.
-    pub deterministic: bool,
-    /// P0 certification: RNG seed for `randn`/`rand`/stochastic ops.
-    /// `None` keeps the historical behavior (seed 42 under
-    /// --deterministic, unseeded otherwise). `Some(s)` seeds the RNG at
-    /// program start regardless of --deterministic (multi-seed training
-    /// campaigns need distinct reproducible inits; bit-reproducibility of
-    /// the DEVICE path still requires --deterministic).
-    pub rng_seed: Option<u64>,
-    /// Weight-aware compilation (`--weights`, the M52 config, the analysis
-    /// report) and the `@export` weight-index map; see [`WeightsOptions`].
-    pub weights: WeightsOptions,
-    /// M54: Unikernel build configuration (None = normal build)
-    pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
-    /// M53: Worst-case-execution-time analysis / certification options.
-    pub wcet: WcetOptions,
-    /// M38a: Enable linear types ownership checking.
-    pub linear_types_enabled: bool,
-    /// M38a: Per-function ownership metadata from semantic analysis.
-    /// Keys are function names, values have linear_params and shared_params.
-    pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
-    /// M55: Zero-knowledge proof-circuit emission options.
-    pub zk: ZkOptions,
-    /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
-    /// [`ZeroOptions`].
-    pub zero: ZeroOptions,
-    /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
-    /// storage with counter-based stochastic rounding on the fused AdamW
-    /// update — no FP32 master copy. Rides the weight-stream residency
-    /// schedule (bf16 device mirrors, transient f32 working views).
-    pub param_dtype_bf16sr: bool,
-    /// Muon optimizer knobs (`--muon-batch-ns`, `--muon-resident-momentum`,
-    /// `--muon-state-dtype`); see [`MuonOptions`].
-    pub muon: MuonOptions,
-    /// P5 item 19 (`--cuda-graphs`): opportunistic per-region CUDA graph
-    /// capture/replay. Each Wengert lowering (forward CCR slice, CSLA
-    /// backward layer range, recompute segment) is bracketed with runtime
-    /// region markers; the runtime records the launch sequence, captures it
-    /// as a CUDA graph once it proves stable across steps, and replays it
-    /// with per-launch verification and eager self-repair on any divergence.
-    /// Optimizer updates and weight-stream transfers stay outside regions.
-    pub cuda_graphs: bool,
     /// Debug training mode: disables fusion, disables FBIP, and emits
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
@@ -1774,17 +1723,86 @@ pub struct CompileOptions {
     /// backward is retained — it is bit-exact-equivalent to the unfused form
     /// (FASE≡AdamW gates) and is not a distinct-numerics surface.
     pub training_reference: bool,
-    /// Item 4 (`--fuse-lm-head`): whether the compiler may install a fused LM
-    /// head that no `@fused_lm_ce` decorator asked for.
-    ///
-    /// `--pretrain-optimized` selects `Auto`. `Require` turns an unprovable
-    /// chain into a compile error, which is what a certification lane wants:
-    /// silently paying for the `[rows, vocab]` logits surface is exactly the
-    /// failure this item exists to make impossible.
-    ///
-    /// Forced `Off` under `--training-reference`, alongside the decorator, so
-    /// the reference arm's numerics stay a single composite path.
-    pub lm_head_fusion: crate::lm_head_inference::LmHeadFusion,
+}
+
+/// Facts forwarded from semantic analysis: what the CLI bridge
+/// (`analysis_to_*` / `module_data_to_*` in `nsl-cli`) copies out of
+/// `nsl_semantic::AnalysisResult` for codegen — the per-function ownership
+/// metadata and the decorator configs (`@csha`, `@fused_lm_ce`,
+/// `@fused_kl_ce`, `@pca`). Not user flags: every field is empty on a
+/// hand-built `CompileOptions` and filled by the build paths before
+/// compile.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct AnalysisOptions {
+    /// M38a: Per-function ownership metadata from semantic analysis.
+    /// Keys are function names, values have linear_params and shared_params.
+    pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
+    /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
+    /// captured by the semantic checker, keyed by the decorated model's name
+    /// (the `<Type>` in `model <Type>:` or the LHS binding name in
+    /// `@csha let m = SomeModel()`).  The CSHA hook in
+    /// `nsl-codegen/src/stmt.rs::compile_train_block` looks up the current
+    /// `model_type_name` in this map and:
+    ///   * `disabled = true` -> skip the CSHA pipeline for that compile.
+    ///   * `level    = Some(L)` -> clamp the planner's `mode_str` to L.
+    ///   * `target   = Some(T)` -> override `csha::run_on_wengert`'s target.
+    /// Empty map = no `@csha` decorators in the program (the default), which
+    /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
+    pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
+    /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
+    /// nsl-semantic.  Empty when no decorator is present; codegen consults
+    /// the first `enabled = true` entry to gate the fused linear-CE
+    /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
+    pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
+    /// CPKD: `@fused_kl_ce(...)` decorator configs, one per decorated
+    /// distill block. Empty when no decorator is present.
+    pub fused_kl_ce_configs: Vec<FusedKlCeDecoratorConfig>,
+    /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca(strategy=...)` strategies
+    /// forwarded from nsl-semantic. Empty when no `@pca` decorator is
+    /// present. The CSHA training-PTX synthesis site consults this list
+    /// to flip `PerDocAdmitConfig::enable_per_doc_cta=true` when at least
+    /// one entry requests `PerDocument`.
+    /// Stored as the codegen-local `PcaUserStrategy` enum so nsl-codegen
+    /// does not depend directly on nsl-semantic types (mirrors the
+    /// `FusedCeDecoratorConfig` / `WrgaInputs` pattern).
+    pub pca_user_strategies: Vec<PcaUserStrategy>,
+}
+
+/// WRGA options: the decorator configs the CLI bridge forwards from
+/// nsl-semantic, the Milestone B.2 allocation folding switch, and the
+/// `nsl check --wrga-analyze | --wrga-compare` override context.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). `inputs` is
+/// `None` when WRGA is off; `check` is all-`None` on normal builds.
+#[derive(Clone, Default)]
+pub struct WrgaOptions {
+    /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
+    pub inputs: Option<WrgaInputs>,
+    /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
+    /// allocations (vs. B.1's observational-only path). Default false.
+    pub fold_allocations: bool,
+    /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
+    /// Carries the `--wrga-target` / `--wrga-ablate` overrides and the
+    /// `--wrga-compare` plan-capture slot. All-`None` on normal builds.
+    pub check: WrgaCheckContext,
+}
+
+/// Memory-planning options: the M36 VRAM budget and plan report, and the
+/// transient-arena placement (`--vram-budget`, `--memory-report`,
+/// `--transient-arena`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3).
+#[derive(Clone, Default)]
+pub struct MemoryOptions {
+    /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
+    pub vram_budget: Option<u64>,
+    /// M36: Print memory plan report to stderr
+    pub report: bool,
     /// Item 5 (`--transient-arena`): place admitted backward temporaries at
     /// fixed arena offsets instead of letting the caching allocator choose.
     ///
@@ -1796,6 +1814,81 @@ pub struct CompileOptions {
     /// jump from lower-bound analysis to placement that the staging exists to
     /// prevent.
     pub transient_arena: bool,
+}
+
+/// Compiler configuration flags passed from CLI.
+#[derive(Clone)]
+pub struct CompileOptions {
+    /// Kernel autotuning (`--no-autotune` / `--autotune-fresh`); see
+    /// [`AutotuneOptions`].
+    pub autotune: AutotuneOptions,
+    pub world_size: usize,
+    /// Fusion: the kill switch, `--fusion-report`, and the opt-in source-AD
+    /// fusions; see [`FusionOptions`].
+    pub fusion: FusionOptions,
+    /// Training diagnostics and reference modes; see [`DiagnosticsOptions`].
+    pub diagnostics: DiagnosticsOptions,
+    /// Memory planning: the VRAM budget, the plan report and the transient
+    /// arena; see [`MemoryOptions`].
+    pub memory: MemoryOptions,
+    /// M47: GPU compilation target name.
+    pub target: String,
+    /// M40: Use compile-time source-to-source AD for training (default: false = tape AD).
+    pub source_ad: bool,
+    /// M46: Enable deterministic mode.
+    pub deterministic: bool,
+    /// P0 certification: RNG seed for `randn`/`rand`/stochastic ops.
+    /// `None` keeps the historical behavior (seed 42 under
+    /// --deterministic, unseeded otherwise). `Some(s)` seeds the RNG at
+    /// program start regardless of --deterministic (multi-seed training
+    /// campaigns need distinct reproducible inits; bit-reproducibility of
+    /// the DEVICE path still requires --deterministic).
+    pub rng_seed: Option<u64>,
+    /// Weight-aware compilation (`--weights`, the M52 config, the analysis
+    /// report) and the `@export` weight-index map; see [`WeightsOptions`].
+    pub weights: WeightsOptions,
+    /// M54: Unikernel build configuration (None = normal build)
+    pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
+    /// M53: Worst-case-execution-time analysis / certification options.
+    pub wcet: WcetOptions,
+    /// M38a: Enable linear types ownership checking.
+    pub linear_types_enabled: bool,
+    /// Facts forwarded from semantic analysis (ownership metadata, the
+    /// `@csha` / `@fused_lm_ce` / `@fused_kl_ce` / `@pca` decorator configs);
+    /// see [`AnalysisOptions`].
+    pub analysis: AnalysisOptions,
+    /// M55: Zero-knowledge proof-circuit emission options.
+    pub zk: ZkOptions,
+    /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
+    /// [`ZeroOptions`].
+    pub zero: ZeroOptions,
+    /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
+    /// storage with counter-based stochastic rounding on the fused AdamW
+    /// update — no FP32 master copy. Rides the weight-stream residency
+    /// schedule (bf16 device mirrors, transient f32 working views).
+    pub param_dtype_bf16sr: bool,
+    /// Muon optimizer knobs (`--muon-batch-ns`, `--muon-resident-momentum`,
+    /// `--muon-state-dtype`); see [`MuonOptions`].
+    pub muon: MuonOptions,
+    /// P5 item 19 (`--cuda-graphs`): opportunistic per-region CUDA graph
+    /// capture/replay. Each Wengert lowering (forward CCR slice, CSLA
+    /// backward layer range, recompute segment) is bracketed with runtime
+    /// region markers; the runtime records the launch sequence, captures it
+    /// as a CUDA graph once it proves stable across steps, and replays it
+    /// with per-launch verification and eager self-repair on any divergence.
+    /// Optimizer updates and weight-stream transfers stay outside regions.
+    pub cuda_graphs: bool,
+    /// Item 4 (`--fuse-lm-head`): whether the compiler may install a fused LM
+    /// head that no `@fused_lm_ce` decorator asked for.
+    ///
+    /// `--pretrain-optimized` selects `Auto`. `Require` turns an unprovable
+    /// chain into a compile error, which is what a certification lane wants:
+    /// silently paying for the `[rows, vocab]` logits surface is exactly the
+    /// failure this item exists to make impossible.
+    ///
+    /// Forced `Off` under `--training-reference`, alongside the decorator, so
+    /// the reference arm's numerics stay a single composite path.
+    pub lm_head_fusion: crate::lm_head_inference::LmHeadFusion,
     /// Shape/value facts about model fields declared in imported modules
     /// (the multi-file build's dims/ranks/values channel); see
     /// [`ImportedModelOptions`].
@@ -1815,28 +1908,9 @@ pub struct CompileOptions {
     /// other module defining them too causes a "multiple definition"
     /// linker error when the objects are joined. Defaults to `false`.
     pub emit_export_table: bool,
-    /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
-    pub wrga_inputs: Option<WrgaInputs>,
-    /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
-    /// nsl-semantic.  Empty when no decorator is present; codegen consults
-    /// the first `enabled = true` entry to gate the fused linear-CE
-    /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
-    pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
-    /// CPKD: `@fused_kl_ce(...)` decorator configs, one per decorated
-    /// distill block. Empty when no decorator is present.
-    pub fused_kl_ce_configs: Vec<FusedKlCeDecoratorConfig>,
-    /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca(strategy=...)` strategies
-    /// forwarded from nsl-semantic. Empty when no `@pca` decorator is
-    /// present. The CSHA training-PTX synthesis site consults this list
-    /// to flip `PerDocAdmitConfig::enable_per_doc_cta=true` when at least
-    /// one entry requests `PerDocument`.
-    /// Stored as the codegen-local `PcaUserStrategy` enum so nsl-codegen
-    /// does not depend directly on nsl-semantic types (mirrors the
-    /// `FusedCeDecoratorConfig` / `WrgaInputs` pattern).
-    pub pca_user_strategies: Vec<PcaUserStrategy>,
-    /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
-    /// allocations (vs. B.1's observational-only path). Default false.
-    pub wrga_fold_allocations: bool,
+    /// WRGA: the forwarded decorator configs, the allocation folding switch
+    /// and the check-mode override context; see [`WrgaOptions`].
+    pub wrga: WrgaOptions,
     /// WGGO: weight-graph global-optimization options.
     pub wggo: WggoOptions,
     /// CFIE: compiler-fused inference-engine options.
@@ -1881,24 +1955,8 @@ pub struct CompileOptions {
     pub weight_stream: WeightStreamOptions,
     /// CSHA (compiler-specialized hardware attention) codegen options.
     pub csha: CshaOptions,
-    /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
-    /// captured by the semantic checker, keyed by the decorated model's name
-    /// (the `<Type>` in `model <Type>:` or the LHS binding name in
-    /// `@csha let m = SomeModel()`).  The CSHA hook in
-    /// `nsl-codegen/src/stmt.rs::compile_train_block` looks up the current
-    /// `model_type_name` in this map and:
-    ///   * `disabled = true` -> skip the CSHA pipeline for that compile.
-    ///   * `level    = Some(L)` -> clamp the planner's `mode_str` to L.
-    ///   * `target   = Some(T)` -> override `csha::run_on_wengert`'s target.
-    /// Empty map = no `@csha` decorators in the program (the default), which
-    /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
-    pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
     /// CPDT (compiler-planned distributed training) options.
     pub cpdt: CpdtOptions,
-    /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
-    /// Carries the `--wrga-target` / `--wrga-ablate` overrides and the
-    /// `--wrga-compare` plan-capture slot. All-`None` on normal builds.
-    pub wrga_check: WrgaCheckContext,
     /// M62: shared output slot the CLI reads after compile returns so it can
     /// emit a matching C header alongside the shared library. Populated by
     /// `Compiler::finalize` from `features.export_functions`.
@@ -2028,7 +2086,7 @@ impl CompileOptions {
             format!("fase_sumsq={}", on_unless_zero("NSL_FASE_BATCH_SUMSQ")),
             format!("fase_override={}", text("NSL_FASE_FUSED_OVERRIDE", "none")),
             format!("csha_save={}", text("NSL_CSHA_DUMP_SAVE_STATE", "off")),
-            format!("arena={}", b(self.transient_arena)),
+            format!("arena={}", b(self.memory.transient_arena)),
             format!("graphs={}", b(self.cuda_graphs)),
             format!("ckpt={ckpt}"),
             format!("offload={}", b(self.optim_state_offload)),
@@ -2060,38 +2118,28 @@ impl Default for CompileOptions {
         Self {
             autotune: AutotuneOptions::default(),
             world_size: 1,
+            memory: MemoryOptions::default(),
+            diagnostics: DiagnosticsOptions::default(),
             fusion: FusionOptions::default(),
-            vram_budget: None,
-            memory_report: false,
             target: "cuda".to_string(),
             source_ad: false,
-            trace_ops: false,
-            nan_analysis: false,
             deterministic: false,
             rng_seed: None,
             weights: WeightsOptions::default(),
             unikernel_config: None,
             wcet: WcetOptions::default(),
             linear_types_enabled: false,
-            ownership_info: HashMap::new(),
+            analysis: AnalysisOptions::default(),
             zk: ZkOptions::default(),
             zero: ZeroOptions::default(),
             param_dtype_bf16sr: false,
             muon: MuonOptions::default(),
             cuda_graphs: false,
-            debug_training: false,
-            grad_integrity: false,
-            training_reference: false,
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
-            transient_arena: false,
             imported_model: ImportedModelOptions::default(),
             shared_lib: false,
             emit_export_table: false,
-            wrga_inputs: None,
-            fused_ce_configs: Vec::new(),
-            fused_kl_ce_configs: Vec::new(),
-            pca_user_strategies: Vec::new(),
-            wrga_fold_allocations: false,
+            wrga: WrgaOptions::default(),
             wggo: WggoOptions::default(),
             cfie: CfieOptions::default(),
             dev_tools: DevToolsOptions::default(),
@@ -2103,9 +2151,7 @@ impl Default for CompileOptions {
             layerwise_accum: false,
             weight_stream: WeightStreamOptions::default(),
             csha: CshaOptions::default(),
-            csha_configs: HashMap::new(),
             cpdt: CpdtOptions::default(),
-            wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,
             calibration: CalibrationOptions::default(),
         }

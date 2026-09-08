@@ -124,7 +124,7 @@ impl Compiler<'_> {
             // zero and the value is that it stays that way.
             let grad_ptr = match grad_src {
                 crate::wengert_lower::ParamGradSource::FusedWgrad { x, g } => {
-                    if c.compile_options.grad_integrity {
+                    if c.compile_options.diagnostics.grad_integrity {
                         return Err(CodegenError::new(
                             "internal: --fuse-wgrad-accum reached lowering with \
                              --grad-integrity active. The fused chain never \
@@ -157,7 +157,7 @@ impl Compiler<'_> {
             };
             // P0.3: note this parameter's gradient BEFORE accumulate
             // frees/consumes it. accum_idx == the param_paths index.
-            if c.compile_options.grad_integrity {
+            if c.compile_options.diagnostics.grad_integrity {
                 c.compile_call_by_name(
                     b,
                     "nsl_grad_integrity_note",
@@ -184,7 +184,7 @@ impl Compiler<'_> {
         // every trainable param must be noted exactly once inside
         // it — anything else is a dropped or double-consumed
         // gradient, which is what the declared expectation catches.
-        let gi = self.compile_options.grad_integrity;
+        let gi = self.compile_options.diagnostics.grad_integrity;
         if gi {
             let one_note = builder.ins().iconst(cl_types::I64, 1);
             self.compile_call_by_name(

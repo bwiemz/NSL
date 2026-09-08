@@ -144,7 +144,10 @@ fn lower_and_resolve(
     let interner = Interner::new();
     let type_map: TypeMap = HashMap::new();
     let opts = CompileOptions {
-        fused_ce_configs: vec![cfg],
+        analysis: nsl_codegen::AnalysisOptions {
+            fused_ce_configs: vec![cfg],
+            ..Default::default()
+        },
         ..CompileOptions::default()
     };
 

@@ -1,6 +1,6 @@
 //! Task 3: WrgaInputs reach the Compiler context.
 //!
-//! Compile a minimal valid NSL module with `options.wrga_inputs = Some(...)`
+//! Compile a minimal valid NSL module with `options.wrga.inputs = Some(...)`
 //! and verify no panic/error; a later task asserts the plan runs.
 
 use nsl_codegen::{CompileOptions, FreezeDecoratorConfig, WrgaInputs};
@@ -23,13 +23,16 @@ fn wrga_inputs_reach_compiler_without_crashing() {
     );
 
     let opts = CompileOptions {
-        wrga_inputs: Some(WrgaInputs {
-            freeze: vec![FreezeDecoratorConfig {
-                exclude: vec!["blocks.6.*".into()],
-                include: vec![],
-            }],
+        wrga: nsl_codegen::WrgaOptions {
+            inputs: Some(WrgaInputs {
+                freeze: vec![FreezeDecoratorConfig {
+                    exclude: vec!["blocks.6.*".into()],
+                    include: vec![],
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         ..Default::default()
     };
     let _obj = nsl_codegen::compile_module(

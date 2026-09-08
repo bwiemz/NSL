@@ -1400,6 +1400,7 @@ pub fn run_on_wengert_with_weights(
     if memory_budget_bytes.is_some()
         && let Some(opts) = compile_options
         && let Some(cfg) = opts
+            .analysis
             .fused_ce_configs
             .iter()
             .find(|c| c.hidden_size.is_some() || c.batch_size.is_some() || c.seq_len.is_some())
@@ -1456,7 +1457,7 @@ pub fn run_on_wengert_with_weights(
     // are pure modeled cost) and the paper's mode=auto could never
     // materialize.
     if compile_options.is_some_and(|o| {
-        o.wrga_inputs
+        o.wrga.inputs
             .as_ref()
             .is_some_and(|w| !w.wrga.is_empty() || !w.adapter.is_empty())
     }) {

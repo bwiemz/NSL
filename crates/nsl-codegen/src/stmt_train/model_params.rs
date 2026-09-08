@@ -254,7 +254,7 @@ impl Compiler<'_> {
         // P0.3: arm the gradient-integrity exit report once, at train setup
         // (before the epoch/step loop), so --grad-integrity works with no env
         // var. The per-step check/note calls below feed the accumulator.
-        if self.compile_options.grad_integrity {
+        if self.compile_options.diagnostics.grad_integrity {
             self.compile_call_by_name(builder, "nsl_grad_integrity_arm", &[])?;
             // All three backward paths feed the accumulator now: FullBuffer
             // (whole-list scan), FASE-interleaved (per-micro brackets), and
@@ -543,7 +543,7 @@ impl Compiler<'_> {
                          --wggo-moment-precision / the CPDT precision plan)",
                     ));
                 }
-                if self.compile_options.training_reference {
+                if self.compile_options.diagnostics.training_reference {
                     return Err(CodegenError::new(
                         "--param-dtype bf16-sr requires the fused optimizer \
                          step, which --training-reference disables",

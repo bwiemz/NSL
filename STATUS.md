@@ -165,7 +165,16 @@ The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
 (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
-`WeightsOptions`, `FusionOptions`, …). The fusion flags moved into
+`WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, `MemoryOptions`,
+`WrgaOptions`, `AnalysisOptions`, …). The semantic-analysis facts moved into
+`AnalysisOptions` (`opts.analysis.{ownership_info, csha_configs,
+fused_ce_configs, fused_kl_ce_configs, pca_user_strategies}`). The WRGA
+cluster moved into `WrgaOptions` (`opts.wrga.{inputs,
+fold_allocations, check}`). The
+memory-planning knobs moved into `MemoryOptions` (`opts.memory.{vram_budget,
+report, transient_arena}`). The training
+diagnostics moved into `DiagnosticsOptions` (`opts.diagnostics.{trace_ops,
+nan_analysis, debug_training, grad_integrity, training_reference}`). The fusion flags moved into
 `FusionOptions` (`opts.fusion.{disabled, report, rmsnorm_backward, wgrad_accum,
 wgrad_accum_from_bundle}`). The autotune flags moved into `AutotuneOptions`
 (`opts.autotune.{disabled, fresh}`) and the weight-aware cluster into

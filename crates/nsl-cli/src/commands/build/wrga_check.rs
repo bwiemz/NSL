@@ -43,7 +43,7 @@ fn wrga_check_context(
 /// `wrga_target` (optional) overrides the `target=` field on every
 /// `@wrga(...)` decorator before codegen — so `--wrga-target h100` from the
 /// CLI wins over any source-level `@wrga(target="a100")`. The override travels
-/// on `opts.wrga_check.target_override` and is applied to `WrgaInputs` by the
+/// on `opts.wrga.check.target_override` and is applied to `WrgaInputs` by the
 /// CLI WRGA bridge (`pipeline::apply_wrga_check_overrides`).
 ///
 /// Returns the process exit code: `0` on success, `2` on "no WRGA decorators
@@ -85,11 +85,14 @@ pub(crate) fn run_check_wrga_analyze(
     let temp_obj = temp_dir.join(format!("{stem}.o"));
 
     // The target / ablation overrides travel explicitly on
-    // `opts.wrga_check`; the WRGA bridge reads them when building `WrgaInputs`.
+    // `opts.wrga.check`; the WRGA bridge reads them when building `WrgaInputs`.
     // No capture slot — analyze renders via the `--wrga-report` path below.
     let opts = nsl_codegen::CompileOptions {
         source_ad: true,
-        wrga_check: wrga_check_context(wrga_target, ablation, None),
+        wrga: nsl_codegen::WrgaOptions {
+            check: wrga_check_context(wrga_target, ablation, None),
+            ..Default::default()
+        },
         ..nsl_codegen::CompileOptions::default()
     };
 
@@ -131,7 +134,7 @@ pub(crate) fn run_check_wrga_analyze(
 /// against LoRA / AdaLoRA / GaLore / ReFT) without leaving a `.o` behind.
 ///
 /// Plumbing mirrors `run_check_wrga_analyze` exactly, except:
-/// 1. `opts.wrga_check.plan_capture` is populated with a shared slot before
+/// 1. `opts.wrga.check.plan_capture` is populated with a shared slot before
 ///    invoking the build, so the plan can be pulled back out after
 ///    `run_build_inner` returns (mirrors `CpdtOptions::plan_out`).
 /// 2. `wrga_report` is passed as `None`, suppressing the normal analyze
@@ -190,7 +193,10 @@ pub(crate) fn run_check_wrga_compare(
 
     let opts = nsl_codegen::CompileOptions {
         source_ad: true,
-        wrga_check: wrga_check_context(wrga_target, ablation, Some(plan_capture.clone())),
+        wrga: nsl_codegen::WrgaOptions {
+            check: wrga_check_context(wrga_target, ablation, Some(plan_capture.clone())),
+            ..Default::default()
+        },
         ..nsl_codegen::CompileOptions::default()
     };
 

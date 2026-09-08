@@ -165,6 +165,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the facts
+  the CLI bridge forwards from semantic analysis moved into
+  `AnalysisOptions` (`opts.analysis.{ownership_info, csha_configs,
+  fused_ce_configs, fused_kl_ce_configs, pca_user_strategies}`: the
+  per-function ownership metadata and the `@csha` / `@fused_lm_ce` /
+  `@fused_kl_ce` / `@pca` decorator configs). Pure rename; defaults
+  unchanged. 39 → 35 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the WRGA
+  cluster moved into `WrgaOptions` (`opts.wrga.{inputs, fold_allocations,
+  check}`: the decorator configs the CLI bridge forwards from nsl-semantic,
+  `--wrga-fold-allocations`, and the `nsl check --wrga-analyze |
+  --wrga-compare` override context). Pure rename; defaults unchanged.
+  41 → 39 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  memory-planning knobs moved into `MemoryOptions` (`opts.memory.{vram_budget,
+  report, transient_arena}` for `--vram-budget` / `--memory-report` /
+  `--transient-arena`). Pure rename; defaults unchanged; the execution
+  fingerprint reads `arena` through the new path. 43 → 41 flat fields.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the training
+  diagnostics moved into `DiagnosticsOptions` (`opts.diagnostics.{trace_ops,
+  nan_analysis, debug_training, grad_integrity, training_reference}` for
+  `--trace-ops` / `--nan-analysis` / `--debug-training` / `--grad-integrity`
+  / `--training-reference`; field names unchanged). Pure rename; defaults
+  unchanged. 47 → 43 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the fusion
   flags moved into `FusionOptions` (`opts.fusion.{disabled, report,
   rmsnorm_backward, wgrad_accum, wgrad_accum_from_bundle}` for
