@@ -96,7 +96,7 @@ impl Compiler<'_> {
         let ccr_segment_free: Option<CcrSegmentFree> = match ccr_plan {
             Some(plan)
                 if ws_fwd_plan.is_none()
-                    && !self.compile_options.layerwise_accum
+                    && !self.compile_options.train.layerwise_accum
                     && std::env::var("NSL_CCR_SEGMENT_FREE").as_deref()
                         != Ok("0") =>
             {

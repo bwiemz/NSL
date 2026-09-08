@@ -195,7 +195,7 @@ impl Compiler<'_> {
                      uses '{optimizer_name}'). Drop the flag"
                 )));
             }
-            if self.compile_options.layerwise_accum {
+            if self.compile_options.train.layerwise_accum {
                 return Err(CodegenError::new(
                     "--muon-batch-ns does not compose with --layerwise-accum \
                      yet: CSLA fires per-layer group updates at window \
@@ -203,7 +203,7 @@ impl Compiler<'_> {
                      the accumulation discipline. Drop one of the flags",
                 ));
             }
-            if self.compile_options.optim_state_offload {
+            if self.compile_options.train.optim_state_offload {
                 return Err(CodegenError::new(
                     "--muon-batch-ns does not compose with \
                      --optim-state-offload: the batched kernels update the \
@@ -219,7 +219,7 @@ impl Compiler<'_> {
                      directly. Drop one of the flags",
                 ));
             }
-            if self.compile_options.param_dtype_bf16sr {
+            if self.compile_options.train.param_dtype_bf16sr {
                 return Err(CodegenError::new(
                     "--muon-batch-ns does not compose with --param-dtype \
                      bf16-sr: the batched kernels read/write f32 params \
@@ -244,7 +244,7 @@ impl Compiler<'_> {
                      (train block uses '{optimizer_name}'). Drop the flag"
                 )));
             }
-            if !self.compile_options.optim_state_offload {
+            if !self.compile_options.train.optim_state_offload {
                 return Err(CodegenError::new(
                     "--muon-resident-momentum is only meaningful with \
                      --optim-state-offload (without offload the momentum is \
@@ -416,7 +416,7 @@ impl Compiler<'_> {
         // momentum buffer itself) is intentionally NOT this mode; it would
         // ship as a separately named mode when it lands.
         let mut plan = plan;
-        if optimizer_name == "muon" && self.compile_options.layerwise_accum {
+        if optimizer_name == "muon" && self.compile_options.train.layerwise_accum {
             plan.mode = crate::fase::FaseMode::Deferred;
             plan.recipe.accum_scale = 1.0;
             plan.rationale = format!(

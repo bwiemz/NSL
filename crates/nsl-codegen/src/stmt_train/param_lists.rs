@@ -245,7 +245,7 @@ impl Compiler<'_> {
             // hook-skipped — so a NULL slot is never read between windows.)
             let zeros = if csla_active {
                 builder.ins().iconst(cl_types::I64, 0)
-            } else if self.compile_options.optim_state_offload {
+            } else if self.compile_options.train.optim_state_offload {
                 self.compile_call_by_name(builder, "nsl_tensor_zeros_like_host_f32", &[p])?
             } else {
                 self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?
