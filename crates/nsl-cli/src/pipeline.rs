@@ -29,7 +29,7 @@ pub(crate) fn frontend_with_source_map(
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: could not read file '{}': {e}", file.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
             process::exit(1);
         }
     };
@@ -73,7 +73,7 @@ pub(crate) fn frontend_with_source_map(
         .count();
 
     if total_errors > 0 {
-        eprintln!("{total_errors} error(s) found");
+        nsl_runtime::nsl_log!(ERROR, "cli", "{total_errors} error(s) found");
         process::exit(1);
     }
 
@@ -100,11 +100,11 @@ pub(crate) fn exit_on_codegen_error(
         }
         _ => {
             match context {
-                Some(ctx) => eprintln!("codegen error {ctx}: {e}"),
-                None => eprintln!("codegen error: {e}"),
+                Some(ctx) => nsl_runtime::nsl_log!(ERROR, "cli", "codegen error {ctx}: {e}"),
+                None => nsl_runtime::nsl_log!(ERROR, "cli", "codegen error: {e}"),
             }
             for note in &e.notes {
-                eprintln!("  = note: {note}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "  = note: {note}");
             }
         }
     }

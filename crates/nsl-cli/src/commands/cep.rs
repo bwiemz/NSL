@@ -78,7 +78,7 @@ pub(crate) fn run_cep_prune(
     use nsl_codegen::cep_extract::{cross_check_dims, extract_model_spec};
 
     let Some(weights_path) = weights else {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: --cep-prune requires --weights <file.safetensors> \
              (a prune from synthetic scores would be silently wrong)"
         );
@@ -105,7 +105,7 @@ pub(crate) fn run_cep_prune(
     let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
 
     let Some(deco) = find_cep_decorator(module, &interner, "cep_prune") else {
-        eprintln!("error: --cep-prune requires a @cep_prune(...) decorator on the model");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: --cep-prune requires a @cep_prune(...) decorator on the model");
         return 1;
     };
     let mut diags = Vec::new();
@@ -123,7 +123,7 @@ pub(crate) fn run_cep_prune(
     let spec = match extract_model_spec(module, &resolve) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
             return 1;
         }
     };
@@ -131,12 +131,12 @@ pub(crate) fn run_cep_prune(
     let wm = match nsl_codegen::weight_aware::WeightMap::load(weights_path) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("error: failed to load weights: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to load weights: {e}");
             return 1;
         }
     };
     if let Err(e) = cross_check_dims(&spec, &wm, &resolve) {
-        eprintln!("{e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
         return 1;
     }
 
@@ -145,7 +145,7 @@ pub(crate) fn run_cep_prune(
         match nsl_codegen::cep::build_prune_input(&cfg, spec.clone(), Some(&wm), &target, ov.sparsity) {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("{e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
                 return 1;
             }
         };
@@ -154,7 +154,7 @@ pub(crate) fn run_cep_prune(
 
     let out_path = ov.cep_out.clone().unwrap_or_else(|| default_cep_out(file));
     if let Err(e) = nsl_codegen::cep::write_prune_delta(&plan, &spec, &out_path) {
-        eprintln!("error: failed to write delta: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to write delta: {e}");
         return 1;
     }
     println!("CEP delta written to {}", out_path.display());
@@ -166,7 +166,7 @@ pub(crate) fn run_cep_prune(
                 let orig_params: usize = wm.entries().map(|(_, e)| e.num_elements).sum();
                 let new_params: usize = sliced.values().map(|e| e.num_elements).sum();
                 if let Err(e) = nsl_codegen::cep_slice::write_sliced_weights(&sliced, weights_out) {
-                    eprintln!("error: failed to write sliced weights: {e}");
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to write sliced weights: {e}");
                     return 1;
                 }
                 println!(
@@ -175,7 +175,7 @@ pub(crate) fn run_cep_prune(
                 );
             }
             Err(e) => {
-                eprintln!("{e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
                 return 1;
             }
         }
@@ -187,7 +187,7 @@ pub(crate) fn run_cep_prune(
         let original_source = match std::fs::read_to_string(file) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("error: failed to re-read source for SP2 emission: {e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to re-read source for SP2 emission: {e}");
                 return 1;
             }
         };
@@ -200,13 +200,13 @@ pub(crate) fn run_cep_prune(
         ) {
             Ok(out_src) => {
                 if let Err(e) = std::fs::write(source_out, &out_src) {
-                    eprintln!("error: failed to write rewritten source: {e}");
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to write rewritten source: {e}");
                     return 1;
                 }
                 println!("CEP rewritten source written to {}", source_out.display());
             }
             Err(e) => {
-                eprintln!("{e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
                 return 1;
             }
         }
@@ -226,7 +226,7 @@ pub(crate) fn run_cep_joint(
     use nsl_codegen::cep_extract::{cross_check_dims, extract_model_spec};
 
     let Some(weights_path) = weights else {
-        eprintln!(
+        nsl_runtime::nsl_log!(ERROR, "cli", 
             "error: --cep-joint requires --weights <file.safetensors> \
              (joint search without weight-derived importance would be silently wrong)"
         );
@@ -249,7 +249,7 @@ pub(crate) fn run_cep_joint(
     let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
 
     let Some(deco) = find_cep_decorator(module, &interner, "cep_prune") else {
-        eprintln!("error: --cep-joint requires a @cep_prune(...) decorator on the model");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: --cep-joint requires a @cep_prune(...) decorator on the model");
         return 1;
     };
     let mut diags = Vec::new();
@@ -265,7 +265,7 @@ pub(crate) fn run_cep_joint(
     let spec = match extract_model_spec(module, &resolve) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
             return 1;
         }
     };
@@ -273,12 +273,12 @@ pub(crate) fn run_cep_joint(
     let wm = match nsl_codegen::weight_aware::WeightMap::load(weights_path) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("error: failed to load weights: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to load weights: {e}");
             return 1;
         }
     };
     if let Err(e) = cross_check_dims(&spec, &wm, &resolve) {
-        eprintln!("{e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
         return 1;
     }
 
@@ -292,7 +292,7 @@ pub(crate) fn run_cep_joint(
     ) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("{e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
             return 1;
         }
     };
@@ -301,7 +301,7 @@ pub(crate) fn run_cep_joint(
 
     let out_path = ov.cep_out.clone().unwrap_or_else(|| default_cep_out(file));
     if let Err(e) = nsl_codegen::cep::write_prune_delta(&plan, &spec, &out_path) {
-        eprintln!("error: failed to write delta: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to write delta: {e}");
         return 1;
     }
     println!("CEP joint delta written to {}", out_path.display());
@@ -314,7 +314,7 @@ pub(crate) fn run_cep_joint(
                 let new_params: usize = sliced.values().map(|e| e.num_elements).sum();
                 if let Err(e) = nsl_codegen::cep_slice::write_sliced_weights(&sliced, weights_out)
                 {
-                    eprintln!("error: failed to write sliced weights: {e}");
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to write sliced weights: {e}");
                     return 1;
                 }
                 println!(
@@ -323,7 +323,7 @@ pub(crate) fn run_cep_joint(
                 );
             }
             Err(e) => {
-                eprintln!("{e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
                 return 1;
             }
         }
@@ -350,7 +350,7 @@ pub(crate) fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides
     let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
 
     let Some(deco) = find_cep_decorator(module, &interner, "cep_search") else {
-        eprintln!("error: --cep-search requires a @cep_search(...) decorator on the model");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: --cep-search requires a @cep_search(...) decorator on the model");
         return 1;
     };
     let mut diags = Vec::new();
@@ -366,7 +366,7 @@ pub(crate) fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides
     let axes = match extract_search_axes(module, &resolve) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("{e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
             return 1;
         }
     };
@@ -374,7 +374,7 @@ pub(crate) fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides
     let input = match nsl_codegen::cep::build_search_input(&cfg, axes, &target) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("{e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
             return 1;
         }
     };
@@ -383,7 +383,7 @@ pub(crate) fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides
 
     let out_path = ov.cep_out.clone().unwrap_or_else(|| default_cep_out(file));
     if let Err(e) = nsl_codegen::cep::write_search_delta(&plan, &out_path) {
-        eprintln!("error: failed to write delta: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to write delta: {e}");
         return 1;
     }
     println!("CEP delta written to {}", out_path.display());
@@ -417,7 +417,7 @@ pub(crate) fn run_cep_profile(
     let spec = match extract_model_spec(module, &resolve) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
             return 1;
         }
     };
@@ -427,12 +427,12 @@ pub(crate) fn run_cep_profile(
         let wm = match nsl_codegen::weight_aware::WeightMap::load(weights_path) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("error: failed to load weights: {e}");
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to load weights: {e}");
                 return 1;
             }
         };
         if let Err(e) = cross_check_dims(&spec, &wm, &resolve) {
-            eprintln!("{e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "{e}");
             return 1;
         }
     }
@@ -441,7 +441,7 @@ pub(crate) fn run_cep_profile(
     let gpu = match nsl_codegen::gpu_specs::find_gpu(&target) {
         Some(g) => g,
         None => {
-            eprintln!(
+            nsl_runtime::nsl_log!(ERROR, "cli", 
                 "error: unknown CEP target '{}'. Supported: {}",
                 target,
                 nsl_codegen::cep::supported_gpus_list()
@@ -452,7 +452,7 @@ pub(crate) fn run_cep_profile(
     let profile = match nsl_codegen::cep_oracle::evaluate(&spec, gpu) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: CEP oracle failed: {e:?}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: CEP oracle failed: {e:?}");
             return 1;
         }
     };

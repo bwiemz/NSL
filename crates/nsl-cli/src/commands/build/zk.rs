@@ -66,15 +66,15 @@ pub(crate) fn run_build_zk(
 
     // M55c: Write ZK proof files alongside the binary
     if zk_proof_fns.is_empty() {
-        eprintln!("[nsl/zk] no @zk_proof functions found — ZK circuit output skipped");
+        nsl_runtime::nsl_log!(WARN, "zk", "[nsl/zk] no @zk_proof functions found — ZK circuit output skipped");
     } else {
-        eprintln!(
+        nsl_runtime::nsl_log!(INFO, "zk", 
             "[nsl/zk] found {} @zk_proof function(s):",
             zk_proof_fns.len()
         );
 
         if let Some(wpath) = zk_weights {
-            eprintln!("[nsl/zk]   weights: {}", wpath.display());
+            nsl_runtime::nsl_log!(INFO, "zk", "[nsl/zk]   weights: {}", wpath.display());
         }
 
         for (fn_name, result) in &zk_results {
@@ -85,9 +85,9 @@ pub(crate) fn run_build_zk(
             if let Some(ref proof) = result.proof {
                 let proof_path = file.with_extension(format!("{}.proof", fn_name));
                 if let Err(e) = std::fs::write(&proof_path, &proof.data) {
-                    eprintln!("[nsl/zk] error writing proof: {e}");
+                    nsl_runtime::nsl_log!(ERROR, "zk", "[nsl/zk] error writing proof: {e}");
                 } else {
-                    eprintln!("[nsl/zk]   proof: {} ({} bytes, {} folds)",
+                    nsl_runtime::nsl_log!(INFO, "zk", "[nsl/zk]   proof: {} ({} bytes, {} folds)",
                         proof_path.display(), proof.data.len(), proof.num_folds);
                 }
 
@@ -101,9 +101,9 @@ pub(crate) fn run_build_zk(
                     pi_entries.join(","), proof.num_folds
                 );
                 if let Err(e) = std::fs::write(&pi_path, &pi_json) {
-                    eprintln!("[nsl/zk] error writing public inputs: {e}");
+                    nsl_runtime::nsl_log!(ERROR, "zk", "[nsl/zk] error writing public inputs: {e}");
                 } else {
-                    eprintln!("[nsl/zk]   public inputs: {}", pi_path.display());
+                    nsl_runtime::nsl_log!(INFO, "zk", "[nsl/zk]   public inputs: {}", pi_path.display());
                 }
             }
         }
@@ -114,13 +114,13 @@ pub(crate) fn run_build_zk(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_else(|| {
-            eprintln!("error: invalid input filename '{}'", file.display());
+            nsl_runtime::nsl_log!(ERROR, "cli", "error: invalid input filename '{}'", file.display());
             process::exit(1);
         });
     let obj_path = file.with_file_name(format!("{stem}.o"));
 
     if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-        eprintln!("error: could not write object file: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write object file: {e}");
         process::exit(1);
     }
 
@@ -144,7 +144,7 @@ pub(crate) fn run_build_zk(
             println!("Built {}", exe_path.display());
         }
         Err(e) => {
-            eprintln!("link error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
     }
@@ -157,7 +157,7 @@ pub(crate) fn run_zk_cmd(cmd: crate::args::ZkCmd) {
             match std::fs::read(&file) {
                 Ok(data) => {
                     if data.len() < 12 {
-                        eprintln!("[nsl/zk] invalid proof file: too short ({} bytes)", data.len());
+                        nsl_runtime::nsl_log!(ERROR, "zk", "[nsl/zk] invalid proof file: too short ({} bytes)", data.len());
                         process::exit(1);
                     }
                     let num_folds = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -171,25 +171,25 @@ pub(crate) fn run_zk_cmd(cmd: crate::args::ZkCmd) {
                     println!("  SC rounds:   {}", num_rounds);
                 }
                 Err(e) => {
-                    eprintln!("error reading {}: {e}", file.display());
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error reading {}: {e}", file.display());
                     process::exit(1);
                 }
             }
         }
         crate::args::ZkCmd::Prove { file, pk: _, input: _, output } => {
             // For the folding backend, proofs are generated during compilation.
-            eprintln!("[nsl/zk] For the folding backend, proofs are generated during `nsl build --zk-circuit`.");
-            eprintln!("[nsl/zk] The proof file is written alongside the binary as <file>.<fn_name>.proof");
+            nsl_runtime::nsl_log!(INFO, "zk", "[nsl/zk] For the folding backend, proofs are generated during `nsl build --zk-circuit`.");
+            nsl_runtime::nsl_log!(INFO, "zk", "[nsl/zk] The proof file is written alongside the binary as <file>.<fn_name>.proof");
             if let Some(ref out) = output {
-                eprintln!("[nsl/zk] Requested output: {}", out.display());
+                nsl_runtime::nsl_log!(INFO, "zk", "[nsl/zk] Requested output: {}", out.display());
             }
-            eprintln!("[nsl/zk] To generate a proof, run: nsl build --zk-circuit {}", file.display());
+            nsl_runtime::nsl_log!(INFO, "zk", "[nsl/zk] To generate a proof, run: nsl build --zk-circuit {}", file.display());
         }
         crate::args::ZkCmd::Verify { vk: _, proof, public: _ } => {
             match std::fs::read(&proof) {
                 Ok(data) => {
                     if data.len() < 12 {
-                        eprintln!("INVALID: proof file too short ({} bytes)", data.len());
+                        nsl_runtime::nsl_log!(ERROR, "cli", "INVALID: proof file too short ({} bytes)", data.len());
                         process::exit(1);
                     }
 
@@ -218,13 +218,13 @@ pub(crate) fn run_zk_cmd(cmd: crate::args::ZkCmd) {
                             process::exit(1);
                         }
                         Err(e) => {
-                            eprintln!("VERIFICATION ERROR: {e}");
+                            nsl_runtime::nsl_log!(ERROR, "cli", "VERIFICATION ERROR: {e}");
                             process::exit(1);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("error reading {}: {e}", proof.display());
+                    nsl_runtime::nsl_log!(ERROR, "cli", "error reading {}: {e}", proof.display());
                     process::exit(1);
                 }
             }
