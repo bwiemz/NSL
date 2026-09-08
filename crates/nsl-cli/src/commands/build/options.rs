@@ -619,8 +619,16 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     .as_deref()
                     .and_then(nsl_codegen::lm_head_inference::LmHeadFusion::parse)
                     .unwrap_or_default(),
-                shared_lib,
-                emit_export_table: shared_lib,
+                export: nsl_codegen::ExportOptions {
+                    shared_lib,
+                    // The single-file shared-lib path emits the export table
+                    // from its one object; the multi-file path clears this on
+                    // every non-entry module (shared_lib.rs).
+                    emit_table: shared_lib,
+                    // Filled by the shared-lib build path with the slot it reads
+                    // back for the C header.
+                    functions_out: None,
+                },
                 wggo: nsl_codegen::WggoOptions {
                     mode: wggo.clone(),
                     report: wggo_report,
@@ -659,7 +667,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // CompileOptions with a populated `wrga.check` (wrga_check.rs).
                     check: nsl_codegen::WrgaCheckContext::default(),
                 },
-                export_functions_out: None,
                 calibration: nsl_codegen::CalibrationOptions {
                     data: calibration_data.clone(),
                     mode: Some(calibrate.clone()),

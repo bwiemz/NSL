@@ -142,6 +142,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`emit_optimizer_step`, fed by an `OptimizerStepInputs`). 987 lines out of
   the driver, no escaping binding; the train-block CLIF snapshots are
   unchanged.
+- `CompileOptions` decomposition continued (roadmap A5 step 3): the
+  shared-library export trio moved into `ExportOptions`
+  (`opts.export.{shared_lib, emit_table, functions_out}` for `--shared-lib`,
+  the export-table emitter decision and the `@export` C-header slot;
+  `emit_export_table` → `emit_table`, `export_functions_out` →
+  `functions_out`). Pure rename; defaults unchanged. 35 → 33 flat fields.
 - `CompileOptions` decomposition continued (roadmap A5 step 3): the facts
   the CLI bridge forwards from semantic analysis moved into
   `AnalysisOptions` (`opts.analysis.{ownership_info, csha_configs,
