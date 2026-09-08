@@ -116,6 +116,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): the WRGA
+  adapter sites of the source-AD arm — the override-rejected diagnostics,
+  the adapter init side-table and the adapter-tensor loads into the VarMap
+  — moved byte-for-byte into `stmt_train/adapter_sites.rs`
+  (`emit_wrga_adapter_sites`, fed by an `AdapterSitesInputs`). 158
+  lines out of the driver; the train-block CLIF snapshots are unchanged.
+  The pass-bus channel inventory names the new file as the
+  `adapter_prescan_plan` consumer.
 - `compile_train_block_inner` peel continued (roadmap A1): the WRGA driver
   run and the CPDT planning site of the source-AD arm — the WRGA driver
   under `PassScheduler::schedule` (pruning / rank allocation / fusion), the

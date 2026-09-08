@@ -520,7 +520,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         name: "adapter_prescan_plan",
         producer: "WRGA",
         carries: "crate::wrga::WrgaPlan",
-        consumers: &["crates/nsl-codegen/src/stmt.rs"],
+        consumers: &["crates/nsl-codegen/src/stmt_train/adapter_sites.rs"],
         empty_means: "the prescan did not run (no adapter decorators), so \
                       train-block adapter injection has nothing to apply",
         consumed_by_passes: &[],
