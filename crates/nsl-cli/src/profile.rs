@@ -166,7 +166,7 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         std::fs::write(html_path, html).map_err(|e| {
             format!("could not write HTML report '{}': {}", html_path.display(), e)
         })?;
-        eprintln!("[nsl] HTML profile report written to {}", html_path.display());
+        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] HTML profile report written to {}", html_path.display());
     }
 
     if args.explain_wggo {
@@ -250,12 +250,12 @@ fn try_capture_real(
     );
     if captures.is_none() {
         match &result {
-            Err(e) => eprintln!(
+            Err(e) => nsl_runtime::nsl_log!(INFO, "cli", 
                 "note: real train-block extraction unavailable ({}); using the \
                  labeled synthetic/approximate profile paths",
                 e.message
             ),
-            Ok(_) => eprintln!(
+            Ok(_) => nsl_runtime::nsl_log!(INFO, "cli", 
                 "note: no source-AD train block in this program; using the \
                  labeled synthetic/approximate profile paths"
             ),

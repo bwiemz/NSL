@@ -30,9 +30,9 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
 
     if tests.is_empty() {
         if let Some(f) = filter {
-            eprintln!("no tests match filter '{f}'");
+            nsl_runtime::nsl_log!(ERROR, "cli", "no tests match filter '{f}'");
         } else {
-            eprintln!("no @test functions found");
+            nsl_runtime::nsl_log!(ERROR, "cli", "no @test functions found");
         }
         process::exit(1);
     }
@@ -40,7 +40,7 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
     // Write object file and link to a temp executable
     let temp_dir = std::env::temp_dir().join(format!("nsl_test_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        eprintln!("error: could not create temp dir: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
         process::exit(1);
     }
 
@@ -57,7 +57,7 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
     let exe_path = temp_dir.join(&exe_name);
 
     if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-        eprintln!("error: could not write object file: {e}");
+        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write object file: {e}");
         process::exit(1);
     }
 
@@ -67,7 +67,7 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
             let _ = std::fs::remove_file(&obj_path);
         }
         Err(e) => {
-            eprintln!("link error: {e}");
+            nsl_runtime::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
     }
@@ -81,7 +81,7 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
             .args(["--run", test_name])
             .output()
             .unwrap_or_else(|e| {
-                eprintln!("error: could not execute '{}': {e}", exe_path.display());
+                nsl_runtime::nsl_log!(ERROR, "cli", "error: could not execute '{}': {e}", exe_path.display());
                 process::exit(1);
             });
 

@@ -255,7 +255,7 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 51 `pub` fields today. The decomposition into cohesive
+The struct has 47 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
 (`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
@@ -284,12 +284,16 @@ keep their own copies), `AutotuneOptions` (`opts.autotune`: `disabled` /
 `fresh` for `--no-autotune` / `--autotune-fresh`), `WeightsOptions`
 (`opts.weights`: the `--weights` `file`, the M52 weight-aware `config`,
 the `nsl check --weight-analysis` report flag `analysis`, and the `@export`
-`index_map` the CLI fills from `AnalysisResult.weight_index_map`), plus
+`index_map` the CLI fills from `AnalysisResult.weight_index_map`),
+`FusionOptions` (`opts.fusion`: the `disabled` kill switch, the
+`--fusion-report` `report` flag, and the opt-in source-AD fusions
+`rmsnorm_backward` / `wgrad_accum` / `wgrad_accum_from_bundle`; the `@fuse`
+kernel path reads the first two through `FusionState`), plus
 `MatmulConfig`
 (`opts.matmul`) and
 `WrgaCheckContext` (`opts.wrga_check`, which retired the CLI's WRGA
 thread-locals — see compiler-state.md Phase 2). Everything else is still a
-flat field (`source_ad`, `deterministic`, `target`, `disable_fusion`,
+flat field (`source_ad`, `deterministic`, `target`, `world_size`,
 `vram_budget`, `memory_report`, `target_gpu`, `dtype`, …). New options
 belong in a sub-struct when they share a subsystem; otherwise a flat field
 is acceptable but should carry a doc comment naming the flag.
@@ -816,7 +820,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`, `ZkOptions`,
    `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
    `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
-   `AutotuneOptions`, `WeightsOptions`, `MatmulConfig`) when one exists — with its
+   `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `MatmulConfig`) when one exists — with its
    default in `impl Default for CompileOptions` (or the sub-struct's).
 2. Declare the clap flag in `crates/nsl-cli/src/args.rs`. Shared flags are
    declared twice (`BuildArgs`, `RunArgs`) and must be identical; a flag
