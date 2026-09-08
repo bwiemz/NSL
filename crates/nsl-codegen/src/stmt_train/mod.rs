@@ -33,6 +33,11 @@
 //!     mode-table / FASE-deferred / stdlib step arms, the ZeRO reduce and
 //!     sync, and the post-optimizer cleanup, fed by an
 //!     [`optimizer_step::OptimizerStepInputs`].
+//!   - [`primal_vars`] — section 3 of the source-AD arm: the initial
+//!     `VarMap` (named inputs / parameters to their Cranelift values, the
+//!     input device guards, the nested parameter and frozen teacher loads,
+//!     the CPKD report facts), fed by a [`primal_vars::PrimalVarsInputs`]
+//!     and returning the map.
 //!   - [`source_ad_grads`] — section 8 of the source-AD arm: the
 //!     parameter-gradient list (or the FASE-hook null sentinel) and the
 //!     ownership sweep of the lowering's intermediates, fed by a
@@ -60,5 +65,6 @@ pub(crate) mod epoch_close;
 pub(crate) mod identity;
 pub(crate) mod optimizer_step;
 pub(crate) mod param_lists;
+pub(crate) mod primal_vars;
 pub(crate) mod source_ad_grads;
 pub(crate) mod teardown;

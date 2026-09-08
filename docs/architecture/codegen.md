@@ -118,7 +118,7 @@ is the shortest readable copy of the sequence.
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~5.7k-line driver. Its shape, in the order the
+`compile_train_block_inner`, a ~5.5k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in
@@ -130,7 +130,11 @@ driver runs it:
 4. Parameter lists (`src/stmt_train/param_lists.rs`: `muon_route_flags`,
    `decay_exempt_flags`, `alloc_grad_accum_buffers`).
 5. Epoch/batch loops; forward extraction into a `WengertList` by
-   `WengertExtractor` (`src/source_ad.rs`); the in-pipeline passes, each under
+   `WengertExtractor` (`src/source_ad.rs`), then the initial primal
+   `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named
+   inputs / parameters to their Cranelift values, the input device guards,
+   the nested parameter and frozen teacher loads, the CPKD report facts);
+   the in-pipeline passes, each under
    `PassScheduler::schedule`: CPKD, WGGO (with the tape), CSHA, WRGA (with
    the tape), CPDT, CCR, and the transient-arena `MemoryPlanner` (with the
    adjoint). PCA and WGGO's prepass run earlier, in

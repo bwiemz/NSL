@@ -116,6 +116,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `compile_train_block_inner` peel continued (roadmap A1): section 3 of
+  the source-AD arm — the initial primal `VarMap` (the two name-order
+  passes, the input device guards, the step parameter, the nested
+  model-parameter and frozen teacher loads, the CPKD report facts) — moved
+  byte-for-byte into `stmt_train/primal_vars.rs` (`emit_primal_vars`, fed by
+  a `PrimalVarsInputs`, returning the map). 239 lines out of the driver;
+  the train-block CLIF snapshots are unchanged.
 - `compile_train_block_inner` peel continued (roadmap A1): section 8 of
   the source-AD arm — the parameter-gradient list (or the FASE-hook null
   sentinel), the gradient-summary diagnostics and the ownership sweep of
