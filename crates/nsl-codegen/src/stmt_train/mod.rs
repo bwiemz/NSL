@@ -43,6 +43,11 @@
 //!     pre-insertion wgrad fusion plan, the in-place `FreeTensor`
 //!     insertion), fed by a [`ccr_adjoint_frees::CcrAdjointFreesInputs`];
 //!     a pure tape rewrite.
+//!   - [`transient_arena_projection`] — section 6e of the source-AD arm:
+//!     the Stage-2A element hints, the arena report and the Stage-2B
+//!     `--transient-arena` placement with its runtime slot declarations,
+//!     fed by a [`transient_arena_projection::TransientArenaInputs`] and
+//!     returning the element hints.
 //!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
 //!     source-AD arm: the adjoint lowering with the per-parameter
 //!     accumulate callback and the grad-integrity bracket, fed by a
@@ -86,3 +91,4 @@ pub(crate) mod param_lists;
 pub(crate) mod primal_vars;
 pub(crate) mod source_ad_grads;
 pub(crate) mod teardown;
+pub(crate) mod transient_arena_projection;
