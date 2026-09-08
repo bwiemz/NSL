@@ -149,11 +149,11 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
     m(
         "[csha]",
         &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_pass_bridges.rs",
             "crates/nsl-codegen/src/csha.rs",
             "crates/nsl-codegen/src/compiler/kernel.rs",
         ],
-        "CSHA planning ran; `[csha] csha[...]` is the plan SUMMARY (stmt.rs), while csha.rs also prints an unrelated `[csha] gpu spec:` probe",
+        "CSHA planning ran; `[csha] csha[...]` is the plan SUMMARY (stmt_pass_bridges.rs), while csha.rs also prints an unrelated `[csha] gpu spec:` probe",
     ),
     m(
         "[pca]",
@@ -237,7 +237,7 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
             // The planning driver's diagnostics: tier agreement, the
             // moment-precision arbitration arms (active / NOT lowered), the
             // stale-plan refusal's neighbors, and the no-WGGO skip notice.
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_pass_bridges.rs",
             "crates/nsl-codegen/src/stmt_train/plan_wrga_cpdt.rs",
             // Decorator, MoE capacity, and expert-prune diagnostics.
             "crates/nsl-codegen/src/cpdt_decorator.rs",
@@ -573,7 +573,7 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         asserts: "@csha(disable=true) suppressed the CSHA plan summary",
         parts: &[
             // eprintln!("[csha] {}", plan.summary())
-            ("[csha] {}", "crates/nsl-codegen/src/stmt.rs"),
+            ("[csha] {}", "crates/nsl-codegen/src/stmt_pass_bridges.rs"),
             // format!("csha[{}]: {} chains, ...")  <- the summary's own prefix
             ("csha[{}]", "crates/nsl-codegen/src/csha.rs"),
         ],

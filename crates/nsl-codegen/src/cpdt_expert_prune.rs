@@ -990,7 +990,7 @@ pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
 /// Compile-flow entry point for the MoE dead-expert prune pass.
 ///
 /// STRUCTURAL GUARANTEE (blocker-sidestep): this is invoked directly from
-/// `compile_returning_plan`, NOT from `stmt.rs::invoke_cpdt_if_enabled` (which
+/// `compile_returning_plan`, NOT from `stmt_pass_bridges.rs::invoke_cpdt_if_enabled` (which
 /// is gated on `wggo_applied`, source-AD only). It depends only on
 /// `compiler.cpdt_mode` + `compiler.features.{moe_configs, weight_map}` — never
 /// on `wggo_applied`. Keep this call site out of any `wggo_applied` guard so

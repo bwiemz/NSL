@@ -116,6 +116,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The pass bridges moved out of `stmt.rs` whole (roadmap A1):
+  `invoke_wrga_if_enabled`, `invoke_cpdt_if_enabled`,
+  `invoke_csha_if_enabled` and the `cpdt_forced_stale_plan` test knob now
+  live in `stmt_pass_bridges.rs`, byte-for-byte; the driver sites in
+  `stmt_train/` call the new path. 707 lines out of `stmt.rs` (~4.0k lines
+  now); the train-block CLIF snapshots are unchanged. The `[csha]` /
+  `[cpdt]` marker registry and the `csha_bridge` / `wggo_overrides` bus
+  consumer lists name the new file.
 - The train-block driver moved out of `stmt.rs` whole (roadmap A1):
   `compile_train_block` (the phase scope, the composition refusals, the
   CPDT offer, the dependency-order check, the fused-CE config bracket)
