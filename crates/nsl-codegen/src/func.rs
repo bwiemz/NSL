@@ -142,7 +142,7 @@ impl Compiler<'_> {
             // (clone elision, in-place op emission). P1.7 --training-reference
             // disables FBIP entirely (no in-place op emission) — leaving
             // use_counts None takes the plain, out-of-place path.
-            state.use_counts = if self.compile_options.training_reference {
+            state.use_counts = if self.compile_options.diagnostics.training_reference {
                 None
             } else {
                 Some(crate::use_count::analyze_use_counts(&fn_def.body))

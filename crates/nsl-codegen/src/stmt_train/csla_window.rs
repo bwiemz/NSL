@@ -918,7 +918,7 @@ impl Compiler<'_> {
                     // from this site.
                     && zero3_streamed.is_none()
                     && two_state
-                    && !self.compile_options.training_reference
+                    && !self.compile_options.diagnostics.training_reference
                     && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
                     && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
                 {
@@ -936,7 +936,7 @@ impl Compiler<'_> {
             // emit_final_step no longer matches).
             let zero3_elem_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
                 if zero3_elem.as_ref().is_some_and(|s| !s.is_empty()) {
-                    if wrap_precision || self.compile_options.training_reference {
+                    if wrap_precision || self.compile_options.diagnostics.training_reference {
                         return Err(CodegenError::new(
                             "--zero-elementwise does not compose with a CPDT \
                              reduced-precision moment plan or \
@@ -986,7 +986,7 @@ impl Compiler<'_> {
             // to exactly that length), and each param's adjoint op lives in
             // exactly one range, so the hook must fire exactly N times per
             // param per window.
-            if self.compile_options.grad_integrity {
+            if self.compile_options.diagnostics.grad_integrity {
                 let expected_notes = builder
                     .ins()
                     .iconst(cl_types::I64, grad_accumulation_steps.max(1));
@@ -1407,7 +1407,7 @@ impl Compiler<'_> {
                     // param's adjoint lands in exactly one range — and the
                     // accumulator merges repeat notes per index (finite ANDs,
                     // nonzero ORs), so the report attests every partial.
-                    if c.compile_options.grad_integrity {
+                    if c.compile_options.diagnostics.grad_integrity {
                         c.compile_call_by_name(
                             b,
                             "nsl_grad_integrity_note",
@@ -1735,7 +1735,7 @@ impl Compiler<'_> {
             // P0.3: close the window-scoped grad-integrity step — every
             // range's hook (and the epilogue params' notes from whichever
             // range produced them) has fired by here.
-            if self.compile_options.grad_integrity {
+            if self.compile_options.diagnostics.grad_integrity {
                 self.compile_call_by_name(builder, "nsl_grad_integrity_step_end", &[])?;
             }
             // D2b part 2: NO post-epilogue restore. The next iterations'

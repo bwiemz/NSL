@@ -1689,6 +1689,42 @@ pub struct FusionOptions {
     pub wgrad_accum_from_bundle: bool,
 }
 
+/// Training diagnostics and reference modes: the observation-only gates
+/// (`--trace-ops`, `--nan-analysis`, `--grad-integrity`) and the two modes
+/// that change what is lowered (`--debug-training`, `--training-reference`).
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (roadmap A5 step 3). Field names are
+/// the old flat names, so a read site only gains the `diagnostics.` hop.
+#[derive(Clone, Default)]
+pub struct DiagnosticsOptions {
+    /// M45: Enable tensor operation tracing.
+    pub trace_ops: bool,
+    /// M45: Enable compile-time NaN risk analysis.
+    pub nan_analysis: bool,
+    /// Debug training mode: disables fusion, disables FBIP, and emits
+    /// gradient checksum assertions after each backward pass.
+    pub debug_training: bool,
+    /// P0.3: gradient-integrity gate. Emits a per-step check that every
+    /// trainable parameter received a finite, mostly-nonzero gradient, and
+    /// prints the `[grad-integrity]` worst-case snapshot at exit (under
+    /// `NSL_GRAD_INTEGRITY=1`, which the flag sets). Unlike `debug_training`
+    /// it changes NO optimization decisions — it only observes gradients.
+    pub grad_integrity: bool,
+    /// P1.7: permanent reference-training mode (`--training-reference`). Forces
+    /// the SIMPLEST correct training path so an optimized stack can be compared
+    /// against an independent baseline (stronger than comparing two optimized
+    /// paths that may share the same bug). Disables: CCR, CSLA, weight
+    /// streaming, optimizer-state offload, WGGO, CPDT/reduced-precision moments,
+    /// CSHA, kernel `@fuse` fusion (the field-controlled ones, forced off at the
+    /// CLI) plus FBIP in-place, the fused FASE optimizer step, and the fused-CE
+    /// (`@fused_lm_ce`) / fused-KL-CE substitution and `@checkpoint` decorators
+    /// (gated in codegen on this field). The source-AD fused activation
+    /// backward is retained — it is bit-exact-equivalent to the unfused form
+    /// (FASE≡AdamW gates) and is not a distinct-numerics surface.
+    pub training_reference: bool,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1699,6 +1735,8 @@ pub struct CompileOptions {
     /// Fusion: the kill switch, `--fusion-report`, and the opt-in source-AD
     /// fusions; see [`FusionOptions`].
     pub fusion: FusionOptions,
+    /// Training diagnostics and reference modes; see [`DiagnosticsOptions`].
+    pub diagnostics: DiagnosticsOptions,
     /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
     pub vram_budget: Option<u64>,
     /// M36: Print memory plan report to stderr
@@ -1707,10 +1745,6 @@ pub struct CompileOptions {
     pub target: String,
     /// M40: Use compile-time source-to-source AD for training (default: false = tape AD).
     pub source_ad: bool,
-    /// M45: Enable tensor operation tracing.
-    pub trace_ops: bool,
-    /// M45: Enable compile-time NaN risk analysis.
-    pub nan_analysis: bool,
     /// M46: Enable deterministic mode.
     pub deterministic: bool,
     /// P0 certification: RNG seed for `randn`/`rand`/stochastic ops.
@@ -1753,27 +1787,6 @@ pub struct CompileOptions {
     /// with per-launch verification and eager self-repair on any divergence.
     /// Optimizer updates and weight-stream transfers stay outside regions.
     pub cuda_graphs: bool,
-    /// Debug training mode: disables fusion, disables FBIP, and emits
-    /// gradient checksum assertions after each backward pass.
-    pub debug_training: bool,
-    /// P0.3: gradient-integrity gate. Emits a per-step check that every
-    /// trainable parameter received a finite, mostly-nonzero gradient, and
-    /// prints the `[grad-integrity]` worst-case snapshot at exit (under
-    /// `NSL_GRAD_INTEGRITY=1`, which the flag sets). Unlike `debug_training`
-    /// it changes NO optimization decisions — it only observes gradients.
-    pub grad_integrity: bool,
-    /// P1.7: permanent reference-training mode (`--training-reference`). Forces
-    /// the SIMPLEST correct training path so an optimized stack can be compared
-    /// against an independent baseline (stronger than comparing two optimized
-    /// paths that may share the same bug). Disables: CCR, CSLA, weight
-    /// streaming, optimizer-state offload, WGGO, CPDT/reduced-precision moments,
-    /// CSHA, kernel `@fuse` fusion (the field-controlled ones, forced off at the
-    /// CLI) plus FBIP in-place, the fused FASE optimizer step, and the fused-CE
-    /// (`@fused_lm_ce`) / fused-KL-CE substitution and `@checkpoint` decorators
-    /// (gated in codegen on this field). The source-AD fused activation
-    /// backward is retained — it is bit-exact-equivalent to the unfused form
-    /// (FASE≡AdamW gates) and is not a distinct-numerics surface.
-    pub training_reference: bool,
     /// Item 4 (`--fuse-lm-head`): whether the compiler may install a fused LM
     /// head that no `@fused_lm_ce` decorator asked for.
     ///
@@ -2060,13 +2073,12 @@ impl Default for CompileOptions {
         Self {
             autotune: AutotuneOptions::default(),
             world_size: 1,
+            diagnostics: DiagnosticsOptions::default(),
             fusion: FusionOptions::default(),
             vram_budget: None,
             memory_report: false,
             target: "cuda".to_string(),
             source_ad: false,
-            trace_ops: false,
-            nan_analysis: false,
             deterministic: false,
             rng_seed: None,
             weights: WeightsOptions::default(),
@@ -2079,9 +2091,6 @@ impl Default for CompileOptions {
             param_dtype_bf16sr: false,
             muon: MuonOptions::default(),
             cuda_graphs: false,
-            debug_training: false,
-            grad_integrity: false,
-            training_reference: false,
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
             transient_arena: false,
             imported_model: ImportedModelOptions::default(),

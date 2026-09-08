@@ -353,7 +353,7 @@ impl FusionState {
             events: Vec::new(),
             barriers: Vec::new(),
             report_enabled: options.fusion.report,
-            disabled: options.fusion.disabled || options.debug_training,
+            disabled: options.fusion.disabled || options.diagnostics.debug_training,
             fused_fns: std::collections::HashMap::new(),
         }
     }
@@ -1378,7 +1378,7 @@ impl<'a> Compiler<'a> {
         // config, so the substitution never fires and the composite
         // cross-entropy path runs — an independent baseline for the fused-CE
         // numerics.
-        self.active_fused_ce_config = if self.compile_options.training_reference {
+        self.active_fused_ce_config = if self.compile_options.diagnostics.training_reference {
             None
         } else {
             self.fused_ce_configs
@@ -1411,7 +1411,7 @@ impl<'a> Compiler<'a> {
         if !self.compile_options.lm_head_fusion.is_on() {
             return None;
         }
-        if self.compile_options.training_reference {
+        if self.compile_options.diagnostics.training_reference {
             return None;
         }
         if self

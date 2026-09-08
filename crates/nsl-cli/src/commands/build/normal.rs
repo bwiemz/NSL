@@ -133,7 +133,7 @@ fn run_build_single(
     let options = &options;
 
     // M45: Run compile-time NaN risk analysis before codegen if --nan-analysis is set.
-    if options.nan_analysis {
+    if options.diagnostics.nan_analysis {
         let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
         analyzer.analyze_module(&parse_result.module, &interner);
         if analyzer.diagnostics.is_empty() {
@@ -270,7 +270,7 @@ fn run_build_multi(
     // warnings the user cannot act on and bleeds module-level value
     // constraints across modules (NanAnalyzer saves/restores state per fn
     // body, not per module).
-    if options.nan_analysis {
+    if options.diagnostics.nan_analysis {
         let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
         analyzer.analyze_module(&graph.modules[&graph.entry].ast, &interner);
         if analyzer.diagnostics.is_empty() {

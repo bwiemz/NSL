@@ -444,8 +444,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 memory_report: false,
                 target,
                 source_ad,
-                trace_ops,
-                nan_analysis: false,
                 deterministic,
                 rng_seed: seed,
                 // CPDT: pass through the four-case-resolved weight file so the
@@ -519,9 +517,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         }
                     },
                 },
-                debug_training,
-                grad_integrity,
-                training_reference,
+                diagnostics: nsl_codegen::DiagnosticsOptions {
+                    debug_training,
+                    grad_integrity,
+                    training_reference,
+                    trace_ops,
+                    nan_analysis: false,
+                },
                 transient_arena,
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
@@ -620,7 +622,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated
-            // in codegen on compile_opts.training_reference).
+            // in codegen on compile_opts.diagnostics.training_reference).
             crate::meta_flags::apply_training_reference(&mut compile_opts);
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

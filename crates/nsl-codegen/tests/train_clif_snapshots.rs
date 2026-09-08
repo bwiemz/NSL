@@ -421,10 +421,10 @@ snapshots! {
     mlp_adamw_cuda_graphs: "mlp_adamw", CompileOptions { cuda_graphs: true, ..source_ad() };
     mlp_adamw_transient_arena: "mlp_adamw", CompileOptions { transient_arena: true, ..source_ad() };
     mlp_adamw_fuse_wgrad_accum: "mlp_adamw", CompileOptions { fusion: nsl_codegen::FusionOptions { wgrad_accum: true, ..Default::default() }, ..source_ad() };
-    mlp_adamw_grad_integrity: "mlp_adamw", CompileOptions { grad_integrity: true, ..source_ad() };
+    mlp_adamw_grad_integrity: "mlp_adamw", CompileOptions { diagnostics: nsl_codegen::DiagnosticsOptions { grad_integrity: true, ..Default::default() }, ..source_ad() };
     // Over the tape lowering: on the source-AD path the FASE hook owns the
     // gradients and the checksum this flag adds is skipped (inert variant).
-    mlp_adamw_debug_training: "mlp_adamw", CompileOptions { debug_training: true, ..tape() };
+    mlp_adamw_debug_training: "mlp_adamw", CompileOptions { diagnostics: nsl_codegen::DiagnosticsOptions { debug_training: true, ..Default::default() }, ..tape() };
     mlp_adamw_optim_state_offload: "mlp_adamw", CompileOptions { optim_state_offload: true, ..source_ad() };
     muon_optim_state_offload: "muon", CompileOptions { optim_state_offload: true, ..source_ad() };
     muon_resident_momentum: "muon", CompileOptions {

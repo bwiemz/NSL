@@ -505,8 +505,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 memory_report,
                 target,
                 source_ad: _source_ad,
-                trace_ops: false,
-                nan_analysis,
                 deterministic: _deterministic,
                 rng_seed: seed,
                 // M52: When --standalone, weights are handled by standalone pipeline;
@@ -594,9 +592,13 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                         }
                     },
                 },
-                debug_training,
-                grad_integrity,
-                training_reference,
+                diagnostics: nsl_codegen::DiagnosticsOptions {
+                    debug_training,
+                    grad_integrity,
+                    training_reference,
+                    trace_ops: false,
+                    nan_analysis,
+                },
                 transient_arena,
                 // Item 4: filled by the multi-file build path after dependency
                 // resolution; empty here because the entry module's own models
@@ -682,7 +684,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             };
             // P1.7: force the field-controlled optimizations off for the
             // reference training path (decorator/pattern-driven ones are gated
-            // in codegen on compile_opts.training_reference).
+            // in codegen on compile_opts.diagnostics.training_reference).
             crate::meta_flags::apply_training_reference(&mut compile_opts);
 
             // Validate WGGO mode string early so users get a clear error
