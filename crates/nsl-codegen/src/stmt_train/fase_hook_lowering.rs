@@ -209,7 +209,7 @@ impl Compiler<'_> {
         let fase_out = match fase_lowered {
             Ok(gv) => Some(gv),
             Err(e) => {
-                nsl_runtime::nsl_log!(ERROR, "nsl", 
+                nsl_log::nsl_log!(ERROR, "nsl", 
                     "[nsl] source AD lowering (FASE hook) failed ({}), \
                      rerun without --source-ad",
                     e

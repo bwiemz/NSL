@@ -212,7 +212,7 @@ pub fn compile_zk(
                 }
             }
             Err(e) => {
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] ZK: warning: failed to load weights from '{}': {} — using zero witness",
                     weights_path.display(),
                     e
@@ -224,7 +224,7 @@ pub fn compile_zk(
     // M55d: Auto-select M31 field for INT8 quantized models (10x faster proving)
     let effective_config = if lower::is_int8_model(&dag) && config.field != backend::ZkField::BN254
     {
-        nsl_runtime::nsl_log!(INFO, "nsl", 
+        nsl_log::nsl_log!(INFO, "nsl", 
             "[nsl] M55d: detected INT8 model — auto-selecting Mersenne-31 field for fast proving"
         );
         let mut cfg = config.clone();

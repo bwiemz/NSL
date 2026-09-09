@@ -957,16 +957,16 @@ type AnalysisEntry = (String, Vec<u8>, Vec<usize>, WeightDType, usize);
 /// CRITICAL FIX: takes `&WeightMap` (immutable) and clones data internally
 /// for analysis, to avoid mutating the caller's weight map.
 pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAwareConfig) {
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "");
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "Weight Analysis Report for {}:", weight_map.source_path());
-    nsl_runtime::nsl_log!(INFO, "weight-aware", 
+    nsl_log::nsl_log!(INFO, "weight-aware", "");
+    nsl_log::nsl_log!(INFO, "weight-aware", "Weight Analysis Report for {}:", weight_map.source_path());
+    nsl_log::nsl_log!(INFO, "weight-aware", 
         "  Total parameters: {}",
         format_number(weight_map.total_parameters())
     );
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "  Total size: {}", format_bytes(weight_map.total_bytes()));
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "  Weight file SHA-256: {}", weight_map.hash_hex());
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "  Tensors: {}", weight_map.len());
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "");
+    nsl_log::nsl_log!(INFO, "weight-aware", "  Total size: {}", format_bytes(weight_map.total_bytes()));
+    nsl_log::nsl_log!(INFO, "weight-aware", "  Weight file SHA-256: {}", weight_map.hash_hex());
+    nsl_log::nsl_log!(INFO, "weight-aware", "  Tensors: {}", weight_map.len());
+    nsl_log::nsl_log!(INFO, "weight-aware", "");
 
     let mut sparse_count = 0usize;
     let mut dead_count = 0usize;
@@ -987,7 +987,7 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
         })
         .collect();
 
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "  Per-tensor sparsity:");
+    nsl_log::nsl_log!(INFO, "weight-aware", "  Per-tensor sparsity:");
     for (name, data, shape, dtype, num_elements) in &mut analysis_entries {
         total_elements += *num_elements;
 
@@ -1012,7 +1012,7 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
             "dense"
         };
 
-        nsl_runtime::nsl_log!(INFO, "weight-aware", 
+        nsl_log::nsl_log!(INFO, "weight-aware", 
             "    {}: {:>5.1}% near-zero ({} kernel)  [shape: {:?}, dtype: {:?}]",
             name,
             info.near_zero_fraction * 100.0,
@@ -1032,9 +1032,9 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
         *data = temp_entry.data;
     }
 
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "");
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "  Summary:");
-    nsl_runtime::nsl_log!(INFO, "weight-aware", 
+    nsl_log::nsl_log!(INFO, "weight-aware", "");
+    nsl_log::nsl_log!(INFO, "weight-aware", "  Summary:");
+    nsl_log::nsl_log!(INFO, "weight-aware", 
         "    Global near-zero fraction: {:.1}%",
         if total_elements > 0 {
             total_near_zero as f64 / total_elements as f64 * 100.0
@@ -1042,19 +1042,19 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
             0.0
         }
     );
-    nsl_runtime::nsl_log!(INFO, "weight-aware", 
+    nsl_log::nsl_log!(INFO, "weight-aware", 
         "    Sparse-eligible tensors: {}/{}",
         sparse_count,
         analysis_entries.len()
     );
     if config.dead_weight_elim {
-        nsl_runtime::nsl_log!(INFO, "weight-aware", 
+        nsl_log::nsl_log!(INFO, "weight-aware", 
             "    Dead weights eliminated: {} (threshold: {:e})",
             format_number(dead_count),
             config.dead_weight_threshold
         );
     }
-    nsl_runtime::nsl_log!(INFO, "weight-aware", "");
+    nsl_log::nsl_log!(INFO, "weight-aware", "");
 }
 
 fn format_number(n: usize) -> String {

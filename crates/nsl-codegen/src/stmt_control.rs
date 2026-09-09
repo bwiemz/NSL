@@ -554,7 +554,7 @@ impl Compiler<'_> {
             return self.compile_for_dataloader(builder, state, pattern, iterable, body);
         }
         if matches!(iter_type, Type::Unknown) {
-            nsl_runtime::nsl_log!(WARN, "nsl-codegen", 
+            nsl_log::nsl_log!(WARN, "nsl-codegen", 
                 "[nsl-codegen] warning: for-loop iterable has Unknown type — compiling as list iteration. \
                  If this is a DataLoader, ensure the variable type is inferred correctly."
             );

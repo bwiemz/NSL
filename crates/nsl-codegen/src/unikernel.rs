@@ -280,37 +280,37 @@ impl UnikernelConfig {
 
     /// Print a human-readable summary of the unikernel configuration to stderr.
     pub fn print_summary(&self) {
-        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Unikernel build configured:");
-        nsl_runtime::nsl_log!(INFO, "unikernel", "  target:        {}", self.target);
-        nsl_runtime::nsl_log!(INFO, "unikernel", "  boot protocol: {}", self.boot_protocol);
-        nsl_runtime::nsl_log!(INFO, "unikernel", "  listen:        {}", self.listen_addr);
-        nsl_runtime::nsl_log!(INFO, "unikernel", "  weights:       {}", self.weight_source);
-        nsl_runtime::nsl_log!(INFO, "unikernel", "  gpu init:      {}", self.gpu_init);
+        nsl_log::nsl_log!(INFO, "nsl", "[nsl] Unikernel build configured:");
+        nsl_log::nsl_log!(INFO, "unikernel", "  target:        {}", self.target);
+        nsl_log::nsl_log!(INFO, "unikernel", "  boot protocol: {}", self.boot_protocol);
+        nsl_log::nsl_log!(INFO, "unikernel", "  listen:        {}", self.listen_addr);
+        nsl_log::nsl_log!(INFO, "unikernel", "  weights:       {}", self.weight_source);
+        nsl_log::nsl_log!(INFO, "unikernel", "  gpu init:      {}", self.gpu_init);
 
         if let Some(layout) = self.memory_layout() {
-            nsl_runtime::nsl_log!(INFO, "unikernel", "  memory layout:");
-            nsl_runtime::nsl_log!(INFO, "unikernel", 
+            nsl_log::nsl_log!(INFO, "unikernel", "  memory layout:");
+            nsl_log::nsl_log!(INFO, "unikernel", 
                 "    total:          {} MiB",
                 layout.total_bytes / (1024 * 1024)
             );
-            nsl_runtime::nsl_log!(INFO, "unikernel", 
+            nsl_log::nsl_log!(INFO, "unikernel", 
                 "    kernel reserved: {} MiB",
                 layout.kernel_reserved / (1024 * 1024)
             );
-            nsl_runtime::nsl_log!(INFO, "unikernel", 
+            nsl_log::nsl_log!(INFO, "unikernel", 
                 "    model pool:     {} MiB",
                 layout.model_pool / (1024 * 1024)
             );
-            nsl_runtime::nsl_log!(INFO, "unikernel", 
+            nsl_log::nsl_log!(INFO, "unikernel", 
                 "    kv-cache pool:  {} MiB",
                 layout.kv_cache_pool / (1024 * 1024)
             );
-            nsl_runtime::nsl_log!(INFO, "unikernel", 
+            nsl_log::nsl_log!(INFO, "unikernel", 
                 "    heap available: {} MiB",
                 layout.heap_available / (1024 * 1024)
             );
         } else {
-            nsl_runtime::nsl_log!(INFO, "unikernel", "  memory:        auto-detect at boot");
+            nsl_log::nsl_log!(INFO, "unikernel", "  memory:        auto-detect at boot");
         }
     }
 }
