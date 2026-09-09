@@ -98,30 +98,15 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, Linkage as ModuleLinkage, Module};
 
-/// Size of the C-ABI `NslTensorDesc` struct in bytes. Used by the
-/// packed-array dispatch wrapper to compute per-element pointer offsets
-/// into the input/output descriptor arrays.
-///
-/// Layout (must match `nsl_runtime::c_api::NslTensorDesc`, `#[repr(C)]`):
-///   data: *mut c_void  (8)
-///   shape: *mut i64    (8)
-///   strides: *mut i64  (8)
-///   ndim: i32          (4)
-///   dtype: i32         (4)
-///   device_type: i32   (4)
-///   device_id: i32     (4)
-///   tape_id: i64       (8)
-/// Total = 48 bytes, 8-byte aligned.
-///
-/// Bumped from 40 → 48 to carry the autodiff `tape_id` across desc
-/// round-trips (Spec B per-call grad context: backward keys the loss
-/// seed on `t.tape_id` and would fall through to the raw-pointer
-/// fallback if the desc dropped the id). The c_header_snapshot test
-/// pins the emitted C header to this layout. Two literal-`40`
-/// stack-slot allocations in `calibration/binary_codegen.rs` are
-/// updated in lockstep — they live outside this crate so cannot
-/// reference this constant directly.
-pub(crate) const NSL_TENSOR_DESC_SIZE: i64 = 48;
+/// Size of the C-ABI `NslTensorDesc` struct in bytes — `sizeof` of the
+/// `repr(C)` struct itself (`nsl_abi::wire::tensor_desc`, roadmap A3), so
+/// the per-element pointer offsets the packed-array dispatch wrapper
+/// computes and the scratch stack slots it allocates cannot drift from the
+/// layout the runtime implements. The layout (48 bytes, 8-byte aligned;
+/// `tape_id: i64` at offset 40 for the Spec B per-call grad context) is
+/// documented and constant-asserted there; `c_header_snapshot` pins the
+/// emitted C header to it and `c_header_compiles` re-checks it from C.
+pub(crate) const NSL_TENSOR_DESC_SIZE: i64 = nsl_abi::wire::tensor_desc::SIZE as i64;
 
 pub fn emit_c_abi_wrapper(
     compiler: &mut Compiler,

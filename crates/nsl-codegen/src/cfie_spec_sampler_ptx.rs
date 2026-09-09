@@ -1301,7 +1301,7 @@ mod tests {
         match crate::ptxas_validation::validate_ptx(&ptx) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                nsl_runtime::nsl_log!(INFO, "skip", "[skip] cfie draft-sample ptxas validation - no validator: {msg}");
+                nsl_log::nsl_log!(INFO, "skip", "[skip] cfie draft-sample ptxas validation - no validator: {msg}");
             }
             Err(msg) => panic!(
                 "cfie draft-sample PTX rejected for paper config:\n{msg}\n\nEmitted PTX:\n{ptx}"
@@ -1315,7 +1315,7 @@ mod tests {
         match crate::ptxas_validation::validate_ptx(&ptx) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                nsl_runtime::nsl_log!(INFO, "skip", "[skip] cfie verify-probs ptxas validation - no validator: {msg}");
+                nsl_log::nsl_log!(INFO, "skip", "[skip] cfie verify-probs ptxas validation - no validator: {msg}");
             }
             Err(msg) => panic!(
                 "cfie verify-probs PTX rejected for paper config:\n{msg}\n\nEmitted PTX:\n{ptx}"

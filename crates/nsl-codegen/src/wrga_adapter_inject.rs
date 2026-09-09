@@ -284,7 +284,7 @@ pub fn run_with_compiler(
         let (var_name, field_name) = match target.split_once('.') {
             Some(p) => p,
             None => {
-                nsl_runtime::nsl_log!(WARN, "wrga", 
+                nsl_log::nsl_log!(WARN, "wrga", 
                     "[wrga] @adapter target '{}' is not a `model.field` form; skipping",
                     target
                 );
@@ -302,7 +302,7 @@ pub fn run_with_compiler(
         let mut candidates =
             candidate_models_for_field(tensor_shapes, field_types, field_name);
         if candidates.is_empty() {
-            nsl_runtime::nsl_log!(WARN, "wrga", 
+            nsl_log::nsl_log!(WARN, "wrga", 
                 "[wrga] @adapter target '{}': field '{}' not found in any known model; \
                  skipping adapter materialisation (dims remain 0)",
                 target, field_name
@@ -310,7 +310,7 @@ pub fn run_with_compiler(
             continue;
         }
         if candidates.len() > 1 {
-            nsl_runtime::nsl_log!(INFO, "wrga", 
+            nsl_log::nsl_log!(INFO, "wrga", 
                 "[wrga] @adapter target '{}': field '{}' ambiguous across models {:?}; \
                  using lexicographically-first; follow-up: thread let-binding type map",
                 target, field_name, candidates
@@ -335,7 +335,7 @@ pub fn run_with_compiler(
             })
             .unwrap_or_default();
         if !type_str.trim_start().starts_with("Tensor<") {
-            nsl_runtime::nsl_log!(INFO, "wrga", "{}", submodel_target_hint(&target, &type_str));
+            nsl_log::nsl_log!(INFO, "wrga", "{}", submodel_target_hint(&target, &type_str));
             continue;
         }
         match resolve_dims_for_target(&model_name, field_name, tensor_shapes)
@@ -348,7 +348,7 @@ pub fn run_with_compiler(
                 site.target_field = field_name.to_string();
             }
             None => {
-                nsl_runtime::nsl_log!(WARN, "wrga", 
+                nsl_log::nsl_log!(WARN, "wrga", 
                     "[wrga] @adapter target '{}': type string for '{}.{}' \
                      isn't a 2-D tensor; skipping",
                     target, model_name, field_name
@@ -361,7 +361,7 @@ pub fn run_with_compiler(
         if site.rank > 16
             && matches!(site.kind, AdapterKind::Lora | AdapterKind::GatedLora)
         {
-            nsl_runtime::nsl_log!(INFO, "wrga", 
+            nsl_log::nsl_log!(INFO, "wrga", 
                 "[wrga] @adapter(target='{}'): rank={} > 16; B.3 single-pass epilogue \
                  does not support rank > 16.  Use rank <= 16 or await multi-pass support.",
                 site.target_param, site.rank,

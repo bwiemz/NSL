@@ -23,6 +23,10 @@ cranelift-module.workspace = true
 cranelift-object.workspace = true
 cranelift-native.workspace = true
 nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
+# Compile-time diagnostics (`nsl_log!`, roadmap C3) — the front door is
+# its own tracing-only crate (roadmap A3), so the diagnostics no longer
+# need the runtime.
+nsl-log.workspace = true
 # The ABI wire constants (dtype tags, the tensor header's data offset, plan
 # bits, allocation-surface tags, the ABI version) come from nsl-abi, not from
 # the runtime (roadmap A3): it is dependency-free, so this edge costs the

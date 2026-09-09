@@ -308,7 +308,7 @@ impl Compiler<'_> {
         // This is the correct path for Dict<String, Tensor> types (e.g., train block batches).
         // Warn if the object type is Unknown — this means type inference failed upstream.
         if matches!(obj_type, Type::Unknown) {
-            nsl_runtime::nsl_log!(WARN, "nsl-codegen", 
+            nsl_log::nsl_log!(WARN, "nsl-codegen", 
                 "[nsl-codegen] warning: member access '.{member_name}' on Unknown-typed object — \
                  falling through to dict access. This may be a type inference gap."
             );
@@ -372,7 +372,7 @@ impl Compiler<'_> {
                     _ => {
                         // Default: list subscript. Warn if the type is Unknown.
                         if matches!(obj_type, Type::Unknown) {
-                            nsl_runtime::nsl_log!(WARN, "nsl-codegen", 
+                            nsl_log::nsl_log!(WARN, "nsl-codegen", 
                                 "[nsl-codegen] warning: subscript on Unknown-typed object — \
                                  defaulting to list access"
                             );
