@@ -724,7 +724,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("profiling", "dev-tools capture"),
     ("ptx_metadata", "PTX metadata"),
     ("ptxas_validation", "ptxas syntax validation"),
-    ("runtime_abi", "FFI symbol registration (runtime-facing half, by subsystem)"),
     ("schema_convert", "schema conversion"),
     ("serve", "serving entry point"),
     ("source_ad", "the source-AD extractor - produces the WengertList passes consume"),
