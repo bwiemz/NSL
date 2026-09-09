@@ -470,8 +470,10 @@ TIER_B_SEQ_LEN_FLOOR}` (re-exported by `src/pca_tier_b.rs`),
 `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR,
 nsl_abi_version}` (`src/c_header.rs`), `nsl_runtime::awq::AwqScales`
 (`src/stmt.rs`), `nsl_runtime::calibration_data::peek_batch_seq`
-(`src/lib.rs`, calibration), and `nsl_runtime::CudaDeviceIdentity` /
-`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`). The rule these
+(`src/lib.rs`, calibration), and `nsl_runtime::cuda_device_identity` /
+`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`; the identity
+record they return is `nsl_abi::wire::device_identity::CudaDeviceIdentity`,
+the autotune cache key's schema). The rule these
 follow: a layout or plan constant the emitted code must agree with is
 imported from the runtime, never retyped in codegen.
 
@@ -548,7 +550,8 @@ will not merge.** If a kernel needs something KIR cannot express, extend
 **Supporting pieces.** `src/gpu_specs.rs` — `GpuSpec` (`sm_version`, peak
 TFLOPs, bandwidth, VRAM, L2, crossover points, launch overhead),
 `GPU_DATABASE`, `find_gpu`, `default_gpu`, `resolve_local_gpu`
-(via `nsl_runtime::CudaDeviceIdentity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
+(via `nsl_abi::wire::device_identity::CudaDeviceIdentity`, probed by
+`nsl_runtime::cuda_device_identity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
 `src/ptxas_validation.rs::validate_ptx` assembles PTX through `cudarc`
 `cuModuleLoadData` when a context is current, else `nvcc --cubin`; it is the
 basis of every `*_ptxas*.rs` test. `src/ptx_metadata.rs` extracts static
