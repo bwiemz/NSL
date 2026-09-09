@@ -222,7 +222,7 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
         }
         #[cfg(not(feature = "cuda"))]
         {
-            panic!("CUDA support not compiled");
+            crate::fatal::cuda_not_compiled();
         }
     }
 
