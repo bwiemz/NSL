@@ -55,3 +55,26 @@ docs/wiki/Environment-Variables.md text eol=lf
 # compared by the `wiki_page_is_the_command_tree_rendering` unit test in
 # crates/nsl-cli/src/cli_reference.rs.
 docs/wiki/CLI-Reference.md text eol=lf
+
+# Every PR appends its entry to the TOP of the same `### Added` / `### Changed`
+# list under `## [Unreleased]`, so two branches that both add an entry insert
+# different text at the same line and CHANGELOG.md conflicts on essentially
+# every merge — 37 merge commits in this repository's history say so in their
+# message, and the resolution has always been the same: keep both sides.
+#
+# `union` is git's built-in low-level merge driver for exactly this shape. On
+# a conflicting hunk it emits both sides' lines in order instead of conflict
+# markers, which for an append-only list is the resolution we were making by
+# hand. Nothing else changes: a merge with no overlap is still a normal merge,
+# and the union result is a working-tree file like any other, so a wrong order
+# is fixable with an ordinary edit.
+#
+# The one case to keep in mind: union is line-based, so if two branches edit
+# THE SAME line — a release that rewrites `## [Unreleased]` to `## [0.11.0]`,
+# say — it keeps both lines rather than picking one. Read the section after a
+# release merge.
+CHANGELOG.md merge=union
+
+# CHANGELOG-CALIBRATION.md is the same append-only shape (#134 §6.2 pairs a
+# sidecar-snapshot change with an entry here), so it takes the same driver.
+CHANGELOG-CALIBRATION.md merge=union

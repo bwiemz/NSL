@@ -19,62 +19,13 @@ pub mod exports;
 // NslTensorDesc — C API tensor descriptor
 // ---------------------------------------------------------------------------
 
-/// Tensor descriptor matching the C header from the M62 spec.
-///
-/// Note: The C API speaks the CANONICAL runtime dtype tag space verbatim
-/// (`crate::tensor::DTYPE_*`: 0=f64, 1=f32, 2=fp16, 3=bf16, 4=int8,
-/// 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=i32). The historical
-/// inverted 0=f32/1=f64 convention was removed in the P4 item-16 dtype/ABI
-/// migration; `capi_dtype_to_nsl` and `nsl_dtype_to_capi` survive only as
-/// validating identity chokepoints (the `dtype_abi_lock` test pins this).
-///
-/// Layout (48 bytes, 8-byte aligned):
-///   offset  0: data         (*mut c_void, 8)
-///   offset  8: shape        (*mut i64,    8)
-///   offset 16: strides      (*mut i64,    8)
-///   offset 24: ndim         (i32,         4)
-///   offset 28: dtype        (i32,         4)
-///   offset 32: device_type  (i32,         4)
-///   offset 36: device_id    (i32,         4)
-///   offset 40: tape_id      (i64,         8)
-///
-/// `tape_id` carries the source tensor's autodiff tape id verbatim so that
-/// a desc round-trip (`nsl_tensor_to_desc` → `desc_to_nsl_tensor`) does not
-/// strip the id. Required for the per-call grad context (Spec B): the
-/// loss seed in `run_backward_core` keys on `t.tape_id`, which would fall
-/// through to the raw-pointer fallback if the desc dropped the id.
-///
-/// Semantics of `tape_id`:
-///   - `tape_id == 0`: source tensor was never autodiff-tracked (constants,
-///     freshly-allocated wrappers, inputs from non-grad code paths).
-///   - `tape_id > 0`: matches the source tensor's `tape_id` as assigned by
-///     `Tape::get_or_assign_id`. Thread-local `next_id` is monotonic
-///     (never reset — see `autodiff/mod.rs:291, 399`), so on the same
-///     thread an imported id is guaranteed `< tape.next_id`.
-///
-/// `#[derive(Default)]` is preserved for the two scratch-desc allocation
-/// sites in `nsl_model_call_dlpack`; new struct-literal sites are
-/// compiler-required to specify `tape_id` explicitly (no `..Default::default()`
-/// shorthand is currently used).
-#[repr(C)]
-#[derive(Default)]
-pub struct NslTensorDesc {
-    pub data: *mut c_void,
-    pub shape: *mut i64,
-    pub strides: *mut i64,
-    pub ndim: i32,
-    /// Canonical NSL dtype tag: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8,
-    /// 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32.
-    pub dtype: i32,
-    /// 0=CPU, 1=CUDA
-    pub device_type: i32,
-    /// GPU index (0 for CPU)
-    pub device_id: i32,
-    /// Autodiff tape id of the source tensor, copied verbatim across desc
-    /// round-trips. `0` means "untracked" (the legacy semantics that
-    /// produced the bug fixed by this commit).
-    pub tape_id: i64,
-}
+/// Tensor descriptor matching the C header from the M62 spec — declared in
+/// `nsl_abi::wire::tensor_desc` (roadmap A3: the one `repr(C)` layout the
+/// host, the runtime and the compiler's emitted wrappers all address by
+/// byte offset) and re-exported here at its historical path. The layout
+/// (48 bytes, 8-byte aligned; `tape_id` at offset 40) and the canonical
+/// dtype tag space are documented there.
+pub use nsl_abi::wire::tensor_desc::NslTensorDesc;
 
 // ---------------------------------------------------------------------------
 // Dtype validation at the C API boundary

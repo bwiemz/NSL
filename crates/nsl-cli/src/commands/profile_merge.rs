@@ -19,7 +19,7 @@ pub(crate) fn merge_profile_traces(memory_path: &str, kernel_path: &str, output_
     std::fs::write(output_path, &merged).ok();
     std::fs::remove_file(memory_path).ok();
     std::fs::remove_file(kernel_path).ok();
-    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] merged profile written to {}", output_path);
+    nsl_log::nsl_log!(INFO, "nsl", "[nsl] merged profile written to {}", output_path);
 }
 
 fn extract_trace_events(json: &str) -> Option<String> {
