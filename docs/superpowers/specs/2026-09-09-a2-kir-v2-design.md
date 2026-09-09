@@ -271,7 +271,14 @@ frozen throughout, so nothing here blocks a kernel fix.
    edge copies in every printer (the non-PTX printers may refuse loops
    with their "unhandled" path until they need them); the verifier's loop
    test flips from pinning a refusal to pinning an accepted loop;
-   `kernel_lower.rs` lowers `while`/`for`.
+   `kernel_lower.rs` lowers `while`/`for`. *Landed (IR half):*
+   `KirBlockParam`, `KirEdge`, `add_block_param`, rule 7, the PTX
+   printer's parallel copy with per-class scratch, the AMDGPU / Metal /
+   WGSL printers marking edge arguments unhandled, the
+   `kir_block_params_ptxas` gate and the `kir_grid_stride_loop_ptx`
+   snapshot. Lowering `while`/`for` in `kernel_lower.rs` is SSA
+   construction over the block's locals and goes with step 3, where
+   `kernel.rs` retires.
 3. **Retire `kernel.rs`.** CUDA `kernel` blocks go through KIR like every
    other target; the AST→PTX `KernelCompiler` is deleted (43 PTX lines,
    one manifest member fewer). Proof: normalised-text identity on the

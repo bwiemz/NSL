@@ -430,6 +430,9 @@ jobs:
           # by the KIR verifier; this is the gate that proves ptxas takes it.
           cargo test -p nsl-codegen --test kir_async_copy_ptxas
           cargo test -p nsl-codegen --test kir_mma_ptxas
+          # Roadmap A2 step 2: a loop-carried value is a block parameter and
+          # an edge is a parallel copy; this proves ptxas takes the lowering.
+          cargo test -p nsl-codegen --test kir_block_params_ptxas
           # M35.1: the BitNet forward emitter shipped producing PTX that ptxas
           # rejected at essentially every instruction, while its structural
           # snapshot tests stayed green. This is the gate that catches that.

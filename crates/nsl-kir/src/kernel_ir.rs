@@ -37,8 +37,55 @@ pub struct KirParam {
 #[derive(Debug, Clone)]
 pub struct KirBlock {
     pub id: BlockId,
+    /// Roadmap A2 step 2: the block's parameters — SSA values defined at
+    /// block entry and given a value by every edge into the block (the
+    /// `args` of the predecessor's `KirEdge`, in order). This is how a
+    /// loop-carried value is written in SSA without phi nodes: the loop
+    /// header takes the induction variable as a parameter, the entry edge
+    /// passes its initial value and the back edge passes the next one.
+    /// Block 0 (the entry) has none.
+    pub params: Vec<KirBlockParam>,
     pub ops: Vec<KirOp>,
     pub terminator: Option<KirTerminator>,
+}
+
+/// One block parameter (roadmap A2 step 2): `id` is defined at the entry of
+/// the block that lists it, typed `ty`, and `KirBuilder::add_block_param`
+/// records the type in `var_types` like any other typed variable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KirBlockParam {
+    pub id: VarId,
+    pub ty: KirType,
+}
+
+/// A control-flow edge (roadmap A2 step 2): the target block and the
+/// arguments for its parameters, in order. `KirEdge::to(b)` is an edge
+/// with no arguments — `b.into()` spells the same — and `KirEdge::with(b,
+/// args)` passes values. The verifier holds the argument count and types
+/// to the target's parameter list (rule 7); the printers implement the
+/// edge as a parallel copy into the parameter registers before the jump.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KirEdge {
+    pub target: BlockId,
+    pub args: Vec<VarId>,
+}
+
+impl KirEdge {
+    /// An edge to `target` that passes no arguments.
+    pub fn to(target: BlockId) -> Self {
+        KirEdge { target, args: Vec::new() }
+    }
+
+    /// An edge to `target` passing `args` for its parameters, in order.
+    pub fn with(target: BlockId, args: Vec<VarId>) -> Self {
+        KirEdge { target, args }
+    }
+}
+
+impl From<BlockId> for KirEdge {
+    fn from(target: BlockId) -> Self {
+        KirEdge::to(target)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,9 +295,27 @@ pub enum KirOp {
 
 #[derive(Debug, Clone)]
 pub enum KirTerminator {
-    Branch(BlockId),
-    CondBranch(VarId, BlockId, BlockId),
+    /// Unconditional jump along one edge.
+    Branch(KirEdge),
+    /// `if cond { taken } else { fallthrough }`; `cond` is a `Bool`.
+    CondBranch(VarId, KirEdge, KirEdge),
     Return,
+}
+
+impl KirTerminator {
+    /// The edges this terminator leaves along, in (taken, not-taken) order.
+    pub fn edges(&self) -> Vec<&KirEdge> {
+        match self {
+            KirTerminator::Branch(e) => vec![e],
+            KirTerminator::CondBranch(_, t, f) => vec![t, f],
+            KirTerminator::Return => vec![],
+        }
+    }
+
+    /// Whether any edge passes block arguments.
+    pub fn has_args(&self) -> bool {
+        self.edges().iter().any(|e| !e.args.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -346,9 +411,20 @@ impl KirBuilder {
         let id = self.blocks.len() as BlockId;
         self.blocks.push(KirBlock {
             id,
+            params: Vec::new(),
             ops: Vec::new(),
             terminator: None,
         });
+        id
+    }
+
+    /// Roadmap A2 step 2: add a typed parameter to `block` and return the
+    /// `VarId` it defines at the block's entry. Every edge into `block`
+    /// must then pass one argument per parameter, in order (verifier
+    /// rule 7). The type is recorded in `var_types`.
+    pub fn add_block_param(&mut self, block: BlockId, ty: KirType) -> VarId {
+        let id = self.new_typed_var(ty.clone());
+        self.blocks[block as usize].params.push(KirBlockParam { id, ty });
         id
     }
 
@@ -473,7 +549,7 @@ mod tests {
         b.emit(KirOp::GlobalId(tid, 0));
         let in_bounds = b.new_var();
         b.emit(KirOp::Cmp(in_bounds, tid, len, CmpOp::Lt));
-        b.terminate(KirTerminator::CondBranch(in_bounds, body, exit));
+        b.terminate(KirTerminator::CondBranch(in_bounds, body.into(), exit.into()));
 
         b.set_block(body);
         // Compute a[tid], b[tid] addresses via PtrOffset
@@ -490,7 +566,7 @@ mod tests {
         let out_addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
         b.emit(KirOp::PtrOffset(out_addr, out_ptr, tid));
         b.emit(KirOp::Store(out_addr, sum, AddressSpace::Global));
-        b.terminate(KirTerminator::Branch(exit));
+        b.terminate(KirTerminator::Branch(exit.into()));
 
         b.set_block(exit);
         b.terminate(KirTerminator::Return);
@@ -545,6 +621,42 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert!(ir.required_features.contains(FeatureSet::WARP_SHUFFLE));
+    }
+
+    /// Roadmap A2 step 2: a grid-stride loop is a header block with the
+    /// induction variable as a parameter; the entry edge passes the first
+    /// index and the back edge passes the next one.
+    #[test]
+    fn block_params_carry_a_loop_variable() {
+        let mut b = KirBuilder::new("loop");
+        let n = b.add_param("n", KirType::U32, AddressSpace::Local);
+        let entry = b.new_block();
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let idx = b.add_block_param(header, KirType::U32);
+        b.set_block(entry);
+        let start = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::GlobalId(start, 0));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![start])));
+        b.set_block(header);
+        let more = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(more, idx, n, CmpOp::Lt));
+        b.terminate(KirTerminator::CondBranch(more, body.into(), exit.into()));
+        b.set_block(body);
+        let stride = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::BlockDim(stride, 0));
+        let next = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Add(next, idx, stride));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![next])));
+        b.set_block(exit);
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.blocks[header as usize].params, vec![KirBlockParam { id: idx, ty: KirType::U32 }]);
+        assert_eq!(ir.var_types.get(&idx), Some(&KirType::U32));
+        assert!(ir.blocks[body as usize].terminator.as_ref().unwrap().has_args());
+        assert!(!ir.blocks[header as usize].terminator.as_ref().unwrap().has_args());
+        assert!(ir.is_well_formed(), "{:?}", ir.verify());
     }
 
     #[test]

@@ -131,6 +131,15 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     if v_count > 0 {
         writeln!(ptx, "    .reg .b32 %v<{}>;", v_count).unwrap();
     }
+    // Roadmap A2 step 2: an edge that passes block arguments is a parallel
+    // copy into the target's parameter registers. A cycle in that copy (a
+    // swap) needs one scratch register of the class; declared only when a
+    // kernel has block parameters, so every other kernel's text is unchanged.
+    if ir.blocks.iter().any(|b| !b.params.is_empty()) {
+        for (ty, name) in EDGE_SCRATCH {
+            writeln!(ptx, "    .reg .{ty} {name};").unwrap();
+        }
+    }
     writeln!(ptx).unwrap();
 
     // Load parameters into registers
@@ -195,7 +204,7 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
             emit_op(&mut ptx, op, ir);
         }
         if let Some(ref term) = block.terminator {
-            emit_terminator(&mut ptx, term);
+            emit_terminator(&mut ptx, term, ir, block.id);
         }
     }
 
@@ -631,14 +640,105 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
     }
 }
 
-fn emit_terminator(ptx: &mut String, term: &KirTerminator) {
-    match term {
-        KirTerminator::Branch(target) => {
-            writeln!(ptx, "    bra BB{};", target).unwrap();
+/// The scratch register per class for breaking a cycle in an edge's
+/// parallel copy: (PTX type, register name), one per `ptx_reg_prefix`
+/// class plus the predicate class.
+const EDGE_SCRATCH: [(&str, &str); 7] = [
+    ("u32", "%edge_r"),
+    ("u64", "%edge_rd"),
+    ("f32", "%edge_f"),
+    ("f64", "%edge_fd"),
+    ("f16", "%edge_h"),
+    ("pred", "%edge_p"),
+    ("b32", "%edge_v"),
+];
+
+/// The register class a variable moves in: (mov type, register prefix,
+/// scratch name). `Bool` lives in the predicate class (`setp` writes `%p`,
+/// `CondBranch` reads it), the 16-bit floats move as `.b16`, packed
+/// fragments as `.b32`; an untyped variable is a `%r`.
+fn mov_class(ir: &KernelIR, dst: VarId, src: VarId) -> (&'static str, &'static str, &'static str) {
+    match ir.var_types.get(&dst).or_else(|| ir.var_types.get(&src)) {
+        Some(KirType::Bool) => ("pred", "%p", "%edge_p"),
+        Some(KirType::F16) | Some(KirType::Bf16) => ("b16", "%h", "%edge_h"),
+        Some(KirType::Vec(_, _)) => ("b32", "%v", "%edge_v"),
+        Some(KirType::F32) => ("f32", "%f", "%edge_f"),
+        Some(KirType::F64) => ("f64", "%fd", "%edge_fd"),
+        Some(KirType::U64) | Some(KirType::I64) | Some(KirType::Ptr(_, _)) => ("u64", "%rd", "%edge_rd"),
+        // U32, I32, I8, I16, the ternary types, untyped.
+        _ => ("u32", "%r", "%edge_r"),
+    }
+}
+
+/// Roadmap A2 step 2: implement an edge's arguments as a parallel copy into
+/// the target's parameter registers — every parameter receives its
+/// argument's value as it was *before* the copy. Moves are sequenced so a
+/// register is written only once nothing pending still reads it; when every
+/// pending destination is still read (a cycle), the first destination's
+/// current value is saved in the class's scratch register and the reads are
+/// redirected there.
+fn emit_edge_copies(ptx: &mut String, ir: &KernelIR, edge: &KirEdge) {
+    let target = &ir.blocks[edge.target as usize];
+    // (dst register text, src register text, mov type), self-moves dropped.
+    let mut pending: Vec<(String, String, &'static str)> = Vec::new();
+    for (param, arg) in target.params.iter().zip(&edge.args) {
+        if param.id == *arg {
+            continue;
         }
-        KirTerminator::CondBranch(cond, true_bb, false_bb) => {
-            writeln!(ptx, "    @%p{} bra BB{};", cond, true_bb).unwrap();
-            writeln!(ptx, "    bra BB{};", false_bb).unwrap();
+        let (mov_ty, prefix, _) = mov_class(ir, param.id, *arg);
+        pending.push((format!("{prefix}{}", param.id), format!("{prefix}{}", arg), mov_ty));
+    }
+    while !pending.is_empty() {
+        // A destination nobody pending still reads can be written now.
+        let ready = pending
+            .iter()
+            .position(|(dst, _, _)| !pending.iter().any(|(_, src, _)| src == dst));
+        match ready {
+            Some(i) => {
+                let (dst, src, mov_ty) = pending.remove(i);
+                writeln!(ptx, "    mov.{mov_ty} {dst}, {src};").unwrap();
+            }
+            None => {
+                // Every destination is still read: a cycle. Park the first
+                // destination's value in scratch and redirect its readers.
+                let (dst, _, mov_ty) = pending[0].clone();
+                let scratch = EDGE_SCRATCH
+                    .iter()
+                    .find(|(ty, _)| *ty == mov_ty)
+                    .map(|(_, name)| *name)
+                    .expect("every mov class has a scratch register");
+                writeln!(ptx, "    mov.{mov_ty} {scratch}, {dst};").unwrap();
+                for (_, src, _) in pending.iter_mut() {
+                    if *src == dst {
+                        *src = scratch.to_string();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_terminator(ptx: &mut String, term: &KirTerminator, ir: &KernelIR, block: BlockId) {
+    match term {
+        KirTerminator::Branch(edge) => {
+            emit_edge_copies(ptx, ir, edge);
+            writeln!(ptx, "    bra BB{};", edge.target).unwrap();
+        }
+        KirTerminator::CondBranch(cond, taken, fallthrough)
+            if taken.args.is_empty() && fallthrough.args.is_empty() =>
+        {
+            writeln!(ptx, "    @%p{} bra BB{};", cond, taken.target).unwrap();
+            writeln!(ptx, "    bra BB{};", fallthrough.target).unwrap();
+        }
+        KirTerminator::CondBranch(cond, taken, fallthrough) => {
+            // Each edge's copies run only when that edge is taken, so the
+            // not-taken path gets its own label in this block.
+            writeln!(ptx, "    @!%p{} bra BB{}_else;", cond, block).unwrap();
+            emit_edge_copies(ptx, ir, taken);
+            writeln!(ptx, "    bra BB{};", taken.target).unwrap();
+            writeln!(ptx, "BB{}_else:", block).unwrap();
+            emit_edge_copies(ptx, ir, fallthrough);
+            writeln!(ptx, "    bra BB{};", fallthrough.target).unwrap();
         }
         KirTerminator::Return => {
             writeln!(ptx, "    ret;").unwrap();
@@ -734,7 +834,8 @@ fn extract_var_ids(op: &KirOp) -> Vec<VarId> {
     }
 }
 
-/// Count the number of body variables (non-param) in the IR.
+/// Count the number of body variables (non-param) in the IR: one past the
+/// highest `VarId` any op, block parameter or edge argument names.
 fn count_body_vars(ir: &KernelIR) -> u32 {
     let mut max_id: u32 = 0;
     for block in &ir.blocks {
@@ -743,6 +844,14 @@ fn count_body_vars(ir: &KernelIR) -> u32 {
                 if id > max_id {
                     max_id = id;
                 }
+            }
+        }
+        for p in &block.params {
+            max_id = max_id.max(p.id);
+        }
+        if let Some(term) = &block.terminator {
+            for id in crate::kir_verify::terminator_uses(term) {
+                max_id = max_id.max(id);
             }
         }
     }
@@ -781,7 +890,7 @@ mod tests {
         b.emit(KirOp::GlobalId(tid, 0));
         let in_bounds = b.new_var();
         b.emit(KirOp::Cmp(in_bounds, tid, len, CmpOp::Lt));
-        b.terminate(KirTerminator::CondBranch(in_bounds, body, exit));
+        b.terminate(KirTerminator::CondBranch(in_bounds, body.into(), exit.into()));
 
         b.set_block(body);
         let a_addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
@@ -797,7 +906,7 @@ mod tests {
         let out_addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
         b.emit(KirOp::PtrOffset(out_addr, out_ptr, tid));
         b.emit(KirOp::Store(out_addr, sum, AddressSpace::Global));
-        b.terminate(KirTerminator::Branch(exit));
+        b.terminate(KirTerminator::Branch(exit.into()));
 
         b.set_block(exit);
         b.terminate(KirTerminator::Return);
@@ -1141,5 +1250,139 @@ mod tests {
             "aliased Tanh must complete the 2*sigmoid(2x) - 1 expansion:\n{}",
             ptx
         );
+    }
+
+    // ── Roadmap A2 step 2: block parameters lower to edge copies ─────
+
+    /// A grid-stride `out[i] = a[i]` copy: the header takes `i`, the entry
+    /// edge passes the thread's first index, the back edge `i + stride`.
+    fn grid_stride_copy() -> KernelIR {
+        let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+        let mut b = KirBuilder::new("grid_stride_copy");
+        let a = b.add_param("a", f32_ptr.clone(), AddressSpace::Global);
+        let out = b.add_param("out", f32_ptr.clone(), AddressSpace::Global);
+        let n = b.add_param("n", KirType::U32, AddressSpace::Local);
+        let entry = b.new_block();
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let i = b.add_block_param(header, KirType::U32);
+        b.set_block(entry);
+        let start = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::GlobalId(start, 0));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![start])));
+        b.set_block(header);
+        let more = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(more, i, n, CmpOp::Lt));
+        b.terminate(KirTerminator::CondBranch(more, body.into(), exit.into()));
+        b.set_block(body);
+        let src = b.new_typed_var(f32_ptr.clone());
+        b.emit(KirOp::PtrOffset(src, a, i));
+        let v = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Load(v, src, AddressSpace::Global));
+        let dst = b.new_typed_var(f32_ptr);
+        b.emit(KirOp::PtrOffset(dst, out, i));
+        b.emit(KirOp::Store(dst, v, AddressSpace::Global));
+        let bdim = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::BlockDim(bdim, 0));
+        let gdim = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::GridDim(gdim, 0));
+        let stride = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Mul(stride, bdim, gdim));
+        let next = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Add(next, i, stride));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![next])));
+        b.set_block(exit);
+        b.terminate(KirTerminator::Return);
+        b.finalize()
+    }
+
+    #[test]
+    fn a_loop_edge_copies_its_argument_into_the_parameter_register() {
+        let ir = grid_stride_copy();
+        assert_eq!(ir.verify(), Ok(()));
+        let i = ir.blocks[1].params[0].id;
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        // Entry edge: the first index moves into the parameter, then the jump.
+        assert!(ptx.contains(&format!("    mov.u32 %r{i}, %r4;\n    bra BB1;\n")), "{ptx}");
+        // Back edge: the next index moves into the same register.
+        let next = ir.blocks[2].ops.iter().rev().find_map(crate::kir_verify::op_dst).unwrap();
+        assert!(ptx.contains(&format!("    mov.u32 %r{i}, %r{next};\n    bra BB1;\n")), "{ptx}");
+        // Arg-less conditional edges keep the two-line form.
+        assert!(ptx.contains("    @%p5 bra BB2;\n    bra BB3;\n"), "{ptx}");
+        // The scratch class is declared, once, and the parameter register fits.
+        assert_eq!(ptx.matches(".reg .u32 %edge_r;").count(), 1, "{ptx}");
+        let declared: u32 = ptx.split(".reg .u32 %r<").nth(1).unwrap().split('>').next().unwrap().parse().unwrap();
+        assert!(declared > i, "{ptx}");
+    }
+
+    #[test]
+    fn a_swap_on_an_edge_goes_through_the_scratch_register() {
+        // header(p0, p1) with a back edge passing (p1, p0): a two-cycle.
+        let mut b = KirBuilder::new("swap");
+        let flag = b.add_param("flag", KirType::Bool, AddressSpace::Local);
+        let entry = b.new_block();
+        let header = b.new_block();
+        let exit = b.new_block();
+        let p0 = b.add_block_param(header, KirType::F32);
+        let p1 = b.add_block_param(header, KirType::F32);
+        b.set_block(entry);
+        let x = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(x, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+        let y = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(y, KirConst { ty: KirType::F32, value: ConstValue::F32(2.0) }));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![x, y])));
+        b.set_block(header);
+        b.terminate(KirTerminator::CondBranch(
+            flag,
+            KirEdge::with(header, vec![p1, p0]),
+            exit.into(),
+        ));
+        b.set_block(exit);
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()));
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let expected = format!(
+            "    @!%p{flag} bra BB1_else;\n    mov.f32 %edge_f, %f{p0};\n    mov.f32 %f{p0}, %f{p1};\n    mov.f32 %f{p1}, %edge_f;\n    bra BB1;\nBB1_else:\n    bra BB2;\n"
+        );
+        assert!(ptx.contains(&expected), "{ptx}");
+    }
+
+    #[test]
+    fn a_chain_on_an_edge_writes_the_read_register_last() {
+        // header(p0, p1) with an edge passing (v, p0): p1 <- p0 must run
+        // before p0 <- v.
+        let mut b = KirBuilder::new("chain");
+        let entry = b.new_block();
+        let header = b.new_block();
+        let p0 = b.add_block_param(header, KirType::U32);
+        let p1 = b.add_block_param(header, KirType::U32);
+        b.set_block(entry);
+        let v = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::ThreadId(v, 0));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![v, p0])));
+        b.set_block(header);
+        b.terminate(KirTerminator::Return);
+        let mut ir = b.finalize();
+        // Not verifiable (the entry reads p0 before the header defines it);
+        // the sequencing is what is under test.
+        ir.var_types.insert(p0, KirType::U32);
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let expected = format!("    mov.u32 %r{p1}, %r{p0};\n    mov.u32 %r{p0}, %r{v};\n    bra BB1;\n");
+        assert!(ptx.contains(&expected), "{ptx}");
+    }
+
+    #[test]
+    fn kernels_without_block_params_declare_no_scratch() {
+        let ir = grid_stride_copy();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains("%edge_"));
+        let mut b = KirBuilder::new("plain");
+        let e = b.new_block();
+        b.set_block(e);
+        b.terminate(KirTerminator::Return);
+        let ptx = String::from_utf8(lower_kir_to_ptx(&b.finalize())).unwrap();
+        assert!(!ptx.contains("%edge_"), "{ptx}");
     }
 }
