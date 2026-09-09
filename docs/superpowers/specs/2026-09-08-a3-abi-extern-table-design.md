@@ -214,6 +214,14 @@ CLIF snapshots.
    (`parse_c_prototypes`) and the hand-written `argtypes`.
 3. **`nsl-log`.** The macro and the install hook; `nsl_runtime::nsl_log`
    re-exports. Gated by the C3 byte-identity tests.
+   *As landed:* the subscriber moved with the macro, and the hook is an
+   `EventsMirror` the runtime registers (consulted at event time) rather
+   than an installer that swaps in a runtime subscriber — an install hook
+   loses the `NSL_EVENTS` mirror for good whenever the compiler's first
+   line precedes the runtime's, since `tracing`'s global subscriber is set
+   once. `nsl_runtime::nsl_log!` stays a thin wrapper (register the
+   mirror, then `nsl_log::nsl_log!`), and the codegen and CLI call
+   `nsl_log::nsl_log!` directly, so step 5 has nothing left to rename.
 4. **`wire` structs and formats.** One PR per format, each with a
    round-trip test in `nsl-abi`.
    *As landed, first PR:* `wire::tensor_desc::NslTensorDesc` (layout

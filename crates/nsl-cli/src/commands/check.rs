@@ -14,7 +14,7 @@ pub(crate) fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
-            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
             process::exit(1);
         }
     };
@@ -47,7 +47,7 @@ pub(crate) fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_
     if dump_ast {
         match serde_json::to_string_pretty(&parse_result.module) {
             Ok(json) => println!("{json}"),
-            Err(e) => nsl_runtime::nsl_log!(ERROR, "cli", "error serializing AST: {e}"),
+            Err(e) => nsl_log::nsl_log!(ERROR, "cli", "error serializing AST: {e}"),
         }
     }
 
@@ -77,7 +77,7 @@ pub(crate) fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_
         .count();
 
     if total_errors > 0 {
-        nsl_runtime::nsl_log!(ERROR, "cli", "{total_errors} error(s) found");
+        nsl_log::nsl_log!(ERROR, "cli", "{total_errors} error(s) found");
         process::exit(1);
     } else {
         println!(
@@ -170,14 +170,14 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
     crate::activation_enforce::apply_allow_unknown_decorators(allow_unknown_decorators);
 
             if cep_search && cep_profile {
-                nsl_runtime::nsl_log!(ERROR, "cli", "error: --cep-search and --cep-profile are mutually exclusive");
+                nsl_log::nsl_log!(ERROR, "cli", "error: --cep-search and --cep-profile are mutually exclusive");
                 std::process::exit(1);
             }
             // CPKD Innovation 5: `--cpkd-design-student` is its own early-exit
             // mode; overlapping it with the CEP modes would silently pick
             // whichever dispatch runs first, so refuse instead.
             if cpkd_design_student.is_some() && (cep_search || cep_profile) {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --cpkd-design-student is mutually exclusive with --cep-search/--cep-profile"
                 );
                 std::process::exit(1);
@@ -186,14 +186,14 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             // report; alone it would do nothing, so refuse (same doctrine as
             // `--gpu requires --perf` below).
             if cpkd_target.is_some() && cpkd_design_student.is_none() {
-                nsl_runtime::nsl_log!(ERROR, "cli", "error: --cpkd-target requires --cpkd-design-student");
+                nsl_log::nsl_log!(ERROR, "cli", "error: --cpkd-target requires --cpkd-design-student");
                 std::process::exit(1);
             }
             // M37: `--trace` on `nsl check` was parsed-but-dormant for a long
             // time (users got silence and no trace file). Deferral must
             // refuse: fail loudly until compile-time trace synthesis exists.
             if trace.is_some() {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --trace is not implemented on `nsl check`; use \
                      `nsl debug <file.nsltrace> --export-chrome <out>` for runtime traces"
                 );
@@ -203,11 +203,11 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             // alone it would do nothing, so refuse instead of silently
             // accepting it.
             if gpu.is_some() && !perf {
-                nsl_runtime::nsl_log!(ERROR, "cli", "error: --gpu requires --perf");
+                nsl_log::nsl_log!(ERROR, "cli", "error: --gpu requires --perf");
                 std::process::exit(1);
             }
             if wrga_analyze.is_some() && wrga_compare.is_some() {
-                nsl_runtime::nsl_log!(ERROR, "cli", "error: --wrga-analyze and --wrga-compare are mutually exclusive");
+                nsl_log::nsl_log!(ERROR, "cli", "error: --wrga-analyze and --wrga-compare are mutually exclusive");
                 std::process::exit(1);
             }
             // Paper §9.3: `--wrga-ablate=<flags>` parses up front so an
@@ -220,13 +220,13 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 Some(s) => match parse_wrga_ablation(s) {
                     Ok(abl) => abl,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", "error: --wrga-ablate: {e}");
+                        nsl_log::nsl_log!(ERROR, "cli", "error: --wrga-ablate: {e}");
                         std::process::exit(1);
                     }
                 },
             };
             if parsed_ablation.is_active() && wrga_analyze.is_none() && wrga_compare.is_none() {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --wrga-ablate requires --wrga-analyze or --wrga-compare"
                 );
                 std::process::exit(1);
@@ -266,7 +266,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 if let Some(ref m) = csha
                     && nsl_codegen::csha::CshaMode::parse(m).is_none()
                 {
-                    nsl_runtime::nsl_log!(ERROR, "cli", 
+                    nsl_log::nsl_log!(ERROR, "cli", 
                         "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
                         m
                     );
@@ -275,7 +275,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 let source = match std::fs::read_to_string(&file) {
                     Ok(s) => s,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
+                        nsl_log::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
                         process::exit(1);
                     }
                 };
@@ -293,7 +293,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     t.starts_with("train(") || t.starts_with("train (")
                 });
                 if !has_train_block {
-                    nsl_runtime::nsl_log!(INFO, "cli", 
+                    nsl_log::nsl_log!(INFO, "cli", 
                         "note: --csha-report: no `train(...)` block in {} — CSHA planner has nothing to do.",
                         file.display(),
                     );
@@ -326,7 +326,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                         .iter()
                         .any(|d| d.level == Level::Error)
                     {
-                        nsl_runtime::nsl_log!(INFO, "cli", 
+                        nsl_log::nsl_log!(INFO, "cli", 
                             "note: --csha-report: lex errors prevented planner from running on {}",
                             file.display(),
                         );
@@ -337,7 +337,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                             .iter()
                             .any(|d| d.level == Level::Error)
                         {
-                            nsl_runtime::nsl_log!(INFO, "cli", 
+                            nsl_log::nsl_log!(INFO, "cli", 
                                 "note: --csha-report: parse errors prevented planner from running on {}",
                                 file.display(),
                             );
@@ -369,7 +369,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                                 false,
                                 &opts,
                             ) {
-                                nsl_runtime::nsl_log!(INFO, "cli", 
+                                nsl_log::nsl_log!(INFO, "cli", 
                                     "note: --csha-report: compile pipeline stopped after the planner ran (full codegen needs `nsl build`): {}",
                                     e.message,
                                 );
@@ -416,7 +416,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 let src = match std::fs::read_to_string(&file) {
                     Ok(s) => s,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
+                        nsl_log::nsl_log!(ERROR, "cli", "error: could not read file '{}': {e}", file.display());
                         process::exit(1);
                     }
                 };
@@ -429,7 +429,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                         return;
                     }
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", "error: shape debug failed: {e}");
+                        nsl_log::nsl_log!(ERROR, "cli", "error: shape debug failed: {e}");
                         process::exit(1);
                     }
                 }
@@ -461,8 +461,8 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 match nsl_cli::profile::run_profile(&profile_args) {
                     Ok(report) => println!("{report}"),
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", "error: --perf: {e}");
-                        nsl_runtime::nsl_log!(ERROR, "cli", 
+                        nsl_log::nsl_log!(ERROR, "cli", "error: --perf: {e}");
+                        nsl_log::nsl_log!(ERROR, "cli", 
                             "hint: for entry-point/dim/JSON control use `nsl profile {} --entry ...`",
                             file.display()
                         );
@@ -485,9 +485,9 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 analyzer.analyze_module(&parse_result.module, &nan_interner);
 
                 if analyzer.diagnostics.is_empty() {
-                    nsl_runtime::nsl_log!(INFO, "cli", "note: --nan-analysis: no NaN/Inf risks detected");
+                    nsl_log::nsl_log!(INFO, "cli", "note: --nan-analysis: no NaN/Inf risks detected");
                 } else {
-                    nsl_runtime::nsl_log!(WARN, "cli", 
+                    nsl_log::nsl_log!(WARN, "cli", 
                         "note: --nan-analysis: {} warning(s) detected",
                         analyzer.diagnostics.len()
                     );
@@ -519,9 +519,9 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     .collect();
 
                 if checker.diagnostics.is_empty() {
-                    nsl_runtime::nsl_log!(INFO, "cli", "note: --deterministic: no non-deterministic ops detected");
+                    nsl_log::nsl_log!(INFO, "cli", "note: --deterministic: no non-deterministic ops detected");
                 } else {
-                    nsl_runtime::nsl_log!(ERROR, "cli", 
+                    nsl_log::nsl_log!(ERROR, "cli", 
                         "note: --deterministic: {} warning(s), {} error(s)",
                         warnings.len(),
                         errors.len()
@@ -548,12 +548,12 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                             nsl_codegen::weight_aware::print_weight_analysis_report(&wmap, &config);
                         }
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "cli", "error: failed to load weights: {}", e);
+                            nsl_log::nsl_log!(ERROR, "cli", "error: failed to load weights: {}", e);
                             process::exit(1);
                         }
                     }
                 } else {
-                    nsl_runtime::nsl_log!(ERROR, "cli", "error: --weight-analysis requires --weights <path>");
+                    nsl_log::nsl_log!(ERROR, "cli", "error: --weight-analysis requires --weights <path>");
                     process::exit(1);
                 }
             }

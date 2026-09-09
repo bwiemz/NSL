@@ -932,18 +932,18 @@ pub fn prune_moe_weights_in_map(
 pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
     for o in outcomes {
         match o {
-            MoePruneOutcome::Pruned { layer, layout, dead, n_live, dropped_bytes } => nsl_runtime::nsl_log!(INFO, "cpdt", 
+            MoePruneOutcome::Pruned { layer, layout, dead, n_live, dropped_bytes } => nsl_log::nsl_log!(INFO, "cpdt", 
                 "[cpdt] moe '{layer}' ({layout:?}): pruned experts {dead:?} (affinity < {DEAD_EXPERT_THRESHOLD}) \
                  -> n_live={n_live}, dropped {dropped_bytes} bytes"
             ),
             MoePruneOutcome::NoDeadExperts { layer } => {
-                nsl_runtime::nsl_log!(INFO, "cpdt", "[cpdt] moe '{layer}': no dead experts, nothing pruned")
+                nsl_log::nsl_log!(INFO, "cpdt", "[cpdt] moe '{layer}': no dead experts, nothing pruned")
             }
             MoePruneOutcome::SkippedMissingRouter { layer } => {
-                nsl_runtime::nsl_log!(WARN, "cpdt", "[cpdt] moe '{layer}': skipped — no router weight found")
+                nsl_log::nsl_log!(WARN, "cpdt", "[cpdt] moe '{layer}': skipped — no router weight found")
             }
             MoePruneOutcome::SkippedMissingExperts { layer } => {
-                nsl_runtime::nsl_log!(WARN, "cpdt", "[cpdt] moe '{layer}': skipped — no expert weights found")
+                nsl_log::nsl_log!(WARN, "cpdt", "[cpdt] moe '{layer}': skipped — no expert weights found")
             }
             // v2.13 fix F12 (IMPORTANT adversarial review): dedicated
             // pretty-print arms for the v2.13 bias-related refusals.
@@ -952,7 +952,7 @@ pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
             MoePruneOutcome::Refused {
                 layer,
                 refusal: ExpertPruneRefusal::PartialBiasBundle { present, missing },
-            } => nsl_runtime::nsl_log!(WARN, "cpdt", 
+            } => nsl_log::nsl_log!(WARN, "cpdt", 
                 "[cpdt] moe '{layer}': prune refused — partial bias bundle. present={present:?}, missing={missing:?}. \
                  v3/v4 biases are all-or-nothing per layout family (UpDown / GateUpDown). \
                  Fix by adding the missing bias tensors to the checkpoint, OR by removing the present biases entirely."
@@ -960,7 +960,7 @@ pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
             MoePruneOutcome::Refused {
                 layer,
                 refusal: ExpertPruneRefusal::BiasShapeRankUnsupported { name, actual_ndim, num_elements },
-            } => nsl_runtime::nsl_log!(WARN, "cpdt", 
+            } => nsl_log::nsl_log!(WARN, "cpdt", 
                 "[cpdt] moe '{layer}': prune refused — bias '{name}' has rank {actual_ndim} (num_elements={num_elements}). \
                  v2.13 supports 1D `[n_experts * dim]` or 2D `[n_experts, dim]` bias layouts only. \
                  Reshape the bias tensor to one of those layouts."
@@ -968,20 +968,20 @@ pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
             MoePruneOutcome::Refused {
                 layer,
                 refusal: ExpertPruneRefusal::SingleLayoutWithBiasEntries { .. },
-            } => nsl_runtime::nsl_log!(WARN, "cpdt", 
+            } => nsl_log::nsl_log!(WARN, "cpdt", 
                 "[cpdt] moe '{layer}': prune refused — Single layout (v1/v2 packed format) does not support FFN biases. \
                  Remove the bias tensors from the checkpoint, OR upgrade the bundle to a multi-projection layout (v3 UpDown / v4 GateUpDown)."
             ),
             MoePruneOutcome::Refused {
                 layer,
                 refusal: ExpertPruneRefusal::OrphanBiasWithoutWeight { orphan_biases, .. },
-            } => nsl_runtime::nsl_log!(WARN, "cpdt", 
+            } => nsl_log::nsl_log!(WARN, "cpdt", 
                 "[cpdt] moe '{layer}': prune refused — orphan bias bundle. \
                  No expert weight projections were found under this layer, but bias entries exist: {orphan_biases:?}. \
                  Either add the matching weight tensors, or remove these orphan biases from the checkpoint."
             ),
             MoePruneOutcome::Refused { layer, refusal } => {
-                nsl_runtime::nsl_log!(WARN, "cpdt", "[cpdt] moe '{layer}': prune refused — {refusal:?}")
+                nsl_log::nsl_log!(WARN, "cpdt", "[cpdt] moe '{layer}': prune refused — {refusal:?}")
             }
         }
     }

@@ -1219,7 +1219,7 @@ fn run_weight_analysis(
                     "magnitude (fallback)",
                 ),
             };
-            nsl_runtime::nsl_log!(INFO, "wggo", "[wggo] layer:{} importance_source={}", layer.name, source);
+            nsl_log::nsl_log!(INFO, "wggo", "[wggo] layer:{} importance_source={}", layer.name, source);
             imp.head_scores = new_scores;
         }
     }
@@ -1338,7 +1338,7 @@ pub fn run_on_wengert_with_weights(
                             p.display(),
                             e
                         );
-                        nsl_runtime::nsl_log!(WARN, "wggo", "[wggo] warning: {msg}");
+                        nsl_log::nsl_log!(WARN, "wggo", "[wggo] warning: {msg}");
                         load_warning = Some(msg);
                         None
                     }
@@ -1364,7 +1364,7 @@ pub fn run_on_wengert_with_weights(
             match build_scorer(opts, provider) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    nsl_runtime::nsl_log!(ERROR, "wggo", "[wggo] error: {e:?}");
+                    nsl_log::nsl_log!(ERROR, "wggo", "[wggo] error: {e:?}");
                     return Ok(None);
                 }
             }

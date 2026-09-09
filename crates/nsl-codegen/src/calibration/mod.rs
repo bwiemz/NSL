@@ -278,7 +278,7 @@ pub fn run_harness_simulated(
         Err(HarnessError::Infrastructure { reason }) => match cfg.mode {
             HarnessMode::Required => Err(HarnessError::Infrastructure { reason }),
             HarnessMode::BestEffort => {
-                nsl_runtime::nsl_log!(WARN, "codegen", 
+                nsl_log::nsl_log!(WARN, "codegen", 
                     "warning: calibration infrastructure failure in best-effort mode: {reason}"
                 );
                 Ok(HarnessOutput {
