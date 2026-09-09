@@ -25,6 +25,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   mapped onto today's seventeen planning sites, the technique-free
   `emit_train_plan`, and the five snapshot-gated steps from the peeled
   driver to that shape.
+- Design spec for the roadmap A3 endgame,
+  `docs/superpowers/specs/2026-09-08-a3-abi-extern-table-design.md`: one
+  X-macro table of the ~370 runtime functions the codegen calls in
+  `nsl-abi`, rendered into the codegen's Cranelift declarations and into
+  `rustc`-checked signature assertions in the runtime (replacing the
+  text-parsing cross-check), the C-header and Python-mirror generators
+  behind `assert_eq!` gates, and the three moves — `nsl-log`, the wire
+  formats, a feature-gated runtime dependency — that drop the codegen →
+  runtime edge; six gated steps.
 
 - Runtime logging front door (roadmap C3): `nsl_log!(LEVEL, "target", …)`
   in nsl-runtime emits a `tracing` event per diagnostic line; the crate's own
