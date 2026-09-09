@@ -764,6 +764,25 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             let prefix = var_reg_prefix(ir, *dst, *dst);
             writeln!(ptx, "    mov.u64 {}{}, shared_mem;", prefix, dst).unwrap();
         }
+        KirOp::SharedRegion { dst, region } => {
+            // One `mov` to the block, then the region's offset folded in.
+            // The offset comes from `SmemLayout::offset_of` — the same
+            // computation the accessors derive from, so a region cannot be
+            // at one address here and another there. Rule 8 has already
+            // bounds-checked `region`; `unwrap_or(0)` keeps the printer
+            // total for a kernel that reached it unverified.
+            let prefix = var_reg_prefix(ir, *dst, *dst);
+            let offset = ir.smem_layout.offset_of(*region as usize).unwrap_or(0);
+            writeln!(ptx, "    mov.u64 {}{}, shared_mem;", prefix, dst).unwrap();
+            if offset != 0 {
+                writeln!(
+                    ptx,
+                    "    add.u64 {}{}, {}{}, {};",
+                    prefix, dst, prefix, dst, offset
+                )
+                .unwrap();
+            }
+        }
         KirOp::CpAsync { dst, src, bytes } => {
             let dst_prefix = var_reg_prefix(ir, *dst, *dst);
             let src_prefix = var_reg_prefix(ir, *src, *src);
@@ -780,16 +799,19 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::CpAsyncWait { pending } => {
             writeln!(ptx, "    cp.async.wait_group {};", pending).unwrap();
         }
-        KirOp::LdMatrixX4 { dst, addr, trans } => {
+        KirOp::LdMatrix { dst, addr, trans } => {
             let regs = dst
                 .iter()
                 .map(|v| format!("{}{}", var_reg_prefix(ir, *v, *v), v))
                 .collect::<Vec<_>>()
                 .join(", ");
             let addr_prefix = var_reg_prefix(ir, *addr, *addr);
+            // The `.x{N}` token is the operand-vector arity: rule 6 has
+            // already held `dst.len()` to 1, 2 or 4, the only forms PTX has.
             writeln!(
                 ptx,
-                "    ldmatrix.sync.aligned.m8n8.x4{}.shared.b16 {{{}}}, [{}{}];",
+                "    ldmatrix.sync.aligned.m8n8.x{}{}.shared.b16 {{{}}}, [{}{}];",
+                dst.len(),
                 if *trans { ".trans" } else { "" },
                 regs,
                 addr_prefix,
@@ -797,16 +819,21 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             )
             .unwrap();
         }
-        KirOp::MmaF16M16N8K16 { d, a, b, c } => {
+        KirOp::Mma { shape, a_ty, d, a, b, c } => {
             let list = |vars: &[VarId]| {
                 vars.iter()
                     .map(|v| format!("{}{}", var_reg_prefix(ir, *v, *v), v))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
+            // `.f32.<ty>.<ty>.f32` — the accumulator is f32 at every estate
+            // site, so only the A/B type varies with `a_ty`.
             writeln!(
                 ptx,
-                "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{}}}, {{{}}}, {{{}}}, {{{}}};",
+                "    mma.sync.aligned.{}.row.col.f32.{}.{}.f32 {{{}}}, {{{}}}, {{{}}}, {{{}}};",
+                shape.ptx_shape(),
+                a_ty.ptx_type(),
+                a_ty.ptx_type(),
                 list(d),
                 list(a),
                 list(b),
@@ -1224,16 +1251,16 @@ mod tests {
         let smem = b.new_typed_var(KirType::Ptr(Box::new(KirType::F16), AddressSpace::Shared));
         b.emit(KirOp::SharedBase(smem));
         let a = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
-        b.emit(KirOp::LdMatrixX4 { dst: a, addr: smem, trans: false });
+        b.emit(KirOp::LdMatrix { dst: a.to_vec(), addr: smem, trans: false });
         let bb = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
-        b.emit(KirOp::LdMatrixX4 { dst: bb, addr: smem, trans: true });
+        b.emit(KirOp::LdMatrix { dst: bb.to_vec(), addr: smem, trans: true });
         let mut c = [0; 4];
         for slot in &mut c {
             *slot = b.new_typed_var(KirType::F32);
             b.emit(KirOp::Const(*slot, KirConst { ty: KirType::F32, value: ConstValue::F32(0.0) }));
         }
         let d = [b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32), b.new_typed_var(KirType::F32)];
-        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.emit(KirOp::Mma { shape: MmaShape::M16N8K16, a_ty: MmaOperandTy::F16, d: d.to_vec(), a: a.to_vec(), b: vec![bb[0], bb[1]], c: c.to_vec() });
         b.emit(KirOp::Store(out, d[0], AddressSpace::Global));
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();

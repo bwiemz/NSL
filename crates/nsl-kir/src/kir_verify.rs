@@ -68,7 +68,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::kernel_ir::{
+use crate::kernel_ir::{MmaShape, 
     AddressSpace, BlockId, KernelIR, KirConst, KirEdge, KirOp, KirTerminator, KirType, VarId,
     VoteMode,
 };
@@ -130,6 +130,33 @@ pub enum KirVerifyError {
     PredicatedValueOp { block: BlockId, op_index: usize },
     /// A `LoadVec`/`StoreVec` of `width` values; PTX vectors are 2 or 4 wide.
     BadVectorWidth { block: BlockId, op_index: usize, width: usize },
+    /// Rule 6: `ldmatrix` has `.x1`, `.x2` and `.x4` and no other form.
+    BadLdMatrixCount { block: BlockId, op_index: usize, count: usize },
+    /// Rule 6: an `Mma` operand vector whose arity does not match its shape.
+    BadMmaFragmentCount {
+        block: BlockId,
+        op_index: usize,
+        shape: MmaShape,
+        role: &'static str,
+        expected: usize,
+        found: usize,
+    },
+    /// Rule 8: `SharedRegion` names a region the layout does not have.
+    SmemRegionOutOfRange { block: BlockId, op_index: usize, region: u32, regions: usize },
+    /// Rule 8: two regions of the layout occupy overlapping bytes.
+    SmemRegionsOverlap { earlier: String, later: String, at: u32 },
+    /// Rule 8: the layout does not fit the budget for its `dynamic` flag.
+    SmemBudgetExceeded { total: u32, budget: u32, dynamic: bool },
+    /// Rule 8: a kernel declares both a region layout and the flat
+    /// `shared_mem_bytes` block. Mixing a static `.shared` declaration with
+    /// an `extern` one is the sm_120 illegal-address finding.
+    SmemLayoutAndFlatBlock { regions: usize, flat_bytes: u32 },
+    /// Rule 8: an `ldmatrix` or 16-byte `cp.async` address comes from a
+    /// region that is not 16-byte aligned.
+    SmemRegionUnaligned { block: BlockId, op_index: usize, region: String, align: u32 },
+    /// Rule 9: a `Barrier` under a predicate. A barrier the whole warp does
+    /// not reach is a hang, not a skipped instruction.
+    PredicatedBarrier { block: BlockId, op_index: usize },
 }
 
 impl fmt::Display for KirVerifyError {
@@ -197,6 +224,43 @@ impl fmt::Display for KirVerifyError {
                 f,
                 "Predicated at block {block} op {op_index} wraps an op that defines a value; predicate only side effects"
             ),
+            KirVerifyError::BadLdMatrixCount { block, op_index, count } => write!(
+                f,
+                "block {block} op {op_index}: ldmatrix loads {count} matrices; \
+                 PTX has .x1, .x2 and .x4 only"
+            ),
+            KirVerifyError::BadMmaFragmentCount { block, op_index, shape, role, expected, found } => write!(
+                f,
+                "block {block} op {op_index}: mma.{} takes {expected} {role} register(s), found {found}",
+                shape.ptx_shape()
+            ),
+            KirVerifyError::SmemRegionOutOfRange { block, op_index, region, regions } => write!(
+                f,
+                "block {block} op {op_index}: shared region {region} but the layout has {regions}"
+            ),
+            KirVerifyError::SmemRegionsOverlap { earlier, later, at } => write!(
+                f,
+                "shared regions '{earlier}' and '{later}' overlap at byte {at}"
+            ),
+            KirVerifyError::SmemBudgetExceeded { total, budget, dynamic } => write!(
+                f,
+                "shared layout needs {total} bytes; the {} budget is {budget}",
+                if *dynamic { "dynamic (extern .shared)" } else { "static .shared" }
+            ),
+            KirVerifyError::SmemLayoutAndFlatBlock { regions, flat_bytes } => write!(
+                f,
+                "kernel declares {regions} shared region(s) AND a flat {flat_bytes}-byte block; \
+                 a kernel is static or dynamic, never both"
+            ),
+            KirVerifyError::SmemRegionUnaligned { block, op_index, region, align } => write!(
+                f,
+                "block {block} op {op_index}: address comes from shared region '{region}' \
+                 aligned to {align}; ldmatrix and 16-byte cp.async need 16"
+            ),
+            KirVerifyError::PredicatedBarrier { block, op_index } => write!(
+                f,
+                "block {block} op {op_index}: a Barrier must not be predicated"
+            ),
             KirVerifyError::BadVectorWidth { block, op_index, width } => write!(
                 f,
                 "vector memory op at block {block} op {op_index} moves {width} values; PTX vectors are 2 or 4 wide"
@@ -214,8 +278,110 @@ pub const BLOCK_PARAM_INDEX: usize = usize::MAX - 1;
 
 /// Verify `ir` against the rules in the module header. `Ok(())` or every
 /// violation found, in block/op order.
+/// Rule 8, the whole-kernel half (roadmap A2 step 6).
+///
+/// Overlap, budget and the static/dynamic exclusivity are properties of the
+/// layout rather than of any op, so they are checked once. The per-op halves
+/// — an in-range region index, and a 16-aligned region behind an `ldmatrix`
+/// or a 16-byte `cp.async` — live with their ops.
+fn check_smem_layout(ir: &KernelIR, errors: &mut Vec<KirVerifyError>) {
+    let layout = &ir.smem_layout;
+    if layout.regions.is_empty() {
+        return;
+    }
+
+    // A kernel is static or dynamic, never both. Mixing a static `.shared`
+    // declaration with an `extern` one is the sm_120 illegal-address
+    // finding the design spec records.
+    if ir.shared_mem_bytes > 0 {
+        errors.push(KirVerifyError::SmemLayoutAndFlatBlock {
+            regions: layout.regions.len(),
+            flat_bytes: ir.shared_mem_bytes,
+        });
+    }
+
+    // Overlap. `offset_of` packs in declaration order, so a region can only
+    // overlap its predecessor — but say which pair and where, because the
+    // report is what a caller fixes.
+    let mut prev_end: Option<(usize, u32)> = None;
+    for index in 0..layout.regions.len() {
+        let Some(start) = layout.offset_of(index) else { continue };
+        if let Some((prev, end)) = prev_end
+            && start < end
+        {
+            errors.push(KirVerifyError::SmemRegionsOverlap {
+                earlier: layout.regions[prev].name.clone(),
+                later: layout.regions[index].name.clone(),
+                at: start,
+            });
+        }
+        prev_end = Some((index, start.saturating_add(layout.regions[index].bytes)));
+    }
+
+    // Alignment. `ldmatrix` and a 16-byte `cp.async` require a 16-byte
+    // aligned shared address. We can only say so for an address that comes
+    // STRAIGHT from a `SharedRegion` — once it has been through arithmetic
+    // the offset is a runtime value and this would need a range analysis.
+    // That is the conservative direction: a missed case is a `ptxas` or
+    // runtime error as it is today, whereas guessing would reject the
+    // indexing every real kernel does.
+    let mut region_of: HashMap<VarId, u32> = HashMap::new();
+    for block in &ir.blocks {
+        for op in &block.ops {
+            if let KirOp::SharedRegion { dst, region } = op {
+                region_of.insert(*dst, *region);
+            }
+        }
+    }
+    if !region_of.is_empty() {
+        for block in &ir.blocks {
+            for (op_index, op) in block.ops.iter().enumerate() {
+                let addr = match op {
+                    KirOp::LdMatrix { addr, .. } => Some(*addr),
+                    KirOp::CpAsync { dst, bytes: 16, .. } => Some(*dst),
+                    _ => None,
+                };
+                let Some(addr) = addr else { continue };
+                let Some(index) = region_of.get(&addr) else { continue };
+                let Some(region) = layout.regions.get(*index as usize) else { continue };
+                if region.align < 16 {
+                    errors.push(KirVerifyError::SmemRegionUnaligned {
+                        block: block.id,
+                        op_index,
+                        region: region.name.clone(),
+                        align: region.align,
+                    });
+                }
+            }
+        }
+    }
+
+    // Budget. `total_bytes` includes the alignment padding, which is the
+    // number the hardware actually has to find.
+    match layout.total_bytes() {
+        Some(total) if total <= layout.budget() => {}
+        Some(total) => errors.push(KirVerifyError::SmemBudgetExceeded {
+            total,
+            budget: layout.budget(),
+            dynamic: layout.dynamic,
+        }),
+        // An overflowing layout cannot fit any budget.
+        None => errors.push(KirVerifyError::SmemBudgetExceeded {
+            total: u32::MAX,
+            budget: layout.budget(),
+            dynamic: layout.dynamic,
+        }),
+    }
+}
+
 pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
     let mut errors = Vec::new();
+
+    // ── 0. Shared-memory layout (rule 8, roadmap A2 step 6) ──────────
+    // Checked before anything else: these are properties of the kernel's
+    // declaration, not of any one op, and a bad layout makes every
+    // `SharedRegion` offset below meaningless.
+    check_smem_layout(ir, &mut errors);
 
     // ── 1. Shape ─────────────────────────────────────────────────────
     if ir.blocks.is_empty() {
@@ -495,8 +661,8 @@ pub fn terminator_uses(term: &KirTerminator) -> Vec<VarId> {
 /// definition).
 pub fn op_dsts(op: &KirOp) -> Vec<VarId> {
     match op {
-        KirOp::LdMatrixX4 { dst, .. } => dst.to_vec(),
-        KirOp::MmaF16M16N8K16 { d, .. } => d.to_vec(),
+        KirOp::LdMatrix { dst, .. } => dst.clone(),
+        KirOp::Mma { d, .. } => d.clone(),
         KirOp::LoadVec { dsts, .. } => dsts.clone(),
         KirOp::Predicated { op, .. } => op_dsts(op),
         _ => op_dst(op).into_iter().collect(),
@@ -549,6 +715,7 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::Const(d, _)
         | KirOp::PtrOffset(d, _, _)
         | KirOp::SharedBase(d) => Some(*d),
+        KirOp::SharedRegion { dst, .. } => Some(*dst),
         KirOp::Store(_, _, _)
         | KirOp::AtomicAdd(_, _, _)
         | KirOp::Barrier
@@ -556,8 +723,8 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::CpAsync { .. }
         | KirOp::CpAsyncCommit
         | KirOp::CpAsyncWait { .. }
-        | KirOp::LdMatrixX4 { .. }
-        | KirOp::MmaF16M16N8K16 { .. }
+        | KirOp::LdMatrix { .. }
+        | KirOp::Mma { .. }
         | KirOp::LoadVec { .. }
         | KirOp::StoreVec { .. }
         | KirOp::Predicated { .. } => None,
@@ -615,14 +782,15 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         }
         KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) => vec![*p, *v],
         KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
-        KirOp::LdMatrixX4 { addr, .. } => vec![*addr],
-        KirOp::MmaF16M16N8K16 { a, b, c, .. } => {
-            let mut v = a.to_vec();
+        KirOp::LdMatrix { addr, .. } => vec![*addr],
+        KirOp::Mma { a, b, c, .. } => {
+            let mut v = a.clone();
             v.extend_from_slice(b);
             v.extend_from_slice(c);
             v
         }
         KirOp::SharedBase(_)
+        | KirOp::SharedRegion { .. }
         | KirOp::CpAsyncCommit
         | KirOp::CpAsyncWait { .. }
         | KirOp::ThreadId(_, _)
@@ -854,6 +1022,14 @@ fn check_types(
             if !op_dsts(inner).is_empty() || matches!(**inner, KirOp::Predicated { .. }) {
                 errors.push(KirVerifyError::PredicatedValueOp { block, op_index });
             }
+            // Rule 9 (roadmap A2 step 6). `Barrier` has no destination, so
+            // the value-op check above lets it through, but a `bar.sync`
+            // that only part of the warp reaches does not skip — it hangs.
+            // Every one of the estate's 248 barrier sites is an unpredicated
+            // `bar.sync 0`, and this keeps it that way.
+            if matches!(**inner, KirOp::Barrier) {
+                errors.push(KirVerifyError::PredicatedBarrier { block, op_index });
+            }
             check_types(ir, inner, block, op_index, errors);
         }
         KirOp::Cast(d, _, target) => expect(*d, "dst", target),
@@ -905,6 +1081,24 @@ fn check_types(
             }),
             Some(found) => errors.push(KirVerifyError::NotAPointer { var: *d, block, op_index, found }),
         },
+        KirOp::SharedRegion { dst, region } => {
+            // Rule 8, index half: an out-of-range region has no offset, so
+            // the printer would silently address byte 0 of the block.
+            match ir.smem_layout.regions.get(*region as usize) {
+                None => errors.push(KirVerifyError::SmemRegionOutOfRange {
+                    block,
+                    op_index,
+                    region: *region,
+                    regions: ir.smem_layout.regions.len(),
+                }),
+                Some(r) => {
+                    // The destination carries the region's declared element
+                    // type, in the shared space.
+                    let want = KirType::Ptr(Box::new(r.elem.clone()), AddressSpace::Shared);
+                    expect(*dst, "dst", &want);
+                }
+            }
+        }
         KirOp::CpAsync { dst, src, .. } => {
             for (var, role, expected) in
                 [(*dst, "dst", AddressSpace::Shared), (*src, "src", AddressSpace::Global)]
@@ -928,12 +1122,22 @@ fn check_types(
                 }
             }
         }
-        KirOp::LdMatrixX4 { dst, addr, .. } => {
+        KirOp::LdMatrix { dst, addr, .. } => {
             // The address check pushes directly, so it runs after the last
             // use of the `expect` closure (which holds `errors` mutably).
             let frag = f16x2();
             for v in dst {
                 expect(*v, "fragment", &frag);
+            }
+            // Rule 6, count half: PTX has `.x1`, `.x2` and `.x4` and no
+            // other form, so an arity outside that set has no instruction
+            // to print and is caught here rather than by `ptxas`.
+            if !matches!(dst.len(), 1 | 2 | 4) {
+                errors.push(KirVerifyError::BadLdMatrixCount {
+                    block,
+                    op_index,
+                    count: dst.len(),
+                });
             }
             match ty(addr) {
                 None | Some(KirType::Ptr(_, AddressSpace::Shared)) => {}
@@ -950,13 +1154,35 @@ fn check_types(
                 }
             }
         }
-        KirOp::MmaF16M16N8K16 { d, a, b, c } => {
-            let frag = f16x2();
+        KirOp::Mma { shape, a_ty, d, a, b, c } => {
+            // Rule 6: the A/B fragments carry the packed pair type for
+            // `a_ty` — a bf16 tile wired with f16 registers is an error
+            // here, not a silently wrong `mma` — and the arities follow the
+            // shape.
+            let frag = a_ty.fragment_ty();
             for v in a.iter().chain(b.iter()) {
                 expect(*v, "fragment", &frag);
             }
             for v in c.iter().chain(d.iter()) {
                 expect(*v, "accumulator", &KirType::F32);
+            }
+            let (want_a, want_b, want_cd) = shape.fragment_counts();
+            for (role, found, expected) in [
+                ("a", a.len(), want_a),
+                ("b", b.len(), want_b),
+                ("c", c.len(), want_cd),
+                ("d", d.len(), want_cd),
+            ] {
+                if found != expected {
+                    errors.push(KirVerifyError::BadMmaFragmentCount {
+                        block,
+                        op_index,
+                        shape: *shape,
+                        role,
+                        expected,
+                        found,
+                    });
+                }
             }
         }
         KirOp::CpAsyncCommit
@@ -973,6 +1199,7 @@ fn check_types(
 mod tests {
     use super::*;
     use crate::kernel_ir::{AddressSpace, CmpOp, ConstValue, KirBuilder, KirEdge};
+    use crate::kernel_ir::{MmaOperandTy, SmemLayout, SmemRegion};
     use crate::kernel_ir::VoteMode;
 
     fn f32_ptr() -> KirType {
@@ -1346,6 +1573,169 @@ mod tests {
         let e = b.new_block();
         b.set_block(e);
         (b, p)
+    }
+
+    // ── Roadmap A2 step 6: SmemLayout and the tensor-core set ────────
+
+    fn region(name: &str, bytes: u32, align: u32) -> SmemRegion {
+        SmemRegion { name: name.to_string(), bytes, align, elem: KirType::F32 }
+    }
+
+    /// Offsets pack in declaration order and round each start up to the
+    /// region's own alignment. This is the computation the 74 FA v2
+    /// accessors derive from, so it is stated as a table rather than as a
+    /// property.
+    #[test]
+    fn region_offsets_pack_in_order_and_respect_alignment() {
+        let layout = SmemLayout {
+            regions: vec![region("q", 100, 16), region("kv", 8, 16), region("tail", 4, 4)],
+            dynamic: false,
+        };
+        assert_eq!(layout.offset_of(0), Some(0));
+        // 100 is not a multiple of 16, so "kv" starts at 112, not 100.
+        assert_eq!(layout.offset_of(1), Some(112));
+        assert_eq!(layout.offset_of(2), Some(120));
+        assert_eq!(layout.total_bytes(), Some(124));
+        assert_eq!(layout.offset_of(3), None);
+        assert_eq!(layout.index_of("kv"), Some(1));
+    }
+
+    /// Rule 8: a layout and the flat block are alternatives. Mixing a
+    /// static `.shared` declaration with an `extern` one is the sm_120
+    /// illegal-address finding.
+    #[test]
+    fn a_kernel_is_static_or_dynamic_never_both() {
+        let (mut b, _) = one_block();
+        b.set_smem_layout(SmemLayout { regions: vec![region("q", 64, 16)], dynamic: false });
+        b.set_shared_mem(256);
+        b.terminate(KirTerminator::Return);
+        let errors = verify(&b.finalize()).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(e, KirVerifyError::SmemLayoutAndFlatBlock { .. })),
+            "expected the static/dynamic exclusivity error, got {errors:?}"
+        );
+    }
+
+    /// Rule 8: the budget follows `dynamic` — the same layout that
+    /// overflows a static declaration fits the `extern` opt-in.
+    #[test]
+    fn the_budget_follows_the_dynamic_flag() {
+        let big = |dynamic| {
+            let (mut b, _) = one_block();
+            b.set_smem_layout(SmemLayout {
+                regions: vec![region("big", 64 * 1024, 16)],
+                dynamic,
+            });
+            b.terminate(KirTerminator::Return);
+            verify(&b.finalize())
+        };
+        // 64 KiB overflows the 48 KiB static declaration ...
+        let errors = big(false).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(e, KirVerifyError::SmemBudgetExceeded { .. })),
+            "64 KiB must not fit the static budget, got {errors:?}"
+        );
+        // ... and fits the 99 KiB dynamic one.
+        assert!(big(true).is_ok(), "64 KiB must fit the dynamic budget");
+    }
+
+    /// Rule 8: `ldmatrix` needs a 16-aligned region. The check only fires
+    /// for an address taken STRAIGHT from a `SharedRegion`; anything that
+    /// has been through arithmetic is left alone deliberately.
+    #[test]
+    fn ldmatrix_refuses_an_underaligned_region() {
+        let (mut b, _) = one_block();
+        b.set_smem_layout(SmemLayout {
+            regions: vec![SmemRegion {
+                name: "frag".to_string(),
+                bytes: 256,
+                align: 4,
+                elem: KirType::F16,
+            }],
+            dynamic: false,
+        });
+        let addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F16), AddressSpace::Shared));
+        b.emit(KirOp::SharedRegion { dst: addr, region: 0 });
+        let dst: Vec<VarId> = (0..4)
+            .map(|_| b.new_typed_var(KirType::Vec(Box::new(KirType::F16), 2)))
+            .collect();
+        b.emit(KirOp::LdMatrix { dst, addr, trans: false });
+        b.terminate(KirTerminator::Return);
+        let errors = verify(&b.finalize()).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(e, KirVerifyError::SmemRegionUnaligned { .. })),
+            "expected the alignment error, got {errors:?}"
+        );
+    }
+
+    /// Rule 8: `SharedRegion` naming a region the layout does not have.
+    #[test]
+    fn a_shared_region_index_is_bounds_checked() {
+        let (mut b, _) = one_block();
+        b.set_smem_layout(SmemLayout { regions: vec![region("only", 64, 16)], dynamic: false });
+        let p = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Shared));
+        b.emit(KirOp::SharedRegion { dst: p, region: 7 });
+        b.terminate(KirTerminator::Return);
+        let errors = verify(&b.finalize()).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(e, KirVerifyError::SmemRegionOutOfRange { .. })),
+            "expected the out-of-range error, got {errors:?}"
+        );
+    }
+
+    /// Rule 6: the fragment arities follow the shape. An m16n8k8 tile wired
+    /// with m16n8k16's four A registers is caught here, not by `ptxas`.
+    #[test]
+    fn mma_fragment_counts_follow_the_shape() {
+        let (mut b, _) = one_block();
+        let frag = |b: &mut KirBuilder| b.new_typed_var(KirType::Vec(Box::new(KirType::F16), 2));
+        let acc = |b: &mut KirBuilder| b.new_typed_var(KirType::F32);
+        let a: Vec<VarId> = (0..4).map(|_| frag(&mut b)).collect();
+        let bb: Vec<VarId> = (0..1).map(|_| frag(&mut b)).collect();
+        let c: Vec<VarId> = (0..4).map(|_| acc(&mut b)).collect();
+        let d: Vec<VarId> = (0..4).map(|_| acc(&mut b)).collect();
+        for v in a.iter().chain(bb.iter()) {
+            b.emit(KirOp::Const(
+                *v,
+                KirConst {
+                    ty: KirType::Vec(Box::new(KirType::F16), 2),
+                    value: ConstValue::U32(0),
+                },
+            ));
+        }
+        for v in c.iter() {
+            b.emit(KirOp::Const(*v, KirConst { ty: KirType::F32, value: ConstValue::F32(0.0) }));
+        }
+        // m16n8k8 takes TWO a registers; this passes four.
+        b.emit(KirOp::Mma { shape: MmaShape::M16N8K8, a_ty: MmaOperandTy::F16, d, a, b: bb, c });
+        b.terminate(KirTerminator::Return);
+        let errors = verify(&b.finalize()).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                KirVerifyError::BadMmaFragmentCount { role: "a", expected: 2, found: 4, .. }
+            )),
+            "expected the a-arity error, got {errors:?}"
+        );
+    }
+
+    /// Rule 9: a barrier the whole warp does not reach hangs; it does not
+    /// skip. `Barrier` has no destination, so the value-op check lets it
+    /// through and this is what refuses it.
+    #[test]
+    fn a_barrier_must_not_be_predicated() {
+        let (mut b, _) = one_block();
+        let t = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::ThreadId(t, 0));
+        let p = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(p, t, t, CmpOp::Eq));
+        b.emit(KirOp::Predicated { pred: p, negate: false, op: Box::new(KirOp::Barrier) });
+        b.terminate(KirTerminator::Return);
+        let errors = verify(&b.finalize()).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(e, KirVerifyError::PredicatedBarrier { .. })),
+            "expected the predicated-barrier error, got {errors:?}"
+        );
     }
 
     #[test]
@@ -1848,9 +2238,9 @@ mod tests {
         let smem = b.new_typed_var(f16_shared_ptr());
         b.emit(KirOp::SharedBase(smem));
         let a = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
-        b.emit(KirOp::LdMatrixX4 { dst: a, addr: smem, trans: false });
+        b.emit(KirOp::LdMatrix { dst: a.to_vec(), addr: smem, trans: false });
         let bb = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
-        b.emit(KirOp::LdMatrixX4 { dst: bb, addr: smem, trans: true });
+        b.emit(KirOp::LdMatrix { dst: bb.to_vec(), addr: smem, trans: true });
         let mut c = [0; 4];
         for slot in &mut c {
             *slot = b.new_typed_var(KirType::F32);
@@ -1863,7 +2253,7 @@ mod tests {
     #[test]
     fn a_tensor_core_tile_verifies_and_requires_the_feature() {
         let (mut b, a, bb, c, d) = one_tile();
-        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.emit(KirOp::Mma { shape: MmaShape::M16N8K16, a_ty: MmaOperandTy::F16, d: d.to_vec(), a: a.to_vec(), b: vec![bb[0], bb[1]], c: c.to_vec() });
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(verify(&ir), Ok(()));
@@ -1876,7 +2266,7 @@ mod tests {
         let wrong = b.new_typed_var(frag());
         b.emit(KirOp::Const(wrong, KirConst { ty: frag(), value: ConstValue::U32(0) }));
         c[2] = wrong;
-        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.emit(KirOp::Mma { shape: MmaShape::M16N8K16, a_ty: MmaOperandTy::F16, d: d.to_vec(), a: a.to_vec(), b: vec![bb[0], bb[1]], c: c.to_vec() });
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(
@@ -1895,7 +2285,7 @@ mod tests {
     #[test]
     fn a_b_fragment_typed_as_f32_is_reported() {
         let (mut b, a, bb, c, d) = one_tile();
-        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], c[0]], c });
+        b.emit(KirOp::Mma { shape: MmaShape::M16N8K16, a_ty: MmaOperandTy::F16, d: d.to_vec(), a: a.to_vec(), b: vec![bb[0], c[0]], c: c.to_vec() });
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(
@@ -1918,7 +2308,7 @@ mod tests {
         let entry = b.new_block();
         b.set_block(entry);
         let a = [b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag()), b.new_typed_var(frag())];
-        b.emit(KirOp::LdMatrixX4 { dst: a, addr: g, trans: false });
+        b.emit(KirOp::LdMatrix { dst: a.to_vec(), addr: g, trans: false });
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(
@@ -1938,7 +2328,7 @@ mod tests {
     fn a_fragment_register_listed_twice_as_a_destination_breaks_ssa() {
         let (mut b, a, bb, c, mut d) = one_tile();
         d[3] = d[0];
-        b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+        b.emit(KirOp::Mma { shape: MmaShape::M16N8K16, a_ty: MmaOperandTy::F16, d: d.to_vec(), a: a.to_vec(), b: vec![bb[0], bb[1]], c: c.to_vec() });
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(
