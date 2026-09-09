@@ -19,6 +19,7 @@ use cranelift_module::Module;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::plan::TrainPlan;
 use crate::stmt::parse_layer_idx_for_health;
 
 /// Every binding of `compile_train_block_inner` the per-step diagnostics
@@ -34,10 +35,10 @@ pub(crate) struct HealthHooksInputs<'a> {
     pub(crate) num_params_val: Value,
     /// The model parameter list.
     pub(crate) param_list: Value,
-    /// The parameter paths, in list order (the per-parameter hooks are unrolled over them).
-    pub(crate) param_paths: &'a [String],
     /// The step counter variable.
     pub(crate) step_count_var: Variable,
+    /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
+    pub(crate) plan: &'a TrainPlan,
 }
 
 impl Compiler<'_> {
@@ -49,14 +50,19 @@ impl Compiler<'_> {
         inputs: HealthHooksInputs<'_>,
     ) -> Result<(), CodegenError> {
         let HealthHooksInputs {
+            plan,
             fase_hook_active,
             grads_list,
             loss_val,
             num_params_val,
             param_list,
-            param_paths,
             step_count_var,
         } = inputs;
+        // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
+        // as copied fields, read from the carrier under their old names so
+        // the body below is unchanged.
+        let param_paths: &[String] = &plan.params.paths;
+
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.

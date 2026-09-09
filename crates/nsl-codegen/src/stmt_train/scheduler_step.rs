@@ -19,42 +19,35 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{InstBuilder, Value};
 use cranelift_frontend::{FunctionBuilder, Variable};
-use nsl_semantic::optim_config::ResolvedScheduler;
 
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::plan::TrainPlan;
 
 /// Every binding of `compile_train_block_inner` the step tail reads;
 /// names are the driver's.
 pub(crate) struct SchedulerStepInputs<'a> {
     /// The DataLoader handle recorded in a checkpoint (null without a loader).
     pub(crate) checkpoint_dl_handle: Value,
-    /// Optimizer steps between periodic checkpoints.
-    pub(crate) checkpoint_every: i64,
     /// The parameter-name list built at setup whenever `checkpoint_save` is set.
     pub(crate) checkpoint_names_list: Option<Value>,
-    /// The `checkpoint_save` path; `None` disables the periodic checkpoint.
-    pub(crate) checkpoint_save_path: &'a Option<String>,
     /// The epoch counter variable.
     pub(crate) epoch_counter_var: Variable,
-    pub(crate) grad_accumulation_steps: i64,
     /// The DataLoader value when the `data:` section declares one.
     pub(crate) has_dataloader: Option<Value>,
-    /// The base learning rate.
-    pub(crate) lr_value: f64,
     /// The learning-rate variable the scheduler redefines.
     pub(crate) lr_var: Variable,
     /// The model parameter list.
     pub(crate) param_list: Value,
-    /// The resolved scheduler, if any.
-    pub(crate) scheduler: &'a Option<ResolvedScheduler>,
     /// The first optimizer-state list.
     pub(crate) state_list_1: Value,
     /// The second optimizer-state list.
     pub(crate) state_list_2: Value,
     /// The step counter variable (incremented here, after the scheduler call).
     pub(crate) step_count_var: Variable,
+    /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
+    pub(crate) plan: &'a TrainPlan,
 }
 
 impl Compiler<'_> {
@@ -67,21 +60,26 @@ impl Compiler<'_> {
         inputs: SchedulerStepInputs<'_>,
     ) -> Result<(), CodegenError> {
         let SchedulerStepInputs {
+            plan,
             checkpoint_dl_handle,
-            checkpoint_every,
             checkpoint_names_list,
-            checkpoint_save_path,
             epoch_counter_var,
-            grad_accumulation_steps,
             has_dataloader,
-            lr_value,
             lr_var,
             param_list,
-            scheduler,
             state_list_1,
             state_list_2,
             step_count_var,
         } = inputs;
+        // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
+        // as copied fields, read from the carrier under their old names so
+        // the body below is unchanged.
+        let checkpoint_every = plan.schedule.checkpoint_every;
+        let checkpoint_save_path = &plan.schedule.checkpoint_save_path;
+        let grad_accumulation_steps = plan.schedule.grad_accumulation_steps;
+        let lr_value = plan.spec.lr_value;
+        let scheduler = &plan.spec.scheduler;
+
 
         // 7g2. Scheduler: update learning rate if a scheduler is configured.
         // NOTE: step_count is incremented AFTER the scheduler call so that
