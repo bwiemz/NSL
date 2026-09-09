@@ -34,6 +34,12 @@ pub const NSL_EXIT_CUDA_ASYNC: i32 = 14;
 /// Exit code for a cuBLAS call that failed where no partial result is safe
 /// to continue from.
 pub const NSL_EXIT_CUBLAS: i32 = 15;
+/// Exit code for a device tensor reaching a runtime built without the
+/// `cuda` feature.
+pub const NSL_EXIT_CUDA_NOT_COMPILED: i32 = 16;
+/// Exit code for a tensor operation asked to work on a dtype it does not
+/// implement — a compiler/runtime contract violation, not a user error.
+pub const NSL_EXIT_UNSUPPORTED_DTYPE: i32 = 17;
 
 /// The fatal conditions the runtime exits on. Each maps to one exit code
 /// ([`Fatal::exit_code`]); the diagnostic text is the caller's.
@@ -51,16 +57,25 @@ pub enum Fatal {
     CudaAsync,
     /// A cuBLAS call returned an error status on an in-place operation.
     Cublas,
+    /// A device tensor reached a tensor op in a runtime built without the
+    /// `cuda` feature (the program was compiled for a GPU this runtime
+    /// cannot drive).
+    CudaNotCompiled,
+    /// A tensor op was asked to work on a dtype it does not implement: the
+    /// compiler emitted a call the runtime's contract does not cover.
+    UnsupportedDtype,
 }
 
 impl Fatal {
     /// Every variant, for the exit-code tests and for documentation
     /// generators.
-    pub const ALL: [Fatal; 4] = [
+    pub const ALL: [Fatal; 6] = [
         Fatal::GpuOom,
         Fatal::CudaDriver,
         Fatal::CudaAsync,
         Fatal::Cublas,
+        Fatal::CudaNotCompiled,
+        Fatal::UnsupportedDtype,
     ];
 
     /// The process exit code for this condition.
@@ -70,6 +85,8 @@ impl Fatal {
             Fatal::CudaDriver => NSL_EXIT_CUDA_DRIVER,
             Fatal::CudaAsync => NSL_EXIT_CUDA_ASYNC,
             Fatal::Cublas => NSL_EXIT_CUBLAS,
+            Fatal::CudaNotCompiled => NSL_EXIT_CUDA_NOT_COMPILED,
+            Fatal::UnsupportedDtype => NSL_EXIT_UNSUPPORTED_DTYPE,
         }
     }
 
@@ -80,6 +97,8 @@ impl Fatal {
             Fatal::CudaDriver => "cuda-driver",
             Fatal::CudaAsync => "cuda-async",
             Fatal::Cublas => "cublas",
+            Fatal::CudaNotCompiled => "cuda-not-compiled",
+            Fatal::UnsupportedDtype => "unsupported-dtype",
         }
     }
 }
@@ -98,6 +117,15 @@ pub fn die(kind: Fatal, msg: &str) -> ! {
     );
     let _ = std::io::stderr().flush();
     std::process::exit(kind.exit_code());
+}
+
+/// The `#[cfg(not(feature = "cuda"))]` arm of a tensor op that a device
+/// tensor reached: one message, one exit code, at every such site.
+pub fn cuda_not_compiled() -> ! {
+    die(
+        Fatal::CudaNotCompiled,
+        "CUDA support not compiled. Rebuild with --features cuda",
+    )
 }
 
 #[cfg(test)]
