@@ -101,9 +101,12 @@ unsafe fn tensor_raw_bytes(t: &NslTensor) -> (Vec<u8>, i32) {
             let slice = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
             (slice.iter().flat_map(|v| v.to_le_bytes()).collect(), FLOAT16)
         }
-        d if d >= DTYPE_CUSTOM_START => panic!(
-            "ONNX export: custom/block-packed dtype {d} has no ONNX tensor \
-             representation; convert the tensor to f32/f16 before export"
+        d if d >= DTYPE_CUSTOM_START => crate::fatal::die(
+            crate::fatal::Fatal::Unsupported,
+            &format!(
+                "ONNX export: custom/block-packed dtype {d} has no ONNX tensor \
+                 representation; convert the tensor to f32/f16 before export"
+            ),
         ),
         _ => {
             // Known narrow dtypes (bf16, i32, u16 token ids): upcast losslessly

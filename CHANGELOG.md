@@ -143,6 +143,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The last production `panic!` sites in `nsl-runtime` are typed fatal
+  exits (roadmap C1, tier 3): `Fatal::ShapeMismatch` (**18**, `nsl_tensor_
+  compare`'s short `b` operand and `fase_fused_step`'s mixed-dtype CPU
+  path) and `Fatal::Unsupported` (**19**, the device-to-device
+  `nsl_tensor_to_device` and an ONNX export of a block-packed dtype) join
+  the table; the eight remaining unsupported-dtype panics
+  (`nsl_tensor_compare`, `nsl_tensor_where`, the f16 elementwise readers,
+  the token readers of `packing.rs` and `dataloader.rs`) go through the
+  new `fatal::unsupported_dtype(op, dtype)` with their message unchanged;
+  `nsl_packed_mask_from_segment_ids`'s non-CUDA arm is
+  `fatal::cuda_not_compiled()`; the inspect stream's `cuStreamCreate`
+  failure is `Fatal::CudaDriver`. Every `panic!` left in the crate is in a
+  `#[cfg(test)]` module or the test-only `alloc_pinned` wrapper.
+  `fatal::tests::the_codes_are_stable` pins all eight codes;
+  `docs/architecture/runtime.md`'s table has the two new rows.
+
 - Two more typed fatal exits (roadmap C1): `Fatal::CudaNotCompiled`
   (**16**) replaces the 51 `panic!("CUDA support not compiled")` sites in
   the `#[cfg(not(feature = "cuda"))]` arms of the GPU-capable tensor ops
