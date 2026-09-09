@@ -8,6 +8,8 @@
 //!
 //! Snapshots are stored in tests/snapshots/*.snap
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // FlashAttention PTX snapshots
 // ---------------------------------------------------------------------------
@@ -459,3 +461,26 @@ fn snapshot_kir_unary_math_ptx() {
 // Fusion graph structure snapshots
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// User `kernel` blocks through KIR (roadmap A2 step 3)
+// ---------------------------------------------------------------------------
+
+/// The CUDA target compiles a `kernel` block AST → KIR → PTX. One snapshot
+/// per shape the lowering accepts (`common::kernel_blocks::ALL`); the
+/// reviewed diff against the retired AST→PTX `KernelCompiler` is
+/// instruction-level (u32 index arithmetic widened at the pointer offset
+/// rather than u64 throughout, `div.rn.f32` for `/`, allocator-numbered
+/// registers) and recorded in the PR that landed step 3.
+/// `kernel_block_ptxas.rs` assembles the same texts.
+#[test]
+fn snapshot_kernel_blocks_ptx() {
+    use nsl_codegen::kernel_lower::compile_kernel_ptx;
+    for (name, src) in common::kernel_blocks::ALL {
+        let (kernel, interner) = common::kernel_blocks::parse_first_kernel(src);
+        let ptx = compile_kernel_ptx(&kernel, &interner)
+            .unwrap_or_else(|e| panic!("{name}: kernel must compile: {e}"));
+        let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]).into_owned();
+        insta::assert_snapshot!(*name, ptx_str);
+    }
+}

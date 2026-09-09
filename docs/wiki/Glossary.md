@@ -125,7 +125,7 @@ Function definition keyword. Full reference: [`spec/01-syntax-fundamentals.nsl.m
 Keyword (not a library call) that initiates a gradient computation; the compiler inserts tape start/stop and backward-pass emission automatically. `grad` is reserved — optimizer stdlib parameters must use `gradient`. Full reference: [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md).
 
 ### <a id="kw-kernel"></a>`kernel`
-Block keyword for writing custom GPU operations; compiles to PTX at build time via `crates/nsl-codegen/src/kernel.rs`. Full reference: [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
+Block keyword for writing custom GPU operations; lowered to `KernelIR` by `crates/nsl-codegen/src/kernel_lower.rs` and printed to PTX at build time. Full reference: [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
 
 ### <a id="kw-let"></a>`let`
 Mutable binding. Full reference: [`spec/01-syntax-fundamentals.nsl.md`](../../spec/01-syntax-fundamentals.nsl.md).

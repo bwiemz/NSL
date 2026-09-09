@@ -1,0 +1,66 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry rowsum(.param .u64 param_a, .param .u64 param_out) {
+    .reg .u32 %r<5>;
+    .reg .u64 %rd<3>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<1>;
+    .reg .u32 %edge_r;
+    .reg .u64 %edge_rd;
+    .reg .f32 %edge_f;
+    .reg .f64 %edge_fd;
+    .reg .b16 %edge_h;
+    .reg .pred %edge_p;
+    .reg .b32 %edge_v;
+    .reg .u32 %gid0;
+    .reg .u32 %gid1;
+
+    ld.param.u64 %rd0, [param_a];
+    ld.param.u64 %rd1, [param_out];
+
+BB0:
+    mov.u32 %gid0, %ctaid.x;
+    mov.u32 %gid1, %ntid.x;
+    mul.lo.u32 %gid0, %gid0, %gid1;
+    mov.u32 %r0, %tid.x;
+    add.u32 %r0, %gid0, %r0;
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r1, 4;
+    mov.u32 %r2, 0;
+    mov.u32 %r3, %r2;
+    mov.f32 %f1, %f0;
+    bra BB1;
+BB1:
+    setp.lt.u32 %p0, %r3, %r1;
+    @!%p0 bra BB1_else;
+    bra BB2;
+BB1_else:
+    mov.f32 %f0, %f1;
+    bra BB3;
+BB2:
+    mov.u32 %r2, 4;
+    mul.lo.u32 %r4, %r0, %r2;
+    add.u32 %r2, %r4, %r3;
+    cvt.u64.u32 %rd2, %r2;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd0, %rd2;
+    ld.global.f32 %f2, [%rd2];
+    add.f32 %f3, %f1, %f2;
+    mov.u32 %r2, 1;
+    add.u32 %r4, %r3, %r2;
+    mov.u32 %r3, %r4;
+    mov.f32 %f1, %f3;
+    bra BB1;
+BB3:
+    cvt.u64.u32 %rd0, %r0;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd1, %rd0;
+    st.global.f32 [%rd0], %f0;
+    ret;
+}

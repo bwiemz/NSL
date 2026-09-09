@@ -277,12 +277,31 @@ frozen throughout, so nothing here blocks a kernel fix.
    WGSL printers marking edge arguments unhandled, the
    `kir_block_params_ptxas` gate and the `kir_grid_stride_loop_ptx`
    snapshot. Lowering `while`/`for` in `kernel_lower.rs` is SSA
-   construction over the block's locals and goes with step 3, where
-   `kernel.rs` retires.
+   construction over the block's locals and went with step 3, where
+   `kernel.rs` retired.
 3. **Retire `kernel.rs`.** CUDA `kernel` blocks go through KIR like every
    other target; the AST→PTX `KernelCompiler` is deleted (43 PTX lines,
    one manifest member fewer). Proof: normalised-text identity on the
    kernel snapshot tests.
+   *Landed:* `kernel_lower.rs` is the one front door — stores, `if`/
+   `elif`/`else`, `for ... in range(...)`, `while`, `break`/`continue`, a
+   bare `return`, compound assignment, and assignment to a `let`-declared
+   local, which a join or a loop header carries as a block parameter
+   (structured SSA construction: the locals assigned in an arm or a body
+   are found by a pre-scan, bound to fresh parameters at the join/header,
+   and every edge passes its values); `compiler/kernel.rs` lowers every
+   target through it and prints CUDA with `backend_ptx`; `kernel.rs` is
+   deleted and the manifest is 70 members. The proof is NOT text identity:
+   the two emitters never shared an instruction sequence (`kernel.rs`
+   did its index arithmetic in u64 and shifted, KIR widens a u32 offset at
+   the pointer; `kernel.rs` wrote `div.approx.f32`, KIR writes the IEEE
+   `div.rn.f32`), so the gate is the reviewed diff instead: seven
+   `kernel_block_*` snapshots in `tests/snapshot_tests.rs` (the e2e
+   fixtures' kernels and one of each control-flow shape) and
+   `tests/kernel_block_ptxas.rs`, which assembles all of them in the cuda
+   lane. Two printer bugs surfaced on the way and are fixed: `mul.lo.f32`
+   and `div.f32` are not PTX (float multiply has no `.lo`; float division
+   needs a rounding mode).
 4. **The scalar ISA.** Bitwise, shifts, `Rem`, `Min`/`Max`, `Rcp`/`Rsqrt`,
    typed `Select`, the shuffle modes and votes, lane/warp ids, the `.b16`
    memory class, `Cast` rounding modes, vector loads/stores, predicated

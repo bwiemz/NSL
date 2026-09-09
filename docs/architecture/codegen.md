@@ -553,14 +553,25 @@ and the PTX backend declares the `.reg .b32 %v<N>` class for them.
 `crates/nsl-kir/src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
 (ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
 `src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
-are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` lowers a
-user `kernel` block's AST to KIR for the portable subset and refuses
-everything else. `src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu,
-Fpga}`, re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
-(`src/compiler/kernel.rs`) dispatches: CUDA still goes to the AST→PTX
-`KernelCompiler` (`src/kernel.rs`), ROCm/Metal/WebGPU go through KIR, and
-`Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use `nsl fpga-compile`). PTX bytes
-are embedded via `declare_data` / `define_data` in the same file.
+are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` is the one
+front door for a user `kernel` block on every target (roadmap A2 step 3
+retired the AST→PTX `KernelCompiler` the CUDA target used until then): it
+lowers `let`, assignment to a declared local, element loads and stores,
+`if`/`elif`/`else`, `for ... in range(...)`, `while`, `break`/`continue`, a
+bare `return` and the index builtins to verified KIR — a local reassigned in
+a branch or a loop body is a block parameter at the join or the header — and
+refuses everything else with the innermost node's span.
+`src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu, Fpga}`,
+re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
+(`src/compiler/kernel.rs`) dispatches: every target lowers to KIR, CUDA
+prints it with `backend_ptx`, ROCm/Metal/WebGPU with their printers (which
+have no control flow yet, so a kernel whose KIR passes block arguments is
+refused there), and `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use
+`nsl fpga-compile`). `@autotune` substitutes its constants into the AST
+(`kernel_lower::substitute_constants`) before lowering. PTX bytes are
+embedded via `declare_data` / `define_data` in the same file;
+`tests/snapshot_tests.rs` (`kernel_block_*`) pins the PTX of every shape the
+lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
 `crates/nsl-codegen/tests/common/kir_builder.rs` is the shared test helper for building KIR;
 `crates/nsl-codegen/tests/snapshot_tests.rs` pins KIR-generated PTX.
 
@@ -574,7 +585,7 @@ are embedded via `declare_data` / `define_data` in the same file.
 `src/precision_cast_ptx.rs`, `src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
 `src/pca_tilerange.rs`, `src/cfie_*_ptx.rs`, `src/cfie_decode_attention.rs`,
-`src/fusion.rs` (elementwise chains), `src/kernel.rs`, and the shared preludes
+`src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
@@ -726,8 +737,8 @@ is the bare message — the CLI adds the `codegen error:` prefix.
 Spans are attached by exactly four dispatchers, each wrapping its
 `*_dispatch` twin with `.map_err(|e| e.with_span_if_unset(node.span))`:
 `Compiler::compile_stmt` (`src/stmt.rs`), `Compiler::compile_expr`
-(`src/expr/mod.rs`), and `KernelCompiler::compile_stmt` /
-`KernelCompiler::compile_expr` (`src/kernel.rs`). Because the innermost node
+(`src/expr/mod.rs`), and `kernel_lower::lower_stmt` /
+`kernel_lower::lower_expr` (`src/kernel_lower.rs`). Because the innermost node
 runs first, a helper deep in a lowering can raise `CodegenError::new(msg)`
 with no span and still be reported at the right expression. Errors raised
 outside statement compilation (model collection, kernel synthesis, the WGGO
@@ -819,7 +830,7 @@ should fail before review.
   every assertion, not just the `eprintln!`.
 - **Deferral must refuse.** An unsupported composition, an unlowerable
   construct, or a flag that did nothing produces a loud `Err`, never a silent
-  fallback — `src/kernel.rs` header, `src/kernel_lower.rs`,
+  fallback — the `src/kernel_lower.rs` header,
   `src/stmt_admission.rs`, the `wgrad_hook_blocks` refusal in
   `compile_main`, and eighteen `src/` files invoke the rule by name. Refusals
   are pinned by message text in `feature_rules.rs` +

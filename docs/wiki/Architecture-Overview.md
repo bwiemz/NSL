@@ -65,7 +65,7 @@ Dependency direction: `nsl-errors` and `nsl-runtime` are the true leaves (nothin
 
 ## GPU layer
 
-NSL binds to NVIDIA CUDA via [cudarc](https://github.com/coreylowman/cudarc) (0.19, dynamic linking). Cranelift is the sole function-emission backend; **PTX is synthesized separately and embedded as Cranelift data sections**, then loaded at runtime via `cuModuleLoadData`. The portable PTX emitter lives in [`crates/nsl-codegen/src/backend_ptx.rs`](../../crates/nsl-kir/src/backend_ptx.rs) (fed by [`kernel_lower.rs`](../../crates/nsl-codegen/src/kernel_lower.rs)); a legacy direct-AST-to-PTX path lives in [`kernel.rs`](../../crates/nsl-codegen/src/kernel.rs) for kernels outside the portable subset. See [Compiler-Pipeline § Stage 4](Compiler-Pipeline.md#stage-4--codegen) for the full picture.
+NSL binds to NVIDIA CUDA via [cudarc](https://github.com/coreylowman/cudarc) (0.19, dynamic linking). Cranelift is the sole function-emission backend; **PTX is synthesized separately and embedded as Cranelift data sections**, then loaded at runtime via `cuModuleLoadData`. User `kernel` blocks are lowered to `KernelIR` by [`kernel_lower.rs`](../../crates/nsl-codegen/src/kernel_lower.rs) and printed by [`backend_ptx.rs`](../../crates/nsl-kir/src/backend_ptx.rs) (roadmap A2 step 3 retired the direct AST-to-PTX `kernel.rs`). See [Compiler-Pipeline § Stage 4](Compiler-Pipeline.md#stage-4--codegen) for the full picture.
 
 ## Per-crate architecture documents
 

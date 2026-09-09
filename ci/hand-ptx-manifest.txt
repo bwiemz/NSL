@@ -57,7 +57,6 @@ crates/nsl-codegen/src/flash_attention_v2/tier_b2/backward/mod.rs
 crates/nsl-codegen/src/flash_attention_v2/tier_b2/backward/proj_backward.rs
 crates/nsl-codegen/src/fused_linear_ce.rs
 crates/nsl-codegen/src/fusion.rs
-crates/nsl-codegen/src/kernel.rs
 crates/nsl-codegen/src/kernel_skeleton/header.rs
 crates/nsl-codegen/src/kernel_skeleton/indexing.rs
 crates/nsl-codegen/src/kernel_skeleton/pad.rs

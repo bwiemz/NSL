@@ -155,9 +155,9 @@ impl Compiler<'_> {
 
     /// Compile a single kernel definition: generate target-specific GPU code and embed in .rodata.
     ///
-    /// Dispatches based on `--target` CLI flag:
-    /// - CUDA (default): direct AST->PTX via KernelCompiler
-    /// - ROCm/Metal/WebGPU: AST->KIR->backend lowerer
+    /// Every target goes AST → KIR (`kernel_lower::lower_kernel_to_ir`,
+    /// verified) → the target's printer (roadmap A2 step 3 retired the
+    /// direct AST→PTX `KernelCompiler` the CUDA target used until then).
     fn compile_single_kernel(
         &mut self,
         kernel: &nsl_ast::block::KernelDef,
@@ -171,66 +171,75 @@ impl Compiler<'_> {
             .unwrap_or("__kernel")
             .to_string();
 
-        let kernel_bytes = match target {
-            GpuTarget::Cuda => {
-                // Original path: direct AST -> PTX
-                crate::kernel::KernelCompiler::compile(kernel, self.interner)?
-            }
-            GpuTarget::Fpga => {
-                // M57.1 §3.2: `nsl build --target fpga` parses successfully (parse_target
-                // recognizes "fpga"), but general-kernel FPGA compilation is not in v1's
-                // scope. Model-block compilation routes through `nsl fpga-compile`; this
-                // arm rejects non-model invocations with a redirecting error.
-                return Err(crate::error::CodegenError::new(FPGA_TARGET_REDIRECT_MSG));
-            }
-            GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
-                // M47b: AST -> KIR -> backend-specific lowerer
-                let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target)?;
+        if target == GpuTarget::Fpga {
+            // M57.1 §3.2: `nsl build --target fpga` parses successfully (parse_target
+            // recognizes "fpga"), but general-kernel FPGA compilation is not in v1's
+            // scope. Model-block compilation routes through `nsl fpga-compile`; this
+            // arm rejects non-model invocations with a redirecting error.
+            return Err(crate::error::CodegenError::new(FPGA_TARGET_REDIRECT_MSG));
+        }
 
-                // Validate that the kernel's required features are supported by the target
-                let missing = target.features().missing(kir.required_features);
-                if !missing.is_empty() {
-                    return Err(CodegenError::new(format!(
-                        "kernel '{}' requires features not supported by {}: {}",
-                        kernel_name,
-                        target.name(),
-                        missing.names().join(", ")
-                    )));
-                }
+        let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target)?;
 
-                let code = match target {
-                    GpuTarget::Rocm => {
-                        nsl_runtime::nsl_log!(WARN, "nsl", 
-                            "[nsl] Generated AMDGPU ISA for kernel '{}' (runtime execution requires M47c)",
-                            kernel_name
-                        );
-                        crate::backend_amdgpu::lower_kir_to_amdgpu(&kir)
-                    }
-                    GpuTarget::Metal => {
-                        nsl_runtime::nsl_log!(WARN, "nsl", 
-                            "[nsl] Generated MSL for kernel '{}' (runtime execution requires M47c)",
-                            kernel_name
-                        );
-                        crate::backend_metal::lower_kir_to_msl(&kir)
-                    }
-                    GpuTarget::WebGpu => {
-                        nsl_runtime::nsl_log!(WARN, "nsl", 
-                            "[nsl] Generated WGSL for kernel '{}' (runtime execution requires M47c)",
-                            kernel_name
-                        );
-                        crate::backend_wgsl::lower_kir_to_wgsl(&kir)
-                    }
-                    GpuTarget::Cuda | GpuTarget::Fpga => unreachable!(),
-                };
+        // Validate that the kernel's required features are supported by the target
+        let missing = target.features().missing(kir.required_features);
+        if !missing.is_empty() {
+            return Err(CodegenError::new(format!(
+                "kernel '{}' requires features not supported by {}: {}",
+                kernel_name,
+                target.name(),
+                missing.names().join(", ")
+            )));
+        }
 
-                // Null-terminate for consistency with PTX path
-                let mut bytes = code;
-                if bytes.last() != Some(&0) {
-                    bytes.push(0);
-                }
-                bytes
+        // The AMDGPU / Metal / WGSL printers have no control flow yet: an
+        // edge that passes block arguments (a loop-carried or
+        // branch-assigned local) would be printed as a comment and the
+        // kernel silently corrupted. Refuse instead (deferral must refuse).
+        if target != GpuTarget::Cuda
+            && kir
+                .blocks
+                .iter()
+                .any(|b| b.terminator.as_ref().is_some_and(|t| t.has_args()))
+        {
+            return Err(CodegenError::new(format!(
+                "kernel '{}': loops and locals reassigned inside `if` / loop bodies are                  not supported on {} yet (its printer has no control flow); use the                  default CUDA target for this kernel",
+                kernel_name,
+                target.name()
+            )));
+        }
+
+        let code = match target {
+            GpuTarget::Cuda => crate::backend_ptx::lower_kir_to_ptx(&kir),
+            GpuTarget::Rocm => {
+                nsl_runtime::nsl_log!(WARN, "nsl", 
+                    "[nsl] Generated AMDGPU ISA for kernel '{}' (runtime execution requires M47c)",
+                    kernel_name
+                );
+                crate::backend_amdgpu::lower_kir_to_amdgpu(&kir)
             }
+            GpuTarget::Metal => {
+                nsl_runtime::nsl_log!(WARN, "nsl", 
+                    "[nsl] Generated MSL for kernel '{}' (runtime execution requires M47c)",
+                    kernel_name
+                );
+                crate::backend_metal::lower_kir_to_msl(&kir)
+            }
+            GpuTarget::WebGpu => {
+                nsl_runtime::nsl_log!(WARN, "nsl", 
+                    "[nsl] Generated WGSL for kernel '{}' (runtime execution requires M47c)",
+                    kernel_name
+                );
+                crate::backend_wgsl::lower_kir_to_wgsl(&kir)
+            }
+            GpuTarget::Fpga => unreachable!(),
         };
+
+        // Null-terminate for consistency (the PTX printer already does)
+        let mut kernel_bytes = code;
+        if kernel_bytes.last() != Some(&0) {
+            kernel_bytes.push(0);
+        }
 
         // Embed kernel code bytes in .rodata
         let data_label = format!("__nsl_kernel_{}_{}", target.name(), kernel_name);
@@ -305,90 +314,16 @@ impl Compiler<'_> {
 
     /// Compile a single kernel with constant substitutions applied.
     ///
-    /// Delegates to `KernelCompiler::compile_with_constants` for CUDA targets,
-    /// or to the normal `compile_single_kernel` path for non-CUDA targets.
+    /// `@autotune` substitutes its chosen constants into the AST
+    /// (`kernel_lower::substitute_constants`) and the variant compiles like
+    /// any other kernel, on every target.
     fn compile_single_kernel_with_constants(
         &mut self,
         kernel: &nsl_ast::block::KernelDef,
         constants: &HashMap<String, i64>,
     ) -> Result<(), CodegenError> {
-        use crate::gpu_target::GpuTarget;
-
-        let target = self.gpu_target();
-        let kernel_name = self
-            .interner
-            .resolve(kernel.name.0)
-            .unwrap_or("__kernel")
-            .to_string();
-
-        let kernel_bytes = match target {
-            GpuTarget::Cuda => {
-                // AST -> constant substitution -> PTX
-                crate::kernel::KernelCompiler::compile_with_constants(
-                    kernel,
-                    self.interner,
-                    constants,
-                )?
-            }
-            _ => {
-                // Non-CUDA: constant substitution not yet supported for KIR path.
-                // Fall through to the normal compile path.
-                return self.compile_single_kernel(kernel);
-            }
-        };
-
-        // Embed kernel code bytes in .rodata (same as compile_single_kernel)
-        let data_label = format!("__nsl_kernel_{}_{}", target.name(), kernel_name);
-        let kernel_data_id = self
-            .module
-            .declare_data(&data_label, cranelift_module::Linkage::Local, false, false)
-            .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to declare kernel data for '{}' ({}): {e}",
-                    kernel_name,
-                    target.name()
-                ))
-            })?;
-        let mut data_desc = cranelift_module::DataDescription::new();
-        data_desc.define(kernel_bytes.into_boxed_slice());
-        self.module
-            .define_data(kernel_data_id, &data_desc)
-            .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to define kernel data for '{}' ({}): {e}",
-                    kernel_name,
-                    target.name()
-                ))
-            })?;
-
-        // Embed kernel name (null-terminated)
-        let mut name_bytes = kernel_name.as_bytes().to_vec();
-        name_bytes.push(0);
-        let name_label = format!("__nsl_kernel_name_{}_{}", target.name(), kernel_name);
-        let name_data_id = self
-            .module
-            .declare_data(&name_label, cranelift_module::Linkage::Local, false, false)
-            .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to declare name data for kernel '{}': {e}",
-                    kernel_name
-                ))
-            })?;
-        let mut name_desc = cranelift_module::DataDescription::new();
-        name_desc.define(name_bytes.into_boxed_slice());
-        self.module
-            .define_data(name_data_id, &name_desc)
-            .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to define name data for kernel '{}': {e}",
-                    kernel_name
-                ))
-            })?;
-
-        self.kernels
-            .kernel_ptx_data
-            .insert(kernel_name, (kernel_data_id, name_data_id));
-        Ok(())
+        let substituted = crate::kernel_lower::substitute_constants(kernel, self.interner, constants);
+        self.compile_single_kernel(&substituted)
     }
 
     /// Run cost-model-based autotune variant selection for a kernel.
@@ -490,7 +425,7 @@ impl Compiler<'_> {
         let ptx_generator = |variant: &crate::autotune::Variant| -> Result<String, String> {
             let const_map: HashMap<String, i64> = variant.iter().cloned().collect();
             let ptx_bytes =
-                crate::kernel::KernelCompiler::compile_with_constants(kernel, interner, &const_map)
+                crate::kernel_lower::compile_kernel_ptx_with_constants(kernel, interner, &const_map)
                     .map_err(|e| e.to_string())?;
             // Convert to string (PTX is null-terminated UTF-8)
             let ptx_str = String::from_utf8_lossy(&ptx_bytes).to_string();
