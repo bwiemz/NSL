@@ -244,6 +244,11 @@ CLIF snapshots.
    mentions it in a comment. With this the compiler's remaining runtime
    uses are the three device probes step 5 puts behind the `cuda`
    feature.
+   *As landed (device identity):* `wire::device_identity::CudaDeviceIdentity`,
+   the four-field record the runtime's compile-time probe returns and the
+   compiler keys its autotune cache on, so step 5 can `cfg` the probe
+   itself without the compiler losing the type; the runtime re-exports it
+   at `nsl_runtime::CudaDeviceIdentity`.
 5. **Optional runtime dependency.** `cfg` the eight probe sites; CI's
    Ubuntu lane builds `nsl-codegen` with `--no-default-features` (no
    runtime) as well as the default, and the `cuda` job as today.

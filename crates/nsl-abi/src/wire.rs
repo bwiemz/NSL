@@ -493,6 +493,34 @@ pub mod calibration_bin {
     }
 }
 
+/// The local CUDA device's driver-reported identity — the cache-key record
+/// for `@autotune` (roadmap item 10) and the device the CSHA planner names
+/// in its spec lookup.
+///
+/// Produced by the runtime's compile-time probe (`cuda_device_identity`,
+/// driver calls only, no context retained) and consumed by the compiler,
+/// which keys its autotune cache on these four fields. Declared here
+/// (roadmap A3) so the compiler can name the record without the runtime in
+/// its build; the runtime re-exports it at `nsl_runtime::CudaDeviceIdentity`.
+/// Deliberately independent of the compiler's `GpuSpec` database: a tuning
+/// result is only transferable to hardware that reports the same values
+/// here, and that has to be true even for a card the database has never
+/// heard of.
+pub mod device_identity {
+    /// Identity of the local CUDA device, as reported by the driver.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CudaDeviceIdentity {
+        /// Marketing name with vendor prefixes stripped, e.g. "RTX 5070 Ti".
+        pub name: String,
+        /// Compute capability major * 10 + minor, e.g. 120 for sm_120.
+        pub sm_version: u32,
+        /// Multiprocessor count.
+        pub sm_count: u32,
+        /// `cuDriverGetVersion`, e.g. 13030 for CUDA 13.3.
+        pub driver_version: u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

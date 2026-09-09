@@ -473,8 +473,10 @@ nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::awq_scales::AwqScales`
 (`src/stmt_quant.rs`; the AWQ blob's one encoder and decoder, shared with
 the runtime's sidecar writer), `nsl_abi::wire::calibration_bin` (the `.bin`
 corpus header, read by `src/calibration/data_shape.rs` for the batch
-geometry at compile time and by the runtime's loader), and `nsl_runtime::CudaDeviceIdentity` /
-`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`). The rule these
+geometry at compile time and by the runtime's loader), and `nsl_runtime::cuda_device_identity` /
+`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`; the identity
+record they return is `nsl_abi::wire::device_identity::CudaDeviceIdentity`,
+the autotune cache key's schema). The rule these
 follow: a layout or plan constant the emitted code must agree with is
 imported from the runtime, never retyped in codegen.
 
@@ -551,7 +553,8 @@ will not merge.** If a kernel needs something KIR cannot express, extend
 **Supporting pieces.** `src/gpu_specs.rs` — `GpuSpec` (`sm_version`, peak
 TFLOPs, bandwidth, VRAM, L2, crossover points, launch overhead),
 `GPU_DATABASE`, `find_gpu`, `default_gpu`, `resolve_local_gpu`
-(via `nsl_runtime::CudaDeviceIdentity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
+(via `nsl_abi::wire::device_identity::CudaDeviceIdentity`, probed by
+`nsl_runtime::cuda_device_identity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
 `src/ptxas_validation.rs::validate_ptx` assembles PTX through `cudarc`
 `cuModuleLoadData` when a context is current, else `nvcc --cubin`; it is the
 basis of every `*_ptxas*.rs` test. `src/ptx_metadata.rs` extracts static
@@ -700,18 +703,17 @@ refusals that write no artifact), and the WGGO unit test
 pins the site that used to exit. Diagnostic *messages* on stderr are a
 different thing: they are the execution markers (below) and are fine.
 
-**Diagnostics go through `nsl_log::nsl_log!`** (roadmap C3; the front
-door and its byte-identical stderr subscriber are the `nsl-log` crate,
-described in runtime.md, "Logging"). A compile-time warning, note or
-marker line is `nsl_log::nsl_log!(LEVEL, "target", "…")` rather than
-`eprintln!`: the
+**Diagnostics go through `nsl_runtime::nsl_log!`** (roadmap C3; the front
+door and its byte-identical stderr subscriber are described in
+runtime.md, "Logging"). A compile-time warning, note or marker line is
+`nsl_runtime::nsl_log!(LEVEL, "target", "…")` rather than `eprintln!`: the
 `warning:` / `error:` / `note:` lines use target `codegen`, a line that
 starts with its own `[marker]` uses that marker (`autotune`, `ccr`,
 `source-ad`, `wggo`, `cpdt`, `arena`, `weight-stream`, …), and the levels
 follow the runtime's rule (`ERROR` for a lost result, `WARN` for a refusal
-or fallback, `INFO` for reports and traces). `nsl-log` depends on
-`tracing` alone, so the diagnostics are no longer a reason for this crate
-to depend on the runtime (roadmap A3). The multi-line report dumps that `eprint!` a pre-rendered string
+or fallback, `INFO` for reports and traces). The macro reaches `tracing`
+through nsl-runtime's re-export, so nsl-codegen carries no dependency of
+its own. The multi-line report dumps that `eprint!` a pre-rendered string
 (`plan.render_report()`, the linker's tool output) and the dev-tool
 binaries under `src/bin/` are the only raw prints left.
 
