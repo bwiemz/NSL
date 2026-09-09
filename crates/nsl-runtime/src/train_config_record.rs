@@ -41,20 +41,13 @@ use crate::exec_fingerprint::{diff, render, FieldDiff};
 
 static TRAIN_CONFIG: Mutex<String> = Mutex::new(String::new());
 
-/// Keys whose drift changes the meaning of restored optimizer state or the
-/// restored step counter. Explicit list, not the negation of the other —
-/// a key in neither class is deliberately silent (the #519 doctrine).
-pub const MOMENT_KEYS: &[&str] = &[
-    "opt", "accum", "beta1", "beta2", "eps", "wd", "momentum", "dampening",
-    "nesterov", "ns_steps", "adamw_lr", "no_decay",
-];
-
-/// Keys whose drift changes the future trajectory only. sp4..sp6 are
-/// reserved ahead of any 4+-parameter scheduler: a parameter rendered
-/// under a key in neither class would be silently unguarded (review
-/// finding — absent-on-both-sides is not a difference by design).
-pub const TRAJECTORY_KEYS: &[&str] =
-    &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"];
+/// The two key classes — moment-meaning and trajectory — are the record's
+/// schema, declared in `nsl_abi::wire::train_config` (roadmap A3) so the
+/// renderer in codegen and this checker read one list; re-exported here at
+/// the historical path. A key in neither class is deliberately silent (the
+/// #519 doctrine); `sp4..sp6` are reserved ahead of any 4+-parameter
+/// scheduler.
+pub use nsl_abi::wire::train_config::{MOMENT_KEYS, TRAJECTORY_KEYS};
 
 /// Install the record for the CURRENT train block. Codegen emits this at
 /// train-block entry — per block, not per program: a module can hold more

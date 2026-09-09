@@ -215,7 +215,7 @@ impl Compiler<'_> {
                     ) && op.inputs.len() == 1
                         && input_leaves.contains(&op.inputs[0]);
                     if arena_debug {
-                        nsl_runtime::nsl_log!(INFO, "arena-debug", 
+                        nsl_log::nsl_log!(INFO, "arena-debug", 
                             "[arena-debug] dict_get:{field} v{} inputs={:?} \
                              leaf={} -> seed {}",
                             op.result,
@@ -233,7 +233,7 @@ impl Compiler<'_> {
                     }
                 }
             } else if arena_debug {
-                nsl_runtime::nsl_log!(INFO, "arena-debug", 
+                nsl_log::nsl_log!(INFO, "arena-debug", 
                     "[arena-debug] loader scan unproven: {:?}",
                     self.lm_head_loader_scan.reason()
                 );
@@ -287,7 +287,7 @@ impl Compiler<'_> {
             // Provenance split. "Sized nothing" reads completely
             // differently when the seeds are empty vs when the
             // propagation stopped early — and the fixes differ too.
-            nsl_runtime::nsl_log!(INFO, "arena", 
+            nsl_log::nsl_log!(INFO, "arena", 
                 "[arena] element counts: {} dim seed(s) + {} numel \
                  hint(s) -> {} shape-propagated -> {} sized, of {} \
                  tape value(s)",
@@ -324,7 +324,7 @@ impl Compiler<'_> {
                 .map_err(CodegenError::new)?
                 .finish(&self.bus)
                 .map_err(CodegenError::new)?;
-            nsl_runtime::nsl_log!(INFO, "arena", "[arena]\n{}", arena.render_report("  "));
+            nsl_log::nsl_log!(INFO, "arena", "[arena]\n{}", arena.render_report("  "));
 
             // ── Stage-2B: placement ──────────────────────────
             //
@@ -367,7 +367,7 @@ impl Compiler<'_> {
                             "runtime path varies (broadcast/view operand)",
                     }).or_default() += 1;
                 }
-                nsl_runtime::nsl_log!(INFO, "arena", 
+                nsl_log::nsl_log!(INFO, "arena", 
                     "[arena] placement: {} of {} transient(s) admitted, \
                      {:.2} MiB payload in {} slot(s)",
                     placements.len(),
@@ -376,7 +376,7 @@ impl Compiler<'_> {
                     placements.len(),
                 );
                 for (reason, n) in &by_reason {
-                    nsl_runtime::nsl_log!(WARN, "arena", "[arena]   refused {n:>5} — {reason}");
+                    nsl_log::nsl_log!(WARN, "arena", "[arena]   refused {n:>5} — {reason}");
                 }
                 // Which op kinds cost the coverage. Unsized = a
                 // propagation rule is missing or a seed never
@@ -420,7 +420,7 @@ impl Compiler<'_> {
                     let mut rows: Vec<_> = by_kind.into_iter().collect();
                     rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
                     for (kind, n) in rows {
-                        nsl_runtime::nsl_log!(INFO, "arena-debug", "[arena-debug]   {n:>5} x {kind}");
+                        nsl_log::nsl_log!(INFO, "arena-debug", "[arena-debug]   {n:>5} x {kind}");
                     }
                     // The forward stall is invisible above (admit
                     // refuses forward transients NotBackward before
@@ -459,7 +459,7 @@ impl Compiler<'_> {
                     let mut rows: Vec<_> = fwd_unsized.into_iter().collect();
                     rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
                     for (kind, n) in rows {
-                        nsl_runtime::nsl_log!(INFO, "arena-debug", "[arena-debug]   fwd unsized {n:>5} x {kind}");
+                        nsl_log::nsl_log!(INFO, "arena-debug", "[arena-debug]   fwd unsized {n:>5} x {kind}");
                     }
                     // The FIRST stalls in tape order — everything
                     // after the first is usually just downstream
@@ -506,7 +506,7 @@ impl Compiler<'_> {
                             }
                             other => format!("{other:?}"),
                         };
-                        nsl_runtime::nsl_log!(INFO, "arena-debug", 
+                        nsl_log::nsl_log!(INFO, "arena-debug", 
                             "[arena-debug]   stall #{i} v{} {} <- [{}]",
                             o.result,
                             kind.chars().take(60).collect::<String>(),
@@ -542,7 +542,7 @@ impl Compiler<'_> {
                             }
                             other => format!("{other:?}"),
                         };
-                        nsl_runtime::nsl_log!(INFO, "arena-debug", 
+                        nsl_log::nsl_log!(INFO, "arena-debug", 
                             "[arena-debug]   numel #{i} v{} {} <- [{}]",
                             o.result,
                             kind.chars().take(60).collect::<String>(),
@@ -596,7 +596,7 @@ impl Compiler<'_> {
                                     .join(", ")
                             })
                             .unwrap_or_default();
-                        nsl_runtime::nsl_log!(INFO, "arena-debug", 
+                        nsl_log::nsl_log!(INFO, "arena-debug", 
                             "[arena-debug] slot {} v{} {} B {} <- {}",
                             p.slot_index, p.var, p.bytes, kind, inputs_desc
                         );

@@ -25,6 +25,7 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::plan::TrainPlan;
 use crate::stmt::{
     MomentFill, ParamHookEntry, SURFACE_WEIGHTS, WS_PCIE_FIXED_LAT_US, WS_PREFETCH_MIN_OPS_PER_RANGE,
 };
@@ -157,17 +158,6 @@ pub(crate) struct CslaSchedule {
 pub(crate) struct CslaWindowInputs<'a> {
     /// The gradient-accumulation buffer list (`Some` whenever CSLA is on).
     pub(crate) accum_list: Option<Value>,
-    /// Muon's AdamW-routed learning rate, as a ratio of `lr_value` at the step.
-    pub(crate) adamw_lr_value: Option<f64>,
-    pub(crate) lr_value: f64,
-    pub(crate) beta1_value: f64,
-    pub(crate) beta2_value: f64,
-    pub(crate) dampening_value: f64,
-    pub(crate) eps_value: f64,
-    pub(crate) momentum_value: f64,
-    pub(crate) weight_decay_value: f64,
-    pub(crate) ns_steps_value: f64,
-    pub(crate) nesterov_value: bool,
     /// The CPDT per-parameter dtype-code lists (m, v).
     pub(crate) cpdt_precision_dtypes: Option<(Value, Value)>,
     /// Muon's per-parameter m dtype codes (`--muon-state-dtype bf16`).
@@ -176,8 +166,6 @@ pub(crate) struct CslaWindowInputs<'a> {
     pub(crate) csla_buffers: Option<(Variable, Variable)>,
     /// The compile-time context the save phase left for this site (taken here).
     pub(crate) csla_pending: Option<CslaPending>,
-    pub(crate) fase_plan: &'a crate::fase::FasePlan,
-    pub(crate) grad_accumulation_steps: i64,
     /// The DataLoader handle, when the `data:` section declared one.
     pub(crate) has_dataloader: Option<Value>,
     pub(crate) lr_var: Variable,
@@ -191,9 +179,8 @@ pub(crate) struct CslaWindowInputs<'a> {
     pub(crate) param_list: Value,
     pub(crate) state_list_1: Value,
     pub(crate) state_list_2: Value,
-    pub(crate) num_state_buffers: usize,
-    pub(crate) optimizer_name: &'a str,
-    pub(crate) param_paths: &'a [String],
+    /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
+    pub(crate) plan: &'a TrainPlan,
 }
 
 impl Compiler<'_> {
@@ -205,23 +192,12 @@ impl Compiler<'_> {
         inputs: CslaWindowInputs<'_>,
     ) -> Result<(), CodegenError> {
         let CslaWindowInputs {
+            plan,
             accum_list,
-            adamw_lr_value,
-            lr_value,
-            beta1_value,
-            beta2_value,
-            dampening_value,
-            eps_value,
-            momentum_value,
-            weight_decay_value,
-            ns_steps_value,
-            nesterov_value,
             cpdt_precision_dtypes,
             muon_state_m_codes,
             csla_buffers,
             mut csla_pending,
-            fase_plan,
-            grad_accumulation_steps,
             has_dataloader,
             lr_var,
             should_step_var,
@@ -232,10 +208,26 @@ impl Compiler<'_> {
             param_list,
             state_list_1,
             state_list_2,
-            num_state_buffers,
-            optimizer_name,
-            param_paths,
         } = inputs;
+        // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
+        // as copied fields, read from the carrier under their old names so
+        // the body below is unchanged.
+        let adamw_lr_value = plan.spec.adamw_lr_value;
+        let lr_value = plan.spec.lr_value;
+        let beta1_value = plan.spec.beta1_value;
+        let beta2_value = plan.spec.beta2_value;
+        let dampening_value = plan.spec.dampening_value;
+        let eps_value = plan.spec.eps_value;
+        let momentum_value = plan.spec.momentum_value;
+        let weight_decay_value = plan.spec.weight_decay_value;
+        let ns_steps_value = plan.spec.ns_steps_value;
+        let nesterov_value = plan.spec.nesterov_value;
+        let fase_plan = &plan.spec.fase_plan;
+        let grad_accumulation_steps = plan.schedule.grad_accumulation_steps;
+        let num_state_buffers = plan.params.num_state_buffers;
+        let optimizer_name: &str = &plan.spec.optimizer_name;
+        let param_paths: &[String] = &plan.params.paths;
+
 
         // ── 7e3b. CSLA Stage-2: window backward phase ───────────────────
         // On accumulation boundaries, replay the adjoint once per buffered
@@ -1095,7 +1087,7 @@ impl Compiler<'_> {
                         }
                     })
                     .collect();
-                nsl_runtime::nsl_log!(INFO, "weight-stream", 
+                nsl_log::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] prefetch double-buffer: {} \
                      (streamed_ranges={streamed_range_count}, gpu={}, accum_window={}, \
                      edges [{}])",
@@ -1110,7 +1102,7 @@ impl Compiler<'_> {
                 );
             }
             if self.compile_options.weight_stream.async_writeback {
-                nsl_runtime::nsl_log!(INFO, "weight-stream", 
+                nsl_log::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] async writeback: {}",
                     if ws_active && streamed_range_count > 0 {
                         "ACTIVE — pack evict DtoH on the transfer stream, mirror \
@@ -1436,7 +1428,7 @@ impl Compiler<'_> {
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", 
+                        nsl_log::nsl_log!(ERROR, "nsl", 
                             "[nsl] csla window backward lowering failed (range {ri}: {}), \
                              rerun without --layerwise-accum",
                             e
@@ -1693,7 +1685,7 @@ impl Compiler<'_> {
             // read — the CADENCE assume/guarantee obligation, discharged.
             if prefetch_active {
                 let total: usize = transfer_cert.iter().map(|(_, _, n)| n).sum();
-                nsl_runtime::nsl_log!(INFO, "weight-stream", 
+                nsl_log::nsl_log!(INFO, "weight-stream", 
                     "[weight-stream] transfer certificate: {} prefetch obligations discharged \
                      ({total} params double-buffered); chain [{}]",
                     transfer_cert.len(),
@@ -2052,7 +2044,7 @@ impl Compiler<'_> {
         // inert; the carry engages under --checkpoint-selective
         // (SDPA outs saved). Gates assert this line's exact slot
         // count so the tested path is named, not assumed.
-        nsl_runtime::nsl_log!(INFO, "csla", "[csla] lse tape-carry: {} slots", lse_slots.len());
+        nsl_log::nsl_log!(INFO, "csla", "[csla] lse tape-carry: {} slots", lse_slots.len());
 
         // Fused-CE tape-carry: one extra slot per
         // `fused_ce_fwd_lse` entry — the [B*S] f32 logsumexp the
@@ -2122,7 +2114,7 @@ impl Compiler<'_> {
         // by the fused-CE gates (1 slot = the carry engaged; a
         // composite fallback shows 0 and the launch counters
         // catch it too).
-        nsl_runtime::nsl_log!(INFO, "csla", 
+        nsl_log::nsl_log!(INFO, "csla", 
             "[csla] fused-ce tape-carry: {} slots",
             fce_slots.len()
         );

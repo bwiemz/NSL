@@ -22,37 +22,18 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
-use crate::param_roles::NoDecayScope;
+use crate::stmt_train::plan::TrainPlan;
 
 /// Every binding of `compile_train_block_inner` the optimizer step reads;
 /// names are the driver's.
-pub(crate) struct OptimizerStepInputs {
+pub(crate) struct OptimizerStepInputs<'a> {
     /// The gradient-accumulation buffer list (`None` = step on the direct grads).
     pub(crate) accum_list: Option<Value>,
-    /// Muon's AdamW-routed learning rate, as a ratio of `lr_value` at the step.
-    pub(crate) adamw_lr_value: Option<f64>,
-    /// The base learning rate the ratio above divides by.
-    pub(crate) lr_value: f64,
-    pub(crate) beta1_value: f64,
-    pub(crate) beta2_value: f64,
-    pub(crate) dampening_value: f64,
-    pub(crate) eps_value: f64,
-    pub(crate) momentum_value: f64,
-    pub(crate) weight_decay_value: f64,
-    /// Muon's Newton-Schulz iteration count.
-    pub(crate) ns_steps_value: f64,
-    pub(crate) nesterov_value: bool,
-    pub(crate) grad_clip: f64,
     /// The CPDT per-parameter dtype-code lists (m, v).
     pub(crate) cpdt_precision_dtypes: Option<(Value, Value)>,
-    pub(crate) csla_active: bool,
-    pub(crate) fase_deferred: bool,
     pub(crate) fase_hook_active: bool,
     /// AdamW parameter groups: the per-parameter decay-exempt flags.
     pub(crate) decay_exempt_list: Option<Value>,
-    /// The FASE plan (consumed here; nothing after the step reads it).
-    pub(crate) fase_plan: crate::fase::FasePlan,
-    pub(crate) grad_accumulation_steps: i64,
     /// The direct gradient list (a null sentinel when the FASE hook consumed them).
     pub(crate) grads_list: Value,
     pub(crate) lr_var: Variable,
@@ -63,13 +44,12 @@ pub(crate) struct OptimizerStepInputs {
     pub(crate) mode_table_base: Option<Value>,
     /// Muon's per-parameter route flags (`--muon-batch-ns`).
     pub(crate) muon_route_list: Option<Value>,
-    pub(crate) no_decay_scope: NoDecayScope,
     pub(crate) num_params_val: Value,
     pub(crate) param_list: Value,
     pub(crate) state_list_1: Value,
     pub(crate) state_list_2: Value,
-    pub(crate) num_state_buffers: usize,
-    pub(crate) optimizer_name: String,
+    /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
+    pub(crate) plan: &'a TrainPlan,
 }
 
 impl Compiler<'_> {
@@ -78,42 +58,47 @@ impl Compiler<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
-        inputs: OptimizerStepInputs,
+        inputs: OptimizerStepInputs<'_>,
     ) -> Result<(), CodegenError> {
         let OptimizerStepInputs {
+            plan,
             accum_list,
-            adamw_lr_value,
-            lr_value,
-            beta1_value,
-            beta2_value,
-            dampening_value,
-            eps_value,
-            momentum_value,
-            weight_decay_value,
-            ns_steps_value,
-            nesterov_value,
-            grad_clip,
             cpdt_precision_dtypes,
-            csla_active,
-            fase_deferred,
             fase_hook_active,
             decay_exempt_list,
-            fase_plan,
-            grad_accumulation_steps,
             grads_list,
             lr_var,
             should_step_var,
             step_count_var,
             mode_table_base,
             muon_route_list,
-            no_decay_scope,
             num_params_val,
             param_list,
             state_list_1,
             state_list_2,
-            num_state_buffers,
-            optimizer_name,
         } = inputs;
+        // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
+        // as copied fields, read from the carrier under their old names so
+        // the body below is unchanged.
+        let adamw_lr_value = plan.spec.adamw_lr_value;
+        let lr_value = plan.spec.lr_value;
+        let beta1_value = plan.spec.beta1_value;
+        let beta2_value = plan.spec.beta2_value;
+        let dampening_value = plan.spec.dampening_value;
+        let eps_value = plan.spec.eps_value;
+        let momentum_value = plan.spec.momentum_value;
+        let weight_decay_value = plan.spec.weight_decay_value;
+        let ns_steps_value = plan.spec.ns_steps_value;
+        let nesterov_value = plan.spec.nesterov_value;
+        let grad_clip = plan.spec.grad_clip;
+        let csla_active = plan.spec.csla_active;
+        let fase_deferred = plan.spec.fase_deferred;
+        let fase_plan = plan.spec.fase_plan.clone();
+        let grad_accumulation_steps = plan.schedule.grad_accumulation_steps;
+        let no_decay_scope = plan.spec.no_decay_scope.clone();
+        let num_state_buffers = plan.params.num_state_buffers;
+        let optimizer_name = plan.spec.optimizer_name.clone();
+
 
         // 7e4. Gradient accumulation gate: only step optimizer every N batches
         let optimizer_block = builder.create_block();
