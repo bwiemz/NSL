@@ -64,6 +64,23 @@ fn modules() -> &'static [CastModule; 4] {
     })
 }
 
+/// The (PTX, kernel-name) pair for one cast, both NUL-terminated.
+///
+/// Building on first call, so the first caller of either this or
+/// [`pick_cast_kernel`] pays for all four and every later call is a
+/// lookup.
+// Used by the cuda-gated raw-buffer casts in `cuda/mod.rs` and by the PTX
+// gates in its test module — dead only when neither applies.
+#[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
+pub(crate) fn module_for(kind: CastKind) -> (&'static str, &'static str) {
+    let slot = CastKind::ALL
+        .iter()
+        .position(|k| *k == kind)
+        .expect("every CastKind is in ALL");
+    let m = &modules()[slot];
+    (m.ptx.as_str(), m.kernel_name.as_str())
+}
+
 /// Pick the (PTX, kernel-name) pair for a (`src_dtype`, `target_dtype`) cast.
 /// Returns `None` if the cast pair has no GPU kernel (caller must refuse / take
 /// a different path).
@@ -88,9 +105,7 @@ pub(crate) fn pick_cast_kernel(
         // direct kernel — the caller stages through f32.
         _ => return None,
     };
-    let slot = CastKind::ALL.iter().position(|k| *k == kind).expect("kind is in ALL");
-    let m = &modules()[slot];
-    Some((m.ptx.as_str(), m.kernel_name.as_str()))
+    Some(module_for(kind))
 }
 
 /// Launch a precision-cast kernel with FFI signature
