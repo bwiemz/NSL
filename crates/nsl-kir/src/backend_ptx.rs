@@ -241,10 +241,17 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Mul(dst, a, b) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
+            // `.lo` (the low half of the product) is the integer form;
+            // a float multiply has no such modifier (roadmap A2 step 3:
+            // `mul.lo.f32` is not PTX).
+            let lo = match ir.var_types.get(dst).or_else(|| ir.var_types.get(a)) {
+                Some(KirType::F16) | Some(KirType::Bf16) | Some(KirType::F32) | Some(KirType::F64) => "",
+                _ => ".lo",
+            };
             writeln!(
                 ptx,
-                "    mul.lo.{} {}{}, {}{}, {}{};",
-                ty, prefix, dst, prefix, a, prefix, b
+                "    mul{}.{} {}{}, {}{}, {}{};",
+                lo, ty, prefix, dst, prefix, a, prefix, b
             )
             .unwrap();
         }
