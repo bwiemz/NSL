@@ -113,13 +113,16 @@ pub mod use_count;
 // --- GPU backends & kernel lowering --------------------------------------
 pub mod backend_amdgpu;
 pub mod backend_metal;
-pub mod backend_ptx;
 pub mod backend_wgsl;
 pub mod gpu_specs;
 pub mod gpu_target;
 pub mod kernel;
-pub mod kernel_ir;
-pub mod kir_verify;
+// `KernelIR`, its verifier and the PTX printer live in the leaf crate
+// `nsl-kir` (roadmap A2 step 1) so the runtime can build kernels on the same
+// IR without depending on the compiler. Re-exported at their historical
+// paths: `nsl_codegen::kernel_ir`, `nsl_codegen::kir_verify`,
+// `nsl_codegen::backend_ptx`.
+pub use nsl_kir::{backend_ptx, kernel_ir, kir_verify};
 pub mod kernel_lower;
 pub mod kernel_skeleton;
 pub mod matmul_mma;

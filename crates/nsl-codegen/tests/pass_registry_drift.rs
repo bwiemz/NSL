@@ -670,12 +670,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("grammar_compiler", "CFIE grammar compilation"),
     ("hir", "high-level IR"),
     (
-        "kir_verify",
-        "the KIR verifier (roadmap A2 step 2): the structural and typing \
-         rules every KernelIR must satisfy before a backend prints it — a \
-         check on the IR, not a transformation of it",
-    ),
-    (
         "ctor_fold",
         "item 5: constant-folds constructor arguments into model-field dims \
          for the arena's shape propagation — an AST fact-scan over model \

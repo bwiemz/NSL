@@ -480,12 +480,17 @@ imported from the runtime, never retyped in codegen.
 Two ways exist to produce a GPU kernel, and the freeze decides which one new
 code may use.
 
-**KernelIR path (the sanctioned one).** `src/kernel_ir.rs` defines
+**KernelIR path (the sanctioned one).** The IR lives in the leaf crate
+`crates/nsl-kir` (roadmap A2 step 1: no workspace dependencies, pinned by
+`crates/nsl-kir/tests/leaf.rs`, so the runtime can build kernels on it
+without depending on the compiler); `nsl_codegen::{kernel_ir, kir_verify,
+backend_ptx}` and `nsl_codegen::gpu_target::FeatureSet` re-export it at the
+historical paths. `crates/nsl-kir/src/kernel_ir.rs` defines
 `KernelIR { name, params: Vec<KirParam>, blocks: Vec<KirBlock>, var_types,
 shared_mem_bytes, workgroup_size, required_features: FeatureSet }`, `KirOp`,
 `KirTerminator`, `KirType`, `AddressSpace`, and `KirBuilder` (`new`,
 `add_param`, `new_typed_var`, `new_block`, `set_block`, `emit`, `terminate`,
-`finalize() -> KernelIR`). `src/kir_verify.rs::verify` is the KIR verifier
+`finalize() -> KernelIR`). `crates/nsl-kir/src/kir_verify.rs::verify` is the KIR verifier
 (roadmap A2 step 2): block shape and branch targets, SSA (one definition per
 `VarId`), def-before-use under dominance over the block CFG, and operand
 typing wherever `var_types` records both sides; `KernelIR::verify` and
@@ -503,13 +508,13 @@ and the PTX backend declares the `.reg .b32 %v<N>` class for them.
 `crates/nsl-codegen/tests/kir_async_copy_ptxas.rs` and
 `crates/nsl-codegen/tests/kir_mma_ptxas.rs` assemble those lowerings with
 `ptxas` where the toolkit is present (CI's cuda-feature lane).
-`src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
+`crates/nsl-kir/src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
 (ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
 `src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
 are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` lowers a
 user `kernel` block's AST to KIR for the portable subset and refuses
 everything else. `src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu,
-Fpga}`, `FeatureSet`) selects the backend; `Compiler::compile_kernels`
+Fpga}`, re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
 (`src/compiler/kernel.rs`) dispatches: CUDA still goes to the AST→PTX
 `KernelCompiler` (`src/kernel.rs`), ROCm/Metal/WebGPU go through KIR, and
 `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use `nsl fpga-compile`). PTX bytes
@@ -955,7 +960,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 
 ### A new GPU kernel (KIR path only)
 
-1. Build it with `KirBuilder` (`src/kernel_ir.rs`): `add_param` for each
+1. Build it with `KirBuilder` (`crates/nsl-kir/src/kernel_ir.rs`): `add_param` for each
    argument with its `AddressSpace`, `new_typed_var`/`emit(KirOp::…)` for the
    body, `terminate`, `finalize()`. Missing operations are added as `KirOp`
    variants with lowering in **every** printer (`backend_ptx.rs`,

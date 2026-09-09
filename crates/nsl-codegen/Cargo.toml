@@ -30,6 +30,10 @@ nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
 # codegen -> runtime edge above. `c_header_agreement` also reuses its type
 # lowering and extern parser to check the generated header.
 nsl-abi.workspace = true
+# KernelIR, its verifier and the PTX printer (roadmap A2 step 1): a leaf
+# crate, so the runtime can build kernels on the same IR without depending on
+# the compiler. Re-exported at `nsl_codegen::{kernel_ir, kir_verify, backend_ptx}`.
+nsl-kir.workspace = true
 nsl-parser.workspace = true
 serde.workspace = true
 serde_json = "1"

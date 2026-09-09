@@ -652,7 +652,7 @@ jobs:
           # file cannot regain hand-PTX under an old blessing.
           cp ci/hand-ptx-manifest.txt /tmp/manifest.bak
           trap 'cp /tmp/manifest.bak ci/hand-ptx-manifest.txt' EXIT
-          echo "crates/nsl-codegen/src/kernel_ir.rs" >> ci/hand-ptx-manifest.txt
+          echo "crates/nsl-kir/src/kernel_ir.rs" >> ci/hand-ptx-manifest.txt
           if ./scripts/hand-ptx-freeze.sh --check > /tmp/av.log 2>&1; then
             echo "ANTI-VACUITY FAILURE: a stale manifest entry left --check green" >&2
             exit 1

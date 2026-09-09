@@ -99,7 +99,7 @@ These invariants come from hard-won debugging and are enforced in the code:
 
 - **`cuCtxCreate` was removed in CUDA 13.** NSL uses `cuDevicePrimaryCtxRetain` + `cuCtxSetCurrent` instead. See [`crates/nsl-runtime/src/cuda/mod.rs:94`](../../crates/nsl-runtime/src/cuda/mod.rs#L94) where `cuDevicePrimaryCtxRetain` is called during `state()` initialization, and line 71 and 101 where `cuCtxSetCurrent` activates the retained context.
 
-- **PTX ISA 7.0 `mad.lo.u32` is invalid in newer CUDA runtimes.** The NSL PTX backend emits `mul.lo.u32` followed by `add.u32` instead. See [`crates/nsl-codegen/src/backend_ptx.rs:376`](../../crates/nsl-codegen/src/backend_ptx.rs#L376) for the comment and line 382 for the emission. A test at line 658 asserts `ptx.contains("mul.lo.u32")` and line 661 asserts `!ptx.contains("mad.lo.u32")`.
+- **PTX ISA 7.0 `mad.lo.u32` is invalid in newer CUDA runtimes.** The NSL PTX backend emits `mul.lo.u32` followed by `add.u32` instead. See [`crates/nsl-kir/src/backend_ptx.rs:484`](../../crates/nsl-kir/src/backend_ptx.rs#L484) for the comment and line 382 for the emission. A test at line 658 asserts `ptx.contains("mul.lo.u32")` and line 661 asserts `!ptx.contains("mad.lo.u32")`.
 
 - **Contexts are thread-local.** Every call path that touches a CUDA driver API must call `ensure_context()` (which wraps `cuCtxSetCurrent`) before any cudarc or raw driver call. Forgetting this produces "invalid context" errors (`CUDA_ERROR_INVALID_CONTEXT`) with no actionable stack trace from cudarc.
 

@@ -1,4 +1,4 @@
-// crates/nsl-codegen/src/kir_verify.rs
+// crates/nsl-kir/src/kir_verify.rs
 //! The KIR verifier (roadmap A2, step 2): the structural and typing rules
 //! every `KernelIR` must satisfy before a backend prints it.
 //!
@@ -1079,8 +1079,8 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(verify(&ir), Ok(()));
-        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::ASYNC_COPY));
-        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::SHARED_MEMORY));
+        assert!(ir.required_features.contains(crate::FeatureSet::ASYNC_COPY));
+        assert!(ir.required_features.contains(crate::FeatureSet::SHARED_MEMORY));
     }
 
     #[test]
@@ -1268,7 +1268,7 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(verify(&ir), Ok(()));
-        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::TENSOR_CORES));
+        assert!(ir.required_features.contains(crate::FeatureSet::TENSOR_CORES));
     }
 
     #[test]
