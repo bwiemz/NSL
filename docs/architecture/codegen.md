@@ -65,7 +65,7 @@ later emission consults.
    │  populate_calibration_retention_from_ast_if_unset (AWQ + WGGO pre-scan)
    │  emit_retention_arena · emit_grad_retention_arena
    ├── DECLARE ─────────────────────────┼──────────────────── src/compiler/declaration.rs
-   │  declare_runtime_functions   ← builtins/ + runtime_abi/ tables (RUNTIME_TABLES)
+   │  declare_runtime_functions   ← the nsl-abi table (nsl_abi::for_each_runtime_fn!)
    │  declare_user_functions · declare_agent_methods
    │  apply_vmap_transforms / register_batched_functions   (src/vmap.rs)
    ├── COMPILE ─────────────────────────┼─────────────────────
@@ -149,7 +149,14 @@ driver runs it:
    whether CSLA Stage 2 is active and refuses the non-validated combinations
    of `--layerwise-accum`, `--weight-stream`, `--zero-stage`.
 4. Parameter lists (`src/stmt_train/param_lists.rs`: `muon_route_flags`,
-   `decay_exempt_flags`, `alloc_grad_accum_buffers`).
+   `decay_exempt_flags`, `alloc_grad_accum_buffers`). After the optimizer
+   state is allocated the driver builds the block's `TrainPlan`
+   (`src/stmt_train/plan.rs`: the resolved contract and hyper-parameters,
+   the FASE plan and the admissions as `TrainSpec`, the parameter paths and
+   state-buffer count as `ParamPlan`, accumulation and checkpointing as
+   `TrainSchedule` — plain data, no Cranelift handle), which the
+   checkpoint-identity record and the late emitters below read as `&plan`
+   (roadmap A1, TrainPlan design step 1).
 5. Epoch/batch loops; forward extraction into a `WengertList` by
    `WengertExtractor` (`src/source_ad.rs`), then the initial primal
    `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named
@@ -283,7 +290,8 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `emit_c_abi_dispatch_wrapper`); `src/c_export_table.rs` — the export table
   `nsl_model_create` reads; `src/c_header.rs` — `ExportInfo`, `lower_type_expr`,
   `emit(exports, module_name)`, stamping `NSL_ABI_VERSION_MAJOR/MINOR` from
-  `nsl_runtime::c_api`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
+  `nsl_abi::wire::version`; `src/c_wrapper.rs` steps through descriptor
+  arrays by `sizeof` of `nsl_abi::wire::tensor_desc::NslTensorDesc`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
   through `nsl_abi`), `crates/nsl-codegen/tests/c_header_compiles.rs` (real C compiler +
   `_Static_assert` on `NslTensorDesc`), `crates/nsl-codegen/tests/c_header_snapshot.rs`,
   `crates/nsl-codegen/tests/exported_symbols_are_dlsym_findable.rs`,
@@ -401,9 +409,8 @@ the `mm*` matmul keys, `arena`, `graphs`, `ckpt`, `offload`). Three rules its
 doc comment states and the unit tests in `exec_fingerprint_tests` pin: fixed
 order, closed vocabularies (never `{:?}`), and no key omitted when false.
 `compile_main` (`src/compiler/main_entry.rs`) interns the string and emits a
-call to `nsl_set_exec_fingerprint` (declared in
-`src/runtime_abi/diagnostics.rs`, implemented in
-`crates/nsl-runtime/src/exec_fingerprint.rs`), so a checkpoint written later
+call to `nsl_set_exec_fingerprint` (a `diagnostics` row of the nsl-abi
+table, implemented in `crates/nsl-runtime/src/exec_fingerprint.rs`), so a checkpoint written later
 carries it and a resume can refuse an arithmetic mismatch.
 
 `--dump-ir` (`dump_ir` on the entry points) prints each function's CLIF just
@@ -413,28 +420,29 @@ the CLIF snapshot suite.
 
 ## The runtime ABI boundary
 
-Every runtime call the codegen can emit is declared once, with its Cranelift
-signature, in a `const RUNTIME_FUNCTIONS*` table. PR #600 split the former
-single 3,500-line table along the line "what the language exposes vs what the
-runtime implements":
+Every runtime call the codegen can emit is declared once, in the typed
+ABI table `crates/nsl-abi/src/table.rs` (roadmap A3): one row
+`[group] name(params) -> ret = runtime::path;` per function, 682 of them,
+exposed as the X-macro `nsl_abi::for_each_runtime_fn!` and as data
+(`nsl_abi::RUNTIME_ABI`). The groups are the split PR #600 made along
+"what the language exposes vs what the runtime implements": `memory`,
+`io`, `scalar`, `collections`, `tensor` are the surface a program writes
+directly (adding one widens the language); `abi_tensor`, `training`,
+`optimizer`, `distributed`, `inference`, `quantization`, `diagnostics`,
+`abi_memory`, `interop` are the implementation surface behind it (adding
+one changes how a program runs, not what it can say). The lowering code for
+the first five groups lives in `src/builtins/{memory,io,scalar,collections,
+tensor}.rs`.
 
-- `src/builtins/` — `memory.rs`, `io.rs`, `scalar.rs`, `collections.rs`,
-  `tensor.rs`: the surface a program writes directly. Adding one widens the
-  language.
-- `src/runtime_abi/` — `tensor.rs`, `training.rs`, `optimizer.rs`,
-  `distributed.rs`, `inference.rs`, `quantization.rs`, `diagnostics.rs`,
-  `memory.rs`, `interop.rs`: fused kernels, the training loop's plumbing,
-  optimizers, parallelism, serving, diagnostics. Adding one changes how a
-  program runs, not what it can say.
-
-`RUNTIME_TABLES` (`src/builtins/mod.rs`) lists all fourteen tables;
-`all_runtime_functions()` flattens them and `declare_runtime_functions`
+`src/builtins/mod.rs` renders the table into `RUNTIME_FUNCTIONS`
+(`render_runtime_functions!`, one `(name, &[Cranelift types], ret)` per row);
+`all_runtime_functions()` iterates it and `declare_runtime_functions`
 declares each as `Linkage::Import`, returning the
 `HashMap<String, (FuncId, Signature)>` stored in
 `compiler.registry.runtime_fns` (`FunctionRegistry`, `src/compiler/mod.rs`).
 Declaration order is *not* load-bearing for CLIF (funcrefs are numbered per
 function by first use; verified by the train CLIF snapshots when `nsl_alloc`
-moved tables), so an entry may be moved between files freely. It does reach
+moved tables), so a row may be moved between groups freely. It does reach
 the `.o` symbol table, on which nothing depends.
 
 A call is emitted by `Compiler::compile_call_by_name(builder, name, args)`
@@ -446,18 +454,24 @@ emission in `last_ffi_emission` for the FFI-ownership classifier. Direct
 `registry.runtime_fns.get(...)` lookups exist for a few hand-built signatures
 (e.g. the health hooks in `src/stmt_train/health_hooks.rs`) but the by-name path is the norm.
 
-**Drift gates.** The table and the runtime are linked by symbol name only, so
-`crates/nsl-abi` (a dependency-free crate, a dev-dependency here) parses every
-`RUNTIME_FUNCTIONS*` table under `crates/nsl-codegen/src` and every
-`#[unsafe(no_mangle)] extern "C" fn` in `nsl-runtime` and cross-checks them
-(`nsl_abi::check_workspace`, `cross_check`, `MismatchKind::DuplicateDecl`);
-`crates/nsl-abi/tests/signature_agreement.rs` is the CI gate
-(`runtime_function_signatures_agree_with_extern_impls`; it also asserts
-`tables_found == tables_parsed` and a truncation floor, 682 entries recorded
-2026-09-02). Inside the crate, `builtins/mod.rs` unit tests
-`no_runtime_function_is_declared_twice` and `every_declared_table_is_reachable`
-guard the table set itself. `crates/nsl-codegen/tests/c_header_agreement.rs` reuses the same
-parser for the generated C header.
+**Drift gates.** The table and the runtime are linked by symbol name, so
+the runtime's own build checks the agreement: `crates/nsl-runtime/src/abi_check.rs`
+renders every row into a `const` that casts the named implementation to
+`unsafe extern "C" fn(_, …) -> _` and compares its inferred signature with
+the row slot by slot (`nsl_abi::typed::assert_sig`; register class and width,
+so `u64`, `usize` and raw pointers are `i64` slots). A row whose arity,
+types or path disagree fails `cargo build -p nsl-runtime` with the
+function's name. As belt-and-braces, `crates/nsl-abi` (dependency-free)
+parses every `#[unsafe(no_mangle)] extern "C" fn` in `nsl-runtime` and
+cross-checks it against the typed table (`nsl_abi::check_workspace`,
+`cross_check`, `MismatchKind::DuplicateDecl`);
+`crates/nsl-abi/tests/signature_agreement.rs` is that CI gate
+(`runtime_function_signatures_agree_with_extern_impls`, with a truncation
+floor of 682 rows recorded 2026-09-02, and `nsl_abi::table::tests` pins the
+row count exactly). Inside the codegen, `builtins/mod.rs` unit tests
+`no_runtime_function_is_declared_twice` and `registry_is_the_abi_table`
+guard the rendering. `crates/nsl-codegen/tests/c_header_agreement.rs` reuses
+the text parser for the generated C header.
 
 **Shared constants imported from `nsl_runtime`** (grep `nsl_runtime::` in
 `src`, non-comment uses): `nsl_runtime::param_plan::{PLAN_BF16_SR,
@@ -696,17 +710,18 @@ refusals that write no artifact), and the WGGO unit test
 pins the site that used to exit. Diagnostic *messages* on stderr are a
 different thing: they are the execution markers (below) and are fine.
 
-**Diagnostics go through `nsl_runtime::nsl_log!`** (roadmap C3; the front
-door and its byte-identical stderr subscriber are described in
-runtime.md, "Logging"). A compile-time warning, note or marker line is
-`nsl_runtime::nsl_log!(LEVEL, "target", "…")` rather than `eprintln!`: the
+**Diagnostics go through `nsl_log::nsl_log!`** (roadmap C3; the front
+door and its byte-identical stderr subscriber are the `nsl-log` crate,
+described in runtime.md, "Logging"). A compile-time warning, note or
+marker line is `nsl_log::nsl_log!(LEVEL, "target", "…")` rather than
+`eprintln!`: the
 `warning:` / `error:` / `note:` lines use target `codegen`, a line that
 starts with its own `[marker]` uses that marker (`autotune`, `ccr`,
 `source-ad`, `wggo`, `cpdt`, `arena`, `weight-stream`, …), and the levels
 follow the runtime's rule (`ERROR` for a lost result, `WARN` for a refusal
-or fallback, `INFO` for reports and traces). The macro reaches `tracing`
-through nsl-runtime's re-export, so nsl-codegen carries no dependency of
-its own. The multi-line report dumps that `eprint!` a pre-rendered string
+or fallback, `INFO` for reports and traces). `nsl-log` depends on
+`tracing` alone, so the diagnostics are no longer a reason for this crate
+to depend on the runtime (roadmap A3). The multi-line report dumps that `eprint!` a pre-rendered string
 (`plan.render_report()`, the linker's tool output) and the dev-tool
 binaries under `src/bin/` are the only raw prints left.
 
@@ -777,11 +792,12 @@ should fail before review.
   `feature_composition_gate.rs` (CLI) and the `*_refusal*.rs` /
   `*_gate.rs` tests here.
 - **Registry entry ↔ runtime `extern "C"` ↔ emission are in lockstep.** A
-  runtime function appears exactly once across the fourteen tables
-  (`no_runtime_function_is_declared_twice`), every table is reachable from
-  `RUNTIME_TABLES` (`every_declared_table_is_reachable`), and every declared
-  signature agrees with the runtime's implementation
-  (`crates/nsl-abi/tests/signature_agreement.rs`). The emitted argument order
+  runtime function appears exactly once in the typed table
+  (`no_runtime_function_is_declared_twice`, `nsl_abi::table::tests`), the
+  codegen's rendering is the table row for row (`registry_is_the_abi_table`),
+  and every row's signature agrees with the runtime's implementation — checked
+  by `rustc` in the runtime's build (`abi_check.rs`) and by text in
+  `crates/nsl-abi/tests/signature_agreement.rs`. The emitted argument order
   must match the table's parameter order — nothing checks that except the
   snapshot and numerical tests, which is why a new call site should be
   covered by one. `crates/nsl-codegen/tests/muon_route_contract_drift.rs` and
@@ -878,16 +894,19 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 
 1. Implement the `#[unsafe(no_mangle)] extern "C" fn` in `nsl-runtime`
    (C-ABI scalars only: `i64`/`f64`/pointers-as-`i64`).
-2. Add one entry `(name, &[params], Some(ret) | None)` to the table whose
-   subject it belongs to: `src/builtins/{memory,io,scalar,collections,tensor}.rs`
-   if a program calls it by name, else `src/runtime_abi/{tensor,training,
-   optimizer,distributed,inference,quantization,diagnostics,memory,interop}.rs`.
-   Position is free; a new *file* must also be listed in `RUNTIME_TABLES`
-   (`src/builtins/mod.rs`) or `every_declared_table_is_reachable` fails.
+2. Add one row `[group] nsl_…(i64, …) -> i64 = module::path::nsl_…;` to
+   `crates/nsl-abi/src/table.rs`, in the group its subject belongs to
+   (`memory`/`io`/`scalar`/`collections`/`tensor` if a program calls it by
+   name, else `abi_tensor`/`training`/`optimizer`/`distributed`/`inference`/
+   `quantization`/`diagnostics`/`abi_memory`/`interop`; `[interop]` after
+   the path if the implementation is behind the runtime's `interop`
+   feature). Position within the group is free. Nothing else is edited: the
+   codegen declares it and the runtime's build checks it.
 3. Emit the call with `self.compile_call_by_name(builder, "nsl_…", &args)`
-   from the lowering site; argument order must match the table.
-4. Run `cargo test -p nsl-abi --test signature_agreement` and
-   `cargo test -p nsl-codegen --lib builtins` (the duplicate/reachability
+   from the lowering site; argument order must match the row.
+4. Build `nsl-runtime` (the row is checked against the implementation at
+   compile time) and run `cargo test -p nsl-abi --test signature_agreement`
+   and `cargo test -p nsl-codegen --lib builtins` (the duplicate/rendering
    tests). If the symbol is exported to C hosts, `crates/nsl-codegen/tests/c_header_agreement.rs`
    and `crates/nsl-codegen/tests/c_header_compiles.rs` cover the header; add the prototype in
    `src/c_header.rs` if the header must expose it.

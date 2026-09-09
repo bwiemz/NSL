@@ -47,6 +47,7 @@ use crate::stmt_train::plan_ccr::{PreForwardPlanInputs, PreForwardPlans};
 use crate::stmt_train::plan_wggo::{WggoPlanning, WggoPlanningInputs};
 use crate::stmt_train::plan_wrga_cpdt::WrgaCpdtInputs;
 use crate::stmt_train::optimizer_state::OptimizerState;
+use crate::stmt_train::plan::{ParamPlan, TrainPlan, TrainSchedule, TrainSpec};
 use crate::stmt_train::optimizer_step::OptimizerStepInputs;
 use crate::stmt_train::config::TrainConfigSection;
 use crate::stmt_train::contract::TrainContract;
@@ -158,7 +159,7 @@ impl Compiler<'_> {
                               on_param_grad hook to its Wengert lowerings, so \
                               there is no FASE accumulate for the fused GEMM \
                               to fold into";
-                nsl_runtime::nsl_log!(WARN, "wgrad-fusion", 
+                nsl_log::nsl_log!(WARN, "wgrad-fusion", 
                     "[wgrad-fusion] declined: train block #{} — {reason}",
                     self.wgrad_block_ordinal()
                 );
@@ -511,6 +512,43 @@ impl Compiler<'_> {
             surface_prev,
         )?;
 
+        // TrainPlan step 1 (roadmap A1; the design in
+        // docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md): the
+        // planning-time facts the late emitters read, as one carrier. Built
+        // from the bindings above — clones of values the driver keeps using
+        // — and handed to the emitters as `&plan` in place of copies of its
+        // fields. Nothing in it is a Cranelift handle.
+        let plan = TrainPlan {
+            spec: TrainSpec {
+                optimizer_name: optimizer_name.clone(),
+                lr_value,
+                momentum_value,
+                dampening_value,
+                weight_decay_value,
+                no_decay_scope: no_decay_scope.clone(),
+                nesterov_value,
+                beta1_value,
+                beta2_value,
+                eps_value,
+                ns_steps_value,
+                adamw_lr_value,
+                scheduler: scheduler.clone(),
+                grad_clip,
+                fase_plan: fase_plan.clone(),
+                fase_deferred,
+                csla_active,
+            },
+            params: ParamPlan {
+                paths: param_paths.clone(),
+                num_state_buffers,
+            },
+            schedule: TrainSchedule {
+                grad_accumulation_steps,
+                checkpoint_save_path: checkpoint_save_path.clone(),
+                checkpoint_every,
+            },
+        };
+
         // ── 5. Initialize lr and step_count variables ───────────────────
         let lr_var = builder.declare_var(cl_types::F64);
         let lr_const = builder.ins().f64const(lr_value);
@@ -526,23 +564,7 @@ impl Compiler<'_> {
         // renderer is a pure function with unit tests.
         self.emit_train_config_record(
             builder,
-            &crate::stmt_train::identity::TrainConfigRecordInputs {
-                optimizer_name: &optimizer_name,
-                lr_value,
-                grad_accumulation_steps,
-                grad_clip,
-                weight_decay_value,
-                beta1_value,
-                beta2_value,
-                eps_value,
-                momentum_value,
-                dampening_value,
-                nesterov_value,
-                ns_steps_value,
-                adamw_lr_value,
-                no_decay_scope: &no_decay_scope,
-                scheduler: &scheduler,
-            },
+            &crate::stmt_train::identity::TrainConfigRecordInputs::from_plan(&plan),
         )?;
 
         // Milestone B: full-state resume — moved to `stmt_train/identity.rs`
@@ -818,7 +840,7 @@ impl Compiler<'_> {
 
         let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
-            nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for backward pass");
+            nsl_log::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for backward pass");
 
             // 1. Set training mode
             let true_val = builder.ins().iconst(cl_types::I8, 1);
@@ -1050,7 +1072,7 @@ impl Compiler<'_> {
                     // Partial: at least one call fused. Report the rest so a
                     // head that quietly stopped matching is still visible.
                     for d in &declines {
-                        nsl_runtime::nsl_log!(INFO, "fused-lm-ce", 
+                        nsl_log::nsl_log!(INFO, "fused-lm-ce", 
                             "[fused-lm-ce] a cross_entropy call fell back to the \
                              composite path: {}",
                             d.describe()
@@ -1075,7 +1097,7 @@ impl Compiler<'_> {
                 // than refuse: unlike a decline, this path has a legitimate
                 // reading (the body genuinely is not statically extractable)
                 // and refusing would break those fixtures.
-                nsl_runtime::nsl_log!(ERROR, "fused-lm-ce", 
+                nsl_log::nsl_log!(ERROR, "fused-lm-ce", 
                     "[fused-lm-ce] @fused_lm_ce(enabled = true) is active, but \
                      source-AD extraction of the step body failed — the fused \
                      linear-CE kernel exists only on the source-AD path, so it \
@@ -1138,7 +1160,7 @@ impl Compiler<'_> {
                     ));
                 }
                 // Source AD extraction failed — fall back to tape
-                nsl_runtime::nsl_log!(WARN, "nsl", "[nsl] source AD extraction failed, falling back to tape-based AD");
+                nsl_log::nsl_log!(WARN, "nsl", "[nsl] source AD extraction failed, falling back to tape-based AD");
 
                 // Undo training mode — tape path sets it itself
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
@@ -1233,7 +1255,7 @@ impl Compiler<'_> {
                     }
                 }
                 for h in &heads {
-                    nsl_runtime::nsl_log!(INFO, "lm-head-fusion", 
+                    nsl_log::nsl_log!(INFO, "lm-head-fusion", 
                         "[lm-head-fusion] inferred: vocab={} hidden={} \
                          rows={}x{}={} bias={} (no @fused_lm_ce decorator \
                          needed; --fuse-lm-head {})",
@@ -1247,7 +1269,7 @@ impl Compiler<'_> {
                     );
                 }
                 for r in &reasons {
-                    nsl_runtime::nsl_log!(WARN, "lm-head-fusion", "[lm-head-fusion] declined: {r}");
+                    nsl_log::nsl_log!(WARN, "lm-head-fusion", "[lm-head-fusion] declined: {r}");
                 }
                 if heads.is_empty()
                     && ctx.mode
@@ -1397,7 +1419,7 @@ impl Compiler<'_> {
                         .as_ref()
                         .expect("inferred_owned computed whenever a plan exists");
                     if !plan.restrict_to_owned(owned) {
-                        nsl_runtime::nsl_log!(WARN, "ccr", 
+                        nsl_log::nsl_log!(WARN, "ccr", 
                             "[ccr] nothing recomputable after the owned-tensor \
                              restriction; running without checkpointing"
                         );
@@ -1437,7 +1459,7 @@ impl Compiler<'_> {
                                 .sum();
                             if credit > 0 {
                                 budget_bytes = budget_bytes.saturating_add(credit);
-                                nsl_runtime::nsl_log!(INFO, "ccr", 
+                                nsl_log::nsl_log!(INFO, "ccr", 
                                     "[ccr] C-01 credit: FASE Deferred frees the gradient \
                                      buffer — activation budget grows by {} MiB",
                                     credit / (1024 * 1024)
@@ -1449,7 +1471,7 @@ impl Compiler<'_> {
                             &effective_primal,
                             &crate::ccr::CcrBudget { sizes, budget_bytes },
                         );
-                        nsl_runtime::nsl_log!(INFO, "ccr", 
+                        nsl_log::nsl_log!(INFO, "ccr", 
                             "[ccr] budget {} MiB: {} tensors flipped back to SAVE",
                             budget_bytes / (1024 * 1024),
                             flipped
@@ -1494,18 +1516,18 @@ impl Compiler<'_> {
                 // targets. Pre-CCR: recompute clones are forward ops, so this is
                 // the true backward-op composition.
                 if std::env::var("NSL_PROFILE_ADJOINT").is_ok() {
-                    nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
+                    nsl_log::nsl_log!(INFO, "adjoint-profile", 
                         "[adjoint-profile] {} generated backward ops:",
                         adjoint.ops.len()
                     );
                     for (k, c) in crate::ew_chain_fusion::histogram(&adjoint.ops) {
-                        nsl_runtime::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
+                        nsl_log::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
                     }
                     // D2b prevalence: binaries whose LEFT operand is a
                     // Constant run the baseline chain in host f64 (the
                     // recorded reconcile_device pull-down) — the v1 fuser
                     // must skip them, so count what that costs.
-                    nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
+                    nsl_log::nsl_log!(INFO, "adjoint-profile", 
                         "[adjoint-profile] const-left binary sites: {}",
                         crate::ew_chain_fusion::const_left_binary_sites(&adjoint.ops)
                     );
@@ -1518,7 +1540,7 @@ impl Compiler<'_> {
                 self.bus.restore_csha_backward_claims(generator.take_csha_claims());
                 // T7.1: surface any CSHA fallback diagnostics.
                 for diag in generator.csha_diagnostics() {
-                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] {diag}");
+                    nsl_log::nsl_log!(INFO, "nsl", "[nsl] {diag}");
                 }
 
                 // 6a–6b.5. Adjoint tape optimizations.
@@ -1989,7 +2011,7 @@ impl Compiler<'_> {
                     match full_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
-                            nsl_runtime::nsl_log!(WARN, "nsl", 
+                            nsl_log::nsl_log!(WARN, "nsl", 
                                 "[nsl] source AD lowering failed ({}), \
                                  cannot fall back to tape AD after forward emit; \
                                  rerun without --source-ad",
@@ -2059,9 +2081,9 @@ impl Compiler<'_> {
                         }
                         let mut counts: Vec<_> = counts.into_iter().collect();
                         counts.sort_by_key(|a| std::cmp::Reverse(a.1));
-                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source-ad owned {} ops:", label);
+                        nsl_log::nsl_log!(INFO, "nsl", "[nsl] source-ad owned {} ops:", label);
                         for (name, count) in counts {
-                            nsl_runtime::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
+                            nsl_log::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
                         }
                     };
 
@@ -2090,9 +2112,9 @@ impl Compiler<'_> {
                     }
                     let mut final_grad_counts: Vec<_> = final_grad_counts.into_iter().collect();
                     final_grad_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
-                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source-ad final grad ops:");
+                    nsl_log::nsl_log!(INFO, "nsl", "[nsl] source-ad final grad ops:");
                     for (name, count) in final_grad_counts {
-                        nsl_runtime::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
+                        nsl_log::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
                     }
                 }
 
@@ -2145,12 +2167,12 @@ impl Compiler<'_> {
             builder,
             state,
             HealthHooksInputs {
+                plan: &plan,
                 fase_hook_active,
                 grads_list,
                 loss_val,
                 num_params_val,
                 param_list,
-                param_paths: &param_paths,
                 step_count_var,
             },
         )?;
@@ -2330,23 +2352,12 @@ impl Compiler<'_> {
             builder,
             state,
             CslaWindowInputs {
+                plan: &plan,
                 accum_list,
-                adamw_lr_value,
-                lr_value,
-                beta1_value,
-                beta2_value,
-                dampening_value,
-                eps_value,
-                momentum_value,
-                weight_decay_value,
-                ns_steps_value,
-                nesterov_value,
                 cpdt_precision_dtypes,
                 muon_state_m_codes,
                 csla_buffers,
                 csla_pending,
-                fase_plan: &fase_plan,
-                grad_accumulation_steps,
                 has_dataloader,
                 lr_var,
                 should_step_var,
@@ -2357,9 +2368,6 @@ impl Compiler<'_> {
                 param_list,
                 state_list_1,
                 state_list_2,
-                num_state_buffers,
-                optimizer_name: &optimizer_name,
-                param_paths: &param_paths,
             },
         )?;
 
@@ -2372,38 +2380,21 @@ impl Compiler<'_> {
             builder,
             state,
             OptimizerStepInputs {
+                plan: &plan,
                 accum_list,
-                adamw_lr_value,
-                lr_value,
-                beta1_value,
-                beta2_value,
-                dampening_value,
-                eps_value,
-                momentum_value,
-                weight_decay_value,
-                ns_steps_value,
-                nesterov_value,
-                grad_clip,
                 cpdt_precision_dtypes,
-                csla_active,
-                fase_deferred,
                 fase_hook_active,
                 decay_exempt_list,
-                fase_plan,
-                grad_accumulation_steps,
                 grads_list,
                 lr_var,
                 should_step_var,
                 step_count_var,
                 mode_table_base,
                 muon_route_list,
-                no_decay_scope,
                 num_params_val,
                 param_list,
                 state_list_1,
                 state_list_2,
-                num_state_buffers,
-                optimizer_name,
             },
         )?;
 
@@ -2414,17 +2405,13 @@ impl Compiler<'_> {
             builder,
             state,
             SchedulerStepInputs {
+                plan: &plan,
                 checkpoint_dl_handle,
-                checkpoint_every,
                 checkpoint_names_list,
-                checkpoint_save_path: &checkpoint_save_path,
                 epoch_counter_var,
-                grad_accumulation_steps,
                 has_dataloader,
-                lr_value,
                 lr_var,
                 param_list,
-                scheduler: &scheduler,
                 state_list_1,
                 state_list_2,
                 step_count_var,

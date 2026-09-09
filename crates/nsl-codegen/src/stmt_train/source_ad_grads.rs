@@ -178,12 +178,12 @@ impl Compiler<'_> {
                 }
             }
             let Some(param_ptr) = full_vars.get(vid).copied() else {
-                nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' has no primal value (VarId {:?} not in full_vars)", param_name, vid);
+                nsl_log::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' has no primal value (VarId {:?} not in full_vars)", param_name, vid);
                 grad_skipped_no_primal += 1;
                 continue;
             };
             let Some(adj_vid) = generator.adjoint_of(*vid) else {
-                nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
+                nsl_log::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
                 grad_skipped_no_adjoint += 1;
                 continue;
             };
@@ -192,7 +192,7 @@ impl Compiler<'_> {
                 .get(&adj_vid)
                 .copied()
             else {
-                nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
+                nsl_log::nsl_log!(INFO, "nsl", "[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
                 grad_skipped_no_lowered += 1;
                 continue;
             };
@@ -289,7 +289,7 @@ impl Compiler<'_> {
         let grad_missing_trainable = trainable_tensor_param_paths
             .len()
             .saturating_sub(seen_trainable_tensor_params.len());
-        nsl_runtime::nsl_log!(WARN, "nsl", 
+        nsl_log::nsl_log!(WARN, "nsl", 
             "[nsl] source AD gradient summary: {}/{} trainable tensor params connected, {} missing-from-forward, {} no-primal, {} no-adjoint, {} cascade-skip, {} ignored config-tensor, {} ignored non-tensor",
             grad_connected,
             trainable_tensor_param_paths.len(),

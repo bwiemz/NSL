@@ -138,7 +138,7 @@ impl Compiler<'_> {
         grad: &nsl_ast::block::GradBlock,
         targets_val: Value,
     ) -> Result<Option<(Value, Value)>, CodegenError> {
-        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for grad block");
+        nsl_log::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for grad block");
 
         // Cycle-10 §5.3 Task 6 wire-up (grad block): route per-fn
         // @checkpoint(policy=...) policies into the extractor. Empty map
@@ -172,7 +172,7 @@ impl Compiler<'_> {
                     "source-AD extraction refused: {msg}"
                 )));
             }
-            nsl_runtime::nsl_log!(WARN, "nsl", 
+            nsl_log::nsl_log!(WARN, "nsl", 
                 "[nsl] source AD extraction failed in grad block, falling back to tape-based AD"
             );
             return Ok(None);
@@ -192,7 +192,7 @@ impl Compiler<'_> {
 
         let Some(loss_var_id) = self.resolve_source_ad_expr_var_id(&extractor, loss_expr, true)
         else {
-            nsl_runtime::nsl_log!(WARN, "nsl", 
+            nsl_log::nsl_log!(WARN, "nsl", 
                 "[nsl] source AD could not resolve grad block loss, falling back to tape-based AD"
             );
             return Ok(None);
@@ -204,14 +204,14 @@ impl Compiler<'_> {
                 self.resolve_source_ad_expr_var_id(&extractor, &grad.targets, false)
             }
             _ => {
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] source AD does not yet resolve this grad target shape, falling back to tape-based AD"
                 );
                 return Ok(None);
             }
         };
         let Some(target_var_id) = target_var_id else {
-            nsl_runtime::nsl_log!(WARN, "nsl", 
+            nsl_log::nsl_log!(WARN, "nsl", 
                 "[nsl] source AD could not resolve grad target, falling back to tape-based AD"
             );
             return Ok(None);
@@ -321,7 +321,7 @@ impl Compiler<'_> {
                 let grad_lowered = match grad_block_lowered {
                     Ok(gv) => gv,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", 
+                        nsl_log::nsl_log!(ERROR, "nsl", 
                             "[nsl] source AD lowering failed ({}) in grad block; rerun without --source-ad",
                             e
                         );

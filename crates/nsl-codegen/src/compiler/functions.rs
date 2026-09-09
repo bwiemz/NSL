@@ -72,9 +72,9 @@ impl Compiler<'_> {
         self.escape = crate::escape::EscapeAnalysis::analyze(&defs, &resolve);
 
         if std::env::var("NSL_DEBUG_ESCAPE").as_deref() == Ok("1") {
-            nsl_runtime::nsl_log!(INFO, "escape", "[escape] analysed {} functions/methods", self.escape.len());
+            nsl_log::nsl_log!(INFO, "escape", "[escape] analysed {} functions/methods", self.escape.len());
             for (k, info) in self.escape.iter() {
-                nsl_runtime::nsl_log!(INFO, "escape", 
+                nsl_log::nsl_log!(INFO, "escape", 
                     "[escape]   {k}: offset={} escapes={:?}",
                     info.arg_offset, info.param_escapes
                 );
@@ -521,7 +521,7 @@ impl Compiler<'_> {
                     .map(|p| (p.scheme as i64, p.window as i64, p.sinks as i64))
                     .unwrap_or((0, 0, 0));
                 if compress_scheme > 0 {
-                    nsl_runtime::nsl_log!(INFO, "nsl", 
+                    nsl_log::nsl_log!(INFO, "nsl", 
                         "[nsl] KV cache compression active: scheme={}, window={}, sinks={}",
                         compress_scheme, compress_window, compress_sinks
                     );
@@ -600,7 +600,7 @@ impl Compiler<'_> {
                         // this method. The config is used by the caller (e.g., serve engine)
                         // to select the appropriate runtime dequantization path.
                         if let Some(qcfg) = self.features.quant_configs.get(&model_name) {
-                            nsl_runtime::nsl_log!(INFO, "nsl", 
+                            nsl_log::nsl_log!(INFO, "nsl", 
                                 "[nsl] M35: compiling '{}' with quantization — dtype={}, group_size={}",
                                 method_name, qcfg.dtype, qcfg.group_size
                             );

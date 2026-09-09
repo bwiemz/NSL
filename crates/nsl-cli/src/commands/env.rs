@@ -22,7 +22,7 @@ pub(crate) fn run(cmd: EnvCmd) {
                 Some(t) => match Tier::parse(t) {
                     Some(tier) => nsl_env::by_tier(tier).collect(),
                     None => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", 
+                        nsl_log::nsl_log!(ERROR, "cli", 
                             "error: unknown tier '{t}' — one of: {}",
                             Tier::ALL.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
                         );
@@ -63,7 +63,7 @@ pub(crate) fn run(cmd: EnvCmd) {
                 }
             }
             if strict && unknown > 0 {
-                nsl_runtime::nsl_log!(ERROR, "cli", "error: {unknown} set NSL_* variable(s) are not registered (see above)");
+                nsl_log::nsl_log!(ERROR, "cli", "error: {unknown} set NSL_* variable(s) are not registered (see above)");
                 process::exit(1);
             }
         }

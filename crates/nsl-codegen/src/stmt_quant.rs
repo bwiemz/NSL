@@ -350,7 +350,7 @@ impl Compiler<'_> {
                     }
                 }
                 Err(e) => {
-                    nsl_runtime::nsl_log!(INFO, "calibration", "[calibration] AWQ discovery for model '{model_name}': {e}");
+                    nsl_log::nsl_log!(INFO, "calibration", "[calibration] AWQ discovery for model '{model_name}': {e}");
                 }
             }
         }

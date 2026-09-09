@@ -35,7 +35,7 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -129,7 +129,7 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -223,7 +223,7 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -317,7 +317,7 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -397,7 +397,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
                 return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIGN_F32_PTX, "nsl_sign_f32\0");
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -492,7 +492,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (skip for i32 — needs dtype conversion)
@@ -649,7 +649,7 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -751,7 +751,7 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned
@@ -855,7 +855,7 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned
@@ -998,7 +998,7 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
             return out;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     // CPU path: same order as the decomposed sigmoid + sub/mul/add/mul/mul,
     // each a round-to-nearest op (no FMA), so byte-identical.
@@ -1102,7 +1102,7 @@ pub extern "C" fn nsl_tensor_swiglu_gate_backward(
             return out;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     // CPU: t = g*u (one rounding), then the exact silu-backward order.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
@@ -1205,7 +1205,7 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
             return out;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     // CPU path: same order as the decomposed sub/mul/mul, each round-to-nearest.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
@@ -1294,7 +1294,7 @@ pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
             return out;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     // CPU path: same order as the decomposed mul/sub/mul, each round-to-nearest.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
@@ -1432,7 +1432,7 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
                 d
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         } else {
             gelu_deriv_cpu(x_ptr)
         };
@@ -1456,7 +1456,7 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
             return out;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     // CPU: tanh-approx derivative (the CPU forward's formula), elementwise.
     let grad_c = nsl_tensor_contiguous(grad_ptr);
@@ -1517,7 +1517,7 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -1619,7 +1619,7 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -1709,7 +1709,7 @@ macro_rules! define_inplace_unary {
                     return ptr;
                 }
                 #[cfg(not(feature = "cuda"))]
-                { panic!("CUDA support not compiled"); }
+                { crate::fatal::cuda_not_compiled(); }
             }
             let len = t.len as usize;
             if t.dtype == 1 {
@@ -1758,7 +1758,7 @@ pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
             return ptr;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     let len = t.len as usize;
     if t.dtype == 1 {
@@ -1795,7 +1795,7 @@ pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
             return ptr;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     let len = t.len as usize;
     if t.dtype == 1 {
