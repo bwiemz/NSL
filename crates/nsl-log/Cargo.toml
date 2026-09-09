@@ -1,0 +1,19 @@
+[package]
+name = "nsl-log"
+description = "The toolchain's logging front door: the nsl_log! macro and the tracing subscriber that renders every diagnostic line to stderr byte-identically to the eprintln! it replaced."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# `tracing` only (std, no proc-macro attributes, no `log` bridge), so a crate
+# that logs through this one — the compiler, the CLI — pulls in tracing +
+# tracing-core and nothing of the runtime (roadmap A3: the compiler stops
+# depending on the runtime for its diagnostics).
+[dependencies]
+tracing.workspace = true

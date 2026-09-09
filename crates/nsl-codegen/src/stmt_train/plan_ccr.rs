@@ -232,7 +232,7 @@ impl Compiler<'_> {
                     };
                     let mut fell_back = true;
                     if sizes.is_empty() {
-                        nsl_runtime::nsl_log!(WARN, "ccr", 
+                        nsl_log::nsl_log!(WARN, "ccr", 
                             "[ccr] --checkpoint-stride dp: no static tensor sizes \
                              available (symbolic shapes) — falling back to the \
                              uniform-stride search"
@@ -262,7 +262,7 @@ impl Compiler<'_> {
                                 .is_none_or(|b| true_peak <= b)
                                 || !choice.fits_budget;
                             if budget_ok {
-                                nsl_runtime::nsl_log!(INFO, "ccr", 
+                                nsl_log::nsl_log!(INFO, "ccr", 
                                     "[ccr] --checkpoint-stride dp: kept {} of {} block \
                                      anchors {:?} (true peak {} MiB, DP projected {} MiB, \
                                      est recompute {:.2} ms/step, window G={window}{})",
@@ -281,7 +281,7 @@ impl Compiler<'_> {
                                 dp_kept_anchors = Some(choice.keep);
                                 fell_back = false;
                             } else {
-                                nsl_runtime::nsl_log!(WARN, "ccr", 
+                                nsl_log::nsl_log!(WARN, "ccr", 
                                     "[ccr] --checkpoint-stride dp: true plan peak \
                                      {} MiB contradicts the DP projection ({} MiB) \
                                      over budget — falling back to the uniform search",
@@ -291,7 +291,7 @@ impl Compiler<'_> {
                             }
                         }
                     } else {
-                        nsl_runtime::nsl_log!(WARN, "ccr", 
+                        nsl_log::nsl_log!(WARN, "ccr", 
                             "[ccr] --checkpoint-stride dp: DP declined (single block \
                              or no plan) — falling back to the uniform-stride search"
                         );
@@ -307,7 +307,7 @@ impl Compiler<'_> {
                             crate::ccr::DEFAULT_STRIDE_CANDIDATES,
                         ) {
                             Some(c) => {
-                                nsl_runtime::nsl_log!(WARN, "ccr", 
+                                nsl_log::nsl_log!(WARN, "ccr", 
                                     "[ccr] --checkpoint-stride dp fallback: uniform \
                                      stride {} (peak {} MiB)",
                                     c.stride,
@@ -331,7 +331,7 @@ impl Compiler<'_> {
                     // and the search silently returns stride 1. Say so,
                     // rather than printing a decision that looks real.
                     if sizes.is_empty() {
-                        nsl_runtime::nsl_log!(WARN, "ccr", 
+                        nsl_log::nsl_log!(WARN, "ccr", 
                             "[ccr] --checkpoint-stride auto: no static tensor sizes \
                              available (symbolic shapes) — cannot project the \
                              activation peak; using stride 1. Pass an explicit \
@@ -364,7 +364,7 @@ impl Compiler<'_> {
                                     format!("k={k}:{}MiB", pb / (1024 * 1024))
                                 })
                                 .collect();
-                            nsl_runtime::nsl_log!(INFO, "ccr", 
+                            nsl_log::nsl_log!(INFO, "ccr", 
                                 "[ccr] --checkpoint-stride auto: chose stride {} \
                                  (projected activation peak {} MiB{}, window G={window}); \
                                  candidates [{}]",
@@ -380,7 +380,7 @@ impl Compiler<'_> {
                             choice.stride
                         }
                         None => {
-                            nsl_runtime::nsl_log!(INFO, "ccr", 
+                            nsl_log::nsl_log!(INFO, "ccr", 
                                 "[ccr] --checkpoint-stride auto: no candidate produced a \
                                  plan; using stride 1"
                             );
@@ -411,7 +411,7 @@ impl Compiler<'_> {
             if resolved_stride > 1
                 && let Some(p) = &plan
             {
-                nsl_runtime::nsl_log!(INFO, "ccr", 
+                nsl_log::nsl_log!(INFO, "ccr", 
                     "[ccr] periodic checkpointing: stride {resolved_stride} → \
                          {} CCR super-segment(s) (saving every {resolved_stride}th block \
                          boundary, recomputing each span — bit-exact)",
@@ -428,12 +428,12 @@ impl Compiler<'_> {
                         dtype,
                         &mut ccr_fresh,
                     );
-                    nsl_runtime::nsl_log!(INFO, "ccr", 
+                    nsl_log::nsl_log!(INFO, "ccr", 
                         "[ccr] compressed saves: {} matmul-class tensors -> {dtype}",
                         ccr_compress_map.len()
                     );
                 } else if compress_requested {
-                    nsl_runtime::nsl_log!(WARN, "ccr", 
+                    nsl_log::nsl_log!(WARN, "ccr", 
                         "[ccr] --checkpoint-compress requested but no \
                          compressible saves exist (policy must be selective \
                          with matmul-class interiors); continuing without"

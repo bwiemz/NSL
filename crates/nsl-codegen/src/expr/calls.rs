@@ -216,7 +216,7 @@ impl Compiler<'_> {
                 // Only warn for Unknown — Error is expected for @pipeline_agent bodies
                 // where type inference doesn't cover synthesised agent vars.
                 if matches!(obj_type, Type::Unknown) {
-                    nsl_runtime::nsl_log!(WARN, "nsl-codegen", 
+                    nsl_log::nsl_log!(WARN, "nsl-codegen", 
                         "[nsl-codegen] warning: method '.{member_name}()' called on Unknown-typed \
                          object — defaulting to tensor dispatch. This may indicate a type inference gap."
                     );
@@ -545,7 +545,7 @@ impl Compiler<'_> {
                     .map(|p| (p.scheme as i64, p.window as i64, p.sinks as i64))
                     .unwrap_or((0, 0, 0));
                 if compress_scheme > 0 {
-                    nsl_runtime::nsl_log!(INFO, "nsl", 
+                    nsl_log::nsl_log!(INFO, "nsl", 
                         "[nsl] KV cache compression active: scheme={}, window={}, sinks={}",
                         compress_scheme, compress_window, compress_sinks
                     );
@@ -1353,7 +1353,7 @@ impl Compiler<'_> {
                 ));
             }
             if self.kernels.flash_attention_context.is_some() {
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] note: scaled_dot_product_attention_masked ignores the \
                      @flash_attention context — the fused kernel has no additive-mask \
                      slot; using the naive masked path (masked flash kernels are \
@@ -1617,7 +1617,7 @@ impl Compiler<'_> {
             if let Some(cp_info) = cp_config
                 && cp_info.ring_size >= 2
             {
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] warning: @context_parallel(ring_size={}) — single-device ring math is verified in the runtime (crates/nsl-runtime/src/context_parallel/attention.rs::run_ring_attention_full), but multi-device distribution (send/recv, NCCL) is deferred; forward runs correctly on this device without sharding K/V across ranks.",
                     cp_info.ring_size
                 );

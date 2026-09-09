@@ -465,7 +465,7 @@ pub fn debug_compile_and_return_cfie_plan_from_ast(
     match (res, cfie_plan) {
         (Ok(_), plan) => Ok(plan),
         (Err(e), Some(plan)) => {
-            nsl_runtime::nsl_log!(ERROR, "debug_compile_and_return_cfie_plan", 
+            nsl_log::nsl_log!(ERROR, "debug_compile_and_return_cfie_plan", 
                 "[debug_compile_and_return_cfie_plan] codegen failed but a CFIE plan was produced: {}",
                 e.message
             );
@@ -497,7 +497,7 @@ fn debug_compile_and_return_plan_with_imports(
     match (res, plan) {
         (Ok(_), plan) => Ok(plan),
         (Err(e), Some(plan)) => {
-            nsl_runtime::nsl_log!(ERROR, "debug_compile_and_return_plan", 
+            nsl_log::nsl_log!(ERROR, "debug_compile_and_return_plan", 
                 "[debug_compile_and_return_plan] codegen failed but a WRGA plan was produced: {}",
                 e.message
             );
@@ -1254,7 +1254,7 @@ impl MatmulConfig {
                 return;
             }
             warned.push(var);
-            nsl_runtime::nsl_log!(INFO, "nsl-matmul", 
+            nsl_log::nsl_log!(INFO, "nsl-matmul", 
                 "[nsl-matmul] DEPRECATED: {var} is set; use {flag}. The variable \
                  still works and its value IS recorded in the execution \
                  fingerprint, but the flag is the supported spelling."
@@ -2371,7 +2371,7 @@ pub fn compile_and_calibrate(
                 ));
             }
             if registry.is_empty() {
-                nsl_runtime::nsl_log!(WARN, "codegen", 
+                nsl_log::nsl_log!(WARN, "codegen", 
                     "warning: --calibration-data {} supplied but no calibration hooks \
                      registered (no consumers yet — this is a no-op in MVP)",
                     data_path.display()
@@ -2410,7 +2410,7 @@ pub fn compile_and_calibrate(
                 };
                 match crate::calibration::binary_codegen::real_subprocess_entry(&cfg, &registry) {
                     Ok(out) => {
-                        nsl_runtime::nsl_log!(INFO, "calibration", 
+                        nsl_log::nsl_log!(INFO, "calibration", 
                             "[calibration] {} ({} hooks)",
                             out.outcome_repr,
                             out.sidecar.hooks.len()
