@@ -129,9 +129,9 @@ pub fn wggo_prepass_deferred_pending_sidecar(options: &crate::CompileOptions) ->
 /// same reason.
 pub fn fingerprint_wengert(list: &crate::wengert::WengertList) -> u64 {
     if std::env::var("NSL_WGGO_PREPASS_DEBUG").is_ok() {
-        nsl_runtime::nsl_log!(INFO, "wggo-prepass-debug", "[wggo-prepass-debug] ops={}", list.ops.len());
+        nsl_log::nsl_log!(INFO, "wggo-prepass-debug", "[wggo-prepass-debug] ops={}", list.ops.len());
         for (i, op) in list.ops.iter().enumerate() {
-            nsl_runtime::nsl_log!(INFO, "wggo-prepass-debug", "[wggo-prepass-debug] {i}: {:?} <- {:?} ({})", op.result, op.inputs, primal_op_tag(&op.op));
+            nsl_log::nsl_log!(INFO, "wggo-prepass-debug", "[wggo-prepass-debug] {i}: {:?} <- {:?} ({})", op.result, op.inputs, primal_op_tag(&op.op));
         }
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -187,7 +187,7 @@ pub fn fingerprint_wengert(list: &crate::wengert::WengertList) -> u64 {
     }
     leaves.sort_by(|a, b| a.0.cmp(b.0));
     if std::env::var("NSL_WGGO_PREPASS_DEBUG").is_ok() {
-        nsl_runtime::nsl_log!(INFO, "wggo-prepass-debug", 
+        nsl_log::nsl_log!(INFO, "wggo-prepass-debug", 
             "[wggo-prepass-debug] stream: hashed_ops={hashed_ops} output={:?} leaves={:?}",
             list.output,
             leaves.iter().map(|(n, _)| *n).collect::<Vec<_>>()
@@ -232,7 +232,7 @@ pub fn fingerprint_wengert(list: &crate::wengert::WengertList) -> u64 {
     }
     let fp = h.finish();
     if std::env::var("NSL_WGGO_PREPASS_DEBUG").is_ok() {
-        nsl_runtime::nsl_log!(INFO, "wggo-prepass-debug", "[wggo-prepass-debug] fingerprint={fp:016x}");
+        nsl_log::nsl_log!(INFO, "wggo-prepass-debug", "[wggo-prepass-debug] fingerprint={fp:016x}");
     }
     fp
 }
@@ -483,7 +483,7 @@ fn walk_stmts(
                     // ordinal is the point of the line: it is what proves the
                     // block occupied its position in the document order rather
                     // than being skipped.
-                    nsl_runtime::nsl_log!(INFO, "wggo", 
+                    nsl_log::nsl_log!(INFO, "wggo", 
                         "[wggo] pre-pass: no pre-plan for training block #{} \
                          (distill block — the pre-pass plans from a train \
                          header; CPDT covers it weights-only)",

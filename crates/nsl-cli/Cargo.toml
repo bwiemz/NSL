@@ -33,6 +33,8 @@ nsl-env.workspace = true
 # `nsl abi`: the C-API table and its host-language mirrors (dependency-free).
 nsl-abi.workspace = true
 nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
+# Diagnostics (`nsl_log!`, roadmap C3): the tracing-only front door.
+nsl-log.workspace = true
 # M57.1 §3.6 (Task 4.1) — `nsl fpga-compile` reads the FixtureFile binary
 # format + manifest hash via nsl-test::fixture. Despite the crate name,
 # `fixture` is a runtime-callable parser, not a test-only utility.

@@ -78,7 +78,7 @@ impl Compiler<'_> {
                     } => format!("site_outside_placement_[{placement}]"),
                     other => format!("{:?}", other),
                 };
-                nsl_runtime::nsl_log!(INFO, "wrga", 
+                nsl_log::nsl_log!(INFO, "wrga", 
                     "[wrga] layer:{} wggo-override-rejected requested={} applied={} reason={}",
                     diag.layer_index, diag.requested, diag.applied, reason_str
                 );

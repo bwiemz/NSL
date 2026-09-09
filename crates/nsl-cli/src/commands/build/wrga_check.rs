@@ -63,7 +63,7 @@ pub(crate) fn run_check_wrga_analyze(
         || !analysis.freeze_configs.is_empty()
         || !analysis.adapter_configs.is_empty();
     if !has_wrga_decorators {
-        nsl_runtime::nsl_log!(INFO, "nsl", 
+        nsl_log::nsl_log!(INFO, "nsl", 
             "nsl: --wrga-analyze: no @wrga / @freeze / @adapter decorators found in '{}'",
             file.display()
         );
@@ -79,7 +79,7 @@ pub(crate) fn run_check_wrga_analyze(
         stem
     ));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_runtime::nsl_log!(ERROR, "nsl", "nsl: --wrga-analyze: could not create temp dir: {e}");
+        nsl_log::nsl_log!(ERROR, "nsl", "nsl: --wrga-analyze: could not create temp dir: {e}");
         return 1;
     }
     let temp_obj = temp_dir.join(format!("{stem}.o"));
@@ -154,7 +154,7 @@ pub(crate) fn run_check_wrga_compare(
     // no shape data), which would silently zero every LoRA/AdaLoRA/ReFT row
     // in the PEFT table. Warn rather than continuing into a misleading report.
     if ablation.skip_spectral_allocation {
-        nsl_runtime::nsl_log!(WARN, "nsl", 
+        nsl_log::nsl_log!(WARN, "nsl", 
             "nsl: --wrga-compare: warning — --wrga-ablate=spectral disables the SVD that \
              recovers per-site weight shapes; the comparison table's LoRA / AdaLoRA / ReFT \
              rows will all show 0 params. Use --wrga-analyze if you want the bare ablated \
@@ -166,7 +166,7 @@ pub(crate) fn run_check_wrga_compare(
         || !analysis.freeze_configs.is_empty()
         || !analysis.adapter_configs.is_empty();
     if !has_wrga_decorators {
-        nsl_runtime::nsl_log!(INFO, "nsl", 
+        nsl_log::nsl_log!(INFO, "nsl", 
             "nsl: --wrga-compare: no @wrga / @freeze / @adapter decorators found in '{}'",
             file.display()
         );
@@ -180,7 +180,7 @@ pub(crate) fn run_check_wrga_compare(
         stem
     ));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_runtime::nsl_log!(ERROR, "nsl", "nsl: --wrga-compare: could not create temp dir: {e}");
+        nsl_log::nsl_log!(ERROR, "nsl", "nsl: --wrga-compare: could not create temp dir: {e}");
         return 1;
     }
     let temp_obj = temp_dir.join(format!("{stem}.o"));
@@ -226,7 +226,7 @@ pub(crate) fn run_check_wrga_compare(
     // Pull the captured plan out and render comparison.
     let captured = plan_capture.lock().ok().and_then(|mut g| g.take());
     let Some(plan) = captured else {
-        nsl_runtime::nsl_log!(INFO, "nsl", 
+        nsl_log::nsl_log!(INFO, "nsl", 
             "nsl: --wrga-compare: codegen completed but no @train block with WRGA decorators \
              was compiled; nothing to compare"
         );
@@ -236,7 +236,7 @@ pub(crate) fn run_check_wrga_compare(
     if report_path == std::path::Path::new("-") {
         print!("{}", report);
     } else if let Err(e) = std::fs::write(report_path, &report) {
-        nsl_runtime::nsl_log!(ERROR, "nsl", "nsl: --wrga-compare: could not write report: {e}");
+        nsl_log::nsl_log!(ERROR, "nsl", "nsl: --wrga-compare: could not write report: {e}");
         return 1;
     }
     0

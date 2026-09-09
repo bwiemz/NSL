@@ -8,7 +8,8 @@
 //! `nsl_runtime::train_config_record` diffs on resume, and its format was
 //! pinned only end-to-end (`train_config_resume_gate.rs`). It now has unit
 //! tests, including one that checks every key it renders against the
-//! runtime's `MOMENT_KEYS` / `TRAJECTORY_KEYS`: a key in neither class is
+//! `nsl_abi::wire::train_config` `MOMENT_KEYS` / `TRAJECTORY_KEYS` (the
+//! runtime classifies with the same lists): a key in neither class is
 //! silently unguarded on resume, which is the drift this file exists to
 //! make impossible.
 //!
@@ -23,6 +24,7 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::plan::TrainPlan;
 use crate::param_roles::NoDecayScope;
 use nsl_semantic::optim_config::ResolvedScheduler;
 
@@ -47,6 +49,30 @@ pub(crate) struct TrainConfigRecordInputs<'a> {
     pub(crate) adamw_lr_value: Option<f64>,
     pub(crate) no_decay_scope: &'a NoDecayScope,
     pub(crate) scheduler: &'a Option<ResolvedScheduler>,
+}
+
+impl<'a> TrainConfigRecordInputs<'a> {
+    /// The record's inputs, read from the block's plan (roadmap A1,
+    /// TrainPlan step 1).
+    pub(crate) fn from_plan(plan: &'a TrainPlan) -> Self {
+        TrainConfigRecordInputs {
+            optimizer_name: &plan.spec.optimizer_name,
+            lr_value: plan.spec.lr_value,
+            grad_accumulation_steps: plan.schedule.grad_accumulation_steps,
+            grad_clip: plan.spec.grad_clip,
+            weight_decay_value: plan.spec.weight_decay_value,
+            beta1_value: plan.spec.beta1_value,
+            beta2_value: plan.spec.beta2_value,
+            eps_value: plan.spec.eps_value,
+            momentum_value: plan.spec.momentum_value,
+            dampening_value: plan.spec.dampening_value,
+            nesterov_value: plan.spec.nesterov_value,
+            ns_steps_value: plan.spec.ns_steps_value,
+            adamw_lr_value: plan.spec.adamw_lr_value,
+            no_decay_scope: &plan.spec.no_decay_scope,
+            scheduler: &plan.spec.scheduler,
+        }
+    }
 }
 
 /// Render the train/optimizer/scheduler record (item 4): one fixed-order
@@ -291,7 +317,7 @@ mod tests {
     /// side. Exercised with the widest scheduler (three parameters).
     #[test]
     fn every_rendered_key_is_classified_by_the_runtime() {
-        use nsl_runtime::train_config_record::{MOMENT_KEYS, TRAJECTORY_KEYS};
+        use nsl_abi::wire::train_config::{MOMENT_KEYS, TRAJECTORY_KEYS};
         let nd = NoDecayScope { static_roles: vec![], exempt_non_rank2: false };
         let sched = Some(ResolvedScheduler::OneCycle {
             max_lr: 0.001,

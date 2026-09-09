@@ -78,7 +78,7 @@ pub(crate) fn apply_allow_unknown_decorators(enabled: bool) {
 /// dispatchers cannot drift (review found the prose pasted verbatim twice).
 pub(crate) fn refuse_unimplemented_distribute(distribute: &Option<String>) {
     if distribute.is_some() {
-        nsl_runtime::nsl_log!(ERROR, "cli", 
+        nsl_log::nsl_log!(ERROR, "cli", 
             "error: --distribute is not implemented (the M43 3D-parallelism \
              config has no consumer); use --zero-stage/--devices/--collectives \
              for multi-process training, or drop the flag"
@@ -133,17 +133,17 @@ pub(crate) fn enforce_from_argv(entry: Subcommand) {
     // "did an optimizer fire".
     let hard = entry != Subcommand::Check && !allow_inert;
 
-    nsl_runtime::nsl_log!(INFO, "cli", 
+    nsl_log::nsl_log!(INFO, "cli", 
         "{}: {} requested feature(s) were silently inert:",
         if hard { "error" } else { "warning" },
         unsat.len(),
     );
     for o in &unsat {
         if let OutcomeState::Unsatisfied { owner } = &o.state {
-            nsl_runtime::nsl_log!(INFO, "cli", "  {}: owner {} recorded no disposition", o.surface.render(), owner);
+            nsl_log::nsl_log!(INFO, "cli", "  {}: owner {} recorded no disposition", o.surface.render(), owner);
         }
     }
-    nsl_runtime::nsl_log!(WARN, "cli", 
+    nsl_log::nsl_log!(WARN, "cli", 
         "note: every supported request must produce Applied, an execution witness, \
          or a typed Declined(reason). Re-run with NSL_PASS_TRACE=1 to see what ran{}",
         if hard { ", or --allow-inert-requests to demote this error to a warning" } else { "" },

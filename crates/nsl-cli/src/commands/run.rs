@@ -103,7 +103,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     match collectives.as_str() {
         "sim" | "sim-gpu" | "nccl" => {}
         other => {
-            nsl_runtime::nsl_log!(ERROR, "cli", 
+            nsl_log::nsl_log!(ERROR, "cli", 
                 "error: --collectives must be 'sim', 'sim-gpu', or 'nccl' (got '{other}')"
             );
             process::exit(1);
@@ -155,11 +155,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
     // accepting it.
     if let Some(n) = health_interval {
         if n == 0 {
-            nsl_runtime::nsl_log!(ERROR, "cli", "error: --health-interval must be >= 1");
+            nsl_log::nsl_log!(ERROR, "cli", "error: --health-interval must be >= 1");
             process::exit(1);
         }
         if !monitor {
-            nsl_runtime::nsl_log!(WARN, "cli", 
+            nsl_log::nsl_log!(WARN, "cli", 
                 "warning: --health-interval has no effect without --monitor"
             );
         }
@@ -171,7 +171,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             if let Some(ref m) = csha
                 && nsl_codegen::csha::CshaMode::parse(m).is_none()
             {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
                     m
                 );
@@ -185,7 +185,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             if let Some(ref m) = wggo
                 && nsl_codegen::wggo::WggoMode::parse(m).is_none()
             {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --wggo value '{}' is not one of full|greedy|off|auto",
                     m
                 );
@@ -197,7 +197,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             if let Some(f) = wggo_prune_fraction
                 && !(0.0..=0.9).contains(&f)
             {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
                     f
                 );
@@ -210,7 +210,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             // Convert MiB -> bytes here so codegen only ever sees bytes.
             let wggo_memory_budget_bytes = match wggo_memory_budget {
                 Some(0) => {
-                    nsl_runtime::nsl_log!(ERROR, "cli", 
+                    nsl_log::nsl_log!(ERROR, "cli", 
                         "error: --wggo-memory-budget must be > 0 MiB"
                     );
                     process::exit(1);
@@ -223,7 +223,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             if let Some(ref p) = wggo_weights
                 && !p.exists()
             {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --wggo-weights path does not exist: {}",
                     p.display()
                 );
@@ -248,7 +248,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 Some(s) => match nsl_codegen::cpdt::CpdtMode::parse(s) {
                     Some(m) => m,
                     None => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", 
+                        nsl_log::nsl_log!(ERROR, "cli", 
                             "error: --cpdt value '{}' is not one of full|zero_only|off",
                             s
                         );
@@ -260,11 +260,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 let n = match cpdt_num_gpus {
                     Some(n) if n >= 1 => n,
                     Some(_) => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", "nsl: --cpdt-num-gpus must be >= 1");
+                        nsl_log::nsl_log!(ERROR, "nsl", "nsl: --cpdt-num-gpus must be >= 1");
                         process::exit(2);
                     }
                     None => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", "nsl: --cpdt requires --cpdt-num-gpus N");
+                        nsl_log::nsl_log!(ERROR, "nsl", "nsl: --cpdt requires --cpdt-num-gpus N");
                         process::exit(2);
                     }
                 };
@@ -305,7 +305,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
 
                 match (&weights, &ast_weight_ref) {
                     (Some(flag_path), Some(ast_path)) => {
-                        nsl_runtime::nsl_log!(WARN, "cli", 
+                        nsl_log::nsl_log!(WARN, "cli", 
                             "warning: --weights {} overrides AST-declared load_safetensors({:?}).",
                             flag_path.display(),
                             ast_path.display(),
@@ -318,7 +318,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         let cpdt_enabled = cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off;
                         let weight_aware = ast_weight_aware.unwrap_or(true);
                         if cpdt_enabled && weight_aware {
-                            nsl_runtime::nsl_log!(ERROR, "cli", 
+                            nsl_log::nsl_log!(ERROR, "cli", 
                                 "error: --cpdt {} requires weights. Resolve by ONE of:\n\
                                  \n\
                                  1. Add --weights <path.safetensors> to this invocation.\n\
@@ -357,7 +357,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // kernel-timing path, where the health monitor (and thus
                 // its flush interval) is inactive.
                 if health_interval.is_some() {
-                    nsl_runtime::nsl_log!(WARN, "cli", 
+                    nsl_log::nsl_log!(WARN, "cli", 
                         "warning: --health-interval has no effect without a train block"
                     );
                 }
@@ -378,7 +378,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 let report_json = match nsl_cli::profile::run_profile(&profile_args) {
                     Ok(s) => s,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
+                        nsl_log::nsl_log!(ERROR, "cli", "error: {e}");
                         process::exit(1);
                     }
                 };
@@ -386,7 +386,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     match serde_json::from_str(&report_json) {
                         Ok(r) => r,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "cli", "error: profile JSON parse: {e}");
+                            nsl_log::nsl_log!(ERROR, "cli", "error: profile JSON parse: {e}");
                             process::exit(1);
                         }
                     };
@@ -394,7 +394,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     match nsl_cli::monitor::write_manifest_beside(&file, &report) {
                         Ok(p) => p,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
+                            nsl_log::nsl_log!(ERROR, "cli", "error: {e}");
                             process::exit(1);
                         }
                     };
@@ -405,7 +405,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         return;
                     }
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
+                        nsl_log::nsl_log!(ERROR, "cli", "error: {e}");
                         process::exit(1);
                     }
                 }
@@ -415,7 +415,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             // rather than silently training eager (the runtime enable()
             // double-checks the env-var forms of both).
             if cuda_graphs && cuda_sync {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --cuda-graphs does not compose with --cuda-sync \
                      (eager per-launch synchronization is incompatible with \
                      stream capture). Drop one of the flags"
@@ -423,7 +423,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 std::process::exit(1);
             }
             if cuda_graphs && profile_kernels {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: --cuda-graphs does not compose with \
                      --profile-kernels (per-launch profiler events are \
                      incompatible with graph replay). Drop one of the flags"
@@ -519,7 +519,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         "f32" => false,
                         "bf16" => true,
                         other => {
-                            nsl_runtime::nsl_log!(ERROR, "cli", 
+                            nsl_log::nsl_log!(ERROR, "cli", 
                                 "error: --muon-state-dtype {other}: ladder rung not \
                                  implemented yet (P4 item 18 order: f32 -> bf16 -> \
                                  blockwise 8-bit -> 4-bit experimental). Use f32 or bf16"
@@ -631,7 +631,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 let temp_dir =
                     std::env::temp_dir().join(format!("nsl_disagg_{}", std::process::id()));
                 if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-                    nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+                    nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
                     process::exit(1);
                 }
 
@@ -673,7 +673,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 {
                     Ok(c) => c,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn router process: {e}");
+                        nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn router process: {e}");
                         std::process::exit(1);
                     }
                 };
@@ -690,7 +690,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn prefill worker {i}: {e}");
+                            nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn prefill worker {i}: {e}");
                             std::process::exit(1);
                         }
                     };
@@ -708,7 +708,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn decode worker {i}: {e}");
+                            nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn decode worker {i}: {e}");
                             std::process::exit(1);
                         }
                     };
@@ -721,13 +721,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     let status = match child.wait() {
                         Ok(s) => s,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to wait on {name}: {e}");
+                            nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to wait on {name}: {e}");
                             exit_code = 1;
                             continue;
                         }
                     };
                     if !status.success() {
-                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] {} exited with {}", name, status);
+                        nsl_log::nsl_log!(INFO, "nsl", "[nsl] {} exited with {}", name, status);
                         exit_code = 1;
                     }
                 }
@@ -749,7 +749,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 let exe = match std::env::current_exe() {
                     Ok(p) => p,
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] could not find current executable: {e}");
+                        nsl_log::nsl_log!(ERROR, "nsl", "[nsl] could not find current executable: {e}");
                         std::process::exit(1);
                     }
                 };
@@ -776,12 +776,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     {
                         Ok(f) => f,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to create shm file: {e}");
+                            nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to create shm file: {e}");
                             std::process::exit(1);
                         }
                     };
                     if let Err(e) = f.set_len(shm_size as u64) {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to set shm size: {e}");
+                        nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to set shm size: {e}");
                         let _ = std::fs::remove_file(&shm_path);
                         std::process::exit(1);
                     }
@@ -789,7 +789,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     let mmap = match unsafe { memmap2::MmapMut::map_mut(&f) } {
                         Ok(m) => m,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to mmap shm file: {e}");
+                            nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to mmap shm file: {e}");
                             let _ = std::fs::remove_file(&shm_path);
                             std::process::exit(1);
                         }
@@ -839,7 +839,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     let child = match cmd.spawn() {
                         Ok(c) => c,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn rank {rank}: {e}");
+                            nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to spawn rank {rank}: {e}");
                             // Reap the ranks already spawned before bailing:
                             // otherwise they orphan and spin on the shm barrier
                             // waiting for peers that never arrive (a core each
@@ -863,13 +863,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     let status = match child.wait() {
                         Ok(s) => s,
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] failed to wait on rank {rank}: {e}");
+                            nsl_log::nsl_log!(ERROR, "nsl", "[nsl] failed to wait on rank {rank}: {e}");
                             failed = true;
                             continue;
                         }
                     };
                     if !status.success() {
-                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] rank {} exited with: {}", rank, status);
+                        nsl_log::nsl_log!(INFO, "nsl", "[nsl] rank {} exited with: {}", rank, status);
                         failed = true;
                     }
                 }
@@ -977,7 +977,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         &health_path,
                         initial_mtime,
                     ) {
-                        nsl_runtime::nsl_log!(WARN, "cli", 
+                        nsl_log::nsl_log!(WARN, "cli", 
                             "warning: no health snapshot at {} — train step may not have reached first flush",
                             health_path.display()
                         );
@@ -993,13 +993,13 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                                     r.render(&snap);
                                 }
-                                Err(e) => nsl_runtime::nsl_log!(WARN, "cli", 
+                                Err(e) => nsl_log::nsl_log!(WARN, "cli", 
                                     "warning: health snapshot at {} failed to parse: {}",
                                     health_path.display(),
                                     e
                                 ),
                             },
-                            Err(_) => nsl_runtime::nsl_log!(WARN, "cli", 
+                            Err(_) => nsl_log::nsl_log!(WARN, "cli", 
                                 "warning: no health snapshot at {} — train step may not have reached first flush",
                                 health_path.display()
                             ),
@@ -1027,7 +1027,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                                     full_count += 1;
                                 }
                             }
-                            nsl_runtime::nsl_log!(INFO, "inspect", 
+                            nsl_log::nsl_log!(INFO, "inspect", 
                                 "[inspect] Wrote {} stats records, {} full dumps to {}/",
                                 stats_count,
                                 full_count,
@@ -1035,7 +1035,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                             );
                         }
                         Err(_) => {
-                            nsl_runtime::nsl_log!(INFO, "inspect", 
+                            nsl_log::nsl_log!(INFO, "inspect", 
                                 "[inspect] No inspect output directory at {} — @inspect sites may not have fired",
                                 dir.display()
                             );
