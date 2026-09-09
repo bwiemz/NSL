@@ -203,7 +203,7 @@ fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::Compil
 /// weights (standalone export, library-module precompile) can simply not set
 /// `weight_file`.
 ///
-/// Load-bearing for CPDT Phase 1: `stmt.rs::invoke_cpdt_if_enabled` reads
+/// Load-bearing for CPDT Phase 1: `stmt_pass_bridges.rs::invoke_cpdt_if_enabled` reads
 /// `compiler.features.weight_map.as_ref()`, so the multi-file entry points
 /// `compile_module_with_imports_best_effort_plan` and
 /// `compile_entry_returning_plan` must call this helper before compiling any

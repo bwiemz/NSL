@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Nightly frontend fuzzing (roadmap T1): `.github/workflows/fuzz-nightly.yml`
+  runs the `lex` and `parse` cargo-fuzz targets from `fuzz/` every night
+  (06:30 UTC; on `workflow_dispatch` with a per-target time budget; and
+  as a 120 s smoke on a pull request that touches `fuzz/` or the workflow)
+  on the nightly toolchain, seeded from `fuzz/corpus/<target>/`, with the
+  documented `-max_len=4096 -timeout=10 -rss_limit_mb=4096` flags. A
+  reproducer fails the lane and is uploaded with the fuzzer log. The
+  `fuzz_seeds` stable test remains the per-PR gate; this is the
+  coverage-guided search that feeds it.
 - Design spec for the roadmap A1 endgame,
   `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`: the
   `TrainPlan` mid-level IR (configuration, parameter facts, tapes and
@@ -137,6 +146,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   instead of aborting with a core dump; the message text is unchanged. The
   codes are documented in `docs/architecture/runtime.md` and pinned by
   `fatal::tests`.
+- The pass bridges moved out of `stmt.rs` whole (roadmap A1):
+  `invoke_wrga_if_enabled`, `invoke_cpdt_if_enabled`,
+  `invoke_csha_if_enabled` and the `cpdt_forced_stale_plan` test knob now
+  live in `stmt_pass_bridges.rs`, byte-for-byte; the driver sites in
+  `stmt_train/` call the new path. 707 lines out of `stmt.rs` (~4.0k lines
+  now); the train-block CLIF snapshots are unchanged. The `[csha]` /
+  `[cpdt]` marker registry and the `csha_bridge` / `wggo_overrides` bus
+  consumer lists name the new file.
 - The train-block driver moved out of `stmt.rs` whole (roadmap A1):
   `compile_train_block` (the phase scope, the composition refusals, the
   CPDT offer, the dependency-order check, the fused-CE config bracket)

@@ -415,7 +415,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         consumers: &[
             "crates/nsl-codegen/src/expr/advanced.rs",
             "crates/nsl-codegen/src/wengert_lower.rs",
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_pass_bridges.rs",
         ],
         empty_means: "CSHA is off, or ran and claimed no layers — the \
                       FlashAttention call site uses the non-CSHA FFI variant",
@@ -618,7 +618,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         producer: "WGGO",
         carries: "crate::wggo_overrides::WggoOverrides",
         consumers: &[
-            "crates/nsl-codegen/src/stmt.rs",
+            "crates/nsl-codegen/src/stmt_pass_bridges.rs",
             "crates/nsl-codegen/src/stmt_train/plan_wrga_cpdt.rs",
             // Section 3 of the train block (the CPDT precision-plan resolution) lives in `stmt_train/model_params.rs` (A1).
             "crates/nsl-codegen/src/stmt_train/model_params.rs",
@@ -657,7 +657,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
             PassConsumer {
                 pass: "WRGA",
                 order: OrderClaim::InvocationOrdered,
-                via: "stmt.rs (invoke_wrga_if_enabled) forwards the channel \
+                via: "stmt_pass_bridges.rs (invoke_wrga_if_enabled) forwards the channel \
                       as WrgaInput.wggo_overrides for the placement filter",
             },
         ],

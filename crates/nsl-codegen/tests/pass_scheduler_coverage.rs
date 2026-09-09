@@ -91,9 +91,9 @@ fn count(hay: &str, needle: &str) -> usize {
 /// drops a count; an unreviewed new invocation site raises one. Both are
 /// deliberate edits that must move this table in the same commit.
 const SCHEDULED: &[(&str, usize, &str)] = &[
-    ("WRGA", 1, "stmt.rs (invoke_wrga_if_enabled site)"),
+    ("WRGA", 1, "stmt_pass_bridges.rs (invoke_wrga_if_enabled site)"),
     ("WGGO", 2, "stmt.rs in-place replan + wggo_prepass.rs prepass"),
-    ("CSHA", 1, "stmt.rs (invoke_csha_if_enabled site)"),
+    ("CSHA", 1, "stmt_pass_bridges.rs (invoke_csha_if_enabled site)"),
     ("CCR", 1, "stmt.rs (the whole search+plan region)"),
     ("CPDT", 3, "stmt.rs: two wrapper offers + the in-place replan site"),
     ("CPKD", 1, "stmt.rs (cpkd::build_plan + publish)"),
