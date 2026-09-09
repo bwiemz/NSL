@@ -5,7 +5,9 @@
 //! (`kernel.rs`); this gate is what replaced its proof. Each kernel below is
 //! parsed from NSL source exactly as `nsl build` would see it, lowered by
 //! `kernel_lower::lower_kernel_to_ir` (verified), printed by `backend_ptx`
-//! and piped through `ptxas --gpu-name sm_70`. The set covers everything
+//! and piped through `ptxas --gpu-name sm_80` (the text says `.target sm_70`,
+//! which an `sm_80` assembly accepts; the CUDA 13 toolkit CI installs no longer
+//! takes `sm_70` as a `--gpu-name`). The set covers everything
 //! the lowering accepts: the e2e fixtures' element-wise kernels, an
 //! `if`/`elif`/`else` chain assigning a local (a join with a block
 //! parameter), a `for ... in range(...)` accumulation (a loop header with
@@ -95,7 +97,7 @@ fn every_kernel_block_shape_assembles() {
         let ptx = compile_kernel_ptx(&kernel, &interner)
             .unwrap_or_else(|e| panic!("{name}: kernel must compile: {e}"));
         let text = String::from_utf8_lossy(&ptx[..ptx.len() - 1]).into_owned();
-        assemble_ptx(&ptxas, &ptx, "sm_70")
+        assemble_ptx(&ptxas, &ptx, "sm_80")
             .unwrap_or_else(|e| panic!("{name}: ptxas rejected the KIR lowering:\n{e}\nPTX:\n{text}"));
     }
 }

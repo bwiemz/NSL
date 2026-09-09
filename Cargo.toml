@@ -13,6 +13,7 @@ members = [
     "crates/nsl-abi",
     "crates/nsl-kir",
     "crates/nsl-env",
+    "crates/nsl-log",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ nsl-codegen = { path = "crates/nsl-codegen" }
 nsl-env = { path = "crates/nsl-env" }
 nsl-abi = { path = "crates/nsl-abi" }
 nsl-kir = { path = "crates/nsl-kir" }
+nsl-log = { path = "crates/nsl-log" }
 
 codespan-reporting = "0.13"
 clap = { version = "4", features = ["derive"] }

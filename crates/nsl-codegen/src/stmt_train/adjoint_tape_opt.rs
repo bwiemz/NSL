@@ -83,7 +83,7 @@ impl Compiler<'_> {
         let norm_res_folds =
             crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &adjoint_needed);
         if norm_res_folds > 0 {
-            nsl_runtime::nsl_log!(INFO, "fuse", "[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
+            nsl_log::nsl_log!(INFO, "fuse", "[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
         }
         // MFU campaign C2: the RoPE backward fold is generation-time
         // (rotate_half_neg emitted instead of rotate_half + Neg);
@@ -97,7 +97,7 @@ impl Compiler<'_> {
             })
             .count();
         if rope_folds > 0 {
-            nsl_runtime::nsl_log!(INFO, "fuse", "[fuse] rope backward folds: {rope_folds}");
+            nsl_log::nsl_log!(INFO, "fuse", "[fuse] rope backward folds: {rope_folds}");
         }
         // MFU campaign C3: generic elementwise-chain fusion + the
         // standalone scalar-immediate sweep. Chain fuser first so
@@ -115,7 +115,7 @@ impl Compiler<'_> {
                 &adjoint.var_types,
             );
             if ew_stats.chains > 0 {
-                nsl_runtime::nsl_log!(INFO, "fuse", 
+                nsl_log::nsl_log!(INFO, "fuse", 
                     "[fuse] elementwise backward chains: {} ({} device ops elided, \
                      {} reduces absorbed, {} imms baked)",
                     ew_stats.chains,
@@ -130,21 +130,21 @@ impl Compiler<'_> {
                 &adjoint.var_types,
             );
             if scalar_imms > 0 {
-                nsl_runtime::nsl_log!(INFO, "fuse", "[fuse] scalar immediates: {scalar_imms}");
+                nsl_log::nsl_log!(INFO, "fuse", "[fuse] scalar immediates: {scalar_imms}");
             }
             if (ew_stats.chains > 0 || scalar_imms > 0)
                 && std::env::var("NSL_PROFILE_ADJOINT").is_ok()
             {
-                nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
+                nsl_log::nsl_log!(INFO, "adjoint-profile", 
                     "[adjoint-profile] post-fusion: {} backward ops:",
                     adjoint.ops.len()
                 );
                 for (k, c) in crate::ew_chain_fusion::histogram(&adjoint.ops) {
-                    nsl_runtime::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
+                    nsl_log::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
                 }
             }
         } else {
-            nsl_runtime::nsl_log!(WARN, "fuse", "[fuse] elementwise backward fusion skipped (--layerwise-accum)");
+            nsl_log::nsl_log!(WARN, "fuse", "[fuse] elementwise backward fusion skipped (--layerwise-accum)");
         }
 
         // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
@@ -161,7 +161,7 @@ impl Compiler<'_> {
                 .map(|(n, v)| (n.clone(), *v))
                 .collect();
             let plan = crate::layerwise::analyze(adjoint, &params, &|_| None);
-            nsl_runtime::nsl_log!(INFO, "csla", "[csla]\n{}", plan.render_report("  "));
+            nsl_log::nsl_log!(INFO, "csla", "[csla]\n{}", plan.render_report("  "));
         }
 
         adjoint_needed

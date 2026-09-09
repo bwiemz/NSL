@@ -126,7 +126,7 @@ impl Compiler<'_> {
 
                             if self.compile_options.autotune.disabled {
                                 // --no-autotune: use middle values, skip benchmarking
-                                nsl_runtime::nsl_log!(INFO, "nsl", 
+                                nsl_log::nsl_log!(INFO, "nsl", 
                                     "[nsl] autotune: --no-autotune, using middle values for {}",
                                     kernel_name
                                 );
@@ -212,21 +212,21 @@ impl Compiler<'_> {
         let code = match target {
             GpuTarget::Cuda => crate::backend_ptx::lower_kir_to_ptx(&kir),
             GpuTarget::Rocm => {
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] Generated AMDGPU ISA for kernel '{}' (runtime execution requires M47c)",
                     kernel_name
                 );
                 crate::backend_amdgpu::lower_kir_to_amdgpu(&kir)
             }
             GpuTarget::Metal => {
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] Generated MSL for kernel '{}' (runtime execution requires M47c)",
                     kernel_name
                 );
                 crate::backend_metal::lower_kir_to_msl(&kir)
             }
             GpuTarget::WebGpu => {
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] Generated WGSL for kernel '{}' (runtime execution requires M47c)",
                     kernel_name
                 );
@@ -370,7 +370,7 @@ impl Compiler<'_> {
                     // someone to "add a GpuSpec entry" for a build that cannot
                     // see GPUs at all would send them to the wrong file.
                     if device.is_real_device() {
-                        nsl_runtime::nsl_log!(INFO, "autotune", 
+                        nsl_log::nsl_log!(INFO, "autotune", 
                             "[autotune] no GpuSpec entry for {} — pricing the roofline against \
                              {} instead. Variant selection is an estimate for the wrong card; \
                              add a GpuSpec entry for this device to fix it.",
@@ -378,7 +378,7 @@ impl Compiler<'_> {
                             fallback.name
                         );
                     } else {
-                        nsl_runtime::nsl_log!(WARN, "autotune", 
+                        nsl_log::nsl_log!(WARN, "autotune", 
                             "[autotune] no local GPU to price against ({}) — using {}. \
                              Variant selection is an estimate for hardware this build cannot \
                              see; rebuild with --features cuda on the target machine for a \
@@ -413,7 +413,7 @@ impl Compiler<'_> {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
             h.update(&ast_bytes);
-            nsl_runtime::nsl_log!(INFO, "autotune", 
+            nsl_log::nsl_log!(INFO, "autotune", 
                 "[autotune] key inputs for '{kernel_name}': ast_sha={} params={tuning_params:?} device={}",
                 crate::autotune::hex(&h.finalize()),
                 device.describe(),
@@ -445,7 +445,7 @@ impl Compiler<'_> {
             for v in &variants {
                 match ptx_generator(v) {
                     Ok(p) => variant_ptx.push((v.clone(), p)),
-                    Err(e) => nsl_runtime::nsl_log!(ERROR, "autotune", 
+                    Err(e) => nsl_log::nsl_log!(ERROR, "autotune", 
                         "[autotune] capture: variant {v:?} of '{kernel_name}' failed to \
                          compile: {e}"
                     ),
@@ -512,7 +512,7 @@ impl Compiler<'_> {
         )
         .map_err(|e| CodegenError::new(format!("autotune failed for '{}': {}", kernel_name, e)))?;
 
-        nsl_runtime::nsl_log!(INFO, "nsl", 
+        nsl_log::nsl_log!(INFO, "nsl", 
             "[nsl] autotune: selected {:?} for kernel '{}'{}",
             winner,
             kernel_name,
@@ -594,7 +594,7 @@ impl Compiler<'_> {
             // arrives as Some("off"), so `mode.is_some()` is NOT "enabled"
             // (review finding — the off mode must stay chatter-free).
             if crate::wggo_prepass::wggo_mode_enabled(&self.compile_options) {
-                nsl_runtime::nsl_log!(INFO, "wggo", 
+                nsl_log::nsl_log!(INFO, "wggo", 
                     "[wggo] pre-pass deferred: calibrated importance scoring requested but \
                      its calibration sidecar is not yet available; planning stays in-place \
                      (kernel admission unplanned)"
@@ -830,7 +830,7 @@ impl Compiler<'_> {
         // `scaled_dot_product_attention_packed`. CSHA fusion levels remain
         // decorator-gated (unchanged).
         if self.features.packed_sdpa_in_module {
-            nsl_runtime::nsl_log!(INFO, "wggo", 
+            nsl_log::nsl_log!(INFO, "wggo", 
                 "[wggo] plan-reachability: decorator-free attention with the PACKED \
                  builtin — the plan's segment_id packing decision lowers through the \
                  Stage-C fused segment-masked kernel family; CSHA fusion levels remain \
@@ -839,7 +839,7 @@ impl Compiler<'_> {
                 pre.overrides.per_layer.len(),
             );
         } else {
-            nsl_runtime::nsl_log!(INFO, "wggo", 
+            nsl_log::nsl_log!(INFO, "wggo", 
                 "[wggo] plan-reachability: this train block lowers attention through the \
                  decorator-free `scaled_dot_product_attention` path (no @flash_attention \
                  context) — the fused plain forward applies, but the plan's per-layer \
@@ -997,7 +997,7 @@ impl Compiler<'_> {
                 }
             }
             if over_level1 > 0 {
-                nsl_runtime::nsl_log!(ERROR, "csha", 
+                nsl_log::nsl_log!(ERROR, "csha", 
                     "[csha] wggo-override-rejected: {over_level1} layer(s) requested \
                      csha level>=2 for the training path; the Tier B.1 forward emits \
                      no activation saves, so honoring it would corrupt the backward — \
@@ -1005,13 +1005,13 @@ impl Compiler<'_> {
                 );
             }
             if level1 > 0 {
-                nsl_runtime::nsl_log!(INFO, "csha", 
+                nsl_log::nsl_log!(INFO, "csha", 
                     "[csha] plan-aligned: {level1} layer(s) requested csha level 1; \
                      training-PTX synthesis honors it (with-saves forward + fused backward)"
                 );
             }
             if level0 > 0 {
-                nsl_runtime::nsl_log!(WARN, "csha", 
+                nsl_log::nsl_log!(WARN, "csha", 
                     "[csha] wggo-override-rejected: {level0} layer(s) requested csha \
                      level 0 (no fusion), but training-PTX synthesis is gated by the \
                      @flash_attention/@csha decorators, not the plan — level-1 \
@@ -1135,7 +1135,7 @@ impl Compiler<'_> {
                 .as_ref()
                 .is_some_and(|c| c.fused_projections);
         if per_doc_authorized && plan_prefers_segment_id {
-            nsl_runtime::nsl_log!(WARN, "pca-per-doc", 
+            nsl_log::nsl_log!(WARN, "pca-per-doc", 
                 "[pca-per-doc] deferred to plan preference: wggo packing_mode=segment_id \
                  prefers the segment-masked Tier-B kernels — skipping per-doc CTA admission"
             );
@@ -1166,14 +1166,14 @@ impl Compiler<'_> {
                     &admit_cfg,
                 ) {
                     Ok(plan) => {
-                        nsl_runtime::nsl_log!(INFO, "pca-per-doc", 
+                        nsl_log::nsl_log!(INFO, "pca-per-doc", 
                             "[pca-per-doc] admitted: {}",
                             plan.reason
                         );
                         Some(plan)
                     }
                     Err(reason) => {
-                        nsl_runtime::nsl_log!(WARN, "codegen", 
+                        nsl_log::nsl_log!(WARN, "codegen", 
                             "warning: @pca(strategy=per_document) was requested but could not \
                              be honored ({reason:?}) — falling through to the segment_id_masked \
                              Tier A kernel"
@@ -1182,7 +1182,7 @@ impl Compiler<'_> {
                     }
                 }
             } else {
-                nsl_runtime::nsl_log!(WARN, "codegen", 
+                nsl_log::nsl_log!(WARN, "codegen", 
                     "warning: @pca(strategy=per_document) was requested but the train block's \
                      dataset packing config could not be resolved — falling through to the \
                      segment_id_masked Tier A kernel"
@@ -1215,7 +1215,7 @@ impl Compiler<'_> {
             crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                 &training_config, &mut diags,
             );
-        for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
+        for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
         // Item 4: when per-doc CTA admission succeeds, route the
         // with-saves forward PTX to the per-document CTA emitter and
         // SKIP Tier-B-on variant emission (per-doc is its own dispatch
@@ -1348,7 +1348,7 @@ impl Compiler<'_> {
                         (Some(pd_bwd_ptx_id), Some(pd_bwd_name_id), None, None)
                     }
                     Err(e) => {
-                        nsl_runtime::nsl_log!(WARN, "pca-per-doc", 
+                        nsl_log::nsl_log!(WARN, "pca-per-doc", 
                             "[pca-per-doc] backward PTX synthesis failed — falling back to no \
                              backward: {e}"
                         );
@@ -1415,7 +1415,7 @@ impl Compiler<'_> {
                                     (Some(on_ptx_id), Some(on_name_id))
                                 }
                                 Err(e) => {
-                                    nsl_runtime::nsl_log!(WARN, "csha-gap-b", 
+                                    nsl_log::nsl_log!(WARN, "csha-gap-b", 
                                         "[csha-gap-b] Tier-B-on backward PTX synthesis skipped — \
                                          validator rejected: {e}"
                                     );
@@ -1429,7 +1429,7 @@ impl Compiler<'_> {
                     (Some(bwd_ptx_id), Some(bwd_name_id), tier_b_ptx_id_opt, tier_b_name_id_opt)
                 }
                 Err(e) => {
-                    nsl_runtime::nsl_log!(WARN, "csha-gap-b", 
+                    nsl_log::nsl_log!(WARN, "csha-gap-b", 
                         "[csha-gap-b] backward PTX synthesis skipped — validator rejected: {e}"
                     );
                     (None, None, None, None)
@@ -1739,7 +1739,7 @@ impl Compiler<'_> {
                 // switch off. The old wording claimed the flag had an effect it
                 // does not have. `flash_attention_block_sizes_are_never_tuned`
                 // in tests/autotune_cache_identity.rs pins this.
-                nsl_runtime::nsl_log!(WARN, "nsl", 
+                nsl_log::nsl_log!(WARN, "nsl", 
                     "[nsl] autotune: flash_attention block sizes are not autotuned — \
                      middle values are always the primary config, with or without --no-autotune"
                 );
@@ -1786,7 +1786,7 @@ impl Compiler<'_> {
                 let shmem = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
                     &test_config, &mut diags,
                 );
-                for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
+                for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
                 if shmem > 49152 {
                     return Err(CodegenError::new(format!(
                         "@autotune variant (block_q={}, block_kv={}) requires {}KB shared memory, exceeds 48KB limit for sm_52",
@@ -1816,7 +1816,7 @@ impl Compiler<'_> {
                 let _ = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                     &test_config, &mut diags,
                 );
-                for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
+                for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
                 let emission =
                     crate::pca_tier_b::emit_tier_b_variants_for_config(&test_config);
                 let variant_kernel_name = emission.base_kernel_name.clone();
@@ -1869,7 +1869,7 @@ impl Compiler<'_> {
             let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                 &config, &mut diags,
             );
-            for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
+            for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
 
             // The primary variant's PTX was already embedded in the loop above.
             // Look up its .rodata IDs from kernel_ptx_data (stored by embed_flash_ptx).
@@ -1996,7 +1996,7 @@ impl Compiler<'_> {
             let _ = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                 &config, &mut diags,
             );
-            for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
+            for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
             let emission = crate::pca_tier_b::emit_tier_b_variants_for_config(&config);
             let kernel_name = emission.base_kernel_name.clone();
             let ptx_bytes = emission.base_ptx;
@@ -2309,7 +2309,7 @@ impl Compiler<'_> {
                 &config, &mut diags,
             ) as i64;
             for d in diags {
-                nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}");
+                nsl_log::nsl_log!(WARN, "codegen", "warning: {d}");
             }
             if emission.tier_b_on_ptx.is_some() {
                 // Tier-B-on kernels build their per-tile segment range table
