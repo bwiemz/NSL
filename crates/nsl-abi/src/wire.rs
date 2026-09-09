@@ -250,6 +250,167 @@ pub mod train_config {
         &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"];
 }
 
+/// The AWQ activation-scales blob — the `"awq_activation_scales"` entry of
+/// the calibration sidecar's `hooks` map, base64 in the JSON.
+///
+/// The calibration harness the compiler emits writes it (through the
+/// runtime's `nsl_calib_write_sidecar`, and the codegen's own AWQ hook in
+/// its in-process tests), and the compiler reads it back at `quant` time
+/// to scale the weights it quantizes. Until roadmap A3 the encoder existed
+/// twice and the decoder twice — one of each in `nsl-codegen`
+/// (`calibration/awq_sidecar.rs`) and in `nsl-runtime` (`awq.rs`) — each
+/// pair kept identical by hand. This module is the one definition.
+///
+/// Layout, little-endian throughout:
+///
+/// ```text
+/// u32  version            (= AWQ_SIDECAR_VERSION)
+/// u32  num_projections
+/// repeated num_projections times:
+///   u32  name_len
+///   u8   name[name_len]   (UTF-8 projection path, "{model_type}.{field}")
+///   u32  channel_count
+///   f32  scales[channel_count]
+/// ```
+pub mod awq_scales {
+    use std::collections::HashMap;
+
+    /// Current blob format version. Readers reject other values.
+    pub const AWQ_SIDECAR_VERSION: u32 = 1;
+
+    /// The key under the sidecar JSON's `hooks` map that carries the blob
+    /// (base64), and the id of the codegen hook that produces it.
+    pub const AWQ_SIDECAR_KEY: &str = "awq_activation_scales";
+
+    /// The decoded blob: projection path → per-input-channel
+    /// max|activation| values.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct AwqScales {
+        /// Projection name → per-output-channel max|activation| values.
+        pub by_projection: HashMap<String, Vec<f32>>,
+    }
+
+    /// Why a blob did not decode.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum AwqBlobError {
+        /// Shorter than the 8-byte header.
+        TooSmall { need: usize, got: usize },
+        /// A version this reader does not understand.
+        UnsupportedVersion { got: u32 },
+        /// A field runs past the end of the blob.
+        Truncated { at: &'static str, offset: usize, need: usize, got: usize },
+        /// A projection name that is not UTF-8.
+        BadUtf8 { offset: usize },
+    }
+
+    impl std::fmt::Display for AwqBlobError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::TooSmall { need, got } => write!(f, "blob too small: need {need}, got {got}"),
+                Self::UnsupportedVersion { got } => write!(
+                    f,
+                    "unsupported AWQ sidecar version {got} (expected {AWQ_SIDECAR_VERSION})"
+                ),
+                Self::Truncated { at, offset, need, got } => {
+                    write!(f, "truncated at {at} offset {offset}: need {need} bytes, got {got}")
+                }
+                Self::BadUtf8 { offset } => {
+                    write!(f, "invalid UTF-8 in projection name at offset {offset}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for AwqBlobError {}
+
+    /// Encode projections in the order given. Callers that need a
+    /// deterministic blob pass them sorted (a `BTreeMap`'s iteration, or
+    /// [`AwqScales::to_blob`]).
+    pub fn encode<'a>(projections: impl IntoIterator<Item = (&'a str, &'a [f32])>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&AWQ_SIDECAR_VERSION.to_le_bytes());
+        // Patched below once the count is known.
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut count: u32 = 0;
+        for (name, scales) in projections {
+            let nb = name.as_bytes();
+            out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            out.extend_from_slice(nb);
+            out.extend_from_slice(&(scales.len() as u32).to_le_bytes());
+            for v in scales {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            count += 1;
+        }
+        out[4..8].copy_from_slice(&count.to_le_bytes());
+        out
+    }
+
+    impl AwqScales {
+        /// Decode a blob. Every length is bounds-checked before it is read,
+        /// so a truncated or hostile blob is an error, never a panic.
+        pub fn from_blob(blob: &[u8]) -> Result<Self, AwqBlobError> {
+            if blob.len() < 8 {
+                return Err(AwqBlobError::TooSmall { need: 8, got: blob.len() });
+            }
+            let u32_at = |off: usize| u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
+            let version = u32_at(0);
+            if version != AWQ_SIDECAR_VERSION {
+                return Err(AwqBlobError::UnsupportedVersion { got: version });
+            }
+            let num_projections = u32_at(4) as usize;
+            let mut by_projection = HashMap::with_capacity(num_projections.min(1 << 16));
+            let mut cursor = 8;
+            let truncated = |at: &'static str, offset: usize, need: usize| AwqBlobError::Truncated {
+                at,
+                offset,
+                need,
+                got: blob.len() - offset,
+            };
+            for _ in 0..num_projections {
+                if blob.len() < cursor + 4 {
+                    return Err(truncated("name_len", cursor, 4));
+                }
+                let name_len = u32_at(cursor) as usize;
+                cursor += 4;
+                if blob.len() < cursor + name_len {
+                    return Err(truncated("name bytes", cursor, name_len));
+                }
+                let name = std::str::from_utf8(&blob[cursor..cursor + name_len])
+                    .map_err(|_| AwqBlobError::BadUtf8 { offset: cursor })?
+                    .to_string();
+                cursor += name_len;
+                if blob.len() < cursor + 4 {
+                    return Err(truncated("channel_count", cursor, 4));
+                }
+                let channel_count = u32_at(cursor) as usize;
+                cursor += 4;
+                let scale_bytes = channel_count
+                    .checked_mul(4)
+                    .ok_or(truncated("scales (channel_count overflow)", cursor, usize::MAX))?;
+                if blob.len() < cursor + scale_bytes {
+                    return Err(truncated("scales", cursor, scale_bytes));
+                }
+                let scales = blob[cursor..cursor + scale_bytes]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                cursor += scale_bytes;
+                by_projection.insert(name, scales);
+            }
+            Ok(Self { by_projection })
+        }
+
+        /// Encode, projections sorted by name so the bytes are a function of
+        /// the contents alone.
+        pub fn to_blob(&self) -> Vec<u8> {
+            let mut names: Vec<&String> = self.by_projection.keys().collect();
+            names.sort();
+            encode(names.into_iter().map(|n| (n.as_str(), self.by_projection[n].as_slice())))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +439,57 @@ mod tests {
         for k in train_config::MOMENT_KEYS {
             assert!(!train_config::TRAJECTORY_KEYS.contains(k), "{k} in both classes");
         }
+    }
+
+    #[test]
+    fn awq_blob_round_trips_and_is_deterministic() {
+        use awq_scales::*;
+        let mut scales = AwqScales::default();
+        scales.by_projection.insert("blocks.0.attn.wq".into(), vec![1.0, 2.0, 3.5, 4.0]);
+        scales.by_projection.insert("blocks.0.attn.wk".into(), vec![0.1, 0.2]);
+        scales.by_projection.insert("empty".into(), vec![]);
+        let blob = scales.to_blob();
+        assert_eq!(&blob[0..4], &AWQ_SIDECAR_VERSION.to_le_bytes());
+        assert_eq!(&blob[4..8], &3u32.to_le_bytes());
+        assert_eq!(AwqScales::from_blob(&blob).unwrap(), scales);
+        // Sorted by name, whatever the map's iteration order.
+        let sorted: Vec<(&str, &[f32])> = vec![
+            ("blocks.0.attn.wk", &[0.1, 0.2]),
+            ("blocks.0.attn.wq", &[1.0, 2.0, 3.5, 4.0]),
+            ("empty", &[]),
+        ];
+        assert_eq!(blob, encode(sorted));
+        // No projections is a valid blob.
+        assert_eq!(AwqScales::from_blob(&encode(Vec::<(&str, &[f32])>::new())).unwrap(), AwqScales::default());
+    }
+
+    #[test]
+    fn awq_blob_decoder_refuses_bad_input_without_panicking() {
+        use awq_scales::*;
+        let mut scales = AwqScales::default();
+        scales.by_projection.insert("long_name".into(), vec![1.0, 2.0, 3.0]);
+        let full = scales.to_blob();
+        assert_eq!(AwqScales::from_blob(&full[..7]), Err(AwqBlobError::TooSmall { need: 8, got: 7 }));
+        let mut bad_version = full.clone();
+        bad_version[0..4].copy_from_slice(&999u32.to_le_bytes());
+        assert_eq!(
+            AwqScales::from_blob(&bad_version),
+            Err(AwqBlobError::UnsupportedVersion { got: 999 })
+        );
+        for cut in 8..full.len() {
+            assert!(
+                matches!(AwqScales::from_blob(&full[..cut]), Err(AwqBlobError::Truncated { .. })),
+                "cut at {cut}"
+            );
+        }
+        let mut bad_utf8 = full.clone();
+        bad_utf8[12] = 0xff; // first byte of the name
+        assert_eq!(AwqScales::from_blob(&bad_utf8), Err(AwqBlobError::BadUtf8 { offset: 12 }));
+        // A count that promises more than the blob holds is truncation, not
+        // a huge allocation.
+        let mut liar = encode(Vec::<(&str, &[f32])>::new());
+        liar[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(AwqScales::from_blob(&liar), Err(AwqBlobError::Truncated { .. })));
     }
 
     #[test]

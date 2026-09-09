@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::calibration::awq_sidecar;
 use crate::calibration::ctx::{BufferHandle, CalibCtx};
 use crate::calibration::discovery::DiscoveredProjection;
 use crate::calibration::hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
@@ -168,7 +167,11 @@ impl CalibrationHook for AwqCalibrationHook {
             }
             by_projection.insert(p.0.clone(), scales);
         }
-        CalibrationResult::Ok(awq_sidecar::serialize(&by_projection))
+        // The blob format is `nsl_abi::wire::awq_scales` (roadmap A3); a
+        // `BTreeMap` iterates sorted, so the bytes are deterministic.
+        CalibrationResult::Ok(nsl_abi::wire::awq_scales::encode(
+            by_projection.iter().map(|(name, scales)| (name.as_str(), scales.as_slice())),
+        ))
     }
 }
 
@@ -235,9 +238,11 @@ mod tests {
             CalibrationResult::Ok(b) => b,
             other => panic!("expected Ok, got {other:?}"),
         };
-        let parsed = awq_sidecar::deserialize(&blob).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].scales, vec![1.0, 2.0, 3.0, 4.0]);
+        let parsed = nsl_abi::wire::awq_scales::AwqScales::from_blob(&blob).unwrap();
+        assert_eq!(parsed.by_projection.len(), 2);
+        for p in &projs {
+            assert_eq!(parsed.by_projection[&p.0], vec![1.0, 2.0, 3.0, 4.0], "{}", p.0);
+        }
     }
 
     #[test]
