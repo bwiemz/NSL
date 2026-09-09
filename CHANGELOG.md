@@ -155,6 +155,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   re-exports both at their historical paths (`c_api::NslTensorDesc`,
   `train_config_record::{MOMENT_KEYS, TRAJECTORY_KEYS}`); nothing on the
   C ABI or in a checkpoint changes.
+- The runtime C-ABI has one typed source (roadmap A3, step 1):
+  `crates/nsl-abi/src/table.rs` holds every runtime function the codegen
+  calls — 682 rows, `[group] name(params) -> ret = runtime::path;` — as the
+  X-macro `nsl_abi::for_each_runtime_fn!`, plus the same rows as data
+  (`nsl_abi::RUNTIME_ABI`). The codegen renders its Cranelift declarations
+  from it (`builtins/mod.rs`; the fourteen hand-written `RUNTIME_FUNCTIONS*`
+  tables under `builtins/` and `runtime_abi/` are gone, and `runtime_abi/`
+  with them), and the runtime renders it into compile-time assertions
+  (`nsl-runtime/src/abi_check.rs`, via `nsl_abi::typed`): each implementation
+  is cast to `unsafe extern "C" fn(_, …) -> _` and its inferred signature
+  compared slot by slot, so a row that disagrees with its implementation —
+  arity, register class, or path — fails the runtime's build naming the
+  function. The `signature_agreement` gate now reads the typed table for the
+  declared side and keeps the text parser for the runtime side, as
+  belt-and-braces. Row order, grouping and comments are carried over
+  verbatim; the train-block CLIF snapshots are unchanged.
 - Runtime fatal exits are typed (roadmap C1): `nsl_runtime::fatal::die(kind,
   msg)` is the one chokepoint for a condition the runtime cannot continue
   from, and each `Fatal` kind has its own exit code — `GpuOom` **12**
