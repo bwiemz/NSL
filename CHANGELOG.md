@@ -25,6 +25,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   mapped onto today's seventeen planning sites, the technique-free
   `emit_train_plan`, and the five snapshot-gated steps from the peeled
   driver to that shape.
+- Design spec for the roadmap A3 endgame,
+  `docs/superpowers/specs/2026-09-08-a3-abi-extern-table-design.md`: one
+  X-macro table of the ~370 runtime functions the codegen calls in
+  `nsl-abi`, rendered into the codegen's Cranelift declarations and into
+  `rustc`-checked signature assertions in the runtime (replacing the
+  text-parsing cross-check), the C-header and Python-mirror generators
+  behind `assert_eq!` gates, and the three moves — `nsl-log`, the wire
+  formats, a feature-gated runtime dependency — that drop the codegen →
+  runtime edge; six gated steps.
 
 - Runtime logging front door (roadmap C3): `nsl_log!(LEVEL, "target", …)`
   in nsl-runtime emits a `tracing` event per diagnostic line; the crate's own
@@ -147,6 +156,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   the plan is a Cranelift handle. The emitter bodies are unchanged (each
   rebinds the facts under their old names), and the train-block CLIF
   snapshots are unchanged.
+- The runtime C-ABI has one typed source (roadmap A3, step 1):
+  `crates/nsl-abi/src/table.rs` holds every runtime function the codegen
+  calls — 682 rows, `[group] name(params) -> ret = runtime::path;` — as the
+  X-macro `nsl_abi::for_each_runtime_fn!`, plus the same rows as data
+  (`nsl_abi::RUNTIME_ABI`). The codegen renders its Cranelift declarations
+  from it (`builtins/mod.rs`; the fourteen hand-written `RUNTIME_FUNCTIONS*`
+  tables under `builtins/` and `runtime_abi/` are gone, and `runtime_abi/`
+  with them), and the runtime renders it into compile-time assertions
+  (`nsl-runtime/src/abi_check.rs`, via `nsl_abi::typed`): each implementation
+  is cast to `unsafe extern "C" fn(_, …) -> _` and its inferred signature
+  compared slot by slot, so a row that disagrees with its implementation —
+  arity, register class, or path — fails the runtime's build naming the
+  function. The `signature_agreement` gate now reads the typed table for the
+  declared side and keeps the text parser for the runtime side, as
+  belt-and-braces. Row order, grouping and comments are carried over
+  verbatim; the train-block CLIF snapshots are unchanged.
 - Runtime fatal exits are typed (roadmap C1): `nsl_runtime::fatal::die(kind,
   msg)` is the one chokepoint for a condition the runtime cannot continue
   from, and each `Fatal` kind has its own exit code — `GpuOom` **12**
