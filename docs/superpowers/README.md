@@ -16,7 +16,7 @@ Older plans (WRGA fused-PTX and gated-LoRA closeouts, the M52–M62 roadmap
 design, the pretraining memory-reduction plan) live in
 [`docs/plans/`](../plans/).
 
-Counts: 121 documents in 23 subsystems.
+Counts: 122 documents in 24 subsystems.
 
 ## FASE — fused adaptive step emission (training-loop fusion)
 
@@ -246,6 +246,12 @@ Counts: 121 documents in 23 subsystems.
 |---|---|---|
 | 2026-08-18 | design spec | [`2026-08-18-item7-dlpack-output-ownership.md`](specs/2026-08-18-item7-dlpack-output-ownership.md) |
 | 2026-08-19 | design spec | [`2026-08-19-item8-resumable-training-state.md`](specs/2026-08-19-item8-resumable-training-state.md) |
+
+## Train-block driver decomposition (roadmap A1)
+
+| Date | Kind | Document |
+|---|---|---|
+| 2026-09-08 | design spec | [`2026-09-08-a1-train-plan-ir-design.md`](specs/2026-09-08-a1-train-plan-ir-design.md) |
 
 ## Other
 

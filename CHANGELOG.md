@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Design spec for the roadmap A1 endgame,
+  `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`: the
+  `TrainPlan` mid-level IR (configuration, parameter facts, tapes and
+  technique plans as plain data; Cranelift handles kept apart in an
+  `EmitState`), the `TrainPass` trait with a single `PASS_ORDER` table
+  mapped onto today's seventeen planning sites, the technique-free
+  `emit_train_plan`, and the five snapshot-gated steps from the peeled
+  driver to that shape.
+
 - Runtime logging front door (roadmap C3): `nsl_log!(LEVEL, "target", …)`
   in nsl-runtime emits a `tracing` event per diagnostic line; the crate's own
   subscriber (`src/log.rs`) keeps stderr byte-identical to the `eprintln!` it
@@ -128,6 +137,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   instead of aborting with a core dump; the message text is unchanged. The
   codes are documented in `docs/architecture/runtime.md` and pinned by
   `fatal::tests`.
+- The train-block driver moved out of `stmt.rs` whole (roadmap A1):
+  `compile_train_block` (the phase scope, the composition refusals, the
+  CPDT offer, the dependency-order check, the fused-CE config bracket)
+  and `compile_train_block_inner` (the epoch and batch loops and the
+  bindings between the peeled phases) now live in
+  `stmt_train/driver.rs`, byte-for-byte; the one `stmt.rs` helper it calls
+  is `pub(crate)`. 2,630 lines out of `stmt.rs` (~4.7k lines now, under
+  the roadmap's Phase 1 exit criterion of 5k); the train-block CLIF
+  snapshots are unchanged. The marker registry, the pass-manager and
+  pass-registry drift scans name the new file.
+
 - The `grad` block drivers moved out of `stmt.rs` whole (roadmap A1):
   `compile_grad_block`, `compile_source_ad_grad_block`,
   `compile_tape_grad_block` and `compile_tape_backward` now live in

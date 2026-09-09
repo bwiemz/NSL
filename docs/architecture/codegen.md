@@ -29,9 +29,9 @@ facade map first, then this, then:
   `fusion_graph.rs` were deleted — `ARCHITECTURE.md` still names the first
   two in its `analysis` row, which is a doc bug, not a hidden module).
 
-Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~7.3k
-(plus `src/stmt_control.rs` and `src/stmt_assign.rs`, ~1.2k each, and
-`src/stmt_grad.rs`, ~0.4k),
+Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~4.7k
+(plus `src/stmt_train/driver.rs`, ~2.7k, `src/stmt_control.rs` and
+`src/stmt_assign.rs`, ~1.2k each, and `src/stmt_grad.rs`, ~0.4k),
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
 `src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
 `tests/` and ~200 modules at the crate root.
@@ -125,11 +125,11 @@ is the shortest readable copy of the sequence.
 
 ### The train-block compiler
 
-`compile_train_block` (`src/stmt.rs`) is the callee-side phase scope: it
+`compile_train_block` (`src/stmt_train/driver.rs`) is the callee-side phase scope: it
 installs `CompilePhase::TrainBlock` via `pass_trace::enter_phase`, refuses the
 `@pipeline` + `--layerwise-accum` / `--zero-stage` compositions, offers CPDT
 at the wrapper (`schedule("CPDT", …)`) and then calls
-`compile_train_block_inner`, a ~2.3k-line driver. Its shape, in the order the
+`compile_train_block_inner` (same file), a ~2.3k-line driver. Its shape, in the order the
 driver runs it:
 
 1. Config extraction from `train(...)` arguments — one resolver in

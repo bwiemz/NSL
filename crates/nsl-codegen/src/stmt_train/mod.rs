@@ -1,9 +1,13 @@
 //! The train block's lowering, one phase per submodule.
 //!
-//! `stmt.rs::compile_train_block_inner` is the driver: it still owns the
+//! [`driver`]'s `compile_train_block_inner` is the driver: it still owns the
 //! epoch + batch loops and the bindings that flow between the phases. Each submodule here is one phase peeled off that function
 //! (roadmap A1), in the order the driver runs them:
 //!
+//!   - [`driver`] — `compile_train_block` (the phase scope, the composition
+//!     refusals, the CPDT offer, the dependency-order check, the fused-CE
+//!     config bracket) and `compile_train_block_inner` (the epoch and batch
+//!     loops and the bindings between the phases below), whole.
 //!   - [`config`] — section 1: the `train(...)` header resolved through
 //!     `nsl-semantic`'s ONE resolver, the CUDA-graphs arming and the
 //!     distill overrides, returned as a [`config::TrainConfigSection`].
@@ -133,6 +137,7 @@ pub(crate) mod optimizer_state;
 pub(crate) mod contract;
 pub(crate) mod csla_precompute;
 pub(crate) mod csla_window;
+pub(crate) mod driver;
 pub(crate) mod epoch_close;
 pub(crate) mod fase_hook_lowering;
 pub(crate) mod forward_lowering;
