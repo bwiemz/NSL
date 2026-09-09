@@ -88,6 +88,7 @@ pub mod args;
 pub mod events;
 pub mod log;
 pub mod fatal;
+mod abi_check;
 pub mod tensor;
 pub(crate) mod cpu;
 pub(crate) mod cuda;
@@ -193,8 +194,10 @@ pub mod fase_step;
 pub mod optim_groups;
 pub mod muon;
 pub mod muon_batch;
-pub mod muon_prof;
-
+/// The CUDA engine's entry point at the crate root, so `nsl_muon_step_batch`
+/// has one path under both feature sets (the ABI table names it).
+#[cfg(feature = "cuda")]
+pub use muon_batch::nsl_muon_step_batch;
 /// Non-CUDA stub: `--muon-batch-ns` is a GPU perf opt-in; a CPU-only build
 /// reaching it is a hard precondition failure, not a silent fallback.
 #[cfg(not(feature = "cuda"))]
@@ -213,6 +216,8 @@ pub extern "C" fn nsl_muon_step_batch(
     crate::nsl_log!(ERROR, "nsl", "nsl: --muon-batch-ns requires a CUDA-enabled build/GPU");
     std::process::abort();
 }
+pub mod muon_prof;
+
 pub mod sr_bf16;
 pub mod csla_stat;
 pub mod grad_integrity;
@@ -256,7 +261,7 @@ pub mod onnx_rt_op;
 // The codegen always declares these as external imports, so the linker
 // needs them even if the program never calls interop functions.
 #[cfg(not(feature = "interop"))]
-mod interop_stubs;
+pub(crate) mod interop_stubs;
 
 pub mod sampling;
 pub mod rng_state;
