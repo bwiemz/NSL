@@ -27,7 +27,7 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -91,7 +91,7 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
