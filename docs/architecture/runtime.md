@@ -398,7 +398,8 @@ a warm start:
   fusion flags, matmul mode) refuses; `placement_diff` (`--transient-arena`,
   `--cuda-graphs`, `--checkpoint-blocks`, `--optim-state-offload`) warns;
 - the resolved train config (`src/train_config_record.rs`, installed by the
-  codegen through `nsl_set_train_config_record`): `MOMENT_KEYS` drift
+  codegen through `nsl_set_train_config_record`; the two key classes are
+  the record's schema in `nsl_abi::wire::train_config`): `MOMENT_KEYS` drift
   (optimizer, accum, betas, eps, wd, ...) aborts; `TRAJECTORY_KEYS` drift
   (lr, schedule, clip) refuses unless `NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1`.
 
@@ -484,7 +485,9 @@ remaining `inference` facade members.
 host uses against a shared library built by `nsl build --shared`:
 
 - `NslTensorDesc` (`#[repr(C)]`; data pointer, shape, dtype in the canonical
-  tag space, device) and `NslModel`;
+  tag space, device, tape id) — declared in `nsl_abi::wire::tensor_desc`
+  with its 48-byte layout constant-asserted, re-exported here — and
+  `NslModel`;
 - `nsl_model_create` / `nsl_model_create_with_lib` (dlopens the model's own
   `.so`, enumerates `nsl_get_num_exports` / `nsl_get_export_name`, and builds
   the read-only `ExportRegistry` in `src/c_api/exports.rs`),
