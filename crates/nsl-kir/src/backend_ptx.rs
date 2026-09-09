@@ -1740,6 +1740,48 @@ mod tests {
     }
 
     #[test]
+    fn sixteen_bit_and_f64_classes_are_declared_up_to_the_highest_register() {
+        // Roadmap A2 step 4 gate regression (fixed in the pre-allocator
+        // printer, kept as a property here): every register class a kernel
+        // uses is declared with a count above the highest index the body
+        // names. The step-4 kernel's first bf16 value had VarId 26 and the
+        // old printer wrote `.reg .b16 %h<2>`, so ptxas saw an unknown `%h26`.
+        let mut names = (0, 0);
+        let (ptx, al) = ptx_of(|b| {
+            let f = f32_const(b, 1.5);
+            for _ in 0..20 {
+                let t = b.new_typed_var(KirType::F32);
+                b.emit(KirOp::Add(t, f, f));
+            }
+            let h = b.new_typed_var(KirType::Bf16);
+            b.emit(KirOp::Cast(h, f, KirType::Bf16));
+            let d = b.new_typed_var(KirType::F64);
+            b.emit(KirOp::Cast(d, f, KirType::F64));
+            names = (h, d);
+        });
+        let (h, d) = (al.name(names.0), al.name(names.1));
+        assert!(ptx.contains(&format!("cvt.rn.bf16.f32 {h}, ")), "{ptx}");
+        assert!(ptx.contains(&format!("cvt.f64.f32 {d}, ")), "{ptx}");
+        for (decl, prefix) in [(".reg .b16 %h<", "%h"), (".reg .f64 %fd<", "%fd")] {
+            let at = ptx.find(decl).unwrap_or_else(|| panic!("no `{decl}` in\n{ptx}")) + decl.len();
+            let declared: u32 = ptx[at..].split('>').next().unwrap().parse().unwrap();
+            let body = &ptx[ptx.find("\n\n").unwrap()..];
+            let highest = body
+                .match_indices(prefix)
+                .filter_map(|(i, _)| {
+                    let digits: String = body[i + prefix.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    digits.parse::<u32>().ok()
+                })
+                .max()
+                .unwrap_or_else(|| panic!("no `{prefix}` register used in\n{ptx}"));
+            assert!(highest < declared, "`{prefix}{highest}` used but only {declared} declared:\n{ptx}");
+        }
+    }
+
+    #[test]
     fn a_kernel_without_bf16_keeps_version_7_0() {
         let (ptx, _) = ptx_of(|b| {
             let f = f32_const(b, 1.5);
