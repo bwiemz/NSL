@@ -1,8 +1,10 @@
-//! Workspace-level ABI gate: the codegen's declared runtime-function
-//! signatures — every `const RUNTIME_FUNCTIONS*` under `nsl-codegen/src`,
-//! spread over `builtins/` and `runtime_abi/` — must agree with the runtime's
-//! `extern "C"` implementations. These are linked by symbol name only, so
-//! nothing else in the build catches a drift; this test does.
+//! Workspace-level ABI gate: every row of the typed table
+//! (`nsl_abi::RUNTIME_ABI`, which the codegen renders its declarations from)
+//! must agree with the runtime's `extern "C"` implementations, parsed from
+//! source text. Since roadmap A3 step 1 the runtime's own build checks the
+//! same agreement through `rustc` (`nsl-runtime/src/abi_check.rs`); this
+//! gate is the belt-and-braces text check, and the one place that reports
+//! every disagreement at once rather than the first.
 
 use std::path::PathBuf;
 
@@ -21,23 +23,6 @@ fn runtime_function_signatures_agree_with_extern_impls() {
     let root = workspace_root();
     let report = nsl_abi::check_workspace(&root).expect("read workspace sources");
 
-    // A declaration that was RECOGNISED but not READ is a parser regression,
-    // and every failure path inside the table parser is silent — a missing
-    // `=`, an initializer that is not a slice literal, an unbalanced `[...]`
-    // all yield "no entries" rather than an error. This catches that exactly,
-    // which the count-based floor below can only approximate.
-    assert_eq!(
-        report.tables_found, report.tables_parsed,
-        "{} `const RUNTIME_FUNCTIONS*` declaration(s) were found but {} parsed — a table \
-         was recognised and then not read. That is a parser regression, not a registry change.",
-        report.tables_found, report.tables_parsed
-    );
-    assert!(
-        report.tables_parsed >= 1,
-        "no `const RUNTIME_FUNCTIONS*` table was found under crates/nsl-codegen/src at all — \
-         the registry moved out of the scanned tree, and this gate is checking nothing."
-    );
-
     // Guard against a silently-short parse making this test vacuously green.
     // `cross_check` visits every declared entry exactly once, so this total IS
     // the number of entries parsed.
@@ -52,10 +37,8 @@ fn runtime_function_signatures_agree_with_extern_impls() {
     // rate. The honest claim is only that the constant is named and dated, so
     // the drift is legible to whoever reads it next.
     //
-    // The real backstop is the `tables_found == tables_parsed` assertion
-    // above, which catches a truncated parse exactly and needs no constant.
-    // This floor stays as defence in depth against a failure that produces a
-    // short table without failing to parse one.
+    // The real backstop is now `nsl_abi::table::tests::table_is_the_recorded_size`,
+    // which pins the row count exactly. This floor stays as defence in depth.
     const RECORDED_TOTAL: usize = 682; // 2026-09-02
     let floor = RECORDED_TOTAL * 95 / 100;
     assert!(
@@ -77,9 +60,9 @@ fn runtime_function_signatures_agree_with_extern_impls() {
             msg.push_str(&format!("  [{:?}] {} — {}\n", m.kind, m.name, m.detail));
         }
         msg.push_str(
-            "\nFix by reconciling the RUNTIME_FUNCTIONS entry with the extern \"C\" fn (arity + \
-             types), or, if the runtime fn is macro-generated/behind a cfg the parser cannot see, \
-             extend nsl-abi to recognize it.\n",
+            "\nFix by reconciling the row in crates/nsl-abi/src/table.rs with the extern \"C\" fn \
+             (arity + types), or, if the runtime fn is macro-generated/behind a cfg the parser \
+             cannot see, extend nsl-abi to recognize it.\n",
         );
         panic!("{msg}");
     }
