@@ -750,15 +750,17 @@ crate is built for Miri the whole module interprets in about ten seconds
    validate them with `NslTensor::from_ptr[_ref]`; report failure with a
    documented sentinel, never a panic; if it can allocate device memory, set
    the OOM context (`cuda::inner::set_oom_context`).
-2. Declare it once in the codegen's ABI table for that subsystem —
-   `crates/nsl-codegen/src/runtime_abi/{tensor,training,optimizer,memory,
-   distributed,inference,interop,quantization,diagnostics}.rs`
-   (`RUNTIME_FUNCTIONS_ABI_*`), or `builtins/*.rs` if a program calls it
-   directly. The table must be reachable from `RUNTIME_TABLES` in
-   `crates/nsl-codegen/src/builtins/mod.rs`; `every_declared_table_is_reachable`
-   and `no_runtime_function_is_declared_twice` check that.
-3. Run `cargo test -p nsl-abi --test signature_agreement`: it parses both
-   sides and fails on any arity, type, or missing-symbol drift.
+2. Declare it once as a row of the typed ABI table,
+   `crates/nsl-abi/src/table.rs` — `[group] nsl_…(i64, …) -> i64 =
+   module::path::nsl_…;` in the group its subsystem belongs to (`[interop]`
+   after the path if it lives behind the `interop` feature). The codegen
+   renders the row into its declaration and this crate renders it into a
+   compile-time check (`src/abi_check.rs`): a row whose arity, slot types or
+   path disagree with the implementation fails `cargo build -p nsl-runtime`
+   naming the function.
+3. Run `cargo test -p nsl-abi --test signature_agreement`: it parses the
+   runtime's `extern "C"` items and cross-checks them against the table,
+   reporting every drift at once.
 4. If the function is part of the host-facing C API, add it to
    `src/c_api/mod.rs`, bind it in `python/nslpy/_core.py` (argtypes/restype),
    document it in `docs/abi/README.md`, and — if it is an `@export`-visible
