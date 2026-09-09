@@ -137,9 +137,9 @@ fn run_build_single(
         let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
         analyzer.analyze_module(&parse_result.module, &interner);
         if analyzer.diagnostics.is_empty() {
-            nsl_runtime::nsl_log!(INFO, "cli", "note: --nan-analysis: no NaN/Inf risks detected");
+            nsl_log::nsl_log!(INFO, "cli", "note: --nan-analysis: no NaN/Inf risks detected");
         } else {
-            nsl_runtime::nsl_log!(WARN, "cli", 
+            nsl_log::nsl_log!(WARN, "cli", 
                 "note: --nan-analysis: {} warning(s) detected",
                 analyzer.diagnostics.len()
             );
@@ -176,12 +176,12 @@ fn run_build_single(
                 if report_path == std::path::Path::new("-") {
                     print!("{}", report);
                 } else if let Err(e) = std::fs::write(report_path, &report) {
-                    nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write WRGA report: {e}");
+                    nsl_log::nsl_log!(ERROR, "cli", "error: could not write WRGA report: {e}");
                     process::exit(1);
                 }
             }
             None => {
-                nsl_runtime::nsl_log!(INFO, "nsl", 
+                nsl_log::nsl_log!(INFO, "nsl", 
                     "nsl: --wrga-report requested but no @train block with WRGA decorators was compiled"
                 );
             }
@@ -193,14 +193,14 @@ fn run_build_single(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_else(|| {
-            nsl_runtime::nsl_log!(ERROR, "cli", "error: invalid input filename '{}'", file.display());
+            nsl_log::nsl_log!(ERROR, "cli", "error: invalid input filename '{}'", file.display());
             process::exit(1);
         });
     let obj_path = file.with_file_name(format!("{stem}.o"));
 
     // Write object file
     if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write object file: {e}");
+        nsl_log::nsl_log!(ERROR, "cli", "error: could not write object file: {e}");
         process::exit(1);
     }
 
@@ -225,7 +225,7 @@ fn run_build_single(
             if !quiet { println!("Built {}", exe_path.display()); }
         }
         Err(e) => {
-            nsl_runtime::nsl_log!(ERROR, "cli", "link error: {e}");
+            nsl_log::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
     }
@@ -251,14 +251,14 @@ fn run_build_multi(
     let graph = match crate::loader::load_all_modules(file, &mut source_map, &mut interner) {
         Ok(g) => g,
         Err(e) => {
-            nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
+            nsl_log::nsl_log!(ERROR, "cli", "error: {e}");
             process::exit(1);
         }
     };
 
     let temp_dir = std::env::temp_dir().join(format!("nsl_build_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+        nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
         process::exit(1);
     }
 
@@ -274,9 +274,9 @@ fn run_build_multi(
         let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
         analyzer.analyze_module(&graph.modules[&graph.entry].ast, &interner);
         if analyzer.diagnostics.is_empty() {
-            nsl_runtime::nsl_log!(INFO, "cli", "note: --nan-analysis: no NaN/Inf risks detected");
+            nsl_log::nsl_log!(INFO, "cli", "note: --nan-analysis: no NaN/Inf risks detected");
         } else {
-            nsl_runtime::nsl_log!(WARN, "cli", 
+            nsl_log::nsl_log!(WARN, "cli", 
                 "note: --nan-analysis: {} warning(s) detected",
                 analyzer.diagnostics.len()
             );
@@ -424,7 +424,7 @@ fn run_build_multi(
                     || !mod_data.freeze_configs.is_empty()
                     || !mod_data.adapter_configs.is_empty();
                 if has_wrga_decorators {
-                    nsl_runtime::nsl_log!(ERROR, "nsl", 
+                    nsl_log::nsl_log!(ERROR, "nsl", 
                         "nsl: --wrga-report requires --source-ad when WRGA decorators are present; re-run with --source-ad"
                     );
                     process::exit(2);
@@ -624,7 +624,7 @@ fn run_build_multi(
         let obj_path = temp_dir.join(format!("{stem}_{}.o", obj_files.len()));
 
         if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-            nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write object file '{}': {e}", obj_path.display());
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not write object file '{}': {e}", obj_path.display());
             process::exit(1);
         }
 
@@ -641,12 +641,12 @@ fn run_build_multi(
                 if report_path == std::path::Path::new("-") {
                     print!("{}", report);
                 } else if let Err(e) = std::fs::write(report_path, &report) {
-                    nsl_runtime::nsl_log!(ERROR, "cli", "error: could not write WRGA report: {e}");
+                    nsl_log::nsl_log!(ERROR, "cli", "error: could not write WRGA report: {e}");
                     process::exit(1);
                 }
             }
             None => {
-                nsl_runtime::nsl_log!(INFO, "nsl", 
+                nsl_log::nsl_log!(INFO, "nsl", 
                     "nsl: --wrga-report requested but no @train block with WRGA decorators was compiled"
                 );
             }
@@ -687,7 +687,7 @@ fn run_build_multi(
             if !quiet { println!("Built {}", exe_path.display()); }
         }
         Err(e) => {
-            nsl_runtime::nsl_log!(ERROR, "cli", "link error: {e}");
+            nsl_log::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
     }

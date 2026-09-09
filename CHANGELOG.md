@@ -155,6 +155,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `argtypes`/`restype` pair per row plus `bind`), pinned by
   `cargo test -p nsl-abi`; `nslpy._core` binds every symbol from it
   instead of spelling the signatures out by hand.
+- `NslTensorDesc` and the train-config record's key classes are wire
+  declarations (roadmap A3, step 4 of the A3 design spec, first PR):
+  `nsl_abi::wire::tensor_desc::NslTensorDesc` is the `repr(C)` descriptor
+  every generated header, host and emitted wrapper addresses by byte
+  offset, with its 48-byte layout constant-asserted on the struct; the
+  compiler's descriptor stride and scratch-slot size are now its `sizeof`
+  rather than a literal kept in lockstep. `nsl_abi::wire::train_config::
+  {MOMENT_KEYS, TRAJECTORY_KEYS}` are the record's schema, read by the
+  codegen renderer and the runtime's resume checker alike. The runtime
+  re-exports both at their historical paths (`c_api::NslTensorDesc`,
+  `train_config_record::{MOMENT_KEYS, TRAJECTORY_KEYS}`); nothing on the
+  C ABI or in a checkpoint changes.
+- The logging front door is its own crate (roadmap A3, step 3 of the
+  A3 design spec): `crates/nsl-log` holds `nsl_log!`, the
+  `NslSubscriber` that renders every line to stderr byte-identically to
+  the `eprintln!` it replaced, and `ensure_installed`; it depends on
+  `tracing` alone. The runtime's `NSL_EVENTS` mirror stays in the runtime
+  as an `nsl_log::EventsMirror` hook (`nsl_runtime::log::EventsStreamMirror`)
+  that `nsl_runtime::log::ensure_installed` registers before the first
+  line and the subscriber consults at event time, so the install order
+  cannot lose it. `nsl_runtime::nsl_log!` is now a thin wrapper
+  (register the mirror, then `nsl_log::nsl_log!`); nsl-codegen's 371 and
+  nsl-cli's 274 diagnostic sites call `nsl_log::nsl_log!` directly, and the
+  `nsl` CLI installs the subscriber with the mirror registered first
+  thing in `main`. stderr, the `log` events on the stream and the marker
+  gates are unchanged; the compiler's diagnostics are no longer a reason
+  for it to depend on the runtime.
+- The train block has a `TrainPlan` carrier (roadmap A1; step 1 of the
+  design in `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`):
+  `stmt_train/plan.rs` holds the planning-time facts as plain data — the
+  resolved optimizer/scheduler contract and hyper-parameters, the FASE plan
+  and the admissions (`TrainSpec`), the parameter paths and state-buffer
+  count (`ParamPlan`), accumulation and checkpointing (`TrainSchedule`).
+  The driver builds it once after the optimizer-state phase, and the four
+  late emitters (`optimizer_step`, `scheduler_step`, `csla_window`,
+  `health_hooks`) plus the checkpoint-identity record take `&plan` in place
+  of the 39 copied fields their `Inputs` structs used to carry; nothing in
+  the plan is a Cranelift handle. The emitter bodies are unchanged (each
+  rebinds the facts under their old names), and the train-block CLIF
+  snapshots are unchanged.
 - Two more typed fatal exits (roadmap C1): `Fatal::CudaNotCompiled`
   (**16**) replaces the 51 `panic!("CUDA support not compiled")` sites in
   the `#[cfg(not(feature = "cuda"))]` arms of the GPU-capable tensor ops

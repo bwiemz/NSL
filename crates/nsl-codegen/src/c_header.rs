@@ -631,15 +631,23 @@ mod tests {
         assert!(header.contains("nsl_abi_version(void)"));
     }
 
-    /// The runtime's exported `nsl_abi_version()` — the number a host reads
-    /// at load time — packs the same declaration the header macros print.
+    /// The two macros the header prints pack to the same number the
+    /// runtime's exported `nsl_abi_version()` returns — the runtime pins its
+    /// side against `wire::version::packed()`
+    /// (`c_api::tests::nsl_abi_version_packs_major_minor`); this pins the
+    /// header's side against the same declaration, so the skew check a host
+    /// performs compares two renderings of one constant.
     #[test]
-    fn runtime_abi_version_packs_major_minor() {
-        let packed = nsl_runtime::c_api::nsl_abi_version();
-        let major = (packed >> 16) as u32;
-        let minor = (packed & 0xffff) as u32;
-        assert_eq!(major, nsl_abi::wire::version::NSL_ABI_VERSION_MAJOR);
-        assert_eq!(minor, nsl_abi::wire::version::NSL_ABI_VERSION_MINOR);
+    fn header_version_macros_pack_to_the_declared_version() {
+        let header = emit(&[], "mymod");
+        let define = |name: &str| -> i64 {
+            let line = header
+                .lines()
+                .find(|l| l.starts_with(&format!("#define {name} ")))
+                .unwrap_or_else(|| panic!("no `#define {name}` in header:\n{header}"));
+            line.rsplit(' ').next().unwrap().parse().unwrap()
+        };
+        let packed = (define("NSL_ABI_VERSION_MAJOR") << 16) | define("NSL_ABI_VERSION_MINOR");
         assert_eq!(packed, nsl_abi::wire::version::packed());
     }
 }

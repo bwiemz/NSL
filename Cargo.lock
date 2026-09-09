@@ -1315,6 +1315,7 @@ dependencies = [
  "nsl-env",
  "nsl-errors",
  "nsl-lexer",
+ "nsl-log",
  "nsl-parser",
  "nsl-runtime",
  "nsl-semantic",
@@ -1349,6 +1350,7 @@ dependencies = [
  "nsl-ast",
  "nsl-errors",
  "nsl-lexer",
+ "nsl-log",
  "nsl-parser",
  "nsl-runtime",
  "nsl-semantic",
@@ -1388,6 +1390,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsl-log"
+version = "0.10.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "nsl-parser"
 version = "0.10.0"
 dependencies = [
@@ -1415,6 +1424,7 @@ dependencies = [
  "memmap2",
  "nsl-abi",
  "nsl-env",
+ "nsl-log",
  "once_cell",
  "prost",
  "rand 0.10.2",
