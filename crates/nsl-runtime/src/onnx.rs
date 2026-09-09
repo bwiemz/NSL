@@ -425,13 +425,53 @@ mod tests {
 
     /// A custom block-packed dtype (>= 256) must refuse loudly rather than
     /// silently emit empty ONNX data.
+    ///
+    /// The refusal is a typed fatal exit, not a panic, so `#[should_panic]`
+    /// cannot observe it — `die` exits the process before libtest regains
+    /// control, which takes the whole binary down with it. So this re-execs
+    /// the test binary with `NSL_ONNX_REFUSAL_CHILD` set and asserts on
+    /// the child's exit status and stderr, the same shape
+    /// `tests/gpu_dtype_refusal.rs` uses for the abort-on-refusal gates. It
+    /// is stronger than the `should_panic` it replaces: the exit code is
+    /// part of the runtime's supervisor contract, and matching it alongside
+    /// the message means an unrelated earlier failure cannot pass the gate.
     #[test]
-    #[should_panic(expected = "no ONNX tensor")]
     fn tensor_raw_bytes_refuses_custom_dtype() {
-        unsafe {
-            let t = raw_tensor(vec![0u8; 4], 1, DTYPE_CUSTOM_START);
-            let _ = tensor_raw_bytes(&t);
+        const CHILD: &str = "NSL_ONNX_REFUSAL_CHILD";
+
+        // Child arm: reached only through the re-exec below.
+        if std::env::var_os(CHILD).is_some() {
+            unsafe {
+                let t = raw_tensor(vec![0u8; 4], 1, DTYPE_CUSTOM_START);
+                let _ = tensor_raw_bytes(&t);
+            }
+            unreachable!("tensor_raw_bytes returned for a block-packed dtype");
         }
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "onnx::tests::tensor_raw_bytes_refuses_custom_dtype",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("failed to re-exec the test binary");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(crate::fatal::NSL_EXIT_UNSUPPORTED),
+            "a block-packed dtype must exit with the `unsupported` code\n\
+             --- child stderr ---\n{stderr}"
+        );
+        assert!(
+            stderr.contains("no ONNX tensor"),
+            "the refusal must name the missing ONNX representation\n\
+             --- child stderr ---\n{stderr}"
+        );
     }
 
     /// Build a TraceGraph manually: input → Add(input, weight) → Relu → output.
