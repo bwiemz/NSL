@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Design spec for the roadmap A4 endgame,
+  `docs/superpowers/specs/2026-09-09-a4-cuda-context-design.md`: what the
+  CUDA singleton is today (`CudaState`'s four fields plus about 25 sibling
+  statics and thread-locals that hold device state), the per-device
+  `CudaContext` (module caches, a `StreamPool` with leased copy streams,
+  cuBLAS/cublasLt, the caching allocator, the free machinery, the
+  device-pointer caches and workspaces, graph-capture state) in a registry
+  keyed by the tensor `device` byte with a per-thread current device — no
+  new parameter on any ABI row — the compatibility shims that keep the
+  ~110 `ensure_context()` callers unchanged, which of the 30 thread-locals
+  fold into the context, the session object and the thread-affine cells
+  that stay, the two new `[cuda]` rows (`nsl_cuda_device_count`,
+  `nsl_cuda_set_device`), in-process SPMD, and seven gated steps.
 - Nightly frontend fuzzing (roadmap T1): `.github/workflows/fuzz-nightly.yml`
   runs the `lex` and `parse` cargo-fuzz targets from `fuzz/` every night
   (06:30 UTC; on `workflow_dispatch` with a per-target time budget; and
