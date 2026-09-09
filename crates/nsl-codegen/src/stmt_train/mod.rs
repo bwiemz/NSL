@@ -20,6 +20,11 @@
 //!   - [`contract`] — section 2: the resolved optimizer / scheduler /
 //!     callbacks contract, the `data:` section, the Muon perf-flag
 //!     refusals and the FASE plan, returned as a [`contract::TrainContract`].
+//!   - [`plan`] — the [`plan::TrainPlan`] carrier: the planning-time facts
+//!     of the block as plain data (spec, parameter facts, schedule), built by
+//!     the driver after section 4 and handed to the late emitters as `&plan`
+//!     in place of the copied fields their `Inputs` used to carry (roadmap
+//!     A1, TrainPlan design step 1).
 //!   - [`csla_window`] — the `--layerwise-accum` window: the save phase
 //!     (the `csla_active` arm of the adjoint-lowering site, fed by a
 //!     [`csla_window::CslaSaveInputs`], returning the window carriers as a
@@ -135,6 +140,7 @@ pub(crate) mod config;
 pub(crate) mod model_params;
 pub(crate) mod optimizer_state;
 pub(crate) mod contract;
+pub(crate) mod plan;
 pub(crate) mod csla_precompute;
 pub(crate) mod csla_window;
 pub(crate) mod driver;

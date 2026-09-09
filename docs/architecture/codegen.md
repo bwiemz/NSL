@@ -149,7 +149,14 @@ driver runs it:
    whether CSLA Stage 2 is active and refuses the non-validated combinations
    of `--layerwise-accum`, `--weight-stream`, `--zero-stage`.
 4. Parameter lists (`src/stmt_train/param_lists.rs`: `muon_route_flags`,
-   `decay_exempt_flags`, `alloc_grad_accum_buffers`).
+   `decay_exempt_flags`, `alloc_grad_accum_buffers`). After the optimizer
+   state is allocated the driver builds the block's `TrainPlan`
+   (`src/stmt_train/plan.rs`: the resolved contract and hyper-parameters,
+   the FASE plan and the admissions as `TrainSpec`, the parameter paths and
+   state-buffer count as `ParamPlan`, accumulation and checkpointing as
+   `TrainSchedule` — plain data, no Cranelift handle), which the
+   checkpoint-identity record and the late emitters below read as `&plan`
+   (roadmap A1, TrainPlan design step 1).
 5. Epoch/batch loops; forward extraction into a `WengertList` by
    `WengertExtractor` (`src/source_ad.rs`), then the initial primal
    `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named
