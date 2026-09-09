@@ -61,6 +61,27 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
                 )
                 .unwrap();
             }
+            // A 64-bit integer parameter lives in the 64-bit file, like a
+            // pointer. Without these arms it fell to the `_` catch-all below
+            // and was loaded with `ld.param.u32` into `%r{id}` — while every
+            // USE of the value, being typed `U64`, reads `%rd{id}`. The
+            // result was PTX naming a register nothing had defined.
+            KirType::U64 => {
+                writeln!(
+                    body,
+                    "    ld.param.u64 %rd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+            KirType::I64 => {
+                writeln!(
+                    body,
+                    "    ld.param.s64 %rd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
             _ => {
                 writeln!(
                     body,
@@ -743,7 +764,20 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             } else {
                 4 // default f32
             };
-            writeln!(ptx, "    cvt.u64.u32 %rd{}, %r{};", dst, offset).unwrap();
+            // The offset may already be 64-bit — a grid-stride induction
+            // variable is. Reading `%r{offset}` unconditionally named the
+            // 32-bit file for a value that lives in the 64-bit one, so the
+            // emitted `cvt.u64.u32` took its source from a register nothing
+            // had defined.
+            let offset_is_64 = matches!(
+                ir.var_types.get(offset),
+                Some(KirType::U64) | Some(KirType::I64) | Some(KirType::Ptr(_, _))
+            );
+            if offset_is_64 {
+                writeln!(ptx, "    mov.u64 %rd{}, %rd{};", dst, offset).unwrap();
+            } else {
+                writeln!(ptx, "    cvt.u64.u32 %rd{}, %r{};", dst, offset).unwrap();
+            }
             if pointee_size > 1 {
                 writeln!(
                     ptx,
@@ -1998,4 +2032,148 @@ mod tests {
         assert_eq!(text, "    mov.b32 %r0, %f0;\n    mov.u32 %r1, %tid.x; %edge_r %gid0\n");
         assert_eq!(extra[0], 2);
     }
+
+    /// Every register a kernel READS must be one the kernel DEFINES.
+    ///
+    /// This is the property both of the bugs below violated, and it is
+    /// checked structurally rather than by matching text: collect the
+    /// destination of every instruction that writes a register, then walk
+    /// the operands and assert each was written, was a `ld.param`
+    /// destination, or is one of the printer's own scratch names.
+    fn assert_no_undefined_registers(ptx: &str) {
+        use std::collections::HashSet;
+        let mut defined: HashSet<String> = HashSet::new();
+        // The printer's own scratch and the special registers.
+        for r in ["%gid0", "%gid1", "%edge_r", "%edge_rd", "%edge_f", "%edge_fd",
+                  "%edge_h", "%edge_p", "%edge_v"] {
+            defined.insert(r.to_string());
+        }
+        let mut used: Vec<(String, String)> = Vec::new();
+        for line in ptx.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('.') || line.ends_with(':') {
+                continue;
+            }
+            let regs: Vec<String> = line
+                .split(|c: char| !(c.is_alphanumeric() || c == '%' || c == '_'))
+                .filter(|t| t.starts_with('%') && !t.starts_with("%tid") && !t.starts_with("%ctaid")
+                            && !t.starts_with("%ntid") && !t.starts_with("%nctaid")
+                            && !t.starts_with("%laneid") && !t.starts_with("%warpid"))
+                .map(|t| t.to_string())
+                .collect();
+            if regs.is_empty() {
+                continue;
+            }
+            // `st.*` and `@%p bra` read their first register; everything else
+            // writes its first and reads the rest.
+            let writes_first = !line.starts_with("st.") && !line.starts_with('@')
+                && !line.starts_with("bra") && !line.starts_with("ret");
+            for (i, r) in regs.iter().enumerate() {
+                if writes_first && i == 0 {
+                    defined.insert(r.clone());
+                } else {
+                    used.push((r.clone(), line.to_string()));
+                }
+            }
+        }
+        for (r, line) in used {
+            assert!(
+                defined.contains(&r),
+                "PTX reads {r}, which nothing defines:\n    {line}\n--- full ---\n{ptx}"
+            );
+        }
+    }
+
+    /// A `u64` scalar parameter must load into the 64-bit register file.
+    /// It used to fall to the `_` catch-all and load with `ld.param.u32`
+    /// into `%r{id}`, while every use read `%rd{id}`.
+    #[test]
+    fn a_u64_parameter_loads_into_the_64_bit_file() {
+        let mut b = KirBuilder::new("u64_param");
+        let n = b.add_param("numel", KirType::U64, AddressSpace::Local);
+        let e = b.new_block();
+        b.set_block(e);
+        let p = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(p, n, n, CmpOp::Ge));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let _ = n;
+        assert!(
+            ptx.contains("ld.param.u64") && ptx.contains("[param_numel]"),
+            "a .u64 param must load with ld.param.u64; got:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("ld.param.u32 %r0, [param_numel];"),
+            "a .u64 param must not load with ld.param.u32; got:\n{ptx}"
+        );
+        assert_no_undefined_registers(&ptx);
+    }
+
+    /// `PtrOffset` with a 64-bit index must read the index from the 64-bit
+    /// file. It used to emit `cvt.u64.u32 %rdN, %rK` unconditionally, and
+    /// `%rK` did not exist when the index was a `u64` — which is exactly
+    /// what a grid-stride induction variable is.
+    #[test]
+    fn ptr_offset_accepts_a_64_bit_index() {
+        let mut b = KirBuilder::new("u64_index");
+        let base = b.add_param(
+            "src",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let e = b.new_block();
+        b.set_block(e);
+        let idx = b.new_typed_var(KirType::U64);
+        b.emit(KirOp::Const(idx, KirConst { ty: KirType::U64, value: ConstValue::U64(7) }));
+        let addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+        b.emit(KirOp::PtrOffset(addr, base, idx));
+        let v = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Load(v, addr, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let _ = (addr, idx);
+        // The register numbers below are the ALLOCATOR's, not VarIds, so the
+        // check is on the mnemonic: a 64-bit index is copied, never widened.
+        assert!(
+            !ptx.contains("cvt.u64.u32"),
+            "a 64-bit index must not be widened from the 32-bit file; got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("mul.lo.u64"),
+            "the offset must still be scaled by the element size; got:\n{ptx}"
+        );
+        assert_no_undefined_registers(&ptx);
+    }
+
+    /// A 32-bit index still widens, so the fix did not trade one file for
+    /// the other.
+    #[test]
+    fn ptr_offset_still_widens_a_32_bit_index() {
+        let mut b = KirBuilder::new("u32_index");
+        let base = b.add_param(
+            "src",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let e = b.new_block();
+        b.set_block(e);
+        let idx = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::GlobalId(idx, 0));
+        let addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+        b.emit(KirOp::PtrOffset(addr, base, idx));
+        let v = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Load(v, addr, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let _ = (addr, idx);
+        assert!(
+            ptx.contains("cvt.u64.u32"),
+            "a 32-bit index must still widen; got:\n{ptx}"
+        );
+        assert_no_undefined_registers(&ptx);
+    }
+
 }
