@@ -482,8 +482,9 @@ TIER_B_SEQ_LEN_FLOOR}` (re-exported by `src/pca_tier_b.rs`),
 `src/calibration/binary_codegen.rs`), `nsl_runtime::tensor::DTYPE_*`
 (compile-time asserts in `src/cpdt_precision_exec.rs`),
 `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR,
-nsl_abi_version}` (`src/c_header.rs`), `nsl_runtime::awq::AwqScales`
-(`src/stmt.rs`), `nsl_runtime::calibration_data::peek_batch_seq`
+nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::awq_scales::AwqScales`
+(`src/stmt_quant.rs`; the AWQ blob's one encoder and decoder, shared with
+the runtime's sidecar writer), `nsl_runtime::calibration_data::peek_batch_seq`
 (`src/lib.rs`, calibration), and `nsl_runtime::CudaDeviceIdentity` /
 `cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`). The rule these
 follow: a layout or plan constant the emitted code must agree with is
@@ -698,8 +699,9 @@ fixtures `tests/train_clif/*.nsl`.
 - **Calibration** — `src/calibration/` (compile-time AWQ / WGGO-gradient
   calibration: `discovery.rs`, `hooks.rs`, `awq_hook.rs`,
   `wggo_gradient_hook.rs`, `retention_pass.rs`, `binary_codegen.rs` emits a
-  `calibration_main()` binary, `subprocess.rs` runs it, `sidecar.rs` /
-  `awq_sidecar.rs` carry results back). Entry: `compile_and_calibrate`
+  `calibration_main()` binary, `subprocess.rs` runs it, `sidecar.rs`
+  carries results back; the AWQ activation-scales blob inside it is
+  `nsl_abi::wire::awq_scales`). Entry: `compile_and_calibrate`
   (`src/lib.rs`); tests `tests/calibration_*.rs`, `tests/awq_*.rs`.
 - **Weight-aware compilation** — `src/weight_aware.rs` (M52 constant folding
   from `--weights`), `src/ctor_fold.rs`, `src/lm_head_inference.rs`

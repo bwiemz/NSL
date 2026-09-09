@@ -114,14 +114,14 @@ impl Compiler<'_> {
         //     Hard error when sidecar present but projection missing:
         //     silent fallback to uncalibrated is a correctness trap.
         let is_awq = matches!(quant.default_dtype, Some(QuantDtype::Awq4));
-        let awq_scales_opt: Option<nsl_runtime::awq::AwqScales> = if is_awq {
+        let awq_scales_opt: Option<nsl_abi::wire::awq_scales::AwqScales> = if is_awq {
             match self.compile_options.calibration.sidecar.as_ref() {
                 None => None,
                 Some(sidecar) => {
-                    match sidecar.hooks.get("awq_activation_scales") {
+                    match sidecar.hooks.get(nsl_abi::wire::awq_scales::AWQ_SIDECAR_KEY) {
                         None => None, // Sidecar present but no AWQ hook blob → treat as uncalibrated.
                         Some(blob) => {
-                            match nsl_runtime::awq::AwqScales::from_blob(blob) {
+                            match nsl_abi::wire::awq_scales::AwqScales::from_blob(blob) {
                                 Ok(scales) => Some(scales),
                                 Err(e) => {
                                     // Blob present but malformed → hard error.
