@@ -107,11 +107,15 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     let r_count = std::cmp::max(*reg_counts.get("%r").unwrap_or(&0), total_vars);
     let rd_count = std::cmp::max(*reg_counts.get("%rd").unwrap_or(&0), total_vars);
     let f_count = std::cmp::max(*reg_counts.get("%f").unwrap_or(&0), total_vars);
-    let fd_count = *reg_counts.get("%fd").unwrap_or(&0);
-    let h_count = *reg_counts.get("%h").unwrap_or(&0);
     let p_count = total_vars; // predicates
-    // Packed fragments (`KirType::Vec`, one .b32 each): declared only when a
-    // kernel has any, sized like the other classes so every VarId fits.
+    // Registers are named by VarId, so a class that any variable uses must
+    // be declared up to `total_vars` (as `%r`/`%rd`/`%f` are) rather than
+    // the number of variables of that type: a lone bf16 value with VarId 26
+    // is `%h26`, which `.reg .b16 %h<1>` does not declare. The classes a
+    // kernel does not use are left undeclared so its text is unchanged.
+    let fd_count = if reg_counts.contains_key("%fd") { total_vars } else { 0 };
+    let h_count = if reg_counts.contains_key("%h") { total_vars } else { 0 };
+    // Packed fragments (`KirType::Vec`, one .b32 each): same rule.
     let v_count = if reg_counts.contains_key("%v") { total_vars } else { 0 };
 
     if r_count > 0 {
@@ -1786,6 +1790,32 @@ mod tests {
         ] {
             assert!(ptx.contains(expected), "missing `{expected}` in\n{ptx}");
         }
+    }
+
+    #[test]
+    fn sixteen_bit_and_f64_classes_are_declared_up_to_the_highest_var_id() {
+        // Roadmap A2 step 4 gate regression: the scalar-ISA kernel's first
+        // bf16 value had VarId 26 and the printer declared `.reg .b16 %h<2>`
+        // (two 16-bit variables), so ptxas saw an unknown `%h26`.
+        let ptx = ptx_of(|b| {
+            let f = f32_const(b, 1.5);
+            for _ in 0..20 {
+                let t = b.new_typed_var(KirType::F32);
+                b.emit(KirOp::Add(t, f, f));
+            }
+            let h = b.new_typed_var(KirType::Bf16);
+            b.emit(KirOp::Cast(h, f, KirType::Bf16));
+            let d = b.new_typed_var(KirType::F64);
+            b.emit(KirOp::Cast(d, f, KirType::F64));
+        });
+        assert!(ptx.contains("cvt.rn.bf16.f32 %h21, %f0;"), "{ptx}");
+        assert!(ptx.contains("cvt.f64.f32 %fd22, %f0;"), "{ptx}");
+        let declared = |class: &str| -> u32 {
+            let start = ptx.find(class).unwrap_or_else(|| panic!("no `{class}` in\n{ptx}")) + class.len();
+            ptx[start..].split('>').next().unwrap().parse().unwrap()
+        };
+        assert!(declared(".reg .b16 %h<") > 21, "{ptx}");
+        assert!(declared(".reg .f64 %fd<") > 22, "{ptx}");
     }
 
     #[test]
