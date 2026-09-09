@@ -535,7 +535,7 @@ impl PassScheduler {
 
     fn trace_line(args: std::fmt::Arguments<'_>) {
         if crate::pass_trace::enabled() {
-            nsl_runtime::nsl_log!(INFO, "pass-manager", "[pass-manager] {args}");
+            nsl_log::nsl_log!(INFO, "pass-manager", "[pass-manager] {args}");
         }
     }
 }
@@ -674,7 +674,7 @@ impl Drop for PassManager {
         // survivor's tail records will mis-attribute.
         let current = crate::pass_trace::current_epoch();
         if current != self.epoch {
-            nsl_runtime::nsl_log!(ERROR, "pass-manager", 
+            nsl_log::nsl_log!(ERROR, "pass-manager", 
                 "[pass-manager] BUG: non-LIFO epoch drop — dropping epoch \
                  {} while the thread is on epoch {current}; records after \
                  this point may be attributed to the wrong compile",

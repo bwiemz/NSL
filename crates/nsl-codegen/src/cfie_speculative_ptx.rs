@@ -1514,7 +1514,7 @@ mod tests {
         match crate::ptxas_validation::validate_ptx(&ptx) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                nsl_runtime::nsl_log!(INFO, "skip", "[skip] cfie spec-verify ptxas validation - no validator: {msg}");
+                nsl_log::nsl_log!(INFO, "skip", "[skip] cfie spec-verify ptxas validation - no validator: {msg}");
             }
             Err(msg) => panic!(
                 "cfie spec-verify PTX rejected for the 6-node tree config:\n{msg}\n\nEmitted PTX:\n{ptx}"
@@ -1528,7 +1528,7 @@ mod tests {
         match crate::ptxas_validation::validate_ptx(&ptx) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                nsl_runtime::nsl_log!(INFO, "skip", "[skip] cfie spec-reject ptxas validation - no validator: {msg}");
+                nsl_log::nsl_log!(INFO, "skip", "[skip] cfie spec-reject ptxas validation - no validator: {msg}");
             }
             Err(msg) => panic!(
                 "cfie spec-reject PTX rejected for the paper config:\n{msg}\n\nEmitted PTX:\n{ptx}"

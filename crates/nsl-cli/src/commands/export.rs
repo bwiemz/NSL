@@ -24,7 +24,7 @@ pub(crate) fn run_export(file: &PathBuf, output: Option<&std::path::Path>, forma
             "nsl" => "onnx".to_string(),
             "nslm" => "safetensors".to_string(),
             _ => {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: cannot determine export format from '{}'.\n\
                      Use --format onnx or --format safetensors, or provide an output path with --output.",
                     file.display()
@@ -37,7 +37,7 @@ pub(crate) fn run_export(file: &PathBuf, output: Option<&std::path::Path>, forma
     match mode.as_str() {
         "onnx" => {
             if ext != "nsl" {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: ONNX export requires an .nsl input file, got '{}'",
                     file.display()
                 );
@@ -50,7 +50,7 @@ pub(crate) fn run_export(file: &PathBuf, output: Option<&std::path::Path>, forma
         }
         "safetensors" => {
             if ext != "nslm" {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "error: safetensors conversion requires an .nslm input file, got '{}'",
                     file.display()
                 );
@@ -67,13 +67,13 @@ pub(crate) fn run_export(file: &PathBuf, output: Option<&std::path::Path>, forma
             match crate::commands::convert::convert_nslm_to_safetensors(file, out_path) {
                 Ok(()) => println!("Converted {} → {}", file.display(), out_path.display()),
                 Err(e) => {
-                    nsl_runtime::nsl_log!(ERROR, "cli", "error: {}", e);
+                    nsl_log::nsl_log!(ERROR, "cli", "error: {}", e);
                     process::exit(1);
                 }
             }
         }
         other => {
-            nsl_runtime::nsl_log!(ERROR, "cli", 
+            nsl_log::nsl_log!(ERROR, "cli", 
                 "error: unknown export format '{}'. Supported formats: onnx, safetensors",
                 other
             );

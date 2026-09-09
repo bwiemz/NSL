@@ -150,13 +150,13 @@ impl Compiler<'_> {
                     // Additive observability line (tests key off
                     // it); the [wggo] summary itself still prints
                     // below, identically to the in-place path.
-                    nsl_runtime::nsl_log!(INFO, "wggo", 
+                    nsl_log::nsl_log!(INFO, "wggo", 
                         "[wggo] consumed pre-solved plan \
                              (graph fingerprint match)"
                     );
                     Some(pre.plan.clone())
                 } else {
-                    nsl_runtime::nsl_log!(WARN, "wggo", 
+                    nsl_log::nsl_log!(WARN, "wggo", 
                         "[wggo] wggo-preplan-rejected \
                              reason=graph_fingerprint_mismatch — replanning in place"
                     );
@@ -230,7 +230,7 @@ impl Compiler<'_> {
                     // FullBuffer-global / muon): nothing stale
                     // executes — downstream consumers get the
                     // fresh plan. Note it loudly anyway.
-                    nsl_runtime::nsl_log!(INFO, "wggo", 
+                    nsl_log::nsl_log!(INFO, "wggo", 
                         "[wggo] note: the rejected pre-plan and the \
                              in-place replan disagree on fase_fused, but no \
                              per-param FASE mode table was emitted for this \
@@ -241,9 +241,9 @@ impl Compiler<'_> {
             }
             if let Some(plan) = plan {
                 if self.compile_options.wggo.report {
-                    nsl_runtime::nsl_log!(INFO, "codegen", "{}", plan.render_report());
+                    nsl_log::nsl_log!(INFO, "codegen", "{}", plan.render_report());
                 } else {
-                    nsl_runtime::nsl_log!(INFO, "wggo", "[wggo] {}", plan.summary());
+                    nsl_log::nsl_log!(INFO, "wggo", "[wggo] {}", plan.summary());
                 }
                 // Prune consumer (diagnostic stub): WGGO's DP can
                 // emit `CoarseDecision::Prune` for low-importance
@@ -273,7 +273,7 @@ impl Compiler<'_> {
                         }
                         other => std::borrow::Cow::Owned(format!("{:?}", other)),
                     };
-                    nsl_runtime::nsl_log!(INFO, "prune", 
+                    nsl_log::nsl_log!(INFO, "prune", 
                         "[prune] layer:{} name={} wggo-override-rejected \
                              requested={} applied={} reason={}",
                         diag.layer_index,
@@ -345,7 +345,7 @@ impl Compiler<'_> {
                         state,
                     ) {
                         match &diag.verdict {
-                            PackingVerdict::Consumed { kernel } => nsl_runtime::nsl_log!(INFO, "pca", 
+                            PackingVerdict::Consumed { kernel } => nsl_log::nsl_log!(INFO, "pca", 
                                 "[pca] layer:{} name={} wggo-override-consumed \
                                      packing_mode={} -> {}",
                                 diag.layer_index,
@@ -373,7 +373,7 @@ impl Compiler<'_> {
                                         "unexpected_packing_reject_reason"
                                     }
                                 };
-                                nsl_runtime::nsl_log!(INFO, "pca", 
+                                nsl_log::nsl_log!(INFO, "pca", 
                                     "[pca] layer:{} name={} wggo-override-rejected \
                                          requested={} applied={} reason={}",
                                     diag.layer_index,
