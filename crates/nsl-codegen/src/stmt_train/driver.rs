@@ -281,7 +281,7 @@ impl Compiler<'_> {
                 let sched = self.passes.scheduler();
                 sched
                     .schedule("CPDT", None, || {
-                        crate::stmt::invoke_cpdt_if_enabled(self, Some(&applied), Some(train))
+                        crate::stmt_pass_bridges::invoke_cpdt_if_enabled(self, Some(&applied), Some(train))
                     })
                     .map_err(CodegenError::new)?
                     .finish(&self.bus)
@@ -309,7 +309,7 @@ impl Compiler<'_> {
                 let sched = self.passes.scheduler();
                 sched
                     .schedule("CPDT", None, || {
-                        crate::stmt::invoke_cpdt_if_enabled(self, None, Some(train))
+                        crate::stmt_pass_bridges::invoke_cpdt_if_enabled(self, None, Some(train))
                     })
                     .map_err(CodegenError::new)?
                     .finish(&self.bus)

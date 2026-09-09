@@ -75,7 +75,7 @@ impl Compiler<'_> {
         let sched = self.passes.scheduler();
         let scheduled = sched
             .schedule("WRGA", Some(extractor.wengert_list()), || {
-                crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list())
+                crate::stmt_pass_bridges::invoke_wrga_if_enabled(self, extractor.wengert_list())
             })
             .map_err(CodegenError::new)?;
         let wrga_plan = scheduled.finish(&self.bus).map_err(CodegenError::new)?;
@@ -99,7 +99,7 @@ impl Compiler<'_> {
                 // no-invocation on every pre-plan-path compile.
                 sched
                     .schedule("CPDT", None, || {
-                        crate::stmt::invoke_cpdt_if_enabled(
+                        crate::stmt_pass_bridges::invoke_cpdt_if_enabled(
                             self,
                             Some(applied),
                             Some(train),
@@ -168,7 +168,7 @@ impl Compiler<'_> {
             // NSL_WGGO_FORCE_STALE_TABLE: force the divergence arm so
             // the refusal is gate-testable without engineering a real
             // fingerprint drift.
-            let forced_stale_plan = crate::stmt::cpdt_forced_stale_plan();
+            let forced_stale_plan = crate::stmt_pass_bridges::cpdt_forced_stale_plan();
             match (cpdt_moment_lists_consumed, &fresh_lists) {
                 (Some(consumed), fresh)
                     if fresh.as_ref() != Some(consumed) || forced_stale_plan =>
@@ -297,7 +297,7 @@ impl Compiler<'_> {
                     MPA::NotLoweredNoOptIn | MPA::Inactive => None,
                 }
             };
-            let forced_stale_plan = crate::stmt::cpdt_forced_stale_plan();
+            let forced_stale_plan = crate::stmt_pass_bridges::cpdt_forced_stale_plan();
             if fresh_weights_only.as_ref() != Some(consumed) || forced_stale_plan {
                 return Err(CodegenError::new(
                     "the optimizer moments were typed from the \

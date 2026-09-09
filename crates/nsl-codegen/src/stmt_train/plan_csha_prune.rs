@@ -1,7 +1,7 @@
 //! The CSHA planner schedule and the WGGO prune of the train block's
 //! source-AD arm, between the WGGO planning site and the WRGA driver:
 //! the CSHA planner run under `PassScheduler::schedule` (the body is
-//! `stmt.rs::invoke_csha_if_enabled`, which also publishes to the bus;
+//! `stmt_pass_bridges.rs::invoke_csha_if_enabled`, which also publishes to the bus;
 //! see the schedule's comment for why no tape digest is captured), the
 //! ELTLS free of the tape-held tensors and the tape-region flag clear,
 //! the `NSL_DEBUG_WENGERT` primal dump, and the spec §4 WGGO prune — the
@@ -86,7 +86,7 @@ impl Compiler<'_> {
         let sched = self.passes.scheduler();
         sched
             .schedule("CSHA", None, || {
-                crate::stmt::invoke_csha_if_enabled(
+                crate::stmt_pass_bridges::invoke_csha_if_enabled(
                     self,
                     extractor.wengert_list(),
                     model_type_name,

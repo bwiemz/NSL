@@ -29,9 +29,10 @@ facade map first, then this, then:
   `fusion_graph.rs` were deleted — `ARCHITECTURE.md` still names the first
   two in its `analysis` row, which is a doc bug, not a hidden module).
 
-Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~4.7k
+Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~4.0k
 (plus `src/stmt_train/driver.rs`, ~2.7k, `src/stmt_control.rs` and
-`src/stmt_assign.rs`, ~1.2k each, and `src/stmt_grad.rs`, ~0.4k),
+`src/stmt_assign.rs`, ~1.2k each, `src/stmt_pass_bridges.rs`, ~0.7k, and
+`src/stmt_grad.rs`, ~0.4k),
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
 `src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
 `tests/` and ~200 modules at the crate root.
@@ -105,7 +106,12 @@ is the shortest readable copy of the sequence.
   the ownership sweep reads live in `src/stmt_assign.rs`; the `grad` block
   drivers (the source-AD arm's compile-time backward and the tape-AD arm's
   runtime backward, which the train block's tape-AD path shares) live in
-  `src/stmt_grad.rs`. `stmt.rs` is the file that also owns the train block
+  `src/stmt_grad.rs`; the pass bridges the train-block driver calls into
+  (`invoke_wrga_if_enabled`, `invoke_cpdt_if_enabled`,
+  `invoke_csha_if_enabled` — each builds the pass input from the state
+  stashed on the `Compiler`, runs the pass, records its disposition and
+  publishes the product on the bus) live in `src/stmt_pass_bridges.rs`.
+  `stmt.rs` is the file that also owns the train block
   (below), the `serve`/`distill` lowering, and most feature-specific
   refusals. `FuncState`
   (`src/context.rs`) is the per-function state: variables, types, loop
