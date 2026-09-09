@@ -2233,7 +2233,7 @@ pub fn compile_and_calibrate(
     })?;
 
     // Step 1: peek at the calibration data to get (_count, seq).
-    let (_count, seq) = nsl_runtime::calibration_data::peek_batch_seq(data_path)
+    let (_count, seq) = crate::calibration::data_shape::peek_batch_seq(data_path)
         .map_err(|e| CodegenError::new(format!("reading calibration data header: {e}")))?;
 
     // Step 2: lex, parse, and semantically analyse.

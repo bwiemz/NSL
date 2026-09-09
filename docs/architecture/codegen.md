@@ -471,8 +471,9 @@ TIER_B_SEQ_LEN_FLOOR}` (re-exported by `src/pca_tier_b.rs`),
 `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR,
 nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::awq_scales::AwqScales`
 (`src/stmt_quant.rs`; the AWQ blob's one encoder and decoder, shared with
-the runtime's sidecar writer), `nsl_runtime::calibration_data::peek_batch_seq`
-(`src/lib.rs`, calibration), and `nsl_runtime::CudaDeviceIdentity` /
+the runtime's sidecar writer), `nsl_abi::wire::calibration_bin` (the `.bin`
+corpus header, read by `src/calibration/data_shape.rs` for the batch
+geometry at compile time and by the runtime's loader), and `nsl_runtime::CudaDeviceIdentity` /
 `cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`). The rule these
 follow: a layout or plan constant the emitted code must agree with is
 imported from the runtime, never retyped in codegen.

@@ -103,7 +103,7 @@ pub fn real_subprocess_entry(
 
     let forward_batch_seq = if needs_forward {
         Some(
-            nsl_runtime::calibration_data::peek_batch_seq(&cfg.calibration_data).map_err(|e| {
+            crate::calibration::data_shape::peek_batch_seq(&cfg.calibration_data).map_err(|e| {
                 HarnessError::Infrastructure {
                     reason: format!("peek_batch_seq: {e}"),
                 }
