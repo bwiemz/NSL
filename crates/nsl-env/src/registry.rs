@@ -960,15 +960,6 @@ pub static REGISTRY: &[EnvVar] = &[
         "Disables parameter escape analysis so every call argument is assumed to escape; fresh temporaries passed to calls strand (more memory)."
     ),
     var!(
-        "NSL_ONNX_REFUSAL_CHILD",
-        Bool,
-        "1 only",
-        "unset (parent re-execs the child)",
-        Test,
-        Test,
-        "Test harness only: marks the re-exec'd child that drives the ONNX block-packed-dtype refusal, so the parent can assert its exit code."
-    ),
-    var!(
         "NSL_OFFLOAD_PAGEABLE",
         Bool,
         "1 only",
@@ -985,6 +976,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Perf,
         Runtime,
         "Set to 1 to force the optimizer-state offload copy-back onto the synchronous path (disables the async DtoH overlap)."
+    ),
+    var!(
+        "NSL_ONNX_REFUSAL_CHILD",
+        Bool,
+        "1 only",
+        "unset (parent re-execs the child)",
+        Test,
+        Test,
+        "Test harness only: marks the re-exec'd child that drives the ONNX block-packed-dtype refusal, so the parent can assert its exit code."
     ),
     var!(
         "NSL_PARAM_PLAN_FAULT",
