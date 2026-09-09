@@ -946,7 +946,7 @@ impl Compiler<'_> {
             None => {
                 // Arena not yet declared (e.g., emit_retention_arena hasn't run
                 // or the data_id is missing).  Emit a warning and skip.
-                nsl_runtime::nsl_log!(WARN, "calibration", 
+                nsl_log::nsl_log!(WARN, "calibration", 
                     "[calibration] retention offset missing for '{}' — splice skipped",
                     hit.projection.0
                 );

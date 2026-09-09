@@ -327,7 +327,7 @@ impl Compiler<'_> {
                     }
                 }
             }
-            nsl_runtime::nsl_log!(INFO, "ccr", 
+            nsl_log::nsl_log!(INFO, "ccr", 
                 "[ccr] per-segment early-free: {} interior value(s) freed \
                  across {} segment(s) during the forward",
                 freed_count, segments_freed,

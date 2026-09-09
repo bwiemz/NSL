@@ -633,7 +633,7 @@ impl Compiler<'_> {
                             results.push(result);
                         }
                         Err(e) => {
-                            nsl_runtime::nsl_log!(ERROR, "codegen", "vmap transform error for '{}': {}", name, e);
+                            nsl_log::nsl_log!(ERROR, "codegen", "vmap transform error for '{}': {}", name, e);
                         }
                     }
                 }
@@ -673,7 +673,7 @@ impl Compiler<'_> {
                             .insert(original_name.to_string(), batched_name.clone());
                     }
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", "[nsl] vmap: failed to declare '{}': {}", batched_name, e);
+                        nsl_log::nsl_log!(ERROR, "nsl", "[nsl] vmap: failed to declare '{}': {}", batched_name, e);
                     }
                 }
             }
@@ -703,7 +703,7 @@ impl Compiler<'_> {
                 match self.compile_fn_def_named(&result.batched_fn, Some(batched_name)) {
                     Ok(()) => {}
                     Err(e) => {
-                        nsl_runtime::nsl_log!(ERROR, "nsl", 
+                        nsl_log::nsl_log!(ERROR, "nsl", 
                             "[nsl] vmap: failed to compile batched variant '{}': {}",
                             batched_name, e
                         );

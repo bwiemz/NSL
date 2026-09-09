@@ -401,7 +401,8 @@ a warm start:
   fusion flags, matmul mode) refuses; `placement_diff` (`--transient-arena`,
   `--cuda-graphs`, `--checkpoint-blocks`, `--optim-state-offload`) warns;
 - the resolved train config (`src/train_config_record.rs`, installed by the
-  codegen through `nsl_set_train_config_record`): `MOMENT_KEYS` drift
+  codegen through `nsl_set_train_config_record`; the two key classes are
+  the record's schema in `nsl_abi::wire::train_config`): `MOMENT_KEYS` drift
   (optimizer, accum, betas, eps, wd, ...) aborts; `TRAJECTORY_KEYS` drift
   (lr, schedule, clip) refuses unless `NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1`.
 
@@ -487,7 +488,9 @@ remaining `inference` facade members.
 host uses against a shared library built by `nsl build --shared`:
 
 - `NslTensorDesc` (`#[repr(C)]`; data pointer, shape, dtype in the canonical
-  tag space, device) and `NslModel`;
+  tag space, device, tape id) — declared in `nsl_abi::wire::tensor_desc`
+  with its 48-byte layout constant-asserted, re-exported here — and
+  `NslModel`;
 - `nsl_model_create` / `nsl_model_create_with_lib` (dlopens the model's own
   `.so`, enumerates `nsl_get_num_exports` / `nsl_get_export_name`, and builds
   the read-only `ExportRegistry` in `src/c_api/exports.rs`),
@@ -550,17 +553,27 @@ writer is the compiled program, one process per rank: the `nsl` CLI passes
 compile-time `nsl_log!` lines never land in the program's file with a
 second `seq` sequence.
 
-**Logging** (`src/log.rs`, roadmap C3). Diagnostic lines go through
+**Logging** (`src/log.rs`, roadmap C3; the front door itself is the
+`nsl-log` crate since roadmap A3). Diagnostic lines go through
 `nsl_log!(LEVEL, "target", "…")`, a `tracing` event whose target names the
-subsystem and whose message is the line. The crate's own subscriber
-(`NslSubscriber`, installed on the first line by `ensure_installed`) writes
-the message plus one newline to stderr and nothing else, so the marker
-lines the CLI gates compare byte for byte are unchanged from the
-`eprintln!` they replaced; when `NSL_EVENTS` is on, the same line is
-appended to the stream as a `log` event (`level`, `target`, `message`), the
-one kind whose `message` is its own marker (`LINE_IS_THE_MARKER` in
-`exec_markers.rs`). A host that installed a global `tracing` subscriber
-first keeps it and receives the runtime's lines as events. Every
+subsystem and whose message is the line. The macro, and the subscriber
+that renders it, live in `crates/nsl-log` (`tracing` only, so the compiler
+and the CLI log through it without depending on the runtime):
+`nsl_log::NslSubscriber`, installed on the first line by
+`nsl_log::ensure_installed`, writes the message plus one newline to stderr
+and nothing else, so the marker lines the CLI gates compare byte for byte
+are unchanged from the `eprintln!` they replaced. What the runtime adds is
+its `NSL_EVENTS` mirror: `log::EventsStreamMirror` implements
+`nsl_log::EventsMirror`, and the runtime's own `nsl_log!` wrapper
+(`log::ensure_installed`) registers it before the first line, after which
+the subscriber hands every line to it as a `log` event (`level`, `target`,
+`message`) whenever the stream is on — the one kind whose `message` is its
+own marker (`LINE_IS_THE_MARKER` in `exec_markers.rs`). The mirror is read
+at event time, not install time, so a compiler line logged before the
+runtime registered goes to stderr like any other and the mirror simply
+starts with the next line; the `nsl` CLI calls `log::ensure_installed`
+first thing in `main` anyway. A host that installed a global `tracing`
+subscriber first keeps it and receives the runtime's lines as events. Every
 diagnostic `eprintln!` in the crate is migrated: the bracketed-marker
 family (`[zero3]`, `[cuda-graph]`, `[weight-stream]`, `[arena]`, …), the
 `nsl: …` and `[nsl] …` families (target `nsl`; `ERROR` where the line
@@ -569,10 +582,9 @@ and the per-subsystem lines (`cfie`, `flash-attention` / `flash-bwd`,
 `fused-linear-ce`, `cuda`, `tensor`, `huggingface`, …; a line that starts
 with its own `[marker]` uses the marker as its target). Program output —
 the `print` builtin, the tensor printer, the health JSON — stays on
-`println!` because it is stdout, not a diagnostic. nsl-codegen is next.
-The stderr path allocates nothing — the
-message is formatted straight into the locked handle — so the
-`nsl: out of memory` line in `memory.rs` still prints. A
+`println!` because it is stdout, not a diagnostic. The stderr path
+allocates nothing — the message is formatted straight into the locked
+handle — so the `nsl: out of memory` line in `memory.rs` still prints. A
 new line in a migrated family uses the macro; a new family picks a target
 and a level (ERROR before an abort or a lost result, WARN for degraded-but-
 continuing, INFO for the rest) and keeps the text it would have printed.

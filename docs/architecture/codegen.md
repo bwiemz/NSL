@@ -149,7 +149,14 @@ driver runs it:
    whether CSLA Stage 2 is active and refuses the non-validated combinations
    of `--layerwise-accum`, `--weight-stream`, `--zero-stage`.
 4. Parameter lists (`src/stmt_train/param_lists.rs`: `muon_route_flags`,
-   `decay_exempt_flags`, `alloc_grad_accum_buffers`).
+   `decay_exempt_flags`, `alloc_grad_accum_buffers`). After the optimizer
+   state is allocated the driver builds the block's `TrainPlan`
+   (`src/stmt_train/plan.rs`: the resolved contract and hyper-parameters,
+   the FASE plan and the admissions as `TrainSpec`, the parameter paths and
+   state-buffer count as `ParamPlan`, accumulation and checkpointing as
+   `TrainSchedule` — plain data, no Cranelift handle), which the
+   checkpoint-identity record and the late emitters below read as `&plan`
+   (roadmap A1, TrainPlan design step 1).
 5. Epoch/batch loops; forward extraction into a `WengertList` by
    `WengertExtractor` (`src/source_ad.rs`), then the initial primal
    `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named
@@ -283,7 +290,8 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `emit_c_abi_dispatch_wrapper`); `src/c_export_table.rs` — the export table
   `nsl_model_create` reads; `src/c_header.rs` — `ExportInfo`, `lower_type_expr`,
   `emit(exports, module_name)`, stamping `NSL_ABI_VERSION_MAJOR/MINOR` from
-  `nsl_runtime::c_api`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
+  `nsl_abi::wire::version`; `src/c_wrapper.rs` steps through descriptor
+  arrays by `sizeof` of `nsl_abi::wire::tensor_desc::NslTensorDesc`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
   through `nsl_abi`), `crates/nsl-codegen/tests/c_header_compiles.rs` (real C compiler +
   `_Static_assert` on `NslTensorDesc`), `crates/nsl-codegen/tests/c_header_snapshot.rs`,
   `crates/nsl-codegen/tests/exported_symbols_are_dlsym_findable.rs`,
@@ -702,17 +710,18 @@ refusals that write no artifact), and the WGGO unit test
 pins the site that used to exit. Diagnostic *messages* on stderr are a
 different thing: they are the execution markers (below) and are fine.
 
-**Diagnostics go through `nsl_runtime::nsl_log!`** (roadmap C3; the front
-door and its byte-identical stderr subscriber are described in
-runtime.md, "Logging"). A compile-time warning, note or marker line is
-`nsl_runtime::nsl_log!(LEVEL, "target", "…")` rather than `eprintln!`: the
+**Diagnostics go through `nsl_log::nsl_log!`** (roadmap C3; the front
+door and its byte-identical stderr subscriber are the `nsl-log` crate,
+described in runtime.md, "Logging"). A compile-time warning, note or
+marker line is `nsl_log::nsl_log!(LEVEL, "target", "…")` rather than
+`eprintln!`: the
 `warning:` / `error:` / `note:` lines use target `codegen`, a line that
 starts with its own `[marker]` uses that marker (`autotune`, `ccr`,
 `source-ad`, `wggo`, `cpdt`, `arena`, `weight-stream`, …), and the levels
 follow the runtime's rule (`ERROR` for a lost result, `WARN` for a refusal
-or fallback, `INFO` for reports and traces). The macro reaches `tracing`
-through nsl-runtime's re-export, so nsl-codegen carries no dependency of
-its own. The multi-line report dumps that `eprint!` a pre-rendered string
+or fallback, `INFO` for reports and traces). `nsl-log` depends on
+`tracing` alone, so the diagnostics are no longer a reason for this crate
+to depend on the runtime (roadmap A3). The multi-line report dumps that `eprint!` a pre-rendered string
 (`plan.render_report()`, the linker's tool output) and the dev-tool
 binaries under `src/bin/` are the only raw prints left.
 

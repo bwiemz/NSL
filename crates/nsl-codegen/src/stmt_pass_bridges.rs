@@ -237,14 +237,14 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // wording overclaiming exactly that.
     if applied_plan.is_none() {
         if compiler.cpdt_mode == CpdtMode::Full && weights_present {
-            nsl_runtime::nsl_log!(WARN, "cpdt", 
+            nsl_log::nsl_log!(WARN, "cpdt", 
                 "[cpdt] planned without a WGGO plan for this block \
                  (weights-only): optimizer-moment precision derives from \
                  the weight map; the ZeRO/comm halves saw an empty cost \
                  model."
             );
         } else {
-            nsl_runtime::nsl_log!(WARN, "cpdt", 
+            nsl_log::nsl_log!(WARN, "cpdt", 
                 "[cpdt] planned without a WGGO plan for this block: the \
                  ZeRO/comm halves saw an empty cost model, and this \
                  configuration builds no per-param precision plan (mode \
@@ -278,13 +278,13 @@ pub(crate) fn invoke_cpdt_if_enabled(
         } else {
             100.0 * agree_params as f64 / total_params as f64
         };
-        nsl_runtime::nsl_log!(INFO, "cpdt", 
+        nsl_log::nsl_log!(INFO, "cpdt", 
             "[cpdt] weight-aware tier agreement: {:.2}% ({}/{} layers, \
                  parameter-weighted {:.2}%)",
             layer_pct, agree_layers, total_layers, param_pct,
         );
         if param_pct < 95.0 {
-            nsl_runtime::nsl_log!(WARN, "codegen", 
+            nsl_log::nsl_log!(WARN, "codegen", 
                 "warning: weight-aware tier agreement below 95% (parameter-weighted \
                      {:.2}%). This may indicate that the calibration constants do not fit \
                      this weight distribution well. Phase 2's spectral factor + sidecar \
@@ -295,7 +295,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
         }
 
         if let Ok(val) = std::env::var("CPDT_CALIB_K") {
-            nsl_runtime::nsl_log!(WARN, "codegen", 
+            nsl_log::nsl_log!(WARN, "codegen", 
                 "warning: CPDT_CALIB_K={val} is set but ignored. Weights are present, \
                      so the computed gradient_magnitude_est is authoritative. If CPDT_CALIB_K \
                      is vestigial in your shell, you can unset it to silence this warning."
@@ -602,9 +602,9 @@ pub(crate) fn invoke_csha_if_enabled(
             compiler.bus.wggo_overrides(),
         ) {
             if compiler.compile_options.csha.report {
-                nsl_runtime::nsl_log!(INFO, "codegen", "{}", plan.render_report());
+                nsl_log::nsl_log!(INFO, "codegen", "{}", plan.render_report());
             } else {
-                nsl_runtime::nsl_log!(INFO, "csha", "[csha] {}", plan.summary());
+                nsl_log::nsl_log!(INFO, "csha", "[csha] {}", plan.summary());
             }
             // Emit override-rejection diagnostics after the summary line
             // so CLI readers see summary first, per-layer details after.
@@ -618,7 +618,7 @@ pub(crate) fn invoke_csha_if_enabled(
                     }
                     other => format!("{:?}", other),
                 };
-                nsl_runtime::nsl_log!(INFO, "csha", 
+                nsl_log::nsl_log!(INFO, "csha", 
                     "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
                     diag.layer_index,
                     diag.requested,
@@ -651,7 +651,7 @@ pub(crate) fn invoke_csha_if_enabled(
                 extras.save_activations_for_backward = true;
             }
             compiler.bus.publish_csha_bridge(bridge_out);
-            for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
+            for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
             // A.2.1d: record the Wengert OpIds CSHA has
             // claimed across all boundary chains so
             // downstream passes (A.2.2 RMSNorm prologue,

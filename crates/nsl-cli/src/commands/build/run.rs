@@ -26,7 +26,7 @@ pub(crate) fn build_to_temp(
 ) -> TempBuild {
     let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+        nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
         process::exit(1);
     }
 
@@ -63,7 +63,7 @@ pub(crate) fn build_to_temp(
         && let Some(plan) = slot.lock().ok().and_then(|g| g.clone())
     {
         for diag in &plan.override_diagnostics {
-            nsl_runtime::nsl_log!(INFO, "cpdt", 
+            nsl_log::nsl_log!(INFO, "cpdt", 
                 "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
                 diag.requested, diag.applied, diag.reason
             );
@@ -119,7 +119,7 @@ pub(crate) fn execute_temp_build(
         cmd.env("NSL_GPU_MEM_REPORT", "1");
     }
     let status = cmd.status().unwrap_or_else(|e| {
-        nsl_runtime::nsl_log!(ERROR, "cli", "error: could not execute '{}': {e}", build.exe_path.display());
+        nsl_log::nsl_log!(ERROR, "cli", "error: could not execute '{}': {e}", build.exe_path.display());
         process::exit(1);
     });
 

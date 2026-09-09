@@ -226,7 +226,7 @@ impl Compiler<'_> {
                     // in-place plan is born at this site, after the
                     // moments were allocated. That residual gap is
                     // what this arm reports.
-                    nsl_runtime::nsl_log!(INFO, "cpdt", 
+                    nsl_log::nsl_log!(INFO, "cpdt", 
                         "[cpdt] optimizer-moment precision NOT fully \
                          lowered: WGGO's in-place plan (and its \
                          moment-bit decisions) arrived after the \
@@ -317,7 +317,7 @@ impl Compiler<'_> {
             // from a pre-plan offer, and claimed planning happened
             // on feature-off builds where the bridge no-ops).
             if !cfg!(feature = "experimental-cpdt") {
-                nsl_runtime::nsl_log!(INFO, "cpdt", 
+                nsl_log::nsl_log!(INFO, "cpdt", 
                     "[cpdt] requested, but this build omits the \
                      experimental-cpdt feature — no planning ran. \
                      No CPDT decisions apply to this block."
@@ -327,7 +327,7 @@ impl Compiler<'_> {
                 // in-place replan produced no plan, and the consult
                 // consumed nothing (e.g. the pre-plan's moment bits
                 // arbitrated to NotLoweredNoOptIn).
-                nsl_runtime::nsl_log!(INFO, "cpdt", 
+                nsl_log::nsl_log!(INFO, "cpdt", 
                     "[cpdt] optimizer-moment precision not active \
                      for this block (planned from the WGGO pre-plan \
                      offer; the fingerprint rejected it and the \
@@ -343,7 +343,7 @@ impl Compiler<'_> {
                 // < 2). The pre-#470 wording claimed CPDT
                 // "requires a WGGO plan", which stopped being true
                 // when the weights-only offer landed.
-                nsl_runtime::nsl_log!(INFO, "cpdt", 
+                nsl_log::nsl_log!(INFO, "cpdt", 
                     "[cpdt] optimizer-moment precision not active \
                      for this block (planned weights-only; no WGGO \
                      plan): arbitration lowered nothing. Check \
