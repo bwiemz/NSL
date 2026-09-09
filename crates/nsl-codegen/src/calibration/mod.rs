@@ -5,7 +5,6 @@ pub mod ast_evaluator;
 pub mod awq_hook;
 pub mod discovery;
 pub mod wggo_gradient_hook;
-pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
 pub mod ctx;

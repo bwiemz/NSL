@@ -143,6 +143,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The AWQ activation-scales blob has one definition (roadmap A3, step 4 of
+  the A3 design spec, second PR): `nsl_abi::wire::awq_scales` holds the
+  layout, `encode`, `AwqScales::from_blob` / `to_blob`, `AwqBlobError` and
+  `AWQ_SIDECAR_KEY`, replacing three hand-matched copies — the codegen's
+  `calibration/awq_sidecar.rs` (encoder + decoder, deleted), the
+  runtime's `AwqScales::from_blob`, and the inline encoder in the
+  runtime's `nsl_calib_write_sidecar`. The runtime re-exports `AwqScales`
+  at `nsl_runtime::awq`; its JSON + base64 sidecar reader is now the free
+  function `awq::awq_scales_from_sidecar_json_path`, and
+  `AwqScalesError` wraps the blob error as `Blob(AwqBlobError)`. Bytes on
+  disk are unchanged (the `awq_sidecar_baseline` snapshot pins them).
 - `NslTensorDesc` and the train-config record's key classes are wire
   declarations (roadmap A3, step 4 of the A3 design spec, first PR):
   `nsl_abi::wire::tensor_desc::NslTensorDesc` is the `repr(C)` descriptor
