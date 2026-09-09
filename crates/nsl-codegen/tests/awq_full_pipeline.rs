@@ -51,13 +51,12 @@ fn fixture(name: &str) -> PathBuf {
 
 /// Build a minimal AWQ Sidecar blob for a set of `(projection, scales)` pairs.
 fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> Sidecar {
-    use nsl_codegen::calibration::awq_sidecar;
 
     let mut map: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     for (name, scales) in projections {
         map.insert(name.to_string(), scales.clone());
     }
-    let blob = awq_sidecar::serialize(&map);
+    let blob = nsl_abi::wire::awq_scales::encode(map.iter().map(|(k, v)| (k.as_str(), v.as_slice())));
 
     let mut hooks = BTreeMap::new();
     hooks.insert("awq_activation_scales".to_string(), blob);
