@@ -784,7 +784,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
             return result;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
 
     let tensor = NslTensor::from_ptr(tensor_ptr);
@@ -1073,7 +1073,7 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            panic!("CUDA support not compiled");
+            crate::fatal::cuda_not_compiled();
         }
     } else {
         let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -1183,7 +1183,7 @@ pub extern "C" fn nsl_tensor_rotate_half_neg(tensor_ptr: i64) -> i64 {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            panic!("CUDA support not compiled");
+            crate::fatal::cuda_not_compiled();
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
