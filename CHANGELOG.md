@@ -134,6 +134,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The `quant`, `distill` and `@inspect` lowerings moved out of `stmt.rs`
+  whole (roadmap A1): `compile_quant_block` and `discover_awq_projections`
+  now live in `stmt_quant.rs`, `compile_distill_block` in
+  `stmt_distill.rs` and `emit_inspect_hook` in `stmt_inspect.rs`,
+  byte-for-byte; the `stmt.rs` glob helper they share is `pub(crate)`.
+  727 lines out of `stmt.rs` (~3.2k lines now); the train-block CLIF
+  snapshots are unchanged. The `cpkd_plan` bus consumer list names
+  `stmt_distill.rs`.
 - The pass bridges moved out of `stmt.rs` whole (roadmap A1):
   `invoke_wrga_if_enabled`, `invoke_cpdt_if_enabled`,
   `invoke_csha_if_enabled` and the `cpdt_forced_stale_plan` test knob now

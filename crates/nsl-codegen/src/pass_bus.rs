@@ -543,7 +543,7 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
         name: "cpkd_plan",
         producer: "CPKD",
         carries: "crate::cpkd::CpkdPlan",
-        consumers: &["crates/nsl-codegen/src/stmt.rs"],
+        consumers: &["crates/nsl-codegen/src/stmt_distill.rs"],
         empty_means: "no distill block compiled, so no distillation report is \
                       rendered",
         consumed_by_passes: &[],
