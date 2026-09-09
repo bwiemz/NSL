@@ -1027,7 +1027,7 @@ fn run_spectral(
         // returning an EMPTY rank plan — empty is strictly worse than the
         // pre-threading behavior (adapter totals report 0, fusion
         // rank_overrides vanish).
-        nsl_runtime::nsl_log!(WARN, "wrga", 
+        nsl_log::nsl_log!(WARN, "wrga", 
             "[wrga] weights present but no checkpoint key matches any adapter \
              placement name — falling back to roofline suggested ranks \
              (spectral allocation needs key-compatible names)"

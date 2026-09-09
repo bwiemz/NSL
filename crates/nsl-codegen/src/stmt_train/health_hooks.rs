@@ -178,7 +178,7 @@ impl Compiler<'_> {
                     )?;
                 }
             } else {
-                nsl_runtime::nsl_log!(INFO, "health", 
+                nsl_log::nsl_log!(INFO, "health", 
                     "[health] note: per-parameter gradient norms are not \
                      recorded under the FASE-Deferred hook (per-batch grads \
                      are consumed into m_partial during the backward) — the \
