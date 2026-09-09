@@ -259,6 +259,12 @@ Counts: 124 documents in 26 subsystems.
 |---|---|---|
 | 2026-09-08 | design spec | [`2026-09-08-a3-abi-extern-table-design.md`](specs/2026-09-08-a3-abi-extern-table-design.md) |
 
+## CUDA context — one value per device (roadmap A4)
+
+| Date | Kind | Document |
+|---|---|---|
+| 2026-09-09 | design spec | [`2026-09-09-a4-cuda-context-design.md`](specs/2026-09-09-a4-cuda-context-design.md) |
+
 ## Kernel IR v2 and the hand-PTX migration (roadmap A2)
 
 | Date | Kind | Document |
