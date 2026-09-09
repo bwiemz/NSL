@@ -105,7 +105,7 @@ impl Compiler<'_> {
         state.flags.in_tape_region = false;
         // Debug: dump primal Wengert ops
         if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
-            nsl_runtime::nsl_log!(INFO, "wengert", 
+            nsl_log::nsl_log!(INFO, "wengert", 
                 "[wengert] primal_vars: {:?}",
                 primal_vars.keys().collect::<Vec<_>>()
             );
@@ -116,7 +116,7 @@ impl Compiler<'_> {
                     .get(&op.result)
                     .cloned()
                     .unwrap_or_default();
-                nsl_runtime::nsl_log!(INFO, "wengert", 
+                nsl_log::nsl_log!(INFO, "wengert", 
                     "[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
                     op.result,
                     name,
@@ -164,7 +164,7 @@ impl Compiler<'_> {
                 // diagnostic contract.
                 for refusal in &wggo_prune_result.refusals {
                     let text = crate::wggo_prune::format_refusal(refusal);
-                    nsl_runtime::nsl_log!(INFO, "codegen", "{text}");
+                    nsl_log::nsl_log!(INFO, "codegen", "{text}");
                 }
                 return Err(crate::error::CodegenError::new(
                     "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
@@ -201,7 +201,7 @@ impl Compiler<'_> {
                     layer_index,
                     rewrite.ops_deleted,  // per-rewrite, not aggregate
                 );
-                nsl_runtime::nsl_log!(INFO, "codegen", "{line}");
+                nsl_log::nsl_log!(INFO, "codegen", "{line}");
             }
         }
         // --- END NEW ---

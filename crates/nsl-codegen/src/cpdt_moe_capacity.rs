@@ -67,10 +67,10 @@ pub fn apply_capacity_overrides(
 pub fn report_outcomes(outcomes: &[MoeCapacityOutcome]) {
     for o in outcomes {
         match o {
-            MoeCapacityOutcome::Overridden { layer, prev, new } => nsl_runtime::nsl_log!(INFO, "cpdt", 
+            MoeCapacityOutcome::Overridden { layer, prev, new } => nsl_log::nsl_log!(INFO, "cpdt", 
                 "[cpdt] moe '{layer}': capacity_factor override {prev} -> {new} (roofline §4.1)"
             ),
-            MoeCapacityOutcome::Unchanged { layer, value } => nsl_runtime::nsl_log!(INFO, "cpdt", 
+            MoeCapacityOutcome::Unchanged { layer, value } => nsl_log::nsl_log!(INFO, "cpdt", 
                 "[cpdt] moe '{layer}': capacity_factor {value} already matches roofline (§4.1, no-op)"
             ),
         }

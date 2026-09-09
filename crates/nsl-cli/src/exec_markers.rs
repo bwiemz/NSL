@@ -773,7 +773,8 @@ pub const LINE_IS_THE_MARKER: &str = "*";
 
 pub const EVENT_SCHEMAS: &[EventSchema] = &[
     EventSchema {
-        // One event per `nsl_log!` line (crates/nsl-runtime/src/log.rs):
+        // One event per `nsl_log!` line (crates/nsl-log, mirrored by
+        // crates/nsl-runtime/src/log.rs):
         // `message` is the stderr line byte for byte, `target` the
         // subsystem tag the emitter named, `level` ERROR / WARN / INFO.
         kind: "log",

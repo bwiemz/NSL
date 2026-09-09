@@ -12,7 +12,7 @@ pub(crate) fn run(file: &Path) {
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
-            nsl_runtime::nsl_log!(ERROR, "cli", "error: cannot read {}: {e}", file.display());
+            nsl_log::nsl_log!(ERROR, "cli", "error: cannot read {}: {e}", file.display());
             process::exit(1);
         }
     };
@@ -21,7 +21,7 @@ pub(crate) fn run(file: &Path) {
     if kernels.is_empty() {
         // Exit non-zero, so the message is framed as an error (not a warning)
         // to stay consistent with the exit code for scripting callers.
-        nsl_runtime::nsl_log!(ERROR, "cli", 
+        nsl_log::nsl_log!(ERROR, "cli", 
             "error: no `.entry` kernels found in {} — is this a PTX module?",
             file.display(),
         );
