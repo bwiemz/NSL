@@ -220,6 +220,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   KIR-generated PTX snapshots are byte-identical. The hand-PTX freeze
   manifest now lists `crates/nsl-kir/src/backend_ptx.rs` as the member
   by construction.
+- Two more typed fatal exits (roadmap C1): `Fatal::CudaNotCompiled`
+  (**16**) replaces the 51 `panic!("CUDA support not compiled")` sites in
+  the `#[cfg(not(feature = "cuda"))]` arms of the GPU-capable tensor ops
+  (one helper, `fatal::cuda_not_compiled`, one message) and the six
+  "compiled without the `cuda` feature" checks in the cast paths;
+  `Fatal::UnsupportedDtype` (**17**) replaces the 19 unsupported-dtype
+  panics in `tensor/precision_cast.rs` and the scalar readers of
+  `tensor/mod.rs`. All of them sit under `extern "C"` tensor ops, where a
+  panic cannot unwind; they now print, flush and exit with a code a
+  supervisor can attribute. Message text is unchanged.
 - The runtime C-ABI has one typed source (roadmap A3, step 1):
   `crates/nsl-abi/src/table.rs` holds every runtime function the codegen
   calls — 682 rows, `[group] name(params) -> ret = runtime::path;` — as the
