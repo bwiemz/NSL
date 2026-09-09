@@ -247,6 +247,14 @@ fn dtype_str_to_kir(dtype: &str) -> KirType {
     }
 }
 
+/// Is `name` one of the aggregate type constructors, spelled bare (no
+/// `<[shape], dtype>` arguments)? Those denote a buffer the kernel indexes,
+/// not a scalar. Kept beside [`dtype_str_to_kir`] so the two stay in step:
+/// a name here must never also be a dtype there.
+fn is_aggregate_type_name(name: &str) -> bool {
+    matches!(name, "Tensor" | "Param" | "Buffer" | "Sparse")
+}
+
 /// Build a type map from kernel parameter names to their KIR types.
 ///
 /// Tensor/Param/Buffer parameters become `Ptr(element_type, Global)`.
@@ -268,7 +276,20 @@ pub fn build_param_type_map(kernel: &KernelDef, interner: &Interner) -> HashMap<
                 }
                 TypeExprKind::Named(sym) => {
                     let name = interner.resolve(sym.0).unwrap_or("f32");
-                    dtype_str_to_kir(name)
+                    // `Tensor` / `Param` / `Buffer` / `Sparse` written WITHOUT
+                    // their `<[shape], dtype>` arguments parse as `Named`, not
+                    // as the variants above -- and it is the dominant idiom in
+                    // the examples (`kernel k(data: Tensor, ...)`). They are
+                    // aggregates, so they are pointers, with the same default
+                    // element type an un-annotated parameter gets;
+                    // `dtype_str_to_kir` would otherwise take its unknown-name
+                    // fallback and hand back a *scalar* f32, and a store into
+                    // the parameter would then be refused as "not a tensor".
+                    if is_aggregate_type_name(name) {
+                        KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
+                    } else {
+                        dtype_str_to_kir(name)
+                    }
                 }
                 _ => KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
             }
@@ -1771,6 +1792,61 @@ mod tests {
 
         let type_map = build_param_type_map(&kernel, &interner);
         assert_eq!(type_map["n"], KirType::I32);
+    }
+
+    /// `data: Tensor` — the aggregate written bare, which is what almost every
+    /// example uses — must be a pointer, not a scalar. It parses as `Named`,
+    /// so before `is_aggregate_type_name` it took `dtype_str_to_kir`'s
+    /// unknown-name fallback and came back `F32`; a store into it was then
+    /// refused with "which is not a tensor" and `e2e_m26_autotune` failed.
+    #[test]
+    fn test_param_type_map_bare_aggregate_names_are_pointers() {
+        for ty in ["Tensor", "Param", "Buffer", "Sparse"] {
+            let mut interner = make_interner();
+            let name_sym = nsl_ast::Symbol(interner.get_or_intern("bare_kernel"));
+            let p_data = nsl_ast::Symbol(interner.get_or_intern("data"));
+            let type_ann = make_named_type_ann(&mut interner, ty);
+
+            let kernel = KernelDef {
+                name: name_sym,
+                params: vec![Param {
+                    name: p_data,
+                    type_ann: Some(type_ann),
+                    default: None,
+                    is_variadic: false,
+                    span: dummy_span(),
+                }],
+                return_type: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    span: dummy_span(),
+                },
+                decorators: Vec::new(),
+                span: dummy_span(),
+            };
+
+            let type_map = build_param_type_map(&kernel, &interner);
+            assert_eq!(
+                type_map["data"],
+                KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+                "`data: {ty}` must be a pointer, not a scalar"
+            );
+        }
+    }
+
+    /// The guard above must not swallow real scalar dtypes: a name that IS a
+    /// dtype still maps to its scalar type.
+    #[test]
+    fn test_bare_aggregate_guard_leaves_scalar_dtypes_alone() {
+        for (name, want) in [
+            ("f32", KirType::F32),
+            ("f64", KirType::F64),
+            ("int", KirType::I32),
+            ("bool", KirType::Bool),
+        ] {
+            assert!(!is_aggregate_type_name(name), "{name} is not an aggregate");
+            assert_eq!(dtype_str_to_kir(name), want);
+        }
     }
 
     #[test]
