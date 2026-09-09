@@ -8,7 +8,9 @@
 //! label. The verifier holds the argument counts and types to the target's
 //! parameters (rule 7); only `ptxas` proves the text is an instruction
 //! stream. This gate builds the grid-stride copy every element-wise kernel
-//! is made of and pipes it through `ptxas --gpu-name sm_70`.
+//! is made of and pipes it through `ptxas --gpu-name sm_80` (the text says
+//! `.target sm_70`, which an `sm_80` assembly accepts; the CUDA 13 toolkit
+//! CI installs no longer takes `sm_70` as a `--gpu-name`).
 //!
 //! Skipped with a note when `ptxas` is not in PATH; CI's cuda-feature lane
 //! installs the toolkit and runs this file in its "PTX emitter ptxas
@@ -166,8 +168,8 @@ fn ptxas_accepts_the_kir_grid_stride_loop() {
     };
     let ir = grid_stride_scale();
     let ptx = lower_kir_to_ptx(&ir);
-    match assemble_ptx(&ptxas, &ptx, "sm_70") {
-        Ok(()) => println!("ptxas accepted the KIR grid-stride loop (sm_70)"),
+    match assemble_ptx(&ptxas, &ptx, "sm_80") {
+        Ok(()) => println!("ptxas accepted the KIR grid-stride loop (sm_80)"),
         Err(stderr) => panic!(
             "ptxas rejected the KIR grid-stride loop:\n{stderr}\n--- PTX ---\n{}",
             String::from_utf8_lossy(&ptx)
