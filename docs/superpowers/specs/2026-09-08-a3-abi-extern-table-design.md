@@ -252,6 +252,19 @@ CLIF snapshots.
 5. **Optional runtime dependency.** `cfg` the eight probe sites; CI's
    Ubuntu lane builds `nsl-codegen` with `--no-default-features` (no
    runtime) as well as the default, and the `cuda` job as today.
+   *As landed:* by the time steps 3–4 were done the eight sites were
+   three (`cuda_device_name`, `cuda_device_identity`,
+   `CUDA_SUPPORT_COMPILED`; the FlashAttention autotune calls and the
+   Tier-B constant had already gone through `nsl-abi` or the codegen's own
+   modules). The runtime became `optional = true`, enabled by `cuda`
+   (`test-hooks` and `csha_cycle19_probe` forward with `?`), a
+   dev-dependency for the tests, and the three sites `cfg(feature =
+   "cuda")` with the runtime's own non-cuda answers (`None`, `false`).
+   The *default* build is the no-runtime build — there is no separate
+   `--no-default-features` lane — and CI checks `cargo check -p
+   nsl-codegen` alone plus a `cargo tree` gate that `nsl-runtime` is absent.
+   Measured: `cargo tree -e normal -p nsl-codegen | sort -u | wc -l`
+   248 → 116.
 6. **Delete the text parser** (`parse_runtime_functions_table*`,
    `parse_externs_in_file`, `cross_check`) once nothing reads it; `nsl-abi`
    is then the table, the wire constants and the two generators.

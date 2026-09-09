@@ -581,9 +581,14 @@ pub fn default_gpu() -> &'static GpuSpec {
 pub fn local_device_identity() -> Option<&'static nsl_abi::wire::device_identity::CudaDeviceIdentity> {
     static IDENTITY: std::sync::OnceLock<Option<nsl_abi::wire::device_identity::CudaDeviceIdentity>> =
         std::sync::OnceLock::new();
-    IDENTITY
-        .get_or_init(nsl_runtime::cuda_device_identity)
-        .as_ref()
+    #[cfg(feature = "cuda")]
+    let probe = nsl_runtime::cuda_device_identity;
+    // Without `cuda` the runtime is not linked into the compiler and there
+    // is no device to probe (roadmap A3, step 5) — the same `None` the
+    // runtime's non-cuda stub returned.
+    #[cfg(not(feature = "cuda"))]
+    let probe = || None;
+    IDENTITY.get_or_init(probe).as_ref()
 }
 
 /// The GPU-database entry for the local device, matched EXACTLY on the

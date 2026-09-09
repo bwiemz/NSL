@@ -478,7 +478,12 @@ geometry at compile time and by the runtime's loader), and `nsl_runtime::cuda_de
 record they return is `nsl_abi::wire::device_identity::CudaDeviceIdentity`,
 the autotune cache key's schema). The rule these
 follow: a layout or plan constant the emitted code must agree with is
-imported from the runtime, never retyped in codegen.
+declared once in `nsl-abi` and read by both crates, never retyped in
+codegen. Since roadmap A3 step 5 the runtime is an *optional* dependency of
+this crate, enabled by the `cuda` feature for the two compile-time device
+probes; a default (CPU-only) compiler build has no runtime in its
+dependency tree at all (CI's `nsl-codegen standalone` step checks the
+tree), and the integration tests link it as a dev-dependency.
 
 ## GPU codegen
 

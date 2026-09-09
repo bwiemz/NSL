@@ -143,6 +143,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The compiler no longer depends on the runtime (roadmap A3, step 5 of the
+  A3 design spec): `nsl-runtime` is an *optional* dependency of
+  `nsl-codegen`, enabled by the `cuda` feature for the two compile-time
+  device probes (`cuda_device_identity`, `cuda_device_name`; `CUDA_SUPPORT_
+  COMPILED` becomes `cfg!(feature = "cuda")`), and a dev-dependency for the
+  integration tests. A default (CPU-only) compiler build has no runtime in
+  its dependency tree: `cargo tree -e normal -p nsl-codegen` goes from 248
+  crates to 116, and CI's new `nsl-codegen standalone` step checks the
+  build and the tree. Declarations come from `nsl-abi`'s table,
+  diagnostics from `nsl-log`, and the shared record formats from
+  `nsl_abi::wire`; nothing the compiler emits changes.
 - The calibration corpus's `.bin` header is a wire declaration and the
   compiler reads corpus geometry without the runtime (roadmap A3, step 4
   of the A3 design spec, third PR): `nsl_abi::wire::calibration_bin`
