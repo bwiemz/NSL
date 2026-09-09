@@ -340,7 +340,7 @@ pub(crate) fn dtype_element_size(dtype: u16) -> usize {
         id if id >= DTYPE_CUSTOM_START => {
             get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
         }
-        _ => panic!("unknown dtype {}", dtype),
+        _ => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("unknown dtype {}", dtype)),
     }
 }
 
@@ -692,10 +692,10 @@ impl NslTensor {
                     out.push(unsafe { *p.add(i) as f64 });
                 }
             }
-            _ => panic!(
+            _ => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!(
                 "as_f64_owned() unsupported for dtype {} (len={})",
                 self.dtype, self.len
-            ),
+            )),
         }
         out
     }
@@ -726,7 +726,7 @@ impl NslTensor {
             }
             1 => unsafe { *self.data_f32().add(offset) as f64 },
             0 => unsafe { *self.data_f64().add(offset) },
-            _ => panic!("read_scalar_as_f64() unsupported for dtype {}", self.dtype),
+            _ => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("read_scalar_as_f64() unsupported for dtype {}", self.dtype)),
         }
     }
 
@@ -777,7 +777,7 @@ impl NslTensor {
             }
             1 => unsafe { *self.data_f32().add(offset) = value as f32 },
             0 => unsafe { *self.data_f64().add(offset) = value },
-            _ => panic!("write_scalar_from_f64() unsupported for dtype {}", self.dtype),
+            _ => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("write_scalar_from_f64() unsupported for dtype {}", self.dtype)),
         }
     }
 
@@ -791,7 +791,7 @@ impl NslTensor {
             DTYPE_I32 => unsafe { *(self.data as *const i32).add(i) as i64 },
             1 => unsafe { *(self.data as *const f32).add(i) as i64 },
             0 => unsafe { *(self.data as *const f64).add(i) as i64 },
-            _ => panic!("read_index() unsupported for dtype {}", self.dtype),
+            _ => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("read_index() unsupported for dtype {}", self.dtype)),
         }
     }
 
@@ -1224,7 +1224,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
             }
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
     tensor.read_scalar_as_f64(0)
 }
@@ -2341,7 +2341,7 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
     #[cfg(not(feature = "cuda"))]
     {
         let _ = shape_list;
-        panic!("CUDA support not compiled. Rebuild with --features cuda");
+        crate::fatal::cuda_not_compiled();
     }
 }
 
@@ -2396,7 +2396,7 @@ pub extern "C" fn nsl_tensor_zeros_f16_on(shape_list: i64, device: i64) -> i64 {
     #[cfg(not(feature = "cuda"))]
     {
         let _ = shape_list;
-        panic!("CUDA support not compiled. Rebuild with --features cuda");
+        crate::fatal::cuda_not_compiled();
     }
 }
 
@@ -2462,7 +2462,7 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        panic!("CUDA support not compiled. Rebuild with --features cuda");
+        crate::fatal::cuda_not_compiled();
     }
 }
 
@@ -2821,7 +2821,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
             return out_ptr;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
 
     let vocab_size = unsafe { *weight.shape.add(0) } as usize;
@@ -2974,7 +2974,7 @@ pub extern "C" fn nsl_tensor_layernorm(
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
 
@@ -3154,7 +3154,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
 
@@ -3512,7 +3512,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
                 return result_ptr;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
 
@@ -3637,7 +3637,7 @@ pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
             }
             #[cfg(not(feature = "cuda"))]
             {
-                panic!("CUDA support not compiled");
+                crate::fatal::cuda_not_compiled();
             }
         }
     }
@@ -3757,7 +3757,7 @@ pub extern "C" fn nsl_tensor_conv2d(
             return result;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
 
     let weight = NslTensor::from_ptr(weight_ptr);
@@ -3904,7 +3904,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
             return result;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
 
     let n = unsafe { *input.shape.add(0) } as usize;
@@ -4020,7 +4020,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
             return out_ptr;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
 
     let rows = unsafe { *tensor.shape.add(0) } as usize;
@@ -4133,7 +4133,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         }
         #[cfg(not(feature = "cuda"))]
         {
-            panic!("CUDA support not compiled");
+            crate::fatal::cuda_not_compiled();
         }
     }
 
@@ -4253,7 +4253,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
 
     if t.device > 0 && target == 0 {
@@ -4315,7 +4315,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        { crate::fatal::cuda_not_compiled(); }
     }
 
     panic!("GPU-to-GPU transfer not yet supported");
