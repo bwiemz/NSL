@@ -134,6 +134,122 @@ pub mod pca_tier_b {
     pub const TIER_B_MAX_BAKED_SEQ_LEN: u32 = 16384;
 }
 
+/// The C-API tensor descriptor (`NslTensorDesc` in every generated header):
+/// the one `repr(C)` struct a host, the runtime and the compiler's emitted
+/// wrappers all address by byte offset.
+///
+/// Declared here (roadmap A3, "data layouts and records") so the compiler
+/// takes its size from the struct rather than from a literal it had to keep
+/// in lockstep, and so the runtime's `c_api::NslTensorDesc` is this type
+/// re-exported. Layout, 48 bytes, 8-byte aligned — pinned by the constant
+/// assertions below and, from the C side, by
+/// `crates/nsl-codegen/tests/c_header_compiles.rs`:
+///
+/// ```text
+/// offset  0: data         (*mut c_void, 8)
+/// offset  8: shape        (*mut i64,    8)
+/// offset 16: strides      (*mut i64,    8)   NULL = contiguous
+/// offset 24: ndim         (i32,         4)
+/// offset 28: dtype        (i32,         4)   canonical tag space (`dtype`)
+/// offset 32: device_type  (i32,         4)   0 = CPU, 1 = CUDA
+/// offset 36: device_id    (i32,         4)   GPU index (0 for CPU)
+/// offset 40: tape_id      (i64,         8)   autodiff identity (0 = untracked)
+/// ```
+///
+/// Any change to this layout is a **major** ABI version bump
+/// ([`version`]).
+pub mod tensor_desc {
+    use core::ffi::c_void;
+
+    /// Tensor descriptor matching the C header. The C API speaks the
+    /// canonical runtime dtype tag space verbatim (`super::dtype`): the
+    /// historical inverted 0=f32/1=f64 convention was removed in the P4
+    /// item-16 dtype/ABI migration.
+    ///
+    /// `tape_id` carries the source tensor's autodiff tape id verbatim so
+    /// that a desc round-trip (`nsl_tensor_to_desc` → `desc_to_nsl_tensor`)
+    /// does not strip the id. Required for the per-call grad context
+    /// (Spec B): the loss seed in `run_backward_core` keys on `t.tape_id`,
+    /// which would fall through to the raw-pointer fallback if the desc
+    /// dropped the id. `tape_id == 0` means the source tensor was never
+    /// autodiff-tracked (constants, freshly-allocated wrappers, inputs from
+    /// non-grad code paths); `tape_id > 0` matches the source tensor's
+    /// `tape_id` as assigned by `Tape::get_or_assign_id`.
+    ///
+    /// `#[derive(Default)]` is kept for the runtime's scratch-desc
+    /// allocation sites; a struct-literal site must name `tape_id`.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct NslTensorDesc {
+        /// Element buffer.
+        pub data: *mut c_void,
+        /// `ndim` dimension sizes.
+        pub shape: *mut i64,
+        /// `ndim` element strides, or NULL for contiguous row-major.
+        pub strides: *mut i64,
+        /// Rank.
+        pub ndim: i32,
+        /// Canonical NSL dtype tag: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8,
+        /// 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32.
+        pub dtype: i32,
+        /// 0=CPU, 1=CUDA
+        pub device_type: i32,
+        /// GPU index (0 for CPU)
+        pub device_id: i32,
+        /// Autodiff tape id of the source tensor, copied verbatim across
+        /// desc round-trips. `0` means "untracked".
+        pub tape_id: i64,
+    }
+
+    /// `sizeof(NslTensorDesc)`: what emitted code multiplies an index by to
+    /// step through a descriptor array, and the size of the stack slot it
+    /// builds a scratch descriptor in.
+    pub const SIZE: usize = core::mem::size_of::<NslTensorDesc>();
+
+    // The layout the header documents, checked on the struct itself so a
+    // field reorder or a type change cannot compile.
+    const _: () = {
+        assert!(SIZE == 48);
+        assert!(core::mem::align_of::<NslTensorDesc>() == 8);
+        assert!(core::mem::offset_of!(NslTensorDesc, data) == 0);
+        assert!(core::mem::offset_of!(NslTensorDesc, shape) == 8);
+        assert!(core::mem::offset_of!(NslTensorDesc, strides) == 16);
+        assert!(core::mem::offset_of!(NslTensorDesc, ndim) == 24);
+        assert!(core::mem::offset_of!(NslTensorDesc, dtype) == 28);
+        assert!(core::mem::offset_of!(NslTensorDesc, device_type) == 32);
+        assert!(core::mem::offset_of!(NslTensorDesc, device_id) == 36);
+        assert!(core::mem::offset_of!(NslTensorDesc, tape_id) == 40);
+    };
+}
+
+/// The resolved train-configuration record (`nsl_set_train_config_record`):
+/// codegen renders one fixed-order `k=v,k=v` string from the resolved
+/// config at train-block entry, the `.optim` sidecar carries it verbatim,
+/// and resume diffs saved-vs-live per key. The two key classes below are
+/// the record's *schema* — which keys exist and how their drift is
+/// judged — so both the renderer (codegen) and the checker (the runtime's
+/// `train_config_record`) read them from here.
+pub mod train_config {
+    /// Keys whose drift changes the meaning of restored optimizer state or
+    /// the restored step counter (`accum` is the optimizer-step divisor and
+    /// the bias-correction clock). A resume under different values is not
+    /// a continuation: the runtime aborts, no escape. Explicit list, not
+    /// the negation of the other — a key in neither class is deliberately
+    /// silent (the #519 doctrine).
+    pub const MOMENT_KEYS: &[&str] = &[
+        "opt", "accum", "beta1", "beta2", "eps", "wd", "momentum", "dampening",
+        "nesterov", "ns_steps", "adamw_lr", "no_decay",
+    ];
+
+    /// Keys whose drift changes the future trajectory only; the runtime
+    /// aborts by default and `NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1` turns
+    /// the refusal into a loud acknowledgment. `sp4..sp6` are reserved
+    /// ahead of any 4+-parameter scheduler: a parameter rendered under a
+    /// key in neither class would be silently unguarded.
+    pub const TRAJECTORY_KEYS: &[&str] =
+        &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"];
+}
+
 /// The local CUDA device's driver-reported identity — the cache-key record
 /// for `@autotune` (roadmap item 10) and the device the CSHA planner names
 /// in its spec lookup.
@@ -161,7 +277,6 @@ pub mod device_identity {
         pub driver_version: u32,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +296,15 @@ mod tests {
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
         assert_eq!(DTYPE_CUSTOM_START, 256);
+    }
+
+    /// The two record classes are disjoint, so a key's drift has one
+    /// verdict.
+    #[test]
+    fn train_config_key_classes_are_disjoint() {
+        for k in train_config::MOMENT_KEYS {
+            assert!(!train_config::TRAJECTORY_KEYS.contains(k), "{k} in both classes");
+        }
     }
 
     #[test]

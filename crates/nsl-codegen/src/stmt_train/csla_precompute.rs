@@ -231,7 +231,7 @@ impl Compiler<'_> {
                 // anchor for the LAYER-MAJOR shape itself (the runtime
                 // window counter can't distinguish a degenerate
                 // all-epilogue schedule from the real k-range one).
-                nsl_runtime::nsl_log!(INFO, "csla", 
+                nsl_log::nsl_log!(INFO, "csla", 
                     "[csla] layer-major schedule: {} ranges, {} layer-grouped params, \
                      {} epilogue params",
                     n_ranges,
@@ -270,7 +270,7 @@ impl Compiler<'_> {
                             .map(|cp| cp.accum_idx)
                             .collect();
                     if !unstreamable_idxs.is_empty() {
-                        nsl_runtime::nsl_log!(INFO, "weight-stream", 
+                        nsl_log::nsl_log!(INFO, "weight-stream", 
                             "[weight-stream] {} param(s) stay resident: a buffered \
                              view of their storage rides the window slots",
                             unstreamable_idxs.len()
@@ -367,7 +367,7 @@ impl Compiler<'_> {
                             .collect::<Vec<_>>()
                             .join(",")
                     };
-                    nsl_runtime::nsl_log!(INFO, "weight-stream", 
+                    nsl_log::nsl_log!(INFO, "weight-stream", 
                         "[weight-stream] forward streaming: {} slices, \
                          {} streamed params ({} touched by the primal); \
                          uploads/slice [{}] evicts/slice [{}]",
@@ -404,7 +404,7 @@ impl Compiler<'_> {
                         }
                     }
                     if self.compile_options.weight_stream.arena {
-                        nsl_runtime::nsl_log!(INFO, "weight-stream", 
+                        nsl_log::nsl_log!(INFO, "weight-stream", 
                             "[weight-stream] arena mode: {} contiguous layer packs \
                              (sizes [{}])",
                             arena_packs.len(),
