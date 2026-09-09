@@ -228,8 +228,13 @@ CLIF snapshots.
    constant-asserted; the compiler's descriptor stride is its `sizeof`)
    and `wire::train_config::{MOMENT_KEYS, TRAJECTORY_KEYS}` (the record's
    schema, read by the renderer and the resume checker alike); the runtime
-   re-exports both at their historical paths. Still in the runtime:
-   `AwqScales::from_blob` (the sidecar blob format), `peek_batch_seq`
+   re-exports both at their historical paths. *Second PR:*
+   `wire::awq_scales` — the AWQ activation-scales blob's layout, `encode`,
+   `AwqScales::from_blob` / `to_blob` and `AWQ_SIDECAR_KEY`; it replaced
+   three hand-matched copies (the codegen's `calibration/awq_sidecar.rs`
+   encoder + decoder, the runtime's decoder, and the inline encoder in
+   `nsl_calib_write_sidecar`), and the runtime keeps only the JSON +
+   base64 sidecar reader around it. Still in the runtime: `peek_batch_seq`
    (the calibration-data readers, which need `safetensors`) and the
    `env_record` renderer.
 5. **Optional runtime dependency.** `cfg` the eight probe sites; CI's

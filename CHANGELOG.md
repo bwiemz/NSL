@@ -60,6 +60,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   the three proof levels that replace "bit-identical PTX" (normalised-text
   identity, SASS-baseline equivalence, the kernel's device tests), and
   thirteen steps from the crate split to the FA v1 deletion.
+- Design spec for the roadmap A4 endgame,
+  `docs/superpowers/specs/2026-09-09-a4-cuda-context-design.md`: what the
+  CUDA singleton is today (`CudaState`'s four fields plus about 25 sibling
+  statics and thread-locals that hold device state), the per-device
+  `CudaContext` (module caches, a `StreamPool` with leased copy streams,
+  cuBLAS/cublasLt, the caching allocator, the free machinery, the
+  device-pointer caches and workspaces, graph-capture state) in a registry
+  keyed by the tensor `device` byte with a per-thread current device — no
+  new parameter on any ABI row — the compatibility shims that keep the
+  ~110 `ensure_context()` callers unchanged, which of the 30 thread-locals
+  fold into the context, the session object and the thread-affine cells
+  that stay, the two new `[cuda]` rows (`nsl_cuda_device_count`,
+  `nsl_cuda_set_device`), in-process SPMD, and seven gated steps.
 - Nightly frontend fuzzing (roadmap T1): `.github/workflows/fuzz-nightly.yml`
   runs the `lex` and `parse` cargo-fuzz targets from `fuzz/` every night
   (06:30 UTC; on `workflow_dispatch` with a per-target time budget; and
@@ -205,6 +218,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   KIR-generated PTX snapshots are byte-identical. The hand-PTX freeze
   manifest now lists `crates/nsl-kir/src/backend_ptx.rs` as the member
   by construction.
+- The AWQ activation-scales blob has one definition (roadmap A3, step 4 of
+  the A3 design spec, second PR): `nsl_abi::wire::awq_scales` holds the
+  layout, `encode`, `AwqScales::from_blob` / `to_blob`, `AwqBlobError` and
+  `AWQ_SIDECAR_KEY`, replacing three hand-matched copies — the codegen's
+  `calibration/awq_sidecar.rs` (encoder + decoder, deleted), the
+  runtime's `AwqScales::from_blob`, and the inline encoder in the
+  runtime's `nsl_calib_write_sidecar`. The runtime re-exports `AwqScales`
+  at `nsl_runtime::awq`; its JSON + base64 sidecar reader is now the free
+  function `awq::awq_scales_from_sidecar_json_path`, and
+  `AwqScalesError` wraps the blob error as `Blob(AwqBlobError)`. Bytes on
+  disk are unchanged (the `awq_sidecar_baseline` snapshot pins them).
 - `NslTensorDesc` and the train-config record's key classes are wire
   declarations (roadmap A3, step 4 of the A3 design spec, first PR):
   `nsl_abi::wire::tensor_desc::NslTensorDesc` is the `repr(C)` descriptor
