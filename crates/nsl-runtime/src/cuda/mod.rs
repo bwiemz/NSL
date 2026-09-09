@@ -376,10 +376,6 @@ pub(crate) mod inner {
         }
     }
 
-    /// Exit code for a fatal GPU OOM, so a supervising driver can tell
-    /// "the card ran out" from "the program crashed" without parsing stderr.
-    pub(crate) const NSL_EXIT_GPU_OOM: i32 = 12;
-
     /// Attribute the shortfall when the device has far less free memory than
     /// this process can account for.
     ///
@@ -411,21 +407,14 @@ pub(crate) mod inner {
         ))
     }
 
-    /// Fatal GPU OOM: report once, then leave.
+    /// Fatal GPU OOM: report once, then leave with `NSL_EXIT_GPU_OOM`.
     ///
-    /// NOT `panic!`. The allocator is reached from `extern "C"` entry points
-    /// (`nsl_tensor_to_device` via `cpu_fallback_binary`, and ~790 others), and
-    /// a Rust panic in such a frame cannot unwind: it becomes
-    /// `panic in a function that cannot unwind` -> SIGABRT -> a multi-GB core
-    /// dump, with the real diagnostic buried under two backtraces. Observed
-    /// 2026-08-31: a 5.5 GB core for a condition we had already diagnosed in
-    /// full. `std::process::exit` on a fatal runtime condition is the existing
-    /// convention here (see `assert.rs`).
+    /// NOT `panic!`: the allocator is reached from `extern "C"` entry points
+    /// (`nsl_tensor_to_device` via `cpu_fallback_binary`, and ~790 others),
+    /// where a panic cannot unwind. The rationale and the exit-code contract
+    /// live in `crate::fatal`; this is its OOM arm.
     pub(crate) fn oom_fatal(msg: String) -> ! {
-        use std::io::Write;
-        crate::nsl_log!(ERROR, "cuda", "{msg}");
-        let _ = std::io::stderr().flush();
-        std::process::exit(NSL_EXIT_GPU_OOM);
+        crate::fatal::die(crate::fatal::Fatal::GpuOom, &msg)
     }
 
     fn oom_diagnostic(requested: usize, alloc_num: u64, pool_freed: usize) -> String {
@@ -845,7 +834,7 @@ pub(crate) mod inner {
             if result != CUresult::CUDA_SUCCESS
                 && !matches!(result, CUresult::CUDA_ERROR_OUT_OF_MEMORY)
             {
-                panic!("cuMemAlloc({size_bytes} bytes) failed: {result:?}");
+                crate::fatal::die(crate::fatal::Fatal::CudaDriver, &format!("cuMemAlloc({size_bytes} bytes) failed: {result:?}"));
             }
             cuCtxSynchronize();
             drain_completed_frees();
@@ -873,14 +862,14 @@ pub(crate) mod inner {
                 && !matches!(result, CUresult::CUDA_ERROR_OUT_OF_MEMORY)
             {
                 if matches!(result, CUresult::CUDA_ERROR_ILLEGAL_ADDRESS) {
-                    panic!(
+                    crate::fatal::die(crate::fatal::Fatal::CudaDriver, &format!(
                         "cuMemAlloc({} bytes) failed with CUDA_ERROR_ILLEGAL_ADDRESS.\n\
                          A prior GPU kernel accessed invalid memory.\n\
                          Re-run with: nsl run --cuda-sync <file>",
                         size_bytes
-                    );
+                    ));
                 }
-                panic!("cuMemAlloc({} bytes) failed: {:?}", size_bytes, result);
+                crate::fatal::die(crate::fatal::Fatal::CudaDriver, &format!("cuMemAlloc({} bytes) failed: {:?}", size_bytes, result));
             }
 
             // OOM recovery: sync and retry
@@ -1265,10 +1254,10 @@ pub(crate) mod inner {
                 } else {
                     format!(" [context: {}]", ctx)
                 };
-                panic!(
+                crate::fatal::die(crate::fatal::Fatal::CudaDriver, &format!(
                     "cuMemcpyHtoD_v2({} bytes) failed: {:?}{}",
                     size_bytes, result, ctx_suffix
-                );
+                ));
             }
         }
     }
@@ -1305,10 +1294,10 @@ pub(crate) mod inner {
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
             if result != CUresult::CUDA_SUCCESS {
-                panic!(
+                crate::fatal::die(crate::fatal::Fatal::CudaDriver, &format!(
                     "cuMemcpyHtoD_v2({} bytes, immediate) failed: {:?}",
                     size_bytes, result
-                );
+                ));
             }
         }
     }
@@ -2151,10 +2140,10 @@ pub(crate) mod inner {
             if sync_result != CUresult::CUDA_SUCCESS {
                 let name_cstr = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const std::ffi::c_char) };
                 let name_str = name_cstr.to_string_lossy();
-                panic!(
+                crate::fatal::die(crate::fatal::Fatal::CudaAsync, &format!(
                     "[nsl] CUDA async error after kernel '{}' (grid={:?}, block={:?}, shared={}B): {:?}",
                     name_str, grid, block, shared_mem_bytes, sync_result
-                );
+                ));
             }
         }
 
@@ -4248,11 +4237,11 @@ pub(crate) fn gpu_wgrad_accum_f32(
         )
     };
     if let Err(e) = res {
-        panic!(
+        crate::fatal::die(crate::fatal::Fatal::Cublas, &format!(
             "[nsl-wgrad] cuBLAS wgrad accum failed (N={n_rows} d={d_in} o={d_out}): {e:?}. \
              This writes gradients in place, so there is no safe partial result to \
              continue from."
-        );
+        ));
     }
 
     if inner::sync_mode_enabled() {
@@ -5605,10 +5594,10 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
         if inner::sync_mode_enabled() {
             let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
             if sync_result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                panic!(
+                crate::fatal::die(crate::fatal::Fatal::CudaAsync, &format!(
                     "[nsl] CUDA async error after cuBLAS sgemm ({}x{}x{}): {:?}",
                     m, n, k, sync_result
-                );
+                ));
             }
         }
 
@@ -5699,10 +5688,10 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
         if inner::sync_mode_enabled() {
             let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
             if sync_result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                panic!(
+                crate::fatal::die(crate::fatal::Fatal::CudaAsync, &format!(
                     "[nsl] CUDA async error after cuBLAS batched gemm \
                      ({total_batch}x{m}x{n}x{k}): {sync_result:?}"
-                );
+                ));
             }
         }
         if let Some((_, stop, _)) = &profiler_events {

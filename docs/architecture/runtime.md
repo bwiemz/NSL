@@ -35,10 +35,11 @@ consequences shape the code you will read:
 
 1. Fatal conditions do not `panic!`. They print, flush stderr, and either
    `std::process::abort()` (`bad_handle` in `src/tensor/mod.rs`,
-   `src/assert.rs`) or `std::process::exit(code)` (`oom_fatal` in
-   `src/cuda/mod.rs`). A panic inside an `extern "C"` frame cannot unwind; it
-   becomes SIGABRT after a second backtrace and, on a GPU box, a multi-GB
-   core dump.
+   `src/assert.rs`) or `std::process::exit(code)` through `src/fatal.rs`
+   (`Fatal::{GpuOom, CudaDriver, CudaAsync, Cublas}`, one exit code each —
+   see "Fatal exits" below). A panic inside an `extern "C"` frame cannot
+   unwind; it becomes SIGABRT after a second backtrace and, on a GPU box, a
+   multi-GB core dump.
 2. Recoverable failures are sentinel returns (`0`, `-1`, null) and, on the
    host-facing C API, a per-thread error string readable through
    `nsl_get_last_error` (`src/c_api/mod.rs`).
@@ -214,13 +215,26 @@ because the `extern "C"` allocation signature has no out-parameter; a bind
 whose size differs from the plan aborts rather than silently falling back to
 the heap. `scripts/arena-parity.sh` is the byte-identity certification.
 
-**GPU OOM.** The allocator's failure path builds `oom_diagnostic` (the
-request, the current `OOM_CONTEXT` description set by `set_oom_context`, the
-pool breakdown, and `oom_contention_line` when the driver's free/total says
-another process holds the card) and calls `oom_fatal`, which prints, flushes,
-and `std::process::exit(NSL_EXIT_GPU_OOM)` — exit code **12** — so a
-supervising driver can distinguish "the card ran out" from "the program
-crashed" without parsing stderr.
+**Fatal exits** (`src/fatal.rs`). A condition the runtime cannot continue
+from goes through `fatal::die(kind, msg)`: the message is printed verbatim,
+then a `[nsl] fatal: <kind>, exiting with code <n>` line, stderr is flushed,
+and the process exits with the kind's code. The codes are a contract with
+whatever supervises a compiled program — they tell the conditions apart from
+each other and from a crash (a panic's 101, SIGABRT's 134) without parsing
+stderr, and `fatal::tests` pins them:
+
+| `Fatal` | Exit code | When |
+|---|---|---|
+| `GpuOom` | **12** | the allocator could not satisfy a request after draining the pool and retrying |
+| `CudaDriver` | **13** | a driver call failed for a reason other than OOM: `cuMemAlloc` (e.g. `CUDA_ERROR_ILLEGAL_ADDRESS` after a faulting kernel), `cuMemcpyHtoD` |
+| `CudaAsync` | **14** | the `cuCtxSynchronize` that `--cuda-sync` inserts after a kernel or cuBLAS call reported an asynchronous device error |
+| `Cublas` | **15** | a cuBLAS call failed on an in-place operation (the fused wgrad accumulate), where no partial result is safe to continue from |
+
+**GPU OOM** is the first of these: the allocator's failure path builds
+`oom_diagnostic` (the request, the current `OOM_CONTEXT` description set by
+`set_oom_context`, the pool breakdown, and `oom_contention_line` when the
+driver's free/total says another process holds the card) and calls
+`oom_fatal`, which is `die(Fatal::GpuOom, …)`.
 
 ## Autodiff tape
 
