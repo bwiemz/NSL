@@ -134,6 +134,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The train block has a `TrainPlan` carrier (roadmap A1; step 1 of the
+  design in `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`):
+  `stmt_train/plan.rs` holds the planning-time facts as plain data — the
+  resolved optimizer/scheduler contract and hyper-parameters, the FASE plan
+  and the admissions (`TrainSpec`), the parameter paths and state-buffer
+  count (`ParamPlan`), accumulation and checkpointing (`TrainSchedule`).
+  The driver builds it once after the optimizer-state phase, and the four
+  late emitters (`optimizer_step`, `scheduler_step`, `csla_window`,
+  `health_hooks`) plus the checkpoint-identity record take `&plan` in place
+  of the 39 copied fields their `Inputs` structs used to carry; nothing in
+  the plan is a Cranelift handle. The emitter bodies are unchanged (each
+  rebinds the facts under their old names), and the train-block CLIF
+  snapshots are unchanged.
 - Runtime fatal exits are typed (roadmap C1): `nsl_runtime::fatal::die(kind,
   msg)` is the one chokepoint for a condition the runtime cannot continue
   from, and each `Fatal` kind has its own exit code — `GpuOom` **12**

@@ -47,6 +47,7 @@ use crate::stmt_train::plan_ccr::{PreForwardPlanInputs, PreForwardPlans};
 use crate::stmt_train::plan_wggo::{WggoPlanning, WggoPlanningInputs};
 use crate::stmt_train::plan_wrga_cpdt::WrgaCpdtInputs;
 use crate::stmt_train::optimizer_state::OptimizerState;
+use crate::stmt_train::plan::{ParamPlan, TrainPlan, TrainSchedule, TrainSpec};
 use crate::stmt_train::optimizer_step::OptimizerStepInputs;
 use crate::stmt_train::config::TrainConfigSection;
 use crate::stmt_train::contract::TrainContract;
@@ -511,6 +512,43 @@ impl Compiler<'_> {
             surface_prev,
         )?;
 
+        // TrainPlan step 1 (roadmap A1; the design in
+        // docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md): the
+        // planning-time facts the late emitters read, as one carrier. Built
+        // from the bindings above — clones of values the driver keeps using
+        // — and handed to the emitters as `&plan` in place of copies of its
+        // fields. Nothing in it is a Cranelift handle.
+        let plan = TrainPlan {
+            spec: TrainSpec {
+                optimizer_name: optimizer_name.clone(),
+                lr_value,
+                momentum_value,
+                dampening_value,
+                weight_decay_value,
+                no_decay_scope: no_decay_scope.clone(),
+                nesterov_value,
+                beta1_value,
+                beta2_value,
+                eps_value,
+                ns_steps_value,
+                adamw_lr_value,
+                scheduler: scheduler.clone(),
+                grad_clip,
+                fase_plan: fase_plan.clone(),
+                fase_deferred,
+                csla_active,
+            },
+            params: ParamPlan {
+                paths: param_paths.clone(),
+                num_state_buffers,
+            },
+            schedule: TrainSchedule {
+                grad_accumulation_steps,
+                checkpoint_save_path: checkpoint_save_path.clone(),
+                checkpoint_every,
+            },
+        };
+
         // ── 5. Initialize lr and step_count variables ───────────────────
         let lr_var = builder.declare_var(cl_types::F64);
         let lr_const = builder.ins().f64const(lr_value);
@@ -526,23 +564,7 @@ impl Compiler<'_> {
         // renderer is a pure function with unit tests.
         self.emit_train_config_record(
             builder,
-            &crate::stmt_train::identity::TrainConfigRecordInputs {
-                optimizer_name: &optimizer_name,
-                lr_value,
-                grad_accumulation_steps,
-                grad_clip,
-                weight_decay_value,
-                beta1_value,
-                beta2_value,
-                eps_value,
-                momentum_value,
-                dampening_value,
-                nesterov_value,
-                ns_steps_value,
-                adamw_lr_value,
-                no_decay_scope: &no_decay_scope,
-                scheduler: &scheduler,
-            },
+            &crate::stmt_train::identity::TrainConfigRecordInputs::from_plan(&plan),
         )?;
 
         // Milestone B: full-state resume — moved to `stmt_train/identity.rs`
@@ -2145,12 +2167,12 @@ impl Compiler<'_> {
             builder,
             state,
             HealthHooksInputs {
+                plan: &plan,
                 fase_hook_active,
                 grads_list,
                 loss_val,
                 num_params_val,
                 param_list,
-                param_paths: &param_paths,
                 step_count_var,
             },
         )?;
@@ -2330,23 +2352,12 @@ impl Compiler<'_> {
             builder,
             state,
             CslaWindowInputs {
+                plan: &plan,
                 accum_list,
-                adamw_lr_value,
-                lr_value,
-                beta1_value,
-                beta2_value,
-                dampening_value,
-                eps_value,
-                momentum_value,
-                weight_decay_value,
-                ns_steps_value,
-                nesterov_value,
                 cpdt_precision_dtypes,
                 muon_state_m_codes,
                 csla_buffers,
                 csla_pending,
-                fase_plan: &fase_plan,
-                grad_accumulation_steps,
                 has_dataloader,
                 lr_var,
                 should_step_var,
@@ -2357,9 +2368,6 @@ impl Compiler<'_> {
                 param_list,
                 state_list_1,
                 state_list_2,
-                num_state_buffers,
-                optimizer_name: &optimizer_name,
-                param_paths: &param_paths,
             },
         )?;
 
@@ -2372,38 +2380,21 @@ impl Compiler<'_> {
             builder,
             state,
             OptimizerStepInputs {
+                plan: &plan,
                 accum_list,
-                adamw_lr_value,
-                lr_value,
-                beta1_value,
-                beta2_value,
-                dampening_value,
-                eps_value,
-                momentum_value,
-                weight_decay_value,
-                ns_steps_value,
-                nesterov_value,
-                grad_clip,
                 cpdt_precision_dtypes,
-                csla_active,
-                fase_deferred,
                 fase_hook_active,
                 decay_exempt_list,
-                fase_plan,
-                grad_accumulation_steps,
                 grads_list,
                 lr_var,
                 should_step_var,
                 step_count_var,
                 mode_table_base,
                 muon_route_list,
-                no_decay_scope,
                 num_params_val,
                 param_list,
                 state_list_1,
                 state_list_2,
-                num_state_buffers,
-                optimizer_name,
             },
         )?;
 
@@ -2414,17 +2405,13 @@ impl Compiler<'_> {
             builder,
             state,
             SchedulerStepInputs {
+                plan: &plan,
                 checkpoint_dl_handle,
-                checkpoint_every,
                 checkpoint_names_list,
-                checkpoint_save_path: &checkpoint_save_path,
                 epoch_counter_var,
-                grad_accumulation_steps,
                 has_dataloader,
-                lr_value,
                 lr_var,
                 param_list,
-                scheduler: &scheduler,
                 state_list_1,
                 state_list_2,
                 step_count_var,
