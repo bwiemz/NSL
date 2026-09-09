@@ -329,7 +329,7 @@ cargo run -p nsl-cli -- run examples/m14_sgd_basic.nsl  # Run a training example
 ```
 
 Key entry points for contributors:
-- **Add a tensor op:** [crates/nsl-runtime/src/tensor/](crates/nsl-runtime/src/tensor/) — implement the op, add it to the registry under [crates/nsl-codegen/src/builtins/](crates/nsl-codegen/src/builtins/) (language surface) or [crates/nsl-codegen/src/runtime_abi/](crates/nsl-codegen/src/runtime_abi/) (implementation surface)
+- **Add a tensor op:** [crates/nsl-runtime/src/tensor/](crates/nsl-runtime/src/tensor/) — implement the op, add its row to the typed ABI table [crates/nsl-abi/src/table.rs](crates/nsl-abi/src/table.rs) (the codegen declares it from there and the runtime's build checks it), and the lowering under [crates/nsl-codegen/src/builtins/](crates/nsl-codegen/src/builtins/) if a program calls it by name
 - **Add an AD rule:** [crates/nsl-runtime/src/autodiff/backward.rs](crates/nsl-runtime/src/autodiff/backward.rs) — add a `TapeOp` variant and backward logic
 - **Add a stdlib layer:** [stdlib/nsl/nn/](stdlib/nsl/nn/) — pure NSL, no Rust needed
 - **Add a language feature:** Parser → AST → Semantic → Codegen pipeline across the 4 crates
