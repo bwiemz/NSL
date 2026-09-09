@@ -88,7 +88,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (no broadcast, CPU).
@@ -204,7 +204,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
@@ -310,7 +310,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
@@ -425,7 +425,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
@@ -522,7 +522,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -643,7 +643,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
@@ -774,7 +774,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
@@ -916,7 +916,7 @@ pub extern "C" fn nsl_tensor_div_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when the caller relinquished (CPU).
@@ -1040,7 +1040,7 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
     // FBIP: mutate in-place when the caller relinquished (CPU). i32 guard as
@@ -1517,7 +1517,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            { crate::fatal::cuda_not_compiled(); }
         }
     }
 
