@@ -32,6 +32,7 @@
 //! lets the compiler stop depending on the runtime's dependency tree.
 
 pub mod wire;
+pub mod capi;
 pub mod table;
 pub mod typed;
 pub use table::{FnDecl, RUNTIME_ABI};

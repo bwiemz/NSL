@@ -283,8 +283,11 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `emit_c_abi_dispatch_wrapper`); `src/c_export_table.rs` — the export table
   `nsl_model_create` reads; `src/c_header.rs` — `ExportInfo`, `lower_type_expr`,
   `emit(exports, module_name)`, stamping `NSL_ABI_VERSION_MAJOR/MINOR` from
-  `nsl_runtime::c_api`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
-  through `nsl_abi`), `crates/nsl-codegen/tests/c_header_compiles.rs` (real C compiler +
+  `nsl_abi::wire::version` and printing every lifecycle prototype from the
+  `nsl_abi::capi` table (roadmap A3 step 2: the runtime's build asserts each
+  row against its implementation, nsl-abi's tests parse each prototype back
+  to its row). Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (the `NslExportFn`
+  typedef and the inline wrappers), `crates/nsl-codegen/tests/c_header_compiles.rs` (real C compiler +
   `_Static_assert` on `NslTensorDesc`), `crates/nsl-codegen/tests/c_header_snapshot.rs`,
   `crates/nsl-codegen/tests/exported_symbols_are_dlsym_findable.rs`,
   `crates/nsl-codegen/tests/export_table_runtime_ffis.rs`.
@@ -462,8 +465,10 @@ cross-checks it against the typed table (`nsl_abi::check_workspace`,
 floor of 682 rows recorded 2026-09-02, and `nsl_abi::table::tests` pins the
 row count exactly). Inside the codegen, `builtins/mod.rs` unit tests
 `no_runtime_function_is_declared_twice` and `registry_is_the_abi_table`
-guard the rendering. `crates/nsl-codegen/tests/c_header_agreement.rs` reuses
-the text parser for the generated C header.
+guard the rendering. The host-facing C API is the second table,
+`nsl_abi::capi` (22 rows, nine with the C prototype the header prints): the
+runtime asserts it the same way, and `nsl abi python` renders it as
+`python/nslpy/_abi.py`, pinned by `cargo test -p nsl-abi`.
 
 **Shared constants imported from `nsl_runtime`** (grep `nsl_runtime::` in
 `src`, non-comment uses): `nsl_runtime::param_plan::{PLAN_BF16_SR,
@@ -811,9 +816,11 @@ should fail before review.
   reason (`thread_local_inventory_drift.rs` in `nsl-runtime`'s tests).
 - **No new hand-PTX files.** `ci/hand-ptx-manifest.txt` only shrinks
   (`scripts/hand-ptx-freeze.sh --check`).
-- **The C header describes the real ABI.** `crates/nsl-codegen/tests/c_header_agreement.rs`,
-  `crates/nsl-codegen/tests/c_header_compiles.rs`, and the `NSL_ABI_VERSION_*` constants come
-  from `nsl_runtime::c_api`.
+- **The C header describes the real ABI.** Its lifecycle prototypes are
+  `nsl_abi::capi` rows the runtime's build asserts against the
+  implementations; `crates/nsl-codegen/tests/c_header_agreement.rs` checks the typedef and
+  the inline wrappers, `crates/nsl-codegen/tests/c_header_compiles.rs` compiles it, and the
+  `NSL_ABI_VERSION_*` constants come from `nsl_abi::wire::version`.
 
 ## Tests and gates
 
@@ -898,9 +905,11 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 4. Build `nsl-runtime` (the row is checked against the implementation at
    compile time) and run `cargo test -p nsl-abi --test signature_agreement`
    and `cargo test -p nsl-codegen --lib builtins` (the duplicate/rendering
-   tests). If the symbol is exported to C hosts, `crates/nsl-codegen/tests/c_header_agreement.rs`
-   and `crates/nsl-codegen/tests/c_header_compiles.rs` cover the header; add the prototype in
-   `src/c_header.rs` if the header must expose it.
+   tests). If the symbol is exported to C hosts, add a row to
+   `nsl_abi::capi` (with the C prototype if the header must expose it) and
+   a `push_capi` call in `src/c_header.rs`; regenerate `python/nslpy/_abi.py`
+   with `cargo run -p nsl-cli -- abi python`; `crates/nsl-codegen/tests/c_header_compiles.rs`
+   covers the header.
 5. If the function takes or returns tensor ownership, classify it in
    `src/ffi_ownership.rs` (`crates/nsl-codegen/tests/ffi_ownership_drift.rs`).
 6. Cover the emission with a compile-and-inspect test (`*_ffi_decls.rs` /

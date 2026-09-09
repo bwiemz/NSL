@@ -18,7 +18,7 @@ use std::process;
 
 use clap::Parser as ClapParser;
 
-use crate::args::{Cli, DocCmd};
+use crate::args::{AbiCmd, Cli, DocCmd};
 
 /// Scan a parsed module for a top-level `train { ... }` block.
 ///
@@ -159,6 +159,9 @@ fn main_inner() {
         }
         Cli::Env { cmd } => {
             commands::env::run(cmd);
+        }
+        Cli::Abi { cmd: AbiCmd::Python } => {
+            print!("{}", nsl_abi::capi::render_python());
         }
         Cli::Doc { cmd: DocCmd::Cli } => {
             use clap::CommandFactory as _;
