@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The KIR scalar ISA (roadmap A2 step 4), the instruction families the
+  hand-PTX estate's index math, reductions and 16-bit paths are made of:
+  `And`/`Or`/`Xor`/`Not`, `Shl`/`Shr` (arithmetic for signed types),
+  `Rem`, `Min`/`Max`, `Rcp`/`Rsqrt`, `WarpShuffle` in a struct form with
+  `Down`/`Up`/`Xor`/`Idx` modes and a segment width, `Vote`
+  (`Any`/`All`/`Ballot`), `LaneId`/`WarpId`, `LoadVec`/`StoreVec` (2 or 4
+  pointee-typed values, one scalar per lane), `CastRounded { mode }`, and
+  `Predicated { pred, negate, op }` for a guarded side effect (a
+  predicated definition is refused: it would be a partial SSA
+  definition). `Cast` now prints the rounding modifier PTX requires
+  (`.rn` for a float result that can round, `.rzi` for float → int; it
+  printed `cvt.bf16.f32`, which ptxas rejects), `I32`/`I64` print as
+  `.s32`/`.s64` (they printed `.i32`/`.i64`, which PTX does not have; the
+  one test that pinned that spelling is corrected), `Select` is typed
+  (`selp.f32`/`.f64`/`.b64`/`.b16`, and a predicate select as `and`/`or`
+  over the predicate class), the 16-bit register class is `.b16` and
+  16-bit loads and stores are `.b16` (`ld.global.bf16` is not an
+  instruction), and a kernel that requires `FeatureSet::BF16_ARITHMETIC`
+  (any bf16 value or conversion) prints `.version 7.8` / `sm_80`. The
+  verifier types every new op (rule 4b) and refuses a 3-wide vector op or
+  a predicated value (rule 8). `crates/nsl-codegen/tests/kir_scalar_isa_ptxas.rs`
+  assembles one kernel using every family in CI's cuda lane.
 - KIR block parameters (roadmap A2 step 2): a loop-carried value is now
   expressible in KIR without phi nodes. `KirBlock::params`
   (`KirBuilder::add_block_param`) define SSA values at block entry, and

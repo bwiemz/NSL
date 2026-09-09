@@ -1632,15 +1632,18 @@ mod tests {
             ptx.contains("add.f32"),
             "Mixed I32+F32 kernel should produce add.f32 in PTX. Got:\n{ptx}"
         );
-        // Should have a cvt (cast from i32 to f32)
+        // Should have a cvt (cast from i32 to f32). PTX spells the signed
+        // 32-bit type `.s32`, and an int → float conversion carries `.rn`
+        // (roadmap A2 step 4; this test pinned `cvt.f32.i32`, which ptxas
+        // rejects, until the printer went through the assembler).
         assert!(
-            ptx.contains("cvt.f32.i32"),
-            "Mixed I32+F32 kernel should produce cvt.f32.i32 in PTX. Got:\n{ptx}"
+            ptx.contains("cvt.rn.f32.s32"),
+            "Mixed I32+F32 kernel should produce cvt.rn.f32.s32 in PTX. Got:\n{ptx}"
         );
-        // Load from a should be i32
+        // Load from a should be s32
         assert!(
-            ptx.contains("ld.global.i32"),
-            "I32 tensor should load as .i32. Got:\n{ptx}"
+            ptx.contains("ld.global.s32"),
+            "I32 tensor should load as .s32. Got:\n{ptx}"
         );
         // Load from b should be f32
         assert!(

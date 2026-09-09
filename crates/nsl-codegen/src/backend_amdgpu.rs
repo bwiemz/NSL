@@ -93,9 +93,9 @@ fn lower_op_to_amdgpu(op: &KirOp, ir: &KernelIR) -> String {
             )
         }
         KirOp::Barrier => "s_barrier".to_string(),
-        KirOp::WarpShuffle(dst, val, offset) => {
+        KirOp::WarpShuffle { dst, val, lane, .. } => {
             // AMDGPU wavefront size is 64; use ds_permute for shuffle
-            format!("ds_permute_b32 v{}, v{}, v{}", dst, offset, val)
+            format!("ds_permute_b32 v{}, v{}, v{}", dst, lane, val)
         }
         KirOp::Load(dst, ptr, space) => {
             let prefix = match space {

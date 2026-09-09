@@ -16,11 +16,15 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     // Header. `cp.async` (FeatureSet::ASYNC_COPY) is an sm_80 instruction;
     // every other op lowers on sm_70, the floor this backend has always
     // targeted, so the bump is taken only when a kernel asks for it.
-    writeln!(ptx, ".version 7.0").unwrap();
+    // A bf16 conversion (FeatureSet::BF16_ARITHMETIC) is PTX ISA 7.8 and
+    // sm_80 as well (roadmap A2 step 4).
+    let bf16 = ir.required_features.contains(FeatureSet::BF16_ARITHMETIC);
+    writeln!(ptx, ".version {}", if bf16 { "7.8" } else { "7.0" }).unwrap();
     // The tensor-core ops (`ldmatrix`, `mma.sync` m16n8k16 f16) are sm_80
     // instructions as well.
     let target = if ir.required_features.contains(FeatureSet::ASYNC_COPY)
         || ir.required_features.contains(FeatureSet::TENSOR_CORES)
+        || bf16
     {
         "sm_80"
     } else {
@@ -123,7 +127,9 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
         writeln!(ptx, "    .reg .f64 %fd<{}>;", fd_count).unwrap();
     }
     if h_count > 0 {
-        writeln!(ptx, "    .reg .f16 %h<{}>;", h_count).unwrap();
+        // `.b16`, not `.f16`: the class holds f16 and bf16 values alike, and
+        // `cvt.rn.bf16.f32` / `ld.global.b16` take a `.b16` register.
+        writeln!(ptx, "    .reg .b16 %h<{}>;", h_count).unwrap();
     }
     if p_count > 0 {
         writeln!(ptx, "    .reg .pred %p<{}>;", p_count).unwrap();
@@ -135,7 +141,11 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     // copy into the target's parameter registers. A cycle in that copy (a
     // swap) needs one scratch register of the class; declared only when a
     // kernel has block parameters, so every other kernel's text is unchanged.
-    if ir.blocks.iter().any(|b| !b.params.is_empty()) {
+    let selects_a_bool = ir.blocks.iter().flat_map(|b| b.ops.iter()).any(|op| {
+        matches!(op, KirOp::Select(d, _, t, _)
+            if ir.var_types.get(d).or_else(|| ir.var_types.get(t)) == Some(&KirType::Bool))
+    });
+    if ir.blocks.iter().any(|b| !b.params.is_empty()) || selects_a_bool {
         for (ty, name) in EDGE_SCRATCH {
             writeln!(ptx, "    .reg .{ty} {name};").unwrap();
         }
@@ -419,20 +429,14 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             .unwrap();
         }
         KirOp::Cast(dst, src, target_ty) => {
-            let src_ty = var_ptx_type(ir, *src, *src);
-            let dst_ty = target_ty.ptx_type();
-            let src_prefix = var_reg_prefix(ir, *src, *src);
-            let dst_prefix = target_ty.ptx_reg_prefix();
-            writeln!(
-                ptx,
-                "    cvt.{}.{} {}{}, {}{};",
-                dst_ty, src_ty, dst_prefix, dst, src_prefix, src
-            )
-            .unwrap();
+            emit_cvt(ptx, ir, *dst, *src, target_ty, None);
+        }
+        KirOp::CastRounded { dst, src, ty, mode } => {
+            emit_cvt(ptx, ir, *dst, *src, ty, Some(*mode));
         }
         KirOp::Load(dst, ptr, addr_space) => {
             let space = address_space_str(*addr_space);
-            let ty = var_ptx_type(ir, *dst, *dst);
+            let ty = mem_type(var_ptx_type(ir, *dst, *dst));
             let dst_prefix = var_reg_prefix(ir, *dst, *dst);
             let ptr_prefix = var_reg_prefix(ir, *ptr, *ptr);
             writeln!(
@@ -444,7 +448,7 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         }
         KirOp::Store(ptr, val, addr_space) => {
             let space = address_space_str(*addr_space);
-            let ty = var_ptx_type(ir, *val, *val);
+            let ty = mem_type(var_ptx_type(ir, *val, *val));
             let val_prefix = var_reg_prefix(ir, *val, *val);
             let ptr_prefix = var_reg_prefix(ir, *ptr, *ptr);
             writeln!(
@@ -497,14 +501,138 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Barrier => {
             writeln!(ptx, "    bar.sync 0;").unwrap();
         }
-        KirOp::WarpShuffle(dst, val, offset) => {
+        KirOp::WarpShuffle { dst, val, lane, mode, width } => {
             let prefix = var_reg_prefix(ir, *dst, *val);
+            // The `c` operand packs the segment mask: `(32 - width) << 8`
+            // in the upper byte, and the clamp (0x1f) in the lower byte for
+            // every mode but `up`, whose clamp is 0.
+            let segmask = (32u32 - u32::from(*width).clamp(1, 32)) << 8;
+            let (mnemonic, c) = match mode {
+                ShuffleMode::Down => ("down", segmask | 0x1f),
+                ShuffleMode::Up => ("up", segmask),
+                ShuffleMode::Xor => ("bfly", segmask | 0x1f),
+                ShuffleMode::Idx => ("idx", segmask | 0x1f),
+            };
             writeln!(
                 ptx,
-                "    shfl.sync.down.b32 {}{}, {}{}, %r{}, 0x1f, 0xffffffff;",
-                prefix, dst, prefix, val, offset
+                "    shfl.sync.{}.b32 {}{}, {}{}, %r{}, 0x{:x}, 0xffffffff;",
+                mnemonic, prefix, dst, prefix, val, lane, c
             )
             .unwrap();
+        }
+        KirOp::Vote { dst, pred, mode } => match mode {
+            VoteMode::Any => writeln!(ptx, "    vote.sync.any.pred %p{}, %p{}, 0xffffffff;", dst, pred).unwrap(),
+            VoteMode::All => writeln!(ptx, "    vote.sync.all.pred %p{}, %p{}, 0xffffffff;", dst, pred).unwrap(),
+            VoteMode::Ballot => {
+                writeln!(ptx, "    vote.sync.ballot.b32 %r{}, %p{}, 0xffffffff;", dst, pred).unwrap()
+            }
+        },
+        KirOp::LaneId(dst) => {
+            writeln!(ptx, "    mov.u32 %r{}, %laneid;", dst).unwrap();
+        }
+        KirOp::WarpId(dst) => {
+            writeln!(ptx, "    mov.u32 %r{}, %warpid;", dst).unwrap();
+        }
+        // Roadmap A2 step 4: the integer / bitwise ISA.
+        KirOp::And(dst, a, b) | KirOp::Or(dst, a, b) | KirOp::Xor(dst, a, b) => {
+            let mnemonic = match op {
+                KirOp::And(..) => "and",
+                KirOp::Or(..) => "or",
+                _ => "xor",
+            };
+            let (ty, prefix) = bit_class(ir, *dst, *a);
+            writeln!(ptx, "    {}.{} {}{}, {}{}, {}{};", mnemonic, ty, prefix, dst, prefix, a, prefix, b)
+                .unwrap();
+        }
+        KirOp::Not(dst, src) => {
+            let (ty, prefix) = bit_class(ir, *dst, *src);
+            writeln!(ptx, "    not.{} {}{}, {}{};", ty, prefix, dst, prefix, src).unwrap();
+        }
+        KirOp::Shl(dst, a, amount) => {
+            let (ty, prefix) = bit_class(ir, *dst, *a);
+            writeln!(ptx, "    shl.{} {}{}, {}{}, %r{};", ty, prefix, dst, prefix, a, amount).unwrap();
+        }
+        KirOp::Shr(dst, a, amount) => {
+            // Arithmetic for signed types, logical otherwise.
+            let ty = var_ptx_type(ir, *dst, *a);
+            let prefix = var_reg_prefix(ir, *dst, *a);
+            let ty = match ty {
+                "s32" | "s8" | "s16" => "s32",
+                "s64" => "s64",
+                "u64" => "u64",
+                _ => "u32",
+            };
+            writeln!(ptx, "    shr.{} {}{}, {}{}, %r{};", ty, prefix, dst, prefix, a, amount).unwrap();
+        }
+        KirOp::Rem(dst, a, b) => {
+            let ty = var_ptx_type(ir, *dst, *a);
+            let prefix = var_reg_prefix(ir, *dst, *a);
+            writeln!(ptx, "    rem.{} {}{}, {}{}, {}{};", ty, prefix, dst, prefix, a, prefix, b).unwrap();
+        }
+        KirOp::Min(dst, a, b) | KirOp::Max(dst, a, b) => {
+            let mnemonic = if matches!(op, KirOp::Min(..)) { "min" } else { "max" };
+            let ty = var_ptx_type(ir, *dst, *a);
+            let prefix = var_reg_prefix(ir, *dst, *a);
+            writeln!(ptx, "    {}.{} {}{}, {}{}, {}{};", mnemonic, ty, prefix, dst, prefix, a, prefix, b)
+                .unwrap();
+        }
+        KirOp::Rcp(dst, src) => {
+            let prefix = var_reg_prefix(ir, *dst, *src);
+            let mnemonic = if var_ptx_type(ir, *dst, *src) == "f64" { "rcp.rn.f64" } else { "rcp.approx.f32" };
+            writeln!(ptx, "    {} {}{}, {}{};", mnemonic, prefix, dst, prefix, src).unwrap();
+        }
+        KirOp::Rsqrt(dst, src) => {
+            let prefix = var_reg_prefix(ir, *dst, *src);
+            let mnemonic =
+                if var_ptx_type(ir, *dst, *src) == "f64" { "rsqrt.approx.f64" } else { "rsqrt.approx.f32" };
+            writeln!(ptx, "    {} {}{}, {}{};", mnemonic, prefix, dst, prefix, src).unwrap();
+        }
+        KirOp::LoadVec { dsts, ptr, space } => {
+            let first = dsts.first().copied().unwrap_or(0);
+            let ty = mem_type(var_ptx_type(ir, first, first));
+            let prefix = var_reg_prefix(ir, first, first);
+            let regs: Vec<String> = dsts.iter().map(|d| format!("{prefix}{d}")).collect();
+            writeln!(
+                ptx,
+                "    ld.{}.v{}.{} {{{}}}, [{}{}];",
+                address_space_str(*space),
+                dsts.len(),
+                ty,
+                regs.join(", "),
+                var_reg_prefix(ir, *ptr, *ptr),
+                ptr
+            )
+            .unwrap();
+        }
+        KirOp::StoreVec { ptr, vals, space } => {
+            let first = vals.first().copied().unwrap_or(0);
+            let ty = mem_type(var_ptx_type(ir, first, first));
+            let prefix = var_reg_prefix(ir, first, first);
+            let regs: Vec<String> = vals.iter().map(|v| format!("{prefix}{v}")).collect();
+            writeln!(
+                ptx,
+                "    st.{}.v{}.{} [{}{}], {{{}}};",
+                address_space_str(*space),
+                vals.len(),
+                ty,
+                var_reg_prefix(ir, *ptr, *ptr),
+                ptr,
+                regs.join(", ")
+            )
+            .unwrap();
+        }
+        KirOp::Predicated { pred, negate, op: inner } => {
+            // Lower the wrapped op on its own and guard every line of it.
+            let mut body = String::new();
+            emit_op(&mut body, inner, ir);
+            let guard = if *negate { format!("@!%p{pred} ") } else { format!("@%p{pred} ") };
+            for line in body.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                writeln!(ptx, "    {guard}{trimmed}").unwrap();
+            }
         }
         KirOp::Cmp(dst, a, b, cmp_op) => {
             let ty = var_ptx_type(ir, *a, *a);
@@ -525,13 +653,37 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             .unwrap();
         }
         KirOp::Select(dst, cond, true_val, false_val) => {
-            let prefix = var_reg_prefix(ir, *dst, *true_val);
-            writeln!(
-                ptx,
-                "    selp.b32 {}{}, {}{}, {}{}, %p{};",
-                prefix, dst, prefix, true_val, prefix, false_val, cond
-            )
-            .unwrap();
+            match ir.var_types.get(dst).or_else(|| ir.var_types.get(true_val)) {
+                // No `selp.pred`: d = (c & t) | (!c & f) over the predicate class.
+                Some(KirType::Bool) => {
+                    writeln!(ptx, "    and.pred %edge_p, %p{}, %p{};", cond, true_val).unwrap();
+                    writeln!(ptx, "    not.pred %p{}, %p{};", dst, cond).unwrap();
+                    writeln!(ptx, "    and.pred %p{}, %p{}, %p{};", dst, dst, false_val).unwrap();
+                    writeln!(ptx, "    or.pred %p{}, %p{}, %edge_p;", dst, dst).unwrap();
+                }
+                Some(ty) => {
+                    let prefix = ty.ptx_reg_prefix();
+                    // selp takes .b16/.b32/.b64 and the numeric types; the
+                    // 32-bit integer classes keep the historical `.b32`.
+                    let sel_ty = match ty {
+                        KirType::F32 => "f32",
+                        KirType::F64 => "f64",
+                        KirType::U64 | KirType::I64 | KirType::Ptr(_, _) => "b64",
+                        KirType::F16 | KirType::Bf16 => "b16",
+                        _ => "b32",
+                    };
+                    writeln!(
+                        ptx,
+                        "    selp.{} {}{}, {}{}, {}{}, %p{};",
+                        sel_ty, prefix, dst, prefix, true_val, prefix, false_val, cond
+                    )
+                    .unwrap();
+                }
+                None => {
+                    writeln!(ptx, "    selp.b32 %r{}, %r{}, %r{}, %p{};", dst, true_val, false_val, cond)
+                        .unwrap();
+                }
+            }
         }
         KirOp::Const(dst, konst) => match &konst.value {
             ConstValue::U32(v) => writeln!(ptx, "    mov.u32 %r{}, {};", dst, v).unwrap(),
@@ -648,7 +800,7 @@ const EDGE_SCRATCH: [(&str, &str); 7] = [
     ("u64", "%edge_rd"),
     ("f32", "%edge_f"),
     ("f64", "%edge_fd"),
-    ("f16", "%edge_h"),
+    ("b16", "%edge_h"),
     ("pred", "%edge_p"),
     ("b32", "%edge_v"),
 ];
@@ -746,6 +898,69 @@ fn emit_terminator(ptx: &mut String, term: &KirTerminator, ir: &KernelIR, block:
     }
 }
 
+/// The memory-op type for a register type: the 16-bit floats move as
+/// `.b16` (`ld.global.bf16` is not an instruction), everything else as its
+/// own type.
+fn mem_type(ty: &'static str) -> &'static str {
+    match ty {
+        "f16" | "bf16" => "b16",
+        other => other,
+    }
+}
+
+/// The (type, prefix) a bitwise op uses: predicates for `Bool`, otherwise
+/// the untyped class of the register's width.
+fn bit_class(ir: &KernelIR, primary: VarId, fallback: VarId) -> (&'static str, &'static str) {
+    match ir.var_types.get(&primary).or_else(|| ir.var_types.get(&fallback)) {
+        Some(KirType::Bool) => ("pred", "%p"),
+        Some(KirType::U64) | Some(KirType::I64) | Some(KirType::Ptr(_, _)) => ("b64", "%rd"),
+        Some(KirType::F16) | Some(KirType::Bf16) => ("b16", "%h"),
+        Some(KirType::Vec(_, _)) => ("b32", "%v"),
+        _ => ("b32", "%r"),
+    }
+}
+
+/// `cvt` with the rounding modifier PTX requires (roadmap A2 step 4): a
+/// float result of a float source that loses width, or of an integer
+/// source, rounds (`.rn` by default); an integer result of a float source
+/// rounds to an integer (`.rzi` by default); everything else is exact and
+/// takes no modifier. An explicit `mode` overrides the default where a
+/// modifier applies. The source type falls back to `u32` when untyped,
+/// as the other arms do.
+fn emit_cvt(ptx: &mut String, ir: &KernelIR, dst: VarId, src: VarId, target: &KirType, mode: Option<RoundMode>) {
+    let src_kty = ir.var_types.get(&src);
+    let src_ty = var_ptx_type(ir, src, src);
+    let dst_ty = target.ptx_type();
+    let src_prefix = var_reg_prefix(ir, src, src);
+    let dst_prefix = target.ptx_reg_prefix();
+    let is_f = |t: Option<&KirType>| {
+        matches!(t, Some(KirType::F16) | Some(KirType::Bf16) | Some(KirType::F32) | Some(KirType::F64))
+    };
+    let src_float = is_f(src_kty);
+    let dst_float = is_f(Some(target));
+    let float_result_rounds = dst_float
+        && (!src_float || src_kty.is_some_and(|t| t.size_bytes() > target.size_bytes()));
+    let modifier = if float_result_rounds {
+        match mode.unwrap_or(RoundMode::Rn) {
+            RoundMode::Rn => ".rn",
+            RoundMode::Rz => ".rz",
+            RoundMode::Rm => ".rm",
+            RoundMode::Rp => ".rp",
+        }
+    } else if src_float && !dst_float && *target != KirType::Bool {
+        match mode.unwrap_or(RoundMode::Rz) {
+            RoundMode::Rn => ".rni",
+            RoundMode::Rz => ".rzi",
+            RoundMode::Rm => ".rmi",
+            RoundMode::Rp => ".rpi",
+        }
+    } else {
+        ""
+    };
+    writeln!(ptx, "    cvt{}.{}.{} {}{}, {}{};", modifier, dst_ty, src_ty, dst_prefix, dst, src_prefix, src)
+        .unwrap();
+}
+
 /// Get the PTX type string for a variable, looking up in var_types.
 fn var_ptx_type(ir: &KernelIR, primary: VarId, fallback: VarId) -> &'static str {
     if let Some(ty) = ir.var_types.get(&primary) {
@@ -825,7 +1040,34 @@ fn extract_var_ids(op: &KirOp) -> Vec<VarId> {
             v.extend_from_slice(c);
             v
         }
-        KirOp::WarpShuffle(d, v, o) => vec![*d, *v, *o],
+        KirOp::WarpShuffle { dst, val, lane, .. } => vec![*dst, *val, *lane],
+        KirOp::And(d, a, b)
+        | KirOp::Or(d, a, b)
+        | KirOp::Xor(d, a, b)
+        | KirOp::Shl(d, a, b)
+        | KirOp::Shr(d, a, b)
+        | KirOp::Rem(d, a, b)
+        | KirOp::Min(d, a, b)
+        | KirOp::Max(d, a, b) => vec![*d, *a, *b],
+        KirOp::Not(d, s) | KirOp::Rcp(d, s) | KirOp::Rsqrt(d, s) => vec![*d, *s],
+        KirOp::CastRounded { dst, src, .. } => vec![*dst, *src],
+        KirOp::Vote { dst, pred, .. } => vec![*dst, *pred],
+        KirOp::LaneId(d) | KirOp::WarpId(d) => vec![*d],
+        KirOp::LoadVec { dsts, ptr, .. } => {
+            let mut v = dsts.clone();
+            v.push(*ptr);
+            v
+        }
+        KirOp::StoreVec { ptr, vals, .. } => {
+            let mut v = vals.clone();
+            v.push(*ptr);
+            v
+        }
+        KirOp::Predicated { pred, op, .. } => {
+            let mut v = extract_var_ids(op);
+            v.push(*pred);
+            v
+        },
         KirOp::Cmp(d, a, b, _) | KirOp::PtrOffset(d, a, b) => vec![*d, *a, *b],
         KirOp::Const(d, _) => vec![*d],
         KirOp::Matmul { a, b, out, .. } => vec![*a, *b, *out],
@@ -1384,5 +1626,286 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let ptx = String::from_utf8(lower_kir_to_ptx(&b.finalize())).unwrap();
         assert!(!ptx.contains("%edge_"), "{ptx}");
+    }
+
+    // ── Roadmap A2 step 4: the scalar ISA ────────────────────────────
+
+    fn ptx_of(build: impl FnOnce(&mut KirBuilder)) -> String {
+        let mut b = KirBuilder::new("isa");
+        let e = b.new_block();
+        b.set_block(e);
+        build(&mut b);
+        b.terminate(KirTerminator::Return);
+        String::from_utf8(lower_kir_to_ptx(&b.finalize())).unwrap()
+    }
+
+    fn u32_const(b: &mut KirBuilder, v: u32) -> VarId {
+        let d = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Const(d, KirConst { ty: KirType::U32, value: ConstValue::U32(v) }));
+        d
+    }
+
+    fn f32_const(b: &mut KirBuilder, v: f32) -> VarId {
+        let d = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(d, KirConst { ty: KirType::F32, value: ConstValue::F32(v) }));
+        d
+    }
+
+    #[test]
+    fn bitwise_and_shift_ops_print_their_class() {
+        let ptx = ptx_of(|b| {
+            let x = u32_const(b, 6);
+            let y = u32_const(b, 3);
+            let a = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::And(a, x, y));
+            let o = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Or(o, x, y));
+            let xo = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Xor(xo, x, y));
+            let n = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Not(n, x));
+            let l = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Shl(l, x, y));
+            let r = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Shr(r, x, y));
+            let m = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Rem(m, x, y));
+            let mn = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Min(mn, x, y));
+            let mx = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Max(mx, x, y));
+            // 64-bit and signed shapes.
+            let w = b.new_typed_var(KirType::U64);
+            b.emit(KirOp::Const(w, KirConst { ty: KirType::U64, value: ConstValue::U64(9) }));
+            let ws = b.new_typed_var(KirType::U64);
+            b.emit(KirOp::Shl(ws, w, y));
+            let wa = b.new_typed_var(KirType::U64);
+            b.emit(KirOp::And(wa, w, w));
+            let i = b.new_typed_var(KirType::I32);
+            b.emit(KirOp::Const(i, KirConst { ty: KirType::I32, value: ConstValue::I32(-8) }));
+            let ia = b.new_typed_var(KirType::I32);
+            b.emit(KirOp::Shr(ia, i, y));
+        });
+        for expected in [
+            "and.b32 %r2, %r0, %r1;",
+            "or.b32 %r3, %r0, %r1;",
+            "xor.b32 %r4, %r0, %r1;",
+            "not.b32 %r5, %r0;",
+            "shl.b32 %r6, %r0, %r1;",
+            "shr.u32 %r7, %r0, %r1;",
+            "rem.u32 %r8, %r0, %r1;",
+            "min.u32 %r9, %r0, %r1;",
+            "max.u32 %r10, %r0, %r1;",
+            "shl.b64 %rd12, %rd11, %r1;",
+            "and.b64 %rd13, %rd11, %rd11;",
+            "shr.s32 %r15, %r14, %r1;",
+        ] {
+            assert!(ptx.contains(expected), "missing `{expected}` in\n{ptx}");
+        }
+    }
+
+    #[test]
+    fn bool_bitwise_ops_use_the_predicate_class() {
+        let ptx = ptx_of(|b| {
+            let x = u32_const(b, 1);
+            let p = b.new_typed_var(KirType::Bool);
+            b.emit(KirOp::Cmp(p, x, x, CmpOp::Eq));
+            let q = b.new_typed_var(KirType::Bool);
+            b.emit(KirOp::Not(q, p));
+            let r = b.new_typed_var(KirType::Bool);
+            b.emit(KirOp::And(r, p, q));
+        });
+        assert!(ptx.contains("not.pred %p2, %p1;"), "{ptx}");
+        assert!(ptx.contains("and.pred %p3, %p1, %p2;"), "{ptx}");
+    }
+
+    #[test]
+    fn rcp_and_rsqrt_pick_the_float_forms() {
+        let ptx = ptx_of(|b| {
+            let x = f32_const(b, 4.0);
+            let r = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Rcp(r, x));
+            let q = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Rsqrt(q, x));
+            let d = b.new_typed_var(KirType::F64);
+            b.emit(KirOp::Const(d, KirConst { ty: KirType::F64, value: ConstValue::F64(4.0) }));
+            let rd = b.new_typed_var(KirType::F64);
+            b.emit(KirOp::Rcp(rd, d));
+            let mn = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Min(mn, x, x));
+        });
+        assert!(ptx.contains("rcp.approx.f32 %f1, %f0;"), "{ptx}");
+        assert!(ptx.contains("rsqrt.approx.f32 %f2, %f0;"), "{ptx}");
+        assert!(ptx.contains("rcp.rn.f64 %fd4, %fd3;"), "{ptx}");
+        assert!(ptx.contains("min.f32 %f5, %f0, %f0;"), "{ptx}");
+    }
+
+    #[test]
+    fn casts_carry_the_rounding_ptx_requires() {
+        let ptx = ptx_of(|b| {
+            let f = f32_const(b, 1.5);
+            let h = b.new_typed_var(KirType::F16);
+            b.emit(KirOp::Cast(h, f, KirType::F16));
+            let bf = b.new_typed_var(KirType::Bf16);
+            b.emit(KirOp::Cast(bf, f, KirType::Bf16));
+            let back = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Cast(back, bf, KirType::F32));
+            let i = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Cast(i, f, KirType::U32));
+            let g = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Cast(g, i, KirType::F32));
+            let w = b.new_typed_var(KirType::U64);
+            b.emit(KirOp::Cast(w, i, KirType::U64));
+            let d = b.new_typed_var(KirType::F64);
+            b.emit(KirOp::Cast(d, f, KirType::F64));
+            let fl = b.new_typed_var(KirType::I32);
+            b.emit(KirOp::CastRounded { dst: fl, src: f, ty: KirType::I32, mode: RoundMode::Rm });
+            let z = b.new_typed_var(KirType::F16);
+            b.emit(KirOp::CastRounded { dst: z, src: f, ty: KirType::F16, mode: RoundMode::Rz });
+        });
+        for expected in [
+            ".version 7.8",
+            ".target sm_80",
+            ".reg .b16 %h<",
+            "cvt.rn.f16.f32 %h1, %f0;",
+            "cvt.rn.bf16.f32 %h2, %f0;",
+            "cvt.f32.bf16 %f3, %h2;",
+            "cvt.rzi.u32.f32 %r4, %f0;",
+            "cvt.rn.f32.u32 %f5, %r4;",
+            "cvt.u64.u32 %rd6, %r4;",
+            "cvt.f64.f32 %fd7, %f0;",
+            "cvt.rmi.s32.f32 %r8, %f0;",
+            "cvt.rz.f16.f32 %h9, %f0;",
+        ] {
+            assert!(ptx.contains(expected), "missing `{expected}` in\n{ptx}");
+        }
+    }
+
+    #[test]
+    fn a_kernel_without_bf16_keeps_version_7_0() {
+        let ptx = ptx_of(|b| {
+            let f = f32_const(b, 1.5);
+            let h = b.new_typed_var(KirType::F16);
+            b.emit(KirOp::Cast(h, f, KirType::F16));
+        });
+        assert!(ptx.contains(".version 7.0\n.target sm_70"), "{ptx}");
+    }
+
+    #[test]
+    fn sixteen_bit_values_move_through_memory_as_b16() {
+        let bf16_ptr = KirType::Ptr(Box::new(KirType::Bf16), AddressSpace::Global);
+        let mut b = KirBuilder::new("b16");
+        let p = b.add_param("p", bf16_ptr, AddressSpace::Global);
+        let e = b.new_block();
+        b.set_block(e);
+        let v = b.new_typed_var(KirType::Bf16);
+        b.emit(KirOp::Load(v, p, AddressSpace::Global));
+        b.emit(KirOp::Store(p, v, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()));
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains("ld.global.b16 %h1, [%rd0];"), "{ptx}");
+        assert!(ptx.contains("st.global.b16 [%rd0], %h1;"), "{ptx}");
+    }
+
+    #[test]
+    fn vector_loads_and_stores_print_the_brace_list() {
+        let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+        let mut b = KirBuilder::new("vec");
+        let p = b.add_param("p", f32_ptr, AddressSpace::Global);
+        let e = b.new_block();
+        b.set_block(e);
+        let d: Vec<VarId> = (0..4).map(|_| b.new_typed_var(KirType::F32)).collect();
+        b.emit(KirOp::LoadVec { dsts: d.clone(), ptr: p, space: AddressSpace::Global });
+        b.emit(KirOp::StoreVec { ptr: p, vals: vec![d[1], d[0]], space: AddressSpace::Global });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()));
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains("ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd0];"), "{ptx}");
+        assert!(ptx.contains("st.global.v2.f32 [%rd0], {%f2, %f1};"), "{ptx}");
+    }
+
+    #[test]
+    fn shuffle_modes_votes_and_lane_ids() {
+        let ptx = ptx_of(|b| {
+            let x = u32_const(b, 7);
+            let one = u32_const(b, 1);
+            for (mode, width) in [
+                (ShuffleMode::Down, 32),
+                (ShuffleMode::Up, 32),
+                (ShuffleMode::Xor, 32),
+                (ShuffleMode::Idx, 32),
+                (ShuffleMode::Down, 16),
+            ] {
+                let d = b.new_typed_var(KirType::U32);
+                b.emit(KirOp::WarpShuffle { dst: d, val: x, lane: one, mode, width });
+            }
+            let p = b.new_typed_var(KirType::Bool);
+            b.emit(KirOp::Cmp(p, x, one, CmpOp::Gt));
+            let any = b.new_typed_var(KirType::Bool);
+            b.emit(KirOp::Vote { dst: any, pred: p, mode: VoteMode::Any });
+            let all = b.new_typed_var(KirType::Bool);
+            b.emit(KirOp::Vote { dst: all, pred: p, mode: VoteMode::All });
+            let bits = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Vote { dst: bits, pred: p, mode: VoteMode::Ballot });
+            let lane = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::LaneId(lane));
+            let warp = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::WarpId(warp));
+        });
+        for expected in [
+            "shfl.sync.down.b32 %r2, %r0, %r1, 0x1f, 0xffffffff;",
+            "shfl.sync.up.b32 %r3, %r0, %r1, 0x0, 0xffffffff;",
+            "shfl.sync.bfly.b32 %r4, %r0, %r1, 0x1f, 0xffffffff;",
+            "shfl.sync.idx.b32 %r5, %r0, %r1, 0x1f, 0xffffffff;",
+            "shfl.sync.down.b32 %r6, %r0, %r1, 0x101f, 0xffffffff;",
+            "vote.sync.any.pred %p8, %p7, 0xffffffff;",
+            "vote.sync.all.pred %p9, %p7, 0xffffffff;",
+            "vote.sync.ballot.b32 %r10, %p7, 0xffffffff;",
+            "mov.u32 %r11, %laneid;",
+            "mov.u32 %r12, %warpid;",
+        ] {
+            assert!(ptx.contains(expected), "missing `{expected}` in\n{ptx}");
+        }
+    }
+
+    #[test]
+    fn a_predicated_store_is_guarded_and_a_bool_select_uses_the_scratch_predicate() {
+        let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+        let mut b = KirBuilder::new("pred");
+        let p = b.add_param("p", f32_ptr, AddressSpace::Global);
+        let e = b.new_block();
+        b.set_block(e);
+        let x = u32_const(&mut b, 1);
+        let c = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(c, x, x, CmpOp::Eq));
+        let v = f32_const(&mut b, 2.0);
+        b.emit(KirOp::Predicated {
+            pred: c,
+            negate: false,
+            op: Box::new(KirOp::Store(p, v, AddressSpace::Global)),
+        });
+        b.emit(KirOp::Predicated {
+            pred: c,
+            negate: true,
+            op: Box::new(KirOp::AtomicAdd(p, v, AddressSpace::Global)),
+        });
+        let d = b.new_typed_var(KirType::Bool);
+        let nc = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Not(nc, c));
+        b.emit(KirOp::Select(d, c, nc, c));
+        let s = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Select(s, c, v, v));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()), "{:?}", ir.verify());
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains("    @%p2 st.global.f32 [%rd0], %f3;"), "{ptx}");
+        assert!(ptx.contains("    @!%p2 atom.global.add.f32"), "{ptx}");
+        assert!(ptx.contains(".reg .pred %edge_p;"), "{ptx}");
+        assert!(ptx.contains("and.pred %edge_p, %p2, %p5;\n    not.pred %p4, %p2;\n    and.pred %p4, %p4, %p2;\n    or.pred %p4, %p4, %edge_p;"), "{ptx}");
+        assert!(ptx.contains("selp.f32 %f6, %f3, %f3, %p2;"), "{ptx}");
     }
 }
