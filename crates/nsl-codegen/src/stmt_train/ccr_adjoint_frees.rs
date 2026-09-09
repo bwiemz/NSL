@@ -128,9 +128,9 @@ impl Compiler<'_> {
                 wgrad_chains.as_ref(),
             );
             if std::env::var("NSL_CCR_DEBUG").is_ok() {
-                nsl_runtime::nsl_log!(INFO, "ccr", "[ccr] adjoint last-use frees inserted: {n}");
+                nsl_log::nsl_log!(INFO, "ccr", "[ccr] adjoint last-use frees inserted: {n}");
                 if let Some(ref chains) = wgrad_chains {
-                    nsl_runtime::nsl_log!(INFO, "ccr", 
+                    nsl_log::nsl_log!(INFO, "ccr", 
                         "[ccr] wgrad chains kept contiguous: {}",
                         chains.by_reduce_result.len()
                     );
@@ -146,7 +146,7 @@ impl Compiler<'_> {
             if let Some(ref before) = wgrad_chains {
                 let after = crate::wgrad_fusion::plan(adjoint, &ccr_protect);
                 if after.by_reduce_result.len() < before.by_reduce_result.len() {
-                    nsl_runtime::nsl_log!(WARN, "codegen", 
+                    nsl_log::nsl_log!(WARN, "codegen", 
                         "warning: [ccr] last-use freeing broke {} weight-gradient \
                          fusion chain(s) ({} admissible before, {} after) — \
                          --fuse-wgrad-accum will silently fuse fewer chains on \

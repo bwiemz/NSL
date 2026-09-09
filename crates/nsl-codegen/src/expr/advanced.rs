@@ -1200,7 +1200,7 @@ impl Compiler<'_> {
             let flags: Vec<bool> = (0..args.len())
                 .map(|i| self.escape.param_is_captive(&escape_key, i))
                 .collect();
-            nsl_runtime::nsl_log!(INFO, "codegen", "[escape/site] {escape_key} nargs={} captive={flags:?}", args.len());
+            nsl_log::nsl_log!(INFO, "codegen", "[escape/site] {escape_key} nargs={} captive={flags:?}", args.len());
         }
         let mut arg_vals = vec![self_val];
         for (i, arg) in args.iter().enumerate() {
@@ -1498,7 +1498,7 @@ impl Compiler<'_> {
         let shmem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
             &ctx.config, &mut diags,
         ) as i64;
-        for d in diags { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {d}"); }
+        for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
 
         // Gap B: capture the CSHA-with-saves PTX / name / shmem triple up
         // front so the `save_activations_for_backward` branch below can
@@ -1534,7 +1534,7 @@ impl Compiler<'_> {
                     crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
                         c, &mut d,
                     ) as i64;
-                for s in d { nsl_runtime::nsl_log!(WARN, "codegen", "warning: {s}"); }
+                for s in d { nsl_log::nsl_log!(WARN, "codegen", "warning: {s}"); }
                 bytes
             })
             .unwrap_or(shmem_bytes);
@@ -2936,7 +2936,7 @@ impl Compiler<'_> {
 
         match result {
             crate::weight_aware::FoldResult::Constant(ct) => {
-                nsl_runtime::nsl_log!(INFO, "nsl", 
+                nsl_log::nsl_log!(INFO, "nsl", 
                     "[nsl] M52b: constant-folded {} @ {} → {:?} tensor ({} bytes)",
                     lk,
                     rk,
@@ -3017,7 +3017,7 @@ impl Compiler<'_> {
                 entry,
                 self.compile_options.weights.config.dead_weight_threshold,
             ) {
-                nsl_runtime::nsl_log!(INFO, "nsl", 
+                nsl_log::nsl_log!(INFO, "nsl", 
                     "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
                     key
                 );
@@ -3036,7 +3036,7 @@ impl Compiler<'_> {
                 entry,
                 self.compile_options.weights.config.dead_weight_threshold,
             ) {
-                nsl_runtime::nsl_log!(INFO, "nsl", 
+                nsl_log::nsl_log!(INFO, "nsl", 
                     "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
                     key
                 );
@@ -3092,7 +3092,7 @@ impl Compiler<'_> {
             None => return Ok(None),
         };
 
-        nsl_runtime::nsl_log!(INFO, "nsl", 
+        nsl_log::nsl_log!(INFO, "nsl", 
             "[nsl] M52c: emitting CSR sparse matmul for weight '{}' ({:.1}% sparse, {} nnz / {} total)",
             rhs_key, sparsity.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
         );
@@ -3189,7 +3189,7 @@ impl Compiler<'_> {
             let hint = if let Some(info) = entry.sparsity() {
                 if info.use_sparse_kernel {
                     if let Some(ref csr) = info.csr {
-                        nsl_runtime::nsl_log!(INFO, "nsl", 
+                        nsl_log::nsl_log!(INFO, "nsl", 
                             "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
                             key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                         );
@@ -3223,7 +3223,7 @@ impl Compiler<'_> {
             let hint = if let Some(info) = entry.sparsity() {
                 if info.use_sparse_kernel {
                     if let Some(ref csr) = info.csr {
-                        nsl_runtime::nsl_log!(INFO, "nsl", 
+                        nsl_log::nsl_log!(INFO, "nsl", 
                             "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
                             key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                         );
@@ -3267,7 +3267,7 @@ impl Compiler<'_> {
         if let Some(key) = state.weight_values.get(&scalar_val)
             && let Some(&scale) = self.memory.weight_scales.get(key)
         {
-            nsl_runtime::nsl_log!(INFO, "nsl", 
+            nsl_log::nsl_log!(INFO, "nsl", 
                 "[nsl] M52d: fused scaling constant {:.6e} for weight '{}'",
                 scale, key
             );
@@ -3286,7 +3286,7 @@ impl Compiler<'_> {
                 let bw = entry.dtype.byte_width();
                 if bw <= entry.data.len() {
                     let val = entry.dtype.to_f64(&entry.data[0..bw]);
-                    nsl_runtime::nsl_log!(INFO, "nsl", 
+                    nsl_log::nsl_log!(INFO, "nsl", 
                         "[nsl] M52d: fused single-element weight '{}' = {:.6e} as compile-time constant",
                         key, val
                     );

@@ -108,7 +108,7 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
             d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast: unsupported source dtype {other} (v6: F32/FP16/BF16)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("nsl_tensor_cast: unsupported source dtype {other} (v6: F32/FP16/BF16)")),
     };
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
@@ -136,7 +136,7 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             }
             p as *mut c_void
         }
-        other => panic!("nsl_tensor_cast: unsupported target dtype {other} (v6: F32/FP16/BF16)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("nsl_tensor_cast: unsupported target dtype {other} (v6: F32/FP16/BF16)")),
     };
 
     let out = Box::new(NslTensor::new(
@@ -210,10 +210,10 @@ fn gpu_cast_core(src_data: u64, src_dtype: u16, dst_data: u64, dst_dtype: u16, l
     }
     let (ptx, kname) = precision_cast_kernels::pick_cast_kernel(src_dtype, dst_dtype)
         .unwrap_or_else(|| {
-            panic!(
+            crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!(
                 "gpu_cast_core: no GPU cast kernel for src dtype {src_dtype} -> \
                  target {dst_dtype}; supported pairs go through f32 only"
-            )
+            ))
         });
     let rc = precision_cast_kernels::launch_cast(ptx, kname, src_data, dst_data, len as u64);
     assert_eq!(
@@ -239,7 +239,7 @@ fn gpu_cast_bare(t: &NslTensor, target_dtype: u16) -> i64 {
     let elem: usize = match target_dtype {
         DTYPE_F32 => 4,
         DTYPE_FP16 | DTYPE_BF16 => 2,
-        other => panic!("gpu_cast_bare: unsupported target dtype {other} (F32/FP16/BF16)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("gpu_cast_bare: unsupported target dtype {other} (F32/FP16/BF16)")),
     };
     let dst_bytes = len * elem;
     let dst_data = crate::cuda::inner::alloc_managed(dst_bytes);
@@ -257,11 +257,11 @@ fn gpu_cast_bare(t: &NslTensor, target_dtype: u16) -> i64 {
 /// `gpu_cast_and_publish`'s non-cuda stub).
 #[cfg(not(feature = "cuda"))]
 fn gpu_cast_bare(t: &NslTensor, _target_dtype: u16) -> i64 {
-    panic!(
+    crate::fatal::die(crate::fatal::Fatal::CudaNotCompiled, &format!(
         "gpu_cast_bare: device tensor (device={}) reached cast path but the \
          runtime was compiled without the `cuda` feature",
         t.device
-    );
+    ));
 }
 
 #[cfg(feature = "cuda")]
@@ -283,9 +283,9 @@ fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
         DTYPE_F32 => 4,
         DTYPE_FP16 => 2,
         DTYPE_BF16 => 2,
-        other => panic!(
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!(
             "gpu_cast_and_publish: unsupported target dtype {other} (v7: F32/FP16/BF16)"
-        ),
+        )),
     };
 
     // Allocate the device-side destination buffer via the runtime's managed
@@ -310,11 +310,11 @@ fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
     } else {
         let (ptx, kname) =
             precision_cast_kernels::pick_cast_kernel(t.dtype, target_dtype).unwrap_or_else(|| {
-                panic!(
+                crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!(
                     "gpu_cast_and_publish: no GPU cast kernel for src dtype {} -> target {}; \
                      v7 supports {{f32,fp16,bf16}} pairs through f32 only",
                     t.dtype, target_dtype
-                )
+                ))
             });
         let rc = precision_cast_kernels::launch_cast(
             ptx,
@@ -362,11 +362,11 @@ fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
 /// so the device-branch in `cast_and_publish` still compiles.
 #[cfg(not(feature = "cuda"))]
 fn gpu_cast_and_publish(t: &NslTensor, _target_dtype: u16) -> i64 {
-    panic!(
+    crate::fatal::die(crate::fatal::Fatal::CudaNotCompiled, &format!(
         "gpu_cast_and_publish: device tensor (device={}) reached cast path \
          but runtime was compiled without the `cuda` feature",
         t.device
-    );
+    ));
 }
 
 /// Shared helper for v6 cast wrappers. Performs a CPU cast (via the same
@@ -422,7 +422,7 @@ fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
             let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
             d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
         }
-        other => panic!("cast_and_publish: unsupported source dtype {other} (v6: F32/FP16/BF16)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("cast_and_publish: unsupported source dtype {other} (v6: F32/FP16/BF16)")),
     };
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
@@ -450,7 +450,7 @@ fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
             }
             p as *mut c_void
         }
-        other => panic!("cast_and_publish: unsupported target dtype {other} (v6: F32/FP16/BF16)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("cast_and_publish: unsupported target dtype {other} (v6: F32/FP16/BF16)")),
     };
 
     let out = Box::new(NslTensor::new(
@@ -515,11 +515,11 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
             return;
         }
         #[cfg(not(feature = "cuda"))]
-        panic!(
+        crate::fatal::die(crate::fatal::Fatal::CudaNotCompiled, &format!(
             "nsl_tensor_cast_into: device tensors (device={}) but the runtime \
              was compiled without the `cuda` feature",
             dst.device
-        );
+        ));
     }
 
     let src_f32: Vec<f32> = match src.dtype {
@@ -532,7 +532,7 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
             let d = unsafe { std::slice::from_raw_parts(src.data as *const u16, len) };
             d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other} (v6: F32/FP16/BF16)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("nsl_tensor_cast_into: unsupported src dtype {other} (v6: F32/FP16/BF16)")),
     };
 
     match dst.dtype {
@@ -554,7 +554,7 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
                 unsafe { *p.add(i) = f32_to_bf16_bits(v) };
             }
         }
-        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other} (v6: F32/FP16/BF16)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("nsl_tensor_cast_into: unsupported dst dtype {other} (v6: F32/FP16/BF16)")),
     }
 }
 
@@ -604,9 +604,9 @@ fn gpu_zeros_like_dtype(t: &NslTensor, dtype: u16) -> i64 {
     let elem_size: usize = match dtype {
         DTYPE_F32 => 4,
         DTYPE_FP16 | DTYPE_BF16 => 2,
-        other => panic!(
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!(
             "nsl_tensor_zeros_like_dtype: unsupported dtype {other} (F32=1, FP16=2, BF16=3)"
-        ),
+        )),
     };
     let data_size = (t.len as usize) * elem_size;
     let data = crate::cuda::inner::alloc_managed(data_size);
@@ -622,11 +622,11 @@ fn gpu_zeros_like_dtype(t: &NslTensor, dtype: u16) -> i64 {
 /// `cuda` off: a device template cannot exist — loud stub.
 #[cfg(not(feature = "cuda"))]
 fn gpu_zeros_like_dtype(t: &NslTensor, _dtype: u16) -> i64 {
-    panic!(
+    crate::fatal::die(crate::fatal::Fatal::CudaNotCompiled, &format!(
         "nsl_tensor_zeros_like_dtype: GPU template (device={}) but the \
          runtime was compiled without the `cuda` feature",
         t.device
-    );
+    ));
 }
 
 fn zeros_like_dtype_body(t: &NslTensor, dtype: u16) -> i64 {
@@ -634,7 +634,7 @@ fn zeros_like_dtype_body(t: &NslTensor, dtype: u16) -> i64 {
         DTYPE_F32 => 4,
         DTYPE_FP16 => 2,
         DTYPE_BF16 => 2,
-        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other} (v6: F32=1, FP16=2, BF16=3)"),
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!("nsl_tensor_zeros_like_dtype: unsupported dtype {other} (v6: F32=1, FP16=2, BF16=3)")),
     };
 
     let ndim = t.ndim;
@@ -747,10 +747,10 @@ pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_p
                 // gpu_cast_bare's caller-side frees).
                 crate::cuda::inner::free_managed(transient);
             }
-            other => panic!(
+            other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!(
                 "nsl_tensor_cast_from_host: unsupported host state dtype {other} \
                  (F32=1, FP16=2, BF16=3)"
-            ),
+            )),
         }
         let shape = NslTensor::copy_shape(src.shape, src.ndim);
         let strides = NslTensor::compute_strides(shape, src.ndim);
@@ -760,11 +760,11 @@ pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_p
         return Box::into_raw(out) as i64;
     }
     #[cfg(not(feature = "cuda"))]
-    panic!(
+    crate::fatal::die(crate::fatal::Fatal::CudaNotCompiled, &format!(
         "nsl_tensor_cast_from_host: device template (device={}) but the runtime \
          was compiled without the `cuda` feature",
         template.device
-    );
+    ));
 }
 
 /// Quant-store a device-resident F32 working tensor back into its
@@ -864,11 +864,11 @@ pub extern "C" fn nsl_tensor_cast_to_host_into(host_dst_ptr: i64, device_src_ptr
         }
     }
     #[cfg(not(feature = "cuda"))]
-    panic!(
+    crate::fatal::die(crate::fatal::Fatal::CudaNotCompiled, &format!(
         "nsl_tensor_cast_to_host_into: device src (device={}) but the runtime \
          was compiled without the `cuda` feature",
         src.device
-    );
+    ));
 }
 
 /// Allocate a zero-filled HOST-resident tensor with `template`'s shape at
@@ -889,9 +889,9 @@ pub extern "C" fn nsl_tensor_zeros_like_host_dtype(template_ptr: i64, dtype: i64
     let elem_size: usize = match dtype {
         DTYPE_F32 => 4,
         DTYPE_FP16 | DTYPE_BF16 => 2,
-        other => panic!(
+        other => crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, &format!(
             "nsl_tensor_zeros_like_host_dtype: unsupported dtype {other} (F32=1, FP16=2, BF16=3)"
-        ),
+        )),
     };
     if t.device == 0 {
         return nsl_tensor_zeros_like_dtype(template_ptr, dtype as i64);

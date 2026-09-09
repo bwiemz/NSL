@@ -31,9 +31,14 @@ const PROBE_SYMBOL: &str = "nsl_flash_attention_csha_backward_probe";
 const ALLOW_LIST: &[&str] = &[
     // Runtime definition file (the symbol lives here).
     "crates/nsl-runtime/src/flash_attention.rs",
-    // Cranelift extern-decl registry. The table quotes the symbol NAME, so
-    // the `(` this scan looks for never follows it and no registry file has
-    // ever matched; the entry is kept only to say that deliberately.
+    // The typed ABI table (roadmap A3): its row spells the declaration as
+    // `nsl_flash_attention_csha_backward(i64, …)`, which is a declaration,
+    // not a call — the codegen renders it into a Cranelift signature and the
+    // runtime into a compile-time signature check.
+    "crates/nsl-abi/src/table.rs",
+    // The codegen's rendering of that table quotes the symbol NAME, so the
+    // `(` this scan looks for never follows it; the entry is kept only to
+    // say that deliberately.
     "crates/nsl-codegen/src/builtins/",
     // AD lowerer emits the call.
     "crates/nsl-codegen/src/wengert_lower.rs",

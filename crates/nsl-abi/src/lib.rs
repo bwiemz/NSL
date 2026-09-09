@@ -32,6 +32,9 @@
 //! lets the compiler stop depending on the runtime's dependency tree.
 
 pub mod wire;
+pub mod table;
+pub mod typed;
+pub use table::{FnDecl, RUNTIME_ABI};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -446,11 +449,11 @@ fn split_top_level(list: &str) -> Vec<String> {
 /// source text, returning the byte offset and spelling of each name.
 ///
 /// `const` ONLY. A registry spelled `static RUNTIME_FUNCTIONS`, or built by a
-/// `LazyLock`, is invisible here and contributes nothing — silently. The
-/// `tables_parsed >= 1` assertion in `signature_agreement` catches the total
-/// case (a registry that moved wholesale), and the truncation floor catches a
-/// large partial one, but a single table converted to `static` alongside
-/// others would go unnoticed. Keep the registry `const`.
+/// `LazyLock`, is invisible here and contributes nothing — silently.
+///
+/// Since roadmap A3 step 1 the codegen keeps no such tables: its declarations
+/// are rendered from [`RUNTIME_ABI`], which `check_workspace` reads directly.
+/// This parser is kept for its unit tests and for any out-of-tree table.
 ///
 /// A declaration is recognised only where one can appear: at the start of a
 /// line, after optional indentation and an optional visibility prefix.
@@ -458,10 +461,10 @@ fn split_top_level(list: &str) -> Vec<String> {
 /// Anchoring on the `const` keyword anywhere in the text was not enough.
 /// Comments are stripped before this runs, but STRING LITERALS are not, so a
 /// source file containing the text `"const RUNTIME_FUNCTIONS"` inside a string
-/// registered as a declaration. That is not hypothetical: the codegen's own
-/// `every_declared_table_is_reachable` test — which scans these same files —
-/// contains exactly that literal twice, and the two phantoms tripped the
-/// `tables_found == tables_parsed` assertion the moment the registry was
+/// registered as a declaration. That is not hypothetical: the codegen's
+/// former `every_declared_table_is_reachable` test — which scanned these
+/// same files — contained exactly that literal twice, and the two phantoms
+/// tripped the gate's table-count assertion the moment the registry was
 /// split.
 ///
 /// Line-anchoring costs a real declaration only if one is written mid-line
@@ -936,12 +939,6 @@ pub struct Report {
     pub via_macro: usize,
     /// All detected disagreements.
     pub mismatches: Vec<Mismatch>,
-    /// How many `const RUNTIME_FUNCTIONS*` declarations were spotted.
-    pub tables_found: usize,
-    /// How many of those were successfully parsed into entries. Fewer than
-    /// `tables_found` means a declaration was recognised but not read — a
-    /// parser regression, which is otherwise silent.
-    pub tables_parsed: usize,
 }
 
 /// Cross-check the declared table against the parsed implementations (textual
@@ -1015,26 +1012,19 @@ pub fn cross_check(declared: &[FnSig], impls: &[FnSig], macro_impls: &[FnSig]) -
 /// truncation floor in `signature_agreement`. Scanning costs one directory walk
 /// of a crate whose sibling is already walked the same way.
 pub fn check_workspace(workspace_root: &Path) -> std::io::Result<Report> {
-    let codegen_src = workspace_root.join("crates/nsl-codegen/src");
-    let mut declared = Vec::new();
-    // Sorted so the report is stable across filesystems: `rust_files` walks in
-    // `read_dir` order, which is not ordered on ext4/btrfs.
-    let mut codegen_files = rust_files(&codegen_src)?;
-    codegen_files.sort();
-    let mut tables_found = 0usize;
-    let mut tables_parsed = 0usize;
-    for path in codegen_files {
-        let text = std::fs::read_to_string(&path)?;
-        let label = path
-            .strip_prefix(workspace_root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .to_string();
-        let (sigs, seen, parsed) = parse_runtime_functions_table_in_file(&text, &label);
-        declared.extend(sigs);
-        tables_found += seen;
-        tables_parsed += parsed;
-    }
+    // The declared side is the typed table itself (roadmap A3): one `FnSig`
+    // per row of `RUNTIME_ABI`, which is what the codegen renders its
+    // declarations from. Parsing the codegen's sources for tables would find
+    // none now; the text parser stays for the runtime side below.
+    let declared: Vec<FnSig> = crate::RUNTIME_ABI
+        .iter()
+        .map(|d| FnSig {
+            name: d.name.to_string(),
+            params: d.params.iter().map(|s| ParsedType::Known(*s)).collect(),
+            ret: d.ret.map(ParsedType::Known),
+            source: format!("nsl-abi table, group `{}`", d.group),
+        })
+        .collect();
 
     let runtime_src = workspace_root.join("crates/nsl-runtime/src");
     let mut impls = Vec::new();
@@ -1051,10 +1041,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<Report> {
             macro_impls.extend(parse_inplace_unary_macro(&text));
         }
     }
-    let mut report = cross_check(&declared, &impls, &macro_impls);
-    report.tables_found = tables_found;
-    report.tables_parsed = tables_parsed;
-    Ok(report)
+    Ok(cross_check(&declared, &impls, &macro_impls))
 }
 
 /// Recursively collect `.rs` files under a directory.

@@ -555,7 +555,7 @@ impl Compiler<'_> {
                                 );
                             }
                             Ownership::TapeHeld => {
-                                nsl_runtime::nsl_log!(WARN, "codegen", 
+                                nsl_log::nsl_log!(WARN, "codegen", 
                                     "ELTLS warning: returning TapeHeld tensor — semantic error"
                                 );
                                 let _ = self.compile_call_by_name(
@@ -2317,7 +2317,7 @@ impl Compiler<'_> {
         if !touch.touches {
             return Ok(None);
         }
-        nsl_runtime::nsl_log!(WARN, "weight-stream", 
+        nsl_log::nsl_log!(WARN, "weight-stream", 
             "[weight-stream] callback '{}' reads model state ({}); inserting a \
              scoped upload/re-evict bracket ({} writeback) so its reads see \
              resident \u{3b8} instead of crashing on evicted (null) data",

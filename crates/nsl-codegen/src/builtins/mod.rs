@@ -1,33 +1,33 @@
 //! The runtime-function registry: every `extern "C"` symbol the codegen can
 //! emit a call to, with its Cranelift signature.
 //!
-//! # Why this is split, and along which line
+//! # Where the declarations live
 //!
-//! The registry was one 3,500-line table. The split is between what the
-//! LANGUAGE exposes and what the RUNTIME implements:
+//! The registry is rendered from the ABI table in `crates/nsl-abi/src/table.rs`
+//! (roadmap A3): `nsl_abi::for_each_runtime_fn!` hands
+//! [`render_runtime_functions`] every row, and each becomes one
+//! `(name, params, ret)` of [`RUNTIME_FUNCTIONS`]. The same table renders,
+//! in `nsl-runtime`, into a compile-time check that each implementation has
+//! that signature, so the two sides cannot drift — the fourteen hand-written
+//! `RUNTIME_FUNCTIONS*` tables this module used to keep (split by PR #600
+//! along "what the language exposes vs what the runtime implements") are the
+//! table's groups now.
 //!
-//! * [`mod@crate::builtins`] — the surface a program writes directly: printing,
-//!   scalar arithmetic, collections, and the tensor operations that have NSL
-//!   syntax or a stdlib spelling. Adding one of these widens the language.
-//! * [`mod@crate::runtime_abi`] — the implementation surface behind it: fused
-//!   kernels, the training loop's plumbing, optimizers, parallelism, serving,
-//!   quantization, diagnostics. Adding one of these does not change what a
-//!   program can say, only how it runs.
-//!
-//! The line is "semantic primitive vs composition", not "could this be written
-//! in NSL?" — plenty of `builtins` entries could be, and stay here because the
-//! compiler needs to know their shape, dtype or aliasing behaviour.
+//! What stays here is the lowering: `builtins/{memory,io,scalar,collections,
+//! tensor}.rs` hold the code that emits calls to the language-facing
+//! functions, and [`declare_runtime_functions`] declares every row as an
+//! import.
 //!
 //! # Declaration order is not load-bearing
 //!
-//! [`declare_runtime_functions`] walks the tables in the order of
-//! [`RUNTIME_TABLES`], so `FuncId`s are assigned in that order. That order does
-//! NOT reach the emitted CLIF: it names its runtime callees (`fn0 = nsl_alloc`)
-//! and numbers funcrefs per function by order of first use, so the global
-//! `FuncId` never appears. Verified by moving `nsl_alloc` from index 6 to index
-//! 0 before this split: all 26 `train_clif_snapshots` stayed byte-identical.
-//! That is what makes regrouping the registry free, and why an entry may be
-//! moved between these files on the strength of where it belongs.
+//! [`declare_runtime_functions`] walks the rows in table order, so `FuncId`s
+//! are assigned in that order. That order does NOT reach the emitted CLIF: it
+//! names its runtime callees (`fn0 = nsl_alloc`) and numbers funcrefs per
+//! function by order of first use, so the global `FuncId` never appears.
+//! Verified by moving `nsl_alloc` from index 6 to index 0 before the split:
+//! all 26 `train_clif_snapshots` stayed byte-identical. That is what makes
+//! regrouping the table free, and why a row may be moved between groups on
+//! the strength of where it belongs.
 //!
 //! It does reach the OBJECT FILE — `cranelift-object` calls `add_symbol`
 //! eagerly from `declare_function`, `Linkage::Import` included, so the `.o`
@@ -35,12 +35,14 @@
 //!
 //! # Adding a runtime function
 //!
-//! Put it in the file its subject matter belongs to, in any position. It must
-//! appear exactly once across every table — `no_runtime_function_is_declared_twice`
-//! checks that here, and `nsl-abi`'s `DuplicateDecl` checks it across files —
-//! and its signature must match the `extern "C" fn` in `nsl-runtime`, which
-//! `nsl-abi`'s `signature_agreement` gate enforces. The two are linked by
-//! symbol name only; nothing else in the build catches a drift.
+//! Implement the `extern "C" fn` in `nsl-runtime`, then add one row to the
+//! table in `nsl-abi` (the grammar and the groups are in its module docs).
+//! Nothing here changes: this file declares whatever the table says. A row
+//! must appear once — `no_runtime_function_is_declared_twice` checks the
+//! rendering here and `nsl-abi`'s own tests check the table — and its
+//! signature must match the implementation, which the runtime's build now
+//! enforces (`abi_check.rs`) and `nsl-abi`'s `signature_agreement` gate
+//! cross-checks by text as belt-and-braces.
 
 use cranelift_codegen::ir::{types, AbiParam, Signature};
 use cranelift_codegen::isa::CallConv;
@@ -59,37 +61,38 @@ pub(crate) mod tensor;
 /// Runtime function info: (name, params, returns).
 type RuntimeFn = (&'static str, &'static [types::Type], Option<types::Type>);
 
-/// Every table in the registry.
-///
-/// A table missing from this list is silently never declared, and the calls
-/// the codegen emits to it fail to link — so a new file must be added here as
-/// well as to its `mod` declaration.
-///
-/// `every_declared_table_is_reachable` catches that: it parses every table
-/// under `src/` and asserts the names found there are exactly the names
-/// reachable through this list. (`dead_code = "deny"` usually gets there
-/// first, rejecting the unused const at compile time; the test covers the
-/// case rustc cannot see, a file that is never `mod`-declared.)
-const RUNTIME_TABLES: &[&[RuntimeFn]] = &[
-    memory::RUNTIME_FUNCTIONS_MEMORY,
-    io::RUNTIME_FUNCTIONS_IO,
-    scalar::RUNTIME_FUNCTIONS_SCALAR,
-    collections::RUNTIME_FUNCTIONS_COLLECTIONS,
-    tensor::RUNTIME_FUNCTIONS_TENSOR,
-    crate::runtime_abi::tensor::RUNTIME_FUNCTIONS_ABI_TENSOR,
-    crate::runtime_abi::training::RUNTIME_FUNCTIONS_ABI_TRAINING,
-    crate::runtime_abi::optimizer::RUNTIME_FUNCTIONS_ABI_OPTIMIZER,
-    crate::runtime_abi::distributed::RUNTIME_FUNCTIONS_ABI_DISTRIBUTED,
-    crate::runtime_abi::inference::RUNTIME_FUNCTIONS_ABI_INFERENCE,
-    crate::runtime_abi::quantization::RUNTIME_FUNCTIONS_ABI_QUANTIZATION,
-    crate::runtime_abi::diagnostics::RUNTIME_FUNCTIONS_ABI_DIAGNOSTICS,
-    crate::runtime_abi::memory::RUNTIME_FUNCTIONS_ABI_MEMORY,
-    crate::runtime_abi::interop::RUNTIME_FUNCTIONS_ABI_INTEROP,
-];
+/// The row scalars of the ABI table as Cranelift types.
+macro_rules! cranelift_type {
+    (i64) => { types::I64 };
+    (i32) => { types::I32 };
+    (i16) => { types::I16 };
+    (i8) => { types::I8 };
+    (f64) => { types::F64 };
+    (f32) => { types::F32 };
+}
 
-/// Every runtime function, across every table.
+macro_rules! cranelift_ret {
+    (()) => { None };
+    ($t:ident) => { Some(cranelift_type!($t)) };
+}
+
+/// One `(name, params, ret)` per row of `nsl_abi::for_each_runtime_fn!`,
+/// in row order. This is the registry: every runtime function the codegen
+/// can emit a call to, rendered from the one table in
+/// `crates/nsl-abi/src/table.rs` (roadmap A3).
+macro_rules! render_runtime_functions {
+    ($([$g:ident] $n:ident ($($p:ident),*) -> $r:tt = $($seg:ident)::+ $([$f:ident])? ;)*) => {
+        const RUNTIME_FUNCTIONS: &[RuntimeFn] = &[
+            $((stringify!($n), &[$(cranelift_type!($p)),*], cranelift_ret!($r)),)*
+        ];
+    };
+}
+
+nsl_abi::for_each_runtime_fn!(render_runtime_functions);
+
+/// Every runtime function, in table order.
 pub(crate) fn all_runtime_functions() -> impl Iterator<Item = &'static RuntimeFn> {
-    RUNTIME_TABLES.iter().flat_map(|t| t.iter())
+    RUNTIME_FUNCTIONS.iter()
 }
 
 /// Declare all runtime functions as imports in the module.
@@ -155,93 +158,39 @@ pub fn declare_runtime_functions(
 
 #[cfg(test)]
 mod tests {
-    use super::all_runtime_functions;
+    use super::{all_runtime_functions, RuntimeFn};
+    use cranelift_codegen::ir::types;
 
-    /// Every table that EXISTS is reachable from [`super::RUNTIME_TABLES`].
-    ///
-    /// Splitting the registry introduced a failure mode the single table did
-    /// not have: a new file can declare a `RUNTIME_FUNCTIONS*` const, be added
-    /// to its `mod` list so it compiles, and be left out of `RUNTIME_TABLES`.
-    /// Nothing then declares those functions, and every call the codegen emits
-    /// to one fails at LINK time, in whatever unrelated test happens to link
-    /// first. `nsl-abi` cannot catch it either: it parses the sources, so it
-    /// sees the orphaned table and is satisfied.
-    ///
-    /// So this reads the registry's own sources and compares the names it
-    /// finds against the names actually reachable at runtime.
-    ///
-    /// The reading is done by `nsl-abi`, which is the parser the ABI gate
-    /// already uses on these same files. A second hand-rolled scanner lived
-    /// here first and was wrong in a way worth recording: it recognised only
-    /// `const` and `pub(crate) const`, so a table spelled `pub(super) const`
-    /// — arguably the more idiomatic visibility, since these are read only by
-    /// the parent — would have been invisible to it. Its names would never
-    /// enter `on_disk`, they would not be reachable either, and BOTH
-    /// assertions below would have passed over exactly the hole this test
-    /// exists to close. Sharing the parser also means the two cannot drift.
+    /// The registry IS the ABI table: every row of `nsl_abi::RUNTIME_ABI` is
+    /// declared here with the same signature, in the same order, and nothing
+    /// else is. Both are renderings of one macro, so they cannot drift apart;
+    /// what this pins is the rendering itself — that every scalar spelling
+    /// maps to the right Cranelift type and every row is read (a macro arm
+    /// that silently matched nothing would surface here as a length gap).
     #[test]
-    fn every_declared_table_is_reachable() {
-        use std::collections::BTreeSet;
+    fn registry_is_the_abi_table() {
+        use nsl_abi::AbiScalar;
 
-        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    out.push(path);
-                }
+        fn scalar(t: types::Type) -> AbiScalar {
+            match t {
+                types::I8 => AbiScalar::Int(8),
+                types::I16 => AbiScalar::Int(16),
+                types::I32 => AbiScalar::Int(32),
+                types::I64 => AbiScalar::Int(64),
+                types::F32 => AbiScalar::Float(32),
+                types::F64 => AbiScalar::Float(64),
+                other => panic!("unmapped Cranelift type {other}"),
             }
         }
 
-        // The WHOLE crate source, not just the two registry directories: a
-        // table in a third directory, or nested one level deeper, is one
-        // `nsl-abi` would still find and signature-check while nothing
-        // declared it.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
-        files.sort();
-
-        let mut on_disk: BTreeSet<String> = BTreeSet::new();
-        let (mut found, mut parsed) = (0usize, 0usize);
-        for path in &files {
-            let text =
-                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-            let label = path.display().to_string();
-            let (sigs, seen, ok) = nsl_abi::parse_runtime_functions_table_in_file(&text, &label);
-            found += seen;
-            parsed += ok;
-            on_disk.extend(sigs.into_iter().map(|s| s.name));
+        let rendered: Vec<&RuntimeFn> = all_runtime_functions().collect();
+        assert_eq!(rendered.len(), nsl_abi::RUNTIME_ABI.len(), "row count");
+        for (r, d) in rendered.iter().zip(nsl_abi::RUNTIME_ABI) {
+            assert_eq!(r.0, d.name, "row order");
+            let params: Vec<AbiScalar> = r.1.iter().map(|t| scalar(*t)).collect();
+            assert_eq!(params, d.params, "{}: params", d.name);
+            assert_eq!(r.2.map(scalar), d.ret, "{}: return", d.name);
         }
-        assert_eq!(
-            found, parsed,
-            "{found} table declaration(s) found under src/ but {parsed} parsed — one was \
-             recognised and then not read, so the comparison below is over an incomplete set."
-        );
-
-        let reachable: BTreeSet<String> =
-            all_runtime_functions().map(|(n, _, _)| (*n).to_string()).collect();
-
-        let orphaned: Vec<&String> = on_disk.difference(&reachable).collect();
-        assert!(
-            orphaned.is_empty(),
-            "{} runtime function(s) are declared in a table that RUNTIME_TABLES does not \
-             list, so nothing declares them and every emitted call to one fails at LINK \
-             time. Add the table to RUNTIME_TABLES in builtins/mod.rs:\n  {:?}",
-            orphaned.len(),
-            orphaned
-        );
-        // The converse would mean the scanner missed a table it should have
-        // found, which would make the check above vacuous.
-        let unseen: Vec<&String> = reachable.difference(&on_disk).collect();
-        assert!(
-            unseen.is_empty(),
-            "the source scan missed {} reachable function(s) — this gate is not seeing \
-             the tables it claims to check:\n  {:?}",
-            unseen.len(),
-            unseen
-        );
     }
 
     /// No runtime function may be declared twice.

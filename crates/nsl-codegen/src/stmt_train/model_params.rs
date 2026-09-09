@@ -407,7 +407,7 @@ impl Compiler<'_> {
                     self.compile_options.wggo.moment_precision,
                 ) {
                     MPA::NotLoweredNoOptIn => {
-                        nsl_runtime::nsl_log!(INFO, "cpdt", 
+                        nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] optimizer-moment precision NOT lowered: WGGO's \
                              plan carries reduced-precision m/v decisions but \
                              --wggo-moment-precision was not passed (opt-in: \
@@ -417,7 +417,7 @@ impl Compiler<'_> {
                     }
                     MPA::Merged(m, v) => {
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
-                        nsl_runtime::nsl_log!(INFO, "cpdt", 
+                        nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] WGGO optimizer-moment precision active \
                              (merged with the CPDT per-param plan, F32 wins): \
                              {sub32} moment buffer(s) in FP16 storage \
@@ -429,7 +429,7 @@ impl Compiler<'_> {
                     }
                     MPA::WggoOnly(m, v) => {
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
-                        nsl_runtime::nsl_log!(INFO, "cpdt", 
+                        nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] WGGO optimizer-moment precision active: {sub32} \
                              moment buffer(s) in FP16 storage (8-bit clamps to FP16 \
                              in v1; device-resident — GPU runs use the CFTP-v7 PTX \
@@ -442,7 +442,7 @@ impl Compiler<'_> {
                         // arm is invisible — this one WAS silent, which is
                         // part of how its dead consult went unnoticed.
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
-                        nsl_runtime::nsl_log!(INFO, "cpdt", 
+                        nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] optimizer-moment precision active (CPDT \
                              per-param plan): {sub32} moment buffer(s) in FP16 \
                              storage (device-resident; GPU runs use the \
@@ -633,7 +633,7 @@ impl Compiler<'_> {
             // semantically empty for Muon (every byte FullBuffer), so skip
             // it and keep Muon on the monolithic loop. Say so loudly.
             if self.bus.has_wggo_overrides() {
-                nsl_runtime::nsl_log!(WARN, "muon", 
+                nsl_log::nsl_log!(WARN, "muon", 
                     "[muon] note: WGGO per-layer FASE overrides do not apply to \
                      the mixed Muon/AdamW optimizer (it has no Deferred mode) — \
                      ignoring the mode table; training uses the standard \

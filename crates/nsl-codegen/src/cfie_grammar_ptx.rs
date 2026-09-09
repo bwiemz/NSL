@@ -343,7 +343,7 @@ mod tests {
         match crate::ptxas_validation::validate_ptx(&spliced) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                nsl_runtime::nsl_log!(INFO, "skip", 
+                nsl_log::nsl_log!(INFO, "skip", 
                     "[skip] cfie grammar-splice ptxas validation - no validator: {msg}"
                 );
             }

@@ -158,7 +158,7 @@ impl Compiler<'_> {
             let ast = match crate::inspect::predicate::parse_predicate(&cond_src) {
                 Ok(p) => p,
                 Err(e) => {
-                    nsl_runtime::nsl_log!(ERROR, "codegen", 
+                    nsl_log::nsl_log!(ERROR, "codegen", 
                         "[@inspect] predicate parse failed for {:?}: {}",
                         cond_src, e
                     );
