@@ -158,7 +158,7 @@ impl Compiler<'_> {
                               on_param_grad hook to its Wengert lowerings, so \
                               there is no FASE accumulate for the fused GEMM \
                               to fold into";
-                nsl_runtime::nsl_log!(WARN, "wgrad-fusion", 
+                nsl_log::nsl_log!(WARN, "wgrad-fusion", 
                     "[wgrad-fusion] declined: train block #{} — {reason}",
                     self.wgrad_block_ordinal()
                 );
@@ -818,7 +818,7 @@ impl Compiler<'_> {
 
         let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
-            nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for backward pass");
+            nsl_log::nsl_log!(INFO, "nsl", "[nsl] Using source-to-source AD for backward pass");
 
             // 1. Set training mode
             let true_val = builder.ins().iconst(cl_types::I8, 1);
@@ -1050,7 +1050,7 @@ impl Compiler<'_> {
                     // Partial: at least one call fused. Report the rest so a
                     // head that quietly stopped matching is still visible.
                     for d in &declines {
-                        nsl_runtime::nsl_log!(INFO, "fused-lm-ce", 
+                        nsl_log::nsl_log!(INFO, "fused-lm-ce", 
                             "[fused-lm-ce] a cross_entropy call fell back to the \
                              composite path: {}",
                             d.describe()
@@ -1075,7 +1075,7 @@ impl Compiler<'_> {
                 // than refuse: unlike a decline, this path has a legitimate
                 // reading (the body genuinely is not statically extractable)
                 // and refusing would break those fixtures.
-                nsl_runtime::nsl_log!(ERROR, "fused-lm-ce", 
+                nsl_log::nsl_log!(ERROR, "fused-lm-ce", 
                     "[fused-lm-ce] @fused_lm_ce(enabled = true) is active, but \
                      source-AD extraction of the step body failed — the fused \
                      linear-CE kernel exists only on the source-AD path, so it \
@@ -1138,7 +1138,7 @@ impl Compiler<'_> {
                     ));
                 }
                 // Source AD extraction failed — fall back to tape
-                nsl_runtime::nsl_log!(WARN, "nsl", "[nsl] source AD extraction failed, falling back to tape-based AD");
+                nsl_log::nsl_log!(WARN, "nsl", "[nsl] source AD extraction failed, falling back to tape-based AD");
 
                 // Undo training mode — tape path sets it itself
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
@@ -1233,7 +1233,7 @@ impl Compiler<'_> {
                     }
                 }
                 for h in &heads {
-                    nsl_runtime::nsl_log!(INFO, "lm-head-fusion", 
+                    nsl_log::nsl_log!(INFO, "lm-head-fusion", 
                         "[lm-head-fusion] inferred: vocab={} hidden={} \
                          rows={}x{}={} bias={} (no @fused_lm_ce decorator \
                          needed; --fuse-lm-head {})",
@@ -1247,7 +1247,7 @@ impl Compiler<'_> {
                     );
                 }
                 for r in &reasons {
-                    nsl_runtime::nsl_log!(WARN, "lm-head-fusion", "[lm-head-fusion] declined: {r}");
+                    nsl_log::nsl_log!(WARN, "lm-head-fusion", "[lm-head-fusion] declined: {r}");
                 }
                 if heads.is_empty()
                     && ctx.mode
@@ -1397,7 +1397,7 @@ impl Compiler<'_> {
                         .as_ref()
                         .expect("inferred_owned computed whenever a plan exists");
                     if !plan.restrict_to_owned(owned) {
-                        nsl_runtime::nsl_log!(WARN, "ccr", 
+                        nsl_log::nsl_log!(WARN, "ccr", 
                             "[ccr] nothing recomputable after the owned-tensor \
                              restriction; running without checkpointing"
                         );
@@ -1437,7 +1437,7 @@ impl Compiler<'_> {
                                 .sum();
                             if credit > 0 {
                                 budget_bytes = budget_bytes.saturating_add(credit);
-                                nsl_runtime::nsl_log!(INFO, "ccr", 
+                                nsl_log::nsl_log!(INFO, "ccr", 
                                     "[ccr] C-01 credit: FASE Deferred frees the gradient \
                                      buffer — activation budget grows by {} MiB",
                                     credit / (1024 * 1024)
@@ -1449,7 +1449,7 @@ impl Compiler<'_> {
                             &effective_primal,
                             &crate::ccr::CcrBudget { sizes, budget_bytes },
                         );
-                        nsl_runtime::nsl_log!(INFO, "ccr", 
+                        nsl_log::nsl_log!(INFO, "ccr", 
                             "[ccr] budget {} MiB: {} tensors flipped back to SAVE",
                             budget_bytes / (1024 * 1024),
                             flipped
@@ -1494,18 +1494,18 @@ impl Compiler<'_> {
                 // targets. Pre-CCR: recompute clones are forward ops, so this is
                 // the true backward-op composition.
                 if std::env::var("NSL_PROFILE_ADJOINT").is_ok() {
-                    nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
+                    nsl_log::nsl_log!(INFO, "adjoint-profile", 
                         "[adjoint-profile] {} generated backward ops:",
                         adjoint.ops.len()
                     );
                     for (k, c) in crate::ew_chain_fusion::histogram(&adjoint.ops) {
-                        nsl_runtime::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
+                        nsl_log::nsl_log!(INFO, "adjoint-profile", "[adjoint-profile]   {c:>5}  {k}");
                     }
                     // D2b prevalence: binaries whose LEFT operand is a
                     // Constant run the baseline chain in host f64 (the
                     // recorded reconcile_device pull-down) — the v1 fuser
                     // must skip them, so count what that costs.
-                    nsl_runtime::nsl_log!(INFO, "adjoint-profile", 
+                    nsl_log::nsl_log!(INFO, "adjoint-profile", 
                         "[adjoint-profile] const-left binary sites: {}",
                         crate::ew_chain_fusion::const_left_binary_sites(&adjoint.ops)
                     );
@@ -1518,7 +1518,7 @@ impl Compiler<'_> {
                 self.bus.restore_csha_backward_claims(generator.take_csha_claims());
                 // T7.1: surface any CSHA fallback diagnostics.
                 for diag in generator.csha_diagnostics() {
-                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] {diag}");
+                    nsl_log::nsl_log!(INFO, "nsl", "[nsl] {diag}");
                 }
 
                 // 6a–6b.5. Adjoint tape optimizations.
@@ -1989,7 +1989,7 @@ impl Compiler<'_> {
                     match full_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
-                            nsl_runtime::nsl_log!(WARN, "nsl", 
+                            nsl_log::nsl_log!(WARN, "nsl", 
                                 "[nsl] source AD lowering failed ({}), \
                                  cannot fall back to tape AD after forward emit; \
                                  rerun without --source-ad",
@@ -2059,9 +2059,9 @@ impl Compiler<'_> {
                         }
                         let mut counts: Vec<_> = counts.into_iter().collect();
                         counts.sort_by_key(|a| std::cmp::Reverse(a.1));
-                        nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source-ad owned {} ops:", label);
+                        nsl_log::nsl_log!(INFO, "nsl", "[nsl] source-ad owned {} ops:", label);
                         for (name, count) in counts {
-                            nsl_runtime::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
+                            nsl_log::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
                         }
                     };
 
@@ -2090,9 +2090,9 @@ impl Compiler<'_> {
                     }
                     let mut final_grad_counts: Vec<_> = final_grad_counts.into_iter().collect();
                     final_grad_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
-                    nsl_runtime::nsl_log!(INFO, "nsl", "[nsl] source-ad final grad ops:");
+                    nsl_log::nsl_log!(INFO, "nsl", "[nsl] source-ad final grad ops:");
                     for (name, count) in final_grad_counts {
-                        nsl_runtime::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
+                        nsl_log::nsl_log!(INFO, "codegen", "  {} -> {}", name, count);
                     }
                 }
 

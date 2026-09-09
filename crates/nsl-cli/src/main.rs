@@ -43,6 +43,12 @@ fn main() {
     // so without this the two processes would interleave their own `seq`
     // sequences in one file (`events_stream_gate` pins single-writer seq).
     nsl_runtime::events::opt_out_this_process();
+    // Install the toolchain's stderr subscriber with the runtime's
+    // `NSL_EVENTS` mirror registered, before the compiler's first
+    // `nsl_log!` line (which would otherwise install it without the
+    // mirror; harmless here since this process is opted out, but the
+    // registration order is then the same in every process).
+    nsl_runtime::log::ensure_installed();
     // Windows debug builds easily overflow the 1MB main-thread stack
     // because NSL's compile pipeline has deeply-nested passes (WRGA +
     // WGGO + source-AD + Cranelift lowering).  Run the real entry
@@ -135,7 +141,7 @@ fn main_inner() {
             match nsl_cli::profile::run_profile(&args) {
                 Ok(s) => println!("{s}"),
                 Err(e) => {
-                    nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
+                    nsl_log::nsl_log!(ERROR, "cli", "error: {e}");
                     process::exit(1);
                 }
             }
@@ -150,7 +156,7 @@ fn main_inner() {
             if let Err(e) =
                 commands::fpga::run_fpga_compile(&file, fixture.as_ref(), output_dir.as_ref(), test_taps, seq)
             {
-                nsl_runtime::nsl_log!(ERROR, "cli", "error: {e}");
+                nsl_log::nsl_log!(ERROR, "cli", "error: {e}");
                 process::exit(1);
             }
         }
@@ -166,7 +172,7 @@ fn main_inner() {
         }
         Cli::Doc { cmd: DocCmd::Stdlib } => {
             let Some(root) = resolver::stdlib_roots().into_iter().next() else {
-                nsl_runtime::nsl_log!(ERROR, "cli", 
+                nsl_log::nsl_log!(ERROR, "cli", 
                     "nsl doc stdlib: no stdlib directory found (looked at $NSL_STDLIB_PATH, \
                      <exe>/stdlib, the toolchain layout, and ./stdlib)"
                 );
@@ -175,7 +181,7 @@ fn main_inner() {
             match stdlib_reference::render_markdown(&root) {
                 Ok(md) => print!("{md}"),
                 Err(e) => {
-                    nsl_runtime::nsl_log!(ERROR, "cli", "nsl doc stdlib: {e}");
+                    nsl_log::nsl_log!(ERROR, "cli", "nsl doc stdlib: {e}");
                     std::process::exit(1);
                 }
             }

@@ -143,6 +143,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The logging front door is its own crate (roadmap A3, step 3 of the
+  A3 design spec): `crates/nsl-log` holds `nsl_log!`, the
+  `NslSubscriber` that renders every line to stderr byte-identically to
+  the `eprintln!` it replaced, and `ensure_installed`; it depends on
+  `tracing` alone. The runtime's `NSL_EVENTS` mirror stays in the runtime
+  as an `nsl_log::EventsMirror` hook (`nsl_runtime::log::EventsStreamMirror`)
+  that `nsl_runtime::log::ensure_installed` registers before the first
+  line and the subscriber consults at event time, so the install order
+  cannot lose it. `nsl_runtime::nsl_log!` is now a thin wrapper
+  (register the mirror, then `nsl_log::nsl_log!`); nsl-codegen's 371 and
+  nsl-cli's 274 diagnostic sites call `nsl_log::nsl_log!` directly, and the
+  `nsl` CLI installs the subscriber with the mirror registered first
+  thing in `main`. stderr, the `log` events on the stream and the marker
+  gates are unchanged; the compiler's diagnostics are no longer a reason
+  for it to depend on the runtime.
 - Runtime fatal exits are typed (roadmap C1): `nsl_runtime::fatal::die(kind,
   msg)` is the one chokepoint for a condition the runtime cannot continue
   from, and each `Fatal` kind has its own exit code — `GpuOom` **12**

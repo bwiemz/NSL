@@ -354,7 +354,7 @@ impl AdjointGenerator {
                             });
                             let this_event_idx = self.csha_fused_events.len() - 1;
 
-                            nsl_runtime::nsl_log!(INFO, "nsl", 
+                            nsl_log::nsl_log!(INFO, "nsl", 
                                 "[nsl] CSHA fused backward: emitting fused launch for \
                                      layer '{}' (hd={}, block_q/kv={}x{}, d_model={}, smoke={})",
                                 mark_layer,
@@ -581,7 +581,7 @@ impl AdjointGenerator {
                                     {
                                         ev.dgamma_emitted = true;
                                     }
-                                    nsl_runtime::nsl_log!(INFO, "nsl", 
+                                    nsl_log::nsl_log!(INFO, "nsl", 
                                         "[nsl] CSHA fused backward: emitted dgamma \
                                              (NormGammaBackward) for layer '{}' → \
                                              gamma VarId {} (x_raw VarId {}, eps={:e})",
@@ -3782,7 +3782,7 @@ impl<'a> WengertExtractor<'a> {
         for stmt in stmts {
             if !self.extract_stmt(stmt) {
                 self.is_static = false;
-                nsl_runtime::nsl_log!(ERROR, "source-ad", 
+                nsl_log::nsl_log!(ERROR, "source-ad", 
                     "[source-ad] extraction failed at {:?} (line {:?})",
                     std::mem::discriminant(&stmt.kind),
                     stmt.span
@@ -3813,7 +3813,7 @@ impl<'a> WengertExtractor<'a> {
                     }
                     true
                 } else {
-                    nsl_runtime::nsl_log!(ERROR, "source-ad", 
+                    nsl_log::nsl_log!(ERROR, "source-ad", 
                         "[source-ad] VarDecl '{}' extraction failed at expr {:?}",
                         _var_name,
                         std::mem::discriminant(&val.kind)
@@ -4358,7 +4358,7 @@ impl<'a> WengertExtractor<'a> {
                                     Some(model_type.as_str()),
                                 );
                             } else {
-                                nsl_runtime::nsl_log!(INFO, "source-ad", "[source-ad] method '{}' not found in model type '{}' (available: {:?})",
+                                nsl_log::nsl_log!(INFO, "source-ad", "[source-ad] method '{}' not found in model type '{}' (available: {:?})",
                                     method_name, model_type,
                                     self.model_method_bodies.get(&model_type)
                                         .map(|m| m.keys().collect::<Vec<_>>())
@@ -4612,10 +4612,10 @@ impl<'a> WengertExtractor<'a> {
                         }
                         _ => format!("{:?}", std::mem::discriminant(&object.kind)),
                     };
-                    nsl_runtime::nsl_log!(INFO, "source-ad", "[source-ad] unresolved method call: {}.{}() — model type not found in method bodies", obj_desc, method);
+                    nsl_log::nsl_log!(INFO, "source-ad", "[source-ad] unresolved method call: {}.{}() — model type not found in method bodies", obj_desc, method);
                     return None;
                 } else {
-                    nsl_runtime::nsl_log!(WARN, "source-ad", 
+                    nsl_log::nsl_log!(WARN, "source-ad", 
                         "[source-ad] unsupported callee expression: {:?}",
                         std::mem::discriminant(&callee.kind)
                     );
@@ -4712,7 +4712,7 @@ impl<'a> WengertExtractor<'a> {
                     // section when it specifies them.
                     "fused_kl_ce" => {
                         if args.len() != 9 {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] fused_kl_ce expected 9 args (x_s, W_s, bias_s, \
                                  x_t, W_t, bias_t, targets, alpha, temperature), got {}",
                                 args.len()
@@ -4729,7 +4729,7 @@ impl<'a> WengertExtractor<'a> {
                         let (Some(alpha), Some(temperature)) =
                             (lit_f64(&args[7].value), lit_f64(&args[8].value))
                         else {
-                            nsl_runtime::nsl_log!(WARN, "source-ad", 
+                            nsl_log::nsl_log!(WARN, "source-ad", 
                                 "[source-ad] fused_kl_ce: alpha and temperature must be \
                                  numeric literals in v1 (compile-time kernel constants)"
                             );
@@ -4741,7 +4741,7 @@ impl<'a> WengertExtractor<'a> {
                         if let Some(la) = loss_alpha
                             && (la - alpha).abs() > 1e-12
                         {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] fused_kl_ce: call-site alpha {alpha} \
                                      != distill loss: section alpha {la}"
                             );
@@ -4750,7 +4750,7 @@ impl<'a> WengertExtractor<'a> {
                         if let Some(lt) = loss_temp
                             && (lt - temperature).abs() > 1e-12
                         {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] fused_kl_ce: call-site temperature \
                                      {temperature} != distill loss: section temperature {lt}"
                             );
@@ -4799,17 +4799,17 @@ impl<'a> WengertExtractor<'a> {
                         // exact precondition so the refusal is actionable
                         // rather than a bare "extraction failed".
                         match self.fused_kl_ce_config.as_ref() {
-                            None => nsl_runtime::nsl_log!(WARN, "source-ad", 
+                            None => nsl_log::nsl_log!(WARN, "source-ad", 
                                 "[source-ad] fused_kl_ce called without an active \
                                  @fused_kl_ce decorator config; add \
                                  @fused_kl_ce(enabled=true, vocab_size=, hidden_size=, \
                                  teacher_hidden=, batch_size=, seq_len=) to the distill block"
                             ),
-                            Some(cfg) if !cfg.enabled => nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            Some(cfg) if !cfg.enabled => nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] fused_kl_ce: @fused_kl_ce is present but \
                                  enabled=false; set enabled=true to activate the fused kernel"
                             ),
-                            Some(_) => nsl_runtime::nsl_log!(WARN, "source-ad", 
+                            Some(_) => nsl_log::nsl_log!(WARN, "source-ad", 
                                 "[source-ad] fused_kl_ce: @fused_kl_ce is enabled but one of \
                                  the shape hints (vocab_size, hidden_size, teacher_hidden, \
                                  batch_size, seq_len) is missing"
@@ -4819,7 +4819,7 @@ impl<'a> WengertExtractor<'a> {
                     }
                     "fused_linear_ce" => {
                         if args.len() != 4 {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] fused_linear_ce expected 4 args (x, W, bias, targets), got {}",
                                 args.len()
                             );
@@ -4842,7 +4842,7 @@ impl<'a> WengertExtractor<'a> {
                         // `fused_kl_ce` arm above, which diagnoses in place for
                         // the same reason.
                         match self.fused_ce_config.as_ref() {
-                            None => nsl_runtime::nsl_log!(WARN, "fused-lm-ce", 
+                            None => nsl_log::nsl_log!(WARN, "fused-lm-ce", 
                                 "[fused-lm-ce] fused_linear_ce(...) called without an \
                                  active @fused_lm_ce decorator; the stdlib composite \
                                  (matmul + cross_entropy) will run instead, \
@@ -4850,7 +4850,7 @@ impl<'a> WengertExtractor<'a> {
                                  Add @fused_lm_ce(enabled=true, vocab_size=, \
                                  hidden_size=, batch_size=, seq_len=) to the train block"
                             ),
-                            Some(cfg) if !cfg.enabled => nsl_runtime::nsl_log!(INFO, "fused-lm-ce", 
+                            Some(cfg) if !cfg.enabled => nsl_log::nsl_log!(INFO, "fused-lm-ce", 
                                 "[fused-lm-ce] fused_linear_ce(...): @fused_lm_ce is \
                                  present but enabled=false; the stdlib composite will \
                                  run instead"
@@ -4858,7 +4858,7 @@ impl<'a> WengertExtractor<'a> {
                             Some(cfg) => {
                                 let missing = missing_shape_hints(cfg);
                                 if !missing.is_empty() {
-                                    nsl_runtime::nsl_log!(INFO, "fused-lm-ce", 
+                                    nsl_log::nsl_log!(INFO, "fused-lm-ce", 
                                         "[fused-lm-ce] fused_linear_ce(...): {}",
                                         FusedLceDecline::MissingShapeHints { missing }
                                             .describe()
@@ -5193,7 +5193,7 @@ impl<'a> WengertExtractor<'a> {
                     // (whose conv2d_backward handles the general case).
                     "conv2d" => {
                         if args.len() != 7 {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] conv2d expected 7 args (input, weight, bias, \
                                  stride_h, stride_w, pad_h, pad_w), got {}",
                                 args.len()
@@ -5272,7 +5272,7 @@ impl<'a> WengertExtractor<'a> {
                     // flash kernels are the Stage C work.
                     "scaled_dot_product_attention_masked" => {
                         if input_vars.len() < 5 {
-                            nsl_runtime::nsl_log!(WARN, "source-ad", 
+                            nsl_log::nsl_log!(WARN, "source-ad", 
                                 "[source-ad] scaled_dot_product_attention_masked \
                                  requires 5 args (q, k, v, scale, mask)"
                             );
@@ -5365,7 +5365,7 @@ impl<'a> WengertExtractor<'a> {
                     // contract.
                     "scaled_dot_product_attention_packed" => {
                         if input_vars.len() < 5 {
-                            nsl_runtime::nsl_log!(WARN, "source-ad", 
+                            nsl_log::nsl_log!(WARN, "source-ad", 
                                 "[source-ad] scaled_dot_product_attention_packed \
                                  requires 5 args (q, k, v, scale, segment_ids)"
                             );
@@ -5425,7 +5425,7 @@ impl<'a> WengertExtractor<'a> {
                     // Forward: y = x @ W + scale * (x @ A @ B).
                     "nsl_adapter_fused_lora_matmul" => {
                         if args.len() != 6 {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] nsl_adapter_fused_lora_matmul expected 6 args, got {}",
                                 args.len()
                             );
@@ -5468,7 +5468,7 @@ impl<'a> WengertExtractor<'a> {
                     // Forward: y = (x @ W) * gamma (gamma broadcasts over out dim).
                     "nsl_adapter_fused_ia3_matmul" => {
                         if args.len() != 4 {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] nsl_adapter_fused_ia3_matmul expected 4 args, got {}",
                                 args.len()
                             );
@@ -5502,7 +5502,7 @@ impl<'a> WengertExtractor<'a> {
                     // scale + kernel_handle carried on the variant.
                     "nsl_adapter_fused_gatedlora_matmul" => {
                         if args.len() != 7 {
-                            nsl_runtime::nsl_log!(INFO, "source-ad", 
+                            nsl_log::nsl_log!(INFO, "source-ad", 
                                 "[source-ad] nsl_adapter_fused_gatedlora_matmul expected 7 args, got {}",
                                 args.len()
                             );
@@ -5540,7 +5540,7 @@ impl<'a> WengertExtractor<'a> {
                         return Some(result);
                     }
                     _ => {
-                        nsl_runtime::nsl_log!(WARN, "source-ad", 
+                        nsl_log::nsl_log!(WARN, "source-ad", 
                             "[source-ad] warning: unrecognized FFI callee '{}' in train block; \
                              falling back to unfused AST evaluation. If you expected a fused kernel, \
                              check that source-AD has a handler for this FFI.",
@@ -6258,7 +6258,7 @@ impl<'a> WengertExtractor<'a> {
             // finalize() has no error channel — surface the diagnosis and
             // fail extraction (callers fall back to the tape/composite
             // path, which is correct, just slower).
-            nsl_runtime::nsl_log!(INFO, "fused-lm-ce", "[fused-lm-ce] {msg}");
+            nsl_log::nsl_log!(INFO, "fused-lm-ce", "[fused-lm-ce] {msg}");
             return None;
         }
         Some(self.list)
