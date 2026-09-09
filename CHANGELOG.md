@@ -196,6 +196,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- A KIR kernel with launch bounds emitted PTX that `ptxas` refuses.
+  `.maxntid`, `.minnctapersm` and `.maxnreg` belong to the entry's
+  declaration, between the parameter list and the opening brace; the
+  printer put them inside the body, where `ptxas` stops at "Parsing error
+  near `.maxntid`". Every kernel that called `set_launch_bounds` or
+  `set_max_registers` since roadmap A2 step 5 was therefore unassemblable.
+  Nothing caught it because no such kernel had yet reached a `ptxas` gate,
+  and the printer test asserted the invalid placement — it pinned the bug
+  rather than the rule. The replacement asserts the grammar (every
+  directive lies before the entry's opening brace) instead of the text, so
+  it holds under any register numbering and any subset of the three.
+  Kernels that set none keep `) {` on one line, so no existing snapshot
+  moves.
+
 - Aliasing-input probes (`tensor::alias_tests`, roadmap C2): every CPU
   entry point that takes two or more tensor handles is called with the same
   handle for all of them — `cat([x, x])`, `x == x`, `where(x, x, x)`,
