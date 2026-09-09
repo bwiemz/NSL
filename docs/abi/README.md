@@ -97,12 +97,12 @@ the runtime that `rustc` checks against each implementation; the host-facing
 surface this document describes is a second table, `nsl_abi::capi`, whose
 rows carry the C prototypes the generated header prints and from which
 `nsl abi python` renders `python/nslpy/_abi.py` (the `ctypes` mirror `nslpy`
-binds from, pinned by `cargo test -p nsl-abi`). `nsl-abi/tests/signature_agreement.rs`
-still parses both surfaces as text as belt-and-braces. When you add or change
+binds from, pinned by `cargo test -p nsl-abi`). When you add or change
 a runtime function, add or edit its row and the `extern "C" fn` together; the
-build and the gate report any divergence per symbol. (It caught one on introduction: `nsl_flash_attention_quantized`
-was declared with 21 params while the runtime read 23, missing the two Tier-B
-sentinel slots.)
+runtime's build reports any divergence per symbol. (The text cross-check
+that preceded the typed table caught one on introduction:
+`nsl_flash_attention_quantized` was declared with 21 params while the
+runtime read 23, missing the two Tier-B sentinel slots.)
 
 ## FFI safety contract (every exported symbol)
 

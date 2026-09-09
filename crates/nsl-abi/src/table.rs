@@ -46,9 +46,10 @@
 //!
 //! Implement the `#[unsafe(no_mangle)] extern "C" fn` in `nsl-runtime`, then
 //! add one row here, in the group its subject belongs to. Nothing else is
-//! edited: the codegen declares it, the runtime's build checks it, and
-//! `signature_agreement` cross-checks the runtime's `extern "C"` items
-//! against this table by text as belt-and-braces.
+//! edited: the codegen declares it and the runtime's build checks it
+//! (`abi_check.rs` casts the implementation to the row's signature, so a
+//! disagreement in arity, register class or path fails `cargo build -p
+//! nsl-runtime` naming the function).
 
 use crate::AbiScalar;
 

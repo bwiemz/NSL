@@ -235,6 +235,14 @@ CLIF snapshots.
 6. **Delete the text parser** (`parse_runtime_functions_table*`,
    `parse_externs_in_file`, `cross_check`) once nothing reads it; `nsl-abi`
    is then the table, the wire constants and the two generators.
+   *As landed:* the Rust-side parser (`parse_runtime_functions_table*`,
+   `parse_externs_in_file`, `parse_inplace_unary_macro`, `cross_check`,
+   `check_workspace`, `Mismatch`/`Report`) and the `signature_agreement`
+   gate are deleted; nothing read them once steps 1–2 rendered both
+   assertions from the tables. `parse_c_prototypes` and the `FnSig` model
+   stay for `c_header_agreement`, which reads the generated header back
+   (its runtime-symbol scan is now a local `extern "C" fn <name>(` token
+   scan). `nsl-abi`'s `lib.rs` shrank from 1,496 to 520 lines.
 
 ## Non-goals
 
