@@ -229,6 +229,8 @@ stderr, and `fatal::tests` pins them:
 | `CudaDriver` | **13** | a driver call failed for a reason other than OOM: `cuMemAlloc` (e.g. `CUDA_ERROR_ILLEGAL_ADDRESS` after a faulting kernel), `cuMemcpyHtoD` |
 | `CudaAsync` | **14** | the `cuCtxSynchronize` that `--cuda-sync` inserts after a kernel or cuBLAS call reported an asynchronous device error |
 | `Cublas` | **15** | a cuBLAS call failed on an in-place operation (the fused wgrad accumulate), where no partial result is safe to continue from |
+| `CudaNotCompiled` | **16** | a device tensor reached a tensor op in a runtime built without the `cuda` feature — the `#[cfg(not(feature = "cuda"))]` arm of every GPU-capable op (`fatal::cuda_not_compiled`) and the cast paths' "compiled without the `cuda` feature" checks |
+| `UnsupportedDtype` | **17** | a tensor op was asked to work on a dtype it does not implement (the cast family in `tensor/precision_cast.rs`, the scalar readers in `tensor/mod.rs`): a compiler/runtime contract violation, not a user error |
 
 **GPU OOM** is the first of these: the allocator's failure path builds
 `oom_diagnostic` (the request, the current `OOM_CONTEXT` description set by
