@@ -283,7 +283,8 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `emit_c_abi_dispatch_wrapper`); `src/c_export_table.rs` — the export table
   `nsl_model_create` reads; `src/c_header.rs` — `ExportInfo`, `lower_type_expr`,
   `emit(exports, module_name)`, stamping `NSL_ABI_VERSION_MAJOR/MINOR` from
-  `nsl_runtime::c_api`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
+  `nsl_abi::wire::version`; `src/c_wrapper.rs` steps through descriptor
+  arrays by `sizeof` of `nsl_abi::wire::tensor_desc::NslTensorDesc`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
   through `nsl_abi`), `crates/nsl-codegen/tests/c_header_compiles.rs` (real C compiler +
   `_Static_assert` on `NslTensorDesc`), `crates/nsl-codegen/tests/c_header_snapshot.rs`,
   `crates/nsl-codegen/tests/exported_symbols_are_dlsym_findable.rs`,

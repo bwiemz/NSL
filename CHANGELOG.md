@@ -143,6 +143,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `NslTensorDesc` and the train-config record's key classes are wire
+  declarations (roadmap A3, step 4 of the A3 design spec, first PR):
+  `nsl_abi::wire::tensor_desc::NslTensorDesc` is the `repr(C)` descriptor
+  every generated header, host and emitted wrapper addresses by byte
+  offset, with its 48-byte layout constant-asserted on the struct; the
+  compiler's descriptor stride and scratch-slot size are now its `sizeof`
+  rather than a literal kept in lockstep. `nsl_abi::wire::train_config::
+  {MOMENT_KEYS, TRAJECTORY_KEYS}` are the record's schema, read by the
+  codegen renderer and the runtime's resume checker alike. The runtime
+  re-exports both at their historical paths (`c_api::NslTensorDesc`,
+  `train_config_record::{MOMENT_KEYS, TRAJECTORY_KEYS}`); nothing on the
+  C ABI or in a checkpoint changes.
 - Runtime fatal exits are typed (roadmap C1): `nsl_runtime::fatal::die(kind,
   msg)` is the one chokepoint for a condition the runtime cannot continue
   from, and each `Fatal` kind has its own exit code — `GpuOom` **12**

@@ -216,6 +216,14 @@ CLIF snapshots.
    re-exports. Gated by the C3 byte-identity tests.
 4. **`wire` structs and formats.** One PR per format, each with a
    round-trip test in `nsl-abi`.
+   *As landed, first PR:* `wire::tensor_desc::NslTensorDesc` (layout
+   constant-asserted; the compiler's descriptor stride is its `sizeof`)
+   and `wire::train_config::{MOMENT_KEYS, TRAJECTORY_KEYS}` (the record's
+   schema, read by the renderer and the resume checker alike); the runtime
+   re-exports both at their historical paths. Still in the runtime:
+   `AwqScales::from_blob` (the sidecar blob format), `peek_batch_seq`
+   (the calibration-data readers, which need `safetensors`) and the
+   `env_record` renderer.
 5. **Optional runtime dependency.** `cfg` the eight probe sites; CI's
    Ubuntu lane builds `nsl-codegen` with `--no-default-features` (no
    runtime) as well as the default, and the `cuda` job as today.

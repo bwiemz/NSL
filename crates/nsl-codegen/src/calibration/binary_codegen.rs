@@ -1072,14 +1072,14 @@ fn emit_calibration_forward_wrapper(
         b.switch_to_block(shape_ok);
         b.seal_block(shape_ok);
 
-        // NslTensorDesc is 48 bytes (8-byte aligned) — see
-        // `nsl_runtime::c_api::NslTensorDesc`. Field at offset 40 is
+        // NslTensorDesc is 48 bytes (8-byte aligned) — `sizeof` of
+        // `nsl_abi::wire::tensor_desc::NslTensorDesc`. Field at offset 40 is
         // `tape_id: i64` (added in the tape_id round-trip fix); the
         // calibration forward wrapper has no autodiff context, so we
         // zero it.
         let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            48,
+            crate::c_wrapper::NSL_TENSOR_DESC_SIZE as u32,
             3,
         ));
         let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);
@@ -1816,9 +1816,10 @@ fn emit_calibration_backward_wrapper(
         //   offset 32: device_type (i32, 0 = CPU)
         //   offset 36: device_id   (i32, 0 for CPU)
         //   offset 40: tape_id     (i64, 0 — calibration has no autodiff context)
+        // (`sizeof` of `nsl_abi::wire::tensor_desc::NslTensorDesc`.)
         let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            48,
+            crate::c_wrapper::NSL_TENSOR_DESC_SIZE as u32,
             3,
         ));
         let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);

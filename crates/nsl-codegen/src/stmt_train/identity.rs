@@ -8,7 +8,8 @@
 //! `nsl_runtime::train_config_record` diffs on resume, and its format was
 //! pinned only end-to-end (`train_config_resume_gate.rs`). It now has unit
 //! tests, including one that checks every key it renders against the
-//! runtime's `MOMENT_KEYS` / `TRAJECTORY_KEYS`: a key in neither class is
+//! `nsl_abi::wire::train_config` `MOMENT_KEYS` / `TRAJECTORY_KEYS` (the
+//! runtime classifies with the same lists): a key in neither class is
 //! silently unguarded on resume, which is the drift this file exists to
 //! make impossible.
 //!
@@ -291,7 +292,7 @@ mod tests {
     /// side. Exercised with the widest scheduler (three parameters).
     #[test]
     fn every_rendered_key_is_classified_by_the_runtime() {
-        use nsl_runtime::train_config_record::{MOMENT_KEYS, TRAJECTORY_KEYS};
+        use nsl_abi::wire::train_config::{MOMENT_KEYS, TRAJECTORY_KEYS};
         let nd = NoDecayScope { static_roles: vec![], exempt_non_rank2: false };
         let sched = Some(ResolvedScheduler::OneCycle {
             max_lr: 0.001,
