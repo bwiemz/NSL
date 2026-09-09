@@ -16,7 +16,7 @@ Older plans (WRGA fused-PTX and gated-LoRA closeouts, the M52–M62 roadmap
 design, the pretraining memory-reduction plan) live in
 [`docs/plans/`](../plans/).
 
-Counts: 123 documents in 25 subsystems.
+Counts: 124 documents in 26 subsystems.
 
 ## FASE — fused adaptive step emission (training-loop fusion)
 
@@ -258,6 +258,12 @@ Counts: 123 documents in 25 subsystems.
 | Date | Kind | Document |
 |---|---|---|
 | 2026-09-08 | design spec | [`2026-09-08-a3-abi-extern-table-design.md`](specs/2026-09-08-a3-abi-extern-table-design.md) |
+
+## Kernel IR v2 and the hand-PTX migration (roadmap A2)
+
+| Date | Kind | Document |
+|---|---|---|
+| 2026-09-09 | design spec | [`2026-09-09-a2-kir-v2-design.md`](specs/2026-09-09-a2-kir-v2-design.md) |
 
 ## Other
 

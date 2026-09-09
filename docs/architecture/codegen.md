@@ -543,7 +543,9 @@ longer emits. Existing members may still be edited — it is a gate on the file
 set, not a line count. **A new kernel must therefore be built as `KernelIR`
 and lowered through `backend_ptx.rs`; a new `.rs` file that formats PTX text
 will not merge.** If a kernel needs something KIR cannot express, extend
-`KirOp` and the printers rather than adding a hand emitter.
+`KirOp` and the printers rather than adding a hand emitter. What KIR still
+cannot express, and the order the frozen files migrate in, is the design
+spec `docs/superpowers/specs/2026-09-09-a2-kir-v2-design.md`.
 
 **Supporting pieces.** `src/gpu_specs.rs` — `GpuSpec` (`sm_version`, peak
 TFLOPs, bandwidth, VRAM, L2, crossover points, launch overhead),
