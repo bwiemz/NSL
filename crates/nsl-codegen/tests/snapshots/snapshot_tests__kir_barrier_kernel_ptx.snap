@@ -9,10 +9,7 @@ expression: ptx_str
 .shared .align 4 .b8 shared_mem[1024];
 
 .visible .entry barrier_kernel(.param .u64 param_data) {
-    .reg .u32 %r<2>;
-    .reg .u64 %rd<2>;
-    .reg .f32 %f<2>;
-    .reg .pred %p<2>;
+    .reg .u64 %rd<1>;
 
     ld.param.u64 %rd0, [param_data];
 

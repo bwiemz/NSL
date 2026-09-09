@@ -7,48 +7,50 @@ expression: ptx_str
 .address_size 64
 
 .visible .entry nsl_grid_stride_copy(.param .u64 param_a, .param .u64 param_out, .param .u32 param_len) {
-    .reg .u32 %r<1006>;
-    .reg .u64 %rd<1006>;
-    .reg .f32 %f<1006>;
-    .reg .pred %p<1006>;
+    .reg .u32 %r<5>;
+    .reg .u64 %rd<3>;
+    .reg .f32 %f<1>;
+    .reg .pred %p<1>;
     .reg .u32 %edge_r;
     .reg .u64 %edge_rd;
     .reg .f32 %edge_f;
     .reg .f64 %edge_fd;
-    .reg .f16 %edge_h;
+    .reg .b16 %edge_h;
     .reg .pred %edge_p;
     .reg .b32 %edge_v;
+    .reg .u32 %gid0;
+    .reg .u32 %gid1;
 
     ld.param.u64 %rd0, [param_a];
     ld.param.u64 %rd1, [param_out];
-    ld.param.u32 %r2, [param_len];
+    ld.param.u32 %r0, [param_len];
 
 BB0:
-    mov.u32 %r1004, %ctaid.x;
-    mov.u32 %r1005, %ntid.x;
-    mul.lo.u32 %r1004, %r1004, %r1005;
-    mov.u32 %r4, %tid.x;
-    add.u32 %r4, %r1004, %r4;
-    mov.u32 %r3, %r4;
+    mov.u32 %gid0, %ctaid.x;
+    mov.u32 %gid1, %ntid.x;
+    mul.lo.u32 %gid0, %gid0, %gid1;
+    mov.u32 %r1, %tid.x;
+    add.u32 %r1, %gid0, %r1;
+    mov.u32 %r2, %r1;
     bra BB1;
 BB1:
-    setp.lt.u32 %p5, %r3, %r2;
-    @%p5 bra BB2;
+    setp.lt.u32 %p0, %r2, %r0;
+    @%p0 bra BB2;
     bra BB3;
 BB2:
-    cvt.u64.u32 %rd6, %r3;
-    mul.lo.u64 %rd6, %rd6, 4;
-    add.u64 %rd6, %rd0, %rd6;
-    ld.global.f32 %f7, [%rd6];
-    cvt.u64.u32 %rd8, %r3;
-    mul.lo.u64 %rd8, %rd8, 4;
-    add.u64 %rd8, %rd1, %rd8;
-    st.global.f32 [%rd8], %f7;
-    mov.u32 %r9, %ntid.x;
-    mov.u32 %r10, %nctaid.x;
-    mul.lo.u32 %r11, %r9, %r10;
-    add.u32 %r12, %r3, %r11;
-    mov.u32 %r3, %r12;
+    cvt.u64.u32 %rd2, %r2;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd2];
+    cvt.u64.u32 %rd2, %r2;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    st.global.f32 [%rd2], %f0;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r3, %nctaid.x;
+    mul.lo.u32 %r4, %r1, %r3;
+    add.u32 %r1, %r2, %r4;
+    mov.u32 %r2, %r1;
     bra BB1;
 BB3:
     ret;

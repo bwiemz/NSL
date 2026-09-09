@@ -23,7 +23,22 @@ pub struct KernelIR {
     pub shared_mem_bytes: u32,
     pub workgroup_size: [u32; 3],
     pub required_features: FeatureSet,
+    /// Roadmap A2 step 5: `.maxntid` / `.minnctapersm` for the entry.
+    pub launch_bounds: Option<LaunchBounds>,
+    /// Roadmap A2 step 5: `.maxnreg` for the entry — the per-thread
+    /// register cap `ptxas` allocates under.
+    pub max_registers: Option<u32>,
     _next_var: VarId,
+}
+
+/// Launch bounds printed on the entry (roadmap A2 step 5): the largest
+/// block the kernel is launched with, and optionally the number of blocks
+/// per SM it must fit — the hand estate's `.maxntid N, 1, 1` /
+/// `.minnctapersm M` pair that sets the register budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchBounds {
+    pub max_threads: u32,
+    pub min_blocks_per_sm: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,9 +161,12 @@ impl KirType {
     /// PTX register prefix.
     pub fn ptx_reg_prefix(&self) -> &'static str {
         match self {
-            KirType::U32 | KirType::I32 | KirType::Bool
+            KirType::U32 | KirType::I32
             | KirType::I8 | KirType::I16
             | KirType::Tq2Packed | KirType::TernaryUnpacked => "%r",
+            // `setp` writes and `@%p` reads the predicate class (roadmap A2
+            // step 5: the prefix said `%r` while every printer used `%p`).
+            KirType::Bool => "%p",
             KirType::U64 | KirType::I64 | KirType::Ptr(_, _) => "%rd",
             KirType::F32 => "%f",
             KirType::F64 => "%fd",
@@ -446,6 +464,8 @@ pub struct KirBuilder {
     shared_mem_bytes: u32,
     workgroup_size: [u32; 3],
     required_features: FeatureSet,
+    launch_bounds: Option<LaunchBounds>,
+    max_registers: Option<u32>,
 }
 
 impl KirBuilder {
@@ -460,7 +480,20 @@ impl KirBuilder {
             shared_mem_bytes: 0,
             workgroup_size: [256, 1, 1],
             required_features: FeatureSet::NONE,
+            launch_bounds: None,
+            max_registers: None,
         }
+    }
+
+    /// Roadmap A2 step 5: print `.maxntid max_threads, 1, 1` (and
+    /// `.minnctapersm` when given) on the entry.
+    pub fn set_launch_bounds(&mut self, max_threads: u32, min_blocks_per_sm: Option<u32>) {
+        self.launch_bounds = Some(LaunchBounds { max_threads, min_blocks_per_sm });
+    }
+
+    /// Roadmap A2 step 5: print `.maxnreg n` on the entry.
+    pub fn set_max_registers(&mut self, n: u32) {
+        self.max_registers = Some(n);
     }
 
     pub fn new_var(&mut self) -> VarId {
@@ -580,6 +613,8 @@ impl KirBuilder {
             shared_mem_bytes: self.shared_mem_bytes,
             workgroup_size: self.workgroup_size,
             required_features: self.required_features,
+            launch_bounds: self.launch_bounds,
+            max_registers: self.max_registers,
             _next_var: self.next_var,
         }
     }
@@ -607,6 +642,14 @@ impl KernelIR {
     /// every violation found.
     pub fn verify(&self) -> Result<(), Vec<crate::kir_verify::KirVerifyError>> {
         crate::kir_verify::verify(self)
+    }
+
+    /// Roadmap A2 step 5: how many registers of each class the kernel holds
+    /// live at once, from the allocator (`crate::regalloc`). This is the
+    /// number the PTX printer declares per class and the figure a register
+    /// budget is checked against.
+    pub fn register_pressure(&self) -> crate::regalloc::RegisterPressure {
+        crate::regalloc::allocate(self).pressure()
     }
 
     /// `verify().is_ok()`. Until roadmap A2 step 2 this checked only that
