@@ -580,7 +580,7 @@ are embedded via `declare_data` / `define_data` in the same file.
 `src/flash_attention_selector.rs`, `src/fused_linear_ce.rs`
 (`synthesize_fused_linear_ce_ptx` and the large-vocab v2 pair),
 `src/matmul_mma.rs` (MMA fragment primitives), `src/moe_kernels.rs`,
-`src/precision_cast_ptx.rs`, `src/wrga_fused_ptx.rs`,
+`src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
 `src/pca_tilerange.rs`, `src/cfie_*_ptx.rs`, `src/cfie_decode_attention.rs`,
 `src/fusion.rs` (elementwise chains), `src/kernel.rs`, and the shared preludes
@@ -588,10 +588,13 @@ in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
-writes PTX into a string (71 members at the 2026-09-02 freeze: the codegen
-files above plus seven under `crates/nsl-runtime/src/cuda/` and
+writes PTX into a string (71 members at the 2026-09-02 freeze; 69 today: the
+codegen files above plus six under `crates/nsl-runtime/src/cuda/` and
 `crates/nsl-runtime/src/flash_attention.rs`; `backend_ptx.rs` is the one
-member that belongs by construction). `scripts/hand-ptx-freeze.sh --check`
+member that belongs by construction). The list shrinks as A2 migrates
+kernels onto KIR — step 7 retired `src/precision_cast_ptx.rs` and the PTX
+text `cuda/precision_cast_kernels.rs` used to carry, which are the two
+members the freeze has lost so far. `scripts/hand-ptx-freeze.sh --check`
 (membership decided by `scripts/hand-ptx-scan.awk`; `--list`, `--explain`,
 `--write-manifest`, `--self-test`) fails CI (`hand-ptx-freeze` job in
 `.github/workflows/ci.yml`) if a file joins the set or a listed file no

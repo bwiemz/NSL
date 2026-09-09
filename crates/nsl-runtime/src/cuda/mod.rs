@@ -19,10 +19,10 @@ pub(crate) mod fused_ce_kernels;
 pub(crate) mod fused_kl_ce_kernels;
 #[cfg(feature = "cuda")]
 pub(crate) mod kernels_hopper;
-// NOT gated: `precision_cast_ptx_runtime_parity` compares these constants
-// against codegen's emitter as pure text and must run on a machine with no
-// GPU, so this module has to exist in a non-CUDA build. Its two launch
-// helpers are gated individually instead.
+// NOT gated: the cast kernels are built from KIR, and the tests that build
+// them and check their PTX must run on a machine with no GPU, so this
+// module has to exist in a non-CUDA build. Its launch helper is gated
+// individually instead.
 pub(crate) mod precision_cast_kernels;
 #[cfg(feature = "cuda")]
 pub(crate) mod strided_copy;

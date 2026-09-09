@@ -1,7 +1,7 @@
-//! CFTP v7 — ptxas gate for the four precision-cast PTX kernels.
+//! ptxas gate for the four precision-cast kernels.
 //!
-//! Pipes each of `synthesize_{f32_to_bf16, bf16_to_f32, f32_to_fp16,
-//! fp16_to_f32}_ptx()` through `ptxas -arch=sm_80 -O0`. Catches the same
+//! Pipes each of `nsl_kir::kernels::cast::ptx(..)` through
+//! `ptxas -arch=sm_80 -O0`. Catches the same
 //! class of bugs structural string-asserts can't: undeclared registers,
 //! malformed cvt operand types, label mismatches, illegal PTX-version /
 //! mnemonic combinations.
@@ -10,10 +10,7 @@
 //! boxes and CI lanes green. Mirrors the skip pattern in
 //! `fused_linear_ce_bf16_ptxas.rs`.
 
-use nsl_codegen::precision_cast_ptx::{
-    synthesize_bf16_to_f32_ptx, synthesize_f32_to_bf16_ptx, synthesize_f32_to_fp16_ptx,
-    synthesize_fp16_to_f32_ptx,
-};
+use nsl_kir::kernels::cast::{ptx as cast_ptx, CastKind};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -97,7 +94,7 @@ fn f32_to_bf16_assembles_for_sm80() {
         eprintln!("ptxas not found; skipping");
         return;
     };
-    let ptx = synthesize_f32_to_bf16_ptx();
+    let ptx = cast_ptx(CastKind::F32ToBf16);
     let tmp = std::env::temp_dir().join("nsl_cast_f32_to_bf16.ptx");
     std::fs::write(&tmp, &ptx).ok();
     match assemble_ptx(&ptxas, &ptx, "sm_80", "f32_to_bf16") {
@@ -115,7 +112,7 @@ fn bf16_to_f32_assembles_for_sm80() {
         eprintln!("ptxas not found; skipping");
         return;
     };
-    let ptx = synthesize_bf16_to_f32_ptx();
+    let ptx = cast_ptx(CastKind::Bf16ToF32);
     let tmp = std::env::temp_dir().join("nsl_cast_bf16_to_f32.ptx");
     std::fs::write(&tmp, &ptx).ok();
     match assemble_ptx(&ptxas, &ptx, "sm_80", "bf16_to_f32") {
@@ -133,7 +130,7 @@ fn f32_to_fp16_assembles_for_sm80() {
         eprintln!("ptxas not found; skipping");
         return;
     };
-    let ptx = synthesize_f32_to_fp16_ptx();
+    let ptx = cast_ptx(CastKind::F32ToFp16);
     let tmp = std::env::temp_dir().join("nsl_cast_f32_to_fp16.ptx");
     std::fs::write(&tmp, &ptx).ok();
     match assemble_ptx(&ptxas, &ptx, "sm_80", "f32_to_fp16") {
@@ -151,7 +148,7 @@ fn fp16_to_f32_assembles_for_sm80() {
         eprintln!("ptxas not found; skipping");
         return;
     };
-    let ptx = synthesize_fp16_to_f32_ptx();
+    let ptx = cast_ptx(CastKind::Fp16ToF32);
     let tmp = std::env::temp_dir().join("nsl_cast_fp16_to_f32.ptx");
     std::fs::write(&tmp, &ptx).ok();
     match assemble_ptx(&ptxas, &ptx, "sm_80", "fp16_to_f32") {
@@ -167,10 +164,10 @@ fn fp16_to_f32_assembles_for_sm80() {
 fn all_four_cast_kernels_are_ascii_only() {
     // Unicode in PTX triggers CUDA_ERROR_INVALID_PTX under cudarc JIT.
     for (tag, bytes) in [
-        ("f32_to_bf16", synthesize_f32_to_bf16_ptx()),
-        ("bf16_to_f32", synthesize_bf16_to_f32_ptx()),
-        ("f32_to_fp16", synthesize_f32_to_fp16_ptx()),
-        ("fp16_to_f32", synthesize_fp16_to_f32_ptx()),
+        ("f32_to_bf16", cast_ptx(CastKind::F32ToBf16)),
+        ("bf16_to_f32", cast_ptx(CastKind::Bf16ToF32)),
+        ("f32_to_fp16", cast_ptx(CastKind::F32ToFp16)),
+        ("fp16_to_f32", cast_ptx(CastKind::Fp16ToF32)),
     ] {
         for &b in &bytes {
             assert!(

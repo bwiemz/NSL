@@ -67,14 +67,12 @@ crates/nsl-codegen/src/matmul_mma.rs
 crates/nsl-codegen/src/moe_kernels.rs
 crates/nsl-codegen/src/pca_rope.rs
 crates/nsl-codegen/src/pca_tilerange.rs
-crates/nsl-codegen/src/precision_cast_ptx.rs
 crates/nsl-codegen/src/wrga_fused_ptx.rs
 crates/nsl-codegen/src/wrga_kernel_helpers.rs
 crates/nsl-kir/src/backend_ptx.rs
 crates/nsl-runtime/src/cuda/fused_kernels.rs
 crates/nsl-runtime/src/cuda/kernels.rs
 crates/nsl-runtime/src/cuda/kernels_hopper.rs
-crates/nsl-runtime/src/cuda/precision_cast_kernels.rs
 crates/nsl-runtime/src/cuda/strided_copy.rs
 crates/nsl-runtime/src/cuda/tier_b1_prepass.rs
 crates/nsl-runtime/src/flash_attention.rs

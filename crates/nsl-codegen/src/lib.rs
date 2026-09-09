@@ -184,7 +184,6 @@ pub mod fused_linear_ce;
 /// Item 4: proves the row count a compiler-inferred fused LM head needs.
 pub mod ctor_fold;
 pub mod lm_head_inference;
-pub mod precision_cast_ptx;
 pub mod fusion;
 /// Milestone A: activation contracts — the join between "requested" and
 /// "the owner recorded a disposition". See the module doc.

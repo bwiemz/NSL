@@ -8,6 +8,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The four precision-cast kernels are KIR (roadmap A2 step 7).
+  `nsl_kir::kernels::cast` describes f32 <-> bf16 and f32 <-> f16 as one
+  grid-stride loop each — a `U64` induction variable carried as a block
+  parameter, so a tensor of more than 2^32 elements is cast to the end
+  rather than modulo 2^32 — and `nsl-runtime` builds them from that
+  description on first use, behind a `OnceLock` that keeps the PTX at a
+  stable address for `kernel_launch`'s module cache.
+  `crates/nsl-codegen/src/precision_cast_ptx.rs` (436 lines of
+  `push_str`) and the four `static` PTX strings `nsl-runtime` carried
+  alongside it are deleted, and with them the byte-for-byte parity test
+  that existed to hold the copy to the emitter and the `__test_runtime_*`
+  hooks `nsl-runtime` re-exported to feed it. The runtime could not call
+  the emitter — `nsl-codegen` depends on `nsl-runtime`, so the reverse
+  edge is a cycle — which is why the bytes were duplicated; `nsl-kir` is
+  a leaf crate, so there is now one description and no copy. The
+  hand-PTX freeze list drops from 71 files to 69.
+  Two header changes come with the move, both widening the set of devices
+  the modules load on: the bf16 pair emits `.version 7.8` (the ISA level
+  the bf16 `cvt` mnemonics actually require) where the hand path pinned
+  `8.0`, and the f16 pair emits `.target sm_70` where it pinned `sm_80`.
+  Equivalence is proved by execution rather than by inspection:
+  `precision_cast_kir_equivalence` freezes the four modules the deleted
+  emitter produced and runs both them and the KIR modules on a PTX
+  interpreter over six launch geometries, asserting the same destination
+  bytes and — separately — that those bytes match an independent
+  reference cast. The interpreter rejects any mnemonic it does not model,
+  so a silently-skipped instruction cannot make the comparison vacuous.
+
 - KIR register allocation (roadmap A2 step 5): `nsl_kir::regalloc` gives
   every value a register class from its type (`RegClass::of`) and a dense
   index by linear scan over live intervals on the block-order
