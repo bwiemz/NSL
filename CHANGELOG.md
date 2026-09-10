@@ -167,6 +167,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   build and the tree. Declarations come from `nsl-abi`'s table,
   diagnostics from `nsl-log`, and the shared record formats from
   `nsl_abi::wire`; nothing the compiler emits changes.
+- The CUDA device-identity record is a wire declaration (roadmap A3, step
+  4 of the A3 design spec): `nsl_abi::wire::device_identity::CudaDeviceIdentity`
+  (name, `sm_version`, `sm_count`, `driver_version`) is what the runtime's
+  compile-time probe `cuda_device_identity` returns and what the compiler
+  keys its `@autotune` cache on; the runtime re-exports it at
+  `nsl_runtime::CudaDeviceIdentity`, and `gpu_specs::local_device_identity`
+  names the `nsl-abi` type. No behaviour change.
 - The calibration corpus's `.bin` header is a wire declaration and the
   compiler reads corpus geometry without the runtime (roadmap A3, step 4
   of the A3 design spec, third PR): `nsl_abi::wire::calibration_bin`
