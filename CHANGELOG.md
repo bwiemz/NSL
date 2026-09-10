@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Design spec for the rest of roadmap A2,
+  `docs/superpowers/specs/2026-09-09-a2-kir-v2-design.md`: what has
+  landed (the freeze, the verifier, the async-copy and tensor-core ops),
+  the 15.3K-line hand-PTX estate and what it uses that KIR cannot yet say
+  (loop-carried values, the integer/bitwise ISA, 16-bit memory and cast
+  rounding, vector memory, predicated side effects), the design of each
+  addition with its verifier rule (block parameters rather than phi,
+  per-class dense register numbering by linear scan with
+  `register_pressure()`, a typed `SmemLayout` promoted from FA v2's
+  offset functions, shape- and dtype-parameterised MMA), KIR as a leaf
+  crate `nsl-kir` so the runtime's 6.0K lines of kernels can build on it,
+  the three proof levels that replace "bit-identical PTX" (normalised-text
+  identity, SASS-baseline equivalence, the kernel's device tests), and
+  thirteen steps from the crate split to the FA v1 deletion.
 - Design spec for the roadmap A4 endgame,
   `docs/superpowers/specs/2026-09-09-a4-cuda-context-design.md`: what the
   CUDA singleton is today (`CudaState`'s four fields plus about 25 sibling
