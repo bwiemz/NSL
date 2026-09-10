@@ -234,9 +234,16 @@ CLIF snapshots.
    three hand-matched copies (the codegen's `calibration/awq_sidecar.rs`
    encoder + decoder, the runtime's decoder, and the inline encoder in
    `nsl_calib_write_sidecar`), and the runtime keeps only the JSON +
-   base64 sidecar reader around it. Still in the runtime: `peek_batch_seq`
-   (the calibration-data readers, which need `safetensors`) and the
-   `env_record` renderer.
+   base64 sidecar reader around it. *Third PR:* `wire::calibration_bin`
+   (the `.bin` corpus header: magic, rank, dims) parsed by the runtime's
+   loader and by the compiler's new `calibration::data_shape` peek, which
+   reads only the header of a `.bin` or `.safetensors` corpus (the
+   safetensors JSON header via `serde_json`, which the compiler already
+   has) — so `peek_batch_seq` no longer goes through the runtime. The
+   `env_record` *renderer* stays in the runtime; the compiler only
+   mentions it in a comment. With this the compiler's remaining runtime
+   uses are the three device probes step 5 puts behind the `cuda`
+   feature.
 5. **Optional runtime dependency.** `cfg` the eight probe sites; CI's
    Ubuntu lane builds `nsl-codegen` with `--no-default-features` (no
    runtime) as well as the default, and the `cuda` job as today.

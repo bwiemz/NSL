@@ -411,6 +411,88 @@ pub mod awq_scales {
     }
 }
 
+/// The header of the NSL-native calibration-data file (`.bin`): what the
+/// compiler reads to learn the batch geometry at compile time, and what
+/// the runtime's loader reads before the payload.
+///
+/// ```text
+/// [0..4]         magic "NSLB"
+/// [4..8]         rank: u32 LE
+/// [8..8+rank*4]  dims[0..rank]: u32 LE each   ([count, dim1, dim2, ...])
+/// [8+rank*4..]   f32 payload (little-endian), count * prod(dims[1..]) * 4 bytes
+/// ```
+pub mod calibration_bin {
+    /// The first four bytes of every `.bin` calibration file.
+    pub const MAGIC: [u8; 4] = *b"NSLB";
+
+    /// Bytes before the dims: magic + rank.
+    pub const FIXED_HEADER_LEN: usize = 8;
+
+    /// Why a header did not parse. The `Display` text is the runtime
+    /// loader's historical wording, which its callers surface verbatim.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum BinHeaderError {
+        /// Fewer than the eight fixed bytes.
+        TooShort { got: usize },
+        /// The first four bytes are not [`MAGIC`].
+        BadMagic([u8; 4]),
+        /// `rank == 0`.
+        ZeroRank,
+        /// The dims run past the end of the bytes given.
+        TruncatedDims { rank: usize, got: usize },
+    }
+
+    impl std::fmt::Display for BinHeaderError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::TooShort { .. } => write!(f, "too short"),
+                Self::BadMagic(_) => write!(f, "bad magic"),
+                Self::ZeroRank => write!(f, "rank must be >= 1"),
+                Self::TruncatedDims { .. } => write!(f, "truncated dims"),
+            }
+        }
+    }
+
+    impl std::error::Error for BinHeaderError {}
+
+    /// Parse the header at the start of `bytes`: the shape
+    /// `[count, dim1, ...]` and the byte offset at which the payload
+    /// begins. `bytes` may be the whole file or just its first
+    /// `FIXED_HEADER_LEN + 4 * rank` bytes.
+    pub fn parse_header(bytes: &[u8]) -> Result<(Vec<u32>, usize), BinHeaderError> {
+        if bytes.len() < FIXED_HEADER_LEN {
+            return Err(BinHeaderError::TooShort { got: bytes.len() });
+        }
+        if bytes[0..4] != MAGIC {
+            return Err(BinHeaderError::BadMagic([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let rank = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        if rank == 0 {
+            return Err(BinHeaderError::ZeroRank);
+        }
+        let dims_end = FIXED_HEADER_LEN + rank * 4;
+        if bytes.len() < dims_end {
+            return Err(BinHeaderError::TruncatedDims { rank, got: bytes.len() });
+        }
+        let shape = bytes[FIXED_HEADER_LEN..dims_end]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok((shape, dims_end))
+    }
+
+    /// The header for `shape`, to be followed by the f32 payload.
+    pub fn encode_header(shape: &[u32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(FIXED_HEADER_LEN + shape.len() * 4);
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for d in shape {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +572,30 @@ mod tests {
         let mut liar = encode(Vec::<(&str, &[f32])>::new());
         liar[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(AwqScales::from_blob(&liar), Err(AwqBlobError::Truncated { .. })));
+    }
+
+    #[test]
+    fn calibration_bin_header_round_trips_and_refuses_bad_headers() {
+        use calibration_bin::*;
+        let header = encode_header(&[2, 4, 4]);
+        assert_eq!(header.len(), FIXED_HEADER_LEN + 12);
+        assert_eq!(parse_header(&header), Ok((vec![2, 4, 4], 20)));
+        // The payload after the header is not the header's concern.
+        let mut file = header.clone();
+        file.extend_from_slice(&[0u8; 128]);
+        assert_eq!(parse_header(&file), Ok((vec![2, 4, 4], 20)));
+        assert_eq!(parse_header(&header[..7]), Err(BinHeaderError::TooShort { got: 7 }));
+        let mut bad = header.clone();
+        bad[0..4].copy_from_slice(b"NOPE");
+        assert_eq!(parse_header(&bad), Err(BinHeaderError::BadMagic(*b"NOPE")));
+        assert_eq!(parse_header(&encode_header(&[])), Err(BinHeaderError::ZeroRank));
+        assert_eq!(
+            parse_header(&header[..15]),
+            Err(BinHeaderError::TruncatedDims { rank: 3, got: 15 })
+        );
+        // The wording the runtime loader has always surfaced.
+        assert_eq!(BinHeaderError::ZeroRank.to_string(), "rank must be >= 1");
+        assert_eq!(BinHeaderError::BadMagic(*b"NOPE").to_string(), "bad magic");
     }
 
     #[test]

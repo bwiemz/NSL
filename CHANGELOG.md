@@ -156,6 +156,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The calibration corpus's `.bin` header is a wire declaration and the
+  compiler reads corpus geometry without the runtime (roadmap A3, step 4
+  of the A3 design spec, third PR): `nsl_abi::wire::calibration_bin`
+  (magic `NSLB`, rank, dims; `parse_header` / `encode_header`) is parsed
+  by the runtime's loader and by the new
+  `nsl_codegen::calibration::data_shape::{peek_shape, peek_batch_seq}`,
+  which reads only the header of a `.bin` or `.safetensors` corpus (for
+  safetensors, the JSON header's `"calibration"` entry) instead of calling
+  the runtime's whole-file loader. Error wording is the loader's. With
+  this, the compiler's only remaining runtime uses are the three
+  compile-time CUDA device probes.
 - The AWQ activation-scales blob has one definition (roadmap A3, step 4 of
   the A3 design spec, second PR): `nsl_abi::wire::awq_scales` holds the
   layout, `encode`, `AwqScales::from_blob` / `to_blob`, `AwqBlobError` and
