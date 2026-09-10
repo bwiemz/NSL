@@ -212,6 +212,19 @@ CLIF snapshots.
 2. **Header from the table, Python generator.** `c_wrapper::emit` reads the
    `[capi]` rows; `nsl abi python` and its gate; delete the prototype parser
    (`parse_c_prototypes`) and the hand-written `argtypes`.
+   *As landed:* a second X-macro, `nsl_abi::for_each_capi_fn!` (`capi.rs`,
+   22 rows: lifecycle, named dispatch and the ownership models, DLPack,
+   the grad context, the error slot), each row carrying the exact C
+   prototype the header prints where the header declares it (nine rows).
+   `c_header::emit` prints those through `push_capi` (byte-identical
+   header), the runtime's `abi_check.rs` asserts every row by type, and
+   nsl-abi's tests parse each prototype back to its row — so the header
+   gate's text comparison against `c_api/mod.rs` is gone and
+   `c_header_agreement` keeps its two structural checks. `nsl abi python`
+   renders `python/nslpy/_abi.py` (`SIGNATURES` + `bind`), pinned by
+   `python_mirror_agreement`; `_core.py`'s three binders and the loader
+   call `bind`. `parse_c_prototypes` survives for nsl-abi's own row test
+   until step 6.
 3. **`nsl-log`.** The macro and the install hook; `nsl_runtime::nsl_log`
    re-exports. Gated by the C3 byte-identity tests.
    *As landed:* the subscriber moved with the macro, and the hook is an
@@ -234,15 +247,48 @@ CLIF snapshots.
    three hand-matched copies (the codegen's `calibration/awq_sidecar.rs`
    encoder + decoder, the runtime's decoder, and the inline encoder in
    `nsl_calib_write_sidecar`), and the runtime keeps only the JSON +
-   base64 sidecar reader around it. Still in the runtime: `peek_batch_seq`
-   (the calibration-data readers, which need `safetensors`) and the
-   `env_record` renderer.
+   base64 sidecar reader around it. *Third PR:* `wire::calibration_bin`
+   (the `.bin` corpus header: magic, rank, dims) parsed by the runtime's
+   loader and by the compiler's new `calibration::data_shape` peek, which
+   reads only the header of a `.bin` or `.safetensors` corpus (the
+   safetensors JSON header via `serde_json`, which the compiler already
+   has) — so `peek_batch_seq` no longer goes through the runtime. The
+   `env_record` *renderer* stays in the runtime; the compiler only
+   mentions it in a comment. With this the compiler's remaining runtime
+   uses are the three device probes step 5 puts behind the `cuda`
+   feature.
+   *As landed (device identity):* `wire::device_identity::CudaDeviceIdentity`,
+   the four-field record the runtime's compile-time probe returns and the
+   compiler keys its autotune cache on, so step 5 can `cfg` the probe
+   itself without the compiler losing the type; the runtime re-exports it
+   at `nsl_runtime::CudaDeviceIdentity`.
 5. **Optional runtime dependency.** `cfg` the eight probe sites; CI's
    Ubuntu lane builds `nsl-codegen` with `--no-default-features` (no
    runtime) as well as the default, and the `cuda` job as today.
+   *As landed:* by the time steps 3–4 were done the eight sites were
+   three (`cuda_device_name`, `cuda_device_identity`,
+   `CUDA_SUPPORT_COMPILED`; the FlashAttention autotune calls and the
+   Tier-B constant had already gone through `nsl-abi` or the codegen's own
+   modules). The runtime became `optional = true`, enabled by `cuda`
+   (`test-hooks` and `csha_cycle19_probe` forward with `?`), a
+   dev-dependency for the tests, and the three sites `cfg(feature =
+   "cuda")` with the runtime's own non-cuda answers (`None`, `false`).
+   The *default* build is the no-runtime build — there is no separate
+   `--no-default-features` lane — and CI checks `cargo check -p
+   nsl-codegen` alone plus a `cargo tree` gate that `nsl-runtime` is absent.
+   Measured: `cargo tree -e normal -p nsl-codegen | sort -u | wc -l`
+   248 → 116.
 6. **Delete the text parser** (`parse_runtime_functions_table*`,
    `parse_externs_in_file`, `cross_check`) once nothing reads it; `nsl-abi`
    is then the table, the wire constants and the two generators.
+   *As landed:* the Rust-side parser (`parse_runtime_functions_table*`,
+   `parse_externs_in_file`, `parse_inplace_unary_macro`, `cross_check`,
+   `check_workspace`, `Mismatch`/`Report`) and the `signature_agreement`
+   gate are deleted; nothing read them once steps 1–2 rendered both
+   assertions from the tables. `parse_c_prototypes` and the `FnSig` model
+   stay for `c_header_agreement`, which reads the generated header back
+   (its runtime-symbol scan is now a local `extern "C" fn <name>(` token
+   scan). `nsl-abi`'s `lib.rs` shrank from 1,496 to 520 lines.
 
 ## Non-goals
 
