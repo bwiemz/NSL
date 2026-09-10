@@ -103,6 +103,12 @@ runtime's build reports any divergence per symbol. (The text cross-check
 that preceded the typed table caught one on introduction:
 `nsl_flash_attention_quantized` was declared with 21 params while the
 runtime read 23, missing the two Tier-B sentinel slots.)
+binds from, pinned by `cargo test -p nsl-abi`). `nsl-abi/tests/signature_agreement.rs`
+still parses both surfaces as text as belt-and-braces. When you add or change
+a runtime function, add or edit its row and the `extern "C" fn` together; the
+build and the gate report any divergence per symbol. (It caught one on introduction: `nsl_flash_attention_quantized`
+was declared with 21 params while the runtime read 23, missing the two Tier-B
+sentinel slots.)
 
 ## FFI safety contract (every exported symbol)
 
