@@ -465,7 +465,9 @@ configuration NSL's shipped tokenizers use; `tests/` in `nsl-cli`
 encoder token for token.
 
 **Calibration data** (`src/calibration_data.rs`). `load(path)` /
-`peek_shape(path)` read either the NSL-native `.bin` (magic `NSLB`) or a
+`peek_shape(path)` read either the NSL-native `.bin` (magic `NSLB`; its
+header is `nsl_abi::wire::calibration_bin`, shared with the compiler's
+compile-time geometry peek) or a
 safetensors archive with a `calibration` tensor, for the AWQ/GPTQ pipelines
 (`src/awq.rs`, `src/gptq.rs`, `src/quantize.rs`).
 
