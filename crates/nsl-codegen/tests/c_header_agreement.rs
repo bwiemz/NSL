@@ -3,12 +3,13 @@
 //!
 //! ## Why this gate did not exist and needed to
 //!
-//! `nsl-abi`'s `cross_check` validates the codegen's `RUNTIME_FUNCTIONS` table
-//! against the runtime's `extern "C"` bodies, and it is thorough (650
-//! signatures). But it iterates the DECLARED TABLE, so a surface with no table
-//! entry is invisible to it — and the emitted header is exactly that: literal
-//! C text assembled in `c_header.rs`, describing runtime symbols the compiler
-//! never declares to Cranelift because host code, not emitted code, calls them.
+//! `nsl-abi`'s typed table (`RUNTIME_ABI`) is checked against the runtime's
+//! `extern "C"` bodies by the runtime's own `abi_check` gate, and it is
+//! thorough (650 signatures). But that gate iterates the DECLARED TABLE, so a
+//! surface with no table entry is invisible to it — and the emitted header is
+//! exactly that: literal C text assembled in `c_header.rs`, describing runtime
+//! symbols the compiler never declares to Cranelift because host code, not
+//! emitted code, calls them.
 //!
 //! Two existing tests touch the header and neither could see a type:
 //! `c_header_compiles.rs` takes the address of one prototype and otherwise runs
@@ -26,7 +27,7 @@
 //!   the returned status.
 //! * `void nsl_model_destroy(NslModel*)` against `-> i64`.
 
-use nsl_abi::{parse_c_prototypes, parse_externs_in_file, AbiScalar, ParsedType};
+use nsl_abi::{parse_c_prototypes, AbiScalar, ParsedType};
 use nsl_codegen::c_header::{
     emit, ExportDevice, ExportDtype, ExportInfo, ExportParamInfo, ExportTypeInfo,
 };
@@ -57,177 +58,16 @@ fn render_all(ts: &[ParsedType]) -> String {
     ts.iter().map(render).collect::<Vec<_>>().join(", ")
 }
 
-#[test]
-fn generated_header_prototypes_agree_with_runtime_externs() {
-    let header = fixed_surface_header();
-    let protos = parse_c_prototypes(&header);
-
-    // Non-vacuity, part 1: the parser must actually find the surface. A
-    // silently-degrading parser is the classic way a drift gate stops
-    // guarding anything while staying green.
-    assert!(
-        protos.len() >= 6,
-        "parsed only {} prototype(s) from the generated header — the emitter's \
-         format changed and this gate is checking almost nothing:\n{}",
-        protos.len(),
-        header
-    );
-
-    let capi = workspace_root().join("crates/nsl-runtime/src/c_api/mod.rs");
-    let src = std::fs::read_to_string(&capi).expect("read c_api/mod.rs");
-    let externs = parse_externs_in_file(&src, "nsl-runtime/src/c_api/mod.rs");
-    assert!(
-        externs.len() >= 20,
-        "parsed only {} extern fn(s) from c_api/mod.rs",
-        externs.len()
-    );
-
-    // The header is OURS: every spelling in it is one `c_header.rs` chose, so
-    // an unmodelled one means `abi_from_c` cannot see a type we emit — a hole
-    // in the gate, not a "cannot verify". (The runtime side keeps
-    // cannot-verify semantics: it legitimately contains types this crate does
-    // not model.)
-    let unmodelled: Vec<String> = protos
-        .iter()
-        .flat_map(|p| {
-            p.params
-                .iter()
-                .chain(p.ret.iter())
-                .filter_map(move |t| match t {
-                    ParsedType::Unknown(s) if !s.contains('*') => {
-                        Some(format!("  {}: `{s}`", p.name))
-                    }
-                    _ => None,
-                })
-        })
-        .collect();
-    assert!(
-        unmodelled.is_empty(),
-        "the generated header uses {} C type spelling(s) `abi_from_c` does not \
-         model, so nothing checks them — teach the mapping or change the \
-         emitter:\n{}",
-        unmodelled.len(),
-        unmodelled.join("\n")
-    );
-
-    let mut checked = 0usize;
-    let mut problems = Vec::new();
-    for p in &protos {
-        // ALL same-name externs, not the first: `#[cfg]` variants of one
-        // symbol must agree with the header individually (nsl-abi learned this
-        // the same way — see its `every_same_name_variant_must_agree_not_just_one`).
-        let impls: Vec<_> = externs.iter().filter(|e| e.name == p.name).collect();
-        if impls.is_empty() {
-            // Not every header name is an `extern "C"` in this one file (the
-            // `NslExportFn` typedef is checked by the test below). Names that
-            // match nothing are reported by the coverage assert, not here.
-            continue;
-        }
-        checked += 1;
-        for imp in impls {
-        if p.params.len() != imp.params.len() {
-            problems.push(format!(
-                "  {}: header declares {} param(s) [{}], runtime takes {} [{}]",
-                p.name,
-                p.params.len(),
-                render_all(&p.params),
-                imp.params.len(),
-                render_all(&imp.params)
-            ));
-            continue;
-        }
-        for (i, (h, r)) in p.params.iter().zip(imp.params.iter()).enumerate() {
-            // An Unknown on either side means "cannot verify", not "differs":
-            // `NslModel*` is a header-only opaque tag. Pointers on both sides
-            // already collapse to Int(64), so this only skips genuinely
-            // unmodelled spellings.
-            if matches!(h, ParsedType::Unknown(_)) || matches!(r, ParsedType::Unknown(_)) {
-                continue;
-            }
-            if h != r {
-                problems.push(format!(
-                    "  {}: param {} is {} in the header, {} in the runtime",
-                    p.name,
-                    i,
-                    render(h),
-                    render(r)
-                ));
-            }
-        }
-        match (&p.ret, &imp.ret) {
-            (None, Some(r)) => problems.push(format!(
-                "  {}: header returns void, runtime returns {}",
-                p.name,
-                render(r)
-            )),
-            (Some(h), None) => problems.push(format!(
-                "  {}: header returns {}, runtime returns nothing",
-                p.name,
-                render(h)
-            )),
-            (Some(h), Some(r)) => {
-                if !matches!(h, ParsedType::Unknown(_))
-                    && !matches!(r, ParsedType::Unknown(_))
-                    && h != r
-                {
-                    problems.push(format!(
-                        "  {}: header returns {}, runtime returns {}",
-                        p.name,
-                        render(h),
-                        render(r)
-                    ));
-                }
-            }
-            (None, None) => {}
-        }
-        }
-    }
-
-    // Non-vacuity, part 2 — by NAME, not by count. A floor set just under the
-    // current value (the first draft said `>= 5`) lets a symbol silently drop
-    // out of the header, which is the other half of the drift this gate is
-    // for: the runtime keeps the function, the header stops describing it,
-    // and a host writing its own extern declaration is back to guessing.
-    for required in [
-        "nsl_abi_version",
-        "nsl_model_create",
-        "nsl_model_destroy",
-        "nsl_model_call",
-        // Item-7 ownership models + introspection. Without these entries a
-        // dropped prototype would pass silently — the pairwise comparison
-        // above only checks names present in BOTH lists.
-        "nsl_model_call_into",
-        "nsl_model_call_alloc",
-        "nsl_model_get_export_signature",
-        "nsl_get_last_error",
-        "nsl_clear_error",
-    ] {
-        assert!(
-            protos.iter().any(|p| p.name == required),
-            "the generated header no longer declares `{required}` — either it was \
-             dropped from the emitter, or the parser stopped seeing it"
-        );
-        assert!(
-            externs.iter().any(|e| e.name == required),
-            "`{required}` is declared in the header but is no longer an extern \"C\" \
-             in c_api/mod.rs"
-        );
-    }
-    assert!(
-        checked >= 6,
-        "only {checked} header prototype(s) matched a runtime extern — the \
-         names diverged, so this gate compared almost nothing"
-    );
-
-    assert!(
-        problems.is_empty(),
-        "{} ABI disagreement(s) between the generated C header and the runtime \
-         it describes — a host that trusts the header calls with the wrong \
-         register widths:\n{}",
-        problems.len(),
-        problems.join("\n")
-    );
-}
+// The prototype-by-prototype agreement between the header and the runtime's
+// `extern "C"` items used to be checked here by parsing both as text. Since
+// roadmap A3 step 2 the header prints each prototype from `nsl_abi::capi`,
+// whose rows the runtime's build asserts against the implementations by
+// type (`abi_check.rs`) and whose prototypes nsl-abi's own tests parse back
+// to the rows — so there is nothing left for this file to parse on the
+// header side. What remains below are the two structural checks the table
+// cannot express: the `NslExportFn` typedef against the dispatch-wrapper
+// signature the codegen builds, and the static-inline wrappers not
+// shadowing runtime symbols.
 
 #[test]
 fn the_export_fn_typedef_matches_the_signature_codegen_emits() {
@@ -439,6 +279,28 @@ fn export_prototypes_agree_with_the_wrapper_signature_codegen_builds() {
     );
 }
 
+/// Every `extern "C" fn <name>(` spelled in `src`, in source order.
+///
+/// Only the NAMES matter here (the test below asks whether the header
+/// defines an inline of the same spelling), so a token scan is enough; the
+/// signatures themselves are covered by the runtime's `abi_check` gate.
+fn extern_c_fn_names(src: &str) -> Vec<String> {
+    const NEEDLE: &str = "extern \"C\" fn ";
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some(at) = rest.find(NEEDLE) {
+        rest = &rest[at + NEEDLE.len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && rest[name.len()..].trim_start().starts_with('(') {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// The header's convenience inlines must not shadow runtime symbols.
 ///
 /// They were emitted as `static inline int32_t nsl_model_forward(...)` /
@@ -459,11 +321,7 @@ fn header_inlines_do_not_shadow_runtime_symbols() {
     let mut runtime_names: Vec<String> = Vec::new();
     for f in [&capi, &grad] {
         let src = std::fs::read_to_string(f).unwrap_or_default();
-        runtime_names.extend(
-            parse_externs_in_file(&src, "runtime")
-                .into_iter()
-                .map(|s| s.name),
-        );
+        runtime_names.extend(extern_c_fn_names(&src));
     }
     assert!(
         runtime_names.iter().any(|n| n == "nsl_model_forward")

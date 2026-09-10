@@ -30,6 +30,8 @@ nsl-semantic.workspace = true
 nsl-codegen.workspace = true
 # `nsl env`: the NSL_* variable registry (dependency-free).
 nsl-env.workspace = true
+# `nsl abi`: the C-API table and its host-language mirrors (dependency-free).
+nsl-abi.workspace = true
 nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
 # Diagnostics (`nsl_log!`, roadmap C3): the tracing-only front door.
 nsl-log.workspace = true

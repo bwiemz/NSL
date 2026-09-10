@@ -36,7 +36,8 @@ consequences shape the code you will read:
 1. Fatal conditions do not `panic!`. They print, flush stderr, and either
    `std::process::abort()` (`bad_handle` in `src/tensor/mod.rs`,
    `src/assert.rs`) or `std::process::exit(code)` through `src/fatal.rs`
-   (`Fatal::{GpuOom, CudaDriver, CudaAsync, Cublas}`, one exit code each —
+   (`Fatal::{GpuOom, CudaDriver, CudaAsync, Cublas, CudaNotCompiled,
+   UnsupportedDtype, ShapeMismatch, Unsupported}`, one exit code each —
    see "Fatal exits" below). A panic inside an `extern "C"` frame cannot
    unwind; it becomes SIGABRT after a second backtrace and, on a GPU box, a
    multi-GB core dump.
@@ -230,7 +231,9 @@ stderr, and `fatal::tests` pins them:
 | `CudaAsync` | **14** | the `cuCtxSynchronize` that `--cuda-sync` inserts after a kernel or cuBLAS call reported an asynchronous device error |
 | `Cublas` | **15** | a cuBLAS call failed on an in-place operation (the fused wgrad accumulate), where no partial result is safe to continue from |
 | `CudaNotCompiled` | **16** | a device tensor reached a tensor op in a runtime built without the `cuda` feature — the `#[cfg(not(feature = "cuda"))]` arm of every GPU-capable op (`fatal::cuda_not_compiled`) and the cast paths' "compiled without the `cuda` feature" checks |
-| `UnsupportedDtype` | **17** | a tensor op was asked to work on a dtype it does not implement (the cast family in `tensor/precision_cast.rs`, the scalar readers in `tensor/mod.rs`): a compiler/runtime contract violation, not a user error |
+| `UnsupportedDtype` | **17** | a tensor op was asked to work on a dtype it does not implement (the cast family in `tensor/precision_cast.rs`, the scalar readers in `tensor/mod.rs`, `nsl_tensor_compare` / `nsl_tensor_where`, the f16 elementwise readers in `cpu.rs`, the token readers in `packing.rs` / `dataloader.rs` — `fatal::unsupported_dtype(op, dtype)` prints the family's one message): a compiler/runtime contract violation, not a user error |
+| `ShapeMismatch` | **18** | a tensor op's operands do not satisfy its shape contract: `nsl_tensor_compare`'s `b` shorter than `a`, `fase_fused_step`'s CPU path handed mixed dtypes — likewise a contract violation |
+| `Unsupported` | **19** | a runtime operation this build does not implement was reached: a device-to-device `nsl_tensor_to_device`, an ONNX export of a block-packed dtype |
 
 **GPU OOM** is the first of these: the allocator's failure path builds
 `oom_diagnostic` (the request, the current `OOM_CONTEXT` description set by
@@ -465,7 +468,9 @@ configuration NSL's shipped tokenizers use; `tests/` in `nsl-cli`
 encoder token for token.
 
 **Calibration data** (`src/calibration_data.rs`). `load(path)` /
-`peek_shape(path)` read either the NSL-native `.bin` (magic `NSLB`) or a
+`peek_shape(path)` read either the NSL-native `.bin` (magic `NSLB`; its
+header is `nsl_abi::wire::calibration_bin`, shared with the compiler's
+compile-time geometry peek) or a
 safetensors archive with a `calibration` tensor, for the AWQ/GPTQ pipelines
 (`src/awq.rs`, `src/gptq.rs`, `src/quantize.rs`).
 
@@ -520,8 +525,9 @@ caveat in `Cargo.toml`), `src/onnx.rs` + `src/onnx_proto.rs`
 `onnx-rt-op`) exports `RegisterCustomOps` for ONNX Runtime.
 
 **The Python bridge** lives outside the crate in `python/nslpy/`:
-`_core.py` loads the shared library with `ctypes.CDLL`, binds the
-`nsl_model_*` and `nsl_get_last_error` prototypes, and wraps them in
+`_core.py` loads the shared library with `ctypes.CDLL`, binds every C-API
+symbol it exports from the generated `_abi.py` (rendered by `nsl abi python`
+from `nsl_abi::capi`, pinned by `cargo test -p nsl-abi`), and wraps them in
 `NslModel`; `_bridge.py` mirrors `NslTensorDesc` byte for byte and implements
 the DLPack exchange with its defensive-copy guard; `autograd.py` wraps the
 grad-context pair as a `torch.autograd.Function`; `hub.py` and `onnxrt.py`
@@ -767,9 +773,11 @@ crate is built for Miri the whole module interprets in about ten seconds
    runtime's `extern "C"` items and cross-checks them against the table,
    reporting every drift at once.
 4. If the function is part of the host-facing C API, add it to
-   `src/c_api/mod.rs`, bind it in `python/nslpy/_core.py` (argtypes/restype),
-   document it in `docs/abi/README.md`, and — if it is an `@export`-visible
-   signature — make sure `nsl_codegen::c_header` renders it.
+   `src/c_api/mod.rs` and a row to `nsl_abi::capi` (the build then asserts
+   the row against it; `cargo run -p nsl-cli -- abi python` regenerates
+   `python/nslpy/_abi.py`, which `_core.py` binds from), document it in
+   `docs/abi/README.md`, and — if the header must expose it — give the row
+   its C prototype and a `push_capi` call in `nsl_codegen::c_header`.
 5. If the codegen only ever calls it when a feature is off, add a stub to
    `src/interop_stubs.rs` under the inverse `cfg`.
 

@@ -40,9 +40,9 @@
 //! Nothing here changes: this file declares whatever the table says. A row
 //! must appear once — `no_runtime_function_is_declared_twice` checks the
 //! rendering here and `nsl-abi`'s own tests check the table — and its
-//! signature must match the implementation, which the runtime's build now
-//! enforces (`abi_check.rs`) and `nsl-abi`'s `signature_agreement` gate
-//! cross-checks by text as belt-and-braces.
+//! signature must match the implementation, which the runtime's build
+//! enforces (`abi_check.rs`: a row that disagrees with its implementation
+//! fails `cargo build -p nsl-runtime` naming the function).
 
 use cranelift_codegen::ir::{types, AbiParam, Signature};
 use cranelift_codegen::isa::CallConv;
