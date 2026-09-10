@@ -489,6 +489,10 @@ the runtime's sidecar writer), `nsl_runtime::calibration_data::peek_batch_seq`
 `cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`; the identity
 record they return is `nsl_abi::wire::device_identity::CudaDeviceIdentity`,
 the autotune cache key's schema). The rule these
+the runtime's sidecar writer), `nsl_abi::wire::calibration_bin` (the `.bin`
+corpus header, read by `src/calibration/data_shape.rs` for the batch
+geometry at compile time and by the runtime's loader), and `nsl_runtime::CudaDeviceIdentity` /
+`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`). The rule these
 follow: a layout or plan constant the emitted code must agree with is
 imported from the runtime, never retyped in codegen.
 
