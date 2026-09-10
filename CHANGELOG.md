@@ -156,60 +156,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
-- `nsl-abi`'s text parser is gone (roadmap A3, step 6 of the A3 design
-  spec): `parse_runtime_functions_table*`, `parse_externs_in_file`,
-  `parse_inplace_unary_macro`, `cross_check`, `check_workspace` and the
-  `Mismatch`/`Report` types, plus the `signature_agreement` gate that ran
-  them, are deleted. Nothing read them since the typed tables landed — the
-  runtime's build asserts every row of `nsl_abi::table` and `nsl_abi::capi`
-  against its implementation (`abi_check.rs`), which is stricter than the
-  text cross-check was. `parse_c_prototypes` and the `FnSig`/`AbiScalar`
-  model stay for `c_header_agreement`, which reads the generated header
-  back; its runtime-symbol scan no longer goes through `nsl-abi`. The
-  crate's `lib.rs` shrinks from 1,496 to 520 lines and its docs, the
-  `table` and `builtins` module docs, `docs/architecture/codegen.md` and
-  `docs/abi/README.md` describe the build-time assertion as the one gate.
-- The host-facing C API has one typed table (roadmap A3, step 2 of the A3
-  design spec): `nsl_abi::capi` declares the 22 lifecycle, named-dispatch,
-  ownership-model, DLPack, grad-context and error entry points once, nine
-  of them with the exact C prototype the generated header prints.
-  `nsl_codegen::c_header` prints those prototypes from the table (the
-  header is byte-identical), the runtime's build asserts every row against
-  its implementation by type, and nsl-abi's tests parse each prototype
-  back to its row — so the header gate no longer parses `c_api/mod.rs`.
-  New `nsl abi python` renders `python/nslpy/_abi.py` (one
-  `argtypes`/`restype` pair per row plus `bind`), pinned by
-  `cargo test -p nsl-abi`; `nslpy._core` binds every symbol from it
-  instead of spelling the signatures out by hand.
-- The compiler no longer depends on the runtime (roadmap A3, step 5 of the
-  A3 design spec): `nsl-runtime` is an *optional* dependency of
-  `nsl-codegen`, enabled by the `cuda` feature for the two compile-time
-  device probes (`cuda_device_identity`, `cuda_device_name`; `CUDA_SUPPORT_
-  COMPILED` becomes `cfg!(feature = "cuda")`), and a dev-dependency for the
-  integration tests. A default (CPU-only) compiler build has no runtime in
-  its dependency tree: `cargo tree -e normal -p nsl-codegen` goes from 248
-  crates to 116, and CI's new `nsl-codegen standalone` step checks the
-  build and the tree. Declarations come from `nsl-abi`'s table,
-  diagnostics from `nsl-log`, and the shared record formats from
-  `nsl_abi::wire`; nothing the compiler emits changes.
-- The CUDA device-identity record is a wire declaration (roadmap A3, step
-  4 of the A3 design spec): `nsl_abi::wire::device_identity::CudaDeviceIdentity`
-  (name, `sm_version`, `sm_count`, `driver_version`) is what the runtime's
-  compile-time probe `cuda_device_identity` returns and what the compiler
-  keys its `@autotune` cache on; the runtime re-exports it at
-  `nsl_runtime::CudaDeviceIdentity`, and `gpu_specs::local_device_identity`
-  names the `nsl-abi` type. No behaviour change.
-- The calibration corpus's `.bin` header is a wire declaration and the
-  compiler reads corpus geometry without the runtime (roadmap A3, step 4
-  of the A3 design spec, third PR): `nsl_abi::wire::calibration_bin`
-  (magic `NSLB`, rank, dims; `parse_header` / `encode_header`) is parsed
-  by the runtime's loader and by the new
-  `nsl_codegen::calibration::data_shape::{peek_shape, peek_batch_seq}`,
-  which reads only the header of a `.bin` or `.safetensors` corpus (for
-  safetensors, the JSON header's `"calibration"` entry) instead of calling
-  the runtime's whole-file loader. Error wording is the loader's. With
-  this, the compiler's only remaining runtime uses are the three
-  compile-time CUDA device probes.
+- The last production `panic!` sites in `nsl-runtime` are typed fatal
+  exits (roadmap C1, tier 3): `Fatal::ShapeMismatch` (**18**, `nsl_tensor_
+  compare`'s short `b` operand and `fase_fused_step`'s mixed-dtype CPU
+  path) and `Fatal::Unsupported` (**19**, the device-to-device
+  `nsl_tensor_to_device` and an ONNX export of a block-packed dtype) join
+  the table; the eight remaining unsupported-dtype panics
+  (`nsl_tensor_compare`, `nsl_tensor_where`, the f16 elementwise readers,
+  the token readers of `packing.rs` and `dataloader.rs`) go through the
+  new `fatal::unsupported_dtype(op, dtype)` with their message unchanged;
+  `nsl_packed_mask_from_segment_ids`'s non-CUDA arm is
+  `fatal::cuda_not_compiled()`; the inspect stream's `cuStreamCreate`
+  failure is `Fatal::CudaDriver`. Every `panic!` left in the crate is in a
+  `#[cfg(test)]` module or the test-only `alloc_pinned` wrapper.
+  `fatal::tests::the_codes_are_stable` pins all eight codes;
+  `docs/architecture/runtime.md`'s table has the two new rows.
+
 - The AWQ activation-scales blob has one definition (roadmap A3, step 4 of
   the A3 design spec, second PR): `nsl_abi::wire::awq_scales` holds the
   layout, `encode`, `AwqScales::from_blob` / `to_blob`, `AwqBlobError` and

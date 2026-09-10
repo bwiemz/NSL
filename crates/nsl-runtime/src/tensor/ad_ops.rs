@@ -68,7 +68,10 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
     let b_is_scalar = b_len == 1;
     // Allow scalar broadcasting: if b has 1 element, broadcast it to match a's length
     if !b_is_scalar && b_len < len {
-        panic!("nsl_tensor_compare: b tensor too short ({} < {})", b_len, len);
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!("nsl_tensor_compare: b tensor too short ({b_len} < {len})"),
+        );
     }
     let ndim = a.ndim;
     let dtype = a.dtype;
@@ -111,7 +114,7 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
             match t.dtype {
                 1 => unsafe { *t.data_f32().add(i) as f64 },
                 0 => unsafe { *t.data_f64().add(i) },
-                other => panic!("nsl_tensor_compare: unsupported dtype {other}"),
+                other => crate::fatal::unsupported_dtype("nsl_tensor_compare", other),
             }
         };
         if dtype == 1 {
@@ -221,7 +224,7 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
         match t.dtype {
             1 => unsafe { *t.data_f32().add(i) as f64 },
             0 => unsafe { *t.data_f64().add(i) },
-            other => panic!("nsl_tensor_where: unsupported dtype {other}"),
+            other => crate::fatal::unsupported_dtype("nsl_tensor_where", other),
         }
     };
     let data: *mut c_void = if dtype == 1 {

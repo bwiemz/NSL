@@ -978,6 +978,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Set to 1 to force the optimizer-state offload copy-back onto the synchronous path (disables the async DtoH overlap)."
     ),
     var!(
+        "NSL_ONNX_REFUSAL_CHILD",
+        Bool,
+        "1 only",
+        "unset (parent re-execs the child)",
+        Test,
+        Test,
+        "Test harness only: marks the re-exec'd child that drives the ONNX block-packed-dtype refusal, so the parent can assert its exit code."
+    ),
+    var!(
         "NSL_PARAM_PLAN_FAULT",
         Int,
         "integer parameter index (trimmed i64); unparsable = off",
