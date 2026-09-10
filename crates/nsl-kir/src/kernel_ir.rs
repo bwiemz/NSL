@@ -1,8 +1,8 @@
-// crates/nsl-codegen/src/kernel_ir.rs
+// crates/nsl-kir/src/kernel_ir.rs
 //! M47: Backend-agnostic Kernel IR -- SSA-form intermediate representation
 //! for GPU compute kernels.
 
-use crate::gpu_target::FeatureSet;
+use crate::FeatureSet;
 
 pub type VarId = u32;
 pub type BlockId = u32;

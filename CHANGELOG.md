@@ -170,6 +170,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `KernelIR`, `KirBuilder`, the KIR verifier, the PTX printer and
+  `FeatureSet` moved from `nsl-codegen` into a new leaf crate `nsl-kir`
+  (roadmap A2 step 1), so the runtime can build kernels on the same IR
+  without depending on the compiler. `nsl_codegen::{kernel_ir, kir_verify,
+  backend_ptx}` and `nsl_codegen::gpu_target::FeatureSet` re-export
+  everything at the historical paths, so no caller changes;
+  `crates/nsl-kir/tests/leaf.rs` pins the crate dependency-free; the
+  KIR-generated PTX snapshots are byte-identical. The hand-PTX freeze
+  manifest now lists `crates/nsl-kir/src/backend_ptx.rs` as the member
+  by construction.
 - The last production `panic!` sites in `nsl-runtime` are typed fatal
   exits (roadmap C1, tier 3): `Fatal::ShapeMismatch` (**18**, `nsl_tensor_
   compare`'s short `b` operand and `fase_fused_step`'s mixed-dtype CPU

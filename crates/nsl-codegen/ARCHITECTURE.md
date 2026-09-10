@@ -32,7 +32,7 @@ Each module is declared once at the crate root (keeping `crate::foo` and
 | Facade | Responsibility | Representative modules |
 |--------|----------------|------------------------|
 | `core` | The compilation pipeline itself | `compiler`, `stmt`, `expr`, `func`, `context`, `linker`, `c_header`, `c_wrapper`, `ownership`, `standalone` |
-| `gpu` | Device backends & kernel lowering | `backend_ptx`, `backend_amdgpu`, `backend_metal`, `backend_wgsl`, `gpu_specs`, `gpu_target`, `kernel*`, `matmul_mma`, `ptxas_validation` |
+| `gpu` | Device backends & kernel lowering | `backend_ptx`, `kernel_ir`, `kir_verify` (re-exported from the `nsl-kir` leaf crate), `backend_amdgpu`, `backend_metal`, `backend_wgsl`, `gpu_specs`, `gpu_target`, `kernel*`, `matmul_mma`, `ptxas_validation` |
 | `training` | Autodiff & training-time codegen | `ad_rules`, `source_ad`, `wengert`, `wengert_lower`, `vmap`, `training_report` |
 | `quantization` | Reduced-precision execution | `fp8`, `bitnet`, `weight_aware`, `pca_*` |
 | `distributed` | Parallelism strategies | `tensor_parallel`, `context_parallel`, `pipeline`, `moe*`, `cpdt*` |

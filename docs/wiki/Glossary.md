@@ -88,7 +88,7 @@ Post-training weight quantization algorithm (Frantar et al.) that uses second-or
 Integer quantization dtypes. `INT4` packs two 4-bit values per byte; `INT8` is one byte per value. Both are supported in NSL's `quant` block with per-channel or per-group granularity. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
 
 ### <a id="kir"></a>KIR — Kernel IR
-NSL's flat SSA-form intermediate representation for GPU kernels, defined in `crates/nsl-codegen/src/kernel_ir.rs`. KIR sits between the `kernel` block AST and backend PTX/WGSL/AMDGPU emission. From M47 onward, KIR is the portable abstraction that non-CUDA backends target.
+NSL's flat SSA-form intermediate representation for GPU kernels, defined in `crates/nsl-kir/src/kernel_ir.rs` (re-exported as `nsl_codegen::kernel_ir`). KIR sits between the `kernel` block AST and backend PTX/WGSL/AMDGPU emission. From M47 onward, KIR is the portable abstraction that non-CUDA backends target.
 
 ### <a id="mma"></a>MMA — Matrix Multiply-Accumulate
 PTX instruction family (`mma.sync.aligned.m16n8k16`, `wgmma.mma_async`, etc.) that performs tile-level matrix multiplication directly in registers. NSL uses `mma.sync.m16n8k16` (Ampere, sm_80) for WRGA fused adapter forward and CSHA projection PTX. Primitives live in `crates/nsl-codegen/src/matmul_mma.rs`.

@@ -7,7 +7,6 @@
 # construction — it is the PTX printer KIR lowers through. Everything else
 # is hand-PTX, including the shared preludes in kernel_skeleton/ that the
 # hand-written kernels compose. The list is meant to shrink.
-crates/nsl-codegen/src/backend_ptx.rs
 crates/nsl-codegen/src/bitnet/mod.rs
 crates/nsl-codegen/src/bitnet/phases/absmean_quant.rs
 crates/nsl-codegen/src/bitnet/phases/finalize.rs
@@ -71,6 +70,7 @@ crates/nsl-codegen/src/pca_tilerange.rs
 crates/nsl-codegen/src/precision_cast_ptx.rs
 crates/nsl-codegen/src/wrga_fused_ptx.rs
 crates/nsl-codegen/src/wrga_kernel_helpers.rs
+crates/nsl-kir/src/backend_ptx.rs
 crates/nsl-runtime/src/cuda/fused_kernels.rs
 crates/nsl-runtime/src/cuda/kernels.rs
 crates/nsl-runtime/src/cuda/kernels_hopper.rs

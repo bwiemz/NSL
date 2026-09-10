@@ -263,6 +263,10 @@ frozen throughout, so nothing here blocks a kernel fix.
 
 1. **`nsl-kir`.** Move the four modules; `nsl-codegen` re-exports; a
    `cargo tree` gate proves the crate has no workspace dependency; the
+   three KIR snapshots are byte-identical. *Landed:* `crates/nsl-kir`
+   (`kernel_ir`, `kir_verify`, `backend_ptx`, `FeatureSet`), re-exported
+   at the historical `nsl_codegen` paths; `crates/nsl-kir/tests/leaf.rs`
+   pins the empty `[dependencies]` table; the snapshots did not change.
    three KIR snapshots are byte-identical.
 2. **Block parameters.** `KirBlock::params`, terminator arguments, rule 7,
    edge copies in every printer (the non-PTX printers may refuse loops

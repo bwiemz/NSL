@@ -1,10 +1,10 @@
-// crates/nsl-codegen/src/backend_ptx.rs
+// crates/nsl-kir/src/backend_ptx.rs
 //! M47: KIR -> PTX text emission backend.
 //!
 //! Lowers a `KernelIR` to null-terminated PTX text bytes suitable for
 //! `cuModuleLoadData`. Uses PTX ISA 7.0 targeting sm_70.
 
-use crate::gpu_target::FeatureSet;
+use crate::FeatureSet;
 use crate::kernel_ir::*;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -1035,7 +1035,7 @@ mod tests {
     /// input must be pre-scaled by log2(e) = 0f3FB8AA3B.
     #[test]
     fn test_ptx_exp_applies_base_conversion() {
-        let ptx = ptx_for_unary_op("test_exp", |d, s| KirOp::Exp(d, s));
+        let ptx = ptx_for_unary_op("test_exp", KirOp::Exp);
 
         let mul = ptx
             .find("mul.f32 %f1, %f0, 0f3FB8AA3B;")
@@ -1059,7 +1059,7 @@ mod tests {
     /// log2(x), so the result must be post-scaled by ln(2) = 0f3F317218.
     #[test]
     fn test_ptx_log_applies_base_conversion() {
-        let ptx = ptx_for_unary_op("test_log", |d, s| KirOp::Log(d, s));
+        let ptx = ptx_for_unary_op("test_log", KirOp::Log);
 
         let lg2 = ptx
             .find("lg2.approx.f32 %f1, %f0;")
@@ -1079,7 +1079,7 @@ mod tests {
     /// identity `mov.f32 dst, src`.
     #[test]
     fn test_ptx_tanh_emits_expansion_not_identity() {
-        let ptx = ptx_for_unary_op("test_tanh", |d, s| KirOp::Tanh(d, s));
+        let ptx = ptx_for_unary_op("test_tanh", KirOp::Tanh);
 
         assert!(
             !ptx.contains("mov.f32 %f1, %f0;"),
