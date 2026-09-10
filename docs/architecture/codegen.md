@@ -484,6 +484,11 @@ TIER_B_SEQ_LEN_FLOOR}` (re-exported by `src/pca_tier_b.rs`),
 `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR,
 nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::awq_scales::AwqScales`
 (`src/stmt_quant.rs`; the AWQ blob's one encoder and decoder, shared with
+the runtime's sidecar writer), `nsl_runtime::calibration_data::peek_batch_seq`
+(`src/lib.rs`, calibration), and `nsl_runtime::cuda_device_identity` /
+`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`; the identity
+record they return is `nsl_abi::wire::device_identity::CudaDeviceIdentity`,
+the autotune cache key's schema). The rule these
 the runtime's sidecar writer), `nsl_abi::wire::calibration_bin` (the `.bin`
 corpus header, read by `src/calibration/data_shape.rs` for the batch
 geometry at compile time and by the runtime's loader), and `nsl_runtime::CudaDeviceIdentity` /
@@ -564,7 +569,8 @@ will not merge.** If a kernel needs something KIR cannot express, extend
 **Supporting pieces.** `src/gpu_specs.rs` — `GpuSpec` (`sm_version`, peak
 TFLOPs, bandwidth, VRAM, L2, crossover points, launch overhead),
 `GPU_DATABASE`, `find_gpu`, `default_gpu`, `resolve_local_gpu`
-(via `nsl_runtime::CudaDeviceIdentity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
+(via `nsl_abi::wire::device_identity::CudaDeviceIdentity`, probed by
+`nsl_runtime::cuda_device_identity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
 `src/ptxas_validation.rs::validate_ptx` assembles PTX through `cudarc`
 `cuModuleLoadData` when a context is current, else `nvcc --cubin`; it is the
 basis of every `*_ptxas*.rs` test. `src/ptx_metadata.rs` extracts static

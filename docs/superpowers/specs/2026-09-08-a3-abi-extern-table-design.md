@@ -224,6 +224,11 @@ CLIF snapshots.
    `nsl_log::nsl_log!` directly, so step 5 has nothing left to rename.
 4. **`wire` structs and formats.** One PR per format, each with a
    round-trip test in `nsl-abi`.
+   *As landed (device identity):* `wire::device_identity::CudaDeviceIdentity`,
+   the four-field record the runtime's compile-time probe returns and the
+   compiler keys its autotune cache on, so step 5 can `cfg` the probe
+   itself without the compiler losing the type; the runtime re-exports it
+   at `nsl_runtime::CudaDeviceIdentity`.
    *As landed, first PR:* `wire::tensor_desc::NslTensorDesc` (layout
    constant-asserted; the compiler's descriptor stride is its `sizeof`)
    and `wire::train_config::{MOMENT_KEYS, TRAJECTORY_KEYS}` (the record's

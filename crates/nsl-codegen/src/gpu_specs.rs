@@ -578,8 +578,8 @@ pub fn default_gpu() -> &'static GpuSpec {
 /// tuning result measured on one GPU was indistinguishable from — and reused
 /// verbatim as — a result for any other. The identity has to come from the
 /// driver for the key to mean anything.
-pub fn local_device_identity() -> Option<&'static nsl_runtime::CudaDeviceIdentity> {
-    static IDENTITY: std::sync::OnceLock<Option<nsl_runtime::CudaDeviceIdentity>> =
+pub fn local_device_identity() -> Option<&'static nsl_abi::wire::device_identity::CudaDeviceIdentity> {
+    static IDENTITY: std::sync::OnceLock<Option<nsl_abi::wire::device_identity::CudaDeviceIdentity>> =
         std::sync::OnceLock::new();
     IDENTITY
         .get_or_init(nsl_runtime::cuda_device_identity)
