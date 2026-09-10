@@ -3,6 +3,7 @@
 
 pub mod ast_evaluator;
 pub mod awq_hook;
+pub mod data_shape;
 pub mod discovery;
 pub mod wggo_gradient_hook;
 pub mod binary_codegen;
