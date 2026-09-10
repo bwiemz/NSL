@@ -270,7 +270,8 @@ has not drifted.
   `exec_markers::tokens`, and an emitter that disappears fails
   `EXEC_MARKERS`'s gate.
 - **Generated pages equal their renderings**: `CLI-Reference.md`,
-  `Stdlib-Reference.md`, `Environment-Variables.md`.
+  `Stdlib-Reference.md`, `Environment-Variables.md`, and `python/nslpy/_abi.py`
+  (`nsl abi python`, pinned by `cargo test -p nsl-abi`).
 - **Every `NSL_*` read is registered and tiered** (`registry_agreement`).
 - **Every `#[ignore]` carries a reason and is in the manifest**
   (`gpu-cert.sh --check-reasons` / `--check-inventory`).

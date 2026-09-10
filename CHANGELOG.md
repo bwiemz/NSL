@@ -210,6 +210,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   thing in `main`. stderr, the `log` events on the stream and the marker
   gates are unchanged; the compiler's diagnostics are no longer a reason
   for it to depend on the runtime.
+- The CUDA device-identity record is a wire declaration (roadmap A3, step
+  4 of the A3 design spec): `nsl_abi::wire::device_identity::CudaDeviceIdentity`
+  (name, `sm_version`, `sm_count`, `driver_version`) is what the runtime's
+  compile-time probe `cuda_device_identity` returns and what the compiler
+  keys its `@autotune` cache on; the runtime re-exports it at
+  `nsl_runtime::CudaDeviceIdentity`, and `gpu_specs::local_device_identity`
+  names the `nsl-abi` type. No behaviour change.
 - The train block has a `TrainPlan` carrier (roadmap A1; step 1 of the
   design in `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`):
   `stmt_train/plan.rs` holds the planning-time facts as plain data — the

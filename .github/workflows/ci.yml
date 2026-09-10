@@ -102,6 +102,23 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # Roadmap A3, step 5: a CPU-only compiler build has no runtime in its
+      # dependency tree (declarations come from nsl-abi's table, diagnostics
+      # from nsl-log, record formats from nsl_abi::wire; the runtime is an
+      # optional dependency enabled by `cuda` for the compile-time device
+      # probes). The check is `-p nsl-codegen` ALONE so no other workspace
+      # member's features unify into it, and the tree gate is what makes a
+      # regression (a new `nsl_runtime::` use, or a feature that re-enables
+      # the dependency) fail here rather than in a downstream build.
+      - name: Compiler builds without the runtime (nsl-codegen standalone)
+        if: runner.os == 'Linux'
+        run: |
+          cargo check -p nsl-codegen
+          if cargo tree -e normal -p nsl-codegen --prefix none | grep -q '^nsl-runtime '; then
+            echo '::error::nsl-runtime is in nsl-codegen'"'"'s default dependency tree (roadmap A3 step 5 regression)'
+            exit 1
+          fi
+
       # --no-fail-fast: without it, `cargo test` stops at the FIRST failing test
       # binary and never builds/runs the rest, so a red run reports exactly one
       # broken target no matter how many are broken. That turned the four

@@ -502,7 +502,13 @@ fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
         // any of those failed, csha would both fall back to the A100 spec and
         // suppress the message saying so — turning a loud fallback into a
         // silent one on exactly the machines where something is already wrong.
-        let Some(name) = nsl_runtime::cuda_device_name() else {
+        // The probe runs at compile time and needs the runtime linked; a
+        // compiler built without `cuda` has no device to name (roadmap A3).
+        #[cfg(feature = "cuda")]
+        let probed = nsl_runtime::cuda_device_name();
+        #[cfg(not(feature = "cuda"))]
+        let probed: Option<String> = None;
+        let Some(name) = probed else {
             return;
         };
         match detected {
