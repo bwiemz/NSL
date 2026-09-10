@@ -224,11 +224,6 @@ CLIF snapshots.
    `nsl_log::nsl_log!` directly, so step 5 has nothing left to rename.
 4. **`wire` structs and formats.** One PR per format, each with a
    round-trip test in `nsl-abi`.
-   *As landed (device identity):* `wire::device_identity::CudaDeviceIdentity`,
-   the four-field record the runtime's compile-time probe returns and the
-   compiler keys its autotune cache on, so step 5 can `cfg` the probe
-   itself without the compiler losing the type; the runtime re-exports it
-   at `nsl_runtime::CudaDeviceIdentity`.
    *As landed, first PR:* `wire::tensor_desc::NslTensorDesc` (layout
    constant-asserted; the compiler's descriptor stride is its `sizeof`)
    and `wire::train_config::{MOMENT_KEYS, TRAJECTORY_KEYS}` (the record's
@@ -249,9 +244,27 @@ CLIF snapshots.
    mentions it in a comment. With this the compiler's remaining runtime
    uses are the three device probes step 5 puts behind the `cuda`
    feature.
+   *As landed (device identity):* `wire::device_identity::CudaDeviceIdentity`,
+   the four-field record the runtime's compile-time probe returns and the
+   compiler keys its autotune cache on, so step 5 can `cfg` the probe
+   itself without the compiler losing the type; the runtime re-exports it
+   at `nsl_runtime::CudaDeviceIdentity`.
 5. **Optional runtime dependency.** `cfg` the eight probe sites; CI's
    Ubuntu lane builds `nsl-codegen` with `--no-default-features` (no
    runtime) as well as the default, and the `cuda` job as today.
+   *As landed:* by the time steps 3–4 were done the eight sites were
+   three (`cuda_device_name`, `cuda_device_identity`,
+   `CUDA_SUPPORT_COMPILED`; the FlashAttention autotune calls and the
+   Tier-B constant had already gone through `nsl-abi` or the codegen's own
+   modules). The runtime became `optional = true`, enabled by `cuda`
+   (`test-hooks` and `csha_cycle19_probe` forward with `?`), a
+   dev-dependency for the tests, and the three sites `cfg(feature =
+   "cuda")` with the runtime's own non-cuda answers (`None`, `false`).
+   The *default* build is the no-runtime build — there is no separate
+   `--no-default-features` lane — and CI checks `cargo check -p
+   nsl-codegen` alone plus a `cargo tree` gate that `nsl-runtime` is absent.
+   Measured: `cargo tree -e normal -p nsl-codegen | sort -u | wc -l`
+   248 → 116.
 6. **Delete the text parser** (`parse_runtime_functions_table*`,
    `parse_externs_in_file`, `cross_check`) once nothing reads it; `nsl-abi`
    is then the table, the wire constants and the two generators.

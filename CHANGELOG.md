@@ -156,6 +156,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The compiler no longer depends on the runtime (roadmap A3, step 5 of the
+  A3 design spec): `nsl-runtime` is an *optional* dependency of
+  `nsl-codegen`, enabled by the `cuda` feature for the two compile-time
+  device probes (`cuda_device_identity`, `cuda_device_name`; `CUDA_SUPPORT_
+  COMPILED` becomes `cfg!(feature = "cuda")`), and a dev-dependency for the
+  integration tests. A default (CPU-only) compiler build has no runtime in
+  its dependency tree: `cargo tree -e normal -p nsl-codegen` goes from 248
+  crates to 116, and CI's new `nsl-codegen standalone` step checks the
+  build and the tree. Declarations come from `nsl-abi`'s table,
+  diagnostics from `nsl-log`, and the shared record formats from
+  `nsl_abi::wire`; nothing the compiler emits changes.
 - The CUDA device-identity record is a wire declaration (roadmap A3, step
   4 of the A3 design spec): `nsl_abi::wire::device_identity::CudaDeviceIdentity`
   (name, `sm_version`, `sm_count`, `driver_version`) is what the runtime's
@@ -212,6 +223,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   thing in `main`. stderr, the `log` events on the stream and the marker
   gates are unchanged; the compiler's diagnostics are no longer a reason
   for it to depend on the runtime.
+- The CUDA device-identity record is a wire declaration (roadmap A3, step
+  4 of the A3 design spec): `nsl_abi::wire::device_identity::CudaDeviceIdentity`
+  (name, `sm_version`, `sm_count`, `driver_version`) is what the runtime's
+  compile-time probe `cuda_device_identity` returns and what the compiler
+  keys its `@autotune` cache on; the runtime re-exports it at
+  `nsl_runtime::CudaDeviceIdentity`, and `gpu_specs::local_device_identity`
+  names the `nsl-abi` type. No behaviour change.
 - The train block has a `TrainPlan` carrier (roadmap A1; step 1 of the
   design in `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`):
   `stmt_train/plan.rs` holds the planning-time facts as plain data — the
