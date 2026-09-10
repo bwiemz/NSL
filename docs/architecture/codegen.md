@@ -522,7 +522,17 @@ shared_mem_bytes, workgroup_size, required_features: FeatureSet }`, `KirOp`,
 `VarId`), def-before-use under dominance over the block CFG, and operand
 typing wherever `var_types` records both sides; `KernelIR::verify` and
 `KernelIR::is_well_formed` are the same check, and `lower_kernel_to_ir`
-refuses a kernel that fails it with every violation listed. The async-copy
+refuses a kernel that fails it with every violation listed. A loop-carried
+value is a block parameter (roadmap A2 step 2): `KirBlock::params`,
+`KirBuilder::add_block_param`, and edges (`KirEdge { target, args }`, the
+payload of `KirTerminator::Branch` / `CondBranch`; `b.into()` is an edge
+with no arguments) pass a value per parameter — verifier rule 7 holds the
+argument count and types to the target's parameters and refuses parameters
+on the entry block, and the PTX printer implements an edge as a parallel
+copy into the parameter registers before the jump (a per-class
+`%edge_*` scratch register breaks a swap; a `CondBranch` whose edges carry
+arguments gets a `BB<n>_else` label). `crates/nsl-codegen/tests/kir_block_params_ptxas.rs`
+assembles a grid-stride loop with `ptxas`. The async-copy
 group is first-class KIR (`SharedBase`, `CpAsync { bytes: 4 | 8 | 16 }`,
 `CpAsyncCommit`, `CpAsyncWait { pending }`, `FeatureSet::ASYNC_COPY`): the
 verifier checks the global → shared state spaces and the commit/wait

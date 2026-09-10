@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- KIR block parameters (roadmap A2 step 2): a loop-carried value is now
+  expressible in KIR without phi nodes. `KirBlock::params`
+  (`KirBuilder::add_block_param`) define SSA values at block entry, and
+  every edge (`KirEdge { target, args }`, now the payload of
+  `KirTerminator::Branch` / `CondBranch`; `block.into()` is an argument-less
+  edge) passes one value per parameter. Verifier rule 7 holds the argument
+  count and types to the target's parameters and refuses parameters on the
+  entry block; block parameters take part in the SSA and dominance rules.
+  The PTX printer implements an edge as a parallel copy into the parameter
+  registers before the jump, with a per-class `%edge_*` scratch register for
+  a swap and a `BB<n>_else` label when a conditional branch's edges carry
+  arguments; kernels without block parameters print byte-identically. The
+  AMDGPU, Metal and WGSL printers mark edge arguments as unhandled rather
+  than dropping them. `crates/nsl-codegen/tests/kir_block_params_ptxas.rs`
+  assembles a grid-stride loop with `ptxas` in CI's cuda lane, and
+  `snapshot_tests.rs` pins its PTX.
 - Design spec for the rest of roadmap A2,
   `docs/superpowers/specs/2026-09-09-a2-kir-v2-design.md`: what has
   landed (the freeze, the verifier, the async-copy and tensor-core ops),

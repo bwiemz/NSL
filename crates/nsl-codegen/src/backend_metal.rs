@@ -59,6 +59,11 @@ pub fn lower_kir_to_msl(ir: &KernelIR) -> Vec<u8> {
         for op in &block.ops {
             writeln!(msl, "    {}", lower_op_to_msl(op)).unwrap();
         }
+        // Roadmap A2 step 2: this printer has no control flow yet, so an
+        // edge that passes block arguments is marked, not silently dropped.
+        if block.terminator.as_ref().is_some_and(|t| t.has_args()) {
+            writeln!(msl, "    // unhandled edge arguments").unwrap();
+        }
     }
 
     writeln!(msl, "}}").unwrap();
