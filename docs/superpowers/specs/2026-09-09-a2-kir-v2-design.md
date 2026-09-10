@@ -267,6 +267,7 @@ frozen throughout, so nothing here blocks a kernel fix.
    (`kernel_ir`, `kir_verify`, `backend_ptx`, `FeatureSet`), re-exported
    at the historical `nsl_codegen` paths; `crates/nsl-kir/tests/leaf.rs`
    pins the empty `[dependencies]` table; the snapshots did not change.
+   three KIR snapshots are byte-identical.
 2. **Block parameters.** `KirBlock::params`, terminator arguments, rule 7,
    edge copies in every printer (the non-PTX printers may refuse loops
    with their "unhandled" path until they need them); the verifier's loop

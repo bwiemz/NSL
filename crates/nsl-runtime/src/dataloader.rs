@@ -575,7 +575,7 @@ fn read_flat_value(data: *const c_void, dtype: u16, index: usize) -> i64 {
         DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(index) as i64 },
         1 => unsafe { *(data as *const f32).add(index) as i64 },
         0 => unsafe { *(data as *const f64).add(index) as i64 },
-        _ => panic!("read_flat_value() unsupported dtype {}", dtype),
+        _ => crate::fatal::unsupported_dtype("read_flat_value()", dtype),
     }
 }
 

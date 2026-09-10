@@ -15,6 +15,10 @@
 //! without the feature the symbol is the stub of the same name in
 //! `interop_stubs`, which is checked instead, so both builds verify the
 //! surface they link.
+//!
+//! The C-API table (`nsl_abi::for_each_capi_fn!`, the surface a host calls
+//! through the generated header or the Python package) is checked the same
+//! way; its rows carry no feature flag.
 
 use nsl_abi::typed::assert_sig;
 
@@ -60,3 +64,11 @@ macro_rules! assert_runtime_abi {
 }
 
 nsl_abi::for_each_runtime_fn!(assert_runtime_abi);
+
+macro_rules! assert_capi_abi {
+    ($($n:ident ($($p:ident),*) -> $r:tt = $($seg:ident)::+ $(: $c:literal)? ;)*) => {
+        $( assert_abi_row! { [] $n ($($p),*) -> $r = $($seg)::+ } )*
+    };
+}
+
+nsl_abi::for_each_capi_fn!(assert_capi_abi);
