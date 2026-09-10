@@ -3,7 +3,7 @@
 # hand-ptx-freeze.sh — the hand-written-PTX freeze (roadmap item A2, step 1).
 #
 # NSL has two ways to produce a GPU kernel. The compiler path builds a
-# KernelIR (crates/nsl-codegen/src/kernel_ir.rs) and lowers it through
+# KernelIR (crates/nsl-kir/src/kernel_ir.rs) and lowers it through
 # backend_ptx.rs, which allocates registers, checks well-formedness, and can
 # in principle target something other than PTX. The other path is a Rust
 # function that `push_str`s PTX text with hand-numbered registers, and it is

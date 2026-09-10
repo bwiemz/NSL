@@ -102,6 +102,23 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # Roadmap A3, step 5: a CPU-only compiler build has no runtime in its
+      # dependency tree (declarations come from nsl-abi's table, diagnostics
+      # from nsl-log, record formats from nsl_abi::wire; the runtime is an
+      # optional dependency enabled by `cuda` for the compile-time device
+      # probes). The check is `-p nsl-codegen` ALONE so no other workspace
+      # member's features unify into it, and the tree gate is what makes a
+      # regression (a new `nsl_runtime::` use, or a feature that re-enables
+      # the dependency) fail here rather than in a downstream build.
+      - name: Compiler builds without the runtime (nsl-codegen standalone)
+        if: runner.os == 'Linux'
+        run: |
+          cargo check -p nsl-codegen
+          if cargo tree -e normal -p nsl-codegen --prefix none | grep -q '^nsl-runtime '; then
+            echo '::error::nsl-runtime is in nsl-codegen'"'"'s default dependency tree (roadmap A3 step 5 regression)'
+            exit 1
+          fi
+
       # --no-fail-fast: without it, `cargo test` stops at the FIRST failing test
       # binary and never builds/runs the rest, so a red run reports exactly one
       # broken target no matter how many are broken. That turned the four
@@ -475,6 +492,9 @@ jobs:
           # by the KIR verifier; this is the gate that proves ptxas takes it.
           cargo test -p nsl-codegen --test kir_async_copy_ptxas
           cargo test -p nsl-codegen --test kir_mma_ptxas
+          # Roadmap A2 step 2: a loop-carried value is a block parameter and
+          # an edge is a parallel copy; this proves ptxas takes the lowering.
+          cargo test -p nsl-codegen --test kir_block_params_ptxas
           # M35.1: the BitNet forward emitter shipped producing PTX that ptxas
           # rejected at essentially every instruction, while its structural
           # snapshot tests stayed green. This is the gate that catches that.
@@ -697,7 +717,7 @@ jobs:
           # file cannot regain hand-PTX under an old blessing.
           cp ci/hand-ptx-manifest.txt /tmp/manifest.bak
           trap 'cp /tmp/manifest.bak ci/hand-ptx-manifest.txt' EXIT
-          echo "crates/nsl-codegen/src/kernel_ir.rs" >> ci/hand-ptx-manifest.txt
+          echo "crates/nsl-kir/src/kernel_ir.rs" >> ci/hand-ptx-manifest.txt
           if ./scripts/hand-ptx-freeze.sh --check > /tmp/av.log 2>&1; then
             echo "ANTI-VACUITY FAILURE: a stale manifest entry left --check green" >&2
             exit 1

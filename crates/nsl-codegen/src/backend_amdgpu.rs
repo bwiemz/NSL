@@ -120,10 +120,23 @@ fn lower_op_to_amdgpu(op: &KirOp, ir: &KernelIR) -> String {
 
 fn lower_terminator_amdgpu(term: &KirTerminator) -> String {
     match term {
-        KirTerminator::Branch(target) => format!("s_branch .LBB{}", target),
-        KirTerminator::CondBranch(pred, t, f) => {
-            format!("s_cbranch_vccnz .LBB{} ; pred=v{}, else .LBB{}", t, pred, f)
+        // Roadmap A2 step 2: an edge that passes block arguments needs a
+        // parallel copy into the target's parameter registers before the
+        // jump; this printer does not implement it yet and says so rather
+        // than dropping the arguments.
+        KirTerminator::Branch(edge) if edge.args.is_empty() => {
+            format!("s_branch .LBB{}", edge.target)
         }
+        KirTerminator::Branch(edge) => {
+            format!("; unhandled edge arguments\n    s_branch .LBB{}", edge.target)
+        }
+        KirTerminator::CondBranch(pred, t, f) if t.args.is_empty() && f.args.is_empty() => {
+            format!("s_cbranch_vccnz .LBB{} ; pred=v{}, else .LBB{}", t.target, pred, f.target)
+        }
+        KirTerminator::CondBranch(pred, t, f) => format!(
+            "; unhandled edge arguments\n    s_cbranch_vccnz .LBB{} ; pred=v{}, else .LBB{}",
+            t.target, pred, f.target
+        ),
         KirTerminator::Return => "s_endpgm".to_string(),
     }
 }

@@ -299,7 +299,7 @@ fn snapshot_kir_tensor_add_ptx() {
     b.emit(KirOp::GlobalId(tid, 0));
     let cond = b.new_typed_var(KirType::Bool);
     b.emit(KirOp::Cmp(cond, tid, len, CmpOp::Lt));
-    b.terminate(KirTerminator::CondBranch(cond, body, exit));
+    b.terminate(KirTerminator::CondBranch(cond, body.into(), exit.into()));
 
     b.set_block(body);
     let a_addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
@@ -315,7 +315,7 @@ fn snapshot_kir_tensor_add_ptx() {
     let out_addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
     b.emit(KirOp::PtrOffset(out_addr, out_ptr, tid));
     b.emit(KirOp::Store(out_addr, sum, AddressSpace::Global));
-    b.terminate(KirTerminator::Branch(exit));
+    b.terminate(KirTerminator::Branch(exit.into()));
 
     b.set_block(exit);
     b.terminate(KirTerminator::Return);
@@ -324,6 +324,65 @@ fn snapshot_kir_tensor_add_ptx() {
     let ptx = lower_kir_to_ptx(&ir);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
     insta::assert_snapshot!("kir_tensor_add_ptx", ptx_str);
+}
+
+/// Roadmap A2 step 2: a loop-carried value is a block parameter. The header
+/// takes `i`, the entry edge passes the thread's first index and the back
+/// edge passes `i + stride`; the printer turns each edge into a `mov` into
+/// the parameter register before the jump.
+#[test]
+fn snapshot_kir_grid_stride_loop_ptx() {
+    use nsl_codegen::backend_ptx::lower_kir_to_ptx;
+    use nsl_codegen::kernel_ir::*;
+
+    let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+    let mut b = KirBuilder::new("nsl_grid_stride_copy");
+    let a_ptr = b.add_param("a", f32_ptr.clone(), AddressSpace::Global);
+    let out_ptr = b.add_param("out", f32_ptr.clone(), AddressSpace::Global);
+    let len = b.add_param("len", KirType::U32, AddressSpace::Local);
+
+    let entry = b.new_block();
+    let header = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    let i = b.add_block_param(header, KirType::U32);
+
+    b.set_block(entry);
+    let start = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::GlobalId(start, 0));
+    b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![start])));
+
+    b.set_block(header);
+    let more = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(more, i, len, CmpOp::Lt));
+    b.terminate(KirTerminator::CondBranch(more, body.into(), exit.into()));
+
+    b.set_block(body);
+    let src = b.new_typed_var(f32_ptr.clone());
+    b.emit(KirOp::PtrOffset(src, a_ptr, i));
+    let v = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Load(v, src, AddressSpace::Global));
+    let dst = b.new_typed_var(f32_ptr);
+    b.emit(KirOp::PtrOffset(dst, out_ptr, i));
+    b.emit(KirOp::Store(dst, v, AddressSpace::Global));
+    let bdim = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::BlockDim(bdim, 0));
+    let gdim = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::GridDim(gdim, 0));
+    let stride = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Mul(stride, bdim, gdim));
+    let next = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Add(next, i, stride));
+    b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![next])));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+
+    let ir = b.finalize();
+    assert_eq!(ir.verify(), Ok(()));
+    let ptx = lower_kir_to_ptx(&ir);
+    let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
+    insta::assert_snapshot!("kir_grid_stride_loop_ptx", ptx_str);
 }
 
 #[test]

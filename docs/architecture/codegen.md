@@ -290,6 +290,11 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `emit_c_abi_dispatch_wrapper`); `src/c_export_table.rs` — the export table
   `nsl_model_create` reads; `src/c_header.rs` — `ExportInfo`, `lower_type_expr`,
   `emit(exports, module_name)`, stamping `NSL_ABI_VERSION_MAJOR/MINOR` from
+  `nsl_abi::wire::version` and printing every lifecycle prototype from the
+  `nsl_abi::capi` table (roadmap A3 step 2: the runtime's build asserts each
+  row against its implementation, nsl-abi's tests parse each prototype back
+  to its row). Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (the `NslExportFn`
+  typedef and the inline wrappers), `crates/nsl-codegen/tests/c_header_compiles.rs` (real C compiler +
   `nsl_abi::wire::version`; `src/c_wrapper.rs` steps through descriptor
   arrays by `sizeof` of `nsl_abi::wire::tensor_desc::NslTensorDesc`. Gates: `crates/nsl-codegen/tests/c_header_agreement.rs` (header vs runtime,
   through `nsl_abi`), `crates/nsl-codegen/tests/c_header_compiles.rs` (real C compiler +
@@ -461,17 +466,16 @@ renders every row into a `const` that casts the named implementation to
 the row slot by slot (`nsl_abi::typed::assert_sig`; register class and width,
 so `u64`, `usize` and raw pointers are `i64` slots). A row whose arity,
 types or path disagree fails `cargo build -p nsl-runtime` with the
-function's name. As belt-and-braces, `crates/nsl-abi` (dependency-free)
-parses every `#[unsafe(no_mangle)] extern "C" fn` in `nsl-runtime` and
-cross-checks it against the typed table (`nsl_abi::check_workspace`,
-`cross_check`, `MismatchKind::DuplicateDecl`);
-`crates/nsl-abi/tests/signature_agreement.rs` is that CI gate
-(`runtime_function_signatures_agree_with_extern_impls`, with a truncation
-floor of 682 rows recorded 2026-09-02, and `nsl_abi::table::tests` pins the
-row count exactly). Inside the codegen, `builtins/mod.rs` unit tests
+function's name, and `nsl_abi::table::tests` pins the row count exactly.
+(Until A3 step 6 `crates/nsl-abi` also parsed every `extern "C" fn` in
+`nsl-runtime` as text and cross-checked it against the table — the
+`signature_agreement` gate; the typed assertions cover every row, so that
+parser and its gate are gone.) Inside the codegen, `builtins/mod.rs` unit tests
 `no_runtime_function_is_declared_twice` and `registry_is_the_abi_table`
-guard the rendering. `crates/nsl-codegen/tests/c_header_agreement.rs` reuses
-the text parser for the generated C header.
+guard the rendering. The host-facing C API is the second table,
+`nsl_abi::capi` (22 rows, nine with the C prototype the header prints): the
+runtime asserts it the same way, and `nsl abi python` renders it as
+`python/nslpy/_abi.py`, pinned by `cargo test -p nsl-abi`.
 
 **Shared constants imported from `nsl_runtime`** (grep `nsl_runtime::` in
 `src`, non-comment uses): `nsl_runtime::param_plan::{PLAN_BF16_SR,
@@ -484,28 +488,51 @@ TIER_B_SEQ_LEN_FLOOR}` (re-exported by `src/pca_tier_b.rs`),
 `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR,
 nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::awq_scales::AwqScales`
 (`src/stmt_quant.rs`; the AWQ blob's one encoder and decoder, shared with
-the runtime's sidecar writer), `nsl_runtime::calibration_data::peek_batch_seq`
-(`src/lib.rs`, calibration), and `nsl_runtime::CudaDeviceIdentity` /
-`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`). The rule these
+the runtime's sidecar writer), `nsl_abi::wire::calibration_bin` (the `.bin`
+corpus header, read by `src/calibration/data_shape.rs` for the batch
+geometry at compile time and by the runtime's loader), and `nsl_runtime::cuda_device_identity` /
+`cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`; the identity
+record they return is `nsl_abi::wire::device_identity::CudaDeviceIdentity`,
+the autotune cache key's schema). The rule these
 follow: a layout or plan constant the emitted code must agree with is
-imported from the runtime, never retyped in codegen.
+declared once in `nsl-abi` and read by both crates, never retyped in
+codegen. Since roadmap A3 step 5 the runtime is an *optional* dependency of
+this crate, enabled by the `cuda` feature for the two compile-time device
+probes; a default (CPU-only) compiler build has no runtime in its
+dependency tree at all (CI's `nsl-codegen standalone` step checks the
+tree), and the integration tests link it as a dev-dependency.
 
 ## GPU codegen
 
 Two ways exist to produce a GPU kernel, and the freeze decides which one new
 code may use.
 
-**KernelIR path (the sanctioned one).** `src/kernel_ir.rs` defines
+**KernelIR path (the sanctioned one).** The IR lives in the leaf crate
+`crates/nsl-kir` (roadmap A2 step 1: no workspace dependencies, pinned by
+`crates/nsl-kir/tests/leaf.rs`, so the runtime can build kernels on it
+without depending on the compiler); `nsl_codegen::{kernel_ir, kir_verify,
+backend_ptx}` and `nsl_codegen::gpu_target::FeatureSet` re-export it at the
+historical paths. `crates/nsl-kir/src/kernel_ir.rs` defines
 `KernelIR { name, params: Vec<KirParam>, blocks: Vec<KirBlock>, var_types,
 shared_mem_bytes, workgroup_size, required_features: FeatureSet }`, `KirOp`,
 `KirTerminator`, `KirType`, `AddressSpace`, and `KirBuilder` (`new`,
 `add_param`, `new_typed_var`, `new_block`, `set_block`, `emit`, `terminate`,
-`finalize() -> KernelIR`). `src/kir_verify.rs::verify` is the KIR verifier
+`finalize() -> KernelIR`). `crates/nsl-kir/src/kir_verify.rs::verify` is the KIR verifier
 (roadmap A2 step 2): block shape and branch targets, SSA (one definition per
 `VarId`), def-before-use under dominance over the block CFG, and operand
 typing wherever `var_types` records both sides; `KernelIR::verify` and
 `KernelIR::is_well_formed` are the same check, and `lower_kernel_to_ir`
-refuses a kernel that fails it with every violation listed. The async-copy
+refuses a kernel that fails it with every violation listed. A loop-carried
+value is a block parameter (roadmap A2 step 2): `KirBlock::params`,
+`KirBuilder::add_block_param`, and edges (`KirEdge { target, args }`, the
+payload of `KirTerminator::Branch` / `CondBranch`; `b.into()` is an edge
+with no arguments) pass a value per parameter — verifier rule 7 holds the
+argument count and types to the target's parameters and refuses parameters
+on the entry block, and the PTX printer implements an edge as a parallel
+copy into the parameter registers before the jump (a per-class
+`%edge_*` scratch register breaks a swap; a `CondBranch` whose edges carry
+arguments gets a `BB<n>_else` label). `crates/nsl-codegen/tests/kir_block_params_ptxas.rs`
+assembles a grid-stride loop with `ptxas`. The async-copy
 group is first-class KIR (`SharedBase`, `CpAsync { bytes: 4 | 8 | 16 }`,
 `CpAsyncCommit`, `CpAsyncWait { pending }`, `FeatureSet::ASYNC_COPY`): the
 verifier checks the global → shared state spaces and the commit/wait
@@ -518,13 +545,13 @@ and the PTX backend declares the `.reg .b32 %v<N>` class for them.
 `crates/nsl-codegen/tests/kir_async_copy_ptxas.rs` and
 `crates/nsl-codegen/tests/kir_mma_ptxas.rs` assemble those lowerings with
 `ptxas` where the toolkit is present (CI's cuda-feature lane).
-`src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
+`crates/nsl-kir/src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
 (ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
 `src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
 are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` lowers a
 user `kernel` block's AST to KIR for the portable subset and refuses
 everything else. `src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu,
-Fpga}`, `FeatureSet`) selects the backend; `Compiler::compile_kernels`
+Fpga}`, re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
 (`src/compiler/kernel.rs`) dispatches: CUDA still goes to the AST→PTX
 `KernelCompiler` (`src/kernel.rs`), ROCm/Metal/WebGPU go through KIR, and
 `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use `nsl fpga-compile`). PTX bytes
@@ -558,12 +585,15 @@ longer emits. Existing members may still be edited — it is a gate on the file
 set, not a line count. **A new kernel must therefore be built as `KernelIR`
 and lowered through `backend_ptx.rs`; a new `.rs` file that formats PTX text
 will not merge.** If a kernel needs something KIR cannot express, extend
-`KirOp` and the printers rather than adding a hand emitter.
+`KirOp` and the printers rather than adding a hand emitter. What KIR still
+cannot express, and the order the frozen files migrate in, is the design
+spec `docs/superpowers/specs/2026-09-09-a2-kir-v2-design.md`.
 
 **Supporting pieces.** `src/gpu_specs.rs` — `GpuSpec` (`sm_version`, peak
 TFLOPs, bandwidth, VRAM, L2, crossover points, launch overhead),
 `GPU_DATABASE`, `find_gpu`, `default_gpu`, `resolve_local_gpu`
-(via `nsl_runtime::CudaDeviceIdentity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
+(via `nsl_abi::wire::device_identity::CudaDeviceIdentity`, probed by
+`nsl_runtime::cuda_device_identity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
 `src/ptxas_validation.rs::validate_ptx` assembles PTX through `cudarc`
 `cuModuleLoadData` when a context is current, else `nvcc --cubin`; it is the
 basis of every `*_ptxas*.rs` test. `src/ptx_metadata.rs` extracts static
@@ -798,8 +828,7 @@ should fail before review.
   (`no_runtime_function_is_declared_twice`, `nsl_abi::table::tests`), the
   codegen's rendering is the table row for row (`registry_is_the_abi_table`),
   and every row's signature agrees with the runtime's implementation — checked
-  by `rustc` in the runtime's build (`abi_check.rs`) and by text in
-  `crates/nsl-abi/tests/signature_agreement.rs`. The emitted argument order
+  by `rustc` in the runtime's build (`abi_check.rs`). The emitted argument order
   must match the table's parameter order — nothing checks that except the
   snapshot and numerical tests, which is why a new call site should be
   covered by one. `crates/nsl-codegen/tests/muon_route_contract_drift.rs` and
@@ -822,9 +851,11 @@ should fail before review.
   reason (`thread_local_inventory_drift.rs` in `nsl-runtime`'s tests).
 - **No new hand-PTX files.** `ci/hand-ptx-manifest.txt` only shrinks
   (`scripts/hand-ptx-freeze.sh --check`).
-- **The C header describes the real ABI.** `crates/nsl-codegen/tests/c_header_agreement.rs`,
-  `crates/nsl-codegen/tests/c_header_compiles.rs`, and the `NSL_ABI_VERSION_*` constants come
-  from `nsl_runtime::c_api`.
+- **The C header describes the real ABI.** Its lifecycle prototypes are
+  `nsl_abi::capi` rows the runtime's build asserts against the
+  implementations; `crates/nsl-codegen/tests/c_header_agreement.rs` checks the typedef and
+  the inline wrappers, `crates/nsl-codegen/tests/c_header_compiles.rs` compiles it, and the
+  `NSL_ABI_VERSION_*` constants come from `nsl_abi::wire::version`.
 
 ## Tests and gates
 
@@ -877,7 +908,7 @@ different thing.
 
 | Gate | Where |
 |------|-------|
-| `cargo test --workspace -- --skip e2e_` (all non-ignored codegen tests, unit tests, the static drift gates, `signature_agreement`) | `ci.yml` `build-and-test` |
+| `cargo test --workspace -- --skip e2e_` (all non-ignored codegen tests, unit tests, the static drift gates, `nsl-abi`'s table tests) | `ci.yml` `build-and-test` |
 | `verilog_emission_snapshots`, `hir_pass_snapshots`, `yosys_gate` | `ci.yml` `fpga` |
 | `csha_ptx_ptxas_validation`, `fused_linear_ce_{bf16,fp16,large_vocab}_ptxas`, `bitnet_gpu_correctness` under `--features cuda` against cudart stubs (assembles PTX, executes nothing) | `ci.yml` `cuda-feature` |
 | `scripts/hand-ptx-freeze.sh --self-test` / `--check` | `ci.yml` `hand-ptx-freeze` |
@@ -907,11 +938,15 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 3. Emit the call with `self.compile_call_by_name(builder, "nsl_…", &args)`
    from the lowering site; argument order must match the row.
 4. Build `nsl-runtime` (the row is checked against the implementation at
+   compile time) and run `cargo test -p nsl-abi` (the row-count pin) and
+   `cargo test -p nsl-codegen --lib builtins` (the duplicate/rendering
    compile time) and run `cargo test -p nsl-abi --test signature_agreement`
    and `cargo test -p nsl-codegen --lib builtins` (the duplicate/rendering
-   tests). If the symbol is exported to C hosts, `crates/nsl-codegen/tests/c_header_agreement.rs`
-   and `crates/nsl-codegen/tests/c_header_compiles.rs` cover the header; add the prototype in
-   `src/c_header.rs` if the header must expose it.
+   tests). If the symbol is exported to C hosts, add a row to
+   `nsl_abi::capi` (with the C prototype if the header must expose it) and
+   a `push_capi` call in `src/c_header.rs`; regenerate `python/nslpy/_abi.py`
+   with `cargo run -p nsl-cli -- abi python`; `crates/nsl-codegen/tests/c_header_compiles.rs`
+   covers the header.
 5. If the function takes or returns tensor ownership, classify it in
    `src/ffi_ownership.rs` (`crates/nsl-codegen/tests/ffi_ownership_drift.rs`).
 6. Cover the emission with a compile-and-inspect test (`*_ffi_decls.rs` /
@@ -974,7 +1009,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 
 ### A new GPU kernel (KIR path only)
 
-1. Build it with `KirBuilder` (`src/kernel_ir.rs`): `add_param` for each
+1. Build it with `KirBuilder` (`crates/nsl-kir/src/kernel_ir.rs`): `add_param` for each
    argument with its `AddressSpace`, `new_typed_var`/`emit(KirOp::…)` for the
    body, `terminate`, `finalize()`. Missing operations are added as `KirOp`
    variants with lowering in **every** printer (`backend_ptx.rs`,

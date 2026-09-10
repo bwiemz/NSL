@@ -1,4 +1,4 @@
-// crates/nsl-codegen/src/kir_verify.rs
+// crates/nsl-kir/src/kir_verify.rs
 //! The KIR verifier (roadmap A2, step 2): the structural and typing rules
 //! every `KernelIR` must satisfy before a backend prints it.
 //!
@@ -35,6 +35,14 @@
 //!      `Vec(F16, 2)` A registers, two `Vec(F16, 2)` B registers and four
 //!      `F32` accumulators in and out.
 //!
+//!   7. **Edges.** Every edge passes exactly one argument per parameter of
+//!      its target block (`EdgeArityMismatch`), each argument reaches the
+//!      terminator like any other use (rules 2–3 treat a block parameter as
+//!      a definition at its block's entry), and a typed argument carries the
+//!      parameter's type (`TypeMismatch { role: "arg" }`). The entry block
+//!      has no parameters (`EntryBlockHasParams`). Roadmap A2 step 2: this
+//!      is how a loop-carried value is written without phi nodes.
+//!
 //! Untyped variables (`KirBuilder::new_var`) are exempt from rule 4 only;
 //! the FPGA-only structured ops (`Matmul`, `ElementwiseAdd`, `Relu`) carry
 //! their dtypes inline and are checked for rules 1–3 only.
@@ -49,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::kernel_ir::{
-    AddressSpace, BlockId, KernelIR, KirConst, KirOp, KirTerminator, KirType, VarId,
+    AddressSpace, BlockId, KernelIR, KirConst, KirEdge, KirOp, KirTerminator, KirType, VarId,
 };
 
 /// One violation. `block` / `op_index` locate the offending op (the
@@ -99,6 +107,11 @@ pub enum KirVerifyError {
     UncommittedAsyncCopy { block: BlockId, op_index: usize },
     /// `CpAsyncWait { pending }` naming more groups than the block committed.
     AsyncWaitExceedsGroups { block: BlockId, op_index: usize, pending: u8, committed: u8 },
+    /// Block 0 lists parameters; nothing enters the kernel with arguments.
+    EntryBlockHasParams { count: usize },
+    /// An edge from `block` to `target` passes `found` arguments for
+    /// `expected` parameters.
+    EdgeArityMismatch { block: BlockId, target: BlockId, expected: usize, found: usize },
 }
 
 impl fmt::Display for KirVerifyError {
@@ -155,12 +168,23 @@ impl fmt::Display for KirVerifyError {
                 f,
                 "CpAsyncWait at block {block} op {op_index} allows {pending} pending group(s) but only {committed} were committed"
             ),
+            KirVerifyError::EntryBlockHasParams { count } => {
+                write!(f, "the entry block lists {count} parameter(s); nothing passes it arguments")
+            }
+            KirVerifyError::EdgeArityMismatch { block, target, expected, found } => write!(
+                f,
+                "the edge from block {block} to block {target} passes {found} argument(s) for {expected} parameter(s)"
+            ),
         }
     }
 }
 
 /// The op index reported for a violation in a block's terminator.
 pub const TERMINATOR_INDEX: usize = usize::MAX;
+
+/// The op index reported for a violation on a block parameter (a
+/// definition at the block's entry, before op 0).
+pub const BLOCK_PARAM_INDEX: usize = usize::MAX - 1;
 
 /// Verify `ir` against the rules in the module header. `Ok(())` or every
 /// violation found, in block/op order.
@@ -194,6 +218,27 @@ pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
             }
         }
     }
+    if !ir.blocks[0].params.is_empty() {
+        errors.push(KirVerifyError::EntryBlockHasParams { count: ir.blocks[0].params.len() });
+    }
+
+    // ── 7. Edges: one argument per target parameter ──────────────────
+    // (Checked here, with the shape, so the typing pass below can pair
+    // arguments with parameters by position.)
+    for block in &ir.blocks {
+        let Some(term) = &block.terminator else { continue };
+        for edge in term.edges() {
+            let Some(target) = ir.blocks.get(edge.target as usize) else { continue };
+            if edge.args.len() != target.params.len() {
+                errors.push(KirVerifyError::EdgeArityMismatch {
+                    block: block.id,
+                    target: edge.target,
+                    expected: target.params.len(),
+                    found: edge.args.len(),
+                });
+            }
+        }
+    }
 
     // ── 2. SSA: one definition per VarId ─────────────────────────────
     // def_site: var -> (block, op_index) of the op that defines it.
@@ -206,10 +251,26 @@ pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
             errors.push(KirVerifyError::Redefined { var: p.id, block: 0, op_index: 0 });
         }
     }
+    // A block parameter is defined at its block's entry (rule 7).
+    let mut block_params: HashMap<VarId, BlockId> = HashMap::new();
+    for block in &ir.blocks {
+        for p in &block.params {
+            if params.contains(&p.id) || block_params.insert(p.id, block.id).is_some() {
+                errors.push(KirVerifyError::Redefined {
+                    var: p.id,
+                    block: block.id,
+                    op_index: BLOCK_PARAM_INDEX,
+                });
+            }
+        }
+    }
     for block in &ir.blocks {
         for (op_index, op) in block.ops.iter().enumerate() {
             for dst in op_dsts(op) {
-                if params.contains(&dst) || def_site.insert(dst, (block.id, op_index)).is_some() {
+                if params.contains(&dst)
+                    || block_params.contains_key(&dst)
+                    || def_site.insert(dst, (block.id, op_index)).is_some()
+                {
                     errors.push(KirVerifyError::Redefined { var: dst, block: block.id, op_index });
                 }
             }
@@ -223,6 +284,15 @@ pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
         // does not reach.
         if params.contains(&var) {
             return Ok(());
+        }
+        if let Some(&def_block) = block_params.get(&var) {
+            // Defined at `def_block`'s entry: reaches everything in that
+            // block (its terminator included) and every block it dominates.
+            return if def_block == use_block || dom[use_block as usize].contains(&def_block) {
+                Ok(())
+            } else {
+                Err(false)
+            };
         }
         match def_site.get(&var) {
             None => Err(true),
@@ -254,8 +324,10 @@ pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
                 report_use(var, block.id, op_index, &mut errors);
             }
         }
-        if let Some(KirTerminator::CondBranch(cond, _, _)) = &block.terminator {
-            report_use(*cond, block.id, TERMINATOR_INDEX, &mut errors);
+        if let Some(term) = &block.terminator {
+            for var in terminator_uses(term) {
+                report_use(var, block.id, TERMINATOR_INDEX, &mut errors);
+            }
         }
     }
 
@@ -276,6 +348,26 @@ pub fn verify(ir: &KernelIR) -> Result<(), Vec<KirVerifyError>> {
                 expected: KirType::Bool,
                 found: found.clone(),
             });
+        }
+        // Rule 7, typing half: a typed argument carries its parameter's type.
+        if let Some(term) = &block.terminator {
+            for edge in term.edges() {
+                let Some(target) = ir.blocks.get(edge.target as usize) else { continue };
+                for (arg, param) in edge.args.iter().zip(&target.params) {
+                    if let Some(found) = ir.var_types.get(arg)
+                        && *found != param.ty
+                    {
+                        errors.push(KirVerifyError::TypeMismatch {
+                            var: *arg,
+                            block: block.id,
+                            op_index: TERMINATOR_INDEX,
+                            role: "arg",
+                            expected: param.ty.clone(),
+                            found: found.clone(),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -343,11 +435,20 @@ fn f16x2() -> KirType {
 }
 
 fn terminator_targets(term: &KirTerminator) -> Vec<BlockId> {
-    match term {
-        KirTerminator::Branch(t) => vec![*t],
-        KirTerminator::CondBranch(_, t, e) => vec![*t, *e],
-        KirTerminator::Return => vec![],
+    term.edges().iter().map(|e: &&KirEdge| e.target).collect()
+}
+
+/// The `VarId`s a terminator reads: the condition of a `CondBranch` and
+/// every edge argument.
+pub fn terminator_uses(term: &KirTerminator) -> Vec<VarId> {
+    let mut uses = Vec::new();
+    if let KirTerminator::CondBranch(cond, _, _) = term {
+        uses.push(*cond);
     }
+    for edge in term.edges() {
+        uses.extend_from_slice(&edge.args);
+    }
+    uses
 }
 
 /// The `VarId`s an op defines: one for most ops, four for the
@@ -671,7 +772,7 @@ fn check_types(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_ir::{AddressSpace, CmpOp, ConstValue, KirBuilder};
+    use crate::kernel_ir::{AddressSpace, CmpOp, ConstValue, KirBuilder, KirEdge};
 
     fn f32_ptr() -> KirType {
         KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
@@ -693,7 +794,7 @@ mod tests {
         b.emit(KirOp::GlobalId(tid, 0));
         let in_bounds = b.new_typed_var(KirType::Bool);
         b.emit(KirOp::Cmp(in_bounds, tid, len, CmpOp::Lt));
-        b.terminate(KirTerminator::CondBranch(in_bounds, body, exit));
+        b.terminate(KirTerminator::CondBranch(in_bounds, body.into(), exit.into()));
         b.set_block(body);
         let a_addr = b.new_typed_var(f32_ptr());
         b.emit(KirOp::PtrOffset(a_addr, a_ptr, tid));
@@ -708,7 +809,7 @@ mod tests {
         let out_addr = b.new_typed_var(f32_ptr());
         b.emit(KirOp::PtrOffset(out_addr, out_ptr, tid));
         b.emit(KirOp::Store(out_addr, sum, AddressSpace::Global));
-        b.terminate(KirTerminator::Branch(exit));
+        b.terminate(KirTerminator::Branch(exit.into()));
         b.set_block(exit);
         b.terminate(KirTerminator::Return);
         b.finalize()
@@ -742,7 +843,7 @@ mod tests {
         let mut b = KirBuilder::new("t");
         let entry = b.new_block();
         b.set_block(entry);
-        b.terminate(KirTerminator::Branch(7));
+        b.terminate(KirTerminator::Branch(7.into()));
         let ir = b.finalize();
         assert_eq!(
             verify(&ir),
@@ -828,13 +929,13 @@ mod tests {
         let right = b.new_block();
         let join = b.new_block();
         b.set_block(entry);
-        b.terminate(KirTerminator::CondBranch(flag, left, right));
+        b.terminate(KirTerminator::CondBranch(flag, left.into(), right.into()));
         b.set_block(left);
         let x = b.new_typed_var(KirType::U32);
         b.emit(KirOp::ThreadId(x, 0));
-        b.terminate(KirTerminator::Branch(join));
+        b.terminate(KirTerminator::Branch(join.into()));
         b.set_block(right);
-        b.terminate(KirTerminator::Branch(join));
+        b.terminate(KirTerminator::Branch(join.into()));
         b.set_block(join);
         let y = b.new_typed_var(KirType::U32);
         b.emit(KirOp::Neg(y, x));
@@ -856,7 +957,7 @@ mod tests {
         b.set_block(entry);
         let x = b.new_typed_var(KirType::U32);
         b.emit(KirOp::ThreadId(x, 0));
-        b.terminate(KirTerminator::CondBranch(flag, left, right));
+        b.terminate(KirTerminator::CondBranch(flag, left.into(), right.into()));
         for blk in [left, right] {
             b.set_block(blk);
             let y = b.new_typed_var(KirType::U32);
@@ -881,15 +982,15 @@ mod tests {
         b.set_block(entry);
         let i = b.new_typed_var(KirType::U32);
         b.emit(KirOp::ThreadId(i, 0));
-        b.terminate(KirTerminator::Branch(header));
+        b.terminate(KirTerminator::Branch(header.into()));
         b.set_block(header);
         let t: VarId = 50; // defined in body below
         let h = b.new_typed_var(KirType::U32);
         b.emit(KirOp::Neg(h, t));
-        b.terminate(KirTerminator::CondBranch(flag, body, exit));
+        b.terminate(KirTerminator::CondBranch(flag, body.into(), exit.into()));
         b.set_block(body);
         b.emit(KirOp::Neg(t, i));
-        b.terminate(KirTerminator::Branch(header));
+        b.terminate(KirTerminator::Branch(header.into()));
         b.set_block(exit);
         let e = b.new_typed_var(KirType::U32);
         b.emit(KirOp::Neg(e, i));
@@ -900,6 +1001,140 @@ mod tests {
             verify(&ir),
             Err(vec![KirVerifyError::UseBeforeDef { var: t, block: header, op_index: 0 }])
         );
+    }
+
+    // ── Rule 7: block parameters and edges (roadmap A2 step 2) ──────
+
+    /// The grid-stride loop every element-wise kernel is made of: the
+    /// header takes `idx` as a parameter, the entry edge passes the thread's
+    /// first index, the back edge passes `idx + stride`. Before block
+    /// parameters this shape was unexpressible (see the back-edge test
+    /// above, which pins that a plain redefinition is still refused).
+    fn grid_stride_loop() -> (KirBuilder, BlockId, BlockId, VarId, VarId) {
+        let mut b = KirBuilder::new("grid_stride");
+        let n = b.add_param("n", KirType::U32, AddressSpace::Local);
+        let entry = b.new_block();
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let idx = b.add_block_param(header, KirType::U32);
+        b.set_block(entry);
+        let start = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::GlobalId(start, 0));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![start])));
+        b.set_block(header);
+        let more = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(more, idx, n, CmpOp::Lt));
+        b.terminate(KirTerminator::CondBranch(more, body.into(), exit.into()));
+        b.set_block(body);
+        let stride = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::BlockDim(stride, 0));
+        let next = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Add(next, idx, stride));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![next])));
+        b.set_block(exit);
+        b.terminate(KirTerminator::Return);
+        (b, header, body, idx, next)
+    }
+
+    #[test]
+    fn a_loop_carried_value_is_a_block_parameter() {
+        let (b, _, _, _, _) = grid_stride_loop();
+        assert_eq!(verify(&b.finalize()), Ok(()));
+    }
+
+    #[test]
+    fn an_edge_passes_one_argument_per_parameter() {
+        let (mut b, header, body, _, _) = grid_stride_loop();
+        b.set_block(body);
+        b.terminate(KirTerminator::Branch(header.into()));
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::EdgeArityMismatch {
+                block: body,
+                target: header,
+                expected: 1,
+                found: 0
+            }])
+        );
+    }
+
+    #[test]
+    fn an_argument_carries_its_parameters_type() {
+        let (mut b, header, body, _, _) = grid_stride_loop();
+        b.set_block(body);
+        let wrong = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(wrong, KirConst { ty: KirType::F32, value: ConstValue::F32(0.0) }));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![wrong])));
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: wrong,
+                block: body,
+                op_index: TERMINATOR_INDEX,
+                role: "arg",
+                expected: KirType::U32,
+                found: KirType::F32,
+            }])
+        );
+    }
+
+    #[test]
+    fn an_argument_is_a_use_at_the_terminator() {
+        // The back edge passes a value defined in the exit block, which
+        // does not dominate the body.
+        let (mut b, header, body, _, _) = grid_stride_loop();
+        let exit = 3;
+        b.set_block(exit);
+        let late = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::ThreadId(late, 0));
+        b.terminate(KirTerminator::Return);
+        b.set_block(body);
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![late])));
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::UseBeforeDef { var: late, block: body, op_index: TERMINATOR_INDEX }])
+        );
+    }
+
+    #[test]
+    fn a_block_parameter_reaches_only_what_its_block_dominates() {
+        // `idx` is the header's parameter; the entry block does not lie
+        // below the header, so it cannot read it.
+        let (mut b, header, _, idx, _) = grid_stride_loop();
+        b.set_block(0);
+        let start = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Neg(start, idx));
+        b.terminate(KirTerminator::Branch(KirEdge::with(header, vec![start])));
+        let ir = b.finalize();
+        let errs = verify(&ir).unwrap_err();
+        assert!(
+            errs.contains(&KirVerifyError::UseBeforeDef { var: idx, block: 0, op_index: 1 }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_parameter_is_a_definition() {
+        let (mut b, _, body, idx, _) = grid_stride_loop();
+        b.set_block(body);
+        b.emit(KirOp::ThreadId(idx, 0));
+        let ir = b.finalize();
+        let errs = verify(&ir).unwrap_err();
+        assert!(
+            errs.contains(&KirVerifyError::Redefined { var: idx, block: body, op_index: 2 }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn the_entry_block_takes_no_parameters() {
+        let mut b = KirBuilder::new("t");
+        let entry = b.new_block();
+        b.add_block_param(entry, KirType::U32);
+        b.set_block(entry);
+        b.terminate(KirTerminator::Return);
+        assert_eq!(verify(&b.finalize()), Err(vec![KirVerifyError::EntryBlockHasParams { count: 1 }]));
     }
 
     #[test]
@@ -1020,7 +1255,7 @@ mod tests {
         let entry = b.new_block();
         let exit = b.new_block();
         b.set_block(entry);
-        b.terminate(KirTerminator::CondBranch(n, exit, exit));
+        b.terminate(KirTerminator::CondBranch(n, exit.into(), exit.into()));
         b.set_block(exit);
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
@@ -1079,8 +1314,8 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(verify(&ir), Ok(()));
-        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::ASYNC_COPY));
-        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::SHARED_MEMORY));
+        assert!(ir.required_features.contains(crate::FeatureSet::ASYNC_COPY));
+        assert!(ir.required_features.contains(crate::FeatureSet::SHARED_MEMORY));
     }
 
     #[test]
@@ -1268,7 +1503,7 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert_eq!(verify(&ir), Ok(()));
-        assert!(ir.required_features.contains(crate::gpu_target::FeatureSet::TENSOR_CORES));
+        assert!(ir.required_features.contains(crate::FeatureSet::TENSOR_CORES));
     }
 
     #[test]

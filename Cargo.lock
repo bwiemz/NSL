@@ -1309,6 +1309,7 @@ dependencies = [
  "criterion",
  "half",
  "memmap2",
+ "nsl-abi",
  "nsl-ast",
  "nsl-codegen",
  "nsl-env",
@@ -1348,6 +1349,7 @@ dependencies = [
  "nsl-abi",
  "nsl-ast",
  "nsl-errors",
+ "nsl-kir",
  "nsl-lexer",
  "nsl-log",
  "nsl-parser",
@@ -1377,6 +1379,10 @@ dependencies = [
  "codespan-reporting",
  "serde",
 ]
+
+[[package]]
+name = "nsl-kir"
+version = "0.10.0"
 
 [[package]]
 name = "nsl-lexer"

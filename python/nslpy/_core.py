@@ -8,6 +8,8 @@ import platform
 from pathlib import Path
 from typing import Optional, Sequence
 
+from . import _abi
+
 # ---------------------------------------------------------------------------
 # Library discovery
 # ---------------------------------------------------------------------------
@@ -80,51 +82,14 @@ def _load_lib(path: Optional[Path] = None) -> ctypes.CDLL:
         path = find_library()
     lib = ctypes.CDLL(str(path))
 
-    # ── Model lifecycle ──────────────────────────────────────────────
-    lib.nsl_model_create.argtypes = [ctypes.c_int64]
-    lib.nsl_model_create.restype = ctypes.c_int64
+    # Every C-API signature comes from the generated mirror (`_abi.py`,
+    # rendered by `nsl abi python` from the table the runtime's build
+    # asserts against its implementations), so a signature cannot be
+    # declared here that the runtime does not implement. Binding every
+    # symbol the library exports covers the lifecycle, DLPack and error
+    # entry points this loader used to spell out by hand.
+    _abi.bind(lib)
 
-    lib.nsl_model_destroy.argtypes = [ctypes.c_int64]
-    lib.nsl_model_destroy.restype = ctypes.c_int64
-
-    lib.nsl_model_forward_dlpack.argtypes = [
-        ctypes.c_int64,  # model_ptr
-        ctypes.c_int64,  # inputs_ptr (array of DLManagedTensor*)
-        ctypes.c_int64,  # num_inputs
-        ctypes.c_int64,  # outputs_ptr (output buffer)
-        ctypes.c_int64,  # num_outputs_ptr
-    ]
-    lib.nsl_model_forward_dlpack.restype = ctypes.c_int64
-
-    lib.nsl_model_get_version.argtypes = []
-    lib.nsl_model_get_version.restype = ctypes.c_int64
-
-    lib.nsl_model_num_weights.argtypes = [ctypes.c_int64]
-    lib.nsl_model_num_weights.restype = ctypes.c_int64
-
-    # ── DLPack ────────────────────────────────────────────────────────
-    lib.nsl_dlpack_export.argtypes = [ctypes.c_int64]
-    lib.nsl_dlpack_export.restype = ctypes.c_int64
-
-    lib.nsl_dlpack_import.argtypes = [ctypes.c_int64]
-    lib.nsl_dlpack_import.restype = ctypes.c_int64
-
-    lib.nsl_dlpack_free.argtypes = [ctypes.c_int64]
-    lib.nsl_dlpack_free.restype = None
-
-    # ── Error handling ─────────────────────────────────────────────────
-    lib.nsl_get_last_error.argtypes = []
-    lib.nsl_get_last_error.restype = ctypes.c_int64
-
-    lib.nsl_clear_error.argtypes = []
-    lib.nsl_clear_error.restype = ctypes.c_int64
-
-    # ── Spec B: per-call grad context FFIs ──────────────────────────────
-    # Bound centrally so the same ABI is enforced on both the standalone
-    # runtime and on @export-emitted shared libraries (which statically
-    # link the runtime). The new `nsl_model_backward` takes a
-    # `*mut GradContext` as the first argument (NOT a model handle —
-    # Spec B T8 removed the model-level grad path).
     _bind_grad_context_ffis(lib)
 
     _bind_named_dispatch_ffis(lib)
@@ -148,32 +113,7 @@ def _bind_grad_context_ffis(lib: ctypes.CDLL) -> None:
     `nsl_grad_context_destroy` reclaims the ctx Box. Idempotent + safe
     on a freed or bogus pointer thanks to the same magic-header gate.
     """
-    if hasattr(lib, "nsl_model_forward_grad"):
-        lib.nsl_model_forward_grad.argtypes = [
-            ctypes.c_int64,  # model_ptr
-            ctypes.c_int64,  # inputs_ptr (NslTensorDesc*)
-            ctypes.c_int64,  # num_inputs
-            ctypes.c_int64,  # outputs_ptr (NslTensorDesc*)
-            ctypes.c_int64,  # num_outputs
-            ctypes.c_int64,  # grad_context_out (*mut *mut GradContext)
-        ]
-        lib.nsl_model_forward_grad.restype = ctypes.c_int64
-
-    if hasattr(lib, "nsl_model_backward"):
-        # NOTE: this REPLACES any prior binding. The legacy
-        # `nsl_model_backward(model, ...)` ABI was removed in Spec B T8.
-        lib.nsl_model_backward.argtypes = [
-            ctypes.c_int64,  # ctx_ptr (*mut GradContext)
-            ctypes.c_int64,  # grad_outputs_ptr (NslTensorDesc*) — v1 unused
-            ctypes.c_int64,  # num_grad_outputs                   — v1 unused
-            ctypes.c_int64,  # grad_inputs_ptr  (NslTensorDesc*)
-            ctypes.c_int64,  # num_grad_inputs
-        ]
-        lib.nsl_model_backward.restype = ctypes.c_int64
-
-    if hasattr(lib, "nsl_grad_context_destroy"):
-        lib.nsl_grad_context_destroy.argtypes = [ctypes.c_int64]
-        lib.nsl_grad_context_destroy.restype = None
+    _abi.bind(lib, ("nsl_model_forward_grad", "nsl_model_backward", "nsl_grad_context_destroy"))
 
 
 def _bind_base_lifecycle_ffis(lib: ctypes.CDLL) -> None:
@@ -183,24 +123,17 @@ def _bind_base_lifecycle_ffis(lib: ctypes.CDLL) -> None:
     ``@export``-emitted shared library (which statically links the
     runtime).
     """
-    if hasattr(lib, "nsl_model_create"):
-        lib.nsl_model_create.argtypes = [ctypes.c_int64]
-        lib.nsl_model_create.restype = ctypes.c_int64
-    if hasattr(lib, "nsl_model_destroy"):
-        lib.nsl_model_destroy.argtypes = [ctypes.c_int64]
-        lib.nsl_model_destroy.restype = ctypes.c_int64
-    if hasattr(lib, "nsl_get_last_error"):
-        lib.nsl_get_last_error.argtypes = []
-        lib.nsl_get_last_error.restype = ctypes.c_int64
-    if hasattr(lib, "nsl_clear_error"):
-        lib.nsl_clear_error.argtypes = []
-        lib.nsl_clear_error.restype = ctypes.c_int64
-    if hasattr(lib, "nsl_model_num_weights"):
-        lib.nsl_model_num_weights.argtypes = [ctypes.c_int64]
-        lib.nsl_model_num_weights.restype = ctypes.c_int64
-    if hasattr(lib, "nsl_model_get_version"):
-        lib.nsl_model_get_version.argtypes = []
-        lib.nsl_model_get_version.restype = ctypes.c_int64
+    _abi.bind(
+        lib,
+        (
+            "nsl_model_create",
+            "nsl_model_destroy",
+            "nsl_get_last_error",
+            "nsl_clear_error",
+            "nsl_model_num_weights",
+            "nsl_model_get_version",
+        ),
+    )
 
 
 def _fetch_last_error(lib: ctypes.CDLL) -> str:
@@ -224,106 +157,26 @@ def _bind_named_dispatch_ffis(lib: ctypes.CDLL) -> None:
     binding helper is reused in both cases so the symbol-presence check is
     centralised.
     """
-    for sym_name, argtypes, restype in (
+    # Optional symbols — older runtimes may pre-date the named-dispatch
+    # FFIs; `bind` leaves an absent one unbound, and callers that need it
+    # fail at use time with a clearer error.
+    _abi.bind(
+        lib,
         (
             "nsl_model_create_with_lib",
-            [ctypes.c_int64, ctypes.c_int64],
-            ctypes.c_int64,
-        ),
-        (
             "nsl_model_export_count",
-            [ctypes.c_int64],
-            ctypes.c_int64,
-        ),
-        (
             "nsl_model_call",
-            [
-                ctypes.c_int64,  # model_ptr
-                ctypes.c_int64,  # name_ptr
-                ctypes.c_int64,  # inputs_desc_ptr
-                ctypes.c_int64,  # num_inputs
-                ctypes.c_int64,  # outputs_desc_ptr
-                ctypes.c_int64,  # num_outputs
-            ],
-            ctypes.c_int64,
-        ),
-        (
             "nsl_model_call_dlpack",
-            [
-                ctypes.c_int64,
-                ctypes.c_int64,
-                ctypes.c_int64,
-                ctypes.c_int64,
-                ctypes.c_int64,
-                ctypes.c_int64,
-            ],
-            ctypes.c_int64,
-        ),
-        (
             "nsl_model_lookup_function",
-            [ctypes.c_int64, ctypes.c_int64],
-            ctypes.c_int64,
-        ),
-        # The DLPack forward shim + standalone bridge FFIs. These were bound
-        # ONLY in `_load_lib` (the standalone-runtime path); a shared-lib
-        # model's handle got ctypes' DEFAULT int conversion — 32-bit — so
-        # every pointer argument was silently truncated. The old forward
-        # path refused before dereferencing anything, which is why this
-        # never surfaced until forward actually worked (item 7).
-        (
             "nsl_model_forward_dlpack",
-            [
-                ctypes.c_int64,  # model_ptr
-                ctypes.c_int64,  # inputs_ptr (DLManagedTensor**)
-                ctypes.c_int64,  # num_inputs
-                ctypes.c_int64,  # outputs_ptr (DLManagedTensor**)
-                ctypes.c_int64,  # num_outputs_ptr (in/out)
-            ],
-            ctypes.c_int64,
-        ),
-        ("nsl_dlpack_export", [ctypes.c_int64], ctypes.c_int64),
-        ("nsl_dlpack_import", [ctypes.c_int64], ctypes.c_int64),
-        ("nsl_dlpack_free", [ctypes.c_int64], None),
-        # Item-7 ownership-model entry points.
-        (
+            "nsl_dlpack_export",
+            "nsl_dlpack_import",
+            "nsl_dlpack_free",
             "nsl_model_call_into",
-            [
-                ctypes.c_int64,  # model_ptr
-                ctypes.c_int64,  # name_ptr
-                ctypes.c_int64,  # inputs_desc_ptr
-                ctypes.c_int64,  # num_inputs
-                ctypes.c_int64,  # outputs_desc_ptr
-                ctypes.c_int64,  # num_outputs
-                ctypes.c_int64,  # out_capacities_ptr (const uint64_t*)
-            ],
-            ctypes.c_int64,
-        ),
-        (
             "nsl_model_call_alloc",
-            [
-                ctypes.c_int64,  # model_ptr
-                ctypes.c_int64,  # name_ptr
-                ctypes.c_int64,  # inputs_desc_ptr
-                ctypes.c_int64,  # num_inputs
-                ctypes.c_int64,  # out_dl_ptr (DLManagedTensor**)
-                ctypes.c_int64,  # num_outputs
-            ],
-            ctypes.c_int64,
-        ),
-        (
             "nsl_model_get_export_signature",
-            [ctypes.c_int64, ctypes.c_int64],
-            ctypes.c_int64,  # *const c_char as int (0 = error)
         ),
-    ):
-        if not hasattr(lib, sym_name):
-            # Optional symbols — older runtimes may pre-date the named-
-            # dispatch FFIs. Leave them unbound; callers that need them
-            # will fail at use time with a clearer error.
-            continue
-        fn = getattr(lib, sym_name)
-        fn.argtypes = argtypes
-        fn.restype = restype
+    )
 
 
 # Lazy-loaded library singleton

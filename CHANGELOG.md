@@ -8,6 +8,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- KIR block parameters (roadmap A2 step 2): a loop-carried value is now
+  expressible in KIR without phi nodes. `KirBlock::params`
+  (`KirBuilder::add_block_param`) define SSA values at block entry, and
+  every edge (`KirEdge { target, args }`, now the payload of
+  `KirTerminator::Branch` / `CondBranch`; `block.into()` is an argument-less
+  edge) passes one value per parameter. Verifier rule 7 holds the argument
+  count and types to the target's parameters and refuses parameters on the
+  entry block; block parameters take part in the SSA and dominance rules.
+  The PTX printer implements an edge as a parallel copy into the parameter
+  registers before the jump, with a per-class `%edge_*` scratch register for
+  a swap and a `BB<n>_else` label when a conditional branch's edges carry
+  arguments; kernels without block parameters print byte-identically. The
+  AMDGPU, Metal and WGSL printers mark edge arguments as unhandled rather
+  than dropping them. `crates/nsl-codegen/tests/kir_block_params_ptxas.rs`
+  assembles a grid-stride loop with `ptxas` in CI's cuda lane, and
+  `snapshot_tests.rs` pins its PTX.
+- Design spec for the rest of roadmap A2,
+  `docs/superpowers/specs/2026-09-09-a2-kir-v2-design.md`: what has
+  landed (the freeze, the verifier, the async-copy and tensor-core ops),
+  the 15.3K-line hand-PTX estate and what it uses that KIR cannot yet say
+  (loop-carried values, the integer/bitwise ISA, 16-bit memory and cast
+  rounding, vector memory, predicated side effects), the design of each
+  addition with its verifier rule (block parameters rather than phi,
+  per-class dense register numbering by linear scan with
+  `register_pressure()`, a typed `SmemLayout` promoted from FA v2's
+  offset functions, shape- and dtype-parameterised MMA), KIR as a leaf
+  crate `nsl-kir` so the runtime's 6.0K lines of kernels can build on it,
+  the three proof levels that replace "bit-identical PTX" (normalised-text
+  identity, SASS-baseline equivalence, the kernel's device tests), and
+  thirteen steps from the crate split to the FA v1 deletion.
 - Design spec for the roadmap A4 endgame,
   `docs/superpowers/specs/2026-09-09-a4-cuda-context-design.md`: what the
   CUDA singleton is today (`CudaState`'s four fields plus about 25 sibling
@@ -156,6 +186,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `KernelIR`, `KirBuilder`, the KIR verifier, the PTX printer and
+  `FeatureSet` moved from `nsl-codegen` into a new leaf crate `nsl-kir`
+  (roadmap A2 step 1), so the runtime can build kernels on the same IR
+  without depending on the compiler. `nsl_codegen::{kernel_ir, kir_verify,
+  backend_ptx}` and `nsl_codegen::gpu_target::FeatureSet` re-export
+  everything at the historical paths, so no caller changes;
+  `crates/nsl-kir/tests/leaf.rs` pins the crate dependency-free; the
+  KIR-generated PTX snapshots are byte-identical. The hand-PTX freeze
+  manifest now lists `crates/nsl-kir/src/backend_ptx.rs` as the member
+  by construction.
+- The last production `panic!` sites in `nsl-runtime` are typed fatal
+  exits (roadmap C1, tier 3): `Fatal::ShapeMismatch` (**18**, `nsl_tensor_
+  compare`'s short `b` operand and `fase_fused_step`'s mixed-dtype CPU
+  path) and `Fatal::Unsupported` (**19**, the device-to-device
+  `nsl_tensor_to_device` and an ONNX export of a block-packed dtype) join
+  the table; the eight remaining unsupported-dtype panics
+  (`nsl_tensor_compare`, `nsl_tensor_where`, the f16 elementwise readers,
+  the token readers of `packing.rs` and `dataloader.rs`) go through the
+  new `fatal::unsupported_dtype(op, dtype)` with their message unchanged;
+  `nsl_packed_mask_from_segment_ids`'s non-CUDA arm is
+  `fatal::cuda_not_compiled()`; the inspect stream's `cuStreamCreate`
+  failure is `Fatal::CudaDriver`. Every `panic!` left in the crate is in a
+  `#[cfg(test)]` module or the test-only `alloc_pinned` wrapper.
+  `fatal::tests::the_codes_are_stable` pins all eight codes;
+  `docs/architecture/runtime.md`'s table has the two new rows.
+
 - The AWQ activation-scales blob has one definition (roadmap A3, step 4 of
   the A3 design spec, second PR): `nsl_abi::wire::awq_scales` holds the
   layout, `encode`, `AwqScales::from_blob` / `to_blob`, `AwqBlobError` and
@@ -194,6 +250,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   thing in `main`. stderr, the `log` events on the stream and the marker
   gates are unchanged; the compiler's diagnostics are no longer a reason
   for it to depend on the runtime.
+- The CUDA device-identity record is a wire declaration (roadmap A3, step
+  4 of the A3 design spec): `nsl_abi::wire::device_identity::CudaDeviceIdentity`
+  (name, `sm_version`, `sm_count`, `driver_version`) is what the runtime's
+  compile-time probe `cuda_device_identity` returns and what the compiler
+  keys its `@autotune` cache on; the runtime re-exports it at
+  `nsl_runtime::CudaDeviceIdentity`, and `gpu_specs::local_device_identity`
+  names the `nsl-abi` type. No behaviour change.
 - The train block has a `TrainPlan` carrier (roadmap A1; step 1 of the
   design in `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`):
   `stmt_train/plan.rs` holds the planning-time facts as plain data — the

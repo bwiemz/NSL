@@ -4318,7 +4318,10 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         { crate::fatal::cuda_not_compiled(); }
     }
 
-    panic!("GPU-to-GPU transfer not yet supported");
+    crate::fatal::die(
+        crate::fatal::Fatal::Unsupported,
+        "nsl_tensor_to_device: GPU-to-GPU transfer not yet supported",
+    );
 }
 
 /// Migrate `src` to match `ref_tensor`'s device. Returns a new refcounted tensor

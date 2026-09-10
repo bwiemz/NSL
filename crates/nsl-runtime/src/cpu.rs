@@ -304,10 +304,7 @@ pub(crate) fn tensor_elementwise_op_f16_impl(
             DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(a.data as *const u16).add(idx) }),
             1 => unsafe { *a.data_f32().add(idx) },
             0 => unsafe { *a.data_f64().add(idx) as f32 },
-            _ => panic!(
-                "tensor_elementwise_op_f16_impl: read_a unsupported dtype {}",
-                a.dtype
-            ),
+            _ => crate::fatal::unsupported_dtype("tensor_elementwise_op_f16_impl: read_a", a.dtype),
         }
     };
     let read_b = |idx: usize| -> f32 {
@@ -316,10 +313,7 @@ pub(crate) fn tensor_elementwise_op_f16_impl(
             DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(b.data as *const u16).add(idx) }),
             1 => unsafe { *b.data_f32().add(idx) },
             0 => unsafe { *b.data_f64().add(idx) as f32 },
-            _ => panic!(
-                "tensor_elementwise_op_f16_impl: read_b unsupported dtype {}",
-                b.dtype
-            ),
+            _ => crate::fatal::unsupported_dtype("tensor_elementwise_op_f16_impl: read_b", b.dtype),
         }
     };
 
