@@ -3,12 +3,13 @@
 //!
 //! ## Why this gate did not exist and needed to
 //!
-//! `nsl-abi`'s `cross_check` validates the codegen's `RUNTIME_FUNCTIONS` table
-//! against the runtime's `extern "C"` bodies, and it is thorough (650
-//! signatures). But it iterates the DECLARED TABLE, so a surface with no table
-//! entry is invisible to it — and the emitted header is exactly that: literal
-//! C text assembled in `c_header.rs`, describing runtime symbols the compiler
-//! never declares to Cranelift because host code, not emitted code, calls them.
+//! `nsl-abi`'s typed table (`RUNTIME_ABI`) is checked against the runtime's
+//! `extern "C"` bodies by the runtime's own `abi_check` gate, and it is
+//! thorough (650 signatures). But that gate iterates the DECLARED TABLE, so a
+//! surface with no table entry is invisible to it — and the emitted header is
+//! exactly that: literal C text assembled in `c_header.rs`, describing runtime
+//! symbols the compiler never declares to Cranelift because host code, not
+//! emitted code, calls them.
 //!
 //! Two existing tests touch the header and neither could see a type:
 //! `c_header_compiles.rs` takes the address of one prototype and otherwise runs
@@ -26,7 +27,7 @@
 //!   the returned status.
 //! * `void nsl_model_destroy(NslModel*)` against `-> i64`.
 
-use nsl_abi::{parse_c_prototypes, parse_externs_in_file, AbiScalar, ParsedType};
+use nsl_abi::{parse_c_prototypes, AbiScalar, ParsedType};
 use nsl_codegen::c_header::{
     emit, ExportDevice, ExportDtype, ExportInfo, ExportParamInfo, ExportTypeInfo,
 };
@@ -278,6 +279,28 @@ fn export_prototypes_agree_with_the_wrapper_signature_codegen_builds() {
     );
 }
 
+/// Every `extern "C" fn <name>(` spelled in `src`, in source order.
+///
+/// Only the NAMES matter here (the test below asks whether the header
+/// defines an inline of the same spelling), so a token scan is enough; the
+/// signatures themselves are covered by the runtime's `abi_check` gate.
+fn extern_c_fn_names(src: &str) -> Vec<String> {
+    const NEEDLE: &str = "extern \"C\" fn ";
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some(at) = rest.find(NEEDLE) {
+        rest = &rest[at + NEEDLE.len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && rest[name.len()..].trim_start().starts_with('(') {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// The header's convenience inlines must not shadow runtime symbols.
 ///
 /// They were emitted as `static inline int32_t nsl_model_forward(...)` /
@@ -298,11 +321,7 @@ fn header_inlines_do_not_shadow_runtime_symbols() {
     let mut runtime_names: Vec<String> = Vec::new();
     for f in [&capi, &grad] {
         let src = std::fs::read_to_string(f).unwrap_or_default();
-        runtime_names.extend(
-            parse_externs_in_file(&src, "runtime")
-                .into_iter()
-                .map(|s| s.name),
-        );
+        runtime_names.extend(extern_c_fn_names(&src));
     }
     assert!(
         runtime_names.iter().any(|n| n == "nsl_model_forward")

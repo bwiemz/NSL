@@ -466,14 +466,11 @@ renders every row into a `const` that casts the named implementation to
 the row slot by slot (`nsl_abi::typed::assert_sig`; register class and width,
 so `u64`, `usize` and raw pointers are `i64` slots). A row whose arity,
 types or path disagree fails `cargo build -p nsl-runtime` with the
-function's name. As belt-and-braces, `crates/nsl-abi` (dependency-free)
-parses every `#[unsafe(no_mangle)] extern "C" fn` in `nsl-runtime` and
-cross-checks it against the typed table (`nsl_abi::check_workspace`,
-`cross_check`, `MismatchKind::DuplicateDecl`);
-`crates/nsl-abi/tests/signature_agreement.rs` is that CI gate
-(`runtime_function_signatures_agree_with_extern_impls`, with a truncation
-floor of 682 rows recorded 2026-09-02, and `nsl_abi::table::tests` pins the
-row count exactly). Inside the codegen, `builtins/mod.rs` unit tests
+function's name, and `nsl_abi::table::tests` pins the row count exactly.
+(Until A3 step 6 `crates/nsl-abi` also parsed every `extern "C" fn` in
+`nsl-runtime` as text and cross-checked it against the table — the
+`signature_agreement` gate; the typed assertions cover every row, so that
+parser and its gate are gone.) Inside the codegen, `builtins/mod.rs` unit tests
 `no_runtime_function_is_declared_twice` and `registry_is_the_abi_table`
 guard the rendering. The host-facing C API is the second table,
 `nsl_abi::capi` (22 rows, nine with the C prototype the header prints): the
@@ -814,8 +811,7 @@ should fail before review.
   (`no_runtime_function_is_declared_twice`, `nsl_abi::table::tests`), the
   codegen's rendering is the table row for row (`registry_is_the_abi_table`),
   and every row's signature agrees with the runtime's implementation — checked
-  by `rustc` in the runtime's build (`abi_check.rs`) and by text in
-  `crates/nsl-abi/tests/signature_agreement.rs`. The emitted argument order
+  by `rustc` in the runtime's build (`abi_check.rs`). The emitted argument order
   must match the table's parameter order — nothing checks that except the
   snapshot and numerical tests, which is why a new call site should be
   covered by one. `crates/nsl-codegen/tests/muon_route_contract_drift.rs` and
@@ -895,7 +891,7 @@ different thing.
 
 | Gate | Where |
 |------|-------|
-| `cargo test --workspace -- --skip e2e_` (all non-ignored codegen tests, unit tests, the static drift gates, `signature_agreement`) | `ci.yml` `build-and-test` |
+| `cargo test --workspace -- --skip e2e_` (all non-ignored codegen tests, unit tests, the static drift gates, `nsl-abi`'s table tests) | `ci.yml` `build-and-test` |
 | `verilog_emission_snapshots`, `hir_pass_snapshots`, `yosys_gate` | `ci.yml` `fpga` |
 | `csha_ptx_ptxas_validation`, `fused_linear_ce_{bf16,fp16,large_vocab}_ptxas`, `bitnet_gpu_correctness` under `--features cuda` against cudart stubs (assembles PTX, executes nothing) | `ci.yml` `cuda-feature` |
 | `scripts/hand-ptx-freeze.sh --self-test` / `--check` | `ci.yml` `hand-ptx-freeze` |
@@ -925,6 +921,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 3. Emit the call with `self.compile_call_by_name(builder, "nsl_…", &args)`
    from the lowering site; argument order must match the row.
 4. Build `nsl-runtime` (the row is checked against the implementation at
+   compile time) and run `cargo test -p nsl-abi` (the row-count pin) and
+   `cargo test -p nsl-codegen --lib builtins` (the duplicate/rendering
    compile time) and run `cargo test -p nsl-abi --test signature_agreement`
    and `cargo test -p nsl-codegen --lib builtins` (the duplicate/rendering
    tests). If the symbol is exported to C hosts, add a row to

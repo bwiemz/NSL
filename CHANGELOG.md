@@ -156,6 +156,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- `nsl-abi`'s text parser is gone (roadmap A3, step 6 of the A3 design
+  spec): `parse_runtime_functions_table*`, `parse_externs_in_file`,
+  `parse_inplace_unary_macro`, `cross_check`, `check_workspace` and the
+  `Mismatch`/`Report` types, plus the `signature_agreement` gate that ran
+  them, are deleted. Nothing read them since the typed tables landed — the
+  runtime's build asserts every row of `nsl_abi::table` and `nsl_abi::capi`
+  against its implementation (`abi_check.rs`), which is stricter than the
+  text cross-check was. `parse_c_prototypes` and the `FnSig`/`AbiScalar`
+  model stay for `c_header_agreement`, which reads the generated header
+  back; its runtime-symbol scan no longer goes through `nsl-abi`. The
+  crate's `lib.rs` shrinks from 1,496 to 520 lines and its docs, the
+  `table` and `builtins` module docs, `docs/architecture/codegen.md` and
+  `docs/abi/README.md` describe the build-time assertion as the one gate.
 - The host-facing C API has one typed table (roadmap A3, step 2 of the A3
   design spec): `nsl_abi::capi` declares the 22 lifecycle, named-dispatch,
   ownership-model, DLPack, grad-context and error entry points once, nine
