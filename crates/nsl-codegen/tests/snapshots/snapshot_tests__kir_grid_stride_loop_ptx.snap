@@ -15,7 +15,7 @@ expression: ptx_str
     .reg .u64 %edge_rd;
     .reg .f32 %edge_f;
     .reg .f64 %edge_fd;
-    .reg .f16 %edge_h;
+    .reg .b16 %edge_h;
     .reg .pred %edge_p;
     .reg .b32 %edge_v;
 

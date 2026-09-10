@@ -35,6 +35,18 @@
 //!      `Vec(F16, 2)` A registers, two `Vec(F16, 2)` B registers and four
 //!      `F32` accumulators in and out.
 //!
+//!   4b. **The scalar ISA (roadmap A2 step 4).** `And`/`Or`/`Xor`/`Not`
+//!      are homogeneous on integers or `Bool`s, `Rem` on integers, `Min`/
+//!      `Max` on any numeric type, `Rcp`/`Rsqrt` on `F32`/`F64`; `Shl`/
+//!      `Shr` keep the operand's type and take a `U32` amount;
+//!      `CastRounded` lands in its target; `LoadVec`/`StoreVec` move 2 or
+//!      4 pointee-typed values through a `Ptr` (`BadVectorWidth`); `Vote`
+//!      reads a `Bool` and produces a `Bool` (`Any`/`All`) or a `U32`
+//!      (`Ballot`); `LaneId`/`WarpId` produce `U32`.
+//!   8. **Predication.** `Predicated { pred, op }` reads a `Bool` and may
+//!      wrap only an op with no destination (`PredicatedValueOp`): a
+//!      predicated definition would be partial, which SSA forbids. The
+//!      wrapped op is checked like any other.
 //!   7. **Edges.** Every edge passes exactly one argument per parameter of
 //!      its target block (`EdgeArityMismatch`), each argument reaches the
 //!      terminator like any other use (rules 2–3 treat a block parameter as
@@ -58,6 +70,7 @@ use std::fmt;
 
 use crate::kernel_ir::{
     AddressSpace, BlockId, KernelIR, KirConst, KirEdge, KirOp, KirTerminator, KirType, VarId,
+    VoteMode,
 };
 
 /// One violation. `block` / `op_index` locate the offending op (the
@@ -112,6 +125,11 @@ pub enum KirVerifyError {
     /// An edge from `block` to `target` passes `found` arguments for
     /// `expected` parameters.
     EdgeArityMismatch { block: BlockId, target: BlockId, expected: usize, found: usize },
+    /// A `Predicated` wrapping an op that defines a value (or another
+    /// `Predicated`).
+    PredicatedValueOp { block: BlockId, op_index: usize },
+    /// A `LoadVec`/`StoreVec` of `width` values; PTX vectors are 2 or 4 wide.
+    BadVectorWidth { block: BlockId, op_index: usize, width: usize },
 }
 
 impl fmt::Display for KirVerifyError {
@@ -174,6 +192,14 @@ impl fmt::Display for KirVerifyError {
             KirVerifyError::EdgeArityMismatch { block, target, expected, found } => write!(
                 f,
                 "the edge from block {block} to block {target} passes {found} argument(s) for {expected} parameter(s)"
+            ),
+            KirVerifyError::PredicatedValueOp { block, op_index } => write!(
+                f,
+                "Predicated at block {block} op {op_index} wraps an op that defines a value; predicate only side effects"
+            ),
+            KirVerifyError::BadVectorWidth { block, op_index, width } => write!(
+                f,
+                "vector memory op at block {block} op {op_index} moves {width} values; PTX vectors are 2 or 4 wide"
             ),
         }
     }
@@ -429,6 +455,17 @@ pub fn render_errors(errors: &[KirVerifyError]) -> String {
     errors.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
 }
 
+fn is_float(ty: &KirType) -> bool {
+    matches!(ty, KirType::F16 | KirType::Bf16 | KirType::F32 | KirType::F64)
+}
+
+fn is_integer(ty: &KirType) -> bool {
+    matches!(
+        ty,
+        KirType::U32 | KirType::I32 | KirType::U64 | KirType::I64 | KirType::I8 | KirType::I16
+    )
+}
+
 /// The packed f16x2 fragment register type the tensor-core ops carry.
 fn f16x2() -> KirType {
     KirType::Vec(Box::new(KirType::F16), 2)
@@ -460,6 +497,8 @@ pub fn op_dsts(op: &KirOp) -> Vec<VarId> {
     match op {
         KirOp::LdMatrixX4 { dst, .. } => dst.to_vec(),
         KirOp::MmaF16M16N8K16 { d, .. } => d.to_vec(),
+        KirOp::LoadVec { dsts, .. } => dsts.clone(),
+        KirOp::Predicated { op, .. } => op_dsts(op),
         _ => op_dst(op).into_iter().collect(),
     }
 }
@@ -489,7 +528,22 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::BlockDim(d, _)
         | KirOp::GridDim(d, _)
         | KirOp::GlobalId(d, _)
-        | KirOp::WarpShuffle(d, _, _)
+        | KirOp::And(d, _, _)
+        | KirOp::Or(d, _, _)
+        | KirOp::Xor(d, _, _)
+        | KirOp::Not(d, _)
+        | KirOp::Shl(d, _, _)
+        | KirOp::Shr(d, _, _)
+        | KirOp::Rem(d, _, _)
+        | KirOp::Min(d, _, _)
+        | KirOp::Max(d, _, _)
+        | KirOp::Rcp(d, _)
+        | KirOp::Rsqrt(d, _)
+        | KirOp::CastRounded { dst: d, .. }
+        | KirOp::Vote { dst: d, .. }
+        | KirOp::LaneId(d)
+        | KirOp::WarpId(d)
+        | KirOp::WarpShuffle { dst: d, .. }
         | KirOp::Cmp(d, _, _, _)
         | KirOp::Select(d, _, _, _)
         | KirOp::Const(d, _)
@@ -503,7 +557,10 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::CpAsyncCommit
         | KirOp::CpAsyncWait { .. }
         | KirOp::LdMatrixX4 { .. }
-        | KirOp::MmaF16M16N8K16 { .. } => None,
+        | KirOp::MmaF16M16N8K16 { .. }
+        | KirOp::LoadVec { .. }
+        | KirOp::StoreVec { .. }
+        | KirOp::Predicated { .. } => None,
         KirOp::Matmul { out, .. } | KirOp::ElementwiseAdd { out, .. } | KirOp::Relu { out, .. } => {
             Some(*out)
         }
@@ -518,7 +575,15 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::Mul(_, a, b)
         | KirOp::Div(_, a, b)
         | KirOp::Pow(_, a, b)
-        | KirOp::WarpShuffle(_, a, b)
+        | KirOp::And(_, a, b)
+        | KirOp::Or(_, a, b)
+        | KirOp::Xor(_, a, b)
+        | KirOp::Shl(_, a, b)
+        | KirOp::Shr(_, a, b)
+        | KirOp::Rem(_, a, b)
+        | KirOp::Min(_, a, b)
+        | KirOp::Max(_, a, b)
+        | KirOp::WarpShuffle { val: a, lane: b, .. }
         | KirOp::Cmp(_, a, b, _)
         | KirOp::PtrOffset(_, a, b) => vec![*a, *b],
         KirOp::Fma(_, a, b, c) | KirOp::Select(_, a, b, c) => vec![*a, *b, *c],
@@ -530,8 +595,24 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::Sin(_, s)
         | KirOp::Cos(_, s)
         | KirOp::Tanh(_, s)
+        | KirOp::Not(_, s)
+        | KirOp::Rcp(_, s)
+        | KirOp::Rsqrt(_, s)
         | KirOp::Cast(_, s, _)
+        | KirOp::CastRounded { src: s, .. }
+        | KirOp::LoadVec { ptr: s, .. }
+        | KirOp::Vote { pred: s, .. }
         | KirOp::Load(_, s, _) => vec![*s],
+        KirOp::StoreVec { ptr, vals, .. } => {
+            let mut v = vec![*ptr];
+            v.extend_from_slice(vals);
+            v
+        }
+        KirOp::Predicated { pred, op, .. } => {
+            let mut v = vec![*pred];
+            v.extend(op_uses(op));
+            v
+        }
         KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) => vec![*p, *v],
         KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
         KirOp::LdMatrixX4 { addr, .. } => vec![*addr],
@@ -549,6 +630,8 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::BlockDim(_, _)
         | KirOp::GridDim(_, _)
         | KirOp::GlobalId(_, _)
+        | KirOp::LaneId(_)
+        | KirOp::WarpId(_)
         | KirOp::Const(_, _)
         | KirOp::Barrier
         | KirOp::SharedMemFence => vec![],
@@ -651,10 +734,127 @@ fn check_types(
                 expect(*s, "src", &dt);
             }
         }
-        KirOp::WarpShuffle(d, v, _) => {
+        KirOp::WarpShuffle { dst: d, val: v, lane, .. } => {
             if let Some(dt) = ty(d) {
                 expect(*v, "val", &dt);
             }
+            expect(*lane, "lane", &KirType::U32);
+        }
+        // Roadmap A2 step 4: the scalar ISA.
+        KirOp::And(d, a, b) | KirOp::Or(d, a, b) | KirOp::Xor(d, a, b) => {
+            if let Some(dt) = ty(d) {
+                expect(*a, "a", &dt);
+                expect(*b, "b", &dt);
+                if is_float(&dt) {
+                    errors.push(KirVerifyError::TypeMismatch {
+                        var: *d,
+                        block,
+                        op_index,
+                        role: "dst (bitwise ops take integers or Bool)",
+                        expected: KirType::U32,
+                        found: dt,
+                    });
+                }
+            }
+        }
+        KirOp::Not(d, s) => {
+            if let Some(dt) = ty(d) {
+                expect(*s, "src", &dt);
+            }
+        }
+        KirOp::Rem(d, a, b) => {
+            if let Some(dt) = ty(d) {
+                expect(*a, "a", &dt);
+                expect(*b, "b", &dt);
+                if !is_integer(&dt) {
+                    errors.push(KirVerifyError::TypeMismatch {
+                        var: *d,
+                        block,
+                        op_index,
+                        role: "dst (Rem takes integers)",
+                        expected: KirType::U32,
+                        found: dt,
+                    });
+                }
+            }
+        }
+        KirOp::Min(d, a, b) | KirOp::Max(d, a, b) => {
+            if let Some(dt) = ty(d) {
+                expect(*a, "a", &dt);
+                expect(*b, "b", &dt);
+            }
+        }
+        KirOp::Shl(d, a, amount) | KirOp::Shr(d, a, amount) => {
+            if let Some(dt) = ty(d) {
+                expect(*a, "a", &dt);
+            }
+            expect(*amount, "amount", &KirType::U32);
+        }
+        KirOp::Rcp(d, s) | KirOp::Rsqrt(d, s) => {
+            if let Some(dt) = ty(d) {
+                expect(*s, "src", &dt);
+                if !is_float(&dt) {
+                    errors.push(KirVerifyError::TypeMismatch {
+                        var: *d,
+                        block,
+                        op_index,
+                        role: "dst (Rcp/Rsqrt take F32 or F64)",
+                        expected: KirType::F32,
+                        found: dt,
+                    });
+                }
+            }
+        }
+        KirOp::CastRounded { dst: d, ty: target, .. } => expect(*d, "dst", target),
+        // (The width check pushes directly, so it runs after the last use
+        // of the `expect` closure in the arm.)
+        KirOp::LoadVec { dsts, ptr, .. } => {
+            match ty(ptr) {
+                Some(KirType::Ptr(pointee, _)) => {
+                    for d in dsts {
+                        expect(*d, "dst", &pointee);
+                    }
+                }
+                Some(found) => {
+                    errors.push(KirVerifyError::NotAPointer { var: *ptr, block, op_index, found })
+                }
+                None => {}
+            }
+            if !matches!(dsts.len(), 2 | 4) {
+                errors.push(KirVerifyError::BadVectorWidth { block, op_index, width: dsts.len() });
+            }
+        }
+        KirOp::StoreVec { ptr, vals, .. } => {
+            match ty(ptr) {
+                Some(KirType::Ptr(pointee, _)) => {
+                    for v in vals {
+                        expect(*v, "value", &pointee);
+                    }
+                }
+                Some(found) => {
+                    errors.push(KirVerifyError::NotAPointer { var: *ptr, block, op_index, found })
+                }
+                None => {}
+            }
+            if !matches!(vals.len(), 2 | 4) {
+                errors.push(KirVerifyError::BadVectorWidth { block, op_index, width: vals.len() });
+            }
+        }
+        KirOp::Vote { dst: d, pred, mode } => {
+            expect(*pred, "pred", &KirType::Bool);
+            let out = match mode {
+                VoteMode::Any | VoteMode::All => KirType::Bool,
+                VoteMode::Ballot => KirType::U32,
+            };
+            expect(*d, "dst", &out);
+        }
+        KirOp::LaneId(d) | KirOp::WarpId(d) => expect(*d, "dst", &KirType::U32),
+        KirOp::Predicated { pred, op: inner, .. } => {
+            expect(*pred, "pred", &KirType::Bool);
+            if !op_dsts(inner).is_empty() || matches!(**inner, KirOp::Predicated { .. }) {
+                errors.push(KirVerifyError::PredicatedValueOp { block, op_index });
+            }
+            check_types(ir, inner, block, op_index, errors);
         }
         KirOp::Cast(d, _, target) => expect(*d, "dst", target),
         KirOp::Load(d, p, _) => match ty(p) {
@@ -773,6 +973,7 @@ fn check_types(
 mod tests {
     use super::*;
     use crate::kernel_ir::{AddressSpace, CmpOp, ConstValue, KirBuilder, KirEdge};
+    use crate::kernel_ir::VoteMode;
 
     fn f32_ptr() -> KirType {
         KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
@@ -1135,6 +1336,169 @@ mod tests {
         b.set_block(entry);
         b.terminate(KirTerminator::Return);
         assert_eq!(verify(&b.finalize()), Err(vec![KirVerifyError::EntryBlockHasParams { count: 1 }]));
+    }
+
+    // ── Rule 4b / 8: the scalar ISA and predication (roadmap A2 step 4) ──
+
+    fn one_block() -> (KirBuilder, VarId) {
+        let mut b = KirBuilder::new("isa");
+        let p = b.add_param("p", f32_ptr(), AddressSpace::Global);
+        let e = b.new_block();
+        b.set_block(e);
+        (b, p)
+    }
+
+    #[test]
+    fn rem_takes_integers() {
+        let (mut b, _) = one_block();
+        let x = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(x, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+        let r = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Rem(r, x, x));
+        b.terminate(KirTerminator::Return);
+        let errs = verify(&b.finalize()).unwrap_err();
+        assert!(matches!(errs[..], [KirVerifyError::TypeMismatch { var, .. }] if var == r), "{errs:?}");
+    }
+
+    #[test]
+    fn a_shift_amount_is_u32() {
+        let (mut b, _) = one_block();
+        let x = b.new_typed_var(KirType::U64);
+        b.emit(KirOp::Const(x, KirConst { ty: KirType::U64, value: ConstValue::U64(8) }));
+        let d = b.new_typed_var(KirType::U64);
+        b.emit(KirOp::Shl(d, x, x));
+        b.terminate(KirTerminator::Return);
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: x,
+                block: 0,
+                op_index: 1,
+                role: "amount",
+                expected: KirType::U32,
+                found: KirType::U64,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_vector_load_is_two_or_four_wide() {
+        let (mut b, p) = one_block();
+        let d: Vec<VarId> = (0..3).map(|_| b.new_typed_var(KirType::F32)).collect();
+        b.emit(KirOp::LoadVec { dsts: d, ptr: p, space: AddressSpace::Global });
+        b.terminate(KirTerminator::Return);
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::BadVectorWidth { block: 0, op_index: 0, width: 3 }])
+        );
+    }
+
+    #[test]
+    fn a_vector_load_is_pointee_typed() {
+        let (mut b, p) = one_block();
+        let d0 = b.new_typed_var(KirType::F32);
+        let d1 = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::LoadVec { dsts: vec![d0, d1], ptr: p, space: AddressSpace::Global });
+        b.terminate(KirTerminator::Return);
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: d1,
+                block: 0,
+                op_index: 0,
+                role: "dst",
+                expected: KirType::F32,
+                found: KirType::U32,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_ballot_is_u32_and_any_is_bool() {
+        let (mut b, _) = one_block();
+        let flag = b.new_typed_var(KirType::Bool);
+        let t = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::ThreadId(t, 0));
+        b.emit(KirOp::Cmp(flag, t, t, CmpOp::Eq));
+        let bits = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Vote { dst: bits, pred: flag, mode: VoteMode::Ballot });
+        let any = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Vote { dst: any, pred: flag, mode: VoteMode::Any });
+        let wrong = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Vote { dst: wrong, pred: flag, mode: VoteMode::All });
+        b.terminate(KirTerminator::Return);
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: wrong,
+                block: 0,
+                op_index: 4,
+                role: "dst",
+                expected: KirType::Bool,
+                found: KirType::U32,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_predicated_store_verifies_and_a_predicated_definition_does_not() {
+        let (mut b, p) = one_block();
+        let t = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::ThreadId(t, 0));
+        let flag = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(flag, t, t, CmpOp::Eq));
+        let v = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(v, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+        b.emit(KirOp::Predicated {
+            pred: flag,
+            negate: false,
+            op: Box::new(KirOp::Store(p, v, AddressSpace::Global)),
+        });
+        b.terminate(KirTerminator::Return);
+        assert_eq!(verify(&b.finalize()), Ok(()));
+
+        let (mut b, p) = one_block();
+        let t = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::ThreadId(t, 0));
+        let flag = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(flag, t, t, CmpOp::Eq));
+        let v = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Predicated {
+            pred: flag,
+            negate: true,
+            op: Box::new(KirOp::Load(v, p, AddressSpace::Global)),
+        });
+        b.terminate(KirTerminator::Return);
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::PredicatedValueOp { block: 0, op_index: 2 }])
+        );
+    }
+
+    #[test]
+    fn a_predicated_op_is_still_type_checked() {
+        let (mut b, p) = one_block();
+        let t = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::ThreadId(t, 0));
+        let flag = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(flag, t, t, CmpOp::Eq));
+        b.emit(KirOp::Predicated {
+            pred: flag,
+            negate: false,
+            op: Box::new(KirOp::Store(p, t, AddressSpace::Global)),
+        });
+        b.terminate(KirTerminator::Return);
+        assert_eq!(
+            verify(&b.finalize()),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: t,
+                block: 0,
+                op_index: 2,
+                role: "value",
+                expected: KirType::F32,
+                found: KirType::U32,
+            }])
+        );
     }
 
     #[test]

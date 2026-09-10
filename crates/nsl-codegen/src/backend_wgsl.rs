@@ -116,7 +116,7 @@ fn lower_op_to_wgsl(op: &KirOp) -> String {
             ),
             _ => format!("// const v{}", dst),
         },
-        KirOp::WarpShuffle(_, _, _) => {
+        KirOp::WarpShuffle { .. } => {
             "// ERROR: WGSL does not support warp shuffle — feature gate should have caught this"
                 .to_string()
         }

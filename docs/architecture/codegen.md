@@ -532,7 +532,20 @@ on the entry block, and the PTX printer implements an edge as a parallel
 copy into the parameter registers before the jump (a per-class
 `%edge_*` scratch register breaks a swap; a `CondBranch` whose edges carry
 arguments gets a `BB<n>_else` label). `crates/nsl-codegen/tests/kir_block_params_ptxas.rs`
-assembles a grid-stride loop with `ptxas`. The async-copy
+assembles a grid-stride loop with `ptxas`. The scalar ISA the hand estate
+is made of is first-class too (roadmap A2 step 4): `And`/`Or`/`Xor`/`Not`,
+`Shl`/`Shr` (arithmetic for signed types), `Rem`, `Min`/`Max`,
+`Rcp`/`Rsqrt`, `WarpShuffle { mode: Down | Up | Xor | Idx, width }`,
+`Vote { Any | All | Ballot }`, `LaneId`/`WarpId`, `LoadVec`/`StoreVec`
+(2 or 4 pointee-typed values), `CastRounded { mode }` beside `Cast`
+(which now prints the rounding modifier PTX requires: `.rn` for a float
+result that can round, `.rzi` for float → int), and `Predicated { pred,
+negate, op }` around an op with no destination (a predicated definition is
+refused as partial SSA). The 16-bit class is `.reg .b16 %h<N>` and 16-bit
+loads and stores are `.b16`; a kernel that requires
+`FeatureSet::BF16_ARITHMETIC` (any bf16 value or conversion) prints
+`.version 7.8` / `sm_80`. `crates/nsl-codegen/tests/kir_scalar_isa_ptxas.rs`
+assembles one kernel using every family. The async-copy
 group is first-class KIR (`SharedBase`, `CpAsync { bytes: 4 | 8 | 16 }`,
 `CpAsyncCommit`, `CpAsyncWait { pending }`, `FeatureSet::ASYNC_COPY`): the
 verifier checks the global → shared state spaces and the commit/wait

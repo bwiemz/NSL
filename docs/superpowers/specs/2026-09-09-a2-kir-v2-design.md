@@ -288,7 +288,13 @@ frozen throughout, so nothing here blocks a kernel fix.
    typed `Select`, the shuffle modes and votes, lane/warp ids, the `.b16`
    memory class, `Cast` rounding modes, vector loads/stores, predicated
    side effects, PTX version from the feature set. Each op has a rule-4
-   case and a `ptxas` test.
+   case and a `ptxas` test. *Landed* (before step 3, which does not need
+   it): every family above, `WarpShuffle` in its struct form with modes
+   and width, `Cast` printing the modifier PTX requires with
+   `CastRounded` for an explicit mode, `LoadVec`/`StoreVec` with one
+   scalar per lane, `Predicated` refused around a definition (rule 8),
+   the `.b16` class, `FeatureSet::BF16_ARITHMETIC` consulted for
+   `.version 7.8` / `sm_80`, the `kir_scalar_isa_ptxas` gate.
 5. **Register classes and the allocator.** Dense per-class numbering by
    linear scan, printer scratch from the allocator (the `+1000` idiom
    goes), `register_pressure()`, the `.maxnreg`/`.maxntid`/`.reqntid`

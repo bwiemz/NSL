@@ -161,9 +161,12 @@ impl KirType {
     pub fn ptx_type(&self) -> &'static str {
         match self {
             KirType::U32 => "u32",
-            KirType::I32 => "i32",
+            // PTX spells the signed integers `.s32` / `.s64`; `.i32` is not
+            // a type (fixed with roadmap A2 step 4, when `Cast` to `I32`
+            // first went through `ptxas`).
+            KirType::I32 => "s32",
             KirType::U64 => "u64",
-            KirType::I64 => "i64",
+            KirType::I64 => "s64",
             KirType::I8 => "s8",
             KirType::I16 => "s16",
             KirType::F16 => "f16",
@@ -228,7 +231,54 @@ pub enum KirOp {
 
     // Synchronization
     Barrier,
-    WarpShuffle(VarId, VarId, VarId), // dst = shuffle_down(val, offset)
+    /// Warp shuffle: `dst = val` from the lane selected by `mode` and
+    /// `lane` (a `U32`: the delta for `Down`/`Up`, the XOR mask for `Xor`,
+    /// the source lane for `Idx`) within a segment of `width` lanes
+    /// (32 = the whole warp). Roadmap A2 step 4; the pre-step form was the
+    /// `Down`, width-32 case.
+    WarpShuffle { dst: VarId, val: VarId, lane: VarId, mode: ShuffleMode, width: u8 },
+    /// Warp vote over `pred` (a `Bool`): `Any` / `All` produce a `Bool`,
+    /// `Ballot` a `U32` bit per lane. Roadmap A2 step 4.
+    Vote { dst: VarId, pred: VarId, mode: VoteMode },
+    /// The lane index within the warp (`%laneid`, `U32`). Roadmap A2 step 4.
+    LaneId(VarId),
+    /// The warp index within the block (`%warpid`, `U32`). Not stable across
+    /// context switches on every part; the estate mostly derives it from
+    /// the thread index. Roadmap A2 step 4.
+    WarpId(VarId),
+
+    // Roadmap A2 step 4: the integer / bitwise ISA the hand estate's index
+    // math and reductions are made of. All homogeneous (dst, a, b):
+    // `And`/`Or`/`Xor` on integers or `Bool`s, `Not` on the same, `Rem` on
+    // integers, `Min`/`Max` on any numeric type; `Shl`/`Shr` take a `U32`
+    // shift amount and `Shr` is arithmetic for signed types.
+    And(VarId, VarId, VarId),
+    Or(VarId, VarId, VarId),
+    Xor(VarId, VarId, VarId),
+    Not(VarId, VarId),
+    Shl(VarId, VarId, VarId),
+    Shr(VarId, VarId, VarId),
+    Rem(VarId, VarId, VarId),
+    Min(VarId, VarId, VarId),
+    Max(VarId, VarId, VarId),
+    /// `dst = 1 / src` (`F32`: `rcp.approx`, `F64`: `rcp.rn`).
+    Rcp(VarId, VarId),
+    /// `dst = 1 / sqrt(src)` (`rsqrt.approx`).
+    Rsqrt(VarId, VarId),
+    /// A conversion with an explicit rounding mode; `Cast` picks the
+    /// default (`Rn` for anything that can round, `Rzi` for float → int).
+    CastRounded { dst: VarId, src: VarId, ty: KirType, mode: RoundMode },
+    /// Vector load: `dsts.len()` (2 or 4) consecutive pointee-typed values
+    /// from `ptr` (`ld.{space}.v{n}`). Each destination is its own scalar.
+    LoadVec { dsts: Vec<VarId>, ptr: VarId, space: AddressSpace },
+    /// Vector store of `vals.len()` (2 or 4) values to `ptr`.
+    StoreVec { ptr: VarId, vals: Vec<VarId>, space: AddressSpace },
+    /// Roadmap A2 step 4: a predicated side effect — `op` runs only when
+    /// `pred` (a `Bool`) is true (`negate`: false). Only ops with no
+    /// destination may be predicated (`Store`, `StoreVec`, `AtomicAdd`,
+    /// `CpAsync`, the barriers); a predicated definition would be partial,
+    /// which SSA forbids — use `Select` or a branch for a value.
+    Predicated { pred: VarId, negate: bool, op: Box<KirOp> },
 
     // Comparison (dst, a, b, op)
     Cmp(VarId, VarId, VarId, CmpOp),
@@ -318,6 +368,42 @@ impl KirTerminator {
     }
 }
 
+/// Rounding for `CastRounded` (roadmap A2 step 4): the PTX `.rn` / `.rz` /
+/// `.rm` / `.rp` modifiers for float results, and their `.rni` / `.rzi` /
+/// `.rmi` / `.rpi` forms for a float → integer conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundMode {
+    /// To nearest even.
+    Rn,
+    /// Toward zero.
+    Rz,
+    /// Toward negative infinity.
+    Rm,
+    /// Toward positive infinity.
+    Rp,
+}
+
+/// Lane selection for `WarpShuffle` (roadmap A2 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShuffleMode {
+    /// From `lane_id + delta` (`shfl.sync.down`).
+    Down,
+    /// From `lane_id - delta` (`shfl.sync.up`).
+    Up,
+    /// From `lane_id ^ mask` (`shfl.sync.bfly`).
+    Xor,
+    /// From the given lane (`shfl.sync.idx`).
+    Idx,
+}
+
+/// The warp vote a `Vote` takes (roadmap A2 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoteMode {
+    Any,
+    All,
+    Ballot,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CmpOp {
     Eq,
@@ -386,6 +472,9 @@ impl KirBuilder {
     /// Allocate a new typed variable. The type is recorded for backend use.
     pub fn new_typed_var(&mut self, ty: KirType) -> VarId {
         let id = self.new_var();
+        if ty == KirType::Bf16 {
+            self.required_features |= FeatureSet::BF16_ARITHMETIC;
+        }
         self.var_types.insert(id, ty);
         id
     }
@@ -437,7 +526,17 @@ impl KirBuilder {
         // Track required features
         match &op {
             KirOp::Barrier => self.required_features |= FeatureSet::SHARED_MEMORY,
-            KirOp::WarpShuffle(_, _, _) => self.required_features |= FeatureSet::WARP_SHUFFLE,
+            KirOp::WarpShuffle { .. } | KirOp::Vote { .. } => {
+                self.required_features |= FeatureSet::WARP_SHUFFLE
+            }
+            // Roadmap A2 step 4: a bf16 conversion is a PTX 7.8 / sm_80
+            // instruction; the printer bumps the header when the kernel
+            // requires the feature.
+            KirOp::Cast(_, src, ty) | KirOp::CastRounded { src, ty, .. }
+                if *ty == KirType::Bf16 || self.var_types.get(src) == Some(&KirType::Bf16) =>
+            {
+                self.required_features |= FeatureSet::BF16_ARITHMETIC;
+            }
             KirOp::SharedMemFence => self.required_features |= FeatureSet::SHARED_MEMORY,
             KirOp::SharedBase(_) => self.required_features |= FeatureSet::SHARED_MEMORY,
             KirOp::CpAsync { .. } | KirOp::CpAsyncCommit | KirOp::CpAsyncWait { .. } => {
@@ -617,7 +716,7 @@ mod tests {
         let v0 = b.new_var();
         let v1 = b.new_var();
         let dst = b.new_var();
-        b.emit(KirOp::WarpShuffle(dst, v0, v1));
+        b.emit(KirOp::WarpShuffle { dst, val: v0, lane: v1, mode: ShuffleMode::Down, width: 32 });
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
         assert!(ir.required_features.contains(FeatureSet::WARP_SHUFFLE));
