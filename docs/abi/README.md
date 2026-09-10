@@ -90,13 +90,17 @@ Rust compiler never checks that their arities and types agree, so a drift (a
 parameter added on one side, an `f64` where the table says `I64`, a removed
 impl) compiles cleanly and only surfaces as a stack-corrupting call at runtime.
 
-The `nsl-abi` crate closes this gap: `nsl-abi/tests/signature_agreement.rs`
-parses both surfaces and fails if any of the 682 declared signatures disagrees
-with its implementation (arity, register-class-level types, and presence of a
-return value). It runs in the ordinary `cargo test --workspace` gate. When you
-add or change a runtime function, update the `RUNTIME_FUNCTIONS` entry and the
-`extern "C" fn` together; the gate reports any divergence with a precise
-per-symbol diff. (It caught one on introduction: `nsl_flash_attention_quantized`
+The `nsl-abi` crate closes this gap (roadmap A3): the 682 functions the
+codegen calls are one typed table, `nsl_abi::for_each_runtime_fn!`, rendered
+into the codegen's Cranelift declarations and into compile-time assertions in
+the runtime that `rustc` checks against each implementation; the host-facing
+surface this document describes is a second table, `nsl_abi::capi`, whose
+rows carry the C prototypes the generated header prints and from which
+`nsl abi python` renders `python/nslpy/_abi.py` (the `ctypes` mirror `nslpy`
+binds from, pinned by `cargo test -p nsl-abi`). `nsl-abi/tests/signature_agreement.rs`
+still parses both surfaces as text as belt-and-braces. When you add or change
+a runtime function, add or edit its row and the `extern "C" fn` together; the
+build and the gate report any divergence per symbol. (It caught one on introduction: `nsl_flash_attention_quantized`
 was declared with 21 params while the runtime read 23, missing the two Tier-B
 sentinel slots.)
 

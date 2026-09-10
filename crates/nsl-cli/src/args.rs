@@ -281,6 +281,22 @@ pub(crate) enum Cli {
         #[command(subcommand)]
         cmd: DocCmd,
     },
+
+    /// The runtime C-ABI tables in `nsl-abi`: render the host-language mirrors.
+    Abi {
+        #[command(subcommand)]
+        cmd: AbiCmd,
+    },
+}
+
+/// `nsl abi` subcommands (roadmap A3: the C-API table in `nsl_abi::capi`,
+/// rendered for host languages and gated against the checked-in copy).
+#[derive(clap::Subcommand)]
+pub(crate) enum AbiCmd {
+    /// Emit the Python ctypes mirror that python/nslpy/_abi.py is generated
+    /// from: one argtypes/restype pair per C-API symbol, from the table
+    /// the runtime's build asserts against its implementations.
+    Python,
 }
 
 /// `nsl doc` subcommands (roadmap Doc2: reference pages rendered from the

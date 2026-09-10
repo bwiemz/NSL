@@ -212,6 +212,19 @@ CLIF snapshots.
 2. **Header from the table, Python generator.** `c_wrapper::emit` reads the
    `[capi]` rows; `nsl abi python` and its gate; delete the prototype parser
    (`parse_c_prototypes`) and the hand-written `argtypes`.
+   *As landed:* a second X-macro, `nsl_abi::for_each_capi_fn!` (`capi.rs`,
+   22 rows: lifecycle, named dispatch and the ownership models, DLPack,
+   the grad context, the error slot), each row carrying the exact C
+   prototype the header prints where the header declares it (nine rows).
+   `c_header::emit` prints those through `push_capi` (byte-identical
+   header), the runtime's `abi_check.rs` asserts every row by type, and
+   nsl-abi's tests parse each prototype back to its row — so the header
+   gate's text comparison against `c_api/mod.rs` is gone and
+   `c_header_agreement` keeps its two structural checks. `nsl abi python`
+   renders `python/nslpy/_abi.py` (`SIGNATURES` + `bind`), pinned by
+   `python_mirror_agreement`; `_core.py`'s three binders and the loader
+   call `bind`. `parse_c_prototypes` survives for nsl-abi's own row test
+   until step 6.
 3. **`nsl-log`.** The macro and the install hook; `nsl_runtime::nsl_log`
    re-exports. Gated by the C3 byte-identity tests.
    *As landed:* the subscriber moved with the macro, and the hook is an

@@ -522,8 +522,9 @@ caveat in `Cargo.toml`), `src/onnx.rs` + `src/onnx_proto.rs`
 `onnx-rt-op`) exports `RegisterCustomOps` for ONNX Runtime.
 
 **The Python bridge** lives outside the crate in `python/nslpy/`:
-`_core.py` loads the shared library with `ctypes.CDLL`, binds the
-`nsl_model_*` and `nsl_get_last_error` prototypes, and wraps them in
+`_core.py` loads the shared library with `ctypes.CDLL`, binds every C-API
+symbol it exports from the generated `_abi.py` (rendered by `nsl abi python`
+from `nsl_abi::capi`, pinned by `cargo test -p nsl-abi`), and wraps them in
 `NslModel`; `_bridge.py` mirrors `NslTensorDesc` byte for byte and implements
 the DLPack exchange with its defensive-copy guard; `autograd.py` wraps the
 grad-context pair as a `torch.autograd.Function`; `hub.py` and `onnxrt.py`
@@ -769,9 +770,11 @@ crate is built for Miri the whole module interprets in about ten seconds
    runtime's `extern "C"` items and cross-checks them against the table,
    reporting every drift at once.
 4. If the function is part of the host-facing C API, add it to
-   `src/c_api/mod.rs`, bind it in `python/nslpy/_core.py` (argtypes/restype),
-   document it in `docs/abi/README.md`, and — if it is an `@export`-visible
-   signature — make sure `nsl_codegen::c_header` renders it.
+   `src/c_api/mod.rs` and a row to `nsl_abi::capi` (the build then asserts
+   the row against it; `cargo run -p nsl-cli -- abi python` regenerates
+   `python/nslpy/_abi.py`, which `_core.py` binds from), document it in
+   `docs/abi/README.md`, and — if the header must expose it — give the row
+   its C prototype and a `push_capi` call in `nsl_codegen::c_header`.
 5. If the codegen only ever calls it when a feature is off, add a stub to
    `src/interop_stubs.rs` under the inverse `cfg`.
 

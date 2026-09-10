@@ -156,6 +156,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The host-facing C API has one typed table (roadmap A3, step 2 of the A3
+  design spec): `nsl_abi::capi` declares the 22 lifecycle, named-dispatch,
+  ownership-model, DLPack, grad-context and error entry points once, nine
+  of them with the exact C prototype the generated header prints.
+  `nsl_codegen::c_header` prints those prototypes from the table (the
+  header is byte-identical), the runtime's build asserts every row against
+  its implementation by type, and nsl-abi's tests parse each prototype
+  back to its row — so the header gate no longer parses `c_api/mod.rs`.
+  New `nsl abi python` renders `python/nslpy/_abi.py` (one
+  `argtypes`/`restype` pair per row plus `bind`), pinned by
+  `cargo test -p nsl-abi`; `nslpy._core` binds every symbol from it
+  instead of spelling the signatures out by hand.
 - The compiler no longer depends on the runtime (roadmap A3, step 5 of the
   A3 design spec): `nsl-runtime` is an *optional* dependency of
   `nsl-codegen`, enabled by the `cuda` feature for the two compile-time
