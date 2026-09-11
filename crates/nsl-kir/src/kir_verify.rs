@@ -760,6 +760,16 @@ fn check_types(
         KirOp::Not(d, s) => {
             if let Some(dt) = ty(d) {
                 expect(*s, "src", &dt);
+                if is_float(&dt) {
+                    errors.push(KirVerifyError::TypeMismatch {
+                        var: *d,
+                        block,
+                        op_index,
+                        role: "dst (bitwise ops take integers or Bool)",
+                        expected: KirType::U32,
+                        found: dt,
+                    });
+                }
             }
         }
         KirOp::Rem(d, a, b) => {
@@ -1358,6 +1368,22 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let errs = verify(&b.finalize()).unwrap_err();
         assert!(matches!(errs[..], [KirVerifyError::TypeMismatch { var, .. }] if var == r), "{errs:?}");
+    }
+
+    #[test]
+    fn not_takes_integers_or_bool() {
+        // `Not` is documented (rule 4b) alongside `And`/`Or`/`Xor` as taking
+        // integers or `Bool` only; backend_ptx's `bit_class` falls back to
+        // the `%r`/.b32 class for any type it doesn't special-case, which is
+        // the wrong register class for a float (`%f`/`%fd`/`%h`).
+        let (mut b, _) = one_block();
+        let x = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(x, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+        let n = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Not(n, x));
+        b.terminate(KirTerminator::Return);
+        let errs = verify(&b.finalize()).unwrap_err();
+        assert!(matches!(errs[..], [KirVerifyError::TypeMismatch { var, .. }] if var == n), "{errs:?}");
     }
 
     #[test]
