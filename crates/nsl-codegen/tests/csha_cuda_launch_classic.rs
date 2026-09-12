@@ -34,7 +34,7 @@
 //! cargo test -p nsl-codegen --features cuda --test csha_cuda_launch_classic -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! `--test-threads=1` is required: the CUDA driver singleton (`CUDA_STATE`)
+//! `--test-threads=1` is required: the process's CUDA context registry
 //! is process-global, and a failed PTX load (e.g., rc=218 for v1's non-ASCII
 //! PTX) can corrupt the context for subsequent launches in the same process.
 //! Sequential execution avoids this poisoning.

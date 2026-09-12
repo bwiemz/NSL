@@ -307,7 +307,31 @@ new true statement.
    `DEVICES` with one slot, `current()` / `device(0)`; `CudaState` and its
    `OnceLock` are replaced by the shims above. `DEFERRED_FREES`,
    `FREE_EVENT_POOL`, the async-alloc probe/set and `CUDA_ALLOC_SET` move
-   in. No caller changes.
+   in. No caller changes. **Done.**
+
+   Two deviations from the sketch above, both because this step has to be
+   provably behaviour-preserving on CPU CI, where no lane can observe a GPU
+   regression:
+
+   - The context keeps **one mutex per former static** (`frees`,
+     `free_events`, `async_allocs`, `allocs`) rather than the single
+     `frees: Mutex<DeferredFrees>` the struct sketch shows. Merging them
+     changes lock granularity on the allocation hot path; that belongs to a
+     step that can run `scripts/gpu-tier.sh`. Today's drain paths call
+     `recycle_free_event` deliberately *outside* the queue lock so the queue
+     and the allocator never nest — collapsing the two locks would have to
+     preserve that by construction.
+   - `sm_version` is a method that queries the driver per call, not the
+     cached `pub sm_version: u32` field. Caching is safe (a live device's
+     capability cannot change) but is a behaviour change this step does not
+     need.
+
+   One incidental behaviour change was unavoidable and is called out here:
+   `prefetch_to_device` used to hold the singleton's mutex across its
+   `cuMemPrefetchAsync_v2` call while reading no field of it — the lock was
+   only how the function reached `state()` to force initialisation.
+   `context::current()` forces initialisation directly, so that incidental
+   serialisation is gone. The driver call is itself thread-safe.
 2. **`StreamPool`.** The three named streams and the five workspaces move
    into the per-(thread, device) slot; `StreamLease` and the event helpers
    are added; `current_stream()`, `transfer_stream()`,

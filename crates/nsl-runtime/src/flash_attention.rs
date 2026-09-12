@@ -7379,7 +7379,7 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
 /// The buffers come from `inner::alloc_device` (raw `cuMemAlloc`), so they
 /// MUST be released via `inner::free_device` (raw `cuMemFree`) — the
 /// documented pair.  This function previously routed through
-/// `inner::free_managed`, which consults `CUDA_ALLOC_SET` (populated only
+/// `inner::free_managed`, which consults the context's `allocs` set (populated only
 /// by `alloc_managed`) and silently early-returns for unregistered
 /// pointers: every "free" was a no-op and each alloc/free cycle leaked all
 /// six buffers (~B*H*S*(10*D+8) bytes per CSHA layer per step).
@@ -7395,7 +7395,7 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
 /// the driver" semantics as before, without the host stall. `NSL_CUDA_SYNC=1`
 /// restores the eager sync-then-free.
 ///
-/// Do NOT "fix" the pairing by registering the pointers in `CUDA_ALLOC_SET`
+/// Do NOT "fix" the pairing by registering the pointers in the context's `allocs`
 /// instead — that would route the frees through the caching allocator, whose
 /// pooling reuse semantics differ from the raw `cuMemFree` these buffers need
 /// (raw free returns the VRAM to the driver; pooling keeps it resident).
@@ -7663,7 +7663,7 @@ mod tests {
 
     /// Leak regression for the alloc/free pairing bug (2026-07-02):
     /// the six save buffers come from `inner::alloc_device` (raw
-    /// `cuMemAlloc`, never registered in `CUDA_ALLOC_SET`), but
+    /// `cuMemAlloc`, never registered in the context's `allocs`), but
     /// `nsl_csha_free_backward_activations` used to free them via
     /// `inner::free_managed`, which silently early-returns for
     /// unregistered pointers.  Every free was a no-op, so each
