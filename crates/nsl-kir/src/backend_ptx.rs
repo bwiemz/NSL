@@ -159,18 +159,32 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
         };
         write!(ptx, ".param {} param_{}", ptx_type, param.name).unwrap();
     }
-    writeln!(ptx, ") {{").unwrap();
+    write!(ptx, ")").unwrap();
 
-    // Roadmap A2 step 5: launch bounds and the register cap, as the hand
-    // estate writes them.
-    if let Some(lb) = ir.launch_bounds {
-        writeln!(ptx, "    .maxntid {}, 1, 1", lb.max_threads).unwrap();
-        if let Some(m) = lb.min_blocks_per_sm {
-            writeln!(ptx, "    .minnctapersm {}", m).unwrap();
+    // Roadmap A2 step 5: launch bounds and the register cap.
+    //
+    // These belong to the entry's *declaration*, between the parameter
+    // list and the opening brace — `ptxas` rejects them inside the body
+    // with "Parsing error near '.maxntid'". They were printed after the
+    // brace until the cast kernels (step 7) became the first KIR module
+    // with launch bounds to reach a `ptxas` gate.
+    let has_directives = ir.launch_bounds.is_some() || ir.max_registers.is_some();
+    if has_directives {
+        writeln!(ptx).unwrap();
+        if let Some(lb) = ir.launch_bounds {
+            writeln!(ptx, ".maxntid {}, 1, 1", lb.max_threads).unwrap();
+            if let Some(m) = lb.min_blocks_per_sm {
+                writeln!(ptx, ".minnctapersm {}", m).unwrap();
+            }
         }
-    }
-    if let Some(n) = ir.max_registers {
-        writeln!(ptx, "    .maxnreg {}", n).unwrap();
+        if let Some(n) = ir.max_registers {
+            writeln!(ptx, ".maxnreg {}", n).unwrap();
+        }
+        writeln!(ptx, "{{").unwrap();
+    } else {
+        // A kernel with no directives keeps `) {` on one line, so the
+        // snapshots for every other KIR module are unchanged.
+        writeln!(ptx, " {{").unwrap();
     }
 
     // Register declarations: one class at its allocated count (plus any
@@ -1986,6 +2000,59 @@ mod tests {
 
     // ── Roadmap A2 step 5: the allocator ─────────────────────────────
 
+    /// `.maxntid` / `.minnctapersm` / `.maxnreg` are part of the entry's
+    /// declaration: PTX puts them between the parameter list and the body,
+    /// and `ptxas` rejects them inside it outright ("Parsing error near
+    /// '.maxntid'").
+    ///
+    /// Asserted as the grammar rule — every directive lies before the
+    /// entry's opening brace — rather than as a text match, so it holds
+    /// whatever the allocator numbers the registers and whichever subset
+    /// of the three a kernel sets.
+    #[test]
+    fn the_entry_directives_precede_the_body() {
+        for (bounds, regs) in [
+            (Some((256u32, None)), None),
+            (Some((128, Some(4))), Some(32u32)),
+            (None, Some(40)),
+        ] {
+            let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+            let mut b = KirBuilder::new("attrs");
+            let p = b.add_param("p", f32_ptr, AddressSpace::Global);
+            if let Some((t, m)) = bounds {
+                b.set_launch_bounds(t, m);
+            }
+            if let Some(n) = regs {
+                b.set_max_registers(n);
+            }
+            let e = b.new_block();
+            b.set_block(e);
+            let v = f32_const(&mut b, 1.0);
+            b.emit(KirOp::Store(p, v, AddressSpace::Global));
+            b.terminate(KirTerminator::Return);
+            let ptx = String::from_utf8(lower_kir_to_ptx(&b.finalize())).unwrap();
+
+            let entry = ptx.find(".visible .entry").expect("an entry");
+            let brace = ptx[entry..].find('{').expect("an opening brace") + entry;
+            for directive in [".maxntid", ".minnctapersm", ".maxnreg"] {
+                if let Some(at) = ptx.find(directive) {
+                    assert!(
+                        at < brace,
+                        "{directive} must precede the entry body, not sit inside it:\n{ptx}"
+                    );
+                }
+            }
+            // And the ones that were asked for are actually printed.
+            assert_eq!(ptx.contains(".maxntid"), bounds.is_some(), "{ptx}");
+            assert_eq!(
+                ptx.contains(".minnctapersm"),
+                matches!(bounds, Some((_, Some(_)))),
+                "{ptx}"
+            );
+            assert_eq!(ptx.contains(".maxnreg"), regs.is_some(), "{ptx}");
+        }
+    }
+
     #[test]
     fn declarations_are_the_allocated_counts_and_attributes_print() {
         let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
@@ -2008,7 +2075,15 @@ mod tests {
         let ir = b.finalize();
         assert_eq!(ir.verify(), Ok(()));
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
-        assert!(ptx.contains(") {\n    .maxntid 256, 1, 1\n    .minnctapersm 2\n    .maxnreg 64\n    .reg .u64 %rd<1>;\n    .reg .f32 %f<2>;\n\n"), "{ptx}");
+        // The three directives belong to the entry *declaration*, between
+        // the parameter list and the opening brace. Printed inside the
+        // body they are a `ptxas` syntax error, which is how they shipped
+        // until the cast kernels reached a `ptxas` gate — this assertion
+        // pinned the invalid form.
+        assert!(
+            ptx.contains(")\n.maxntid 256, 1, 1\n.minnctapersm 2\n.maxnreg 64\n{\n    .reg .u64 %rd<1>;\n    .reg .f32 %f<2>;\n\n"),
+            "{ptx}"
+        );
         assert!(!ptx.contains(".reg .u32"), "{ptx}");
         assert!(!ptx.contains(".reg .pred"), "{ptx}");
         let pressure = ir.register_pressure();

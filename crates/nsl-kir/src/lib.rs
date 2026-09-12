@@ -14,6 +14,7 @@ pub mod backend_ptx;
 mod feature_set;
 pub mod fragment_layout;
 pub mod kernel_ir;
+pub mod kernels;
 pub mod kir_verify;
 pub mod regalloc;
 

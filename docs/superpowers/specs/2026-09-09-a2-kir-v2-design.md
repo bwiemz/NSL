@@ -225,17 +225,27 @@ has.
 "Bit-identical PTX" is the wrong gate: the hand kernels name registers and
 the KIR printer numbers them, so no migrated kernel's text is identical to
 its predecessor. What the roadmap wants from the gate — the migration
-cannot change what the GPU runs — is established at three levels, and each
+cannot change what the GPU runs — is established at four levels, and each
 migrating PR states which it used:
 
-1. **Normalised-text identity**, for straight-line kernels. `nsl_kir::
-   normalize(ptx) -> String` renames every register to its class plus
-   first-use ordinal (`%rd_src` → `%rd0`, `%f_val` → `%f0`), strips
-   comments and blank lines, and canonicalises the `.reg` declarations.
-   The hand text and the KIR text normalise to the same string when the
-   instruction sequence is the same — which is the bar for the cast
-   kernels, the MoE gather/scatter, and most of CFIE. The PR records the
+1. **Normalised-text identity**, for straight-line kernels whose
+   instruction sequences genuinely coincide. `nsl_kir::normalize(ptx) ->
+   String` renames every register to its class plus first-use ordinal
+   (`%rd_src` → `%rd0`, `%f_val` → `%f0`), strips comments and blank
+   lines, and canonicalises the `.reg` declarations. The PR records the
    normalised diff (empty, or the reviewed instruction-level difference).
+
+   **Step 7 found the premise does not hold, and this level was not used
+   there.** The KIR lowering of a construct need not pick the same
+   instruction as the hand author did for the same semantics: `PtrOffset`
+   scales an index with `mul.lo.u64 %rd, %rd, 4` where the cast kernels
+   were hand-written with `shl.b64 %rd, %rd, 2`. Register renaming cannot
+   reconcile those, and widening the normaliser until it can — teaching
+   it that a shift by 2 is a multiply by 4 — would be laundering an
+   algebraic identity rather than erasing a naming difference, which is
+   exactly the class of change a migration gate exists to show. Use this
+   level only after confirming the two sequences match; when they do not,
+   use level 3 rather than growing the normaliser.
 2. **SASS equivalence**, for the rest. The workspace-level
    `tests/sass_baselines/` harness (`sass_baseline_helpers.rs`: `ptxas` +
    `cuobjdump`, instruction count within `tolerance`, `spill_bytes` exact)
@@ -243,7 +253,24 @@ migrating PR states which it used:
    baseline is recorded; the KIR version must land within it. The harness
    soft-skips without a device, so this gate runs in the local GPU lane
    (`scripts/gpu-tier.sh certify`), and the PR quotes the numbers.
-3. **The kernel's own device tests**, always: the `ci/gpu-cert-manifest.tsv`
+3. **Differential execution**, when the instruction sequences differ but
+   the computed function must not. The hand module is frozen in the test
+   as a fixture — which is what lets the claim outlive the emitter being
+   deleted — and both it and the KIR module are executed on a small
+   interpreter for the PTX subset they use, over a set of launch
+   geometries, asserting the same output bytes *and*, separately, that
+   those bytes match an independent reference implementation. Agreement
+   alone would be satisfied by two kernels wrong in the same way.
+
+   The interpreter must reject any mnemonic it does not model rather than
+   skipping it: a silently-ignored instruction makes every assertion in
+   the suite vacuous. Prove the gate bites by mutation before trusting
+   it. `precision_cast_kir_equivalence` (step 7) is the worked example;
+   its limitation is that modelling `cvt` in Rust does not prove the
+   hardware rounds the same way, so level 4 still carries fidelity to the
+   machine.
+
+4. **The kernel's own device tests**, always: the `ci/gpu-cert-manifest.tsv`
    rows for the kernel are unchanged by the migration, and `ptxas`
    assembly of the KIR text runs in hosted CI's cuda lane through the
    existing `*_ptxas.rs` pattern.
@@ -313,15 +340,20 @@ frozen throughout, so nothing here blocks a kernel fix.
 7. **Precision casts.** The four kernels as KIR in `nsl-kir`
    (`nsl_kir::kernels::cast`), built by the runtime at first use;
    `precision_cast_ptx.rs`, the embedded statics and the parity test are
-   deleted (two members fewer). Proof: normalised-text identity, quoted in
-   the PR. This is the end-to-end proof of the pipeline.
+   deleted (two members fewer). Proof: differential execution (level 3) —
+   normalised-text identity was specified here and turned out to be the
+   wrong property, for the reason recorded under level 1. This is the
+   end-to-end proof of the pipeline. **Done** (#696); the freeze went
+   from 71 members to 69.
 8. **MoE.** Six kernels; dynamic `SmemLayout` sized by `num_experts`,
    predicated stores, one MMA tile. Proof: SASS equivalence for the GEMM,
-   normalised identity for the rest.
+   differential execution or normalised identity for the rest, per level
+   1's caveat.
 9. **CFIE**, one file per PR in size order (`decode_attention`,
    `kv_quant`, `spec_sampler`, `speculative`, `sample`, `persistent`;
    `grammar` is one line and goes with the first). Proof: normalised
-   identity.
+   identity where the sequences coincide, differential execution
+   otherwise (level 1's caveat).
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).
