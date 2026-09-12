@@ -275,6 +275,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   KIR-generated PTX snapshots are byte-identical. The hand-PTX freeze
   manifest now lists `crates/nsl-kir/src/backend_ptx.rs` as the member
   by construction.
+- The last production `panic!` sites in `nsl-runtime` are typed fatal
+  exits (roadmap C1, tier 3): `Fatal::ShapeMismatch` (**18**, `nsl_tensor_
+  compare`'s short `b` operand and `fase_fused_step`'s mixed-dtype CPU
+  path) and `Fatal::Unsupported` (**19**, the device-to-device
+  `nsl_tensor_to_device` and an ONNX export of a block-packed dtype) join
+  the table; the eight remaining unsupported-dtype panics
+  (`nsl_tensor_compare`, `nsl_tensor_where`, the f16 elementwise readers,
+  the token readers of `packing.rs` and `dataloader.rs`) go through the
+  new `fatal::unsupported_dtype(op, dtype)` with their message unchanged;
+  `nsl_packed_mask_from_segment_ids`'s non-CUDA arm is
+  `fatal::cuda_not_compiled()`; the inspect stream's `cuStreamCreate`
+  failure is `Fatal::CudaDriver`. Every `panic!` left in the crate is in a
+  `#[cfg(test)]` module or the test-only `alloc_pinned` wrapper.
+  `fatal::tests::the_codes_are_stable` pins all eight codes;
+  `docs/architecture/runtime.md`'s table has the two new rows.
+
 - The AWQ activation-scales blob has one definition (roadmap A3, step 4 of
   the A3 design spec, second PR): `nsl_abi::wire::awq_scales` holds the
   layout, `encode`, `AwqScales::from_blob` / `to_blob`, `AwqBlobError` and
@@ -313,6 +329,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   thing in `main`. stderr, the `log` events on the stream and the marker
   gates are unchanged; the compiler's diagnostics are no longer a reason
   for it to depend on the runtime.
+- The CUDA device-identity record is a wire declaration (roadmap A3, step
+  4 of the A3 design spec): `nsl_abi::wire::device_identity::CudaDeviceIdentity`
+  (name, `sm_version`, `sm_count`, `driver_version`) is what the runtime's
+  compile-time probe `cuda_device_identity` returns and what the compiler
+  keys its `@autotune` cache on; the runtime re-exports it at
+  `nsl_runtime::CudaDeviceIdentity`, and `gpu_specs::local_device_identity`
+  names the `nsl-abi` type. No behaviour change.
 - The train block has a `TrainPlan` carrier (roadmap A1; step 1 of the
   design in `docs/superpowers/specs/2026-09-08-a1-train-plan-ir-design.md`):
   `stmt_train/plan.rs` holds the planning-time facts as plain data — the

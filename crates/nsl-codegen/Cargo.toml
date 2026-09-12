@@ -22,7 +22,13 @@ cranelift-frontend.workspace = true
 cranelift-module.workspace = true
 cranelift-object.workspace = true
 cranelift-native.workspace = true
-nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
+# The runtime is a build dependency of the compiler ONLY for the compile-time
+# CUDA device probes (`cuda_device_identity`, `cuda_device_name`) behind the
+# `cuda` feature (roadmap A3, step 5). A CPU-only compiler build has no
+# runtime in its dependency tree: declarations come from `nsl-abi`'s table,
+# diagnostics from `nsl-log`, and the shared record formats from
+# `nsl_abi::wire`. Integration tests link it as a dev-dependency below.
+nsl-runtime = { path = "../nsl-runtime", features = ["interop"], optional = true }
 # Compile-time diagnostics (`nsl_log!`, roadmap C3) — the front door is
 # its own tracing-only crate (roadmap A3), so the diagnostics no longer
 # need the runtime.
@@ -63,15 +69,17 @@ rand = { version = "0.10", optional = true }
 # docs/architecture/compiler-state.md). Additional subsystems (WGGO, CSHA, ZK,
 # FPGA) follow the same entry-point pattern as the gating is extended.
 default = ["experimental-wrga", "experimental-cpdt"]
-cuda = ["nsl-runtime/cuda", "dep:cudarc"]
+cuda = ["dep:nsl-runtime", "nsl-runtime/cuda", "dep:cudarc"]
 nccl = ["cuda", "nsl-runtime/nccl"]
-test-hooks = ["nsl-runtime/test-hooks"]
+# Forwarded to the runtime only when the runtime is in the build (`?`): the
+# codegen's own gate sites (`linker.rs`) work either way.
+test-hooks = ["nsl-runtime?/test-hooks"]
 test-helpers = []
 calibrate = ["dep:rand"]
 debug_kernel_instrumentation = []
 # CSHA cycle 19 T1: propagate the runtime `csha_cycle19_probe` feature so codegen
 # can cfg-gate the Cranelift extern-decl for the new probe FFI symbol. Default OFF.
-csha_cycle19_probe = ["nsl-runtime/csha_cycle19_probe"]
+csha_cycle19_probe = ["nsl-runtime?/csha_cycle19_probe"]
 # CSHA cycle 20 T4: G16-3 forward +0xB30 SMEM address probe scaffolding.
 # Emits 8 sample sites in `emit_save_activations_subset` that write
 # `{%rd_save_smem, %rd_save_base}` tuples to an HBM scratch buffer, so a
@@ -87,6 +95,10 @@ experimental-wrga = []
 experimental-cpdt = []
 
 [dev-dependencies]
+# The integration tests exercise compiled programs against the real runtime
+# (and the lib unit tests that reach for it); the library itself does not
+# depend on it without `cuda`.
+nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
 libloading = "0.9"

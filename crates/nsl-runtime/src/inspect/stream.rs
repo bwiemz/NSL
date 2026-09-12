@@ -23,7 +23,10 @@ pub fn current_inspect_stream() -> sys::CUstream {
             unsafe {
                 let res = sys::cuStreamCreate(&mut stream, 0);
                 if res != sys::CUresult::CUDA_SUCCESS {
-                    panic!("cuStreamCreate failed: {:?}", res);
+                    crate::fatal::die(
+                        crate::fatal::Fatal::CudaDriver,
+                        &format!("cuStreamCreate failed: {res:?}"),
+                    );
                 }
             }
             *g = Some(stream);

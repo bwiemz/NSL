@@ -6374,17 +6374,11 @@ pub fn cuda_device_name() -> Option<String> {
 /// and that has to be true even for a card the database has never heard of.
 /// Reading identity out of the database instead would collapse every unknown
 /// GPU onto whatever the database default happens to be.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CudaDeviceIdentity {
-    /// Marketing name with vendor prefixes stripped, e.g. "RTX 5070 Ti".
-    pub name: String,
-    /// Compute capability major * 10 + minor, e.g. 120 for sm_120.
-    pub sm_version: u32,
-    /// Multiprocessor count.
-    pub sm_count: u32,
-    /// `cuDriverGetVersion`, e.g. 13030 for CUDA 13.3.
-    pub driver_version: u32,
-}
+///
+/// Declared in `nsl_abi::wire::device_identity` (roadmap A3) so the
+/// compiler can name the record without this crate; re-exported here at its
+/// historical path.
+pub use nsl_abi::wire::device_identity::CudaDeviceIdentity;
 
 /// Probe the local CUDA device for its cache-key identity.
 ///
