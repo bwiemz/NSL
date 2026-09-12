@@ -1,7 +1,9 @@
 //! Calibration-data loader for AWQ / quantization pipelines.
 //!
 //! Supports two on-disk formats:
-//!   - `.bin`  — NSL-native binary format (magic "NSLB" + rank + dims + f32 payload)
+//!   - `.bin`  — NSL-native binary format (magic "NSLB" + rank + dims + f32 payload;
+//!     the header is `nsl_abi::wire::calibration_bin`, shared with the compiler's
+//!     compile-time geometry peek)
 //!   - `.safetensors` — standard safetensors archive; must contain a tensor named "calibration"
 //!
 //! The public Rust API is `load(path)` and `peek_shape(path)`.
@@ -108,7 +110,7 @@ pub fn peek_batch_seq(path: &Path) -> Result<(u32, u32), CalibDataError> {
 
 // ── .bin loader ───────────────────────────────────────────────────────────────
 //
-// Binary format:
+// Binary format (declared in `nsl_abi::wire::calibration_bin`):
 //   [0..4]   magic "NSLB"
 //   [4..8]   rank: u32 LE
 //   [8..8+rank*4]  dims[0..rank]: u32 LE each
@@ -116,23 +118,11 @@ pub fn peek_batch_seq(path: &Path) -> Result<(u32, u32), CalibDataError> {
 
 fn load_bin(path: &Path) -> Result<Batches, CalibDataError> {
     let bytes = std::fs::read(path)?;
-    if bytes.len() < 8 {
-        return Err(CalibDataError::BinHeader("too short".into()));
-    }
-    if &bytes[0..4] != b"NSLB" {
-        return Err(CalibDataError::BinHeader("bad magic".into()));
-    }
-    let rank = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    if rank == 0 {
-        return Err(CalibDataError::BinHeader("rank must be >= 1".into()));
-    }
-    let dims_end = 8 + rank * 4;
-    if bytes.len() < dims_end {
-        return Err(CalibDataError::BinHeader("truncated dims".into()));
-    }
-    let shape: Vec<u32> = (0..rank)
-        .map(|i| u32::from_le_bytes(bytes[8 + i * 4..12 + i * 4].try_into().unwrap()))
-        .collect();
+    // The header layout is `nsl_abi::wire::calibration_bin` (roadmap A3):
+    // the compiler reads the same header at compile time for the batch
+    // geometry, so the two readers cannot disagree on it.
+    let (shape, dims_end) = nsl_abi::wire::calibration_bin::parse_header(&bytes)
+        .map_err(|e| CalibDataError::BinHeader(e.to_string()))?;
 
     let count = shape[0] as usize;
     let batch_elems: u64 = shape[1..].iter().map(|&d| d as u64).product::<u64>();
