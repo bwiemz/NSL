@@ -40,6 +40,14 @@ pub const NSL_EXIT_CUDA_NOT_COMPILED: i32 = 16;
 /// Exit code for a tensor operation asked to work on a dtype it does not
 /// implement — a compiler/runtime contract violation, not a user error.
 pub const NSL_EXIT_UNSUPPORTED_DTYPE: i32 = 17;
+/// Exit code for a tensor operation whose operands' shapes do not satisfy
+/// its contract (an operand shorter than the other, a dtype mix a fused
+/// step cannot take) — a compiler/runtime contract violation, not a user
+/// error.
+pub const NSL_EXIT_SHAPE_MISMATCH: i32 = 18;
+/// Exit code for a runtime operation this build does not implement (a
+/// device-to-device transfer, an ONNX export of a block-packed dtype).
+pub const NSL_EXIT_UNSUPPORTED: i32 = 19;
 
 /// The fatal conditions the runtime exits on. Each maps to one exit code
 /// ([`Fatal::exit_code`]); the diagnostic text is the caller's.
@@ -64,18 +72,27 @@ pub enum Fatal {
     /// A tensor op was asked to work on a dtype it does not implement: the
     /// compiler emitted a call the runtime's contract does not cover.
     UnsupportedDtype,
+    /// A tensor op's operands do not satisfy its shape contract (an operand
+    /// too short for the other, a fused step handed mixed dtypes): the
+    /// compiler emitted a call the runtime's contract does not cover.
+    ShapeMismatch,
+    /// A runtime operation this build does not implement was reached (a
+    /// device-to-device transfer, an ONNX export of a block-packed dtype).
+    Unsupported,
 }
 
 impl Fatal {
     /// Every variant, for the exit-code tests and for documentation
     /// generators.
-    pub const ALL: [Fatal; 6] = [
+    pub const ALL: [Fatal; 8] = [
         Fatal::GpuOom,
         Fatal::CudaDriver,
         Fatal::CudaAsync,
         Fatal::Cublas,
         Fatal::CudaNotCompiled,
         Fatal::UnsupportedDtype,
+        Fatal::ShapeMismatch,
+        Fatal::Unsupported,
     ];
 
     /// The process exit code for this condition.
@@ -87,6 +104,8 @@ impl Fatal {
             Fatal::Cublas => NSL_EXIT_CUBLAS,
             Fatal::CudaNotCompiled => NSL_EXIT_CUDA_NOT_COMPILED,
             Fatal::UnsupportedDtype => NSL_EXIT_UNSUPPORTED_DTYPE,
+            Fatal::ShapeMismatch => NSL_EXIT_SHAPE_MISMATCH,
+            Fatal::Unsupported => NSL_EXIT_UNSUPPORTED,
         }
     }
 
@@ -99,6 +118,8 @@ impl Fatal {
             Fatal::Cublas => "cublas",
             Fatal::CudaNotCompiled => "cuda-not-compiled",
             Fatal::UnsupportedDtype => "unsupported-dtype",
+            Fatal::ShapeMismatch => "shape-mismatch",
+            Fatal::Unsupported => "unsupported",
         }
     }
 }
@@ -128,6 +149,12 @@ pub fn cuda_not_compiled() -> ! {
     )
 }
 
+/// `die(Fatal::UnsupportedDtype, ..)` for the "`<op>: unsupported dtype
+/// <n>`" family — the same message every site printed as a panic.
+pub fn unsupported_dtype(op: &str, dtype: impl std::fmt::Display) -> ! {
+    die(Fatal::UnsupportedDtype, &format!("{op}: unsupported dtype {dtype}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +178,26 @@ mod tests {
             // is a Rust panic, 128+ are signals: a fatal code must be none of
             // those, so a supervisor can attribute it.
             assert!((3..=100).contains(&c), "{k:?} → {c} collides with a conventional code");
+        }
+    }
+
+    #[test]
+    fn the_codes_are_stable() {
+        // Existing codes never change meaning; a new condition takes the
+        // next one. The table in docs/architecture/runtime.md mirrors this.
+        let expected = [
+            (Fatal::GpuOom, 12),
+            (Fatal::CudaDriver, 13),
+            (Fatal::CudaAsync, 14),
+            (Fatal::Cublas, 15),
+            (Fatal::CudaNotCompiled, 16),
+            (Fatal::UnsupportedDtype, 17),
+            (Fatal::ShapeMismatch, 18),
+            (Fatal::Unsupported, 19),
+        ];
+        assert_eq!(expected.len(), Fatal::ALL.len());
+        for (k, c) in expected {
+            assert_eq!(k.exit_code(), c, "{k:?}");
         }
     }
 

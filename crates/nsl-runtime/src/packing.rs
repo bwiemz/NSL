@@ -88,7 +88,7 @@ fn read_flat_value(data: *const c_void, dtype: u16, index: usize) -> i64 {
         DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(index) as i64 },
         1 => unsafe { *(data as *const f32).add(index) as i64 },
         0 => unsafe { *(data as *const f64).add(index) as i64 },
-        _ => panic!("read_flat_value() unsupported dtype {}", dtype),
+        _ => crate::fatal::unsupported_dtype("read_flat_value()", dtype),
     }
 }
 
@@ -571,25 +571,23 @@ pub extern "C" fn nsl_packed_mask_from_segment_ids(seg_ptr: i64) -> i64 {
                     }
                     buf
                 }
-                other => panic!(
-                    "nsl_packed_mask_from_segment_ids: unsupported GPU segment_ids dtype {}",
-                    other
+                other => crate::fatal::unsupported_dtype(
+                    "nsl_packed_mask_from_segment_ids: GPU segment_ids",
+                    other,
                 ),
             }
         }
         #[cfg(not(feature = "cuda"))]
         {
-            panic!(
-                "nsl_packed_mask_from_segment_ids: GPU-resident segment_ids in a non-CUDA build"
-            );
+            crate::fatal::cuda_not_compiled();
         }
     } else {
         match t.dtype {
             1 => (0..n).map(|i| unsafe { *t.data_f32().add(i) as f64 }).collect(),
             0 => (0..n).map(|i| unsafe { *t.data_f64().add(i) }).collect(),
-            other => panic!(
-                "nsl_packed_mask_from_segment_ids: unsupported segment_ids dtype {}",
-                other
+            other => crate::fatal::unsupported_dtype(
+                "nsl_packed_mask_from_segment_ids: segment_ids",
+                other,
             ),
         }
     };
