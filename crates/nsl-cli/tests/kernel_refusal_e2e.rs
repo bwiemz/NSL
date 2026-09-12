@@ -49,31 +49,31 @@ fn run_expect_compile_error(example: &str) -> String {
 }
 
 #[test]
-fn e2e_kernel_for_loop_refused() {
-    let stderr = run_expect_compile_error("m17_kernel_for_loop_error");
+fn e2e_kernel_unknown_call_refused() {
+    let stderr = run_expect_compile_error("m17_kernel_unknown_call_error");
     assert!(
-        stderr.contains("for loop"),
-        "Expected refusal naming the `for loop` construct, got:\n{}",
+        stderr.contains("sqrt"),
+        "Expected refusal naming the unsupported call `sqrt`, got:\n{}",
         stderr
     );
     assert!(
-        stderr.contains("bad_loop"),
-        "Expected refusal naming the kernel 'bad_loop', got:\n{}",
+        stderr.contains("bad_call"),
+        "Expected refusal naming the kernel 'bad_call', got:\n{}",
         stderr
     );
 }
 
 #[test]
-fn e2e_kernel_eq_condition_refused() {
-    let stderr = run_expect_compile_error("m17_kernel_eq_condition_error");
+fn e2e_kernel_pow_operator_refused() {
+    let stderr = run_expect_compile_error("m17_kernel_pow_operator_error");
     assert!(
-        stderr.contains("'=='"),
-        "Expected refusal naming the `==` operator, got:\n{}",
+        stderr.contains("'**'"),
+        "Expected refusal naming the `**` operator, got:\n{}",
         stderr
     );
     assert!(
-        stderr.contains("bad_eq"),
-        "Expected refusal naming the kernel 'bad_eq', got:\n{}",
+        stderr.contains("bad_pow"),
+        "Expected refusal naming the kernel 'bad_pow', got:\n{}",
         stderr
     );
 }

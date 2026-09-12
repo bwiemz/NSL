@@ -325,10 +325,17 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Div(dst, a, b) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
+            // A float division carries a rounding modifier (`div.f32` is
+            // not PTX); integer division has none. Roadmap A2 step 3: the
+            // IEEE `.rn` form, which is what `/` means.
+            let round = match ir.var_types.get(dst).or_else(|| ir.var_types.get(a)) {
+                Some(KirType::F32) | Some(KirType::F64) => ".rn",
+                _ => "",
+            };
             writeln!(
                 ptx,
-                "    div.{} {}{}, {}{}, {}{};",
-                ty, prefix, dst, prefix, a, prefix, b
+                "    div{}.{} {}{}, {}{}, {}{};",
+                round, ty, prefix, dst, prefix, a, prefix, b
             )
             .unwrap();
         }
@@ -2108,6 +2115,36 @@ mod tests {
         assert_eq!(extra[0], 2);
     }
 
+    /// Roadmap A2 step 3: `mul.lo` and a bare `div` are the integer
+    /// spellings; a float multiply has no `.lo` and a float division
+    /// carries `.rn`.
+    #[test]
+    fn float_mul_and_div_spell_as_ptx() {
+        let mut b = KirBuilder::new("fmuldiv");
+        let entry = b.new_block();
+        b.set_block(entry);
+        let x = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(x, KirConst { ty: KirType::F32, value: ConstValue::F32(2.0) }));
+        let m = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Mul(m, x, x));
+        let d = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Div(d, m, x));
+        let i = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Const(i, KirConst { ty: KirType::U32, value: ConstValue::U32(3) }));
+        let im = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Mul(im, i, i));
+        let id = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Div(id, im, i));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let alloc = crate::regalloc::allocate(&ir);
+        assert!(ptx.contains(&format!("mul.f32 {}, {}, {};", alloc.name(m), alloc.name(x), alloc.name(x))), "{ptx}");
+        assert!(ptx.contains(&format!("div.rn.f32 {}, {}, {};", alloc.name(d), alloc.name(m), alloc.name(x))), "{ptx}");
+        assert!(ptx.contains(&format!("mul.lo.u32 {}, {}, {};", alloc.name(im), alloc.name(i), alloc.name(i))), "{ptx}");
+        assert!(ptx.contains(&format!("div.u32 {}, {}, {};", alloc.name(id), alloc.name(im), alloc.name(i))), "{ptx}");
+        assert!(!ptx.contains("mul.lo.f32") && !ptx.contains("div.f32 "), "{ptx}");
+    }
     /// Every register a kernel READS must be one the kernel DEFINES.
     ///
     /// This is the property both of the bugs below violated, and it is

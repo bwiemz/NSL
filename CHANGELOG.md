@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- User `kernel` blocks compile through KIR on every target (roadmap A2
+  step 3): `kernel_lower.rs` is the one AST → KIR front door, and it now
+  lowers stores (`out[i] = v`, `out[i] += v`), `if`/`elif`/`else`,
+  `for j in range(...)` (one to three arguments with a literal step, or
+  `a..b` / `a..=b`), `while`, `break`, `continue`, a bare `return`, and
+  assignment to a `let`-declared local (`x = v`, `x += v`) — a local
+  reassigned inside a branch or a loop body reaches the join or the loop
+  header as a block parameter, so the IR stays SSA without a phi. The
+  index builtins take an optional literal dimension (`thread_id(1)`), and
+  `thread_id_y()`, `block_id()`, `block_id_y()` join `block_dim()`,
+  `global_id()` and `sync_threads()`; `%` (integers), `and` / `or` on
+  comparisons and `==` / `!=` are accepted. Every kernel is verified
+  before it is printed, and a construct outside the set is refused with
+  the innermost node's span. `@autotune` substitutes its constants into
+  the AST (`kernel_lower::substitute_constants`) before lowering, so a
+  tile size can be a loop bound. The direct AST → PTX `KernelCompiler`
+  (`crates/nsl-codegen/src/kernel.rs`) is deleted — the hand-PTX manifest
+  is 70 members — and `tests/snapshot_tests.rs` pins the PTX of every
+  shape the lowering accepts (`kernel_block_*`), which
+  `tests/kernel_block_ptxas.rs` assembles in CI's cuda lane. The AMDGPU /
+  Metal / WGSL printers have no control flow yet, so a kernel whose KIR
+  passes block arguments is refused on those targets rather than printed
+  with a comment where the edge should be.
 - The four precision-cast kernels are KIR (roadmap A2 step 7).
   `nsl_kir::kernels::cast` describes f32 <-> bf16 and f32 <-> f16 as one
   grid-stride loop each — a `U64` induction variable carried as a block
@@ -196,6 +219,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The KIR PTX printer spelled a float multiply `mul.lo.f32` and a float
+  division `div.f32`, neither of which is PTX (`.lo` is the integer
+  half-product; a float division needs a rounding mode); they are
+  `mul.f32` and `div.rn.f32`. Until roadmap A2 step 3 no user kernel
+  reached the printer with either, so nothing shipped with them.
 - A KIR kernel with launch bounds emitted PTX that `ptxas` refuses.
   `.maxntid`, `.minnctapersm` and `.maxnreg` belong to the entry's
   declaration, between the parameter list and the opening brace; the

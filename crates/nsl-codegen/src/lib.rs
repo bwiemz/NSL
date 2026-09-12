@@ -115,7 +115,6 @@ pub mod backend_metal;
 pub mod backend_wgsl;
 pub mod gpu_specs;
 pub mod gpu_target;
-pub mod kernel;
 // `KernelIR`, its verifier and the PTX printer live in the leaf crate
 // `nsl-kir` (roadmap A2 step 1) so the runtime can build kernels on the same
 // IR without depending on the compiler. Re-exported at their historical
@@ -316,7 +315,7 @@ pub mod core {
 pub mod gpu {
     pub use crate::{
         backend_amdgpu, backend_metal, backend_ptx, backend_wgsl, gpu_specs,
-        gpu_target, kernel, kernel_ir, kernel_lower, kernel_skeleton,
+        gpu_target, kernel_ir, kernel_lower, kernel_skeleton,
         matmul_mma, ptx_metadata, ptxas_validation,
     };
 }
