@@ -545,7 +545,20 @@ refused as partial SSA). The 16-bit class is `.reg .b16 %h<N>` and 16-bit
 loads and stores are `.b16`; a kernel that requires
 `FeatureSet::BF16_ARITHMETIC` (any bf16 value or conversion) prints
 `.version 7.8` / `sm_80`. `crates/nsl-codegen/tests/kir_scalar_isa_ptxas.rs`
-assembles one kernel using every family. The async-copy
+assembles one kernel using every family. Registers are allocated
+(roadmap A2 step 5, `crates/nsl-kir/src/regalloc.rs`): each value gets a
+class from its type (`RegClass::of`: `%r`/`%rd`/`%f`/`%fd`/`%h`/`%p`/`%v`)
+and a dense index by linear scan over live intervals on the block-order
+linearisation — a kernel parameter is live from before block 0, a block
+parameter from its block's entry and at every incoming edge's terminator,
+and a value to its last use and the end of every block it is live-out of,
+so a loop-carried value keeps its register through the loop; the printer
+emits `%<class><VarId>` names and renames them through the `Allocation`
+as a last pass, declares each class at its allocated count (the
+`dst + 1000` scratch idiom is gone: `GlobalId` uses `%gid0`/`%gid1`), and
+prints `.maxntid` / `.minnctapersm` / `.maxnreg` from
+`KirBuilder::set_launch_bounds` / `set_max_registers`.
+`KernelIR::register_pressure()` is the per-class count. The async-copy
 group is first-class KIR (`SharedBase`, `CpAsync { bytes: 4 | 8 | 16 }`,
 `CpAsyncCommit`, `CpAsyncWait { pending }`, `FeatureSet::ASYNC_COPY`): the
 verifier checks the global → shared state spaces and the commit/wait

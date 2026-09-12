@@ -6,11 +6,86 @@
 
 use crate::FeatureSet;
 use crate::kernel_ir::*;
+use crate::regalloc::RegClass;
 use std::collections::HashMap;
 use std::fmt::Write;
 
 /// Lower a KernelIR to PTX text bytes (null-terminated).
 pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
+    // Roadmap A2 step 5: the body is printed first with virtual
+    // `%<class><VarId>` names, the allocator (`crate::regalloc`) renames
+    // them to dense per-class indices, and the header's `.reg` declarations
+    // are written last from the counts that produced.
+    let mut body = String::new();
+
+    // Load parameters into registers
+    for param in &ir.params {
+        match &param.ty {
+            KirType::Ptr(_, _) => {
+                writeln!(
+                    body,
+                    "    ld.param.u64 %rd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+            KirType::U32 => {
+                writeln!(
+                    body,
+                    "    ld.param.u32 %r{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+            KirType::I32 => {
+                writeln!(
+                    body,
+                    "    ld.param.s32 %r{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+            KirType::F32 => {
+                writeln!(
+                    body,
+                    "    ld.param.f32 %f{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+            KirType::F64 => {
+                writeln!(
+                    body,
+                    "    ld.param.f64 %fd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+            _ => {
+                writeln!(
+                    body,
+                    "    ld.param.u32 %r{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+        }
+    }
+    writeln!(body).unwrap();
+
+    // Emit blocks
+    for block in &ir.blocks {
+        writeln!(body, "BB{}:", block.id).unwrap();
+        for op in &block.ops {
+            emit_op(&mut body, op, ir);
+        }
+        if let Some(ref term) = block.terminator {
+            emit_terminator(&mut body, term, ir, block.id);
+        }
+    }
+    let alloc = crate::regalloc::allocate(ir);
+    let (body, extra) = rename_registers(&body, &alloc);
+
     let mut ptx = String::new();
 
     // Header. `cp.async` (FeatureSet::ASYNC_COPY) is an sm_80 instruction;
@@ -65,86 +140,33 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     }
     writeln!(ptx, ") {{").unwrap();
 
-    // Pre-scan IR to count registers by type
-    let mut reg_counts: HashMap<&str, u32> = HashMap::new();
-    // Count all vars from var_types map
-    for ty in ir.var_types.values() {
-        let prefix = ty.ptx_reg_prefix();
-        let entry = reg_counts.entry(prefix).or_insert(0);
-        *entry += 1;
+    // Roadmap A2 step 5: launch bounds and the register cap, as the hand
+    // estate writes them.
+    if let Some(lb) = ir.launch_bounds {
+        writeln!(ptx, "    .maxntid {}, 1, 1", lb.max_threads).unwrap();
+        if let Some(m) = lb.min_blocks_per_sm {
+            writeln!(ptx, "    .minnctapersm {}", m).unwrap();
+        }
     }
-    // Also count vars that appear in ops but may not be in var_types
-    // (e.g., untyped vars from new_var() -- default to u32)
-    let max_var = ir
-        .blocks
-        .iter()
-        .flat_map(|b| b.ops.iter())
-        .flat_map(extract_var_ids)
-        .max()
-        .unwrap_or(0);
-    // GlobalId emits synthetic u32 temps at dst+1000 and dst+1001 to avoid
-    // collision with normal VarIds (see emit_op GlobalId arm). Those indices
-    // are not returned by extract_var_ids, so they are invisible to the
-    // max_var scan above. Without an explicit floor the .reg .u32 %r<N>
-    // declaration is too small and ptxas rejects the output.
-    let global_id_reg_floor: u32 = ir
-        .blocks
-        .iter()
-        .flat_map(|b| b.ops.iter())
-        .filter_map(|op| {
-            if let KirOp::GlobalId(d, _) = op {
-                Some(d + 1002) // highest temp index is d+1001; need count d+1002
-            } else {
-                None
-            }
-        })
-        .max()
-        .unwrap_or(0);
-    // Ensure we have enough registers for all variables
-    let total_vars = std::cmp::max(max_var + 1, ir.params.len() as u32 + count_body_vars(ir));
-    let total_vars = std::cmp::max(total_vars, global_id_reg_floor);
-    // Declare enough registers of each type
-    let r_count = std::cmp::max(*reg_counts.get("%r").unwrap_or(&0), total_vars);
-    let rd_count = std::cmp::max(*reg_counts.get("%rd").unwrap_or(&0), total_vars);
-    let f_count = std::cmp::max(*reg_counts.get("%f").unwrap_or(&0), total_vars);
-    let p_count = total_vars; // predicates
-    // Registers are named by VarId, so a class that any variable uses must
-    // be declared up to `total_vars` (as `%r`/`%rd`/`%f` are) rather than
-    // the number of variables of that type: a lone bf16 value with VarId 26
-    // is `%h26`, which `.reg .b16 %h<1>` does not declare. The classes a
-    // kernel does not use are left undeclared so its text is unchanged.
-    let fd_count = if reg_counts.contains_key("%fd") { total_vars } else { 0 };
-    let h_count = if reg_counts.contains_key("%h") { total_vars } else { 0 };
-    // Packed fragments (`KirType::Vec`, one .b32 each): same rule.
-    let v_count = if reg_counts.contains_key("%v") { total_vars } else { 0 };
+    if let Some(n) = ir.max_registers {
+        writeln!(ptx, "    .maxnreg {}", n).unwrap();
+    }
 
-    if r_count > 0 {
-        writeln!(ptx, "    .reg .u32 %r<{}>;", r_count).unwrap();
-    }
-    if rd_count > 0 {
-        writeln!(ptx, "    .reg .u64 %rd<{}>;", rd_count).unwrap();
-    }
-    if f_count > 0 {
-        writeln!(ptx, "    .reg .f32 %f<{}>;", f_count).unwrap();
-    }
-    if fd_count > 0 {
-        writeln!(ptx, "    .reg .f64 %fd<{}>;", fd_count).unwrap();
-    }
-    if h_count > 0 {
-        // `.b16`, not `.f16`: the class holds f16 and bf16 values alike, and
-        // `cvt.rn.bf16.f32` / `ld.global.b16` take a `.b16` register.
-        writeln!(ptx, "    .reg .b16 %h<{}>;", h_count).unwrap();
-    }
-    if p_count > 0 {
-        writeln!(ptx, "    .reg .pred %p<{}>;", p_count).unwrap();
-    }
-    if v_count > 0 {
-        writeln!(ptx, "    .reg .b32 %v<{}>;", v_count).unwrap();
+    // Register declarations: one class at its allocated count (plus any
+    // registers the rename pass had to invent for a value printed in a
+    // class other than its own).
+    let pressure = alloc.pressure();
+    for (i, class) in RegClass::ALL.iter().enumerate() {
+        let count = pressure.of(*class) + extra[i];
+        if count > 0 {
+            writeln!(ptx, "    .reg .{} {}<{}>;", class.ptx_type(), class.prefix(), count).unwrap();
+        }
     }
     // Roadmap A2 step 2: an edge that passes block arguments is a parallel
     // copy into the target's parameter registers. A cycle in that copy (a
     // swap) needs one scratch register of the class; declared only when a
-    // kernel has block parameters, so every other kernel's text is unchanged.
+    // kernel has block parameters (or selects a predicate, which lowers
+    // through the same scratch), so every other kernel's text is unchanged.
     let selects_a_bool = ir.blocks.iter().flat_map(|b| b.ops.iter()).any(|op| {
         matches!(op, KirOp::Select(d, _, t, _)
             if ir.var_types.get(d).or_else(|| ir.var_types.get(t)) == Some(&KirType::Bool))
@@ -154,80 +176,76 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
             writeln!(ptx, "    .reg .{ty} {name};").unwrap();
         }
     }
-    writeln!(ptx).unwrap();
-
-    // Load parameters into registers
-    for param in &ir.params {
-        match &param.ty {
-            KirType::Ptr(_, _) => {
-                writeln!(
-                    ptx,
-                    "    ld.param.u64 %rd{}, [param_{}];",
-                    param.id, param.name
-                )
-                .unwrap();
-            }
-            KirType::U32 => {
-                writeln!(
-                    ptx,
-                    "    ld.param.u32 %r{}, [param_{}];",
-                    param.id, param.name
-                )
-                .unwrap();
-            }
-            KirType::I32 => {
-                writeln!(
-                    ptx,
-                    "    ld.param.s32 %r{}, [param_{}];",
-                    param.id, param.name
-                )
-                .unwrap();
-            }
-            KirType::F32 => {
-                writeln!(
-                    ptx,
-                    "    ld.param.f32 %f{}, [param_{}];",
-                    param.id, param.name
-                )
-                .unwrap();
-            }
-            KirType::F64 => {
-                writeln!(
-                    ptx,
-                    "    ld.param.f64 %fd{}, [param_{}];",
-                    param.id, param.name
-                )
-                .unwrap();
-            }
-            _ => {
-                writeln!(
-                    ptx,
-                    "    ld.param.u32 %r{}, [param_{}];",
-                    param.id, param.name
-                )
-                .unwrap();
-            }
-        }
+    // `GlobalId` lowers through two u32 temporaries of its own.
+    if ir.blocks.iter().flat_map(|b| b.ops.iter()).any(|op| matches!(op, KirOp::GlobalId(..))) {
+        writeln!(ptx, "    .reg .u32 %gid0;").unwrap();
+        writeln!(ptx, "    .reg .u32 %gid1;").unwrap();
     }
     writeln!(ptx).unwrap();
 
-    // Emit blocks
-    for block in &ir.blocks {
-        writeln!(ptx, "BB{}:", block.id).unwrap();
-        for op in &block.ops {
-            emit_op(&mut ptx, op, ir);
-        }
-        if let Some(ref term) = block.terminator {
-            emit_terminator(&mut ptx, term, ir, block.id);
-        }
-    }
-
+    ptx.push_str(&body);
     writeln!(ptx, "}}").unwrap();
 
     // Null-terminate
     let mut bytes = ptx.into_bytes();
     bytes.push(0);
     bytes
+}
+
+/// Roadmap A2 step 5: rename every virtual `%<class><VarId>` register in
+/// `text` to the allocated `%<class><index>`. A value printed in a class
+/// other than its own (`extract`-style mismatches the verifier would have
+/// reported) gets a fresh register of the printed class past the allocated
+/// count; the per-class number of those is returned so the declarations
+/// can cover them.
+fn rename_registers(text: &str, alloc: &crate::regalloc::Allocation) -> (String, [u32; 7]) {
+    let mut out = String::with_capacity(text.len());
+    let mut extra = [0u32; 7];
+    let mut invented: HashMap<(RegClass, VarId), u32> = HashMap::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        // `%` + letters + digits, not followed by an identifier character.
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_lowercase() {
+            j += 1;
+        }
+        let mut k = j;
+        while k < bytes.len() && bytes[k].is_ascii_digit() {
+            k += 1;
+        }
+        let followed_by_ident = k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_');
+        let class = RegClass::from_prefix(&text[i..j]);
+        match class {
+            Some(class) if k > j && !followed_by_ident => {
+                let var: VarId = text[j..k].parse().unwrap();
+                let index = match alloc.class(var) {
+                    Some(c) if c == class => alloc.index(var).unwrap(),
+                    _ => {
+                        let slot = RegClass::ALL.iter().position(|c| *c == class).unwrap();
+                        *invented.entry((class, var)).or_insert_with(|| {
+                            let idx = alloc.pressure().of(class) + extra[slot];
+                            extra[slot] += 1;
+                            idx
+                        })
+                    }
+                };
+                out.push_str(class.prefix());
+                out.push_str(&index.to_string());
+                i = k;
+            }
+            _ => {
+                out.push('%');
+                i += 1;
+            }
+        }
+    }
+    (out, extra)
 }
 
 fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
@@ -501,13 +519,13 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             // GlobalId = blockIdx * blockDim + threadIdx
             // IMPORTANT: Use mul.lo.u32 + add.u32, NOT mad.lo.u32 (causes INVALID_PTX on ISA 7.0)
             let dim_name = dim_char(*dim);
-            // Use a temporary register for the intermediate multiply
-            let tmp = dst + 1000; // offset to avoid collision
-            writeln!(ptx, "    mov.u32 %r{}, %ctaid.{};", tmp, dim_name).unwrap();
-            writeln!(ptx, "    mov.u32 %r{}, %ntid.{};", tmp + 1, dim_name).unwrap();
-            writeln!(ptx, "    mul.lo.u32 %r{}, %r{}, %r{};", tmp, tmp, tmp + 1).unwrap();
+            // Two named temporaries of the printer's own (declared with the
+            // classes; roadmap A2 step 5 retired the `dst + 1000` idiom).
+            writeln!(ptx, "    mov.u32 %gid0, %ctaid.{};", dim_name).unwrap();
+            writeln!(ptx, "    mov.u32 %gid1, %ntid.{};", dim_name).unwrap();
+            writeln!(ptx, "    mul.lo.u32 %gid0, %gid0, %gid1;").unwrap();
             writeln!(ptx, "    mov.u32 %r{}, %tid.{};", dst, dim_name).unwrap();
-            writeln!(ptx, "    add.u32 %r{}, %r{}, %r{};", dst, tmp, dst).unwrap();
+            writeln!(ptx, "    add.u32 %r{}, %gid0, %r{};", dst, dst).unwrap();
         }
         KirOp::Barrier => {
             writeln!(ptx, "    bar.sync 0;").unwrap();
@@ -1012,104 +1030,6 @@ fn dim_char(dim: u8) -> char {
     }
 }
 
-/// Extract all VarIds referenced by a KirOp.
-fn extract_var_ids(op: &KirOp) -> Vec<VarId> {
-    match op {
-        KirOp::Add(d, a, b)
-        | KirOp::Sub(d, a, b)
-        | KirOp::Mul(d, a, b)
-        | KirOp::Div(d, a, b)
-        | KirOp::Pow(d, a, b) => vec![*d, *a, *b],
-        KirOp::Fma(d, a, b, c) | KirOp::Select(d, a, b, c) => vec![*d, *a, *b, *c],
-        KirOp::Neg(d, s)
-        | KirOp::Abs(d, s)
-        | KirOp::Sqrt(d, s)
-        | KirOp::Exp(d, s)
-        | KirOp::Log(d, s)
-        | KirOp::Sin(d, s)
-        | KirOp::Cos(d, s)
-        | KirOp::Tanh(d, s) => vec![*d, *s],
-        KirOp::Cast(d, s, _) => vec![*d, *s],
-        KirOp::Load(d, p, _) | KirOp::Store(d, p, _) | KirOp::AtomicAdd(d, p, _) => vec![*d, *p],
-        KirOp::ThreadId(d, _)
-        | KirOp::BlockIdx(d, _)
-        | KirOp::BlockDim(d, _)
-        | KirOp::GridDim(d, _)
-        | KirOp::GlobalId(d, _) => vec![*d],
-        KirOp::Barrier | KirOp::SharedMemFence | KirOp::CpAsyncCommit | KirOp::CpAsyncWait { .. } => vec![],
-        KirOp::SharedBase(d) => vec![*d],
-        KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
-        KirOp::LdMatrixX4 { dst, addr, .. } => {
-            let mut v = dst.to_vec();
-            v.push(*addr);
-            v
-        }
-        KirOp::MmaF16M16N8K16 { d, a, b, c } => {
-            let mut v = d.to_vec();
-            v.extend_from_slice(a);
-            v.extend_from_slice(b);
-            v.extend_from_slice(c);
-            v
-        }
-        KirOp::WarpShuffle { dst, val, lane, .. } => vec![*dst, *val, *lane],
-        KirOp::And(d, a, b)
-        | KirOp::Or(d, a, b)
-        | KirOp::Xor(d, a, b)
-        | KirOp::Shl(d, a, b)
-        | KirOp::Shr(d, a, b)
-        | KirOp::Rem(d, a, b)
-        | KirOp::Min(d, a, b)
-        | KirOp::Max(d, a, b) => vec![*d, *a, *b],
-        KirOp::Not(d, s) | KirOp::Rcp(d, s) | KirOp::Rsqrt(d, s) => vec![*d, *s],
-        KirOp::CastRounded { dst, src, .. } => vec![*dst, *src],
-        KirOp::Vote { dst, pred, .. } => vec![*dst, *pred],
-        KirOp::LaneId(d) | KirOp::WarpId(d) => vec![*d],
-        KirOp::LoadVec { dsts, ptr, .. } => {
-            let mut v = dsts.clone();
-            v.push(*ptr);
-            v
-        }
-        KirOp::StoreVec { ptr, vals, .. } => {
-            let mut v = vals.clone();
-            v.push(*ptr);
-            v
-        }
-        KirOp::Predicated { pred, op, .. } => {
-            let mut v = extract_var_ids(op);
-            v.push(*pred);
-            v
-        },
-        KirOp::Cmp(d, a, b, _) | KirOp::PtrOffset(d, a, b) => vec![*d, *a, *b],
-        KirOp::Const(d, _) => vec![*d],
-        KirOp::Matmul { a, b, out, .. } => vec![*a, *b, *out],
-        KirOp::ElementwiseAdd { a, b, out, .. } => vec![*a, *b, *out],
-        KirOp::Relu { a, out, .. } => vec![*a, *out],
-    }
-}
-
-/// Count the number of body variables (non-param) in the IR: one past the
-/// highest `VarId` any op, block parameter or edge argument names.
-fn count_body_vars(ir: &KernelIR) -> u32 {
-    let mut max_id: u32 = 0;
-    for block in &ir.blocks {
-        for op in &block.ops {
-            for id in extract_var_ids(op) {
-                if id > max_id {
-                    max_id = id;
-                }
-            }
-        }
-        for p in &block.params {
-            max_id = max_id.max(p.id);
-        }
-        if let Some(term) = &block.terminator {
-            for id in crate::kir_verify::terminator_uses(term) {
-                max_id = max_id.max(id);
-            }
-        }
-    }
-    max_id + 1
-}
 
 #[cfg(test)]
 mod tests {
@@ -1319,20 +1239,22 @@ mod tests {
         let ir = b.finalize();
         assert_eq!(ir.verify(), Ok(()));
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let al = crate::regalloc::allocate(&ir);
+        let n = |v: VarId| al.name(v);
         assert!(ptx.contains(".target sm_80"), "{ptx}");
-        assert!(ptx.contains("    .reg .b32 %v<"), "{ptx}");
+        assert!(ptx.contains("    .reg .b32 %v<8>;"), "{ptx}");
         assert!(
             ptx.contains(&format!(
-                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%v{}, %v{}, %v{}, %v{}}}, [%rd{}];\n",
-                a[0], a[1], a[2], a[3], smem
+                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{}, {}, {}, {}}}, [{}];\n",
+                n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(smem)
             )),
             "{ptx}"
         );
         assert!(ptx.contains("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"), "{ptx}");
         assert!(
             ptx.contains(&format!(
-                "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%f{}, %f{}, %f{}, %f{}}}, {{%v{}, %v{}, %v{}, %v{}}}, {{%v{}, %v{}}}, {{%f{}, %f{}, %f{}, %f{}}};\n",
-                d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], bb[0], bb[1], c[0], c[1], c[2], c[3]
+                "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{}, {}, {}, {}}}, {{{}, {}, {}, {}}}, {{{}, {}}}, {{{}, {}, {}, {}}};\n",
+                n(d[0]), n(d[1]), n(d[2]), n(d[3]), n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(bb[0]), n(bb[1]), n(c[0]), n(c[1]), n(c[2]), n(c[3])
             )),
             "{ptx}"
         );
@@ -1346,34 +1268,22 @@ mod tests {
     }
 
     #[test]
-    fn test_ptx_global_id_register_count_covers_synthetic_temps() {
+    fn test_ptx_global_id_uses_named_scratch() {
+        // Roadmap A2 step 5: `GlobalId` lowers through two named
+        // temporaries declared with the classes, not through registers at
+        // `dst + 1000` that the declaration count had to be padded for.
         let mut b = KirBuilder::new("test_global_id_regs");
         let entry = b.new_block();
         b.set_block(entry);
-        // First new_var() → VarId 0; synthetic temps land at %r1000 and %r1001.
         let tid = b.new_var();
         b.emit(KirOp::GlobalId(tid, 0));
         b.terminate(KirTerminator::Return);
         let ir = b.finalize();
-
-        let ptx_bytes = lower_kir_to_ptx(&ir);
-        let ptx = String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]);
-
-        let decl_count: u32 = ptx
-            .lines()
-            .find(|l| l.trim_start().starts_with(".reg .u32 %r<"))
-            .and_then(|l| {
-                let after = l.trim_start().strip_prefix(".reg .u32 %r<")?;
-                after.split('>').next()?.trim().parse().ok()
-            })
-            .expect(".reg .u32 %r<N> declaration must be present");
-
-        assert!(
-            decl_count >= 1002,
-            "GlobalId(dst=0) uses synthetic temps %r1000 and %r1001; \
-             .reg .u32 %r<N> must declare N >= 1002, got {}",
-            decl_count
-        );
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains("    .reg .u32 %r<1>;\n"), "{ptx}");
+        assert!(ptx.contains("    .reg .u32 %gid0;\n    .reg .u32 %gid1;\n"), "{ptx}");
+        assert!(ptx.contains("    mul.lo.u32 %gid0, %gid0, %gid1;\n    mov.u32 %r0, %tid.x;\n    add.u32 %r0, %gid0, %r0;\n"), "{ptx}");
+        assert!(!ptx.contains("%r1000"), "{ptx}");
     }
 
     /// Build a trivial kernel with a single unary math op `emit(dst, src)`
@@ -1556,17 +1466,22 @@ mod tests {
         assert_eq!(ir.verify(), Ok(()));
         let i = ir.blocks[1].params[0].id;
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let al = crate::regalloc::allocate(&ir);
+        let n = |v: VarId| al.name(v);
         // Entry edge: the first index moves into the parameter, then the jump.
-        assert!(ptx.contains(&format!("    mov.u32 %r{i}, %r4;\n    bra BB1;\n")), "{ptx}");
+        let start = crate::kir_verify::op_dst(&ir.blocks[0].ops[0]).unwrap();
+        assert!(ptx.contains(&format!("    mov.u32 {}, {};\n    bra BB1;\n", n(i), n(start))), "{ptx}");
         // Back edge: the next index moves into the same register.
         let next = ir.blocks[2].ops.iter().rev().find_map(crate::kir_verify::op_dst).unwrap();
-        assert!(ptx.contains(&format!("    mov.u32 %r{i}, %r{next};\n    bra BB1;\n")), "{ptx}");
+        assert!(ptx.contains(&format!("    mov.u32 {}, {};\n    bra BB1;\n", n(i), n(next))), "{ptx}");
         // Arg-less conditional edges keep the two-line form.
-        assert!(ptx.contains("    @%p5 bra BB2;\n    bra BB3;\n"), "{ptx}");
-        // The scratch class is declared, once, and the parameter register fits.
+        let more = crate::kir_verify::op_dst(&ir.blocks[1].ops[0]).unwrap();
+        assert!(ptx.contains(&format!("    @{} bra BB2;\n    bra BB3;\n", n(more))), "{ptx}");
+        // The scratch class is declared once; the u32 class holds i, start,
+        // n, bdim, gdim, stride, next at their densest.
         assert_eq!(ptx.matches(".reg .u32 %edge_r;").count(), 1, "{ptx}");
-        let declared: u32 = ptx.split(".reg .u32 %r<").nth(1).unwrap().split('>').next().unwrap().parse().unwrap();
-        assert!(declared > i, "{ptx}");
+        assert!(ptx.contains(".reg .u32 %r<"), "{ptx}");
+        assert_eq!(al.pressure().of(crate::regalloc::RegClass::P), 1);
     }
 
     #[test]
@@ -1596,8 +1511,10 @@ mod tests {
         let ir = b.finalize();
         assert_eq!(ir.verify(), Ok(()));
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let al = crate::regalloc::allocate(&ir);
+        let (f, r0, r1) = (al.name(flag), al.name(p0), al.name(p1));
         let expected = format!(
-            "    @!%p{flag} bra BB1_else;\n    mov.f32 %edge_f, %f{p0};\n    mov.f32 %f{p0}, %f{p1};\n    mov.f32 %f{p1}, %edge_f;\n    bra BB1;\nBB1_else:\n    bra BB2;\n"
+            "    @!{f} bra BB1_else;\n    mov.f32 %edge_f, {r0};\n    mov.f32 {r0}, {r1};\n    mov.f32 {r1}, %edge_f;\n    bra BB1;\nBB1_else:\n    bra BB2;\n"
         );
         assert!(ptx.contains(&expected), "{ptx}");
     }
@@ -1622,7 +1539,9 @@ mod tests {
         // the sequencing is what is under test.
         ir.var_types.insert(p0, KirType::U32);
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
-        let expected = format!("    mov.u32 %r{p1}, %r{p0};\n    mov.u32 %r{p0}, %r{v};\n    bra BB1;\n");
+        let al = crate::regalloc::allocate(&ir);
+        let (r0, r1, rv) = (al.name(p0), al.name(p1), al.name(v));
+        let expected = format!("    mov.u32 {r1}, {r0};\n    mov.u32 {r0}, {rv};\n    bra BB1;\n");
         assert!(ptx.contains(&expected), "{ptx}");
     }
 
@@ -1641,13 +1560,16 @@ mod tests {
 
     // ── Roadmap A2 step 4: the scalar ISA ────────────────────────────
 
-    fn ptx_of(build: impl FnOnce(&mut KirBuilder)) -> String {
+    /// Build a one-block kernel and print it; returns the text and the
+    /// allocation so expectations name registers the way the printer does.
+    fn ptx_of(build: impl FnOnce(&mut KirBuilder)) -> (String, crate::regalloc::Allocation) {
         let mut b = KirBuilder::new("isa");
         let e = b.new_block();
         b.set_block(e);
         build(&mut b);
         b.terminate(KirTerminator::Return);
-        String::from_utf8(lower_kir_to_ptx(&b.finalize())).unwrap()
+        let ir = b.finalize();
+        (String::from_utf8(lower_kir_to_ptx(&ir)).unwrap(), crate::regalloc::allocate(&ir))
     }
 
     fn u32_const(b: &mut KirBuilder, v: u32) -> VarId {
@@ -1664,7 +1586,8 @@ mod tests {
 
     #[test]
     fn bitwise_and_shift_ops_print_their_class() {
-        let ptx = ptx_of(|b| {
+        let mut ids = Vec::new();
+        let (ptx, al) = ptx_of(|b| {
             let x = u32_const(b, 6);
             let y = u32_const(b, 3);
             let a = b.new_typed_var(KirType::U32);
@@ -1696,28 +1619,33 @@ mod tests {
             b.emit(KirOp::Const(i, KirConst { ty: KirType::I32, value: ConstValue::I32(-8) }));
             let ia = b.new_typed_var(KirType::I32);
             b.emit(KirOp::Shr(ia, i, y));
+            ids = vec![x, y, a, o, xo, n, l, r, m, mn, mx, w, ws, wa, i, ia];
         });
+        let n = |k: usize| al.name(ids[k]);
+        let (x, y) = (n(0), n(1));
         for expected in [
-            "and.b32 %r2, %r0, %r1;",
-            "or.b32 %r3, %r0, %r1;",
-            "xor.b32 %r4, %r0, %r1;",
-            "not.b32 %r5, %r0;",
-            "shl.b32 %r6, %r0, %r1;",
-            "shr.u32 %r7, %r0, %r1;",
-            "rem.u32 %r8, %r0, %r1;",
-            "min.u32 %r9, %r0, %r1;",
-            "max.u32 %r10, %r0, %r1;",
-            "shl.b64 %rd12, %rd11, %r1;",
-            "and.b64 %rd13, %rd11, %rd11;",
-            "shr.s32 %r15, %r14, %r1;",
+            format!("and.b32 {}, {x}, {y};", n(2)),
+            format!("or.b32 {}, {x}, {y};", n(3)),
+            format!("xor.b32 {}, {x}, {y};", n(4)),
+            format!("not.b32 {}, {x};", n(5)),
+            format!("shl.b32 {}, {x}, {y};", n(6)),
+            format!("shr.u32 {}, {x}, {y};", n(7)),
+            format!("rem.u32 {}, {x}, {y};", n(8)),
+            format!("min.u32 {}, {x}, {y};", n(9)),
+            format!("max.u32 {}, {x}, {y};", n(10)),
+            format!("shl.b64 {}, {}, {y};", n(12), n(11)),
+            format!("and.b64 {}, {}, {};", n(13), n(11), n(11)),
+            format!("shr.s32 {}, {}, {y};", n(15), n(14)),
         ] {
-            assert!(ptx.contains(expected), "missing `{expected}` in\n{ptx}");
+            assert!(ptx.contains(&expected), "missing `{expected}` in\n{ptx}");
         }
+        assert!(n(11).starts_with("%rd") && n(14).starts_with("%r") && !n(14).starts_with("%rd"));
     }
 
     #[test]
     fn bool_bitwise_ops_use_the_predicate_class() {
-        let ptx = ptx_of(|b| {
+        let mut ids = (0, 0, 0);
+        let (ptx, al) = ptx_of(|b| {
             let x = u32_const(b, 1);
             let p = b.new_typed_var(KirType::Bool);
             b.emit(KirOp::Cmp(p, x, x, CmpOp::Eq));
@@ -1725,14 +1653,19 @@ mod tests {
             b.emit(KirOp::Not(q, p));
             let r = b.new_typed_var(KirType::Bool);
             b.emit(KirOp::And(r, p, q));
+            ids = (p, q, r);
         });
-        assert!(ptx.contains("not.pred %p2, %p1;"), "{ptx}");
-        assert!(ptx.contains("and.pred %p3, %p1, %p2;"), "{ptx}");
+        let (p, q, r) = (al.name(ids.0), al.name(ids.1), al.name(ids.2));
+        assert!(p.starts_with("%p"), "{p}");
+        assert!(ptx.contains(&format!("not.pred {q}, {p};")), "{ptx}");
+        assert!(ptx.contains(&format!("and.pred {r}, {p}, {q};")), "{ptx}");
+        assert!(ptx.contains("    .reg .pred %p<3>;"), "{ptx}");
     }
 
     #[test]
     fn rcp_and_rsqrt_pick_the_float_forms() {
-        let ptx = ptx_of(|b| {
+        let mut ids = Vec::new();
+        let (ptx, al) = ptx_of(|b| {
             let x = f32_const(b, 4.0);
             let r = b.new_typed_var(KirType::F32);
             b.emit(KirOp::Rcp(r, x));
@@ -1744,16 +1677,20 @@ mod tests {
             b.emit(KirOp::Rcp(rd, d));
             let mn = b.new_typed_var(KirType::F32);
             b.emit(KirOp::Min(mn, x, x));
+            ids = vec![x, r, q, d, rd, mn];
         });
-        assert!(ptx.contains("rcp.approx.f32 %f1, %f0;"), "{ptx}");
-        assert!(ptx.contains("rsqrt.approx.f32 %f2, %f0;"), "{ptx}");
-        assert!(ptx.contains("rcp.rn.f64 %fd4, %fd3;"), "{ptx}");
-        assert!(ptx.contains("min.f32 %f5, %f0, %f0;"), "{ptx}");
+        let n = |k: usize| al.name(ids[k]);
+        assert!(ptx.contains(&format!("rcp.approx.f32 {}, {};", n(1), n(0))), "{ptx}");
+        assert!(ptx.contains(&format!("rsqrt.approx.f32 {}, {};", n(2), n(0))), "{ptx}");
+        assert!(ptx.contains(&format!("rcp.rn.f64 {}, {};", n(4), n(3))), "{ptx}");
+        assert!(ptx.contains(&format!("min.f32 {}, {}, {};", n(5), n(0), n(0))), "{ptx}");
+        assert!(n(3).starts_with("%fd"));
     }
 
     #[test]
     fn casts_carry_the_rounding_ptx_requires() {
-        let ptx = ptx_of(|b| {
+        let mut ids = Vec::new();
+        let (ptx, al) = ptx_of(|b| {
             let f = f32_const(b, 1.5);
             let h = b.new_typed_var(KirType::F16);
             b.emit(KirOp::Cast(h, f, KirType::F16));
@@ -1773,31 +1710,37 @@ mod tests {
             b.emit(KirOp::CastRounded { dst: fl, src: f, ty: KirType::I32, mode: RoundMode::Rm });
             let z = b.new_typed_var(KirType::F16);
             b.emit(KirOp::CastRounded { dst: z, src: f, ty: KirType::F16, mode: RoundMode::Rz });
+            ids = vec![f, h, bf, back, i, g, w, d, fl, z];
         });
+        let n = |k: usize| al.name(ids[k]);
+        let f = n(0);
         for expected in [
-            ".version 7.8",
-            ".target sm_80",
-            ".reg .b16 %h<",
-            "cvt.rn.f16.f32 %h1, %f0;",
-            "cvt.rn.bf16.f32 %h2, %f0;",
-            "cvt.f32.bf16 %f3, %h2;",
-            "cvt.rzi.u32.f32 %r4, %f0;",
-            "cvt.rn.f32.u32 %f5, %r4;",
-            "cvt.u64.u32 %rd6, %r4;",
-            "cvt.f64.f32 %fd7, %f0;",
-            "cvt.rmi.s32.f32 %r8, %f0;",
-            "cvt.rz.f16.f32 %h9, %f0;",
+            ".version 7.8".to_string(),
+            ".target sm_80".to_string(),
+            ".reg .b16 %h<".to_string(),
+            format!("cvt.rn.f16.f32 {}, {f};", n(1)),
+            format!("cvt.rn.bf16.f32 {}, {f};", n(2)),
+            format!("cvt.f32.bf16 {}, {};", n(3), n(2)),
+            format!("cvt.rzi.u32.f32 {}, {f};", n(4)),
+            format!("cvt.rn.f32.u32 {}, {};", n(5), n(4)),
+            format!("cvt.u64.u32 {}, {};", n(6), n(4)),
+            format!("cvt.f64.f32 {}, {f};", n(7)),
+            format!("cvt.rmi.s32.f32 {}, {f};", n(8)),
+            format!("cvt.rz.f16.f32 {}, {f};", n(9)),
         ] {
-            assert!(ptx.contains(expected), "missing `{expected}` in\n{ptx}");
+            assert!(ptx.contains(&expected), "missing `{expected}` in\n{ptx}");
         }
     }
 
     #[test]
-    fn sixteen_bit_and_f64_classes_are_declared_up_to_the_highest_var_id() {
-        // Roadmap A2 step 4 gate regression: the scalar-ISA kernel's first
-        // bf16 value had VarId 26 and the printer declared `.reg .b16 %h<2>`
-        // (two 16-bit variables), so ptxas saw an unknown `%h26`.
-        let ptx = ptx_of(|b| {
+    fn sixteen_bit_and_f64_classes_are_declared_up_to_the_highest_register() {
+        // Roadmap A2 step 4 gate regression (fixed in the pre-allocator
+        // printer, kept as a property here): every register class a kernel
+        // uses is declared with a count above the highest index the body
+        // names. The step-4 kernel's first bf16 value had VarId 26 and the
+        // old printer wrote `.reg .b16 %h<2>`, so ptxas saw an unknown `%h26`.
+        let mut names = (0, 0);
+        let (ptx, al) = ptx_of(|b| {
             let f = f32_const(b, 1.5);
             for _ in 0..20 {
                 let t = b.new_typed_var(KirType::F32);
@@ -1807,20 +1750,33 @@ mod tests {
             b.emit(KirOp::Cast(h, f, KirType::Bf16));
             let d = b.new_typed_var(KirType::F64);
             b.emit(KirOp::Cast(d, f, KirType::F64));
+            names = (h, d);
         });
-        assert!(ptx.contains("cvt.rn.bf16.f32 %h21, %f0;"), "{ptx}");
-        assert!(ptx.contains("cvt.f64.f32 %fd22, %f0;"), "{ptx}");
-        let declared = |class: &str| -> u32 {
-            let start = ptx.find(class).unwrap_or_else(|| panic!("no `{class}` in\n{ptx}")) + class.len();
-            ptx[start..].split('>').next().unwrap().parse().unwrap()
-        };
-        assert!(declared(".reg .b16 %h<") > 21, "{ptx}");
-        assert!(declared(".reg .f64 %fd<") > 22, "{ptx}");
+        let (h, d) = (al.name(names.0), al.name(names.1));
+        assert!(ptx.contains(&format!("cvt.rn.bf16.f32 {h}, ")), "{ptx}");
+        assert!(ptx.contains(&format!("cvt.f64.f32 {d}, ")), "{ptx}");
+        for (decl, prefix) in [(".reg .b16 %h<", "%h"), (".reg .f64 %fd<", "%fd")] {
+            let at = ptx.find(decl).unwrap_or_else(|| panic!("no `{decl}` in\n{ptx}")) + decl.len();
+            let declared: u32 = ptx[at..].split('>').next().unwrap().parse().unwrap();
+            let body = &ptx[ptx.find("\n\n").unwrap()..];
+            let highest = body
+                .match_indices(prefix)
+                .filter_map(|(i, _)| {
+                    let digits: String = body[i + prefix.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    digits.parse::<u32>().ok()
+                })
+                .max()
+                .unwrap_or_else(|| panic!("no `{prefix}` register used in\n{ptx}"));
+            assert!(highest < declared, "`{prefix}{highest}` used but only {declared} declared:\n{ptx}");
+        }
     }
 
     #[test]
     fn a_kernel_without_bf16_keeps_version_7_0() {
-        let ptx = ptx_of(|b| {
+        let (ptx, _) = ptx_of(|b| {
             let f = f32_const(b, 1.5);
             let h = b.new_typed_var(KirType::F16);
             b.emit(KirOp::Cast(h, f, KirType::F16));
@@ -1842,8 +1798,11 @@ mod tests {
         let ir = b.finalize();
         assert_eq!(ir.verify(), Ok(()));
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
-        assert!(ptx.contains("ld.global.b16 %h1, [%rd0];"), "{ptx}");
-        assert!(ptx.contains("st.global.b16 [%rd0], %h1;"), "{ptx}");
+        let al = crate::regalloc::allocate(&ir);
+        let (pr, vr) = (al.name(p), al.name(v));
+        assert!(ptx.contains(&format!("ld.global.b16 {vr}, [{pr}];")), "{ptx}");
+        assert!(ptx.contains(&format!("st.global.b16 [{pr}], {vr};")), "{ptx}");
+        assert!(ptx.contains("    .reg .b16 %h<1>;"), "{ptx}");
     }
 
     #[test]
@@ -1860,15 +1819,23 @@ mod tests {
         let ir = b.finalize();
         assert_eq!(ir.verify(), Ok(()));
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
-        assert!(ptx.contains("ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd0];"), "{ptx}");
-        assert!(ptx.contains("st.global.v2.f32 [%rd0], {%f2, %f1};"), "{ptx}");
+        let al = crate::regalloc::allocate(&ir);
+        let n = |v: VarId| al.name(v);
+        assert!(
+            ptx.contains(&format!("ld.global.v4.f32 {{{}, {}, {}, {}}}, [{}];", n(d[0]), n(d[1]), n(d[2]), n(d[3]), n(p))),
+            "{ptx}"
+        );
+        assert!(ptx.contains(&format!("st.global.v2.f32 [{}], {{{}, {}}};", n(p), n(d[1]), n(d[0]))), "{ptx}");
     }
 
     #[test]
     fn shuffle_modes_votes_and_lane_ids() {
-        let ptx = ptx_of(|b| {
+        let mut ids = Vec::new();
+        let (ptx, al) = ptx_of(|b| {
             let x = u32_const(b, 7);
             let one = u32_const(b, 1);
+            ids.push(x);
+            ids.push(one);
             for (mode, width) in [
                 (ShuffleMode::Down, 32),
                 (ShuffleMode::Up, 32),
@@ -1878,6 +1845,7 @@ mod tests {
             ] {
                 let d = b.new_typed_var(KirType::U32);
                 b.emit(KirOp::WarpShuffle { dst: d, val: x, lane: one, mode, width });
+                ids.push(d);
             }
             let p = b.new_typed_var(KirType::Bool);
             b.emit(KirOp::Cmp(p, x, one, CmpOp::Gt));
@@ -1891,20 +1859,23 @@ mod tests {
             b.emit(KirOp::LaneId(lane));
             let warp = b.new_typed_var(KirType::U32);
             b.emit(KirOp::WarpId(warp));
+            ids.extend([p, any, all, bits, lane, warp]);
         });
+        let n = |k: usize| al.name(ids[k]);
+        let (x, one, p) = (n(0), n(1), n(7));
         for expected in [
-            "shfl.sync.down.b32 %r2, %r0, %r1, 0x1f, 0xffffffff;",
-            "shfl.sync.up.b32 %r3, %r0, %r1, 0x0, 0xffffffff;",
-            "shfl.sync.bfly.b32 %r4, %r0, %r1, 0x1f, 0xffffffff;",
-            "shfl.sync.idx.b32 %r5, %r0, %r1, 0x1f, 0xffffffff;",
-            "shfl.sync.down.b32 %r6, %r0, %r1, 0x101f, 0xffffffff;",
-            "vote.sync.any.pred %p8, %p7, 0xffffffff;",
-            "vote.sync.all.pred %p9, %p7, 0xffffffff;",
-            "vote.sync.ballot.b32 %r10, %p7, 0xffffffff;",
-            "mov.u32 %r11, %laneid;",
-            "mov.u32 %r12, %warpid;",
+            format!("shfl.sync.down.b32 {}, {x}, {one}, 0x1f, 0xffffffff;", n(2)),
+            format!("shfl.sync.up.b32 {}, {x}, {one}, 0x0, 0xffffffff;", n(3)),
+            format!("shfl.sync.bfly.b32 {}, {x}, {one}, 0x1f, 0xffffffff;", n(4)),
+            format!("shfl.sync.idx.b32 {}, {x}, {one}, 0x1f, 0xffffffff;", n(5)),
+            format!("shfl.sync.down.b32 {}, {x}, {one}, 0x101f, 0xffffffff;", n(6)),
+            format!("vote.sync.any.pred {}, {p}, 0xffffffff;", n(8)),
+            format!("vote.sync.all.pred {}, {p}, 0xffffffff;", n(9)),
+            format!("vote.sync.ballot.b32 {}, {p}, 0xffffffff;", n(10)),
+            format!("mov.u32 {}, %laneid;", n(11)),
+            format!("mov.u32 {}, %warpid;", n(12)),
         ] {
-            assert!(ptx.contains(expected), "missing `{expected}` in\n{ptx}");
+            assert!(ptx.contains(&expected), "missing `{expected}` in\n{ptx}");
         }
     }
 
@@ -1939,10 +1910,65 @@ mod tests {
         let ir = b.finalize();
         assert_eq!(ir.verify(), Ok(()), "{:?}", ir.verify());
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
-        assert!(ptx.contains("    @%p2 st.global.f32 [%rd0], %f3;"), "{ptx}");
-        assert!(ptx.contains("    @!%p2 atom.global.add.f32"), "{ptx}");
+        let al = crate::regalloc::allocate(&ir);
+        let n = |v: VarId| al.name(v);
+        let (pc, pp, pv, pd, pnc, ps) = (n(c), n(p), n(v), n(d), n(nc), n(s));
+        assert!(ptx.contains(&format!("    @{pc} st.global.f32 [{pp}], {pv};")), "{ptx}");
+        assert!(ptx.contains(&format!("    @!{pc} atom.global.add.f32")), "{ptx}");
         assert!(ptx.contains(".reg .pred %edge_p;"), "{ptx}");
-        assert!(ptx.contains("and.pred %edge_p, %p2, %p5;\n    not.pred %p4, %p2;\n    and.pred %p4, %p4, %p2;\n    or.pred %p4, %p4, %edge_p;"), "{ptx}");
-        assert!(ptx.contains("selp.f32 %f6, %f3, %f3, %p2;"), "{ptx}");
+        assert!(
+            ptx.contains(&format!("and.pred %edge_p, {pc}, {pnc};\n    not.pred {pd}, {pc};\n    and.pred {pd}, {pd}, {pc};\n    or.pred {pd}, {pd}, %edge_p;")),
+            "{ptx}"
+        );
+        assert!(ptx.contains(&format!("selp.f32 {ps}, {pv}, {pv}, {pc};")), "{ptx}");
+    }
+
+    // ── Roadmap A2 step 5: the allocator ─────────────────────────────
+
+    #[test]
+    fn declarations_are_the_allocated_counts_and_attributes_print() {
+        let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+        let mut b = KirBuilder::new("dense");
+        let p = b.add_param("p", f32_ptr, AddressSpace::Global);
+        b.set_launch_bounds(256, Some(2));
+        b.set_max_registers(64);
+        let e = b.new_block();
+        b.set_block(e);
+        // Ten f32 values, each dead after the next one is made: two
+        // registers suffice.
+        let mut prev = f32_const(&mut b, 1.0);
+        for _ in 0..9 {
+            let next = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Neg(next, prev));
+            prev = next;
+        }
+        b.emit(KirOp::Store(p, prev, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()));
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        assert!(ptx.contains(") {\n    .maxntid 256, 1, 1\n    .minnctapersm 2\n    .maxnreg 64\n    .reg .u64 %rd<1>;\n    .reg .f32 %f<2>;\n\n"), "{ptx}");
+        assert!(!ptx.contains(".reg .u32"), "{ptx}");
+        assert!(!ptx.contains(".reg .pred"), "{ptx}");
+        let pressure = ir.register_pressure();
+        assert_eq!(pressure.of(crate::regalloc::RegClass::F), 2);
+        assert_eq!(pressure.of(crate::regalloc::RegClass::Rd), 1);
+        assert_eq!(pressure.of(crate::regalloc::RegClass::R), 0);
+    }
+
+    #[test]
+    fn a_value_printed_in_a_foreign_class_gets_a_register_past_the_count() {
+        // `rename_registers` on its own: v0 is an f32, but the text names
+        // it as a `%r`; the pass invents `%r` index `count(R)` for it.
+        let mut b = KirBuilder::new("t");
+        let e = b.new_block();
+        b.set_block(e);
+        let x = f32_const(&mut b, 1.0);
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let al = crate::regalloc::allocate(&ir);
+        let (text, extra) = rename_registers(&format!("    mov.b32 %r{x}, %f{x};\n    mov.u32 %r7, %tid.x; %edge_r %gid0\n"), &al);
+        assert_eq!(text, "    mov.b32 %r0, %f0;\n    mov.u32 %r1, %tid.x; %edge_r %gid0\n");
+        assert_eq!(extra[0], 2);
     }
 }

@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- KIR register allocation (roadmap A2 step 5): `nsl_kir::regalloc` gives
+  every value a register class from its type (`RegClass::of`) and a dense
+  index by linear scan over live intervals on the block-order
+  linearisation (block-level liveness over the CFG, so a loop-carried
+  value keeps its register through the whole loop; a block parameter is
+  live at every incoming edge's terminator, where the edge copy writes
+  it). The PTX printer renames its `%<class><VarId>` names through the
+  allocation as a last pass and declares each class at its allocated
+  count — a kernel with N values no longer declares four to five N
+  registers — `GlobalId` lowers through named `%gid0`/`%gid1` scratch
+  instead of registers at `dst + 1000`, `Bool` values report the
+  predicate class, and `KirBuilder::set_launch_bounds` /
+  `set_max_registers` print `.maxntid` / `.minnctapersm` / `.maxnreg` on
+  the entry. `KernelIR::register_pressure()` is the per-class count. The
+  four KIR-generated PTX snapshots are re-blessed with the dense numbering.
 - The KIR scalar ISA (roadmap A2 step 4), the instruction families the
   hand-PTX estate's index math, reductions and 16-bit paths are made of:
   `And`/`Or`/`Xor`/`Not`, `Shl`/`Shr` (arithmetic for signed types),

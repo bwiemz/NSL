@@ -299,6 +299,13 @@ frozen throughout, so nothing here blocks a kernel fix.
    linear scan, printer scratch from the allocator (the `+1000` idiom
    goes), `register_pressure()`, the `.maxnreg`/`.maxntid`/`.reqntid`
    attributes; the snapshots re-blessed with the reviewed diff.
+   *Landed:* `nsl_kir::regalloc` (`RegClass`, `allocate`, `Allocation`,
+   `RegisterPressure`), the printer's rename pass, named `%gid0`/`%gid1`
+   scratch, `LaunchBounds` and `max_registers` on `KernelIR`,
+   `KernelIR::register_pressure()`; the four KIR snapshots re-blessed
+   (dense numbering, `.reg` counts at the live maximum). The two
+   `register_budget.rs` closed forms are replaced when their kernels
+   migrate (step 12).
 6. **`SmemLayout` and the tensor-core set.** Rules 8 and 9;
    `flash_attention_v2/smem_layout.rs::layout()`; `Mma`/`LdMatrix`
    parameterised by shape and dtype. `matmul_mma.rs`'s lane-mapping tests
