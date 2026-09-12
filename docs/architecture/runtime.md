@@ -308,18 +308,29 @@ All of it lives under `src/cuda/` behind `feature = "cuda"`; `src/cpu.rs`
 is the host fallback and `src/gpu_backend.rs` is the (compile-time) backend
 trait.
 
-**The process-global driver state.** `cuda::inner::CudaState` holds the
-`CUdevice`, the primary `CUcontext`, a `module_cache: HashMap<u64, CUmodule>`
-keyed by an FNV-1a hash of the PTX text, and a `func_cache` keyed by
-(module hash, entry-name hash). It is a `static CUDA_STATE:
-OnceLock<Mutex<CudaState>>`, initialised on first use by `state()`:
-`cuInit`, `cuDeviceGet(select_device_ordinal())`,
+**The driver state is a per-device value.** `cuda::context::CudaContext`
+holds the `CUdevice`, the primary `CUcontext`, a `ModuleCache` (PTX modules
+keyed by an FNV-1a hash of the text, resolved functions keyed by (module
+hash, entry-name hash)), the deferred-free queue and its recycled-event
+pool, the `cuMemAllocAsync` support probe, and the two allocation-tracking
+sets. Contexts live in a registry, `static DEVICES: OnceLock<Box<[OnceLock<
+CudaContext>]>>`, reached by `context::current()`; a slot initialises on
+first use with `cuInit`, `cuDeviceGet(select_device_ordinal())`,
 `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`. `select_device_ordinal`
 honours `NSL_CUDA_DEVICE` and otherwise stripes by `NSL_LOCAL_RANK` only
-under the SPMD spawner protocol (`NSL_TP_SHM_PATH` set). There is exactly one
+under the SPMD spawner protocol (`NSL_TP_SHM_PATH` set). Lock order inside a
+context is modules before allocator, and two contexts are never locked
+together.
+
+`cuda::inner`'s old doors — `ensure_context()`, `current_device_ordinal()`,
+`detect_sm_version()`, `async_alloc_enabled()`, the deferred-free helpers —
+are shims over `context::current()`, so no call site names a context.
+
+**The registry has one slot today** (roadmap A4 step 1 built the shape; step
+5 grows it to `cuDeviceGetCount()` and starts resolving each op through the
+`device` byte its tensors already carry). So there is still exactly one
 device, one context, and one cuBLAS handle (`cublas_handle()`, lazily
-created) per process. Multi-GPU today means one process per device; a single
-process driving two devices is blocked on this singleton — roadmap item A4.
+created) per process, and multi-GPU still means one process per device.
 
 **Streams and workspaces** are per-thread cells in `src/cuda/mod.rs`:
 `COMPUTE_STREAM`, `TRANSFER_STREAM` (with `transfer_stream_synchronize` and

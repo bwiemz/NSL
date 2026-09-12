@@ -65,36 +65,22 @@ pub fn test_lt_matmul_reset() {
 
 pub(crate) mod graph_capture;
 
+/// Roadmap A4 step 1: the per-device CUDA context. `inner` below is now a
+/// layer of shims over `context::current()`.
+#[cfg(feature = "cuda")]
+pub(crate) mod context;
+
 
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
-    use std::collections::HashMap;
     use std::ffi::c_void;
-    use std::sync::{Mutex, OnceLock};
 
-    struct CudaState {
-        device: CUdevice,
-        context: CUcontext,
-        // Keyed by FNV-1a hash of PTX content so different PTX Vecs at the
-        // same address (heap reuse between sequential test calls) don't
-        // produce stale cache hits.  Raw pointer was used previously but
-        // caused CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was
-        // allocated at the same address as an old one.
-        module_cache: HashMap<u64, CUmodule>,
-        // Resolved CUfunction handles, keyed by (module content hash,
-        // FNV-1a of the entry name). Content-derived keys inherit the
-        // module cache's immunity to heap-address reuse; a CUfunction
-        // stays valid as long as its module is loaded (modules are never
-        // unloaded here).
-        func_cache: HashMap<(u64, u64), CUfunction>,
-    }
-
-    // SAFETY: CUcontext/CUmodule are opaque pointers managed by the CUDA driver.
-    // We only access CudaState through the Mutex, ensuring single-threaded access.
-    unsafe impl Send for CudaState {}
-
-    static CUDA_STATE: OnceLock<Mutex<CudaState>> = OnceLock::new();
+    // Roadmap A4 step 1: `CudaState` and its `static CUDA_STATE:
+    // OnceLock<Mutex<…>>` are gone. The device handle, the primary context and
+    // the two caches are fields of `super::context::CudaContext`, reached
+    // through `context::current()`. Everything below that used to lock the
+    // singleton is now a shim over that context, so no caller changed.
 
     static CUDA_SYNC_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -155,11 +141,7 @@ pub(crate) mod inner {
     /// Ensure the CUDA context is current on the calling thread.
     /// Must be called before any CUDA driver API call.
     pub(crate) fn ensure_context() {
-        let s = state();
-        let guard = s.lock().unwrap();
-        unsafe {
-            cuCtxSetCurrent(guard.context);
-        }
+        super::context::current().activate();
     }
 
     /// The device this process's CUDA state is bound to.
@@ -168,9 +150,7 @@ pub(crate) mod inner {
     /// contents-only key would hand a pointer allocated on one device to a
     /// kernel launched on another.
     pub(crate) fn current_device_ordinal() -> i32 {
-        let s = state();
-        let guard = s.lock().unwrap();
-        guard.device as i32
+        super::context::current().device as i32
     }
 
     /// Non-panicking probe: has the process-wide CUDA state already been
@@ -180,7 +160,7 @@ pub(crate) mod inner {
     /// abort a pure-CPU run of a cuda-featured binary on a GPU-less
     /// machine from inside an instrumentation path.
     pub(crate) fn context_initialized() -> bool {
-        CUDA_STATE.get().is_some()
+        super::context::initialized()
     }
 
     /// P4 item 14: pick this process's CUDA device ordinal.
@@ -224,84 +204,33 @@ pub(crate) mod inner {
         ordinal
     }
 
-    fn state() -> &'static Mutex<CudaState> {
-        CUDA_STATE.get_or_init(|| {
-            unsafe {
-                let result = cuInit(0);
-                assert_eq!(
-                    result,
-                    CUresult::CUDA_SUCCESS,
-                    "cuInit failed: {:?}",
-                    result
-                );
-                let ordinal = select_device_ordinal();
-                let mut device: CUdevice = 0;
-                let result = cuDeviceGet(&mut device, ordinal);
-                assert_eq!(
-                    result,
-                    CUresult::CUDA_SUCCESS,
-                    "cuDeviceGet (ordinal {ordinal}) failed: {:?}",
-                    result
-                );
-                let mut context: CUcontext = std::ptr::null_mut();
-                let result = cuDevicePrimaryCtxRetain(&mut context, device);
-                assert_eq!(
-                    result,
-                    CUresult::CUDA_SUCCESS,
-                    "cuDevicePrimaryCtxRetain failed: {:?}",
-                    result
-                );
-                let result = cuCtxSetCurrent(context);
-                assert_eq!(
-                    result,
-                    CUresult::CUDA_SUCCESS,
-                    "cuCtxSetCurrent failed: {:?}",
-                    result
-                );
-                if std::env::var("NSL_CUDA_SYNC").map(|v| v == "1").unwrap_or(false) {
-                    CUDA_SYNC_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    crate::nsl_log!(INFO, "nsl", "[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch");
-                }
-                // Register atexit handler for memory stats if NSL_MEMSTATS=1
-                if super::caching_allocator::memstats_enabled() {
-                    unsafe extern "C" {
-                        fn atexit(callback: extern "C" fn()) -> i32;
-                    }
-                    extern "C" fn memstats_atexit() {
-                        super::caching_allocator::print_memory_summary();
-                    }
-                    atexit(memstats_atexit);
-                }
-                Mutex::new(CudaState {
-                    device,
-                    context,
-                    module_cache: HashMap::new(),
-                    func_cache: HashMap::new(),
-                })
+    /// Process-wide side effects of the first CUDA context coming up.
+    ///
+    /// Called once by `context::init_device`. These two live here rather than
+    /// on the context because neither is device state: the sync-mode flag is a
+    /// process-global bisection switch, and the memstats hook is an `atexit`
+    /// registration, which a process may only sensibly do once.
+    pub(super) fn on_first_context() {
+        if std::env::var("NSL_CUDA_SYNC").map(|v| v == "1").unwrap_or(false) {
+            CUDA_SYNC_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::nsl_log!(INFO, "nsl", "[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch");
+        }
+        // Register atexit handler for memory stats if NSL_MEMSTATS=1
+        if super::caching_allocator::memstats_enabled() {
+            unsafe extern "C" {
+                fn atexit(callback: extern "C" fn()) -> i32;
             }
-        })
+            extern "C" fn memstats_atexit() {
+                super::caching_allocator::print_memory_summary();
+            }
+            unsafe { atexit(memstats_atexit) };
+        }
     }
 
     /// Detect the SM compute capability of the current GPU.
     /// Returns e.g. 90 for Hopper H100, 89 for Ada RTX 4090, 100 for Blackwell B200.
     pub(crate) fn detect_sm_version() -> u32 {
-        let s = state();
-        let guard = s.lock().unwrap();
-        let mut major: i32 = 0;
-        let mut minor: i32 = 0;
-        unsafe {
-            cuDeviceGetAttribute(
-                &mut major,
-                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                guard.device,
-            );
-            cuDeviceGetAttribute(
-                &mut minor,
-                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                guard.device,
-            );
-        }
-        (major * 10 + minor) as u32
+        super::context::current().sm_version()
     }
 
     static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -516,7 +445,7 @@ pub(crate) mod inner {
             }
             let cptr = ptr as *mut c_void;
             register_cuda_alloc(cptr);
-            ASYNC_ALLOC_SET.lock().unwrap().insert(cptr as usize);
+            super::context::current().async_allocs.lock().unwrap().insert(cptr as usize);
             // A1: route async allocations through the unified accounting so
             // their bytes reach the surface counters, the global peak, and
             // the allocation-count gates — they used to be invisible.
@@ -646,12 +575,12 @@ pub(crate) mod inner {
     // Track all CUDA allocations so we can validate frees
     use std::collections::HashSet;
 
-    static CUDA_ALLOC_SET: std::sync::LazyLock<std::sync::Mutex<HashSet<usize>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    // A4 step 1: was `static CUDA_ALLOC_SET` — now `context.allocs`, because a
+    // device pointer is only meaningful on the device that produced it.
 
     pub(crate) fn register_cuda_alloc(ptr: *mut c_void) {
         if !ptr.is_null() {
-            CUDA_ALLOC_SET.lock().unwrap().insert(ptr as usize);
+            super::context::current().allocs.lock().unwrap().insert(ptr as usize);
         }
     }
 
@@ -662,7 +591,7 @@ pub(crate) mod inner {
     #[allow(dead_code)]
     pub(crate) fn is_cuda_alloc(ptr: *mut c_void) -> bool {
         if ptr.is_null() { return false; }
-        CUDA_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
+        super::context::current().allocs.lock().unwrap().contains(&(ptr as usize))
     }
 
     // ------------------------------------------------------------------
@@ -692,10 +621,11 @@ pub(crate) mod inner {
             free_async(ptr);
             return;
         }
-        let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
+        let was_cuda = super::context::current().allocs.lock().unwrap().remove(&(ptr as usize));
         if !was_cuda { return; }
         // Ensure CUDA context BEFORE acquiring CACHING_ALLOCATOR lock.
-        // Lock ordering: CUDA_STATE first, then CACHING_ALLOCATOR.
+        // Lock ordering: the context's own mutexes first, then
+        // CACHING_ALLOCATOR (A4 step 1 renamed CUDA_STATE, not the rule).
         // Reversing this order causes ABBA deadlock with alloc_managed.
         ensure_context();
         // Return to caching allocator (coalesces with neighbors)
@@ -718,41 +648,19 @@ pub(crate) mod inner {
     // pool to avoid device-wide synchronization on allocation.
     // ------------------------------------------------------------------
 
-    static ASYNC_ALLOC_RESULT: OnceLock<bool> = OnceLock::new();
+    // A4 step 1: was `static ASYNC_ALLOC_RESULT` — the probe asks the device
+    // for its default memory pool, so the answer belongs to the device.
 
     /// Check if async allocation is enabled and supported.
-    /// Uses OnceLock to avoid TOCTOU race on initialization.
     /// pub(crate): the memory reports (memstats summary, nsl_debug_gpu_mem)
     /// note that async allocations bypass the caching allocator's
     /// surface/pool accounting.
     pub(crate) fn async_alloc_enabled() -> bool {
-        *ASYNC_ALLOC_RESULT.get_or_init(|| {
-            let env_enabled = std::env::var("NSL_ASYNC_ALLOC")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            if !env_enabled {
-                return false;
-            }
-            // Probe: try to query the default memory pool
-            let s = state();
-            let guard = s.lock().unwrap();
-            let supported = unsafe {
-                let mut pool: CUmemoryPool = std::ptr::null_mut();
-                let r = cuDeviceGetDefaultMemPool(&mut pool, guard.device);
-                r == CUresult::CUDA_SUCCESS && !pool.is_null()
-            };
-            if supported {
-                crate::nsl_log!(INFO, "nsl", "[nsl] Async GPU allocation ENABLED (cuMemAllocAsync)");
-            } else {
-                crate::nsl_log!(INFO, "nsl", "[nsl] NSL_ASYNC_ALLOC=1 but driver does not support memory pools — using sync alloc");
-            }
-            supported
-        })
+        super::context::current().async_alloc_enabled()
     }
 
     /// Track async-allocated pointers (freed via cuMemFreeAsync, not cuMemFree)
-    static ASYNC_ALLOC_SET: std::sync::LazyLock<std::sync::Mutex<HashSet<usize>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    // A4 step 1: was `static ASYNC_ALLOC_SET` — now `context.async_allocs`.
 
     // no caller anywhere in the CUDA build. Kept rather than deleted here:
     // `dead_code = "deny"` is what made it visible at all, and the CUDA
@@ -773,8 +681,8 @@ pub(crate) mod inner {
     /// Free device memory that was allocated via cuMemAllocAsync.
     pub(crate) fn free_async(ptr: *mut c_void) {
         if ptr.is_null() { return; }
-        CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
-        ASYNC_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
+        super::context::current().allocs.lock().unwrap().remove(&(ptr as usize));
+        super::context::current().async_allocs.lock().unwrap().remove(&(ptr as usize));
         // A1: decrement the unified accounting for this async allocation.
         super::caching_allocator::CACHING_ALLOCATOR
             .lock()
@@ -793,7 +701,7 @@ pub(crate) mod inner {
     /// Check if a pointer was async-allocated.
     pub(crate) fn is_async_alloc(ptr: *mut c_void) -> bool {
         if ptr.is_null() { return false; }
-        ASYNC_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
+        super::context::current().async_allocs.lock().unwrap().contains(&(ptr as usize))
     }
 
     /// A1: attribute a direct `cuMemAlloc_v2` region (slab, paged KV,
@@ -941,27 +849,14 @@ pub(crate) mod inner {
     // but matches with it on, a genuine use-after-free was exposed.
     // ------------------------------------------------------------------
 
-    struct DeferredFree {
-        /// Buffers sharing one lifetime (all consumed by the same preceding
-        /// kernels), guarded by a single completion event.
-        ptrs: Vec<usize>,
-        event: CUevent,
-    }
-    // SAFETY: `CUevent` is an opaque driver handle (raw pointer) that is never
-    // dereferenced on the Rust side; every driver call that touches it first
-    // re-establishes the shared primary context via `ensure_context`. Moving
-    // the handle between threads (the queue is a global `static`) is therefore
-    // sound.
-    unsafe impl Send for DeferredFree {}
-
-    static DEFERRED_FREES: std::sync::LazyLock<Mutex<std::collections::VecDeque<DeferredFree>>> =
-        std::sync::LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
-    /// Recycled disable-timing events, to avoid create/destroy churn.
-    static FREE_EVENT_POOL: std::sync::LazyLock<Mutex<Vec<usize>>> =
-        std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+    // A4 step 1: `DeferredFree` and the two statics that held it —
+    // `DEFERRED_FREES` and `FREE_EVENT_POOL` — are now `context.frees` and
+    // `context.free_events`. Both hold device handles (a `CUdeviceptr` batch
+    // and a `CUevent`), so a second device must not share them.
+    use super::context::DeferredFree;
 
     fn acquire_free_event() -> CUevent {
-        if let Some(ev) = FREE_EVENT_POOL.lock().unwrap().pop() {
+        if let Some(ev) = super::context::current().free_events.lock().unwrap().pop() {
             return ev as CUevent;
         }
         let mut ev: CUevent = std::ptr::null_mut();
@@ -977,13 +872,14 @@ pub(crate) mod inner {
     }
 
     fn recycle_free_event(ev: CUevent) {
-        FREE_EVENT_POOL.lock().unwrap().push(ev as usize);
+        super::context::current().free_events.lock().unwrap().push(ev as usize);
     }
 
     /// Number of buffers currently awaiting a deferred physical free.
     /// Exposed for tests and the memory diagnostics.
     pub(crate) fn deferred_free_pending() -> usize {
-        DEFERRED_FREES
+        super::context::current()
+            .frees
             .lock()
             .unwrap()
             .iter()
@@ -1058,7 +954,8 @@ pub(crate) mod inner {
             }
             return;
         }
-        DEFERRED_FREES
+        super::context::current()
+            .frees
             .lock()
             .unwrap()
             .push_back(DeferredFree { ptrs: live, event });
@@ -1085,10 +982,11 @@ pub(crate) mod inner {
         }
         // Collect completed entries under the lock, then free outside it:
         // `free_device` takes the CACHING_ALLOCATOR lock, and holding
-        // DEFERRED_FREES across that call would nest two locks.
+        // the frees queue across that call would nest two locks.
         let mut ready: Vec<DeferredFree> = Vec::new();
         {
-            let mut q = DEFERRED_FREES.lock().unwrap();
+            let ctx = super::context::current();
+            let mut q = ctx.frees.lock().unwrap();
             let mut i = 0;
             while i < q.len() {
                 // Only CUDA_SUCCESS means "done". CUDA_ERROR_NOT_READY (and, in a
@@ -1124,7 +1022,7 @@ pub(crate) mod inner {
     /// next drain.
     pub(crate) fn drain_all_deferred_frees() {
         let drained: Vec<DeferredFree> = {
-            let mut q = DEFERRED_FREES.lock().unwrap();
+            let mut q = super::context::current().frees.lock().unwrap();
             if q.is_empty() {
                 return;
             }
@@ -1767,8 +1665,11 @@ pub(crate) mod inner {
     /// Prefetch memory to device. Best-effort: silently ignores NOT_SUPPORTED.
     /// NOTE: Only meaningful for unified memory. With device memory this is a no-op.
     pub(crate) fn prefetch_to_device(ptr: *mut c_void, size_bytes: usize, device_id: i32) {
-        let state = state();
-        let _guard = state.lock().unwrap();
+        // A4 step 1: this used to lock the CUDA-state singleton, but read no
+        // field of it — the lock was only how one reached `state()` to force
+        // initialisation. `current()` forces it directly, so the incidental
+        // serialisation is gone; `cuMemPrefetchAsync_v2` is itself thread-safe.
+        let _ctx = super::context::current();
         unsafe {
             let location = CUmemLocation {
                 type_: CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
@@ -1940,10 +1841,10 @@ pub(crate) mod inner {
         shared_mem_bytes: u32,
     ) -> CUresult {
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::KernelLaunch);
-        let state = state();
+        let ctx = super::context::current();
         let func = {
-            let mut guard = state.lock().unwrap();
-            unsafe { cuCtxSetCurrent(guard.context); }
+            let mut guard = ctx.modules.lock().unwrap();
+            ctx.activate();
 
             // Cache modules by FNV-1a hash of PTX content.
             // Using pointer address as key (the old approach) caused
@@ -1971,13 +1872,13 @@ pub(crate) mod inner {
                 }
                 h
             };
-            let module = if let Some(m) = guard.module_cache.get(&cache_key) {
+            let module = if let Some(m) = guard.modules.get(&cache_key) {
                 *m
             } else {
                 let mut module: CUmodule = std::ptr::null_mut();
                 let res = unsafe { cuModuleLoadData(&mut module, ptx_ptr as *const c_void) };
                 if res != CUresult::CUDA_SUCCESS { return res; }
-                guard.module_cache.insert(cache_key, module);
+                guard.modules.insert(cache_key, module);
                 module
             };
 
@@ -1997,14 +1898,14 @@ pub(crate) mod inner {
                 }
                 h
             };
-            if let Some(f) = guard.func_cache.get(&(cache_key, name_key)) {
+            if let Some(f) = guard.funcs.get(&(cache_key, name_key)) {
                 *f
             } else {
                 let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
                 let mut func: CUfunction = std::ptr::null_mut();
                 let res = unsafe { cuModuleGetFunction(&mut func, module, name.as_ptr()) };
                 if res != CUresult::CUDA_SUCCESS { return res; }
-                guard.func_cache.insert((cache_key, name_key), func);
+                guard.funcs.insert((cache_key, name_key), func);
                 func
             }
         }; // guard dropped here — no lock held for CUDA calls
@@ -2048,21 +1949,19 @@ pub(crate) mod inner {
         if shared_mem_bytes > 0 {
             // Query the device's opt-in SMEM limit before attempting the
             // attribute set. Cached: the limit is a device constant, and the
-            // old per-launch query took a second CUDA_STATE lock + driver
+            // old per-launch query took a second CUDA-state lock + driver
             // call on every dynamic-SMEM launch (every sum_dim reduction on
             // the training hot path).
             static SMEM_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
             let device_smem_limit = *SMEM_LIMIT.get_or_init(|| {
-                let mut guard2 = state.lock().unwrap();
                 let mut limit: i32 = 0;
                 unsafe {
                     cuDeviceGetAttribute(
                         &mut limit,
                         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-                        guard2.device,
+                        ctx.device,
                     );
                 }
-                let _ = &mut guard2; // keep guard alive to silence lint
                 limit as u32
             });
             if shared_mem_bytes > device_smem_limit {
@@ -2178,7 +2077,7 @@ pub(crate) mod inner {
     // Handles cross this boundary as `usize`: CUmodule / CUfunction are
     // opaque driver pointers and not `Send` on their own, so the CFIE
     // engine stores the casts behind its own global Mutex — the same
-    // pattern CudaState uses for `module_cache`.
+    // pattern `CudaContext` uses for its module cache.
     // ------------------------------------------------------------------
 
     /// Load a PTX module once, reusing the content-hash module cache
@@ -2188,9 +2087,9 @@ pub(crate) mod inner {
     /// `Err(positive CUresult code)`.
     pub(crate) fn load_module_once(ptx_nul: &[u8]) -> Result<usize, u32> {
         debug_assert_eq!(ptx_nul.last(), Some(&0u8), "PTX must be NUL-terminated");
-        let s = state();
-        let mut guard = s.lock().unwrap();
-        unsafe { cuCtxSetCurrent(guard.context); }
+        let ctx = super::context::current();
+        let mut guard = ctx.modules.lock().unwrap();
+        ctx.activate();
         // FNV-1a over the PTX bytes excluding the trailing NUL — matches
         // the hash `kernel_launch` computes by scanning to the NUL, so
         // CFIE modules and kernel_launch modules share one cache entry.
@@ -2199,7 +2098,7 @@ pub(crate) mod inner {
             h ^= b as u64;
             h = h.wrapping_mul(1099511628211u64);
         }
-        if let Some(m) = guard.module_cache.get(&h) {
+        if let Some(m) = guard.modules.get(&h) {
             return Ok(*m as usize);
         }
         let mut module: CUmodule = std::ptr::null_mut();
@@ -2207,7 +2106,7 @@ pub(crate) mod inner {
         if res != CUresult::CUDA_SUCCESS {
             return Err(res as u32);
         }
-        guard.module_cache.insert(h, module);
+        guard.modules.insert(h, module);
         Ok(module as usize)
     }
 
@@ -9858,7 +9757,7 @@ pub extern "C" fn nsl_test_cuda_alloc(bytes: i64) -> i64 {
 /// `nsl_test_cuda_alloc` which calls `inner::alloc_device` (raw `cuMemAlloc_v2`).
 ///
 /// Earlier versions called `inner::free_managed`, which early-returns silently
-/// when the pointer is not in `CUDA_ALLOC_SET` — but `alloc_device` never
+/// when the pointer is not in the context's `allocs` — but `alloc_device` never
 /// registers in that set, so every `nsl_test_cuda_free` was a no-op. That leak
 /// (5-9 buffers per `launch_pca_ex`-style helper, accumulating over the suite)
 /// was the empirical root cause of the 2026-05-27 in-suite PCA test flakiness:
@@ -9905,7 +9804,7 @@ pub extern "C" fn nsl_test_cuda_jit_log(ptx_ptr: i64) -> i64 {
         use cudarc::driver::sys::*;
         // Context is assumed already current on this thread (nsl_cuda_init
         // and any prior kernel launch will have set it). We don't re-set
-        // it here to avoid having to reach into the private CudaState.
+        // it here to avoid having to reach into the context's private fields.
         let mut log_buf = vec![0u8; 4096];
         let mut info_buf = vec![0u8; 4096];
         let log_size: u32 = log_buf.len() as u32;
