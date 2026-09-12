@@ -61,6 +61,27 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
                 )
                 .unwrap();
             }
+            // A 64-bit integer parameter lives in the 64-bit file, like a
+            // pointer. Without these arms it fell to the `_` catch-all below
+            // and was loaded with `ld.param.u32` into `%r{id}` — while every
+            // USE of the value, being typed `U64`, reads `%rd{id}`. The
+            // result was PTX naming a register nothing had defined.
+            KirType::U64 => {
+                writeln!(
+                    body,
+                    "    ld.param.u64 %rd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
+            KirType::I64 => {
+                writeln!(
+                    body,
+                    "    ld.param.s64 %rd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
+            }
             _ => {
                 writeln!(
                     body,
@@ -138,18 +159,32 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
         };
         write!(ptx, ".param {} param_{}", ptx_type, param.name).unwrap();
     }
-    writeln!(ptx, ") {{").unwrap();
+    write!(ptx, ")").unwrap();
 
-    // Roadmap A2 step 5: launch bounds and the register cap, as the hand
-    // estate writes them.
-    if let Some(lb) = ir.launch_bounds {
-        writeln!(ptx, "    .maxntid {}, 1, 1", lb.max_threads).unwrap();
-        if let Some(m) = lb.min_blocks_per_sm {
-            writeln!(ptx, "    .minnctapersm {}", m).unwrap();
+    // Roadmap A2 step 5: launch bounds and the register cap.
+    //
+    // These belong to the entry's *declaration*, between the parameter
+    // list and the opening brace — `ptxas` rejects them inside the body
+    // with "Parsing error near '.maxntid'". They were printed after the
+    // brace until the cast kernels (step 7) became the first KIR module
+    // with launch bounds to reach a `ptxas` gate.
+    let has_directives = ir.launch_bounds.is_some() || ir.max_registers.is_some();
+    if has_directives {
+        writeln!(ptx).unwrap();
+        if let Some(lb) = ir.launch_bounds {
+            writeln!(ptx, ".maxntid {}, 1, 1", lb.max_threads).unwrap();
+            if let Some(m) = lb.min_blocks_per_sm {
+                writeln!(ptx, ".minnctapersm {}", m).unwrap();
+            }
         }
-    }
-    if let Some(n) = ir.max_registers {
-        writeln!(ptx, "    .maxnreg {}", n).unwrap();
+        if let Some(n) = ir.max_registers {
+            writeln!(ptx, ".maxnreg {}", n).unwrap();
+        }
+        writeln!(ptx, "{{").unwrap();
+    } else {
+        // A kernel with no directives keeps `) {` on one line, so the
+        // snapshots for every other KIR module are unchanged.
+        writeln!(ptx, " {{").unwrap();
     }
 
     // Register declarations: one class at its allocated count (plus any
@@ -750,7 +785,20 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             } else {
                 4 // default f32
             };
-            writeln!(ptx, "    cvt.u64.u32 %rd{}, %r{};", dst, offset).unwrap();
+            // The offset may already be 64-bit — a grid-stride induction
+            // variable is. Reading `%r{offset}` unconditionally named the
+            // 32-bit file for a value that lives in the 64-bit one, so the
+            // emitted `cvt.u64.u32` took its source from a register nothing
+            // had defined.
+            let offset_is_64 = matches!(
+                ir.var_types.get(offset),
+                Some(KirType::U64) | Some(KirType::I64) | Some(KirType::Ptr(_, _))
+            );
+            if offset_is_64 {
+                writeln!(ptx, "    mov.u64 %rd{}, %rd{};", dst, offset).unwrap();
+            } else {
+                writeln!(ptx, "    cvt.u64.u32 %rd{}, %r{};", dst, offset).unwrap();
+            }
             if pointee_size > 1 {
                 writeln!(
                     ptx,
@@ -1959,6 +2007,59 @@ mod tests {
 
     // ── Roadmap A2 step 5: the allocator ─────────────────────────────
 
+    /// `.maxntid` / `.minnctapersm` / `.maxnreg` are part of the entry's
+    /// declaration: PTX puts them between the parameter list and the body,
+    /// and `ptxas` rejects them inside it outright ("Parsing error near
+    /// '.maxntid'").
+    ///
+    /// Asserted as the grammar rule — every directive lies before the
+    /// entry's opening brace — rather than as a text match, so it holds
+    /// whatever the allocator numbers the registers and whichever subset
+    /// of the three a kernel sets.
+    #[test]
+    fn the_entry_directives_precede_the_body() {
+        for (bounds, regs) in [
+            (Some((256u32, None)), None),
+            (Some((128, Some(4))), Some(32u32)),
+            (None, Some(40)),
+        ] {
+            let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+            let mut b = KirBuilder::new("attrs");
+            let p = b.add_param("p", f32_ptr, AddressSpace::Global);
+            if let Some((t, m)) = bounds {
+                b.set_launch_bounds(t, m);
+            }
+            if let Some(n) = regs {
+                b.set_max_registers(n);
+            }
+            let e = b.new_block();
+            b.set_block(e);
+            let v = f32_const(&mut b, 1.0);
+            b.emit(KirOp::Store(p, v, AddressSpace::Global));
+            b.terminate(KirTerminator::Return);
+            let ptx = String::from_utf8(lower_kir_to_ptx(&b.finalize())).unwrap();
+
+            let entry = ptx.find(".visible .entry").expect("an entry");
+            let brace = ptx[entry..].find('{').expect("an opening brace") + entry;
+            for directive in [".maxntid", ".minnctapersm", ".maxnreg"] {
+                if let Some(at) = ptx.find(directive) {
+                    assert!(
+                        at < brace,
+                        "{directive} must precede the entry body, not sit inside it:\n{ptx}"
+                    );
+                }
+            }
+            // And the ones that were asked for are actually printed.
+            assert_eq!(ptx.contains(".maxntid"), bounds.is_some(), "{ptx}");
+            assert_eq!(
+                ptx.contains(".minnctapersm"),
+                matches!(bounds, Some((_, Some(_)))),
+                "{ptx}"
+            );
+            assert_eq!(ptx.contains(".maxnreg"), regs.is_some(), "{ptx}");
+        }
+    }
+
     #[test]
     fn declarations_are_the_allocated_counts_and_attributes_print() {
         let f32_ptr = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
@@ -1981,7 +2082,15 @@ mod tests {
         let ir = b.finalize();
         assert_eq!(ir.verify(), Ok(()));
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
-        assert!(ptx.contains(") {\n    .maxntid 256, 1, 1\n    .minnctapersm 2\n    .maxnreg 64\n    .reg .u64 %rd<1>;\n    .reg .f32 %f<2>;\n\n"), "{ptx}");
+        // The three directives belong to the entry *declaration*, between
+        // the parameter list and the opening brace. Printed inside the
+        // body they are a `ptxas` syntax error, which is how they shipped
+        // until the cast kernels reached a `ptxas` gate — this assertion
+        // pinned the invalid form.
+        assert!(
+            ptx.contains(")\n.maxntid 256, 1, 1\n.minnctapersm 2\n.maxnreg 64\n{\n    .reg .u64 %rd<1>;\n    .reg .f32 %f<2>;\n\n"),
+            "{ptx}"
+        );
         assert!(!ptx.contains(".reg .u32"), "{ptx}");
         assert!(!ptx.contains(".reg .pred"), "{ptx}");
         let pressure = ir.register_pressure();
@@ -2036,4 +2145,147 @@ mod tests {
         assert!(ptx.contains(&format!("div.u32 {}, {}, {};", alloc.name(id), alloc.name(im), alloc.name(i))), "{ptx}");
         assert!(!ptx.contains("mul.lo.f32") && !ptx.contains("div.f32 "), "{ptx}");
     }
+    /// Every register a kernel READS must be one the kernel DEFINES.
+    ///
+    /// This is the property both of the bugs below violated, and it is
+    /// checked structurally rather than by matching text: collect the
+    /// destination of every instruction that writes a register, then walk
+    /// the operands and assert each was written, was a `ld.param`
+    /// destination, or is one of the printer's own scratch names.
+    fn assert_no_undefined_registers(ptx: &str) {
+        use std::collections::HashSet;
+        let mut defined: HashSet<String> = HashSet::new();
+        // The printer's own scratch and the special registers.
+        for r in ["%gid0", "%gid1", "%edge_r", "%edge_rd", "%edge_f", "%edge_fd",
+                  "%edge_h", "%edge_p", "%edge_v"] {
+            defined.insert(r.to_string());
+        }
+        let mut used: Vec<(String, String)> = Vec::new();
+        for line in ptx.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('.') || line.ends_with(':') {
+                continue;
+            }
+            let regs: Vec<String> = line
+                .split(|c: char| !(c.is_alphanumeric() || c == '%' || c == '_'))
+                .filter(|t| t.starts_with('%') && !t.starts_with("%tid") && !t.starts_with("%ctaid")
+                            && !t.starts_with("%ntid") && !t.starts_with("%nctaid")
+                            && !t.starts_with("%laneid") && !t.starts_with("%warpid"))
+                .map(|t| t.to_string())
+                .collect();
+            if regs.is_empty() {
+                continue;
+            }
+            // `st.*` and `@%p bra` read their first register; everything else
+            // writes its first and reads the rest.
+            let writes_first = !line.starts_with("st.") && !line.starts_with('@')
+                && !line.starts_with("bra") && !line.starts_with("ret");
+            for (i, r) in regs.iter().enumerate() {
+                if writes_first && i == 0 {
+                    defined.insert(r.clone());
+                } else {
+                    used.push((r.clone(), line.to_string()));
+                }
+            }
+        }
+        for (r, line) in used {
+            assert!(
+                defined.contains(&r),
+                "PTX reads {r}, which nothing defines:\n    {line}\n--- full ---\n{ptx}"
+            );
+        }
+    }
+
+    /// A `u64` scalar parameter must load into the 64-bit register file.
+    /// It used to fall to the `_` catch-all and load with `ld.param.u32`
+    /// into `%r{id}`, while every use read `%rd{id}`.
+    #[test]
+    fn a_u64_parameter_loads_into_the_64_bit_file() {
+        let mut b = KirBuilder::new("u64_param");
+        let n = b.add_param("numel", KirType::U64, AddressSpace::Local);
+        let e = b.new_block();
+        b.set_block(e);
+        let p = b.new_typed_var(KirType::Bool);
+        b.emit(KirOp::Cmp(p, n, n, CmpOp::Ge));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let _ = n;
+        assert!(
+            ptx.contains("ld.param.u64") && ptx.contains("[param_numel]"),
+            "a .u64 param must load with ld.param.u64; got:\n{ptx}"
+        );
+        assert!(
+            !ptx.contains("ld.param.u32 %r0, [param_numel];"),
+            "a .u64 param must not load with ld.param.u32; got:\n{ptx}"
+        );
+        assert_no_undefined_registers(&ptx);
+    }
+
+    /// `PtrOffset` with a 64-bit index must read the index from the 64-bit
+    /// file. It used to emit `cvt.u64.u32 %rdN, %rK` unconditionally, and
+    /// `%rK` did not exist when the index was a `u64` — which is exactly
+    /// what a grid-stride induction variable is.
+    #[test]
+    fn ptr_offset_accepts_a_64_bit_index() {
+        let mut b = KirBuilder::new("u64_index");
+        let base = b.add_param(
+            "src",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let e = b.new_block();
+        b.set_block(e);
+        let idx = b.new_typed_var(KirType::U64);
+        b.emit(KirOp::Const(idx, KirConst { ty: KirType::U64, value: ConstValue::U64(7) }));
+        let addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+        b.emit(KirOp::PtrOffset(addr, base, idx));
+        let v = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Load(v, addr, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let _ = (addr, idx);
+        // The register numbers below are the ALLOCATOR's, not VarIds, so the
+        // check is on the mnemonic: a 64-bit index is copied, never widened.
+        assert!(
+            !ptx.contains("cvt.u64.u32"),
+            "a 64-bit index must not be widened from the 32-bit file; got:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("mul.lo.u64"),
+            "the offset must still be scaled by the element size; got:\n{ptx}"
+        );
+        assert_no_undefined_registers(&ptx);
+    }
+
+    /// A 32-bit index still widens, so the fix did not trade one file for
+    /// the other.
+    #[test]
+    fn ptr_offset_still_widens_a_32_bit_index() {
+        let mut b = KirBuilder::new("u32_index");
+        let base = b.add_param(
+            "src",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let e = b.new_block();
+        b.set_block(e);
+        let idx = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::GlobalId(idx, 0));
+        let addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+        b.emit(KirOp::PtrOffset(addr, base, idx));
+        let v = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Load(v, addr, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let _ = (addr, idx);
+        assert!(
+            ptx.contains("cvt.u64.u32"),
+            "a 32-bit index must still widen; got:\n{ptx}"
+        );
+        assert_no_undefined_registers(&ptx);
+    }
+
 }

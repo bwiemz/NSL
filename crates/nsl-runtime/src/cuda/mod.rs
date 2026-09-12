@@ -19,10 +19,10 @@ pub(crate) mod fused_ce_kernels;
 pub(crate) mod fused_kl_ce_kernels;
 #[cfg(feature = "cuda")]
 pub(crate) mod kernels_hopper;
-// NOT gated: `precision_cast_ptx_runtime_parity` compares these constants
-// against codegen's emitter as pure text and must run on a machine with no
-// GPU, so this module has to exist in a non-CUDA build. Its two launch
-// helpers are gated individually instead.
+// NOT gated: the cast kernels are built from KIR, and the tests that build
+// them and check their PTX must run on a machine with no GPU, so this
+// module has to exist in a non-CUDA build. Its launch helper is gated
+// individually instead.
 pub(crate) mod precision_cast_kernels;
 #[cfg(feature = "cuda")]
 pub(crate) mod strided_copy;
@@ -5023,13 +5023,14 @@ pub(crate) fn gpu_sr_bf16_round_probe(
 }
 
 /// P4 item 17: raw-buffer precision casts between a bf16 mirror and an f32
-/// working view (grid-stride kernels from `precision_cast_kernels`). Both
-/// pointers are raw device allocations; `n` is the element count.
+/// working view (grid-stride kernels from `precision_cast_kernels`, built
+/// from `nsl_kir::kernels::cast` on first use). Both pointers are raw
+/// device allocations; `n` is the element count.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_cast_raw_f32_to_bf16(src_f32_dev: u64, dst_bf16_dev: u64, n: usize) {
     gpu_cast_raw(
-        precision_cast_kernels::PTX_F32_TO_BF16.as_ptr(),
-        precision_cast_kernels::KNAME_F32_TO_BF16.as_ptr(),
+        precision_cast_kernels::module_for(nsl_kir::kernels::cast::CastKind::F32ToBf16).0.as_ptr(),
+        precision_cast_kernels::module_for(nsl_kir::kernels::cast::CastKind::F32ToBf16).1.as_ptr(),
         src_f32_dev, dst_bf16_dev, n,
     );
 }
@@ -5037,8 +5038,8 @@ pub(crate) fn gpu_cast_raw_f32_to_bf16(src_f32_dev: u64, dst_bf16_dev: u64, n: u
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_cast_raw_bf16_to_f32(src_bf16_dev: u64, dst_f32_dev: u64, n: usize) {
     gpu_cast_raw(
-        precision_cast_kernels::PTX_BF16_TO_F32.as_ptr(),
-        precision_cast_kernels::KNAME_BF16_TO_F32.as_ptr(),
+        precision_cast_kernels::module_for(nsl_kir::kernels::cast::CastKind::Bf16ToF32).0.as_ptr(),
+        precision_cast_kernels::module_for(nsl_kir::kernels::cast::CastKind::Bf16ToF32).1.as_ptr(),
         src_bf16_dev, dst_f32_dev, n,
     );
 }
@@ -10393,26 +10394,6 @@ mod tests {
             true,
         ),
         (
-            "PTX_F32_TO_BF16",
-            super::precision_cast_kernels::PTX_F32_TO_BF16,
-            true,
-        ),
-        (
-            "PTX_BF16_TO_F32",
-            super::precision_cast_kernels::PTX_BF16_TO_F32,
-            true,
-        ),
-        (
-            "PTX_F32_TO_FP16",
-            super::precision_cast_kernels::PTX_F32_TO_FP16,
-            true,
-        ),
-        (
-            "PTX_FP16_TO_F32",
-            super::precision_cast_kernels::PTX_FP16_TO_F32,
-            true,
-        ),
-        (
             "STRIDED_COPY_RUN_PTX",
             super::strided_copy::STRIDED_COPY_RUN_PTX,
             true,
@@ -10424,6 +10405,24 @@ mod tests {
         ),
     ];
 
+    /// `EXTRA_RUNTIME_PTX` plus the modules that are built rather than
+    /// declared.
+    ///
+    /// The four precision casts moved to `nsl_kir::kernels::cast` (roadmap
+    /// A2 step 7), so they are no longer `const` and cannot sit in the
+    /// array above. They still have to reach both gates: the registry's
+    /// own comment records that covering a module in only one of them was
+    /// the hole that let a whole kernel module ship unassembled. Every
+    /// consumer of the registry reads this instead of the array.
+    fn extra_runtime_ptx() -> Vec<(&'static str, &'static str, bool)> {
+        let mut all = EXTRA_RUNTIME_PTX.to_vec();
+        for kind in nsl_kir::kernels::cast::CastKind::ALL {
+            let (ptx, _) = super::precision_cast_kernels::module_for(kind);
+            all.push((kind.kernel_name(), ptx, true));
+        }
+        all
+    }
+
     #[test]
     fn all_handwritten_ptx_assembles_with_ptxas() {
         let Some(ptxas) = find_ptxas() else {
@@ -10434,12 +10433,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
         let mut failures = Vec::new();
+        let extra = extra_runtime_ptx();
         let modules = super::kernels::ALL_PTX
             .iter()
             .chain(super::fused_kernels::ALL_PTX.iter())
             .map(|(name, ptx)| (*name, *ptx))
             .chain(
-                EXTRA_RUNTIME_PTX
+                extra
                     .iter()
                     .filter(|(_, _, standalone)| *standalone)
                     .map(|(name, ptx, _)| (*name, *ptx)),
@@ -10508,7 +10508,7 @@ mod tests {
     /// `fused_kernels::ALL_PTX`), plus the runtime-loaded PTX in the `cuda::`
     /// submodules that those tables omit -- the tier-B1 prepass kernels (which
     /// had NO ASCII guard before this), the precision-cast kernels (also
-    /// covered by their own `embedded_ptx_strings_are_ascii`), and the shared
+    /// covered by their own `built_ptx_modules_are_ascii`), and the shared
     /// Hopper header assembled via `push_str`. PTX defined outside `cuda::` --
     /// the CSHA kernels in `flash_attention.rs` -- is out of this gate's
     /// module reach and is guarded by that file's own tests
@@ -10517,12 +10517,13 @@ mod tests {
     #[test]
     fn all_handwritten_ptx_is_pure_ascii() {
         // Runtime-loaded PTX outside the two ALL_PTX tables comes from the
-        // shared `EXTRA_RUNTIME_PTX` registry, which the ptxas gate reads too.
+        // shared registry, which the ptxas gate reads too.
+        let extra = extra_runtime_ptx();
         let modules = super::kernels::ALL_PTX
             .iter()
             .chain(super::fused_kernels::ALL_PTX.iter())
             .map(|(name, ptx)| (*name, *ptx))
-            .chain(EXTRA_RUNTIME_PTX.iter().map(|(name, ptx, _)| (*name, *ptx)));
+            .chain(extra.iter().map(|(name, ptx, _)| (*name, *ptx)));
         let mut failures = Vec::new();
         for (name, ptx) in modules {
             for (i, line) in ptx.lines().enumerate() {
