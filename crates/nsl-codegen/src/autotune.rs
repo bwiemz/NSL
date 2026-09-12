@@ -134,7 +134,9 @@ impl DeviceIdentity {
                 sm_count: d.sm_count,
                 driver_version: d.driver_version,
             },
-            None if !nsl_runtime::CUDA_SUPPORT_COMPILED => Self::no_cuda_support(),
+            // `cuda` is the feature that links the runtime's probe; without it
+            // this compiler cannot see a device at all (roadmap A3, step 5).
+            None if !cfg!(feature = "cuda") => Self::no_cuda_support(),
             None => Self::no_device(),
         }
     }

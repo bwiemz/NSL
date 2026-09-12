@@ -311,10 +311,13 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
             }
         }
     } else {
-        panic!(
-            "fase_fused_step: CPU path requires uniform f64 or f32 tensors \
-             (theta={}, m={}, v={}, mp={})",
-            th.dtype, m.dtype, v.dtype, mp.dtype
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!(
+                "fase_fused_step: CPU path requires uniform f64 or f32 tensors \
+                 (theta={}, m={}, v={}, mp={})",
+                th.dtype, m.dtype, v.dtype, mp.dtype
+            ),
         );
     }
     FASE_FUSED_STEP_COUNT.fetch_add(1, Ordering::Relaxed);

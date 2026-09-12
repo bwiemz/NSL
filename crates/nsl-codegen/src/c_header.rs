@@ -270,13 +270,16 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
           );\n\n",
     );
 
+    // Every prototype below is a row of `nsl_abi::capi` (roadmap A3): the
+    // runtime's build asserts each row against its implementation, and
+    // nsl-abi's tests parse each prototype back to the row, so the header
+    // cannot declare a signature the runtime does not implement.
     out.push_str("/* Lifecycle (provided by libnsl_runtime) */\n");
-    out.push_str("int64_t   nsl_abi_version(void); /* (major<<16)|minor; cf. NSL_ABI_VERSION */\n");
-    out.push_str("NslModel* nsl_model_create(const char* weights_path);\n");
-    out.push_str("int64_t   nsl_model_destroy(NslModel* model); /* returns 0 */\n");
-    out.push_str("int64_t   nsl_model_call(NslModel* model, const char* name,\n");
-    out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
-    out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs);\n\n");
+    push_capi(&mut out, "nsl_abi_version");
+    push_capi(&mut out, "nsl_model_create");
+    push_capi(&mut out, "nsl_model_destroy");
+    push_capi(&mut out, "nsl_model_call");
+    out.push('\n');
 
     // Item-7 ownership-model entry points. The DLManagedTensor definition
     // lives in the DLPack standard header (dlpack/dlpack.h, v0.8); hosts
@@ -302,10 +305,8 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str(" * nsl_get_last_error exported by THIS library, not one from a\n");
     out.push_str(" * separately-linked libnsl_runtime — the two have distinct\n");
     out.push_str(" * thread-local error slots, and probe-and-retry sizing needs this one. */\n");
-    out.push_str("int64_t   nsl_model_call_into(NslModel* model, const char* name,\n");
-    out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
-    out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs,\n");
-    out.push_str("                          const uint64_t* out_capacities);\n\n");
+    push_capi(&mut out, "nsl_model_call_into");
+    out.push('\n');
     out.push_str("/* Ownership model B — NSL allocates, ownership TRANSFERS. On rc==0 each\n");
     out.push_str(" * out_dl[i] holds a DLManagedTensor* whose deleter releases the underlying\n");
     out.push_str(" * NSL tensor exactly once. Consume it (torch.utils.dlpack.from_dlpack) or\n");
@@ -315,15 +316,15 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str(" * leak-free: every slot is NULL and nothing needs freeing.\n");
     out.push_str(" * LIFETIME: each deleter is code inside THIS shared library — do not\n");
     out.push_str(" * unload the library while any transferred output is still alive. */\n");
-    out.push_str("int64_t   nsl_model_call_alloc(NslModel* model, const char* name,\n");
-    out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
-    out.push_str("                          DLManagedTensor** out_dl, int64_t n_outputs);\n\n");
+    push_capi(&mut out, "nsl_model_call_alloc");
+    out.push('\n');
     out.push_str("/* Introspection: per-export signature as JSON (serialized ExportInfo:\n");
     out.push_str(" * params + return type, shapes with symbolic dims as strings, dtypes,\n");
     out.push_str(" * devices). BORROWED pointer into the model's artifact — valid until\n");
     out.push_str(" * nsl_model_destroy, never freed by the caller. NULL + error if the name\n");
     out.push_str(" * is unknown or the artifact predates the signature table. */\n");
-    out.push_str("const char* nsl_model_get_export_signature(NslModel* model, const char* name);\n\n");
+    push_capi(&mut out, "nsl_model_get_export_signature");
+    out.push('\n');
 
     // The error contract in docs/abi/README.md tells hosts that detail is
     // "retrievable via nsl_get_last_error(); clear with nsl_clear_error()" —
@@ -338,8 +339,9 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str(" * runtime, valid only until the next call that sets or clears the error\n");
     out.push_str(" * on THIS thread, and must not be freed. Copy it if you need to keep it.\n");
     out.push_str(" * Never NULL — \"\" when no error is set. */\n");
-    out.push_str("const char* nsl_get_last_error(void);\n");
-    out.push_str("int64_t     nsl_clear_error(void); /* returns 0 */\n\n");
+    push_capi(&mut out, "nsl_get_last_error");
+    push_capi(&mut out, "nsl_clear_error");
+    out.push('\n');
 
     out.push_str("/* @export functions */\n");
     for info in exports {
@@ -402,6 +404,16 @@ fn emit_static_inline_wrappers(out: &mut String, exports: &[ExportInfo]) {
             ));
         }
     }
+}
+
+/// Print the C prototype the `nsl_abi::capi` table carries for `name`. A
+/// name the table does not declare is a programming error in this emitter,
+/// not a runtime condition: every prototype the header prints must be a row.
+fn push_capi(out: &mut String, name: &str) {
+    let proto = nsl_abi::capi::c_prototype(name)
+        .unwrap_or_else(|| panic!("c_header: `{name}` has no prototype in nsl_abi::capi"));
+    out.push_str(proto);
+    out.push('\n');
 }
 
 fn sanitize_header_guard(name: &str) -> String {
