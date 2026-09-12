@@ -153,6 +153,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Daily invariant audit: `check_binary_op`'s `BitOr`/`BitAnd` arm
+  (`nsl-semantic/src/checker/ops.rs`) returned the left operand's type
+  verbatim, skipping the device and `shapes::check_elementwise` checks
+  every sibling arithmetic arm runs. `|`/`&` are real, parsed and
+  codegen'd tensor ops (used for boolean masks), so `mask_a & mask_b`
+  with mismatched shapes or devices type-checked silently with no
+  diagnostic. New `check_bitwise` mirrors `check_arithmetic`'s tensor
+  branch; scalar `|`/`&` (ints) are unaffected.
+- Daily invariant audit: the opt-in PTX register-cap report
+  (`nsl-codegen/src/ptx_metadata.rs`, `--ptx-metadata`) never counted the
+  `%v` packed-fragment register class that `backend_ptx.rs` emits for
+  `mma.sync`/`ldmatrix` operands, so a tensor-core fusion kernel could
+  exceed the sm_80 255-register-per-thread cap and silently spill to
+  local memory with the checker reporting no warning at all.
+  `RegisterCounts` now tracks `v_regs` and includes it in `total()`.
 - Aliasing-input probes (`tensor::alias_tests`, roadmap C2): every CPU
   entry point that takes two or more tensor handles is called with the same
   handle for all of them — `cat([x, x])`, `x == x`, `where(x, x, x)`,

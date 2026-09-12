@@ -23,8 +23,36 @@ impl<'a> TypeChecker<'a> {
             }
             BinOp::And | BinOp::Or => Type::Bool,
             BinOp::Is | BinOp::In => Type::Bool,
-            BinOp::BitOr | BinOp::BitAnd => lty,
+            BinOp::BitOr | BinOp::BitAnd => self.check_bitwise(&lty, &rty, span),
         }
+    }
+
+    /// `|` / `&` on tensors are elementwise (used for boolean masks) and
+    /// must be shape/device-checked exactly like arithmetic ops; on scalars
+    /// they fall back to the left operand's type as before.
+    pub(crate) fn check_bitwise(&mut self, lty: &Type, rty: &Type, span: Span) -> Type {
+        if lty.is_tensor() && rty.is_tensor() {
+            let (ls, ld, ldev) = lty.as_tensor_parts().unwrap();
+            let (rs, _rd, rdev) = rty.as_tensor_parts().unwrap();
+            if ldev != rdev && !matches!(ldev, Device::Unknown) && !matches!(rdev, Device::Unknown) {
+                self.diagnostics.push(
+                    Diagnostic::error("cannot operate on tensors on different devices")
+                        .with_label(span, format!("{} vs {}", display_device(&ldev), display_device(&rdev))),
+                );
+            }
+            return match shapes::check_elementwise(ls, rs, span) {
+                Ok(result_shape) => Type::Tensor {
+                    shape: result_shape,
+                    dtype: *ld,
+                    device: ldev,
+                },
+                Err(diag) => {
+                    self.diagnostics.push(diag);
+                    Type::Error
+                }
+            };
+        }
+        lty.clone()
     }
 
     pub(crate) fn check_arithmetic(&mut self, lty: &Type, rty: &Type, op: BinOp, span: Span) -> Type {
