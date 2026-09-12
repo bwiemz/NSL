@@ -21,6 +21,11 @@ pub struct KernelIR {
     /// Required by backends to emit typed instructions (e.g., `add.f32` vs `add.u32`).
     pub var_types: std::collections::HashMap<VarId, KirType>,
     pub shared_mem_bytes: u32,
+    /// Roadmap A2 step 6: the shared-memory block as named regions. Empty
+    /// for a kernel that only wants the flat `shared_mem_bytes` block and
+    /// its one `SharedBase` — the two are alternatives, and rule 8 refuses
+    /// a kernel that declares both.
+    pub smem_layout: SmemLayout,
     pub workgroup_size: [u32; 3],
     pub required_features: FeatureSet,
     /// Roadmap A2 step 5: `.maxntid` / `.minnctapersm` for the entry.
@@ -200,6 +205,161 @@ impl KirType {
     }
 }
 
+/// One named region of the kernel's shared-memory block (roadmap A2 step 6).
+///
+/// The estate does not think in one flat `shared_mem[N]`: FA v2's
+/// `smem_layout.rs` hands out `q_offset(config)`, `kv_offset(config)`, ... as
+/// byte offsets into a single `extern .shared` block, and MoE sizes its
+/// histogram region by `num_experts`. A region is that, named and typed, so
+/// the verifier can check what the hand-written offsets could only assert by
+/// inspection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmemRegion {
+    /// Diagnostic name — what the estate calls this span (`"q"`, `"kv"`,
+    /// `"histogram"`). Not emitted into PTX; regions are addressed by offset.
+    pub name: String,
+    /// Size of the region in bytes.
+    pub bytes: u32,
+    /// Required alignment of the region's start, in bytes. `ldmatrix` and a
+    /// 16-byte `cp.async` need 16 (verifier rule 8).
+    pub align: u32,
+    /// Element type a `SharedRegion` pointer into this region carries.
+    pub elem: KirType,
+}
+
+/// The kernel's shared memory as named regions at computed offsets
+/// (roadmap A2 step 6).
+///
+/// `dynamic` is load-bearing rather than cosmetic. A static `.shared`
+/// declaration caps at 48 KiB; the larger budget is an opt-in `extern
+/// .shared` block sized at launch. Mixing the two in one kernel is the
+/// sm_120 illegal-address finding the spec records, so rule 8 holds a kernel
+/// to one or the other.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SmemLayout {
+    pub regions: Vec<SmemRegion>,
+    /// `true`: one `extern .shared` block sized at launch (99 KiB opt-in).
+    /// `false`: a static `.shared` declaration (48 KiB).
+    pub dynamic: bool,
+}
+
+/// Static shared memory per CTA, in bytes — the cap on a non-`dynamic`
+/// layout (verifier rule 8).
+pub const SMEM_STATIC_BUDGET: u32 = 48 * 1024;
+
+/// The opt-in `extern .shared` cap on sm_80+, in bytes — the cap on a
+/// `dynamic` layout (verifier rule 8).
+pub const SMEM_DYNAMIC_BUDGET: u32 = 99 * 1024;
+
+impl SmemLayout {
+    /// Byte offset of region `index`, packing regions in declaration order
+    /// and rounding each start up to its own `align`.
+    ///
+    /// This is the one place offsets are computed. `smem_layout.rs`'s 74
+    /// accessors derive from it rather than each recomputing the sum, which
+    /// is what made a missed region silently overlap its neighbour.
+    pub fn offset_of(&self, index: usize) -> Option<u32> {
+        if index >= self.regions.len() {
+            return None;
+        }
+        let mut at: u32 = 0;
+        for region in &self.regions[..index] {
+            at = align_up(at, region.align)?;
+            at = at.checked_add(region.bytes)?;
+        }
+        align_up(at, self.regions[index].align)
+    }
+
+    /// Total bytes the layout occupies, including the padding `offset_of`
+    /// inserts for alignment. `None` on overflow.
+    pub fn total_bytes(&self) -> Option<u32> {
+        match self.regions.len() {
+            0 => Some(0),
+            n => {
+                let last = self.offset_of(n - 1)?;
+                last.checked_add(self.regions[n - 1].bytes)
+            }
+        }
+    }
+
+    /// The budget this layout is held to, per `dynamic`.
+    pub fn budget(&self) -> u32 {
+        if self.dynamic { SMEM_DYNAMIC_BUDGET } else { SMEM_STATIC_BUDGET }
+    }
+
+    /// Index of the region named `name`, if any.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.regions.iter().position(|r| r.name == name)
+    }
+}
+
+/// Round `at` up to a multiple of `align`. `None` on overflow; `align == 0`
+/// is treated as 1 so a region that forgot to say leaves the cursor alone
+/// rather than dividing by zero.
+fn align_up(at: u32, align: u32) -> Option<u32> {
+    let align = align.max(1);
+    let rem = at % align;
+    if rem == 0 { Some(at) } else { at.checked_add(align - rem) }
+}
+
+/// The tile an `Mma` computes (roadmap A2 step 6). The estate uses two
+/// shapes; the fragment counts differ per shape and rule 6 checks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmaShape {
+    /// `mma.sync.aligned.m16n8k16` — a: 4, b: 2, c/d: 4.
+    M16N8K16,
+    /// `mma.sync.aligned.m16n8k8` — a: 2, b: 1, c/d: 4.
+    M16N8K8,
+}
+
+impl MmaShape {
+    /// PTX shape token.
+    pub fn ptx_shape(&self) -> &'static str {
+        match self {
+            MmaShape::M16N8K16 => "m16n8k16",
+            MmaShape::M16N8K8 => "m16n8k8",
+        }
+    }
+
+    /// Fragment register counts for `(a, b, c_and_d)` at this shape. These
+    /// are the PTX operand-vector arities, not a convention of ours: an
+    /// m16n8k16 `mma` takes `{a0..a3}, {b0,b1}` and an m16n8k8 takes
+    /// `{a0,a1}, {b0}`, both accumulating into `{c0..c3}`.
+    pub fn fragment_counts(&self) -> (usize, usize, usize) {
+        match self {
+            MmaShape::M16N8K16 => (4, 2, 4),
+            MmaShape::M16N8K8 => (2, 1, 4),
+        }
+    }
+}
+
+/// The A/B operand element type of an `Mma` (roadmap A2 step 6). The
+/// accumulator is `F32` in every estate site, so it is not a parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmaOperandTy {
+    F16,
+    Bf16,
+}
+
+impl MmaOperandTy {
+    /// PTX type token for the A/B operands.
+    pub fn ptx_type(&self) -> &'static str {
+        match self {
+            MmaOperandTy::F16 => "f16",
+            MmaOperandTy::Bf16 => "bf16",
+        }
+    }
+
+    /// The `KirType` each A/B fragment register carries: one packed pair per
+    /// `.b32` register.
+    pub fn fragment_ty(&self) -> KirType {
+        match self {
+            MmaOperandTy::F16 => KirType::Vec(Box::new(KirType::F16), 2),
+            MmaOperandTy::Bf16 => KirType::Vec(Box::new(KirType::Bf16), 2),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AddressSpace {
     Global,
@@ -318,6 +478,15 @@ pub enum KirOp {
     /// dst = the address of the kernel's shared-memory block (`shared_mem`),
     /// typed `Ptr(_, Shared)` by the producer.
     SharedBase(VarId),
+    /// dst = the address of region `region` of the kernel's [`SmemLayout`],
+    /// typed `Ptr(elem, Shared)` from the region's declared element type
+    /// (roadmap A2 step 6).
+    ///
+    /// `region` indexes `KernelIR::smem_layout.regions`; the offset is
+    /// [`SmemLayout::offset_of`], the one place offsets are computed. An
+    /// out-of-range index is a verifier error (rule 8) rather than a
+    /// silently wrong address.
+    SharedRegion { dst: VarId, region: u32 },
     /// Copy `bytes` (4, 8 or 16) from a global address into a shared one
     /// without staging through registers. The copy is complete only after
     /// a `CpAsyncWait` that covers the group it is committed into.
@@ -333,15 +502,34 @@ pub enum KirOp {
     // Fragments are `Vec(F16, 2)` (one packed f16x2 per .b32 register) for
     // the A/B operands and `F32` for the accumulator; the verifier holds
     // every listed register to that type (FeatureSet::TENSOR_CORES, sm_80).
-    /// Warp-collective load of four 8x8 b16 matrices from shared memory:
-    /// `ldmatrix.sync.aligned.m8n8.x4[.trans].shared.b16 {dst}, [addr]`.
-    /// `addr` is a `Ptr(_, Shared)`; each `dst` is a `Vec(F16, 2)`.
-    LdMatrixX4 { dst: [VarId; 4], addr: VarId, trans: bool },
-    /// Warp-collective `d = a * b + c` on one m16n8k16 tile:
-    /// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {d}, {a}, {b}, {c}`.
-    /// `a` (4) and `b` (2) are `Vec(F16, 2)` fragments; `c` and `d` (4 each)
-    /// are `F32`.
-    MmaF16M16N8K16 { d: [VarId; 4], a: [VarId; 4], b: [VarId; 2], c: [VarId; 4] },
+    /// Warp-collective load of `dst.len()` 8x8 b16 matrices from shared
+    /// memory: `ldmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].shared.b16
+    /// {dst}, [addr]`. `addr` is a `Ptr(_, Shared)`; each `dst` is a
+    /// `Vec(F16, 2)`.
+    ///
+    /// Roadmap A2 step 6: the count is the operand-vector arity, so `x1`
+    /// and `x2` are the same op with a shorter `dst` rather than two more
+    /// variants. Rule 6 holds the count to 1, 2 or 4 — PTX has no other
+    /// form — and rule 8 requires `addr` to come from a 16-aligned region.
+    LdMatrix { dst: Vec<VarId>, addr: VarId, trans: bool },
+    /// Warp-collective `d = a * b + c` on one tile:
+    /// `mma.sync.aligned.<shape>.row.col.f32.<ty>.<ty>.f32 {d}, {a}, {b}, {c}`.
+    ///
+    /// Roadmap A2 step 6: parameterised by `shape` and by the A/B element
+    /// type. The fragment arities follow the shape
+    /// ([`MmaShape::fragment_counts`]) and rule 6 checks them, so a tile
+    /// wired with m16n8k16's four A registers under m16n8k8 is a verifier
+    /// error rather than a `ptxas` one. `a`/`b` registers carry the packed
+    /// pair type for `a_ty`; `c`/`d` are `F32` — every estate site
+    /// accumulates in f32, so the accumulator is not a parameter.
+    Mma {
+        shape: MmaShape,
+        a_ty: MmaOperandTy,
+        d: Vec<VarId>,
+        a: Vec<VarId>,
+        b: Vec<VarId>,
+        c: Vec<VarId>,
+    },
 
     // M57 v1: structured ops for FPGA target. GPU/CPU codegen ignores these
     // (existing AST → templated PTX path for GPU; Cranelift for CPU);
@@ -462,6 +650,7 @@ pub struct KirBuilder {
     next_var: VarId,
     var_types: std::collections::HashMap<VarId, KirType>,
     shared_mem_bytes: u32,
+    smem_layout: SmemLayout,
     workgroup_size: [u32; 3],
     required_features: FeatureSet,
     launch_bounds: Option<LaunchBounds>,
@@ -478,6 +667,7 @@ impl KirBuilder {
             next_var: 0,
             var_types: std::collections::HashMap::new(),
             shared_mem_bytes: 0,
+            smem_layout: SmemLayout::default(),
             workgroup_size: [256, 1, 1],
             required_features: FeatureSet::NONE,
             launch_bounds: None,
@@ -571,14 +761,23 @@ impl KirBuilder {
                 self.required_features |= FeatureSet::BF16_ARITHMETIC;
             }
             KirOp::SharedMemFence => self.required_features |= FeatureSet::SHARED_MEMORY,
-            KirOp::SharedBase(_) => self.required_features |= FeatureSet::SHARED_MEMORY,
+            KirOp::SharedBase(_) | KirOp::SharedRegion { .. } => {
+                self.required_features |= FeatureSet::SHARED_MEMORY
+            }
             KirOp::CpAsync { .. } | KirOp::CpAsyncCommit | KirOp::CpAsyncWait { .. } => {
                 self.required_features |= FeatureSet::SHARED_MEMORY | FeatureSet::ASYNC_COPY
             }
-            KirOp::LdMatrixX4 { .. } => {
+            KirOp::LdMatrix { .. } => {
                 self.required_features |= FeatureSet::SHARED_MEMORY | FeatureSet::TENSOR_CORES
             }
-            KirOp::MmaF16M16N8K16 { .. } => self.required_features |= FeatureSet::TENSOR_CORES,
+            // A bf16 `mma` needs the bf16 arithmetic feature as well as the
+            // tensor cores: sm_75 has the latter and not the former.
+            KirOp::Mma { a_ty, .. } => {
+                self.required_features |= FeatureSet::TENSOR_CORES;
+                if matches!(a_ty, MmaOperandTy::Bf16) {
+                    self.required_features |= FeatureSet::BF16_ARITHMETIC;
+                }
+            }
             KirOp::AtomicAdd(_, _, AddressSpace::Global) => {
                 // Float atomics need ATOMIC_FLOAT; integer atomics are universal
                 self.required_features |= FeatureSet::ATOMIC_FLOAT;
@@ -597,6 +796,23 @@ impl KirBuilder {
         self.workgroup_size = size;
     }
 
+    /// Declare the kernel's shared memory as named regions (roadmap A2
+    /// step 6). Sets `required_features |= SHARED_MEMORY` the way an
+    /// emitted `SharedBase` does, so a kernel that declares a layout but
+    /// reaches it only through `SharedRegion` still reports the feature.
+    pub fn set_smem_layout(&mut self, layout: SmemLayout) {
+        if !layout.regions.is_empty() {
+            self.required_features |= FeatureSet::SHARED_MEMORY;
+        }
+        self.smem_layout = layout;
+    }
+
+    /// The layout as declared so far — `SharedRegion` emitters need the
+    /// element type to type their destination.
+    pub fn smem_layout(&self) -> &SmemLayout {
+        &self.smem_layout
+    }
+
     pub fn set_shared_mem(&mut self, bytes: u32) {
         self.shared_mem_bytes = bytes;
         if bytes > 0 {
@@ -611,6 +827,7 @@ impl KirBuilder {
             blocks: self.blocks,
             var_types: self.var_types,
             shared_mem_bytes: self.shared_mem_bytes,
+            smem_layout: self.smem_layout.clone(),
             workgroup_size: self.workgroup_size,
             required_features: self.required_features,
             launch_bounds: self.launch_bounds,

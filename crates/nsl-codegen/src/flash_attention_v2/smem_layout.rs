@@ -6,6 +6,10 @@
 //!   S/P rows: offset Q_bytes + KV_bytes, bytes = 4 warps × block_kv × 4
 
 use crate::flash_attention::FlashAttentionConfig;
+// Roadmap A2 step 6. Aliased: this module already has a `SmemLayout` of its
+// own (sizes only, just below `layout()`), and the two are different things
+// until the v2 emitter itself moves to KIR.
+use crate::kernel_ir::{KirType, SmemLayout as KirSmemLayout, SmemRegion};
 
 // Supported-config matrix. Published so Task 3's per-config iteration
 // tests and downstream phase emitters can consume the same lists the
@@ -642,6 +646,49 @@ pub fn softmax_save_offset(config: &FlashAttentionConfig) -> u32 {
         + wo_tile_bytes(config) + x_residual_bytes(config)
 }
 
+/// The forward SMEM estate as a KIR [`KirSmemLayout`] — roadmap A2 step 6.
+///
+/// The struct below this one carries region SIZES; the OFFSETS live in the
+/// accessors (`q_offset`, `kv_offset`, `sp_offset`, `softmax_save_offset`,
+/// ...), each recomputing its own prefix sum. That is the arrangement the
+/// roadmap asks to promote: one declaration the offsets are read out of,
+/// so that two accessors cannot disagree about where a region starts.
+///
+/// The region order is the one the accessors already imply, and
+/// `agreement_with_the_accessors` below holds this function to it across
+/// the whole supported-config matrix.
+///
+/// **`align: 1` is deliberate.** The accessors pack regions at exact prefix
+/// sums with no padding, and the emitted block — `.shared .align 16 .b8
+/// shmem[N]` — is what carries the 16-byte alignment. Declaring `align: 16`
+/// per region here would insert padding `offset_of` does not currently
+/// produce and silently move every offset. Faithfulness to the existing
+/// layout wins; a region that later needs its own alignment can say so when
+/// the emitter moves to KIR and the offsets become KIR's to choose.
+pub fn layout(config: &FlashAttentionConfig) -> KirSmemLayout {
+    let effective_bkv = crate::flash_attention_v2::sinks::effective_block_kv(config) as u32;
+    let head_dim = config.head_dim as u32;
+
+    let mut regions = Vec::with_capacity(9);
+    let mut push = |name: &str, bytes: u32, elem: KirType| {
+        regions.push(SmemRegion { name: name.to_string(), bytes, align: 1, elem });
+    };
+
+    push("q", (config.block_q as u32) * head_dim * 2, KirType::F16);
+    push("kv", effective_bkv * head_dim * 2, KirType::F16);
+    push("sp", sp_bytes(config), KirType::F32);
+    // The fused-projection tiles. Each is 0 bytes unless its feature is on,
+    // and a 0-byte region occupies no space and shifts nothing.
+    push("wq", wq_tile_bytes(config), KirType::F16);
+    push("wk", wk_tile_bytes(config), KirType::F16);
+    push("wv", wv_tile_bytes(config), KirType::F16);
+    push("wo", wo_tile_bytes(config), KirType::F16);
+    push("x_residual", x_residual_bytes(config), KirType::F16);
+    push("softmax_save", softmax_save_bytes(config), KirType::F32);
+
+    KirSmemLayout { regions, dynamic: needs_dynamic_smem(config) }
+}
+
 /// SmemLayout captures all per-config SMEM region sizes.
 #[derive(Debug)]
 pub struct SmemLayout {
@@ -934,6 +981,88 @@ mod tests {
             csha: None,
             checkpoint: None,
         }
+    }
+
+    /// Roadmap A2 step 6. `layout()` must agree with the accessors it is
+    /// meant to become the source of, on every supported config — otherwise
+    /// deriving them from it later would silently move regions.
+    ///
+    /// This walks the published matrix rather than a sample: the whole
+    /// point of the promotion is that no config is left where two answers
+    /// disagree.
+    #[test]
+    fn layout_agrees_with_the_accessors_across_the_supported_matrix() {
+        let mut checked = 0usize;
+        for &block_q in ALLOWED_BLOCK_Q {
+            for &block_kv in ALLOWED_BLOCK_KV {
+                for &head_dim in ALLOWED_HEAD_DIM {
+                    for &num_sink_tokens in &[0u32, 4] {
+                        let cfg = FlashAttentionConfig {
+                            block_q,
+                            block_kv,
+                            head_dim,
+                            num_sink_tokens,
+                            ..base_cfg()
+                        };
+                        let l = layout(&cfg);
+
+                        // The named regions land where the accessors say.
+                        let at = |name: &str| {
+                            l.offset_of(l.index_of(name).expect("region declared"))
+                                .expect("offset computable")
+                        };
+                        assert_eq!(at("q"), q_offset(&cfg), "q @ {block_q}/{block_kv}/{head_dim}");
+                        assert_eq!(at("kv"), kv_offset(&cfg), "kv @ {block_q}/{block_kv}/{head_dim}");
+                        assert_eq!(at("sp"), sp_offset(&cfg), "sp @ {block_q}/{block_kv}/{head_dim}");
+
+                        // And the whole block is the same size.
+                        assert_eq!(
+                            l.total_bytes(),
+                            Some(total_bytes(&cfg)),
+                            "total @ {block_q}/{block_kv}/{head_dim}"
+                        );
+
+                        // `dynamic` is the same question `needs_dynamic_smem`
+                        // answers, so the budget the verifier holds the
+                        // layout to is the one the emitter declares under.
+                        assert_eq!(l.dynamic, needs_dynamic_smem(&cfg));
+
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        // Anti-vacuity: a typo in the matrix names would silently check
+        // nothing.
+        assert_eq!(
+            checked,
+            ALLOWED_BLOCK_Q.len() * ALLOWED_BLOCK_KV.len() * ALLOWED_HEAD_DIM.len() * 2
+        );
+        assert!(checked >= 192, "expected the full matrix, checked {checked}");
+    }
+
+    /// The fused-projection tiles shift the regions after them, and
+    /// `softmax_save_offset` is the accessor that has to agree.
+    #[test]
+    fn layout_agrees_with_the_accessors_under_fused_projections() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            csha: Some(CshaExtras { fused_projections: true, d_model: 32, ..Default::default() }),
+            ..base_cfg()
+        };
+        let l = layout(&cfg);
+        let at = |name: &str| {
+            l.offset_of(l.index_of(name).expect("region declared")).expect("offset computable")
+        };
+        assert_eq!(at("q"), q_offset(&cfg));
+        assert_eq!(at("kv"), kv_offset(&cfg));
+        assert_eq!(at("sp"), sp_offset(&cfg));
+        assert_eq!(at("softmax_save"), softmax_save_offset(&cfg));
+        assert_eq!(l.total_bytes(), Some(total_bytes(&cfg)));
+        // The tiles are actually present, so this is not agreeing about zero.
+        assert!(wq_tile_bytes(&cfg) > 0, "the fused path must declare a Wq tile");
     }
 
     #[test]

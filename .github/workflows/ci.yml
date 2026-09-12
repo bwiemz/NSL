@@ -130,6 +130,51 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --no-fail-fast -- --skip e2e_
 
+      # Diagnostics for a red `Unit tests` step. Three fixtures LINK a program
+      # (`nsl build --shared-lib`, ~128 MB each) rather than just computing,
+      # and the header of this file already records why that matters: on a
+      # runner that has run out of disk, the LINKER fails and the failure is
+      # indistinguishable from a real regression in the summary line.
+      #
+      # `--no-fail-fast` makes that worse to read, not better: the run ends
+      # with `error: N targets failed` and a bare list of target names, while
+      # the output that explains any one of them scrolled past thousands of
+      # lines earlier, interleaved with every other target. So re-run just
+      # these three, one at a time, with the free space printed first. The job
+      # log then ENDS with an isolated verdict per fixture next to the disk
+      # number that would explain an out-of-disk one.
+      #
+      # `--features interop` on the dlpack target is load-bearing. That file is
+      # `#![cfg(feature = "interop")]`, and nothing in `-p nsl-runtime` alone
+      # turns it on — the workspace step only compiles it because nsl-cli and
+      # nsl-codegen both ask for that feature and cargo unifies. Without the
+      # flag here this step runs ZERO tests and prints a green `ok`, which is
+      # the exact failure mode the gated-tests step above exists to prevent.
+      # `test result:` lines are echoed so a zero-test run is visible as one.
+      #
+      # Diagnostic only, and only on an already-red job: `continue-on-error`
+      # plus `|| true` mean it can neither turn a red run green nor add a
+      # second, misleading red of its own.
+      - name: Program-linking fixtures (diagnostics, only on failure)
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "=== free space on the workspace volume ==="
+          df -h . || true
+          echo "=== free space on TMPDIR (${TMPDIR:-/tmp}) ==="
+          df -h "${TMPDIR:-/tmp}" || true
+          echo
+          echo "### -p nsl-runtime --features interop --test dlpack_unsupported_dtype_refusal"
+          cargo test -p nsl-runtime --features interop \
+            --test dlpack_unsupported_dtype_refusal -- --test-threads=1 || true
+          echo
+          echo "### -p nsl-cli --test ccr_periodic_stride_gate"
+          cargo test -p nsl-cli --test ccr_periodic_stride_gate -- --test-threads=1 || true
+          echo
+          echo "### -p nsl-codegen --test awq_full_pipeline"
+          cargo test -p nsl-codegen --test awq_full_pipeline -- --test-threads=1 || true
+
       # 28 nsl-codegen integration test files are `#![cfg(feature =
       # "test-helpers")]` and three more are `required-features` targets.
       # The step above builds the first group as EMPTY binaries and skips
