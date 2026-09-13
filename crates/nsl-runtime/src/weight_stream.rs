@@ -782,7 +782,15 @@ fn arena_teardown() {
     // Item 11: ensure no prefetch HtoD is still in flight into a slot before
     // its device buffer is freed (codegen awaits every pack before its
     // compute, so this is belt-and-suspenders for the async path).
+    //
+    // Roadmap A4 step 2: a prefetch may have gone out on a leased stream
+    // instead of the shared transfer one (`NSL_WS_PREFETCH_LEASE=1`), so
+    // both are drained. Unconditionally, not only in that mode — a drain
+    // that depended on which stream the copy took would be a sharp edge
+    // waiting for the next caller, and draining an empty lease pool costs
+    // nothing.
     crate::cuda::inner::transfer_stream_synchronize();
+    crate::cuda::inner::lease_streams_synchronize();
     let mut pool = ARENA_POOL.lock().unwrap();
     for s in pool.drain(..) {
         crate::cuda::inner::ensure_context();

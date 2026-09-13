@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- CUDA streams and kernel workspaces are per **(thread, device)** rather
+  than per thread (roadmap A4 step 2). The three named streams — the
+  blocking compute stream, the non-blocking offload transfer stream and the
+  inspect stream — and the five persistent device-pointer workspaces (the
+  two fused-AdamW multi tables, the cross-entropy scratch, the Muon stats
+  buffer and the batched Newton-Schulz workspace cache) were eight separate
+  `thread_local!` cells across three modules; they are now one slot on the
+  device context's `StreamPool`, keyed by registry slot. Thread affinity is
+  unchanged and still load-bearing (two blocking streams do not synchronise
+  with each other, so only the launching thread may record ordering events
+  against its work); what is added is device affinity, so a second device
+  will get its own streams and scratch instead of sharing device 0's.
+  `current_stream()`, `transfer_stream()` and `current_inspect_stream()`
+  are shims over the pool and no call site changed.
+
+- `StreamLease` — a non-blocking stream borrowed from the device context for
+  bounded work that should not serialise behind compute, returned to a free
+  list on drop and recycled — together with the pool's `record` / `wait`
+  event helpers, which reuse completion events instead of creating and
+  destroying one per use. The weight-streaming prefetch is the first user,
+  behind `NSL_WS_PREFETCH_LEASE=1`; with the switch off (the default) it
+  shares the transfer stream exactly as before. The weight-stream arena's
+  teardown drains the lease pool unconditionally, so the two modes differ in
+  overlap and never in safety.
+
 - The runtime's CUDA driver state is a per-device value rather than a
   process singleton (roadmap A4 step 1). `cuda::context::CudaContext` holds
   the `CUdevice`, the primary `CUcontext`, the PTX module and resolved-

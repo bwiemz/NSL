@@ -336,7 +336,56 @@ new true statement.
    into the per-(thread, device) slot; `StreamLease` and the event helpers
    are added; `current_stream()`, `transfer_stream()`,
    `current_inspect_stream()` become shims. First user of a lease: the
-   weight-streaming prefetch. Inventory rows updated.
+   weight-streaming prefetch. Inventory rows updated. **Done.**
+
+   Four deviations from the sketch above, the first two because the named
+   streams are on the launch hot path and the last two because CPU CI cannot
+   observe a GPU ordering regression:
+
+   - The per-(thread, device) slot is a **thread-local table indexed by
+     registry slot**, not the `named: Mutex<HashMap<ThreadId, …>>` the
+     `StreamPool` sketch shows. `current_stream()` is called on every launch;
+     a mutex and a hash lookup per launch would be a real cost for storage
+     whose access is thread-affine *by contract* — nothing but the owning
+     thread may read these handles, so nothing has to lock them. The pool's
+     genuinely shared halves (the lease free list, the event pool) do use
+     mutexes. The registry slot is what makes the table device-keyed, so the
+     ownership model the spec describes is unchanged; only its
+     representation is.
+   - The five workspaces share **one `TypeId`-keyed map** rather than five
+     named fields on a `Workspaces` struct. `MultiWs` and `SrMultiWs` are
+     declared inside the functions that use them and `GroupWs` lives in
+     `muon_batch`; naming them all here would drag three unrelated modules
+     into `context.rs` and invert the dependency. Steps 3 and 4 move more
+     per-thread device state in without editing the accessor.
+   - The lease is wired into `prefetch_htod_on_transfer` but is **off by
+     default**, behind `NSL_WS_PREFETCH_LEASE=1`. The shared transfer stream
+     is what the weight-stream arena's teardown drains, and moving a copy
+     off it is exactly the class of change no CPU lane can check; the switch
+     makes the leased path one env var away for `scripts/gpu-tier.sh`
+     without betting the default path on an unrun measurement. The teardown
+     drain covers the lease pool *unconditionally*, so the two modes differ
+     in overlap and never in safety.
+   - `StreamPool` therefore also carries `synchronize_leases`, which the
+     sketch does not list. It walks every stream the pool ever created
+     rather than the idle ones, so its correctness does not depend on the
+     borrower having dropped its lease first — a property of today's single
+     caller, not of the API.
+
+   Two incidental behaviour changes, both called out rather than hidden:
+   `cuStreamCreate` failure for the compute and transfer streams is now a
+   typed fatal exit rather than an `assert_eq!` panic, which is the contract
+   C1 tier 3 set and which `inspect/stream.rs` already followed; and
+   `current_inspect_stream()` now force-initialises the context like its two
+   siblings, where before it created a stream against whatever context
+   happened to be current (in practice always one, since its only callers are
+   emitted hooks inside a running program).
+
+   The prefetch's completion event now comes from the pool and goes back to
+   it, replacing a `cuEventCreate` / `cuEventDestroy_v2` pair per prefetch.
+   `cuStreamWaitEvent` captures the event's state when it is enqueued, so the
+   event is reusable as soon as the wait is issued — the same rule the
+   deferred-free machinery's own event pool already relies on.
 3. **Handles, allocator, caches, regions.** cuBLAS, cublasLt (handle,
    workspace, plans), `CACHING_ALLOCATOR`, the bf16/strided-copy/prepass
    caches, `FP8_SCALES`, the slab and arena bases move in; the lock order

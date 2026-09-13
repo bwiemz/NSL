@@ -332,11 +332,27 @@ are shims over `context::current()`, so no call site names a context.
 device, one context, and one cuBLAS handle (`cublas_handle()`, lazily
 created) per process, and multi-GPU still means one process per device.
 
-**Streams and workspaces** are per-thread cells in `src/cuda/mod.rs`:
-`COMPUTE_STREAM`, `TRANSFER_STREAM` (with `transfer_stream_synchronize` and
-event-based cross-stream waits such as `compute_stream_wait_event`), plus
-persistent kernel workspaces (`WS`, `SR_WS`, `CE_SCRATCH`, `MUON_STATS_BUF`).
-`NSL_CUDA_SYNC=1` synchronises after every launch for bisecting async bugs.
+**Streams and workspaces** live on the context's `StreamPool` (roadmap A4
+step 2), one set per **(thread, device)**: the blocking compute stream, the
+non-blocking offload transfer stream (with `transfer_stream_synchronize` and
+event-based cross-stream waits such as `compute_stream_wait_event`), the
+inspect stream, and the persistent kernel workspaces the fused optimizers and
+Muon reuse. Thread affinity is load-bearing, not incidental — two blocking
+streams do not synchronise with each other, so only the thread that launched
+work may record ordering events against it — and it is now paired with device
+affinity, which is what lets step 5 add a second device without it sharing
+device 0's streams and scratch. `current_stream()`, `transfer_stream()` and
+`current_inspect_stream()` are the shims over it, so no call site changed.
+
+The pool also hands out `StreamLease`s: non-blocking streams for bounded work
+that should not serialise behind compute, returned to a free list on drop and
+recycled (a `CUstream` is FIFO, so a reused stream orders the next borrower
+behind the previous one's tail — never a race, at worst a lost overlap). Its
+first user is the weight-streaming prefetch, behind
+`NSL_WS_PREFETCH_LEASE=1`; with the switch off the prefetch shares the
+transfer stream as it always has. Either way the arena teardown drains both
+the transfer stream and the lease pool. `NSL_CUDA_SYNC=1` synchronises after
+every launch for bisecting async bugs.
 
 **Kernel launch path.** PTX is embedded as NUL-terminated `&str` constants:
 `src/cuda/kernels.rs` (elementwise, `.target sm_70`),
@@ -816,7 +832,7 @@ crate is built for Miri the whole module interprets in about ten seconds
 A hand-written PTX constant in `src/cuda/*.rs` trips
 `scripts/hand-ptx-freeze.sh` and needs an explicit freeze-list change. Either
 way: load with `load_module_once` / `get_function`, launch with
-`launch_function_raw` on `COMPUTE_STREAM`, give a `--deterministic` variant
+`launch_function_raw` on the context's compute stream, give a `--deterministic` variant
 in `src/deterministic_ops.rs` if it uses atomics, make it graph-capture-safe
 (no readbacks inside a region), and add a `ptxas` syntax check to the
 `cuda-feature` job's PTX assembly gate.

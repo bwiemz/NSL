@@ -1,36 +1,23 @@
-//! Lazy-init dedicated CUstream for inspect copies.
+//! The dedicated CUstream for inspect copies.
 //!
 //! Sync model: codegen-emitted hook calls cuEventRecord on the compute stream
 //! after the producing kernel, then cuStreamWaitEvent on this inspect stream
 //! BEFORE issuing the memcpy. That ordering is not enforced here; this module
-//! only owns the thread-local stream handle itself.
+//! only owns the accessor.
+//!
+//! Roadmap A4 step 2: the handle itself moved out of an `INSPECT_STREAM`
+//! thread-local and onto the current device context's `StreamPool`, which
+//! keeps one per (thread, device). The stream is still created lazily with
+//! the same flags on first access, and is still the calling thread's alone —
+//! it is now also the calling *device*'s alone.
 
 #![cfg(feature = "cuda")]
 
 use cudarc::driver::sys;
-use std::cell::RefCell;
 
-thread_local! {
-    static INSPECT_STREAM: RefCell<Option<sys::CUstream>> = const { RefCell::new(None) };
-}
-
-/// Returns the thread-local inspect stream, creating it on first access.
+/// Returns this (thread, device)'s inspect stream, creating it on first
+/// access.
 pub fn current_inspect_stream() -> sys::CUstream {
-    INSPECT_STREAM.with(|s| {
-        let mut g = s.borrow_mut();
-        if g.is_none() {
-            let mut stream: sys::CUstream = std::ptr::null_mut();
-            unsafe {
-                let res = sys::cuStreamCreate(&mut stream, 0);
-                if res != sys::CUresult::CUDA_SUCCESS {
-                    crate::fatal::die(
-                        crate::fatal::Fatal::CudaDriver,
-                        &format!("cuStreamCreate failed: {res:?}"),
-                    );
-                }
-            }
-            *g = Some(stream);
-        }
-        g.unwrap()
-    })
+    let ctx = crate::cuda::context::current();
+    ctx.streams.inspect(|| ctx.activate())
 }

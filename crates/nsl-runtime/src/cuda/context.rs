@@ -32,8 +32,22 @@
 //! here: with one slot nothing reads it, and the crate denies dead code rather
 //! than carrying speculative state. The `CUdevice` handle that
 //! `cuDeviceGet(ordinal)` returned is kept, because the shims do read it.
+//! (Step 2's [`StreamPool`] carries the *registry slot* index, which is the
+//! key into the per-thread table — still not the CUDA ordinal.)
+//!
+//! **Step 2 adds [`StreamPool`].** The three named streams (compute, transfer,
+//! inspect) and the five device-pointer workspaces were `thread_local!` cells
+//! scattered across `cuda/mod.rs`, `inspect/stream.rs` and `muon_batch.rs`.
+//! They are thread-affine for a correctness reason that has not changed — two
+//! blocking streams do not synchronise with each other, so the thread that
+//! launched work is the only one that may record ordering events against it —
+//! and they are now *also* device-affine: one [`ThreadSlot`] per (thread,
+//! device), reached through the context. The slot index is what step 1
+//! deliberately left off the context; it earns its place here.
 
 use cudarc::driver::sys::*;
+use std::any::{Any, TypeId};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
@@ -89,6 +103,9 @@ pub(crate) struct CudaContext {
     pub(crate) device: CUdevice,
     /// The retained primary context. Made current by [`CudaContext::activate`].
     primary: CUcontext,
+    /// Roadmap A4 step 2: the three named streams (per thread), the shared
+    /// lease free list and the completion-event pool.
+    pub(crate) streams: StreamPool,
     /// Was `CudaState`'s `module_cache` + `func_cache`.
     pub(crate) modules: Mutex<ModuleCache>,
     /// Was `DEFERRED_FREES`.
@@ -180,6 +197,377 @@ impl CudaContext {
             supported
         })
     }
+
+    /// Run `f` against this (thread, device)'s workspace of type `T`,
+    /// creating it with `Default` on first use.
+    ///
+    /// This is the generic replacement for the four `thread_local!` cells
+    /// that held one device pointer each (`WS`, `SR_WS`, `CE_SCRATCH`,
+    /// `MUON_STATS_BUF`) plus `muon_batch`'s keyed `WS_CACHE`. Keying by
+    /// `TypeId` means each workspace type stays declared where it is used —
+    /// `MultiWs` is still a local type inside `fase_fused_adamw_multi` — and
+    /// this module never has to name any of them. Steps 3 and 4 move more
+    /// per-thread device state in without touching this function.
+    ///
+    /// The `&mut T` is exclusive for the duration of `f` *provided* `f` does
+    /// not itself ask for the same `T`, which is precisely the contract the
+    /// raw-pointer cells had before (they handed out `&mut *ptr` and held it
+    /// across the whole body). Asking for a *different* `T`, or for a stream,
+    /// is fine: the map's borrow is released before `f` runs.
+    ///
+    /// `T` must not implement `Drop` in a way that calls the driver — the
+    /// boxes are freed at thread exit, when the context may already be gone.
+    /// Device memory a workspace owns is leaked at thread exit, exactly as it
+    /// was before this step.
+    pub(crate) fn with_workspace<T: Default + 'static, R>(
+        &self,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        self.streams.with_workspace(f)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Roadmap A4 step 2 — the stream pool and the per-(thread, device) slot.
+// ---------------------------------------------------------------------------
+
+/// The streams and device-pointer workspaces belonging to one (thread,
+/// device) pair.
+///
+/// Every cell here was a `thread_local!` of its own before this step. They
+/// stay thread-affine — that is their correctness model, not an accident:
+/// the compute stream is a BLOCKING stream, and two blocking streams do not
+/// synchronise with each other, so only the thread that launched work may
+/// record ordering events against it. What changes is that the affinity is
+/// now to a *pair*: thread B on device 1 no longer reuses thread B's device-0
+/// scratch, which is what makes step 5's second device possible.
+///
+/// Handles are stored as `usize` because the driver's are `!Send` raw
+/// pointers and a `thread_local!` initialiser must be `const` to stay on the
+/// fast path; `0` means "not created yet", as it did before.
+pub(crate) struct ThreadSlot {
+    /// Was `cuda::mod`'s `COMPUTE_STREAM` — blocking (`CU_STREAM_DEFAULT`).
+    compute: Cell<usize>,
+    /// Was `cuda::mod`'s `TRANSFER_STREAM` — `CU_STREAM_NON_BLOCKING`.
+    transfer: Cell<usize>,
+    /// Was `inspect::stream`'s `INSPECT_STREAM` — blocking, debug copies.
+    inspect: Cell<usize>,
+    /// Was `WS`, `SR_WS`, `CE_SCRATCH`, `MUON_STATS_BUF` and `muon_batch`'s
+    /// `WS_CACHE`, keyed by the workspace's own type so no workspace type has
+    /// to be named here. See [`CudaContext::with_workspace`].
+    workspaces: RefCell<HashMap<TypeId, Box<dyn Any>>>,
+}
+
+impl ThreadSlot {
+    fn new() -> Self {
+        Self {
+            compute: Cell::new(0),
+            transfer: Cell::new(0),
+            inspect: Cell::new(0),
+            workspaces: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+thread_local! {
+    /// This thread's slots, indexed by registry slot. Boxed so a slot's
+    /// address is stable once created: `StreamPool::with_slot` hands out a
+    /// reference *after* releasing the `RefCell` borrow, which is what makes
+    /// the re-entrant paths legal (the `WS` realloc closure calls
+    /// `current_stream()`, which reaches back into the same slot).
+    ///
+    /// Dropped at thread exit, which frees the `Box`es and nothing else — no
+    /// workspace type may implement `Drop` with a driver call in it, because
+    /// the context may already be gone by then. That matches the previous
+    /// behaviour exactly: these cells leaked their device memory too.
+    static THREAD_SLOTS: RefCell<Vec<Option<Box<ThreadSlot>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Streams that are *not* one of the three named ones: a shared free list of
+/// non-blocking streams handed out as [`StreamLease`]s, plus a pool of
+/// recycled completion events for [`StreamPool::record`].
+///
+/// Shared across threads, unlike [`ThreadSlot`]: a lease exists precisely so
+/// a bounded piece of work can run off the thread's named streams, and a
+/// recycled `CUstream` is FIFO, so the next borrower is ordered *behind* the
+/// previous borrower's tail. That can cost overlap; it can never race.
+pub(crate) struct StreamPool {
+    /// Which registry slot this pool belongs to — the index into
+    /// [`THREAD_SLOTS`] for the named streams.
+    slot: usize,
+    /// Idle `CU_STREAM_NON_BLOCKING` streams, as `usize`.
+    free: Mutex<Vec<usize>>,
+    /// EVERY stream this pool has created, idle or out on lease, as `usize`.
+    ///
+    /// [`StreamPool::synchronize_leases`] walks this rather than `free` on
+    /// purpose: a drain that only covered idle streams would be correct only
+    /// as long as every borrower happened to drop its lease first, which is a
+    /// property of today's one caller and not of the API.
+    all: Mutex<Vec<usize>>,
+    /// Idle `CU_EVENT_DISABLE_TIMING` events, as `usize`.
+    ///
+    /// Deliberately *not* the context's `free_events`: that pool belongs to
+    /// the deferred-free machinery, whose drain path recycles outside the
+    /// queue lock on purpose. Sharing one pool would couple two schedules for
+    /// no gain.
+    events: Mutex<Vec<usize>>,
+}
+
+// SAFETY: every field is either a `usize` or a `Mutex` of `usize`s. The
+// driver handles they encode are opaque and never dereferenced on the Rust
+// side; each is only handed back to a driver call that first makes the owning
+// context current.
+unsafe impl Send for StreamPool {}
+unsafe impl Sync for StreamPool {}
+
+/// A non-blocking stream borrowed from a [`StreamPool`], returned on drop.
+///
+/// The borrower owns the ordering of its own work, exactly as the transfer
+/// stream's callers do today: record an event when the work is issued and
+/// have the consumer wait on it. Drop does **not** synchronise — a lease
+/// whose work is still in flight is fine, because a `CUstream` is FIFO and
+/// the next borrower's work simply queues behind it.
+pub(crate) struct StreamLease<'a> {
+    pool: &'a StreamPool,
+    stream: CUstream,
+}
+
+impl StreamLease<'_> {
+    pub(crate) fn stream(&self) -> CUstream {
+        self.stream
+    }
+}
+
+impl Drop for StreamLease<'_> {
+    fn drop(&mut self) {
+        self.pool.free.lock().unwrap().push(self.stream as usize);
+    }
+}
+
+impl StreamPool {
+    fn new(slot: usize) -> Self {
+        Self {
+            slot,
+            free: Mutex::new(Vec::new()),
+            all: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Run `f` against the calling thread's slot for this pool's device,
+    /// creating the slot on first use.
+    ///
+    /// The `RefCell` borrow is released *before* `f` runs, so a closure that
+    /// reaches back in (the `WS` realloc path calls `current_stream()`) does
+    /// not hit a double borrow. The `Box` keeps the address stable for the
+    /// thread's life, and the higher-ranked closure bound stops the reference
+    /// escaping.
+    fn with_slot<R>(&self, f: impl FnOnce(&ThreadSlot) -> R) -> R {
+        let ptr = THREAD_SLOTS.with(|slots| {
+            let mut v = slots.borrow_mut();
+            if v.len() <= self.slot {
+                v.resize_with(self.slot + 1, || None);
+            }
+            let entry = v[self.slot].get_or_insert_with(|| Box::new(ThreadSlot::new()));
+            &raw const **entry
+        });
+        // SAFETY: the box was just created or already existed in this
+        // thread's `THREAD_SLOTS`, is never moved out or replaced, and lives
+        // until the thread exits — which cannot happen while this frame is on
+        // that thread's stack.
+        f(unsafe { &*ptr })
+    }
+
+    /// Run `f` against this (thread, device)'s workspace of type `T`. See
+    /// [`CudaContext::with_workspace`], which is the door callers use; the
+    /// implementation lives here because it is slot bookkeeping and touches
+    /// no driver state, which is also what makes it testable without a GPU.
+    fn with_workspace<T: Default + 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let ptr = self.with_slot(|s| {
+            let mut map = s.workspaces.borrow_mut();
+            let entry = map
+                .entry(TypeId::of::<T>())
+                .or_insert_with(|| Box::new(T::default()) as Box<dyn Any>);
+            let t: &mut T = entry
+                .downcast_mut::<T>()
+                .expect("workspace map keyed by TypeId cannot hold another type");
+            &raw mut *t
+        });
+        // SAFETY: the box is owned by this thread's slot, is never replaced
+        // or moved out, and outlives this frame. Exclusivity is the caller
+        // contract documented on `CudaContext::with_workspace`.
+        f(unsafe { &mut *ptr })
+    }
+
+    /// Lazily create and return this (thread, device)'s blocking compute
+    /// stream — where `kernel_launch` issues, and where the profiler and the
+    /// deferred-free machinery record.
+    ///
+    /// `activate` runs only when the stream has to be created, so a warm
+    /// launch costs a thread-local read and no driver call — which is what
+    /// the `COMPUTE_STREAM` cell cost before this step.
+    ///
+    /// `CU_STREAM_DEFAULT` (flags = 0) is load-bearing: a blocking stream is
+    /// an implicit two-way barrier against the legacy NULL stream, so the
+    /// runtime's synchronous memcpys interleave in exactly the total order
+    /// they did before the p8 stream migration.
+    pub(crate) fn compute(&self, activate: impl FnOnce()) -> CUstream {
+        self.with_slot(|s| named(&s.compute, 0, "compute stream", activate))
+    }
+
+    /// Lazily create and return this (thread, device)'s offload transfer
+    /// stream.
+    ///
+    /// `CU_STREAM_NON_BLOCKING` (0x1): no implicit synchronisation with the
+    /// legacy NULL stream, so a copy-back overlaps the next parameter's
+    /// update kernels. Correctness ordering is per copy, via an event the
+    /// transfer stream waits on.
+    pub(crate) fn transfer(&self, activate: impl FnOnce()) -> CUstream {
+        self.with_slot(|s| named(&s.transfer, 0x1, "offload transfer stream", activate))
+    }
+
+    /// This (thread, device)'s transfer stream if it was ever created, and
+    /// `None` otherwise — the non-creating read the offload drain needs so
+    /// that synchronising an unused stream is a no-op rather than a reason to
+    /// build one.
+    pub(crate) fn transfer_if_created(&self) -> Option<CUstream> {
+        self.with_slot(|s| match s.transfer.get() {
+            0 => None,
+            raw => Some(raw as CUstream),
+        })
+    }
+
+    /// Lazily create and return this (thread, device)'s inspect stream — the
+    /// debug-copy stream the emitted inspect hooks issue on.
+    pub(crate) fn inspect(&self, activate: impl FnOnce()) -> CUstream {
+        self.with_slot(|s| named(&s.inspect, 0, "inspect stream", activate))
+    }
+
+    /// Borrow a non-blocking stream for a bounded piece of work.
+    ///
+    /// Reuses an idle one when the free list has it, so a steady-state
+    /// prefetch/copy loop creates its stream once. Returned on drop.
+    pub(crate) fn lease(&self) -> StreamLease<'_> {
+        if let Some(raw) = self.free.lock().unwrap().pop() {
+            return StreamLease {
+                pool: self,
+                stream: raw as CUstream,
+            };
+        }
+        let mut stream: CUstream = std::ptr::null_mut();
+        let r = unsafe { cuStreamCreate(&mut stream, 0x1) };
+        if r != CUresult::CUDA_SUCCESS {
+            crate::fatal::die(
+                crate::fatal::Fatal::CudaDriver,
+                &format!("cuStreamCreate (leased stream) failed: {r:?}"),
+            );
+        }
+        self.all.lock().unwrap().push(stream as usize);
+        StreamLease {
+            pool: self,
+            stream,
+        }
+    }
+
+    /// Block the host until every stream this pool ever leased has drained.
+    ///
+    /// The counterpart to `inner::transfer_stream_synchronize` for work that
+    /// went out on a lease instead of on a named stream: teardown paths that
+    /// free a buffer a lease may still be copying into must call this, and it
+    /// is a no-op when nothing was ever leased.
+    pub(crate) fn synchronize_leases(&self) {
+        let streams = self.all.lock().unwrap().clone();
+        for raw in streams {
+            let r = unsafe { cuStreamSynchronize(raw as CUstream) };
+            if r != CUresult::CUDA_SUCCESS {
+                crate::fatal::die(
+                    crate::fatal::Fatal::CudaDriver,
+                    &format!("cuStreamSynchronize (leased stream) failed: {r:?}"),
+                );
+            }
+        }
+    }
+
+    /// Record a completion event on `stream`, taking one from the pool when
+    /// there is a spare.
+    ///
+    /// The event is the caller's to hand to [`StreamPool::wait`] and then to
+    /// [`StreamPool::recycle`]; dropping it on the floor leaks one driver
+    /// event, as the open-coded `cuEventCreate` sites did before.
+    pub(crate) fn record(&self, stream: CUstream) -> CUevent {
+        let ev = match self.events.lock().unwrap().pop() {
+            Some(raw) => raw as CUevent,
+            None => {
+                let mut ev: CUevent = std::ptr::null_mut();
+                // 0x2 = CU_EVENT_DISABLE_TIMING (the cheapest flavour).
+                let r = unsafe { cuEventCreate(&mut ev, 0x2) };
+                if r != CUresult::CUDA_SUCCESS {
+                    crate::fatal::die(
+                        crate::fatal::Fatal::CudaDriver,
+                        &format!("cuEventCreate (stream pool) failed: {r:?}"),
+                    );
+                }
+                ev
+            }
+        };
+        let r = unsafe { cuEventRecord(ev, stream) };
+        if r != CUresult::CUDA_SUCCESS {
+            crate::fatal::die(
+                crate::fatal::Fatal::CudaDriver,
+                &format!("cuEventRecord (stream pool) failed: {r:?}"),
+            );
+        }
+        ev
+    }
+
+    /// Make `stream` wait for `ev` without blocking the host.
+    pub(crate) fn wait(&self, stream: CUstream, ev: CUevent) {
+        let r = unsafe { cuStreamWaitEvent(stream, ev, 0) };
+        if r != CUresult::CUDA_SUCCESS {
+            crate::fatal::die(
+                crate::fatal::Fatal::CudaDriver,
+                &format!("cuStreamWaitEvent (stream pool) failed: {r:?}"),
+            );
+        }
+    }
+
+    /// Return an event to the pool.
+    ///
+    /// Safe as soon as every wait that needed it has been *enqueued*, not
+    /// only once they have completed: `cuStreamWaitEvent` captures the
+    /// event's state at call time, so a later `cuEventRecord` on the same
+    /// handle cannot retroactively change what an already-issued wait waits
+    /// for. A caller that has neither waited nor synchronised must not
+    /// recycle.
+    pub(crate) fn recycle(&self, ev: CUevent) {
+        self.events.lock().unwrap().push(ev as usize);
+    }
+}
+
+/// Shared body of [`StreamPool::compute`] / `transfer` / `inspect`: read the
+/// cell, create the stream on a miss.
+///
+/// `activate` runs ONLY on the miss, because that is when a live context is
+/// needed. Calling it on every read would put a `cuCtxSetCurrent` on the
+/// launch path, where before this step the hit was a thread-local read and
+/// nothing else.
+fn named(cell: &Cell<usize>, flags: u32, what: &str, activate: impl FnOnce()) -> CUstream {
+    let cur = cell.get();
+    if cur != 0 {
+        return cur as CUstream;
+    }
+    activate();
+    let mut stream: CUstream = std::ptr::null_mut();
+    let r = unsafe { cuStreamCreate(&mut stream, flags) };
+    if r != CUresult::CUDA_SUCCESS {
+        crate::fatal::die(
+            crate::fatal::Fatal::CudaDriver,
+            &format!("cuStreamCreate ({what}) failed: {r:?}"),
+        );
+    }
+    cell.set(stream as usize);
+    stream
 }
 
 /// One slot per device. Sized 1 in this step; `cuDeviceGetCount()` in step 5.
@@ -281,6 +669,7 @@ unsafe fn init_device(slot: usize) -> CudaContext {
         CudaContext {
             device: dev,
             primary,
+            streams: StreamPool::new(slot),
             modules: Mutex::new(ModuleCache {
                 modules: HashMap::new(),
                 funcs: HashMap::new(),
@@ -317,6 +706,100 @@ mod tests {
     /// the test does not depend on which other test in this binary ran
     /// first: whatever the answer is, calling the probe — and touching the
     /// slot table it reads — must not change it.
+    /// The slot bookkeeping is reachable without a device, which is the
+    /// whole reason `with_slot` / `with_workspace` live on `StreamPool`
+    /// rather than behind `CudaContext`'s driver handles: CPU CI can run
+    /// them. A `StreamPool` touches the driver only in `lease`, `record`,
+    /// `wait` and the three named-stream accessors — none of which these
+    /// tests call.
+    fn test_pool(slot: usize) -> StreamPool {
+        StreamPool::new(slot)
+    }
+
+    #[derive(Default, PartialEq, Debug)]
+    struct ProbeA(u64);
+    #[derive(Default, PartialEq, Debug)]
+    struct ProbeB(u64);
+
+    /// A workspace is created once and then reused: the whole point of the
+    /// cells this replaced.
+    #[test]
+    fn a_workspace_is_created_once_and_then_reused() {
+        let pool = test_pool(0);
+        assert_eq!(pool.with_workspace(|w: &mut ProbeA| w.0), 0, "not default");
+        pool.with_workspace(|w: &mut ProbeA| w.0 = 7);
+        assert_eq!(pool.with_workspace(|w: &mut ProbeA| w.0), 7, "not reused");
+    }
+
+    /// Two workspace types in one slot are two workspaces. Keying by
+    /// `TypeId` is what lets `WS`, `SR_WS`, `CE_SCRATCH`, `MUON_STATS_BUF`
+    /// and `WS_CACHE` share one map without this module naming any of them.
+    #[test]
+    fn workspace_types_do_not_collide() {
+        let pool = test_pool(0);
+        pool.with_workspace(|w: &mut ProbeA| w.0 = 1);
+        pool.with_workspace(|w: &mut ProbeB| w.0 = 2);
+        assert_eq!(pool.with_workspace(|w: &mut ProbeA| w.0), 1);
+        assert_eq!(pool.with_workspace(|w: &mut ProbeB| w.0), 2);
+    }
+
+    /// Re-entrancy is the property the `Box` + released-borrow dance exists
+    /// for: the real `WS` closure calls `current_stream()`, which reaches
+    /// back into the same slot. A `RefCell` still held across `f` would
+    /// panic here instead.
+    #[test]
+    fn a_workspace_closure_may_reach_back_into_its_slot() {
+        let pool = test_pool(0);
+        let inner = pool.with_workspace(|a: &mut ProbeA| {
+            a.0 = 3;
+            // Another workspace, and the slot's stream cells, from inside.
+            let b = pool.with_workspace(|b: &mut ProbeB| {
+                b.0 = 4;
+                b.0
+            });
+            let created = pool.transfer_if_created();
+            assert!(created.is_none(), "no driver call was made");
+            a.0 + b
+        });
+        assert_eq!(inner, 7);
+        assert_eq!(pool.with_workspace(|a: &mut ProbeA| a.0), 3);
+    }
+
+    /// Two registry slots are two sets of per-thread state — the device
+    /// affinity this step adds on top of the thread affinity that was
+    /// already there. With `SLOTS == 1` nothing in production exercises
+    /// this yet; step 5 does, and this is what says it works.
+    #[test]
+    fn slots_do_not_share_workspaces() {
+        let a = test_pool(0);
+        let b = test_pool(3);
+        a.with_workspace(|w: &mut ProbeA| w.0 = 11);
+        b.with_workspace(|w: &mut ProbeA| w.0 = 22);
+        assert_eq!(a.with_workspace(|w: &mut ProbeA| w.0), 11);
+        assert_eq!(b.with_workspace(|w: &mut ProbeA| w.0), 22);
+    }
+
+    /// `transfer_if_created` must not create: it is what keeps
+    /// `transfer_stream_synchronize` a no-op on a thread that never
+    /// transferred, which is in turn what keeps the offload drain safe to
+    /// call unconditionally.
+    #[test]
+    fn the_transfer_probe_does_not_create_a_stream() {
+        let pool = test_pool(2);
+        assert!(pool.transfer_if_created().is_none());
+        assert!(pool.transfer_if_created().is_none());
+    }
+
+    /// A recycled event comes back out before a new one is made — the pool
+    /// half of `record`, without the driver half.
+    #[test]
+    fn recycled_events_are_reused_before_new_ones() {
+        let pool = test_pool(0);
+        pool.recycle(0xbeef as CUevent);
+        assert_eq!(pool.events.lock().unwrap().pop(), Some(0xbeef));
+        assert!(pool.events.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn the_probe_does_not_force_initialisation() {
         let before = initialized();
