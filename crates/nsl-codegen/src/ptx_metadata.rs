@@ -25,7 +25,8 @@
 /// Per-register-class declared counts for one kernel.
 ///
 /// Mirrors the register classes the PTX backend emits (`backend_ptx.rs`):
-/// `%r` (u32), `%rd` (u64), `%f` (f32), `%fd` (f64), `%h` (f16), `%p` (pred).
+/// `%r` (u32), `%rd` (u64), `%f` (f32), `%fd` (f64), `%h` (f16), `%p` (pred),
+/// `%v` (b32 packed fragment, used by `mma.sync`/`ldmatrix` operands).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegisterCounts {
     /// 32-bit integer registers (`%r`).
@@ -40,6 +41,10 @@ pub struct RegisterCounts {
     pub f16_regs: u32,
     /// Predicate registers (`%p`).
     pub pred_regs: u32,
+    /// 32-bit packed-fragment registers (`%v`), emitted for `mma.sync`
+    /// operands. Left uncounted here, `total()` undercounts exactly the
+    /// tensor-core fusion kernels the register cap exists to protect.
+    pub v_regs: u32,
 }
 
 impl RegisterCounts {
@@ -53,6 +58,7 @@ impl RegisterCounts {
             + self.f64_regs
             + self.f16_regs
             + self.pred_regs
+            + self.v_regs
     }
 }
 
@@ -214,7 +220,7 @@ pub fn format_ptx_metadata_report(kernels: &[KernelMetadata]) -> String {
         let r = &k.registers;
         let _ = writeln!(
             s,
-            "    registers: {} total (u32={}, u64={}, f32={}, f64={}, f16={}, pred={})",
+            "    registers: {} total (u32={}, u64={}, f32={}, f64={}, f16={}, pred={}, v={})",
             r.total(),
             r.u32_regs,
             r.u64_regs,
@@ -222,6 +228,7 @@ pub fn format_ptx_metadata_report(kernels: &[KernelMetadata]) -> String {
             r.f64_regs,
             r.f16_regs,
             r.pred_regs,
+            r.v_regs,
         );
         let dyn_note = if k.has_dynamic_shared {
             " (+ dynamic extern .shared sized at launch)"
@@ -331,6 +338,8 @@ fn accumulate_reg(line: &str, counts: &mut RegisterCounts) {
         &mut counts.f16_regs
     } else if line.contains("%p") {
         &mut counts.pred_regs
+    } else if line.contains("%v") {
+        &mut counts.v_regs
     } else {
         return;
     };
@@ -503,5 +512,39 @@ mod tests {
         assert!(!report.contains("WARNING"));
         assert!(report.contains("48 total"));
         assert!(report.contains("512 bytes"));
+    }
+
+    /// `%v<N>` (the packed-fragment class `backend_ptx.rs` emits for
+    /// `mma.sync`/`ldmatrix` operands) must be counted like every other
+    /// register class, or an mma.sync-heavy kernel can silently exceed the
+    /// 255-register cap with no warning.
+    #[test]
+    fn v_class_registers_are_counted() {
+        const MMA_SAMPLE: &str = r#"
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry gemm_kernel(
+    .param .u64 a
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b32 %v<300>;
+    .reg .f32 %f<8>;
+    ret;
+}
+"#;
+        let k = extract_ptx_metadata(MMA_SAMPLE.as_bytes());
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0].registers.v_regs, 300, "the %v class must be parsed, not dropped");
+        assert_eq!(k[0].registers.total(), 2 + 4 + 300 + 8);
+
+        let report = format_ptx_metadata_report(&k);
+        assert!(
+            report.contains("WARNING"),
+            "a kernel whose %v registers alone exceed the 255 cap must warn, got: {report}"
+        );
     }
 }

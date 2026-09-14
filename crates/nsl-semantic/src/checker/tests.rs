@@ -3155,3 +3155,45 @@ fn duplicate_callback_definition_is_refused() {
         "distinct callbacks across sections must stay legal, got {errs:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Bitwise ops (`|` / `&`) on tensors: shape-checked like arithmetic
+// -----------------------------------------------------------------------
+
+#[test]
+fn bitwise_and_on_mismatched_tensor_shapes_is_refused() {
+    // `&`/`|` used for boolean masks previously skipped shape checking
+    // entirely (`BinOp::BitOr | BinOp::BitAnd => lty`), so a shape-mismatched
+    // mask combination type-checked silently with no diagnostic.
+    let src = concat!(
+        "fn f(a: Tensor<[4], bool>, b: Tensor<[8], bool>) -> Tensor<[4], bool>:\n",
+        "    return a & b\n",
+    );
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| format!("{d:?}").contains("shape mismatch")),
+        "expected a shape mismatch diagnostic for `&` on Tensor<[4]> and Tensor<[8]>, got: {diags:?}"
+    );
+}
+
+#[test]
+fn bitwise_or_on_matching_tensor_shapes_is_accepted() {
+    let src = concat!(
+        "fn f(a: Tensor<[4], bool>, b: Tensor<[4], bool>) -> Tensor<[4], bool>:\n",
+        "    return a | b\n",
+    );
+    let diags = check_source(src);
+    assert!(
+        !diags.iter().any(|d| format!("{d:?}").contains("shape mismatch")),
+        "matching shapes must not produce a shape mismatch, got: {diags:?}"
+    );
+}
+
+#[test]
+fn bitwise_and_on_ints_still_type_checks_as_before() {
+    // Scalar bitwise ops have no shape to check; must keep working exactly
+    // as before the tensor-shape fix.
+    let src = "fn f(a: int, b: int) -> int:\n    return a & b\n";
+    let diags = check_source(src);
+    assert!(diags.is_empty(), "scalar `&` must stay legal, got: {diags:?}");
+}
