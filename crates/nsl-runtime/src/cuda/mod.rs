@@ -2239,21 +2239,13 @@ pub use cudarc::driver::sys::CUresult;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas_inner {
     use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
-    use std::sync::OnceLock;
 
     /// Newtype wrapper so we can implement `Send`/`Sync` for the raw
     /// `cublasHandle_t` pointer (opaque and thread-safe per cuBLAS docs
     /// when serialized via NSL's existing single-context model).
-    #[derive(Copy, Clone)]
-    pub(crate) struct CublasHandle(pub cublas_sys::cublasHandle_t);
-
-    // SAFETY: cublasHandle_t is an opaque driver-managed pointer. NSL serializes
-    // access via single-threaded GPU dispatch today; the handle is thread-safe
-    // per the cuBLAS API for multi-thread use with external serialization.
-    unsafe impl Send for CublasHandle {}
-    unsafe impl Sync for CublasHandle {}
-
-    static CUBLAS_HANDLE: OnceLock<CublasHandle> = OnceLock::new();
+    /// Roadmap A4 step 3a: the newtype and its `Send`/`Sync` justification
+    /// moved to `cuda::context`, which owns the field the handle lives in.
+    pub(crate) use super::context::CublasHandle;
 
     /// cuBLAS math-mode selection (spec §9). Resolved ONCE at `OnceLock`
     /// init time and baked into the handle via `cublasSetMathMode`.
@@ -2419,7 +2411,12 @@ pub(crate) mod cublas_inner {
     /// FFI since cudarc does not expose it through its safe API.  Logs the
     /// active mode once at init for discoverability (spec §9).
     pub(crate) fn cublas_handle() -> cublas_sys::cublasHandle_t {
-        CUBLAS_HANDLE
+        // Roadmap A4 step 3a: the handle lives on the current device's
+        // context. Same `OnceLock`, so still created exactly once — but once
+        // PER DEVICE rather than per process, which is what a handle bound to
+        // a context has to be.
+        let ctx = super::context::current();
+        ctx.cublas
             .get_or_init(|| {
                 // Ensure the CUDA primary context is current on this thread
                 // before calling any cuBLAS API (cuBLAS piggybacks the current
