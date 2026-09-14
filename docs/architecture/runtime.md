@@ -329,8 +329,17 @@ are shims over `context::current()`, so no call site names a context.
 **The registry has one slot today** (roadmap A4 step 1 built the shape; step
 5 grows it to `cuDeviceGetCount()` and starts resolving each op through the
 `device` byte its tensors already carry). So there is still exactly one
-device, one context, and one cuBLAS handle (`cublas_handle()`, lazily
-created) per process, and multi-GPU still means one process per device.
+device and one context per process, and multi-GPU still means one process
+per device.
+
+**Library handles** live on the context (roadmap A4 step 3a): the cuBLAS
+handle (`cublas_handle()`), the cublasLt handle, its device workspace and its
+per-shape plan cache. Each binds the CUDA context that was current when it
+was created, which is why they are device state and not process state — one
+per device, still created exactly once each. `RESOLVED_MATH_MODE` is the
+deliberate exception and stays process-global: it caches an env read, and a
+per-device copy could let the handle and the transpose-dispatch coupling
+disagree about the math mode, which is the bug it exists to prevent.
 
 **Streams and workspaces** live on the context's `StreamPool` (roadmap A4
 step 2), one set per **(thread, device)**: the blocking compute stream, the

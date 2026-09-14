@@ -94,7 +94,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use cudarc::cublaslt::sys as lt;
 
@@ -129,8 +129,18 @@ unsafe impl Send for Plan {}
 /// without re-querying per GEMM.
 type Key = (i32, i32, i32, i32, i32, i32, i32, i32); // (opa, opb, m, n, k, lda, ldb, ldc)
 
-static PLANS: LazyLock<Mutex<HashMap<Key, Option<Plan>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Roadmap A4 step 3a: was a `PLANS` `LazyLock<Mutex<..>>` static; now one
+/// map per device, parked on the CUDA context and keyed by this type. The
+/// `Plan` type and the cache's contents stay here — the context names
+/// neither.
+#[derive(Default)]
+struct PlanCache(HashMap<Key, Option<Plan>>);
+
+/// Run `f` against this device's plan cache. Holds the context's cache mutex
+/// for the duration, exactly as the `PLANS` mutex did.
+fn with_plans<R>(f: impl FnOnce(&mut HashMap<Key, Option<Plan>>) -> R) -> R {
+    super::context::current().with_cache(|c: &mut PlanCache| f(&mut c.0))
+}
 
 // Diagnostic counters (relaxed; teardown line + gates). `ISSUED` counts
 // GEMMs launched through cublasLt; `TUNED` counts shapes that went through a
@@ -215,17 +225,18 @@ pub(crate) fn stats() -> (u64, u64, u64) {
     )
 }
 
-struct LtHandle(lt::cublasLtHandle_t);
-// SAFETY: cublasLt handles are documented thread-safe; ours is used from the
-// single GPU-work thread only.
-unsafe impl Send for LtHandle {}
-unsafe impl Sync for LtHandle {}
+/// Roadmap A4 step 3a: the newtype and its `Send`/`Sync` justification moved
+/// to `cuda::context`, which owns the field the handle lives in.
+use super::context::LtHandle;
 
 /// Process-global cublasLt handle, created on first engaged GEMM. `None`
 /// (creation failed) makes every call fall back — printed once below.
 fn lt_handle() -> Option<lt::cublasLtHandle_t> {
-    static HANDLE: OnceLock<Option<LtHandle>> = OnceLock::new();
-    HANDLE
+    // Roadmap A4 step 3a: per device, not per process — a cublasLt handle
+    // binds the context current at `cublasLtCreate`. Same `OnceLock`, so the
+    // creation and its one-time failure diagnostic still happen exactly once.
+    let ctx = super::context::current();
+    ctx.cublaslt
         .get_or_init(|| {
             super::inner::ensure_context();
             let mut h: lt::cublasLtHandle_t = std::ptr::null_mut();
@@ -266,8 +277,10 @@ fn lt_handle() -> Option<lt::cublasLtHandle_t> {
 /// heuristics then select zero-workspace kernels, which is still at worst
 /// DFALT-equivalent.
 fn workspace() -> (u64, usize) {
-    static WS: OnceLock<(u64, usize)> = OnceLock::new();
-    *WS.get_or_init(|| {
+    // Roadmap A4 step 3a: a device pointer, so per device. Still allocated
+    // once and never freed — captured graph nodes may reference it for the
+    // life of the process.
+    *super::context::current().lt_workspace.get_or_init(|| {
         let bytes = workspace_bytes_configured();
         if bytes == 0 {
             return (0, 0);
@@ -614,10 +627,9 @@ pub(crate) unsafe fn matmul_bf16_f32(
     // (which synchronizes the device while timing) nor across the launch —
     // holding a lock over device-blocking work is how unrelated paths
     // (teardown atexit, test resets) end up serialized behind a GEMM.
-    let hit = {
-        let plans = PLANS.lock().unwrap();
+    let hit = with_plans(|plans| {
         plans.get(&key).map(|p| p.as_ref().map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes)))
-    };
+    });
     let (desc, adesc, bdesc, cdesc, algo, ws_need) = match hit {
         Some(Some(t)) => t,
         Some(None) => {
@@ -636,32 +648,38 @@ pub(crate) unsafe fn matmul_bf16_f32(
             // the incumbent and destroy the newcomer's handles instead of
             // leaking or double-caching. (Single-threaded today; cheap
             // insurance regardless.)
-            let mut plans = PLANS.lock().unwrap();
-            match plans.entry(key) {
+            // The closure yields `None` where this block used to `return
+            // false` — a closure cannot return from the enclosing fn, and the
+            // counter bump and the one-time print happen inside it either way.
+            let resolved = with_plans(|plans| match plans.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     if let Some(p) = plan {
                         // SAFETY: newcomer's handles, never published.
                         unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
                     }
                     match e.get() {
-                        Some(p) => (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes),
+                        Some(p) => Some((p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes)),
                         None => {
                             FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                            return false;
+                            None
                         }
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
                     v.insert(plan);
                     match tuple {
-                        Some(t) => t,
+                        Some(t) => Some(t),
                         None => {
                             FALLBACKS.fetch_add(1, Ordering::Relaxed);
                             print_fallback_once("no heuristic candidate for a shape");
-                            return false;
+                            None
                         }
                     }
                 }
+            });
+            match resolved {
+                Some(t) => t,
+                None => return false,
             }
         }
     };
@@ -701,7 +719,7 @@ pub(crate) unsafe fn matmul_bf16_f32(
         // cached, heuristic-validated algo failing transiently is itself a
         // machine-state anomaly no local choice repairs; documented rather
         // than masked.
-        let displaced = PLANS.lock().unwrap().insert(key, None);
+        let displaced = with_plans(|plans| plans.insert(key, None));
         if let Some(Some(p)) = displaced {
             // SAFETY: just removed from the map; no launch is in flight with
             // these handles (single-threaded GPU work) and cublasLt keeps no

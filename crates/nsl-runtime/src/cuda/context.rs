@@ -118,6 +118,22 @@ pub(crate) struct CudaContext {
     pub(crate) async_allocs: Mutex<HashSet<usize>>,
     /// Was `CUDA_ALLOC_SET` — every allocation, so frees can be validated.
     pub(crate) allocs: Mutex<HashSet<usize>>,
+    /// Roadmap A4 step 3a: was `inner`'s `CUBLAS_HANDLE`. A cuBLAS handle
+    /// binds whichever CUDA context was current when it was created, so it is
+    /// device state; `OnceLock` keeps the exactly-once creation the static
+    /// had.
+    pub(crate) cublas: OnceLock<CublasHandle>,
+    /// Was `lt_matmul`'s `HANDLE`. `None` means `cublasLtCreate` failed and
+    /// every GEMM falls back — cached so the failure is diagnosed once.
+    pub(crate) cublaslt: OnceLock<Option<LtHandle>>,
+    /// Was `lt_matmul`'s `WS`: the cublasLt workspace as `(device ptr, bytes)`,
+    /// `(0, 0)` if the allocation failed. A device pointer, hence per device.
+    /// Never freed — captured graph nodes may reference it for the life of the
+    /// process, exactly as before.
+    pub(crate) lt_workspace: OnceLock<(u64, usize)>,
+    /// Was `lt_matmul`'s `PLANS`, reached through [`CudaContext::with_cache`]
+    /// so the plan type stays declared in `lt_matmul`.
+    caches: Mutex<HashMap<TypeId, Box<dyn Any + Send>>>,
 }
 
 // SAFETY: the two raw driver handles (`primary`, and `device` which is an
@@ -225,7 +241,63 @@ impl CudaContext {
     ) -> R {
         self.streams.with_workspace(f)
     }
+
+    /// Run `f` against this DEVICE's cache of type `T`, creating it with
+    /// `Default` on first use.
+    ///
+    /// The device-level counterpart to [`CudaContext::with_workspace`], and
+    /// the difference is the whole point: a workspace is per (thread, device)
+    /// because a kernel on thread A's stream must not reuse thread B's
+    /// scratch, whereas a cache like `lt_matmul`'s plan map is shared by every
+    /// thread on the device and needs a lock rather than thread affinity. So
+    /// this one hands out `&mut T` *while holding the mutex* — `f` must not
+    /// re-enter for the same `T`, and should not do long GPU work under it.
+    ///
+    /// Keyed by `TypeId` for the same reason as the workspaces: `lt_matmul`'s
+    /// `Plan` stays declared in `lt_matmul`, and this module names no caller's
+    /// type. Roadmap A4 step 3a.
+    pub(crate) fn with_cache<T: Default + Send + 'static, R>(
+        &self,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        let mut map = self.caches.lock().unwrap();
+        let entry = map
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()) as Box<dyn Any + Send>);
+        let t: &mut T = entry
+            .downcast_mut::<T>()
+            .expect("device cache map keyed by TypeId cannot hold another type");
+        f(t)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Roadmap A4 step 3a — the library handles.
+// ---------------------------------------------------------------------------
+
+/// A cuBLAS handle.
+///
+/// Defined here rather than in `cuda::mod`'s `inner` because the context owns
+/// the field; `inner` imports it back. A handle binds the CUDA context that
+/// was current when `cublasCreate_v2` ran, which is exactly why it is device
+/// state and not process state.
+#[derive(Copy, Clone)]
+pub(crate) struct CublasHandle(pub cudarc::cublas::sys::cublasHandle_t);
+
+// SAFETY: `cublasHandle_t` is an opaque library-managed pointer that the Rust
+// side never dereferences. cuBLAS documents handles as usable from multiple
+// threads with external serialization; NSL serializes GPU dispatch.
+unsafe impl Send for CublasHandle {}
+unsafe impl Sync for CublasHandle {}
+
+/// A cublasLt handle. Same ownership story as [`CublasHandle`].
+#[derive(Copy, Clone)]
+pub(crate) struct LtHandle(pub cudarc::cublaslt::sys::cublasLtHandle_t);
+
+// SAFETY: as [`CublasHandle`] — opaque, never dereferenced here, and
+// documented thread-safe by cublasLt.
+unsafe impl Send for LtHandle {}
+unsafe impl Sync for LtHandle {}
 
 // ---------------------------------------------------------------------------
 // Roadmap A4 step 2 — the stream pool and the per-(thread, device) slot.
@@ -679,6 +751,10 @@ unsafe fn init_device(slot: usize) -> CudaContext {
             async_alloc: OnceLock::new(),
             async_allocs: Mutex::new(HashSet::new()),
             allocs: Mutex::new(HashSet::new()),
+            cublas: OnceLock::new(),
+            cublaslt: OnceLock::new(),
+            lt_workspace: OnceLock::new(),
+            caches: Mutex::new(HashMap::new()),
         }
     }
 }

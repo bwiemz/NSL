@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The cuBLAS and cublasLt handles are per device rather than per process
+  (roadmap A4 step 3a). The cuBLAS handle, the cublasLt handle, its device
+  workspace and its per-shape plan cache move onto the device context — each
+  binds the CUDA context current at its creation, so a second device could
+  not have shared them. Each is still created exactly once, now once per
+  device. `RESOLVED_MATH_MODE` deliberately stays process-global: it caches
+  an env read and exists so the handle and the transpose-dispatch coupling
+  cannot disagree about the math mode.
+
+- `CudaContext::with_cache` — the device-level counterpart to the
+  per-(thread, device) `with_workspace` added in step 2. A cache shared by
+  every thread on a device wants a lock rather than thread affinity, so this
+  one hands out `&mut T` under the context's mutex; both are keyed by type so
+  a cache's own types stay declared where they are used.
+
 - CUDA streams and kernel workspaces are per **(thread, device)** rather
   than per thread (roadmap A4 step 2). The three named streams — the
   blocking compute stream, the non-blocking offload transfer stream and the

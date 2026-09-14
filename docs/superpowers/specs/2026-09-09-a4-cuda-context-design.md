@@ -392,6 +392,42 @@ new true statement.
    is restated on the context. `caching_allocator`'s public `LazyLock` is
    replaced by `current().allocator`; its tests keep working through the
    shim.
+
+   **Split into slices, one PR each.** This step as written spans ten-odd
+   statics across seven files — larger than steps 1 and 2 together, and the
+   allocator is the most delicate state in the runtime. Steps 1 and 2 landed
+   as single PRs and the second of them reached `main` having never run a CI
+   lane (it was stacked on step 1's branch, and `ci.yml` only fires for PRs
+   based on `main`), so the whole migration was validated only after it was
+   merged. Slicing is the fix: each slice is based on `main`, gets its own
+   CI, and is small enough to read.
+
+   - **3a — the library handles. Done.** `CUBLAS_HANDLE`, and `lt_matmul`'s
+     `HANDLE`, `WS` (the cublasLt device workspace) and `PLANS`.
+   - **3b** — the device caches: `bf16_cast_cache`, `strided_copy`,
+     `tier_b1_prepass`, `FP8_SCALES`.
+   - **3c** — the regions: the slab and transient-arena base/size.
+   - **3d** — `CACHING_ALLOCATOR` and the lock-order restatement, last
+     because it is the one with a public `LazyLock` and external callers.
+
+   Two notes from 3a:
+
+   - `RESOLVED_MATH_MODE` **stays a process static** and is not moved. It
+     caches an env-var read (`NSL_MATMUL_TF32`), holds no device handle, and
+     exists precisely so the handle and the transpose-dispatch coupling
+     cannot disagree about the mode within one process — per-device copies
+     would reintroduce the mixed-cell bug it was added to close. Same
+     reasoning that kept the `NSL_CUDA_SYNC` flag and the memstats hook in
+     `on_first_context()` at step 1.
+   - The handle newtypes (`CublasHandle`, `LtHandle`) moved **into**
+     `context.rs`, and `inner` / `lt_matmul` import them back. The
+     alternative — naming those modules' types from `context.rs` — inverts
+     the dependency. `lt_matmul`'s `Plan` did *not* move: its cache goes
+     through a new `CudaContext::with_cache`, the device-level counterpart
+     to step 2's per-thread `with_workspace`, so the plan type stays where
+     it is used. `with_cache` hands out `&mut T` while holding the context's
+     mutex, which is what a cache shared by every thread on the device wants
+     and what a thread-affine workspace does not.
 4. **Capture and placement state.** graph_capture's four cells and its
    param-info cache, `CURRENT_POOL`, the arena's `PIN` / `PLACED_AT` become
    `CaptureState` and the allocator's placement channel on the context
