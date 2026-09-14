@@ -1265,43 +1265,26 @@ pub(crate) mod inner {
     // finished) is enforced per copy with a NULL-stream event that the
     // transfer stream waits on.
     //
-    // CUDA contexts are THREAD-LOCAL in this runtime, so the stream is
-    // thread-local too (mirrors `inspect/stream.rs`). Env kill-switches
+    // The CUDA context is made current PER THREAD by the driver, so the
+    // stream is per (thread, device) too — it lives on the context's
+    // `StreamPool` (roadmap A4 step 2), which is also where
+    // `inspect/stream.rs`'s stream now lives. Env kill-switches
     // (documented at their read sites in `tensor/mod.rs`):
     //   NSL_OFFLOAD_SYNC=1     — force synchronous copy-back
     //   NSL_OFFLOAD_PAGEABLE=1 — force pageable host state buffers
     // ------------------------------------------------------------------
 
-    thread_local! {
-        // CUstream stored as usize (raw handles are !Send; 0 = not created).
-        static TRANSFER_STREAM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
-    /// Lazily create (once per thread) and return the offload transfer
-    /// stream. Must only be called when a CUDA context exists (it calls
-    /// `ensure_context`, which force-initializes CUDA).
+    /// Lazily create (once per thread AND device) and return the offload
+    /// transfer stream. Must only be called when a CUDA context exists (it
+    /// calls `ensure_context`, which force-initializes CUDA).
+    ///
+    /// Roadmap A4 step 2: the handle moved from a `TRANSFER_STREAM`
+    /// thread-local here to the current context's `StreamPool`, which keeps
+    /// one per (thread, device). Same stream, same flags, same lazy
+    /// creation — this is the shim.
     pub(crate) fn transfer_stream() -> CUstream {
-        TRANSFER_STREAM.with(|s| {
-            let cur = s.get();
-            if cur != 0 {
-                return cur as CUstream;
-            }
-            ensure_context();
-            let mut stream: CUstream = std::ptr::null_mut();
-            unsafe {
-                // 0x1 = CU_STREAM_NON_BLOCKING: no implicit synchronization
-                // with the legacy NULL stream (ordering is via events).
-                let result = cuStreamCreate(&mut stream, 0x1);
-                assert_eq!(
-                    result,
-                    CUresult::CUDA_SUCCESS,
-                    "cuStreamCreate (offload transfer stream) failed: {:?}",
-                    result
-                );
-            }
-            s.set(stream as usize);
-            stream
-        })
+        let ctx = super::context::current();
+        ctx.streams.transfer(|| ctx.activate())
     }
 
     /// Make the calling thread's transfer stream wait for all previously
@@ -1396,14 +1379,20 @@ pub(crate) mod inner {
         }
     }
 
-    /// Item 11: issue an HtoD PREFETCH on the transfer stream that does NOT
+    /// Item 11: issue an HtoD PREFETCH on a non-blocking stream that does NOT
     /// wait on prior compute (unlike `memcpy_htod_async`, whose copy is
     /// ordered after the compute that produced its source). A prefetch's
     /// source is a stable pinned host buffer already filled on the host, so
     /// the copy can start immediately and run CONCURRENTLY with compute. The
-    /// returned event is recorded on the transfer stream right after the copy;
+    /// returned event is recorded on that stream right after the copy;
     /// the consumer discharges it with `compute_stream_wait_event` before any
     /// kernel reads `dst_device`. `src_host` must be pinned for true async DMA.
+    ///
+    /// Which non-blocking stream: the shared offload transfer stream by
+    /// default, or a leased one under `NSL_WS_PREFETCH_LEASE=1` (roadmap A4
+    /// step 2). Both are `CU_STREAM_NON_BLOCKING`, so neither is ordered by
+    /// the legacy NULL stream's implicit barrier and the event discipline
+    /// below is what makes the copy safe in either mode.
     ///
     /// CADENCE assume/guarantee: ASSUME (1) `dst_device` has no other pending
     /// writer and (2) `src_host` is not re-written until this copy completes —
@@ -1419,9 +1408,28 @@ pub(crate) mod inner {
         src_host: *const c_void,
         size_bytes: usize,
     ) -> u64 {
+        let ctx = super::context::current();
+        ctx.activate();
+
+        // Roadmap A4 step 2: the first user of a stream lease. Off the
+        // transfer stream, this copy stops serialising behind the offload
+        // copy-back that shares it — the overlap the `StreamLease` API
+        // exists for. Default OFF because CPU CI cannot observe a GPU
+        // ordering regression: the shared-stream path below is what ships
+        // until `scripts/gpu-tier.sh` has run the leased one.
+        //
+        // Either way the ordering contract is the same and is the caller's:
+        // the returned event, waited on the compute stream by
+        // `compute_stream_wait_event`, is what orders this copy before every
+        // later read of `dst_device`. The teardown drain covers both streams
+        // unconditionally (see `arena_teardown`), so the two modes differ in
+        // overlap, never in safety.
+        let lease = lease_prefetch_stream().then(|| ctx.streams.lease());
+        let stream = match &lease {
+            Some(l) => l.stream(),
+            None => transfer_stream(),
+        };
         crate::host_profile::record_h2d(size_bytes);
-        ensure_context();
-        let stream = transfer_stream();
         unsafe {
             let result =
                 cuMemcpyHtoDAsync_v2(dst_device as CUdeviceptr, src_host, size_bytes, stream);
@@ -1432,14 +1440,34 @@ pub(crate) mod inner {
                 size_bytes,
                 result
             );
-            let mut ev: CUevent = std::ptr::null_mut();
-            // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest).
-            let r = cuEventCreate(&mut ev, 0x2);
-            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (prefetch) failed: {:?}", r);
-            let r = cuEventRecord(ev, stream);
-            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (prefetch) failed: {:?}", r);
-            ev as u64
         }
+        // The event comes from (and goes back to) the context's pool rather
+        // than being freshly created and destroyed per prefetch.
+        ctx.streams.record(stream) as u64
+    }
+
+    /// `NSL_WS_PREFETCH_LEASE=1` — issue weight-stream prefetches on a leased
+    /// non-blocking stream instead of sharing the offload transfer stream.
+    /// Read once, cached, like the other stream kill-switches.
+    fn lease_prefetch_stream() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("NSL_WS_PREFETCH_LEASE").ok().as_deref() == Some("1")
+        })
+    }
+
+    /// Drain every stream the current device's pool has leased.
+    ///
+    /// Teardown paths that free a buffer a prefetch may still be writing call
+    /// this next to `transfer_stream_synchronize`; it is a no-op when nothing
+    /// was ever leased, which is the default configuration.
+    pub(crate) fn lease_streams_synchronize() {
+        if !super::context::initialized() {
+            return;
+        }
+        let ctx = super::context::current();
+        ctx.activate();
+        ctx.streams.synchronize_leases();
     }
 
     /// Item 11 (writeback half): issue a DtoH WRITEBACK on the transfer
@@ -1517,17 +1545,20 @@ pub(crate) mod inner {
         if ev == 0 {
             return;
         }
-        ensure_context();
-        unsafe {
-            let r = cuStreamWaitEvent(current_stream(), ev as CUevent, 0);
-            assert_eq!(
-                r,
-                CUresult::CUDA_SUCCESS,
-                "cuStreamWaitEvent (prefetch await) failed: {:?}",
-                r
-            );
-            cuEventDestroy_v2(ev as CUevent);
-        }
+        let ctx = super::context::current();
+        ctx.activate();
+        // Roadmap A4 step 2: the wait and the event's return to the pool go
+        // through the pool that issued it, replacing the open-coded
+        // `cuStreamWaitEvent` + `cuEventDestroy_v2` pair. `cuStreamWaitEvent`
+        // captures the event's state at call time, so the event is reusable
+        // the moment the wait is enqueued: a later record on the recycled
+        // handle cannot change what this wait waits for.
+        //
+        // `current_stream()`, not `ctx.streams.compute()`: the wait must land
+        // on the NULL stream under `NSL_LEGACY_NULL_STREAM=1`, as it did
+        // before, and only `current_stream` reads that kill-switch.
+        ctx.streams.wait(current_stream(), ev as CUevent);
+        ctx.streams.recycle(ev as CUevent);
     }
 
     // no caller anywhere in the CUDA build. Kept rather than deleted here:
@@ -1569,24 +1600,30 @@ pub(crate) mod inner {
     /// Synchronize the calling thread's transfer stream. No-op when the
     /// stream was never created on this thread (does NOT force-initialize
     /// CUDA — safe to call unconditionally from the offload drain).
+    ///
+    /// The `context_initialized()` guard is what keeps the no-force promise
+    /// after roadmap A4 step 2 moved the handle onto the context: with no
+    /// context there is no stream to synchronize, so reaching for one would
+    /// only be a way to `cuInit` from a drain path.
     pub(crate) fn transfer_stream_synchronize() {
         super::graph_capture::taint("transfer-stream synchronize");
-        TRANSFER_STREAM.with(|s| {
-            let cur = s.get();
-            if cur == 0 {
-                return;
-            }
-            ensure_context();
-            unsafe {
-                let result = cuStreamSynchronize(cur as CUstream);
-                assert_eq!(
-                    result,
-                    CUresult::CUDA_SUCCESS,
-                    "cuStreamSynchronize (offload transfer stream) failed: {:?}",
-                    result
-                );
-            }
-        })
+        if !super::context::initialized() {
+            return;
+        }
+        let ctx = super::context::current();
+        let Some(stream) = ctx.streams.transfer_if_created() else {
+            return;
+        };
+        ctx.activate();
+        unsafe {
+            let result = cuStreamSynchronize(stream);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuStreamSynchronize (offload transfer stream) failed: {:?}",
+                result
+            );
+        }
     }
 
     /// Fill device memory with an arbitrary byte.
@@ -1711,7 +1748,8 @@ pub(crate) mod inner {
     }
 
     // ------------------------------------------------------------------
-    // Per-thread COMPUTE stream — p8 PR-A stream migration
+    // Per-(thread, device) COMPUTE stream — p8 PR-A stream migration,
+    // re-homed onto the context's `StreamPool` by roadmap A4 step 2.
     //
     // All kernel launches (and cuBLAS, via a per-call cublasSetStream_v2)
     // now issue onto a dedicated per-thread stream created with
@@ -1730,10 +1768,6 @@ pub(crate) mod inner {
     // modes bit-identical.
     // ------------------------------------------------------------------
 
-    thread_local! {
-        // CUstream stored as usize (raw handles are !Send; 0 = not created).
-        static COMPUTE_STREAM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
     static LEGACY_NULL_STREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
     /// Returns the CUstream that `kernel_launch` issues work onto: the
@@ -1750,8 +1784,8 @@ pub(crate) mod inner {
     /// Only call when CUDA work is (about to be) in flight — creating the
     /// stream force-initializes the context via `ensure_context`.
     ///
-    /// SAME-THREAD CONTRACT (p8 PR-A): the compute stream is per-thread and
-    /// two blocking streams do NOT synchronize with each other (only with the
+    /// SAME-THREAD CONTRACT (p8 PR-A): the compute stream is per (thread,
+    /// device) and two blocking streams do NOT synchronize with each other (only with the
     /// legacy NULL stream). Every consumer that records ordering events
     /// against "the work that touched this buffer" (`defer_free_device*`, the
     /// offload transfer-stream wait) must run on the SAME thread that
@@ -1763,28 +1797,12 @@ pub(crate) mod inner {
         {
             return std::ptr::null_mut();
         }
-        COMPUTE_STREAM.with(|s| {
-            let cur = s.get();
-            if cur != 0 {
-                return cur as CUstream;
-            }
-            ensure_context();
-            let mut stream: CUstream = std::ptr::null_mut();
-            unsafe {
-                // 0 = CU_STREAM_DEFAULT: a BLOCKING stream — implicit two-way
-                // synchronization with the legacy NULL stream (load-bearing;
-                // see the module comment above).
-                let result = cuStreamCreate(&mut stream, 0);
-                assert_eq!(
-                    result,
-                    CUresult::CUDA_SUCCESS,
-                    "cuStreamCreate (compute stream) failed: {:?}",
-                    result
-                );
-            }
-            s.set(stream as usize);
-            stream
-        })
+        // Roadmap A4 step 2: the handle lives on the current context's
+        // `StreamPool`, one per (thread, device). `activate` is what
+        // `ensure_context()` did here before, and like it, it runs only on
+        // the create — a warm launch stays a thread-local read.
+        let ctx = super::context::current();
+        ctx.streams.compute(|| ctx.activate())
     }
 
     pub unsafe fn cu_event_synchronize_raw(event: u64) -> CUresult {
@@ -4404,13 +4422,21 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         /// several lists per optimizer step).
         blk_cache: BlkTableCache,
     }
-    thread_local! {
-        static WS: std::cell::Cell<*mut MultiWs> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Roadmap A4 step 2: was a `WS` thread-local holding this raw pointer;
+    /// now one per (thread, device), keyed by this type on the context. The
+    /// pointer and its ownership rules are unchanged — the workspace is
+    /// grow-only, reused across optimizer steps, and freed only when a larger
+    /// one replaces it.
+    struct WsSlot(*mut MultiWs);
+    impl Default for WsSlot {
+        fn default() -> Self {
+            Self(std::ptr::null_mut())
+        }
     }
 
     inner::set_oom_context("fase_fused_adamw_multi");
-    let ws: &mut MultiWs = WS.with(|c| {
-        let cur = c.get();
+    let ws_raw = context::current().with_workspace(|c: &mut WsSlot| {
+        let cur = c.0;
         let need_new = cur.is_null() || unsafe { (*cur).cap } < k;
         if need_new {
             unsafe {
@@ -4450,7 +4476,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                     ntab,
                     blk_cache: BlkTableCache::default(),
                 }));
-                c.set(fresh);
+                c.0 = fresh;
             }
         } else {
             // Same-cap reuse: the previous optimizer step's uploads read this
@@ -4461,8 +4487,12 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                 assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
             }
         }
-        unsafe { &mut *c.get() }
+        c.0
     });
+    // SAFETY: just set (or reused) above and non-null; the slot is this
+    // thread's alone and nothing re-enters this workspace while `ws` lives —
+    // the same contract the raw-pointer thread-local had.
+    let ws: &mut MultiWs = unsafe { &mut *ws_raw };
 
     unsafe {
         let base = ws.stage as *mut u64;
@@ -4589,14 +4619,18 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
         /// Item 8: per-shape-list block tables (see `BlkTableCache`).
         blk_cache: BlkTableCache,
     }
-    thread_local! {
-        static SR_WS: std::cell::Cell<*mut SrMultiWs> =
-            const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Roadmap A4 step 2: was the `SR_WS` thread-local; now one per
+    /// (thread, device) on the context. See `WsSlot` in the f32 multi above.
+    struct SrWsSlot(*mut SrMultiWs);
+    impl Default for SrWsSlot {
+        fn default() -> Self {
+            Self(std::ptr::null_mut())
+        }
     }
 
     inner::set_oom_context("fase_fused_adamw_multi_bf16sr");
-    let ws: &mut SrMultiWs = SR_WS.with(|c| {
-        let cur = c.get();
+    let ws_raw = context::current().with_workspace(|c: &mut SrWsSlot| {
+        let cur = c.0;
         let need_new = cur.is_null() || unsafe { (*cur).cap } < k;
         if need_new {
             unsafe {
@@ -4637,7 +4671,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
                     ntab,
                     blk_cache: BlkTableCache::default(),
                 }));
-                c.set(fresh);
+                c.0 = fresh;
             }
         } else {
             // Same-cap reuse: the previous optimizer step's uploads read this
@@ -4648,8 +4682,10 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
                 assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
             }
         }
-        unsafe { &mut *c.get() }
+        c.0
     });
+    // SAFETY: as in the f32 multi above.
+    let ws: &mut SrMultiWs = unsafe { &mut *ws_raw };
 
     unsafe {
         let base = ws.stage as *mut u64;
@@ -7316,14 +7352,16 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
     let total = smt.len as u32;
     let rows = total / cols.max(1);
 
-    thread_local! {
-        static CE_SCRATCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-    let scratch = CE_SCRATCH.with(|c| {
-        if c.get() == 0 {
-            c.set(inner::alloc_managed(16) as u64);
+    /// Roadmap A4 step 2: was the `CE_SCRATCH` thread-local; now one per
+    /// (thread, device) on the context. 16 bytes of device scratch, allocated
+    /// once and never freed, exactly as before.
+    #[derive(Default)]
+    struct CeScratch(u64);
+    let scratch = context::current().with_workspace(|c: &mut CeScratch| {
+        if c.0 == 0 {
+            c.0 = inner::alloc_managed(16) as u64;
         }
-        c.get()
+        c.0
     });
 
     let tgt = NslTensor::from_ptr_ref(targets_ptr);
@@ -7447,14 +7485,15 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     }
     let n = a.len as usize;
 
-    thread_local! {
-        static MUON_STATS_BUF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-    let stats_buf = MUON_STATS_BUF.with(|c| {
-        if c.get() == 0 {
-            c.set(inner::alloc_managed(16) as u64);
+    /// Roadmap A4 step 2: was the `MUON_STATS_BUF` thread-local; now one per
+    /// (thread, device) on the context. Same 16-byte allocate-once scratch.
+    #[derive(Default)]
+    struct MuonStatsBuf(u64);
+    let stats_buf = context::current().with_workspace(|c: &mut MuonStatsBuf| {
+        if c.0 == 0 {
+            c.0 = inner::alloc_managed(16) as u64;
         }
-        c.get()
+        c.0
     });
 
     // Launch 1: stats reduction (slot 3 = raw Σx²) into the device scratch.

@@ -44,7 +44,6 @@
 
 #![cfg(feature = "cuda")]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::list::NslList;
@@ -165,9 +164,11 @@ impl GroupWs {
     }
 }
 
-thread_local! {
-    static WS_CACHE: RefCell<HashMap<(usize, usize), GroupWs>> = RefCell::new(HashMap::new());
-}
+/// Roadmap A4 step 2: was the `WS_CACHE` thread-local; now one per
+/// (thread, device), parked on the CUDA context and keyed by this type.
+/// Contents and grow-only reuse policy are unchanged.
+#[derive(Default)]
+struct WsCache(HashMap<(usize, usize), GroupWs>);
 
 #[allow(clippy::too_many_arguments)]
 fn launch(ptx: &'static str, name: &'static [u8], grid: [i64; 3], block: [i64; 3], args: &[*mut std::ffi::c_void], smem: u32) {
@@ -522,8 +523,8 @@ pub extern "C" fn nsl_muon_step_batch(
         // cap so tiny-shape mega-groups sub-chunk instead of aborting the
         // launch (review finding).
         let chunk = (budget_bytes() / per).clamp(1, m_ptrs.len()).min(65535);
-        WS_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
+        crate::cuda::context::current().with_workspace(|cache: &mut WsCache| {
+            let cache = &mut cache.0;
             // Grow-only capacity per shape; reallocate when a bigger chunk
             // arrives (workspace cache is keyed by oriented shape).
             let needs_realloc = match cache.get(&(rp, cp)) {

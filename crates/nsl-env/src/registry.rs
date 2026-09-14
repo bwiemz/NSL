@@ -1482,6 +1482,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Path to write the weight-stream residency decision (reserve, must-free, pinned, PCIe traffic) as JSON at exit."
     ),
     var!(
+        "NSL_WS_PREFETCH_LEASE",
+        Bool,
+        "1 only",
+        "off (prefetch shares the offload transfer stream)",
+        Perf,
+        Runtime,
+        "Set to 1 to issue weight-stream prefetch copies on a leased non-blocking stream instead of sharing the offload transfer stream."
+    ),
+    var!(
         "NSL_WS_RESIDENT",
         Bool,
         "0 = off; anything else = on",
