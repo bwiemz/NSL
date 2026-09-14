@@ -90,7 +90,6 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
 
 struct Entry {
     /// Element count of the parameter. A lookup with a different count (a
@@ -107,15 +106,42 @@ struct Entry {
     valid: bool,
 }
 
-static CACHE: LazyLock<Mutex<HashMap<u64, Entry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The images, held per DEVICE on [`CudaContext`](super::context::CudaContext)
+/// since roadmap A4 step 3b. Every value in an [`Entry`] is a device
+/// allocation of this device's, so a second device sharing this map would
+/// have handed device 0's `buf16` to a GEMM running on device 1.
+///
+/// Reached through `with_cache`, whose contract forbids calling the allocator
+/// inside the closure. That is not a new constraint here — this module
+/// already dropped its own lock before every `alloc_managed`/`free_managed`,
+/// because the OOM recovery re-enters the free hook — but it is now enforced
+/// against every device cache rather than just this one.
+#[derive(Default)]
+struct Images(HashMap<u64, Entry>);
+
+/// Run `f` against this device's image map.
+fn with_images<R>(f: impl FnOnce(&mut HashMap<u64, Entry>) -> R) -> R {
+    super::context::current().with_cache(|c: &mut Images| f(&mut c.0))
+}
 
 /// Fast-path gate: false until the first registration, so runs outside BF16
 /// mode (and the first window inside it) pay one relaxed load per free and
 /// per GEMM operand, nothing more.
+///
+/// Stays a PROCESS static rather than moving onto the context with the map,
+/// and the reason is the cost it exists to avoid: `evict` runs at the top of
+/// every `free_managed`, and this load is what makes that free. Per-device it
+/// would become a registry lookup plus a mutex acquisition on a path that
+/// today touches one relaxed atomic. Its meaning survives the widening — "has
+/// any device ever registered a parameter" — because a false positive costs
+/// only a lookup that misses, never a wrong image: the map it guards is the
+/// per-device one.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // Diagnostic counters (relaxed; read by the gates and the teardown line).
+// Process-wide, and deliberately so: `stats()` feeds one teardown line and the
+// gates that prove the fast path ran, both of which ask a process question.
+// Per-device counters would silently change what those numbers mean.
 // `HITS` counts operand acquisitions served without a cast launch; `RECASTS`
 // counts invalid->valid transitions (one per param per optimizer step, once
 // warm); `EVICTIONS` counts entries dropped for ANY reason — free hook,
@@ -167,8 +193,7 @@ pub(crate) fn note_param_stepped(data: u64, elems: usize) {
         }
         return;
     }
-    let old = {
-        let mut map = CACHE.lock().unwrap();
+    let old = with_images(|map| {
         match map.get_mut(&data) {
             Some(e) if e.elems == elems => {
                 e.valid = false;
@@ -184,7 +209,7 @@ pub(crate) fn note_param_stepped(data: u64, elems: usize) {
                     .map_or(0, |e| e.buf16)
             }
         }
-    };
+    });
     if old != 0 {
         EVICTIONS.fetch_add(1, Ordering::Relaxed);
         super::inner::free_managed(old as *mut std::ffi::c_void);
@@ -208,11 +233,19 @@ pub(crate) fn acquire(data: u64, elems: usize) -> Option<(u64, bool)> {
         return None;
     }
     // First pass under the lock: identify, and detect a missing image.
-    {
-        let mut map = CACHE.lock().unwrap();
-        let e = map.get_mut(&data)?;
+    // `?` cannot cross the closure, so the three outcomes come back as a
+    // value and the early returns happen outside it.
+    enum Probe {
+        Miss,
+        Ready(u64, bool),
+        NeedsImage,
+    }
+    match with_images(|map| {
+        let Some(e) = map.get_mut(&data) else {
+            return Probe::Miss;
+        };
         if e.elems != elems {
-            return None;
+            return Probe::Miss;
         }
         if e.buf16 != 0 {
             let needs = !e.valid;
@@ -222,8 +255,13 @@ pub(crate) fn acquire(data: u64, elems: usize) -> Option<(u64, bool)> {
             } else {
                 HITS.fetch_add(1, Ordering::Relaxed);
             }
-            return Some((e.buf16, needs));
+            return Probe::Ready(e.buf16, needs);
         }
+        Probe::NeedsImage
+    }) {
+        Probe::Miss => return None,
+        Probe::Ready(buf16, needs) => return Some((buf16, needs)),
+        Probe::NeedsImage => {}
     }
     // Image not allocated yet. Allocate WITHOUT the lock (alloc_managed's
     // OOM recovery may re-enter the free hook), then install. If the entry
@@ -233,17 +271,14 @@ pub(crate) fn acquire(data: u64, elems: usize) -> Option<(u64, bool)> {
     if fresh == 0 {
         return None;
     }
-    let install = {
-        let mut map = CACHE.lock().unwrap();
-        match map.get_mut(&data) {
-            Some(e) if e.elems == elems && e.buf16 == 0 => {
-                e.buf16 = fresh;
-                e.valid = true;
-                true
-            }
-            _ => false,
+    let install = with_images(|map| match map.get_mut(&data) {
+        Some(e) if e.elems == elems && e.buf16 == 0 => {
+            e.buf16 = fresh;
+            e.valid = true;
+            true
         }
-    };
+        _ => false,
+    });
     if install {
         RECASTS.fetch_add(1, Ordering::Relaxed);
         Some((fresh, true))
@@ -262,7 +297,7 @@ pub(crate) fn evict(data: u64) {
     if !ACTIVE.load(Ordering::Acquire) || data == 0 {
         return;
     }
-    let removed = CACHE.lock().unwrap().remove(&data);
+    let removed = with_images(|map| map.remove(&data));
     if let Some(e) = removed {
         EVICTIONS.fetch_add(1, Ordering::Relaxed);
         if e.buf16 != 0 {
@@ -294,10 +329,18 @@ pub(crate) fn stats() -> (u64, u64, u64) {
 // already `#[cfg(feature = "cuda")]`, so that axis needs no repeating here.
 #[cfg(feature = "test-hooks")]
 pub(crate) fn reset_for_test() {
-    let drained: Vec<Entry> = {
-        let mut map = CACHE.lock().unwrap();
-        std::mem::take(&mut *map).into_values().collect()
-    };
+    // No context, no images: the map lives on one, and reaching for it here
+    // would force CUDA initialisation from a reset hook — which aborts on a
+    // machine with no driver, where the old process static simply cleared.
+    if !super::context::initialized() {
+        ACTIVE.store(false, Ordering::Release);
+        HITS.store(0, Ordering::Relaxed);
+        RECASTS.store(0, Ordering::Relaxed);
+        EVICTIONS.store(0, Ordering::Relaxed);
+        return;
+    }
+    let drained: Vec<Entry> =
+        with_images(|map| std::mem::take(map).into_values().collect());
     ACTIVE.store(false, Ordering::Release);
     for e in drained {
         if e.buf16 != 0 {

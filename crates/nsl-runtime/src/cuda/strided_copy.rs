@@ -425,10 +425,16 @@ SC_BC4_LOOP:\n\
 SC_BC4_DONE: ret;\n\
 }\0";
 
-/// Memo key: `(device, shape, source strides)`. The destination strides are
-/// derived from the shape, so they add nothing to the identity of a plan.
+/// Memo key: `(shape, source strides)`. The destination strides are derived
+/// from the shape, so they add nothing to the identity of a plan.
+///
+/// The device ordinal used to lead this tuple, because the offset table a plan
+/// carries is a device allocation and handing device 0's pointer to a kernel
+/// on device 1 would read another address space. Roadmap A4 step 3b dropped
+/// it: the memo now lives on the device's own `CudaContext`, so the ordinal is
+/// the map it is found in rather than a field that has to be compared.
 #[cfg(feature = "cuda")]
-type PlanKey = (i32, Vec<i64>, Vec<i64>);
+type PlanKey = (Vec<i64>, Vec<i64>);
 
 /// A resolved plan plus its device-resident offset table.
 ///
@@ -481,34 +487,32 @@ pub(crate) fn resident_plan(
     src_strides: &[i64],
     dst_strides: &[i64],
 ) -> Option<std::sync::Arc<ResidentPlan>> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<PlanKey, Option<Arc<ResidentPlan>>>>> =
-        std::sync::OnceLock::new();
-    static SPENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    use std::sync::Arc;
 
     if !run_path_enabled() {
         return None;
     }
 
-    let device = super::inner::current_device_ordinal();
-    let key = (device, shape.to_vec(), src_strides.to_vec());
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    // Clone the Arc, not the plan, and drop the guard before returning: the
+    let key = (shape.to_vec(), src_strides.to_vec());
+    // Clone the Arc, not the plan, and release the cache before returning: the
     // steady state is one refcount bump per copy.
-    if let Some(hit) = cache.lock().unwrap().get(&key) {
-        return hit.clone();
+    if let Some(hit) = with_memo(|memo| memo.plans.get(&key).cloned()) {
+        return hit;
     }
 
-    // Build outside the lock so a large offset table never serializes lookups.
+    // Build outside the cache so a large offset table never serializes lookups
+    // — and, since step 3b, because `with_memo` holds the mutex every other
+    // device cache shares, under which the allocator must not be called.
     let built = plan_run(shape, src_strides, dst_strides).and_then(|plan| {
         let bytes = std::mem::size_of_val(&plan.src_offsets[..]);
         // Reserve before allocating; a loser of the race simply falls back.
-        if SPENT.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes
-            > OFFSET_TABLE_BUDGET
-        {
-            SPENT.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        if !with_memo(|memo| {
+            if memo.spent + bytes > OFFSET_TABLE_BUDGET {
+                return false;
+            }
+            memo.spent += bytes;
+            true
+        }) {
             return None;
         }
         Some(plan)
@@ -530,31 +534,75 @@ pub(crate) fn resident_plan(
         Arc::new(ResidentPlan { plan, offsets_dev: dev as u64 })
     });
 
-    let mut guard = cache.lock().unwrap();
-    match guard.entry(key) {
+    // Publish, deciding INSIDE the cache and freeing OUTSIDE it. The refund
+    // used to run under the old private lock, which `with_memo` cannot do:
+    // `free_managed`'s first act is `bf16_cast_cache::evict`, another
+    // `with_cache` call on the same mutex, so freeing here would deadlock
+    // against a cache in a different file.
+    enum Publish {
+        /// Ours went in (or replaced a poisoned `None`); nothing to release.
+        Took(Option<Arc<ResidentPlan>>),
+        /// Another thread published first: return theirs, release ours.
+        Lost { winner: Option<Arc<ResidentPlan>>, ours: Arc<ResidentPlan> },
+    }
+    let outcome = with_memo(|memo| match memo.plans.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut slot) => {
             // Another thread published first. If it lost the budget race and
             // published `None` while we succeeded, take ours -- otherwise the
             // key stays permanently poisoned even though the budget is free.
             if slot.get().is_none() && built.is_some() {
                 slot.insert(built.clone());
-                return built;
+                return Publish::Took(built);
             }
-            // Otherwise ours is the duplicate: free it and refund the budget.
-            if let Some(ours) = &built {
-                super::inner::free_managed(ours.offsets_dev as *mut std::ffi::c_void);
-                SPENT.fetch_sub(
-                    std::mem::size_of_val(&ours.plan.src_offsets[..]),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+            match &built {
+                Some(ours) => {
+                    memo.spent -= std::mem::size_of_val(&ours.plan.src_offsets[..]);
+                    Publish::Lost { winner: slot.get().clone(), ours: Arc::clone(ours) }
+                }
+                None => Publish::Took(slot.get().clone()),
             }
-            slot.get().clone()
         }
         std::collections::hash_map::Entry::Vacant(slot) => {
             slot.insert(built.clone());
-            built
+            Publish::Took(built)
+        }
+    });
+    match outcome {
+        Publish::Took(plan) => plan,
+        Publish::Lost { winner, ours } => {
+            // `ours` never reached the map, so this is the only `Arc` to it and
+            // the table it names has no other reader.
+            super::inner::free_managed(ours.offsets_dev as *mut std::ffi::c_void);
+            winner
         }
     }
+}
+
+/// The resident-plan memo and the device bytes its offset tables hold, kept
+/// per DEVICE on [`CudaContext`](super::context::CudaContext) since roadmap A4
+/// step 3b.
+///
+/// The budget moved with the map rather than staying a process atomic, and
+/// that is a fix as much as a move: one process-wide counter let a second
+/// device's tables consume the first device's allowance, so whichever device
+/// warmed up second degraded to the generic kernel while its own memory sat
+/// unspent. Being inside the cache also makes reserve-and-refund exact — both
+/// now happen under the same lock as the publish they belong to, where the
+/// atomic could interleave.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct PlanMemo {
+    plans: std::collections::HashMap<PlanKey, Option<std::sync::Arc<ResidentPlan>>>,
+    /// Device bytes committed to offset tables, capped by
+    /// [`OFFSET_TABLE_BUDGET`]. Never decreases except on the publish race.
+    spent: usize,
+}
+
+/// Run `f` against this device's plan memo. **Must not call the allocator** —
+/// see [`CudaContext::with_cache`](super::context::CudaContext::with_cache).
+#[cfg(feature = "cuda")]
+fn with_memo<R>(f: impl FnOnce(&mut PlanMemo) -> R) -> R {
+    super::context::current().with_cache(f)
 }
 
 /// Per-arm successful-launch counters, for tests that must prove the fast path

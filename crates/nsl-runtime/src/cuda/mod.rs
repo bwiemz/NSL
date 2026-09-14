@@ -144,15 +144,6 @@ pub(crate) mod inner {
         super::context::current().activate();
     }
 
-    /// The device this process's CUDA state is bound to.
-    ///
-    /// For keying caches that hold device pointers: those are per-device, so a
-    /// contents-only key would hand a pointer allocated on one device to a
-    /// kernel launched on another.
-    pub(crate) fn current_device_ordinal() -> i32 {
-        super::context::current().device as i32
-    }
-
     /// Non-panicking probe: has the process-wide CUDA state already been
     /// initialized (by some prior tensor op)? Diagnostics-only callers
     /// (e.g. the NSL_PHASE_TIMING device sync) must NOT force-initialize
@@ -8529,22 +8520,27 @@ pub(crate) fn gpu_scatter_add_f32(
 /// make the per-step drain silently stop working. Persistent segments are never
 /// drained anyway, so putting them there costs nothing and pins nothing extra.
 ///
-/// The key includes the device ordinal: the contents alone would hand a pointer
-/// uploaded on device 0 to a kernel running on device 1.
+/// The uploads used to be one process map keyed by `(device ordinal, contents)`
+/// — the contents alone would hand a pointer uploaded on device 0 to a kernel
+/// running on device 1. Roadmap A4 step 3b put the map on the device's own
+/// `CudaContext` instead, so the ordinal is the map the entry is found in.
 #[cfg(feature = "cuda")]
 pub(crate) fn upload_meta_i64_cached(host: *const i64, ndim: usize) -> *mut std::ffi::c_void {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    /// This device's uploads, keyed by contents.
+    #[derive(Default)]
+    struct MetaUploads(std::collections::HashMap<Vec<i64>, u64>);
 
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<(i32, Vec<i64>), u64>>> =
-        std::sync::OnceLock::new();
-    let device = inner::current_device_ordinal();
-    let key = (device, (0..ndim).map(|i| unsafe { *host.add(i) }).collect::<Vec<i64>>());
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    /// **Must not call the allocator** — see `CudaContext::with_cache`. Both
+    /// uses below allocate and free outside it.
+    fn with_uploads<R>(f: impl FnOnce(&mut std::collections::HashMap<Vec<i64>, u64>) -> R) -> R {
+        context::current().with_cache(|c: &mut MetaUploads| f(&mut c.0))
+    }
 
-    // Take the lock only to look up / publish; the upload itself happens outside
-    // so a slow copy never serializes other threads' lookups.
-    if let Some(&dev) = cache.lock().unwrap().get(&key) {
+    let key = (0..ndim).map(|i| unsafe { *host.add(i) }).collect::<Vec<i64>>();
+
+    // Hold the cache only to look up / publish; the upload itself happens
+    // outside so a slow copy never serializes other threads' lookups.
+    if let Some(dev) = with_uploads(|c| c.get(&key).copied()) {
         return dev as *mut std::ffi::c_void;
     }
     let bytes = ndim * std::mem::size_of::<i64>();
@@ -8557,18 +8553,23 @@ pub(crate) fn upload_meta_i64_cached(host: *const i64, ndim: usize) -> *mut std:
     // launch and the cache would publish a pointer to unwritten memory. See
     // `memcpy_htod_immediate`.
     inner::memcpy_htod_immediate(dev, host as *const std::ffi::c_void, bytes);
-    let mut guard = cache.lock().unwrap();
-    match guard.entry(key) {
-        std::collections::hash_map::Entry::Occupied(slot) => {
-            // Another thread published an identical vector first; drop ours.
-            let winner = *slot.get() as *mut std::ffi::c_void;
-            inner::free_managed(dev);
-            winner
-        }
+    // Decide inside the cache, release the loser outside it: `free_managed`
+    // begins with `bf16_cast_cache::evict`, another `with_cache` call on the
+    // mutex this one holds, so the old in-guard free would now deadlock.
+    let winner = with_uploads(|c| match c.entry(key) {
+        std::collections::hash_map::Entry::Occupied(slot) => Some(*slot.get()),
         std::collections::hash_map::Entry::Vacant(slot) => {
             slot.insert(dev as u64);
-            dev
+            None
         }
+    });
+    match winner {
+        // Another thread published an identical vector first; drop ours.
+        Some(theirs) => {
+            inner::free_managed(dev);
+            theirs as *mut std::ffi::c_void
+        }
+        None => dev,
     }
 }
 
