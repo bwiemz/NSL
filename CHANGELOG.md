@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The runtime's CUDA driver state is a per-device value rather than a
+  process singleton (roadmap A4 step 1). `cuda::context::CudaContext` holds
+  the `CUdevice`, the primary `CUcontext`, the PTX module and resolved-
+  function caches, the deferred-free queue and its recycled-event pool, the
+  `cuMemAllocAsync` support probe and the two allocation-tracking sets —
+  every piece of state that names a device handle and would otherwise be
+  shared if a second device existed. Contexts live in a registry
+  (`static DEVICES`) reached through `context::current()`, chosen over
+  threading a handle onto every FFI call because each `NslTensor` already
+  carries the `device` byte that says which context an op needs. The
+  registry has one slot in this step and binds the same ordinal the
+  singleton did, so behaviour is unchanged; `cuda::inner`'s existing doors
+  (`ensure_context`, `current_device_ordinal`, `detect_sm_version`,
+  `async_alloc_enabled`, the deferred-free helpers) became shims and no
+  call site changed.
+
 - User `kernel` blocks compile through KIR on every target (roadmap A2
   step 3): `kernel_lower.rs` is the one AST → KIR front door, and it now
   lowers stores (`out[i] = v`, `out[i] += v`), `if`/`elif`/`else`,

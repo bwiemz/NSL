@@ -91,7 +91,7 @@ Binds to CUDA via [cudarc](https://github.com/coreylowman/cudarc) `0.19.4` with 
 
 ### Initialization and context management
 
-`ensure_context()` (line 67) must be called before any CUDA driver API call. It is a free function in [`crates/nsl-runtime/src/cuda/mod.rs`](../../crates/nsl-runtime/src/cuda/mod.rs) — no arguments, acquires the global `CudaState` mutex internally. Call it as `crate::cuda::ensure_context()` at the top of any new CUDA call site. It locks `CudaState` and invokes `cuCtxSetCurrent(guard.context)`. Because CUDA contexts are **thread-local state in the driver**, failing to call this on a new thread produces "invalid context" errors deep in cudarc with no useful stack trace.
+`ensure_context()` (line 67) must be called before any CUDA driver API call. It is a free function in [`crates/nsl-runtime/src/cuda/mod.rs`](../../crates/nsl-runtime/src/cuda/mod.rs) — no arguments, resolves the calling thread's `CudaContext` internally. Call it as `crate::cuda::ensure_context()` at the top of any new CUDA call site. It is a shim for `context::current().activate()`, which invokes `cuCtxSetCurrent` on that context's retained primary context. Because CUDA contexts are **thread-local state in the driver**, failing to call this on a new thread produces "invalid context" errors deep in cudarc with no useful stack trace.
 
 ### CUDA 13.x workarounds
 
@@ -105,7 +105,7 @@ These invariants come from hard-won debugging and are enforced in the code:
 
 ### Module caching
 
-PTX modules are cached in `CudaState::module_cache` keyed by the FNV-1a hash of the PTX content string — not by raw pointer — because heap reuse between sequential test invocations can place different PTX `Vec`s at the same address, producing stale cache hits (`CUDA_ERROR_NOT_FOUND`, rc=500) on the old pointer-keyed design.
+PTX modules are cached in the device context's `ModuleCache` keyed by the FNV-1a hash of the PTX content string — not by raw pointer — because heap reuse between sequential test invocations can place different PTX `Vec`s at the same address, producing stale cache hits (`CUDA_ERROR_NOT_FOUND`, rc=500) on the old pointer-keyed design.
 
 ## Autodiff tape
 

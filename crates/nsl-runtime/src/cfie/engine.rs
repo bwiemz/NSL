@@ -72,7 +72,7 @@ struct KernelRegistration {
     /// CUmodule / CUfunction as `usize` — opaque driver pointers are
     /// not `Send`, so they cross module boundaries as integer casts
     /// guarded by the ENGINE mutex (same pattern as
-    /// `CudaState.module_cache`).  0 = not resolved yet.
+    /// `CudaContext.modules`).  0 = not resolved yet.
     module: usize,
     func: usize,
 }
@@ -432,7 +432,7 @@ pub extern "C" fn nsl_cfie_engine_finalize() -> i64 {
 /// the slot allocator's device buffer (`attach_device_buffer(0, 0)`),
 /// and clears registrations and cached handles so a fresh
 /// register→finalize cycle can run.  CUmodules are left loaded
-/// (leak-by-design precedent: `cuda/mod.rs` `module_cache`).  Always
+/// (leak-by-design precedent: the context's module cache).  Always
 /// returns 0.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {

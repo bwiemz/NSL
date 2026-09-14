@@ -494,7 +494,7 @@ impl Compiler<'_> {
 
             // CFIE Cycle 6: free the pool + clear registrations before
             // the serve runtime tears down (CUmodules may stay loaded —
-            // module leak-by-design precedent, cuda/mod.rs module_cache).
+            // module leak-by-design precedent, the runtime's context module cache).
             if cfie_init.as_ref().is_some_and(|i| !i.kernels.is_empty()) {
                 self.compile_call_by_name(builder, "nsl_cfie_engine_destroy", &[])?;
             }
