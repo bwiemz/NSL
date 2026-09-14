@@ -1,0 +1,69 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry bucket(.param .u64 param_a, .param .u64 param_out) {
+    .reg .u32 %r<1>;
+    .reg .u64 %rd<3>;
+    .reg .f32 %f<3>;
+    .reg .pred %p<1>;
+    .reg .u32 %edge_r;
+    .reg .u64 %edge_rd;
+    .reg .f32 %edge_f;
+    .reg .f64 %edge_fd;
+    .reg .b16 %edge_h;
+    .reg .pred %edge_p;
+    .reg .b32 %edge_v;
+    .reg .u32 %gid0;
+    .reg .u32 %gid1;
+
+    ld.param.u64 %rd0, [param_a];
+    ld.param.u64 %rd1, [param_out];
+
+BB0:
+    mov.u32 %gid0, %ctaid.x;
+    mov.u32 %gid1, %ntid.x;
+    mul.lo.u32 %gid0, %gid0, %gid1;
+    mov.u32 %r0, %tid.x;
+    add.u32 %r0, %gid0, %r0;
+    mov.f32 %f0, 0f00000000;
+    cvt.u64.u32 %rd2, %r0;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd2];
+    mov.f32 %f1, 0f3F800000;
+    setp.lt.f32 %p0, %f0, %f1;
+    @%p0 bra BB2;
+    bra BB3;
+BB1:
+    cvt.u64.u32 %rd2, %r0;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    st.global.f32 [%rd2], %f0;
+    ret;
+BB2:
+    mov.f32 %f1, 0f3F800000;
+    mov.f32 %f0, %f1;
+    bra BB1;
+BB3:
+    cvt.u64.u32 %rd2, %r0;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd0, %rd2;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f40000000;
+    setp.lt.f32 %p0, %f1, %f2;
+    @%p0 bra BB4;
+    bra BB5;
+BB4:
+    mov.f32 %f1, 0f40000000;
+    mov.f32 %f0, %f1;
+    bra BB1;
+BB5:
+    mov.f32 %f1, 0f40400000;
+    mov.f32 %f0, %f1;
+    bra BB1;
+}

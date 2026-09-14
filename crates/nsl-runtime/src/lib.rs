@@ -107,18 +107,10 @@ pub use cuda::{
 #[cfg(feature = "cuda")]
 pub use cuda::strided_copy::nsl_test_strided_copy_arm_launches;
 
-// CFTP v7 follow-on (findings 3/11/13): expose the runtime-embedded PTX
-// cast constants and kernel-name C strings to the byte-for-byte parity
-// test in `crates/nsl-codegen/tests/precision_cast_ptx_runtime_parity.rs`.
-// Keeping the cuda module pub(crate) means we re-export the test hooks
-// through a flat doc-hidden facade so the runtime API surface is not
-// widened to leak the embedded PTX constants.
-#[doc(hidden)]
-pub mod precision_cast_kernels {
-    pub use crate::cuda::precision_cast_kernels::{
-        __test_runtime_kernel_names, __test_runtime_ptx_strings,
-    };
-}
+// Roadmap A2 step 7: the runtime used to re-export doc-hidden hooks here
+// so a parity test could compare its embedded cast PTX against the codegen
+// emitter's. Both the copy and the test are gone — the cast kernels are
+// built from `nsl_kir::kernels::cast` — and so is the facade.
 
 // G3 fused linear-CE FFIs exposed for cross-crate integration tests.
 #[doc(hidden)]

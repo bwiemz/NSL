@@ -18,7 +18,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use nsl_codegen::backend_ptx::lower_kir_to_ptx;
-use nsl_codegen::kernel_ir::{
+use nsl_codegen::kernel_ir::{MmaOperandTy, MmaShape, 
     AddressSpace, ConstValue, KernelIR, KirBuilder, KirConst, KirOp, KirTerminator, KirType,
 };
 
@@ -100,14 +100,14 @@ fn one_tile() -> KernelIR {
         b.new_typed_var(frag()),
         b.new_typed_var(frag()),
     ];
-    b.emit(KirOp::LdMatrixX4 { dst: a, addr: smem, trans: false });
+    b.emit(KirOp::LdMatrix { dst: a.to_vec(), addr: smem, trans: false });
     let bb = [
         b.new_typed_var(frag()),
         b.new_typed_var(frag()),
         b.new_typed_var(frag()),
         b.new_typed_var(frag()),
     ];
-    b.emit(KirOp::LdMatrixX4 { dst: bb, addr: smem, trans: true });
+    b.emit(KirOp::LdMatrix { dst: bb.to_vec(), addr: smem, trans: true });
     let mut c = [0; 4];
     for slot in &mut c {
         *slot = b.new_typed_var(KirType::F32);
@@ -122,7 +122,7 @@ fn one_tile() -> KernelIR {
         b.new_typed_var(KirType::F32),
         b.new_typed_var(KirType::F32),
     ];
-    b.emit(KirOp::MmaF16M16N8K16 { d, a, b: [bb[0], bb[1]], c });
+    b.emit(KirOp::Mma { shape: MmaShape::M16N8K16, a_ty: MmaOperandTy::F16, d: d.to_vec(), a: a.to_vec(), b: vec![bb[0], bb[1]], c: c.to_vec() });
     b.emit(KirOp::Store(out, d[0], AddressSpace::Global));
     b.terminate(KirTerminator::Return);
     b.set_workgroup_size([32, 1, 1]);

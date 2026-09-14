@@ -47,10 +47,10 @@ fn rendered_not_plain() -> impl Predicate<str> {
 
 #[test]
 fn a_spanned_codegen_error_renders_file_line_col_and_excerpt() {
-    // `==` inside a `kernel` block: refused by the PTX kernel compiler,
-    // which knows the kernel name but nothing about where in the file it
-    // is — the span comes from the statement/expression dispatchers.
-    let example = workspace_root().join("examples/m17_kernel_eq_condition_error.nsl");
+    // `**` inside a `kernel` block: refused by the kernel lowering, which
+    // knows the kernel name but nothing about where in the file it is — the
+    // span comes from the statement/expression dispatchers.
+    let example = workspace_root().join("examples/m17_kernel_pow_operator_error.nsl");
     let tmp = TempDir::new().unwrap();
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();
@@ -63,12 +63,12 @@ fn a_spanned_codegen_error_renders_file_line_col_and_excerpt() {
     cmd.assert()
         .code(1)
         .stderr(predicate::str::contains(
-            "error: kernel 'bad_eq': binary operator '==' is not supported in kernel code",
+            "error: kernel 'bad_pow': binary operator '**' is not supported in kernel code",
         ))
         // The location line names the file, and the caret sits on the
-        // `i == 0` condition (line 7, column 8), not on the whole `if`.
-        .stderr(predicate::str::contains("m17_kernel_eq_condition_error.nsl:7:8"))
-        .stderr(predicate::str::contains("if i == 0:"))
+        // `i ** 2` operand (line 8, column 8), not on the whole `if`.
+        .stderr(predicate::str::contains("m17_kernel_pow_operator_error.nsl:8:8"))
+        .stderr(predicate::str::contains("if i ** 2 > 0:"))
         .stderr(rendered_not_plain());
 }
 

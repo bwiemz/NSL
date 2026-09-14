@@ -8,6 +8,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- User `kernel` blocks compile through KIR on every target (roadmap A2
+  step 3): `kernel_lower.rs` is the one AST → KIR front door, and it now
+  lowers stores (`out[i] = v`, `out[i] += v`), `if`/`elif`/`else`,
+  `for j in range(...)` (one to three arguments with a literal step, or
+  `a..b` / `a..=b`), `while`, `break`, `continue`, a bare `return`, and
+  assignment to a `let`-declared local (`x = v`, `x += v`) — a local
+  reassigned inside a branch or a loop body reaches the join or the loop
+  header as a block parameter, so the IR stays SSA without a phi. The
+  index builtins take an optional literal dimension (`thread_id(1)`), and
+  `thread_id_y()`, `block_id()`, `block_id_y()` join `block_dim()`,
+  `global_id()` and `sync_threads()`; `%` (integers), `and` / `or` on
+  comparisons and `==` / `!=` are accepted. Every kernel is verified
+  before it is printed, and a construct outside the set is refused with
+  the innermost node's span. `@autotune` substitutes its constants into
+  the AST (`kernel_lower::substitute_constants`) before lowering, so a
+  tile size can be a loop bound. The direct AST → PTX `KernelCompiler`
+  (`crates/nsl-codegen/src/kernel.rs`) is deleted — the hand-PTX manifest
+  is 70 members — and `tests/snapshot_tests.rs` pins the PTX of every
+  shape the lowering accepts (`kernel_block_*`), which
+  `tests/kernel_block_ptxas.rs` assembles in CI's cuda lane. The AMDGPU /
+  Metal / WGSL printers have no control flow yet, so a kernel whose KIR
+  passes block arguments is refused on those targets rather than printed
+  with a comment where the edge should be.
+- The four precision-cast kernels are KIR (roadmap A2 step 7).
+  `nsl_kir::kernels::cast` describes f32 <-> bf16 and f32 <-> f16 as one
+  grid-stride loop each — a `U64` induction variable carried as a block
+  parameter, so a tensor of more than 2^32 elements is cast to the end
+  rather than modulo 2^32 — and `nsl-runtime` builds them from that
+  description on first use, behind a `OnceLock` that keeps the PTX at a
+  stable address for `kernel_launch`'s module cache.
+  `crates/nsl-codegen/src/precision_cast_ptx.rs` (436 lines of
+  `push_str`) and the four `static` PTX strings `nsl-runtime` carried
+  alongside it are deleted, and with them the byte-for-byte parity test
+  that existed to hold the copy to the emitter and the `__test_runtime_*`
+  hooks `nsl-runtime` re-exported to feed it. The runtime could not call
+  the emitter — `nsl-codegen` depends on `nsl-runtime`, so the reverse
+  edge is a cycle — which is why the bytes were duplicated; `nsl-kir` is
+  a leaf crate, so there is now one description and no copy. The
+  hand-PTX freeze list drops from 71 files to 69.
+  Two header changes come with the move, both widening the set of devices
+  the modules load on: the bf16 pair emits `.version 7.8` (the ISA level
+  the bf16 `cvt` mnemonics actually require) where the hand path pinned
+  `8.0`, and the f16 pair emits `.target sm_70` where it pinned `sm_80`.
+  Equivalence is proved by execution rather than by inspection:
+  `precision_cast_kir_equivalence` freezes the four modules the deleted
+  emitter produced and runs both them and the KIR modules on a PTX
+  interpreter over six launch geometries, asserting the same destination
+  bytes and — separately — that those bytes match an independent
+  reference cast. The interpreter rejects any mnemonic it does not model,
+  so a silently-skipped instruction cannot make the comparison vacuous.
+
+- KIR register allocation (roadmap A2 step 5): `nsl_kir::regalloc` gives
+  every value a register class from its type (`RegClass::of`) and a dense
+  index by linear scan over live intervals on the block-order
+  linearisation (block-level liveness over the CFG, so a loop-carried
+  value keeps its register through the whole loop; a block parameter is
+  live at every incoming edge's terminator, where the edge copy writes
+  it). The PTX printer renames its `%<class><VarId>` names through the
+  allocation as a last pass and declares each class at its allocated
+  count — a kernel with N values no longer declares four to five N
+  registers — `GlobalId` lowers through named `%gid0`/`%gid1` scratch
+  instead of registers at `dst + 1000`, `Bool` values report the
+  predicate class, and `KirBuilder::set_launch_bounds` /
+  `set_max_registers` print `.maxntid` / `.minnctapersm` / `.maxnreg` on
+  the entry. `KernelIR::register_pressure()` is the per-class count. The
+  four KIR-generated PTX snapshots are re-blessed with the dense numbering.
 - The KIR scalar ISA (roadmap A2 step 4), the instruction families the
   hand-PTX estate's index math, reductions and 16-bit paths are made of:
   `And`/`Or`/`Xor`/`Not`, `Shl`/`Shr` (arithmetic for signed types),
@@ -168,6 +234,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   exceed the sm_80 255-register-per-thread cap and silently spill to
   local memory with the checker reporting no warning at all.
   `RegisterCounts` now tracks `v_regs` and includes it in `total()`.
+- The KIR PTX printer spelled a float multiply `mul.lo.f32` and a float
+  division `div.f32`, neither of which is PTX (`.lo` is the integer
+  half-product; a float division needs a rounding mode); they are
+  `mul.f32` and `div.rn.f32`. Until roadmap A2 step 3 no user kernel
+  reached the printer with either, so nothing shipped with them.
+- A KIR kernel with launch bounds emitted PTX that `ptxas` refuses.
+  `.maxntid`, `.minnctapersm` and `.maxnreg` belong to the entry's
+  declaration, between the parameter list and the opening brace; the
+  printer put them inside the body, where `ptxas` stops at "Parsing error
+  near `.maxntid`". Every kernel that called `set_launch_bounds` or
+  `set_max_registers` since roadmap A2 step 5 was therefore unassemblable.
+  Nothing caught it because no such kernel had yet reached a `ptxas` gate,
+  and the printer test asserted the invalid placement — it pinned the bug
+  rather than the rule. The replacement asserts the grammar (every
+  directive lies before the entry's opening brace) instead of the text, so
+  it holds under any register numbering and any subset of the three.
+  Kernels that set none keep `) {` on one line, so no existing snapshot
+  moves.
+
 - Aliasing-input probes (`tensor::alias_tests`, roadmap C2): every CPU
   entry point that takes two or more tensor handles is called with the same
   handle for all of them — `cat([x, x])`, `x == x`, `where(x, x, x)`,

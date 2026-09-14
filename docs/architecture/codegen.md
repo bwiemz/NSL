@@ -545,7 +545,20 @@ refused as partial SSA). The 16-bit class is `.reg .b16 %h<N>` and 16-bit
 loads and stores are `.b16`; a kernel that requires
 `FeatureSet::BF16_ARITHMETIC` (any bf16 value or conversion) prints
 `.version 7.8` / `sm_80`. `crates/nsl-codegen/tests/kir_scalar_isa_ptxas.rs`
-assembles one kernel using every family. The async-copy
+assembles one kernel using every family. Registers are allocated
+(roadmap A2 step 5, `crates/nsl-kir/src/regalloc.rs`): each value gets a
+class from its type (`RegClass::of`: `%r`/`%rd`/`%f`/`%fd`/`%h`/`%p`/`%v`)
+and a dense index by linear scan over live intervals on the block-order
+linearisation — a kernel parameter is live from before block 0, a block
+parameter from its block's entry and at every incoming edge's terminator,
+and a value to its last use and the end of every block it is live-out of,
+so a loop-carried value keeps its register through the loop; the printer
+emits `%<class><VarId>` names and renames them through the `Allocation`
+as a last pass, declares each class at its allocated count (the
+`dst + 1000` scratch idiom is gone: `GlobalId` uses `%gid0`/`%gid1`), and
+prints `.maxntid` / `.minnctapersm` / `.maxnreg` from
+`KirBuilder::set_launch_bounds` / `set_max_registers`.
+`KernelIR::register_pressure()` is the per-class count. The async-copy
 group is first-class KIR (`SharedBase`, `CpAsync { bytes: 4 | 8 | 16 }`,
 `CpAsyncCommit`, `CpAsyncWait { pending }`, `FeatureSet::ASYNC_COPY`): the
 verifier checks the global → shared state spaces and the commit/wait
@@ -561,14 +574,25 @@ and the PTX backend declares the `.reg .b32 %v<N>` class for them.
 `crates/nsl-kir/src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
 (ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
 `src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
-are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` lowers a
-user `kernel` block's AST to KIR for the portable subset and refuses
-everything else. `src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu,
-Fpga}`, re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
-(`src/compiler/kernel.rs`) dispatches: CUDA still goes to the AST→PTX
-`KernelCompiler` (`src/kernel.rs`), ROCm/Metal/WebGPU go through KIR, and
-`Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use `nsl fpga-compile`). PTX bytes
-are embedded via `declare_data` / `define_data` in the same file.
+are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` is the one
+front door for a user `kernel` block on every target (roadmap A2 step 3
+retired the AST→PTX `KernelCompiler` the CUDA target used until then): it
+lowers `let`, assignment to a declared local, element loads and stores,
+`if`/`elif`/`else`, `for ... in range(...)`, `while`, `break`/`continue`, a
+bare `return` and the index builtins to verified KIR — a local reassigned in
+a branch or a loop body is a block parameter at the join or the header — and
+refuses everything else with the innermost node's span.
+`src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu, Fpga}`,
+re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
+(`src/compiler/kernel.rs`) dispatches: every target lowers to KIR, CUDA
+prints it with `backend_ptx`, ROCm/Metal/WebGPU with their printers (which
+have no control flow yet, so a kernel whose KIR passes block arguments is
+refused there), and `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use
+`nsl fpga-compile`). `@autotune` substitutes its constants into the AST
+(`kernel_lower::substitute_constants`) before lowering. PTX bytes are
+embedded via `declare_data` / `define_data` in the same file;
+`tests/snapshot_tests.rs` (`kernel_block_*`) pins the PTX of every shape the
+lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
 `crates/nsl-codegen/tests/common/kir_builder.rs` is the shared test helper for building KIR;
 `crates/nsl-codegen/tests/snapshot_tests.rs` pins KIR-generated PTX.
 
@@ -579,18 +603,21 @@ are embedded via `declare_data` / `define_data` in the same file.
 `src/flash_attention_selector.rs`, `src/fused_linear_ce.rs`
 (`synthesize_fused_linear_ce_ptx` and the large-vocab v2 pair),
 `src/matmul_mma.rs` (MMA fragment primitives), `src/moe_kernels.rs`,
-`src/precision_cast_ptx.rs`, `src/wrga_fused_ptx.rs`,
+`src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
 `src/pca_tilerange.rs`, `src/cfie_*_ptx.rs`, `src/cfie_decode_attention.rs`,
-`src/fusion.rs` (elementwise chains), `src/kernel.rs`, and the shared preludes
+`src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
-writes PTX into a string (71 members at the 2026-09-02 freeze: the codegen
-files above plus seven under `crates/nsl-runtime/src/cuda/` and
+writes PTX into a string (71 members at the 2026-09-02 freeze; 69 today: the
+codegen files above plus six under `crates/nsl-runtime/src/cuda/` and
 `crates/nsl-runtime/src/flash_attention.rs`; `backend_ptx.rs` is the one
-member that belongs by construction). `scripts/hand-ptx-freeze.sh --check`
+member that belongs by construction). The list shrinks as A2 migrates
+kernels onto KIR — step 7 retired `src/precision_cast_ptx.rs` and the PTX
+text `cuda/precision_cast_kernels.rs` used to carry, which are the two
+members the freeze has lost so far. `scripts/hand-ptx-freeze.sh --check`
 (membership decided by `scripts/hand-ptx-scan.awk`; `--list`, `--explain`,
 `--write-manifest`, `--self-test`) fails CI (`hand-ptx-freeze` job in
 `.github/workflows/ci.yml`) if a file joins the set or a listed file no
@@ -736,8 +763,8 @@ is the bare message — the CLI adds the `codegen error:` prefix.
 Spans are attached by exactly four dispatchers, each wrapping its
 `*_dispatch` twin with `.map_err(|e| e.with_span_if_unset(node.span))`:
 `Compiler::compile_stmt` (`src/stmt.rs`), `Compiler::compile_expr`
-(`src/expr/mod.rs`), and `KernelCompiler::compile_stmt` /
-`KernelCompiler::compile_expr` (`src/kernel.rs`). Because the innermost node
+(`src/expr/mod.rs`), and `kernel_lower::lower_stmt` /
+`kernel_lower::lower_expr` (`src/kernel_lower.rs`). Because the innermost node
 runs first, a helper deep in a lowering can raise `CodegenError::new(msg)`
 with no span and still be reported at the right expression. Errors raised
 outside statement compilation (model collection, kernel synthesis, the WGGO
@@ -830,7 +857,7 @@ should fail before review.
   every assertion, not just the `eprintln!`.
 - **Deferral must refuse.** An unsupported composition, an unlowerable
   construct, or a flag that did nothing produces a loud `Err`, never a silent
-  fallback — `src/kernel.rs` header, `src/kernel_lower.rs`,
+  fallback — the `src/kernel_lower.rs` header,
   `src/stmt_admission.rs`, the `wgrad_hook_blocks` refusal in
   `compile_main`, and eighteen `src/` files invoke the rule by name. Refusals
   are pinned by message text in `feature_rules.rs` +

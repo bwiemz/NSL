@@ -720,7 +720,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          pipeline, is not a stage in it",
     ),
     ("pipeline", "pipeline-parallel scheduling"),
-    ("precision_cast_ptx", "precision-cast PTX emitter"),
     ("profiling", "dev-tools capture"),
     ("ptx_metadata", "PTX metadata"),
     ("ptxas_validation", "ptxas syntax validation"),

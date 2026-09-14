@@ -112,7 +112,7 @@ fn extract_int_field(json: &str, from: usize, key: &str) -> Result<usize, String
         .ok_or_else(|| format!("{} field missing", key))?;
     let abs = from + idx + pattern.len();
     let end = json[abs..]
-        .find(|c: char| c == ',' || c == '}')
+        .find([',', '}'])
         .ok_or_else(|| format!("{} value unterminated", key))?;
     json[abs..abs + end]
         .trim()

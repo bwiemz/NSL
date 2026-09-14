@@ -1429,6 +1429,7 @@ dependencies = [
  "memmap2",
  "nsl-abi",
  "nsl-env",
+ "nsl-kir",
  "nsl-log",
  "once_cell",
  "prost",

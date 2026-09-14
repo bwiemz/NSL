@@ -1,0 +1,11 @@
+# Negative test: `**` is not a supported operator inside `kernel` blocks.
+# The kernel lowering must refuse loudly, pointing at the operator, instead
+# of compiling the condition to a garbage register and silently dropping
+# the whole if-body (which is what the first kernel compiler did).
+
+kernel bad_pow(a, out):
+    let i = thread_id()
+    if i ** 2 > 0:
+        out[i] = a[i]
+
+print("should_not_compile")

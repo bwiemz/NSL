@@ -1,0 +1,52 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry guard(.param .u64 param_a, .param .u64 param_out, .param .u64 param_n) {
+    .reg .u32 %r<2>;
+    .reg .u64 %rd<4>;
+    .reg .f32 %f<3>;
+    .reg .pred %p<1>;
+    .reg .u32 %gid0;
+    .reg .u32 %gid1;
+
+    ld.param.u64 %rd0, [param_a];
+    ld.param.u64 %rd1, [param_out];
+    ld.param.u64 %rd2, [param_n];
+
+BB0:
+    mov.u32 %gid0, %ctaid.x;
+    mov.u32 %gid1, %ntid.x;
+    mul.lo.u32 %gid0, %gid0, %gid1;
+    mov.u32 %r0, %tid.x;
+    add.u32 %r0, %gid0, %r0;
+    mov.u32 %r1, 0;
+    cvt.u64.u32 %rd3, %r1;
+    mul.lo.u64 %rd3, %rd3, 4;
+    add.u64 %rd3, %rd2, %rd3;
+    ld.global.f32 %f0, [%rd3];
+    cvt.rn.f32.u32 %f1, %r0;
+    setp.ge.f32 %p0, %f1, %f0;
+    @%p0 bra BB2;
+    bra BB3;
+BB1:
+    cvt.u64.u32 %rd2, %r0;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    cvt.u64.u32 %rd3, %r0;
+    mul.lo.u64 %rd3, %rd3, 4;
+    add.u64 %rd3, %rd0, %rd3;
+    ld.global.f32 %f0, [%rd3];
+    mov.f32 %f1, 0f40000000;
+    div.rn.f32 %f2, %f0, %f1;
+    st.global.f32 [%rd2], %f2;
+    ret;
+BB2:
+    ret;
+BB3:
+    bra BB1;
+}

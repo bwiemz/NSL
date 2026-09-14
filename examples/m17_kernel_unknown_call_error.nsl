@@ -1,0 +1,10 @@
+# Negative test: a call to anything but the kernel builtins is not supported
+# inside `kernel` blocks. The kernel lowering must refuse loudly instead of
+# binding an uninitialised register for the call's result (which used to
+# produce wrong numbers at runtime).
+
+kernel bad_call(a, out):
+    let i = thread_id()
+    out[i] = sqrt(a[i])
+
+print("should_not_compile")

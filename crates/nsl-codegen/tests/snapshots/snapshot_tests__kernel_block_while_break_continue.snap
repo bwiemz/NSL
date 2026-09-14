@@ -1,0 +1,97 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry scan(.param .u64 param_a, .param .u64 param_out) {
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<3>;
+    .reg .f32 %f<2>;
+    .reg .pred %p<1>;
+    .reg .u32 %edge_r;
+    .reg .u64 %edge_rd;
+    .reg .f32 %edge_f;
+    .reg .f64 %edge_fd;
+    .reg .b16 %edge_h;
+    .reg .pred %edge_p;
+    .reg .b32 %edge_v;
+    .reg .u32 %gid0;
+    .reg .u32 %gid1;
+
+    ld.param.u64 %rd0, [param_a];
+    ld.param.u64 %rd1, [param_out];
+
+BB0:
+    mov.u32 %gid0, %ctaid.x;
+    mov.u32 %gid1, %ntid.x;
+    mul.lo.u32 %gid0, %gid0, %gid1;
+    mov.u32 %r0, %tid.x;
+    add.u32 %r0, %gid0, %r0;
+    mov.u32 %r1, 0;
+    mov.u32 %r2, 0;
+    mov.u32 %r3, %r2;
+    mov.u32 %r4, %r1;
+    bra BB1;
+BB1:
+    mov.u32 %r1, 16;
+    setp.lt.u32 %p0, %r4, %r1;
+    @!%p0 bra BB1_else;
+    bra BB2;
+BB1_else:
+    mov.u32 %r1, %r3;
+    mov.u32 %r2, %r4;
+    bra BB3;
+BB2:
+    mov.u32 %r5, 1;
+    add.u32 %r6, %r4, %r5;
+    mov.u32 %r5, 16;
+    mul.lo.u32 %r7, %r0, %r5;
+    add.u32 %r5, %r7, %r6;
+    cvt.u64.u32 %rd2, %r5;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd2];
+    mov.f32 %f1, 0f00000000;
+    setp.lt.f32 %p0, %f0, %f1;
+    @%p0 bra BB5;
+    bra BB6;
+BB3:
+    cvt.u64.u32 %rd2, %r0;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    cvt.rn.f32.u32 %f0, %r1;
+    st.global.f32 [%rd2], %f0;
+    ret;
+BB4:
+    mov.u32 %r5, 16;
+    mul.lo.u32 %r7, %r0, %r5;
+    add.u32 %r5, %r7, %r6;
+    cvt.u64.u32 %rd2, %r5;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd2, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd2];
+    mov.f32 %f1, 0f42C80000;
+    setp.gt.f32 %p0, %f0, %f1;
+    @%p0 bra BB8;
+    bra BB9;
+BB5:
+    mov.u32 %r4, %r6;
+    bra BB1;
+BB6:
+    bra BB4;
+BB7:
+    mov.u32 %r5, 1;
+    add.u32 %r7, %r3, %r5;
+    mov.u32 %r3, %r7;
+    mov.u32 %r4, %r6;
+    bra BB1;
+BB8:
+    mov.u32 %r1, %r3;
+    mov.u32 %r2, %r6;
+    bra BB3;
+BB9:
+    bra BB7;
+}

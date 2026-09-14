@@ -26,6 +26,7 @@ nsl-env.workspace = true
 # subscriber); this crate adds the `NSL_EVENTS` mirror on top (`log.rs`,
 # roadmap A3). tracing-only.
 nsl-log.workspace = true
+nsl-kir.workspace = true
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

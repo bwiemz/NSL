@@ -1,0 +1,46 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry scale_add(.param .u64 param_x, .param .u64 param_scale, .param .u64 param_bias, .param .u64 param_out) {
+    .reg .u32 %r<1>;
+    .reg .u64 %rd<5>;
+    .reg .f32 %f<3>;
+    .reg .u32 %gid0;
+    .reg .u32 %gid1;
+
+    ld.param.u64 %rd0, [param_x];
+    ld.param.u64 %rd1, [param_scale];
+    ld.param.u64 %rd2, [param_bias];
+    ld.param.u64 %rd3, [param_out];
+
+BB0:
+    mov.u32 %gid0, %ctaid.x;
+    mov.u32 %gid1, %ntid.x;
+    mul.lo.u32 %gid0, %gid0, %gid1;
+    mov.u32 %r0, %tid.x;
+    add.u32 %r0, %gid0, %r0;
+    cvt.u64.u32 %rd4, %r0;
+    mul.lo.u64 %rd4, %rd4, 4;
+    add.u64 %rd4, %rd3, %rd4;
+    cvt.u64.u32 %rd3, %r0;
+    mul.lo.u64 %rd3, %rd3, 4;
+    add.u64 %rd3, %rd0, %rd3;
+    ld.global.f32 %f0, [%rd3];
+    cvt.u64.u32 %rd0, %r0;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd1, %rd0;
+    ld.global.f32 %f1, [%rd0];
+    mul.f32 %f2, %f0, %f1;
+    cvt.u64.u32 %rd0, %r0;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd2, %rd0;
+    ld.global.f32 %f0, [%rd0];
+    add.f32 %f1, %f2, %f0;
+    st.global.f32 [%rd4], %f1;
+    ret;
+}

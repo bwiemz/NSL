@@ -42,8 +42,9 @@
 //!
 //!   1. `cast_and_publish` now accepts GPU tensors and routes them through
 //!      `gpu_cast_and_publish` (commit 30f2183c).
-//!   2. The GPU cast kernels (`crates/nsl-codegen/src/precision_cast_ptx.rs`,
-//!      commit 3cc13824) emit `cvt.rn.{bf16,f16}.f32` — IEEE-754 default
+//!   2. The GPU cast kernels (`nsl_kir::kernels::cast`, built by the
+//!      runtime at first use; hand-written PTX before roadmap A2 step 7)
+//!      emit `cvt.rn.{bf16,f16}.f32` — IEEE-754 default
 //!      round-to-nearest-even — matching the host `half::*::from_f32`
 //!      rounding used by the direct-FFI numerical baselines.
 //!   3. The CPU primitives `f32_to_{bf16,f16}_bits` (`tensor/mod.rs`) now
