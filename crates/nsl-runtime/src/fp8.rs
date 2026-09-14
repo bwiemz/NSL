@@ -27,6 +27,27 @@ pub const FP8_FORMAT_E5M2: i64 = 1;
 /// Uses a Mutex-protected HashMap instead of thread_local to ensure scales
 /// set on one thread (e.g., a worker) are visible on another (e.g., main thread
 /// running backward pass).
+///
+/// Roadmap A4 step 3b listed this among the caches to move onto the per-device
+/// `CudaContext` and it STAYS a process static, for three reasons that the
+/// other four caches do not share:
+///
+/// * It is not device state. The other four hold device pointers; this holds
+///   an `f32` per tensor, keyed by a host pointer to the `NslTensor` box. That
+///   key is unique across the process, so two devices can never collide — and
+///   a tensor whose scale is set from one thread and read from another would
+///   get the 1.0 default instead if the map were split per device.
+/// * This module is not `cuda`-gated. `set`/`get`/`remove` are reachable in a
+///   CPU-only build, where `CudaContext` does not exist at all.
+/// * `remove_fp8_scale` runs on EVERY tensor free (`tensor/mod.rs`), including
+///   host tensors. Routing it through `context::current()` would force CUDA
+///   initialisation from the free path — aborting a pure-CPU run of a
+///   cuda-featured binary on a GPU-less machine — and guarding it with
+///   `context::initialized()` instead would silently drop removals issued
+///   before the first device op.
+///
+/// Same call as `RESOLVED_MATH_MODE` in step 3a: the roadmap's inventory names
+/// what to examine, not what must move.
 static FP8_SCALES: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, f32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 

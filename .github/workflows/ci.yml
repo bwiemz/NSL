@@ -465,6 +465,15 @@ jobs:
       - name: Build workspace with --features cuda
         run: cargo build --workspace --features cuda
 
+      # `cuda` alone does NOT compile the `test-hooks`-gated reset hooks, so
+      # every `reset_for_test` in the cuda modules was invisible to CI: roadmap
+      # A4 step 3a moved `lt_matmul`'s plan map onto the context and left that
+      # function referencing the deleted `PLANS` static, and the break reached
+      # `main` green. Deps are already built by the step above, so this is a
+      # short incremental check rather than a second full build.
+      - name: Check --features cuda,test-hooks (the reset hooks)
+        run: cargo check -p nsl-runtime --features cuda,test-hooks --all-targets
+
       # Assembles all 59 hand-written PTX modules with ptxas. Needs no GPU.
       # Would have caught the invalid `.reg .f32 %f<3>` in BIAS_ADD_F32_PTX.
       - name: PTX assembly gate

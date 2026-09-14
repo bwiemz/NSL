@@ -746,10 +746,18 @@ pub(crate) unsafe fn matmul_bf16_f32(
 // already `#[cfg(feature = "cuda")]`, so that axis needs no repeating here.
 #[cfg(feature = "test-hooks")]
 pub(crate) fn reset_for_test() {
-    let drained: Vec<Option<Plan>> = {
-        let mut plans = PLANS.lock().unwrap();
-        std::mem::take(&mut *plans).into_values().collect()
-    };
+    // No context, no plans — and reaching for one here would force CUDA
+    // initialisation from a reset hook, which aborts where there is no driver.
+    if !super::context::initialized() {
+        ISSUED.store(0, Ordering::Relaxed);
+        TUNED.store(0, Ordering::Relaxed);
+        FALLBACKS.store(0, Ordering::Relaxed);
+        return;
+    }
+    // Drain inside the cache, destroy outside it: `destroy_handles` is a
+    // driver call, and `with_cache` holds the mutex every device cache shares.
+    let drained: Vec<Option<Plan>> =
+        with_plans(|plans| std::mem::take(plans).into_values().collect());
     for p in drained.into_iter().flatten() {
         // SAFETY: handles were live and are now unreachable from the map.
         unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
