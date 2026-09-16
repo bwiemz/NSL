@@ -290,6 +290,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   exceed the sm_80 255-register-per-thread cap and silently spill to
   local memory with the checker reporting no warning at all.
   `RegisterCounts` now tracks `v_regs` and includes it in `total()`.
+- Daily invariant audit: roadmap A4 step 3a (`lt_matmul`'s cublasLt plan
+  cache moving off its own process-global mutex onto the device context's
+  cache map, see Added above) updated `matmul_bf16_f32`'s two call sites but
+  left `reset_for_test()` referencing the deleted `PLANS` static — a build
+  error reachable only under `--features cuda,test-hooks`, which is exactly
+  the combination `scripts/gpu-cert.sh` uses and neither `ci.yml`'s
+  `cuda-feature` job (plain `--features cuda`, no `test-hooks`) nor any
+  other lane compiles. The next GPU-cert run would have failed before a
+  single test executed. `reset_for_test` now drains the cache through the
+  same `with_plans` door the live call sites use.
 - The KIR PTX printer spelled a float multiply `mul.lo.f32` and a float
   division `div.f32`, neither of which is PTX (`.lo` is the integer
   half-product; a float division needs a rounding mode); they are

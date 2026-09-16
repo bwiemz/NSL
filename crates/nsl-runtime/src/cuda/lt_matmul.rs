@@ -746,10 +746,8 @@ pub(crate) unsafe fn matmul_bf16_f32(
 // already `#[cfg(feature = "cuda")]`, so that axis needs no repeating here.
 #[cfg(feature = "test-hooks")]
 pub(crate) fn reset_for_test() {
-    let drained: Vec<Option<Plan>> = {
-        let mut plans = PLANS.lock().unwrap();
-        std::mem::take(&mut *plans).into_values().collect()
-    };
+    let drained: Vec<Option<Plan>> =
+        with_plans(|plans| std::mem::take(plans).into_values().collect());
     for p in drained.into_iter().flatten() {
         // SAFETY: handles were live and are now unreachable from the map.
         unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
