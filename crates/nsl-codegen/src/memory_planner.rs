@@ -459,6 +459,11 @@ pub struct SlabPlan {
     pub naive_total: u64,
     /// Total alignment padding bytes (aligned_size - actual_size across all tensors).
     pub padding_bytes: u64,
+    /// Allocation sites from the input that were excluded from the plan because
+    /// `is_plannable()` was false (e.g. `SizeKind::Dynamic`). Each of these falls
+    /// back to a runtime heap allocation, so a non-empty list means the zero-heap
+    /// invariant is NOT satisfied even though a `SlabPlan` was produced.
+    pub unplanned: Vec<TensorAllocId>,
 }
 
 impl SlabPlan {
@@ -609,6 +614,14 @@ pub fn rematerialize(
 /// Tensors with SizeKind::Dynamic are skipped.
 pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> SlabPlan {
     crate::pass_trace::record("MemoryPlanner");
+    // Allocation sites the planner cannot place (e.g. SizeKind::Dynamic) — these
+    // still fall back to a runtime heap allocation and must be surfaced to callers
+    // (see `unplanned` on SlabPlan / `prove_no_heap`), not silently dropped.
+    let unplanned: Vec<TensorAllocId> = allocs
+        .iter()
+        .filter(|a| !a.is_plannable())
+        .map(|a| a.id)
+        .collect();
     // Sort tensor IDs by size (largest first) for decreasing order
     let mut sorted: Vec<TensorAllocId> = allocs
         .iter()
@@ -695,11 +708,11 @@ pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> Sl
     // decline, not a zero-effect apply: the planner ran and had nothing it
     // could statically place.
     //
-    // The production driver (`compiler/entry_points.rs`) applies the same
-    // filter BEFORE calling, so on that path the decline arm is unreachable —
-    // "no plannable allocations" shows up as MemoryPlanner never being entered
-    // at all. The arm is still correct for the direct callers, and writing it
-    // is what keeps the empty case from silently rendering as `applied, 0`.
+    // Callers pass the FULL (unfiltered) alloc list so `unplanned` above can
+    // report every site the planner had to decline — see `prove_no_heap`,
+    // which treats a non-empty `unplanned` as proof failure even when
+    // `assignments` is non-empty (a partially-dynamic function still heap
+    // allocates at runtime for its dynamic tensors).
     if assignments.is_empty() {
         crate::pass_trace::record_disposition("MemoryPlanner", PassDisposition::Declined {
             reason: DeclineReason::NoCandidates("no statically-sized tensor allocation to place"),
@@ -715,6 +728,7 @@ pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> Sl
         assignments,
         naive_total,
         padding_bytes: total_padding,
+        unplanned,
     }
 }
 
@@ -1652,6 +1666,7 @@ mod tests {
             assignments: HashMap::new(),
             naive_total: 0,
             padding_bytes: 0,
+            unplanned: vec![],
         };
         assert_eq!(plan.savings_fraction(), 0.0);
     }
@@ -1664,6 +1679,7 @@ mod tests {
             assignments: HashMap::new(),
             naive_total: 2048,
             padding_bytes: 0,
+            unplanned: vec![],
         };
         assert!(check_vram_budget(&plan, 2048).is_none());
     }
@@ -1676,6 +1692,7 @@ mod tests {
             assignments: HashMap::new(),
             naive_total: 4096,
             padding_bytes: 0,
+            unplanned: vec![],
         };
         let err = check_vram_budget(&plan, 2048);
         assert!(err.is_some());

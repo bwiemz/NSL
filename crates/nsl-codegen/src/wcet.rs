@@ -678,15 +678,30 @@ pub fn prove_no_heap(
 ) -> NoHeapProof {
     match slab_plan {
         Some(plan) => {
-            let total = plan.assignments.len();
-            // In a fully slab-planned function, every allocation site has been assigned a slot.
-            // Violations would come from dynamic-sized tensors that couldn't be planned.
+            let planned = plan.assignments.len();
+            let total = planned + plan.unplanned.len();
+            // Every allocation site the planner had to decline (SizeKind::Dynamic,
+            // typically) still performs a runtime heap allocation, so their presence
+            // — even alongside a non-empty slab plan — is a real proof failure, not
+            // a partial success.
+            let violations: Vec<HeapViolation> = plan
+                .unplanned
+                .iter()
+                .map(|&id| HeapViolation {
+                    function: fn_name.to_string(),
+                    source_loc: String::new(),
+                    reason: format!(
+                        "allocation site #{id} has a dynamic/unbounded size and could not be \
+                         slab-planned — it falls back to a runtime heap allocation"
+                    ),
+                })
+                .collect();
             NoHeapProof {
                 functions_checked: vec![fn_name.to_string()],
                 total_alloc_sites: total,
-                slab_planned_sites: total,
-                violations: Vec::new(),
-                proven: true,
+                slab_planned_sites: planned,
+                proven: violations.is_empty(),
+                violations,
             }
         }
         None => {
@@ -1245,6 +1260,58 @@ mod tests {
         let proof = prove_no_heap(None, "forward");
         assert!(!proof.proven);
         assert_eq!(proof.violations.len(), 1);
+    }
+
+    #[test]
+    fn test_prove_no_heap_fully_planned() {
+        use crate::memory_planner::SlabPlan;
+        use std::collections::HashMap;
+
+        let mut assignments = HashMap::new();
+        assignments.insert(0u32, (0u32, 0u64));
+        let plan = SlabPlan {
+            slots: Vec::new(),
+            total_bytes: 256,
+            assignments,
+            naive_total: 256,
+            padding_bytes: 0,
+            unplanned: Vec::new(),
+        };
+        let proof = prove_no_heap(Some(&plan), "forward");
+        assert!(proof.proven, "a fully slab-planned function must be proven heap-free");
+        assert!(proof.violations.is_empty());
+        assert_eq!(proof.total_alloc_sites, 1);
+        assert_eq!(proof.slab_planned_sites, 1);
+    }
+
+    #[test]
+    fn test_prove_no_heap_partially_dynamic_not_proven() {
+        // Regression test: a SlabPlan can be `Some` (some tensors were planned)
+        // while other allocation sites were dynamically-sized and excluded from
+        // the plan. Those still heap-allocate at runtime, so `proven` must be
+        // false — previously this was reported as `proven: true` with zero
+        // violations just because `slab_plan` was `Some(..)`.
+        use crate::memory_planner::SlabPlan;
+        use std::collections::HashMap;
+
+        let mut assignments = HashMap::new();
+        assignments.insert(0u32, (0u32, 0u64));
+        let plan = SlabPlan {
+            slots: Vec::new(),
+            total_bytes: 256,
+            assignments,
+            naive_total: 256,
+            padding_bytes: 0,
+            unplanned: vec![1u32],
+        };
+        let proof = prove_no_heap(Some(&plan), "forward");
+        assert!(
+            !proof.proven,
+            "a dynamic-sized allocation site excluded from the slab plan must fail the proof"
+        );
+        assert_eq!(proof.violations.len(), 1);
+        assert_eq!(proof.total_alloc_sites, 2);
+        assert_eq!(proof.slab_planned_sites, 1);
     }
 
     #[test]
