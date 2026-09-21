@@ -802,9 +802,15 @@ fn compile_returning_plan_impl(
                 // indices and names. The closure captures only locals, and
                 // the vram-budget refusal below stays OUTSIDE the body so a
                 // budget error is never misattributed as a scheduler refusal.
+                //
+                // Pass the FULL (unfiltered) `allocs`, not `plannable`: plan_slab
+                // filters internally and records everything it declines in
+                // `SlabPlan::unplanned`, which `prove_no_heap` relies on to catch
+                // dynamic-sized tensors that still heap-allocate at runtime. Pre-
+                // filtering here would silently hide them from that proof.
                 let sched = compiler.passes.scheduler();
                 let plan = sched
-                    .schedule("MemoryPlanner", None, || plan_slab(&plannable, &graph))
+                    .schedule("MemoryPlanner", None, || plan_slab(&allocs, &graph))
                     .map_err(crate::error::CodegenError::new)?
                     .finish(&compiler.bus)
                     .map_err(crate::error::CodegenError::new)?;

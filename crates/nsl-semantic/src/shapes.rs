@@ -97,29 +97,41 @@ pub fn check_matmul(lhs: &Shape, rhs: &Shape, op_span: Span) -> Result<Shape, Di
         )));
     }
 
-    // Verify batch dimensions are compatible
+    // Verify batch dimensions are compatible and unify them, right-aligned
+    // (numpy-style broadcasting: extra leading batch dims on either side pass through).
     let l_batch = lhs.rank() - 2;
     let r_batch = rhs.rank() - 2;
-    let min_batch = l_batch.min(r_batch);
-    for i in 0..min_batch {
-        let l_dim = &lhs.dims[l_batch - 1 - i];
-        let r_dim = &rhs.dims[r_batch - 1 - i];
-        if unify_dim(l_dim, r_dim).is_none() {
-            return Err(Diagnostic::error(format!(
-                "matmul batch dimensions don't match: {} vs {}",
-                fmt_shape(lhs),
-                fmt_shape(rhs)
-            ))
-            .with_label(op_span, format!(
-                "batch dim mismatch: {} vs {}",
-                fmt_dim(l_dim),
-                fmt_dim(r_dim)
-            )));
-        }
+    let max_batch = l_batch.max(r_batch);
+    let mut batch_dims = Vec::with_capacity(max_batch);
+    for i in 0..max_batch {
+        let l_dim = (i < l_batch).then(|| &lhs.dims[l_batch - 1 - i]);
+        let r_dim = (i < r_batch).then(|| &rhs.dims[r_batch - 1 - i]);
+        let unified = match (l_dim, r_dim) {
+            (Some(l), Some(r)) => match unify_dim(l, r) {
+                Some(d) => d,
+                None => {
+                    return Err(Diagnostic::error(format!(
+                        "matmul batch dimensions don't match: {} vs {}",
+                        fmt_shape(lhs),
+                        fmt_shape(rhs)
+                    ))
+                    .with_label(op_span, format!(
+                        "batch dim mismatch: {} vs {}",
+                        fmt_dim(l),
+                        fmt_dim(r)
+                    )));
+                }
+            },
+            (Some(d), None) | (None, Some(d)) => d.clone(),
+            (None, None) => unreachable!("i < max_batch implies at least one side has this dim"),
+        };
+        batch_dims.push(unified);
     }
+    batch_dims.reverse();
 
-    // Result: [.., M, N] — take all but last from lhs, append last from rhs
-    let mut result = lhs.dims[..lhs.rank() - 1].to_vec();
+    // Result: [.., M, N] — unified batch dims, M from lhs, N from rhs.
+    let mut result = batch_dims;
+    result.push(lhs.dims[lhs.rank() - 2].clone());
     result.push(rhs.dims[rhs.rank() - 1].clone());
 
     Ok(Shape { dims: result })
@@ -279,6 +291,40 @@ mod tests {
         assert_eq!(
             result.dims,
             vec![Dim::Concrete(2), Dim::Concrete(3), Dim::Concrete(5)]
+        );
+    }
+
+    #[test]
+    fn matmul_batch_unequal_rank_rhs_wider() {
+        // a: [4, 5], b: [2, 3, 5, 6] -> a broadcasts over b's leading batch dims.
+        let a = concrete_shape(&[4, 5]);
+        let b = concrete_shape(&[2, 3, 5, 6]);
+        let result = check_matmul(&a, &b, Span::DUMMY).unwrap();
+        assert_eq!(
+            result.dims,
+            vec![
+                Dim::Concrete(2),
+                Dim::Concrete(3),
+                Dim::Concrete(4),
+                Dim::Concrete(6)
+            ]
+        );
+    }
+
+    #[test]
+    fn matmul_batch_unequal_rank_lhs_wider() {
+        // a: [2, 3, 4, 5], b: [5, 6] -> b broadcasts over a's leading batch dims.
+        let a = concrete_shape(&[2, 3, 4, 5]);
+        let b = concrete_shape(&[5, 6]);
+        let result = check_matmul(&a, &b, Span::DUMMY).unwrap();
+        assert_eq!(
+            result.dims,
+            vec![
+                Dim::Concrete(2),
+                Dim::Concrete(3),
+                Dim::Concrete(4),
+                Dim::Concrete(6)
+            ]
         );
     }
 
