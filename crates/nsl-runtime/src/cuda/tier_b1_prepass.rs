@@ -276,10 +276,8 @@ use cudarc::driver::sys::CUresult;
 
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
-#[cfg(feature = "cuda")]
-use std::sync::Mutex;
 
-/// Process-global cache of chunkified weight tiles. Weights are static
+/// Per-device cache of chunkified weight tiles. Weights are static
 /// across inference calls in a typical workflow (loaded once at model
 /// init), so the per-call cost of running `launch_w_prepass` three
 /// times (Wq/Wk/Wv) every attention layer dominates the actual
@@ -302,6 +300,18 @@ use std::sync::Mutex;
 /// (the caller will then allocate a fresh per-call scratch — slower
 /// but correct).
 ///
+/// Roadmap A4 step 3b moved the map itself onto the per-device
+/// `CudaContext` and KEPT this field, because the two guard different
+/// things. The registry answers "which device did this runtime pick";
+/// `cuCtxGetCurrent` answers "which context is actually current on
+/// this thread right now", and those coincide only while the runtime
+/// is the sole creator of contexts — which `current()` does not yet
+/// enforce, since it returns slot 0 without activating it. Step 5
+/// makes `current()` ordinal-driven with activation at every entry;
+/// that is the step which can retire this field, not this one. Until
+/// then it costs one `cuCtxGetCurrent` per lookup and rules out a
+/// class of wrong answer the map's location does not.
+///
 /// **Lifetime:** entries hold owned `cuMemAlloc`'d device buffers that
 /// live until process exit. This intentionally leaks: for inference
 /// workloads weights are loaded once and used until the process dies,
@@ -316,10 +326,19 @@ struct WCacheKey {
     chunk: u32,
 }
 
+/// The W cache, held per DEVICE on
+/// [`CudaContext`](super::context::CudaContext) since roadmap A4 step 3b: its
+/// values are `cuMemAlloc`'d scratch buffers of one device's.
 #[cfg(feature = "cuda")]
-fn w_cache() -> &'static Mutex<HashMap<WCacheKey, u64>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<WCacheKey, u64>>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct WCache(HashMap<WCacheKey, u64>);
+
+/// Run `f` against this device's W cache. **Must not call the allocator** —
+/// see [`CudaContext::with_cache`](super::context::CudaContext::with_cache).
+/// Both call sites here already allocate outside it.
+#[cfg(feature = "cuda")]
+fn with_w_cache<R>(f: impl FnOnce(&mut HashMap<WCacheKey, u64>) -> R) -> R {
+    super::context::current().with_cache(|c: &mut WCache| f(&mut c.0))
 }
 
 /// Read the currently-active CUDA context for the calling thread.
@@ -337,7 +356,7 @@ fn current_cuda_context() -> Option<u64> {
     }
 }
 
-/// Look up `(ctx, in_ptr, dm, hd, chunk)` in the global W cache.
+/// Look up `(ctx, in_ptr, dm, hd, chunk)` in this device's W cache.
 /// Returns the chunkified GPU pointer on hit. On miss, allocates a GPU
 /// scratch buffer, launches `launch_w_prepass`, inserts into the
 /// cache (when a context is current), and returns the new pointer.
@@ -365,7 +384,7 @@ pub(crate) fn w_chunkified_cached(
             hd: hd as u32,
             chunk: chunk as u32,
         };
-        if let Some(&p) = w_cache().lock().unwrap().get(&key) {
+        if let Some(p) = with_w_cache(|c| c.get(&key).copied()) {
             return Some(p);
         }
     }
@@ -392,7 +411,7 @@ pub(crate) fn w_chunkified_cached(
             hd: hd as u32,
             chunk: chunk as u32,
         };
-        w_cache().lock().unwrap().insert(key, scratch as u64);
+        with_w_cache(|c| c.insert(key, scratch as u64));
     }
     Some(scratch as u64)
 }

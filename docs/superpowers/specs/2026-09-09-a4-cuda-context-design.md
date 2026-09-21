@@ -404,11 +404,65 @@ new true statement.
 
    - **3a — the library handles. Done.** `CUBLAS_HANDLE`, and `lt_matmul`'s
      `HANDLE`, `WS` (the cublasLt device workspace) and `PLANS`.
-   - **3b** — the device caches: `bf16_cast_cache`, `strided_copy`,
-     `tier_b1_prepass`, `FP8_SCALES`.
+   - **3b — the device caches. Done.** `bf16_cast_cache`'s `CACHE`,
+     `strided_copy`'s plan memo, `tier_b1_prepass`'s W cache, and a fifth the
+     sketch missed: `upload_meta_i64_cached`'s map in `cuda/mod.rs`, which is
+     the same thing (device pointers, keyed by device ordinal) and sat in the
+     file the slice was already editing. `FP8_SCALES` **stays a process
+     static** — see below.
    - **3c** — the regions: the slab and transient-arena base/size.
    - **3d** — `CACHING_ALLOCATOR` and the lock-order restatement, last
      because it is the one with a public `LazyLock` and external callers.
+
+   Four notes from 3b:
+
+   - **The shared cache mutex is a real constraint, not a formality.** One
+     `Mutex<HashMap<TypeId, ...>>` holds every device cache, so the allocator
+     must not be called inside a `with_cache` closure: `free_managed` begins
+     with `bf16_cast_cache::evict`, which is itself a `with_cache` call, and
+     `alloc_managed`'s OOM recovery frees. Two of the four caches were freeing
+     a duplicate device buffer **under their own lock** — legal while the locks
+     were separate, a self-deadlock once they are one — so both had their
+     publish restructured to decide inside the cache and release the loser
+     outside it. The rule is now on `with_cache`'s doc: short closures, driver
+     calls between them.
+   - **Two keys shrank, and one budget was wrong.** `strided_copy`'s
+     `PlanKey` and `upload_meta_i64_cached`'s key both led with the device
+     ordinal precisely because the values are device pointers; on a per-device
+     map the ordinal is the map, not a field. `strided_copy`'s
+     `OFFSET_TABLE_BUDGET` accounting moved into the cache with it, which fixes
+     a bug rather than just relocating one: a single process-wide `SPENT` let a
+     second device's offset tables consume the first device's allowance, so
+     whichever device warmed up second would degrade to the generic kernel with
+     its own memory unspent. `inner::current_device_ordinal()` existed only to
+     key these two maps and is deleted.
+   - **`tier_b1_prepass` keeps its `ctx` key field.** It hashes
+     `cuCtxGetCurrent` so a hit cannot return a pointer from another address
+     space. That guards a different axis than the registry does — the registry
+     says which device this runtime picked, `cuCtxGetCurrent` says which
+     context is current on this thread right now — and the two coincide only
+     while the runtime is the sole creator of contexts, which `current()` does
+     not yet enforce (it returns slot 0 without activating it). Step 5 is what
+     retires that field, not this step.
+   - **`FP8_SCALES` does not move**, for three reasons the other four do not
+     share: it is not device state (an `f32` per tensor, keyed by a
+     process-unique host pointer — splitting it per device would return the
+     1.0 default for a scale set on another device's map); `fp8.rs` is not
+     `cuda`-gated, so the type does not exist in a CPU-only build; and
+     `remove_fp8_scale` runs on *every* tensor free, so routing it through
+     `current()` would force CUDA initialisation from the free path and abort a
+     pure-CPU run of a cuda-featured binary on a GPU-less machine. Same call as
+     `RESOLVED_MATH_MODE` in 3a: the inventory names what to examine, not what
+     must move.
+
+   3b also repaired a **3a regression that reached `main` green**:
+   `lt_matmul::reset_for_test` still referenced the deleted `PLANS` static, so
+   `--features cuda,test-hooks` did not compile. Nothing built that
+   combination — the CUDA lane builds `--features cuda`, under which every
+   `reset_for_test` in the cuda modules is `#[cfg]`'d out — so the whole family
+   of reset hooks was invisible to CI. The lane now runs a short incremental
+   `cargo check -p nsl-runtime --features cuda,test-hooks --all-targets`
+   after its build, which closes the class and not just the instance.
 
    Two notes from 3a:
 

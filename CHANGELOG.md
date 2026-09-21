@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The GPU resource caches are per device rather than per process (roadmap A4
+  step 3b). The BF16 weight-image cache, the strided-copy resident-plan memo,
+  Tier B.1's chunkified-weight cache and the small-metadata upload cache all
+  hold device pointers; each now lives on its own device's context. Two of
+  them had carried the device ordinal in their key for exactly that reason,
+  and drop it — the map an entry is found in *is* the device.
+
+- `FP8_SCALES` stays process-global, unlike the four caches above: it holds a
+  scale per tensor keyed by a process-unique host pointer rather than any
+  device state, `fp8.rs` is not CUDA-gated, and its removal hook runs on every
+  tensor free — where forcing CUDA initialisation would abort a pure-CPU run
+  of a CUDA-featured binary on a machine with no GPU.
+
 - The cuBLAS and cublasLt handles are per device rather than per process
   (roadmap A4 step 3a). The cuBLAS handle, the cublasLt handle, its device
   workspace and its per-shape plan cache move onto the device context — each
@@ -274,6 +287,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- The strided-copy offset-table budget is per device. One process-wide
+  counter capped every device's resident plans together, so on a second
+  device whichever warmed up later fell back to the generic copy kernel with
+  its own memory unspent. The budget now lives in the per-device plan cache,
+  where reserve and refund happen under the same lock as the publish they
+  belong to.
+
+- `--features cuda,test-hooks` compiles again: roadmap A4 step 3a moved
+  `lt_matmul`'s plan map onto the device context and left `reset_for_test`
+  referencing the deleted `PLANS` static. Nothing in CI built that feature
+  combination, so every `reset_for_test` in the CUDA modules was
+  uncompiled — the CUDA lane now checks it.
 
 - Daily invariant audit: `check_binary_op`'s `BitOr`/`BitAnd` arm
   (`nsl-semantic/src/checker/ops.rs`) returned the left operand's type

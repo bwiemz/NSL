@@ -253,9 +253,22 @@ impl CudaContext {
     /// this one hands out `&mut T` *while holding the mutex* — `f` must not
     /// re-enter for the same `T`, and should not do long GPU work under it.
     ///
+    /// **`f` must not call the allocator.** One mutex guards every cache on
+    /// the device, so `alloc_managed` or `free_managed` inside any closure can
+    /// come back through another cache and self-deadlock — `free_managed`'s
+    /// first act is `bf16_cast_cache::evict`, which is a `with_cache` call,
+    /// and `alloc_managed`'s OOM recovery frees. This is not the theoretical
+    /// hazard it looks like: two of step 3b's caches published a duplicate
+    /// device buffer by calling `free_managed` under their own (then separate)
+    /// lock, and both had to move that free after the critical section to be
+    /// migrated here. The shape that works is short closures with the driver
+    /// calls *between* them: probe, allocate, install, and release the loser
+    /// outside. Step 3a's plan cache already followed it, for the different
+    /// reason that `build_plan` syncs the device while timing.
+    ///
     /// Keyed by `TypeId` for the same reason as the workspaces: `lt_matmul`'s
     /// `Plan` stays declared in `lt_matmul`, and this module names no caller's
-    /// type. Roadmap A4 step 3a.
+    /// type. Roadmap A4 steps 3a and 3b.
     pub(crate) fn with_cache<T: Default + Send + 'static, R>(
         &self,
         f: impl FnOnce(&mut T) -> R,
