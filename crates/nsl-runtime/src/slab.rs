@@ -56,12 +56,47 @@ pub extern "C" fn nsl_slab_offset(slab_ptr: i64, offset: i64) -> i64 {
 // GPU slab (device memory — compile-time planned arena)
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::device_region::Region;
 
-/// Global GPU slab base pointer (set by nsl_gpu_slab_init).
-static GPU_SLAB_BASE: AtomicU64 = AtomicU64::new(0);
-/// GPU slab total size for diagnostics / validation.
-static GPU_SLAB_SIZE: AtomicU64 = AtomicU64::new(0);
+/// This device's GPU slab — base pointer (set by `nsl_gpu_slab_init`) and
+/// total size, `(0, 0)` when none is allocated.
+///
+/// Roadmap A4 step 3c: the base is a device pointer, so it belongs to a
+/// device, not to the process. Under `cuda` it lives on that device's
+/// [`CudaContext`](crate::cuda::context::CudaContext); in a CPU-only build,
+/// where `nsl_gpu_slab_init` cannot allocate anything at all, one
+/// process-global region keeps these `extern "C"` rows answering 0 without
+/// needing a device to exist.
+///
+/// Unlike the arena's, none of these readers is hot: the slab is allocated
+/// once at program start and freed at exit, and `nsl_gpu_slab_active` /
+/// `nsl_gpu_slab_size` are probes.
+#[cfg(feature = "cuda")]
+fn region() -> &'static Region {
+    // NON-FORCING, and that is the whole point. `context::current()` would
+    // lazily create the context, and these rows are reached on paths that
+    // must not: `nsl_gpu_slab_destroy` is emitted at program exit
+    // unconditionally, for CPU-only programs included. A
+    // cuda-featured binary running a CPU-only program on a machine with no
+    // driver would then abort at teardown where today it no-ops.
+    //
+    // No context means no device means no region, so an empty one answers
+    // every read correctly. Writes are safe through the same door only
+    // because both initialisers allocate device memory FIRST — which
+    // initialises the context — and publish afterwards; keep that order.
+    if crate::cuda::context::initialized() {
+        &crate::cuda::context::current().slab
+    } else {
+        static NO_DEVICE: Region = Region::new();
+        &NO_DEVICE
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn region() -> &'static Region {
+    static CPU_ONLY: Region = Region::new();
+    &CPU_ONLY
+}
 
 /// Allocate the GPU memory slab. Called once at program start.
 /// `size_bytes` is the total slab size computed by the compile-time memory planner.
@@ -75,8 +110,7 @@ pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
         if ptr.is_null() { return 0; }
         // Zero the slab (tensors expect zero-initialized memory)
         crate::cuda::inner::memset_d8(ptr, size_bytes as usize);
-        GPU_SLAB_BASE.store(ptr as u64, Ordering::SeqCst);
-        GPU_SLAB_SIZE.store(size_bytes as u64, Ordering::SeqCst);
+        region().set(ptr as u64, size_bytes as u64);
         return ptr as i64;
     }
     #[cfg(not(feature = "cuda"))]
@@ -86,25 +120,24 @@ pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
 /// Free the GPU memory slab. Called once at program exit.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_destroy() {
-    let base = GPU_SLAB_BASE.swap(0, Ordering::SeqCst);
+    let base = region().take();
     if base == 0 { return; }
     #[cfg(feature = "cuda")]
     {
         crate::cuda::inner::free_device(base as *mut std::ffi::c_void);
     }
-    GPU_SLAB_SIZE.store(0, Ordering::SeqCst);
 }
 
 /// Returns 1 if a GPU slab is currently allocated, 0 otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_active() -> i64 {
-    if GPU_SLAB_BASE.load(Ordering::SeqCst) != 0 { 1 } else { 0 }
+    if region().active() { 1 } else { 0 }
 }
 
 /// Returns the GPU slab total size in bytes (for diagnostics). 0 if no slab.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_size() -> i64 {
-    GPU_SLAB_SIZE.load(Ordering::SeqCst) as i64
+    region().size() as i64
 }
 
 #[cfg(test)]

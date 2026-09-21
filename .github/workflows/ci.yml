@@ -486,6 +486,15 @@ jobs:
       - name: GPU caching allocator tests
         run: cargo test -p nsl-runtime --features cuda --lib -- cuda::caching_allocator
 
+      # The per-device context's own gates: the registry's slot invariant, the
+      # stream pool and workspaces (A4 step 2), and step 3c's rule that a
+      # teardown row must not create a context. All GPU-free, and none of them
+      # ran before — the two filters above select `caching_allocator` and the
+      # ptxas gate only, so everything under `cuda::context` was compiled and
+      # never executed.
+      - name: CUDA context tests (registry, stream pool, regions)
+        run: cargo test -p nsl-runtime --features cuda --lib -- cuda::context
+
       # These live in nsl-codegen and need only ptxas, not the cuda feature.
       # They silently no-op on a runner without a toolkit, which is exactly how
       # the NUL-terminator bug survived.

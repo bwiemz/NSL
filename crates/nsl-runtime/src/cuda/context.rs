@@ -47,6 +47,8 @@
 
 use cudarc::driver::sys::*;
 use std::any::{Any, TypeId};
+
+use crate::device_region::Region;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -134,6 +136,19 @@ pub(crate) struct CudaContext {
     /// Was `lt_matmul`'s `PLANS`, reached through [`CudaContext::with_cache`]
     /// so the plan type stays declared in `lt_matmul`.
     caches: Mutex<HashMap<TypeId, Box<dyn Any + Send>>>,
+    /// The compile-time-planned transient arena for this device (roadmap A4
+    /// step 3c). Was `transient_arena`'s `ARENA_BASE` / `ARENA_SIZE`.
+    ///
+    /// Plain atomics rather than a slot in `caches`: `Region::contains` runs
+    /// at the top of every `free_managed` and `base` is read once per wrapped
+    /// op, so this is read-hot state, where the plan cache is read-rare. See
+    /// [`crate::device_region`].
+    pub(crate) arena: Region,
+    /// The compile-time-planned GPU slab for this device (roadmap A4 step
+    /// 3c). Was `slab`'s `GPU_SLAB_BASE` / `GPU_SLAB_SIZE`. Cold by
+    /// comparison — allocated at program start, freed at exit — but it is the
+    /// same kind of thing and shares the type.
+    pub(crate) slab: Region,
 }
 
 // SAFETY: the two raw driver handles (`primary`, and `device` which is an
@@ -768,6 +783,8 @@ unsafe fn init_device(slot: usize) -> CudaContext {
             cublaslt: OnceLock::new(),
             lt_workspace: OnceLock::new(),
             caches: Mutex::new(HashMap::new()),
+            arena: Region::new(),
+            slab: Region::new(),
         }
     }
 }
@@ -775,6 +792,35 @@ unsafe fn init_device(slot: usize) -> CudaContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slab and arena teardown rows must not bring a context into being.
+    ///
+    /// Roadmap A4 step 3c moved both regions onto the context, and the first
+    /// cut of that reached them through `current()`, which creates one. The
+    /// emitted `nsl_gpu_slab_destroy` runs at the end of EVERY program, a
+    /// CPU-only one included, so a cuda-featured binary on a machine with no
+    /// driver would have aborted at exit where it used to no-op — `device()`
+    /// asserts on `cuInit` failure. Both accessors are gated on
+    /// [`initialized`] for that reason, and this is the gate that says so.
+    ///
+    /// Stated as an implication so it is honest on a box that has a GPU: if a
+    /// context already exists some other test made it, and there is nothing
+    /// here to prove. On CI's CUDA lane, which has stub libraries and no
+    /// device, it can never exist — which is exactly where the regression
+    /// would bite.
+    #[test]
+    fn the_teardown_rows_do_not_create_a_context() {
+        if initialized() {
+            return;
+        }
+        crate::slab::nsl_gpu_slab_destroy();
+        crate::transient_arena::nsl_arena_destroy();
+        assert!(
+            !initialized(),
+            "a teardown row created a CUDA context; on a driverless machine \
+             that is an abort at program exit, not a slow path"
+        );
+    }
 
     /// The registry is one slot in this step. When step 5 changes this, the
     /// `SLOTS == 1` branch in `init_device` must go with it — that branch is
