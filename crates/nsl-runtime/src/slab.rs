@@ -120,11 +120,16 @@ pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
 /// Free the GPU memory slab. Called once at program exit.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_slab_destroy() {
+    // Retire the region first, then release what it held. Phrased as an `if`
+    // rather than an early `return` because `take()` clearing the extent is
+    // now the last statement in a non-`cuda` build, where a trailing `return`
+    // is `clippy::needless_return` under the workspace's `-D warnings`.
     let base = region().take();
-    if base == 0 { return; }
-    #[cfg(feature = "cuda")]
-    {
-        crate::cuda::inner::free_device(base as *mut std::ffi::c_void);
+    if base != 0 {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::inner::free_device(base as *mut std::ffi::c_void);
+        }
     }
 }
 
