@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CUDA caching allocator is per device (roadmap A4 step 3d, the last
+  slice of step 3). It was one process-wide `CACHING_ALLOCATOR` static whose
+  free lists held device pointers, so a second device's blocks would have
+  been filed with the first's; each device context now owns its own.
+  `caching_allocator::allocator()` serves the alloc and free paths;
+  `allocator_if_initialized()` serves the `nsl_gpu_*` stats rows, the
+  per-step reset, the allocation summary and the `NSL_MEMSTATS` report,
+  which must answer zero rather than create a context in a CPU-only run of
+  a CUDA-featured binary. The lock-order rule is restated on the context as
+  what the code does: the allocator's mutex is a leaf, never held while
+  another of the context's mutexes is taken, and a source check keeps the
+  allocator's own methods lock-free.
+
 - The GPU slab and the transient arena are per device rather than per process
   (roadmap A4 step 3c). Both are a device base pointer plus an extent, so
   both now live on the device's context, behind a new `device_region::Region`

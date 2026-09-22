@@ -238,7 +238,8 @@ struct Block {
 }
 
 /// SAFETY: Block contains raw pointers to GPU memory and sibling Blocks.
-/// All access is guarded by the single `CACHING_ALLOCATOR` Mutex.
+/// All access is guarded by the owning device's allocator mutex
+/// (`CudaContext::allocator`).
 unsafe impl Send for Block {}
 
 /// A single `cuMemAlloc_v2` region, subdivided into one or more Blocks.
@@ -438,7 +439,10 @@ pub(crate) struct CachingAllocator<D: DriverAlloc = CudaDriverAlloc> {
 unsafe impl<D: DriverAlloc + Send> Send for CachingAllocator<D> {}
 
 impl CachingAllocator<CudaDriverAlloc> {
-    fn new() -> Self {
+    /// A fresh allocator over the real driver. Pure — no driver call, only
+    /// the `NSL_GPU_MEM_LIMIT` read — so the context can build one inside
+    /// its own lazy initialisation.
+    pub(crate) fn new() -> Self {
         let memory_limit = parse_mem_limit();
         CachingAllocator {
             small_free: BTreeSet::new(),
@@ -1200,11 +1204,39 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 }
 
 // ---------------------------------------------------------------------------
-// Global static instance
+// The per-device instance (roadmap A4 step 3d)
 // ---------------------------------------------------------------------------
 
-pub static CACHING_ALLOCATOR: LazyLock<Mutex<CachingAllocator>> =
-    LazyLock::new(|| Mutex::new(CachingAllocator::new()));
+/// The current device's allocator, creating the device's context if there is
+/// none yet.
+///
+/// Was `pub static CACHING_ALLOCATOR: LazyLock<Mutex<CachingAllocator>>`: one
+/// allocator per process, holding device pointers — so a second device's
+/// blocks would have been filed in the first device's free lists. Each
+/// context now owns its own (`CudaContext::allocator`).
+///
+/// For the allocation and free paths, which are about to use the device
+/// anyway. A path a CPU-only run can reach — a stats row, a report, a
+/// teardown hook — uses [`allocator_if_initialized`] instead: the old static
+/// never touched the driver, so reading it was safe on a machine with no GPU,
+/// and creating a context there would turn that read into a `cuInit`
+/// assertion.
+pub(crate) fn allocator() -> &'static Mutex<CachingAllocator> {
+    &super::context::current().allocator
+}
+
+/// The current device's allocator if a context exists, without creating one.
+///
+/// `None` means no device has been touched, so there is nothing to report:
+/// every stats row answers what a fresh allocator would (zero), which is
+/// exactly what the old process-wide static answered before any allocation.
+pub(crate) fn allocator_if_initialized() -> Option<&'static Mutex<CachingAllocator>> {
+    if super::context::initialized() {
+        Some(allocator())
+    } else {
+        None
+    }
+}
 
 thread_local! {
     /// Current allocation pool tag. Code that allocates persistent tensors
@@ -1387,8 +1419,15 @@ pub(crate) fn memstats_enabled() -> bool {
 }
 
 /// Print a human-readable summary of GPU memory allocator statistics.
+///
+/// Registered with `atexit` when the first context comes up, so a context
+/// exists by the time it runs; non-forcing all the same, because it is a
+/// report and must never be what initialises a device.
 pub(crate) fn print_memory_summary() {
-    let alloc = CACHING_ALLOCATOR.lock().unwrap();
+    let Some(allocator) = allocator_if_initialized() else {
+        return;
+    };
+    let alloc = allocator.lock().unwrap();
     let s = &alloc.stats;
     let fmt = fmt_bytes;
     let mut context_totals: HashMap<String, (usize, usize)> = HashMap::new();
@@ -1496,6 +1535,46 @@ pub(crate) fn print_memory_summary() {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Roadmap A4 step 3d: the allocator's mutex is a leaf lock — while a
+    /// guard is held only the driver, thread-locals and the log are touched
+    /// (the rule is written down on `CudaContext`). This holds the
+    /// allocator's own methods to it: none takes a lock, reaches the device
+    /// context, or re-enters an allocation entry point, so whatever a caller
+    /// does under the guard, the allocator adds no lock edge of its own. A
+    /// source check rather than a run because the property is about every
+    /// path, and the paths that would violate it need a device.
+    #[test]
+    fn the_allocator_methods_take_no_lock() {
+        let src = include_str!("caching_allocator.rs");
+        let header = "impl<D: DriverAlloc> CachingAllocator<D> {";
+        let start = src.find(header).expect("the allocator's method impl");
+        // The impl ends at the first line that is a lone closing brace.
+        let len = src[start..].find("\n}\n").expect("the impl's closing brace");
+        let code: String = src[start..start + len]
+            .lines()
+            .map(|l| l.split("//").next().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("fn free_block"), "scanned the wrong block");
+        for forbidden in [
+            ".lock(",
+            ".try_lock(",
+            "context::",
+            "with_cache",
+            "ensure_context",
+            "alloc_managed",
+            "free_managed",
+            "free_device",
+            "allocator()",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "a CachingAllocator method calls `{forbidden}`: the allocator mutex would stop \
+                 being a leaf lock (see the lock-order note on CudaContext)"
+            );
+        }
+    }
 
     /// Mock driver that hands out sequential addresses from a bump allocator.
     struct MockDriver {

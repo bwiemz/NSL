@@ -413,8 +413,9 @@ new true statement.
    - **3c — the regions. Done.** The slab's `GPU_SLAB_BASE`/`SIZE` and the
      transient arena's `ARENA_BASE`/`SIZE`, now `CudaContext::slab` and
      `CudaContext::arena`. Notes below.
-   - **3d** — `CACHING_ALLOCATOR` and the lock-order restatement, last
-     because it is the one with a public `LazyLock` and external callers.
+   - **3d — the allocator and the lock-order restatement. Done.** Was
+     `caching_allocator`'s `pub static CACHING_ALLOCATOR`, now
+     `CudaContext::allocator`. Notes below. **Step 3 is complete.**
 
    Four notes from 3b:
 
@@ -465,6 +466,42 @@ new true statement.
    of reset hooks was invisible to CI. The lane now runs a short incremental
    `cargo check -p nsl-runtime --features cuda,test-hooks --all-targets`
    after its build, which closes the class and not just the instance.
+
+   Three notes from 3d:
+
+   - **Two accessors, split by whether the caller may create a context.**
+     `caching_allocator::allocator()` goes through `current()` and is for the
+     allocation and free paths, which are about to use the device anyway.
+     `allocator_if_initialized()` is for everything that only *reads* it —
+     the `nsl_gpu_peak_allocated_bytes` / `cumulative_alloc_count` /
+     `surface_*` rows, `nsl_gpu_reset_mem_stats`,
+     `nsl_debug_gpu_alloc_summary`, the `NSL_MEMSTATS` report — and answers
+     what a fresh allocator would when there is no context. The old static
+     never touched the driver, so those rows were safe in a CPU-only run of a
+     cuda binary; routing them through `current()` would have made them a
+     `cuInit` assertion, the same trap 3c found in `nsl_gpu_slab_destroy`.
+     `the_allocator_stats_rows_do_not_create_a_context` is the gate.
+   - **The lock order is a leaf, not a pair.** "CUDA_STATE before
+     CACHING_ALLOCATOR" existed because `ensure_context` locked the state and
+     `alloc_managed` called it with the allocator held. Step 1 made
+     `ensure_context` lock-free, and reading every site now shows the
+     allocator's mutex is never held while another of the context's mutexes
+     is taken, nor taken while one is held: under it the code calls only the
+     driver, thread-locals and the log. That is what `CudaContext`'s doc now
+     says, with the three places that release one guard before taking the
+     next. `caching_allocator::the_allocator_methods_take_no_lock` holds the
+     allocator's own methods to it by source (planting a `.lock()` in
+     `free_block` fails it) — a check on text because the paths that would
+     break it need a device.
+   - **The CUDA lane's GPU-free tests can now be run without a GPU box.**
+     `--features cuda` test binaries need `-lcuda`, `-lcublas` and
+     `-lcublasLt` to link, which is why they had only ever run in CI. A stub
+     of each, generated from cudarc's own binding declarations with every
+     entry point returning `CUDA_ERROR_STUB_LIBRARY` (34, as the toolkit's
+     stubs do), links them; `cuda::context` (10) and
+     `cuda::caching_allocator` (33) pass against it. The rest of the `--lib`
+     suite still needs a device — its first `cuInit` aborts — which is why
+     the lane filters.
 
    Three notes from 3c:
 

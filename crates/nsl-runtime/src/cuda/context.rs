@@ -89,10 +89,33 @@ unsafe impl Send for DeferredFree {}
 
 /// Everything one CUDA device owns.
 ///
-/// Lock order within a context: **modules before allocator**, the same rule
-/// the singleton documented as "CUDA_STATE before CACHING_ALLOCATOR". Two
-/// contexts are never locked together — that is the invariant that makes a
-/// second device safe, and step 5 depends on it.
+/// **Lock order (restated in roadmap A4 step 3d, when the allocator moved
+/// in).** The singleton documented "CUDA_STATE before CACHING_ALLOCATOR",
+/// because `ensure_context` locked the state and `alloc_managed` called it
+/// with the allocator held. Step 1 made `ensure_context` lock-free
+/// (`activate` is one `cuCtxSetCurrent`), so that pair can no longer nest,
+/// and what the code actually does now is stronger than an order:
+///
+/// - **[`allocator`](Self::allocator) is a leaf.** While it is held, the
+///   code calls the driver (`cuMemAlloc_v2` / `cuMemFree_v2` in `drain_all`
+///   and the grow path), reads thread-locals and writes the log — never
+///   another of this context's mutexes and never the allocator's own entry
+///   points (`caching_allocator::the_allocator_methods_take_no_lock` holds
+///   its methods to that). Every caller releases it before touching
+///   `allocs`, `async_allocs` or `frees`: `caching_alloc` drops the guard
+///   before `register_cuda_alloc`, `free_managed` releases `allocs` before
+///   taking it, and the deferred-free drain collects under `frees` and frees
+///   after.
+/// - **[`with_cache`](Self::with_cache) never reaches the allocator** (its
+///   doc says why: `free_managed` opens with a `with_cache` call).
+/// - If a future path must nest, the rule the singleton wrote down still
+///   applies — this context's other mutexes outside, the allocator inside —
+///   and it must be added to this list.
+///
+/// Two contexts are never locked together — that is the invariant that makes
+/// a second device safe, and step 5 depends on it. With one allocator per
+/// context it also means a device's blocks can only ever be filed in that
+/// device's free lists.
 ///
 /// The mutexes are deliberately one-per-former-static rather than the single
 /// `frees: Mutex<DeferredFrees>` the design spec sketches. Merging them would
@@ -148,7 +171,14 @@ pub(crate) struct CudaContext {
     /// 3c). Was `slab`'s `GPU_SLAB_BASE` / `GPU_SLAB_SIZE`. Cold by
     /// comparison — allocated at program start, freed at exit — but it is the
     /// same kind of thing and shares the type.
-    pub(crate) slab: Region,
+    pub(crate) slab: Region,    /// Roadmap A4 step 3d: was `caching_allocator`'s
+    /// `pub static CACHING_ALLOCATOR: LazyLock<Mutex<CachingAllocator>>`.
+    /// The pools hold this device's pointers, so they are this device's.
+    /// Reached through `caching_allocator::allocator()` (forcing, for the
+    /// alloc/free paths) or `allocator_if_initialized()` (for the stats rows
+    /// and reports a CPU-only run can reach). A leaf lock — see the struct
+    /// doc.
+    pub(crate) allocator: Mutex<super::caching_allocator::CachingAllocator>,
 }
 
 // SAFETY: the two raw driver handles (`primary`, and `device` which is an
@@ -785,6 +815,9 @@ unsafe fn init_device(slot: usize) -> CudaContext {
             caches: Mutex::new(HashMap::new()),
             arena: Region::new(),
             slab: Region::new(),
+            // Pure: no driver call, so building it inside this lazy init
+            // cannot re-enter `device()`.
+            allocator: Mutex::new(super::caching_allocator::CachingAllocator::new()),
         }
     }
 }
@@ -819,6 +852,34 @@ mod tests {
             !initialized(),
             "a teardown row created a CUDA context; on a driverless machine \
              that is an abort at program exit, not a slow path"
+        );
+    }
+
+    /// Roadmap A4 step 3d: the allocator moved onto the context, and the rows
+    /// that only READ it — the `nsl_gpu_*` stats getters gates call, the
+    /// per-step reset, the debug summary, the `NSL_MEMSTATS` report — must
+    /// not create one. The old process-wide static never touched the driver,
+    /// so a CPU-only run of a cuda binary could call them on a machine with
+    /// no GPU; forcing a context there is a `cuInit` assertion. Each answers
+    /// what a fresh allocator would. Stated as an implication, like the
+    /// teardown test above.
+    #[test]
+    fn the_allocator_stats_rows_do_not_create_a_context() {
+        if initialized() {
+            return;
+        }
+        assert_eq!(crate::tensor::nsl_gpu_peak_allocated_bytes(), 0);
+        assert_eq!(crate::tensor::nsl_gpu_cumulative_alloc_count(), 0);
+        assert_eq!(crate::tensor::nsl_gpu_surface_peak_bytes(0), 0);
+        assert_eq!(crate::tensor::nsl_gpu_surface_at_peak_bytes(0), 0);
+        crate::tensor::nsl_gpu_reset_mem_stats();
+        crate::tensor::nsl_debug_gpu_alloc_summary(0);
+        crate::cuda::caching_allocator::print_memory_summary();
+        assert!(crate::cuda::caching_allocator::allocator_if_initialized().is_none());
+        assert!(
+            !initialized(),
+            "an allocator stats row created a CUDA context; on a driverless \
+             machine that is an abort, where the old static answered zero"
         );
     }
 

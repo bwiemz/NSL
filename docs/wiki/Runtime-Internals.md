@@ -80,7 +80,7 @@ Key properties:
 - **Segments.** Each `cuMemAlloc_v2` call returns a large region (`SMALL_SEGMENT_SIZE = 2 MB` or `LARGE_SEGMENT_SIZE = 20 MB`) that is subdivided into `Block`s. Blocks form a doubly-linked list within their parent segment ordered by GPU address.
 - **Coalescing.** When a block is freed, adjacent free blocks merge in O(1) via the linked-list pointers. Fully-free segments are returned to the driver on `drain_all`.
 - **Two pool tags.** `AllocPool::Persistent` covers model weights, optimizer moment buffers, and DataLoader tensors — these segments survive `drain_all`. `AllocPool::Transient` covers forward/backward intermediates and gradients — these segments are released once fully free.
-- **Single global lock.** `CACHING_ALLOCATOR` is a `LazyLock<Mutex<CachingAllocator>>`. All alloc/free paths are serialised through this mutex; every CUDA call site must call `ensure_context()` before acquiring it.
+- **One lock per device.** Each `CudaContext` owns its allocator as a `Mutex<CachingAllocator>` (roadmap A4 step 3d; it was the process-wide `CACHING_ALLOCATOR` static). All alloc/free paths on a device are serialised through it — `caching_allocator::allocator()` — and it is a leaf lock: no other lock is taken while it is held. Stats rows read it through `allocator_if_initialized()`, which never creates a context.
 - **Memory limit.** `NSL_GPU_MEMORY_LIMIT` environment variable sets a soft ceiling; an over-limit alloc triggers `drain_all` and retries before returning OOM.
 
 ## GPU path
