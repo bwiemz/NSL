@@ -410,7 +410,9 @@ new true statement.
      the same thing (device pointers, keyed by device ordinal) and sat in the
      file the slice was already editing. `FP8_SCALES` **stays a process
      static** — see below.
-   - **3c** — the regions: the slab and transient-arena base/size.
+   - **3c — the regions. Done.** The slab's `GPU_SLAB_BASE`/`SIZE` and the
+     transient arena's `ARENA_BASE`/`SIZE`, now `CudaContext::slab` and
+     `CudaContext::arena`. Notes below.
    - **3d** — `CACHING_ALLOCATOR` and the lock-order restatement, last
      because it is the one with a public `LazyLock` and external callers.
 
@@ -463,6 +465,41 @@ new true statement.
    of reset hooks was invisible to CI. The lane now runs a short incremental
    `cargo check -p nsl-runtime --features cuda,test-hooks --all-targets`
    after its build, which closes the class and not just the instance.
+
+   Three notes from 3c:
+
+   - **A new leaf type, `device_region::Region`, not a slot in `caches`.**
+     Both regions are a base pointer plus an extent, and both are read on
+     paths the cache mutex has no business on: `Region::contains` runs at the
+     top of every `free_managed` (the arena-interior check that keeps an
+     interior pointer out of `cuMemFree`) and `base` is read once per wrapped
+     op by `nsl_arena_bind`. That is the step-3b workspace/cache distinction
+     one level down — state whose *reads* are hot wants atomics, state whose
+     reads are rare wants the lock. The type lives in a leaf module rather
+     than in `context.rs` because `slab.rs` and `transient_arena.rs` are
+     **not** `cuda`-gated: their `extern "C"` rows are part of the ABI in a
+     CPU-only build, so the type they are written in terms of must compile
+     without the feature.
+
+   - **The accessor is non-forcing, and that is load-bearing.** The first cut
+     reached the region through `context::current()`, which *creates* a
+     context. `nsl_gpu_slab_destroy` is emitted at the end of every program,
+     a CPU-only one included, so a cuda-featured binary on a driverless
+     machine would have aborted at exit (via `device()`'s `cuInit` assert)
+     where it used to no-op. Both accessors now answer from an empty region
+     when `initialized()` is false — no context means no device means no
+     region, so every read is still correct. Writes go through the same door
+     safely only because both initialisers allocate device memory *first*
+     (each allocator opens with `ensure_context()`) and publish after; that
+     order is a requirement, not an accident. `cuda::context`'s
+     `the_teardown_rows_do_not_create_a_context` is the gate.
+
+   - **The `cuda::context` tests had never run.** The CUDA lane's two `--lib`
+     invocations filter to `caching_allocator` and the ptxas gate, so
+     everything under `cuda::context` — the registry slot invariant and step
+     2's six stream/workspace gates — was compiled and never executed. (A
+     claim to the contrary in #701's PR body was wrong.) 3c adds the step
+     that runs them, which is also what makes the gate above real.
 
    Two notes from 3a:
 
