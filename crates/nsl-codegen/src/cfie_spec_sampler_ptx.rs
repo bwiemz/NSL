@@ -93,18 +93,6 @@ pub struct SpecSamplerMeta {
     pub block_dim: u32,
 }
 
-/// Mirrors `gpu_specs::GpuSpec::ptx_version` (same convention as the
-/// sibling CFIE emitters): sm_100+ -> 8.6, sm_90+ -> 8.4, else 7.0.
-fn ptx_version_for_sm(sm: u32) -> &'static str {
-    if sm >= 100 {
-        "8.6"
-    } else if sm >= 90 {
-        "8.4"
-    } else {
-        "7.0"
-    }
-}
-
 fn f32_imm(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
@@ -361,7 +349,7 @@ pub fn emit_draft_sample(cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
     writeln!(w, "//   vocab_tile = {}", TILE).unwrap();
     writeln!(w, "//   rms_eps    = {} ({})", RMS_EPS, eps).unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();
@@ -477,7 +465,7 @@ pub fn emit_verify_probs(cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
     writeln!(w, "//   vocab_tile = {}", TILE).unwrap();
     writeln!(w, "//   rms_eps    = {} ({})", RMS_EPS, eps).unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();
@@ -883,6 +871,11 @@ mod tests {
             assert!(emit_ptx(&c).contains(".version 8.4\n.target sm_90"));
             c.sm_version = 100;
             assert!(emit_ptx(&c).contains(".version 8.6\n.target sm_100"));
+            // The parts whose ISA the old table got wrong.
+            c.sm_version = 86;
+            assert!(emit_ptx(&c).contains(".version 7.1\n.target sm_86"));
+            c.sm_version = 120;
+            assert!(emit_ptx(&c).contains(".version 8.7\n.target sm_120"));
         }
     }
 

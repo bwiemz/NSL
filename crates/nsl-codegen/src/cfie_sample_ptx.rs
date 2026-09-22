@@ -73,18 +73,6 @@ pub struct FusedSampleMeta {
     pub block_dim: u32,
 }
 
-/// Mirrors `gpu_specs::GpuSpec::ptx_version`: sm_100+ -> 8.6 (Blackwell),
-/// sm_90+ -> 8.4 (Hopper wgmma/TMA), else 7.0 baseline.
-fn ptx_version_for_sm(sm: u32) -> &'static str {
-    if sm >= 100 {
-        "8.6"
-    } else if sm >= 90 {
-        "8.4"
-    } else {
-        "7.0"
-    }
-}
-
 fn f32_imm(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
@@ -245,7 +233,7 @@ pub fn emit(
     )
     .unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();
@@ -1049,6 +1037,13 @@ mod tests {
         cfg.sm_version = 100;
         assert!(emit_fused_sample_ptx(&paper_program(), &cfg)
             .contains(".version 8.6\n.target sm_100"));
+        // The parts whose ISA the old table got wrong (7.0 / 7.0 / 8.6).
+        cfg.sm_version = 89;
+        assert!(emit_fused_sample_ptx(&paper_program(), &cfg)
+            .contains(".version 7.8\n.target sm_89"));
+        cfg.sm_version = 120;
+        assert!(emit_fused_sample_ptx(&paper_program(), &cfg)
+            .contains(".version 8.7\n.target sm_120"));
     }
 
     #[test]

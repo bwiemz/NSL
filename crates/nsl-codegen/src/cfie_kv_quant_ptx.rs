@@ -100,19 +100,6 @@ pub struct LayerPoolOffsets {
     pub v_elem_bytes: u32,
 }
 
-/// Mirrors `gpu_specs::GpuSpec::ptx_version` (duplicated here because
-/// the base emitter keeps its copy private): sm_100+ -> 8.6, sm_90+ ->
-/// 8.4, else 7.0 baseline.
-fn ptx_version_for_sm(sm: u32) -> &'static str {
-    if sm >= 100 {
-        "8.6"
-    } else if sm >= 90 {
-        "8.4"
-    } else {
-        "7.0"
-    }
-}
-
 fn f32_imm(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
@@ -292,7 +279,7 @@ pub fn emit_layer(
     writeln!(w, "//   k_elem_bytes        = {}", k_elem).unwrap();
     writeln!(w, "//   v_elem_bytes        = {}", v_elem).unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();

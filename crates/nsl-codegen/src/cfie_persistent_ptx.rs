@@ -67,18 +67,6 @@ pub struct DecodeBlockMeta {
     pub block_dim: u32,
 }
 
-/// Mirrors `gpu_specs::GpuSpec::ptx_version` (same convention as
-/// `cfie_decode_attention`).
-fn ptx_version_for_sm(sm: u32) -> &'static str {
-    if sm >= 100 {
-        "8.6"
-    } else if sm >= 90 {
-        "8.4"
-    } else {
-        "7.0"
-    }
-}
-
 fn f32_imm(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
@@ -226,7 +214,7 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
     )
     .unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();
