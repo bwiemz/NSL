@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- CUDA-graph capture state is per (thread, device) rather than per thread
+  (roadmap A4 step 4a). The capture state machine was four `thread_local!`
+  cells: the active region, the per-region states holding the captured
+  `CUgraphExec`s, the occurrence counters and the nested-begin depth. It now
+  lives in the context's per-thread slot, next to the compute stream it
+  captures on. The `cuFuncGetParamInfo` cache is keyed by `CUfunction`, and
+  moves from a process static onto the device context. Behaviour is unchanged
+  while the registry has one slot.
+
 - The GPU slab and the transient arena are per device rather than per process
   (roadmap A4 step 3c). Both are a device base pointer plus an extent, so
   both now live on the device's context, behind a new `device_region::Region`

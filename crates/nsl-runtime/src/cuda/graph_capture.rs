@@ -44,7 +44,7 @@
 #[cfg(feature = "cuda")]
 mod imp {
     use cudarc::driver::sys::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -382,23 +382,80 @@ mod imp {
         deferred: Vec<usize>,
     }
 
-    thread_local! {
-        static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) };
-        static REGIONS: RefCell<HashMap<(i64, u64), RegionState>> = RefCell::new(HashMap::new());
+    /// The capture state machine for one (thread, device) — roadmap A4 step 4.
+    ///
+    /// These were four `thread_local!` cells (`ACTIVE`, `REGIONS`,
+    /// `OCCURRENCE`, `NESTED_SKIP`). They stay thread-affine: a region
+    /// captures on the calling thread's compute stream, and only that thread
+    /// may issue into it. What changes is the device half — the state now
+    /// lives in the context's per-(thread, device) slot
+    /// (`context::ThreadSlot`), so a captured `CUgraphExec`, which belongs to
+    /// the context it was instantiated in, can never be replayed from another
+    /// device's region of the same id.
+    ///
+    /// The fields keep the cells' own interior mutability, and the slot hands
+    /// out a shared reference, so the borrow rules are exactly the cells':
+    /// `region_end` reading `active` while it holds `nested_skip` is legal,
+    /// and a nested `borrow_mut` of one field panics as it always did.
+    #[derive(Default)]
+    pub(crate) struct CaptureState {
+        active: RefCell<Option<Active>>,
+        regions: RefCell<HashMap<(i64, u64), RegionState>>,
         /// Per-region-id execution counter (phase = count % WINDOW).
-        static OCCURRENCE: RefCell<HashMap<i64, u64>> = RefCell::new(HashMap::new());
+        occurrence: RefCell<HashMap<i64, u64>>,
         /// Depth of ignored nested begins (should not happen; belt).
-        static NESTED_SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        nested_skip: Cell<u32>,
     }
+
+    #[cfg(test)]
+    impl CaptureState {
+        /// The one field a test can drive without a device.
+        pub(crate) fn nested_skip(&self) -> &Cell<u32> {
+            &self.nested_skip
+        }
+    }
+
+    /// Run `f` against the calling thread's capture state on the current
+    /// device. Only reached once `enabled()` is true, which `enable` makes
+    /// true only after it has probed the device — so this never initialises
+    /// CUDA on its own.
+    fn capture<R>(f: impl FnOnce(&CaptureState) -> R) -> R {
+        crate::cuda::context::current().streams.with_capture(f)
+    }
+
+    // One accessor per former cell, so each call site reads as the
+    // `LocalKey::with` it replaced.
+    fn with_active<R>(f: impl FnOnce(&RefCell<Option<Active>>) -> R) -> R {
+        capture(|c| f(&c.active))
+    }
+    fn with_regions<R>(f: impl FnOnce(&RefCell<HashMap<(i64, u64), RegionState>>) -> R) -> R {
+        capture(|c| f(&c.regions))
+    }
+    fn with_occurrence<R>(f: impl FnOnce(&RefCell<HashMap<i64, u64>>) -> R) -> R {
+        capture(|c| f(&c.occurrence))
+    }
+    fn with_nested_skip<R>(f: impl FnOnce(&Cell<u32>) -> R) -> R {
+        capture(|c| f(&c.nested_skip))
+    }
+
+    /// This device's `cuFuncGetParamInfo` answers, keyed by `CUfunction`.
+    ///
+    /// Was a process-wide `static CACHE`. A `CUfunction` is a handle into one
+    /// context's module, so the answer is device state: roadmap A4 step 4
+    /// puts it on the context through `with_cache`.
+    #[derive(Default)]
+    struct ParamInfo(HashMap<usize, Option<Vec<usize>>>);
 
     /// Per-CUfunction argument sizes queried once via `cuFuncGetParamInfo`
     /// (CUDA 12.4+). `None` = query unsupported/failed → region taints.
+    ///
+    /// The query runs between two short `with_cache` closures rather than
+    /// inside one, the shape `with_cache` asks for. Two threads missing on
+    /// the same function both ask the driver and insert the same answer.
     fn param_sizes(func: usize) -> Option<Vec<usize>> {
-        static CACHE: OnceLock<Mutex<HashMap<usize, Option<Vec<usize>>>>> = OnceLock::new();
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut guard = cache.lock().unwrap();
-        if let Some(v) = guard.get(&func) {
-            return v.clone();
+        let ctx = crate::cuda::context::current();
+        if let Some(v) = ctx.with_cache(|c: &mut ParamInfo| c.0.get(&func).cloned()) {
+            return v;
         }
         let mut sizes = Vec::new();
         let mut ok = true;
@@ -423,7 +480,7 @@ mod imp {
             }
         }
         let entry = if ok && !sizes.is_empty() { Some(sizes) } else { None };
-        guard.insert(func, entry.clone());
+        ctx.with_cache(|c: &mut ParamInfo| c.0.insert(func, entry.clone()));
         entry
     }
 
@@ -731,31 +788,31 @@ mod imp {
         if !enabled() {
             return;
         }
-        let nested = ACTIVE.with(|a| a.borrow().is_some());
+        let nested = with_active(|a| a.borrow().is_some());
         if nested {
             // Should never happen (regions are straight-line lowerings) —
             // ignore the inner region entirely, but keep begin/end balanced.
-            NESTED_SKIP.with(|n| n.set(n.get() + 1));
+            with_nested_skip(|n| n.set(n.get() + 1));
             if log_on() {
                 crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] nested region_begin({id}) ignored");
             }
             return;
         }
-        let phase = OCCURRENCE.with(|o| {
+        let phase = with_occurrence(|o| {
             let mut m = o.borrow_mut();
             let c = m.entry(id).or_insert(0);
             let cur = *c;
             *c += 1;
             cur % WINDOW.load(Ordering::Relaxed).max(1)
         });
-        let state = REGIONS.with(|r| r.borrow_mut().remove(&(id, phase)));
+        let state = with_regions(|r| r.borrow_mut().remove(&(id, phase)));
         let state = state.unwrap_or_else(|| {
             REGIONS_SEEN.fetch_add(1, Ordering::Relaxed);
             RegionState::Record { prev_digest: None, streak: 0, attempts: 0, rounds: 0, prev_seq: None }
         });
         let active = match state {
             RegionState::Eager => {
-                REGIONS.with(|r| r.borrow_mut().insert((id, phase), RegionState::Eager));
+                with_regions(|r| r.borrow_mut().insert((id, phase), RegionState::Eager));
                 return;
             }
             RegionState::Record { prev_digest, streak, attempts, rounds, prev_seq } => {
@@ -772,7 +829,7 @@ mod imp {
                         if log_on() {
                             crate::nsl_log!(WARN, "cuda-graph", "[cuda-graph] region {id}: begin-capture failed: {r:?}");
                         }
-                        REGIONS.with(|reg| reg.borrow_mut().insert((id, phase), fail_state(attempts)));
+                        with_regions(|reg| reg.borrow_mut().insert((id, phase), fail_state(attempts)));
                         return;
                     }
                     Active {
@@ -834,18 +891,18 @@ mod imp {
                 }
             }
         };
-        ACTIVE.with(|a| *a.borrow_mut() = Some(active));
+        with_active(|a| *a.borrow_mut() = Some(active));
     }
 
     pub fn region_end(id: i64) {
         if !enabled() {
             return;
         }
-        let skip = NESTED_SKIP.with(|n| {
+        let skip = with_nested_skip(|n| {
             let v = n.get();
             if v > 0 {
                 // Only swallow the end that matches an ignored nested begin.
-                let owns = ACTIVE.with(|a| {
+                let owns = with_active(|a| {
                     a.borrow().as_ref().map(|act| act.id) == Some(id)
                 });
                 if !owns {
@@ -858,7 +915,7 @@ mod imp {
         if skip {
             return;
         }
-        let Some(mut active) = ACTIVE.with(|a| a.borrow_mut().take()) else {
+        let Some(mut active) = with_active(|a| a.borrow_mut().take()) else {
             return; // eager region — nothing was activated
         };
         if active.id != id {
@@ -1055,7 +1112,7 @@ mod imp {
                 }
             }
         };
-        REGIONS.with(|r| r.borrow_mut().insert((id, active.phase), next));
+        with_regions(|r| r.borrow_mut().insert((id, active.phase), next));
         // Region work is on the stream (graph launch or eager) — the queued
         // deferred frees may record their completion events now.
         for ptr in active.deferred.drain(..) {
@@ -1120,7 +1177,7 @@ mod imp {
         if !enabled() {
             return true;
         }
-        let outcome = ACTIVE.with(|a| {
+        let outcome = with_active(|a| {
             let mut guard = a.borrow_mut();
             let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
@@ -1311,7 +1368,7 @@ mod imp {
             beta_bits: beta.to_bits(),
             batch, stride_a, stride_b, stride_c,
         };
-        let outcome = ACTIVE.with(|act| {
+        let outcome = with_active(|act| {
             let mut guard = act.borrow_mut();
             let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
@@ -1356,7 +1413,7 @@ mod imp {
             return MemsetAction::Sync;
         }
         let op = GpuOp::Memset { dst, bytes };
-        let (action, to_repair) = ACTIVE.with(|act| {
+        let (action, to_repair) = with_active(|act| {
             let mut guard = act.borrow_mut();
             let Some(active) = guard.as_mut() else {
                 return (MemsetAction::Sync, None);
@@ -1401,7 +1458,7 @@ mod imp {
         if !enabled() {
             return true;
         }
-        let outcome = ACTIVE.with(|act| {
+        let outcome = with_active(|act| {
             let mut guard = act.borrow_mut();
             let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
@@ -1479,7 +1536,7 @@ mod imp {
             return true;
         }
         let op = GpuOp::DtoD { dst: dst as usize, src: src as usize, len };
-        let outcome = ACTIVE.with(|act| {
+        let outcome = with_active(|act| {
             let mut guard = act.borrow_mut();
             let Some(active) = guard.as_mut() else { return HookOutcome::Issue };
             match active.mode {
@@ -1551,7 +1608,7 @@ mod imp {
         if !enabled() {
             return;
         }
-        let to_repair = ACTIVE.with(|act| {
+        let to_repair = with_active(|act| {
             let mut guard = act.borrow_mut();
             let Some(active) = guard.as_mut() else { return None };
             match active.mode {
@@ -1596,7 +1653,7 @@ mod imp {
         if !enabled() {
             return false;
         }
-        ACTIVE.with(|a| {
+        with_active(|a| {
             let mut guard = a.borrow_mut();
             match guard.as_mut() {
                 Some(active) => {
@@ -1612,7 +1669,7 @@ mod imp {
     /// events then (`cuEventQuery` is illegal during capture, and during
     /// replay the polled work may not be issued yet).
     pub fn in_region() -> bool {
-        enabled() && ACTIVE.with(|a| a.borrow().is_some())
+        enabled() && with_active(|a| a.borrow().is_some())
     }
 
     // ------------------------------------------------------------------
@@ -1893,5 +1950,5 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 pub(crate) use imp::{
     enabled, in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
     on_sgemm_full, queue_deferred_free, taint, taint_at,
-    GemmPrecision, MemsetAction, SgemmKind,
+    CaptureState, GemmPrecision, MemsetAction, SgemmKind,
 };
