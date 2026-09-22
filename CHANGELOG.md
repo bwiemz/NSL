@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The GPU slab and the transient arena are per device rather than per process
+  (roadmap A4 step 3c). Both are a device base pointer plus an extent, so
+  both now live on the device's context, behind a new `device_region::Region`
+  — plain atomics rather than the context's cache map, because the arena's
+  range check runs at the top of every device free and its base is read once
+  per wrapped op.
+
 - The GPU resource caches are per device rather than per process (roadmap A4
   step 3b). The BF16 weight-image cache, the strided-copy resident-plan memo,
   Tier B.1's chunkified-weight cache and the small-metadata upload cache all
@@ -287,6 +294,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- The CUDA context's own tests now run in CI. The CUDA lane's two filtered
+  test invocations selected the caching allocator and the ptxas gate, so
+  everything under `cuda::context` — the device-registry invariant and the
+  six GPU-free stream/workspace gates — was compiled and never executed.
 
 - The strided-copy offset-table budget is per device. One process-wide
   counter capped every device's resident plans together, so on a second

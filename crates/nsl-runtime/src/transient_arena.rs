@@ -45,7 +45,9 @@
 //! warns against.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+use crate::device_region::Region;
 
 /// Bytes of guard on each side of every slot.
 ///
@@ -59,10 +61,47 @@ pub const REDZONE: usize = 256;
 /// guard would be indistinguishable from an untouched one.
 pub const POISON: u8 = 0xA5;
 
-/// Base device pointer of the arena, or 0 when inactive.
-static ARENA_BASE: AtomicU64 = AtomicU64::new(0);
-/// Total arena size including all red zones.
-static ARENA_SIZE: AtomicU64 = AtomicU64::new(0);
+/// This device's arena region — base pointer and total size including all
+/// red zones, `(0, 0)` when inactive.
+///
+/// Roadmap A4 step 3c: the base is a device pointer, so it belongs to a
+/// device rather than to the process. Under `cuda` it lives on that device's
+/// [`CudaContext`](crate::cuda::context::CudaContext); in a CPU-only build,
+/// where no device and no context exist, one process-global region is the
+/// only meaningful home — and it is the one the GPU-free gates below write to
+/// when they fake an active arena.
+///
+/// The lookup is deliberately non-forcing — see the body. `owns`'s only
+/// caller is the top of `free_managed`, which does resolve the context a few
+/// lines later anyway, but `nsl_arena_destroy` and the probes are reached on
+/// runs where no device was ever touched, and creating one from a teardown
+/// path would abort on a machine with no driver.
+#[cfg(feature = "cuda")]
+fn region() -> &'static Region {
+    // NON-FORCING, and that is the whole point. `context::current()` would
+    // lazily create the context, and these rows are reached on paths that
+    // must not: `nsl_arena_destroy` runs at exit whether or not an arena was
+    // ever allocated. A
+    // cuda-featured binary running a CPU-only program on a machine with no
+    // driver would then abort at teardown where today it no-ops.
+    //
+    // No context means no device means no region, so an empty one answers
+    // every read correctly. Writes are safe through the same door only
+    // because both initialisers allocate device memory FIRST — which
+    // initialises the context — and publish afterwards; keep that order.
+    if crate::cuda::context::initialized() {
+        &crate::cuda::context::current().arena
+    } else {
+        static NO_DEVICE: Region = Region::new();
+        &NO_DEVICE
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn region() -> &'static Region {
+    static CPU_ONLY: Region = Region::new();
+    &CPU_ONLY
+}
 
 /// Diagnostics. `binds` counts arms, `placements` counts pins actually
 /// consumed by an allocation. They must be equal at teardown: an armed pin
@@ -111,7 +150,7 @@ thread_local! {
 
 /// True when an arena is allocated.
 pub fn active() -> bool {
-    ARENA_BASE.load(SeqCst) != 0
+    region().active()
 }
 
 /// Is `ptr` inside the arena?
@@ -121,12 +160,7 @@ pub fn active() -> bool {
 /// forgotten, and getting it wrong here means handing an arena interior
 /// pointer to `cuMemFree`.
 pub fn owns(ptr: *const c_void) -> bool {
-    let base = ARENA_BASE.load(SeqCst);
-    if base == 0 {
-        return false;
-    }
-    let p = ptr as u64;
-    p >= base && p < base + ARENA_SIZE.load(SeqCst)
+    region().contains(ptr)
 }
 
 /// Allocate the arena. `payload_bytes` is the planner's packed size; the
@@ -153,8 +187,7 @@ pub extern "C" fn nsl_arena_init(payload_bytes: i64, n_slots: i64) -> i64 {
         // POISON at check time means a slot nobody ever wrote, which is a
         // plan that allocated a slot for an op that does not exist.
         crate::cuda::inner::memset_d8_value(ptr, POISON, total);
-        ARENA_BASE.store(ptr as u64, SeqCst);
-        ARENA_SIZE.store(total as u64, SeqCst);
+        region().set(ptr as u64, total as u64);
         BINDS.store(0, SeqCst);
         PLACEMENTS.store(0, SeqCst);
         GUARD_FAILURES.store(0, SeqCst);
@@ -195,7 +228,8 @@ pub extern "C" fn nsl_arena_declare_slot(payload_offset: i64, bytes: i64) {
 /// the payload sits after that slot's leading guard.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i64) {
-    let base = ARENA_BASE.load(SeqCst);
+    let region = region();
+    let base = region.base();
     if base == 0 || bytes <= 0 || slot_index < 0 || payload_offset < 0 {
         return;
     }
@@ -223,7 +257,7 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
     }
     let payload = base + payload_offset as u64 + REDZONE as u64 * (slot_index as u64 + 1);
     let end = payload + bytes as u64 + REDZONE as u64;
-    if end > base + ARENA_SIZE.load(SeqCst) {
+    if end > base + region.size() {
         crate::nsl_log!(WARN, "arena", "[arena] bind slot {slot_index} (+{payload_offset}, {bytes} B) runs past \
              the arena; refusing to place it"
         );
@@ -304,7 +338,7 @@ pub extern "C" fn nsl_arena_unbind() {
 // non-cuda tests below still exercise it, so it cannot be cfg-gated away.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn take_pin(size_bytes: usize) -> Option<*mut c_void> {
-    if ARENA_BASE.load(SeqCst) == 0 {
+    if !region().active() {
         return None;
     }
     PIN_PROBES.fetch_add(1, SeqCst);
@@ -345,8 +379,8 @@ fn debug_enabled() -> bool {
 /// a per-step one. `nsl_arena_check_enabled` gates the compiler's emission.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_check() -> i64 {
-    let base = ARENA_BASE.load(SeqCst);
-    let size = ARENA_SIZE.load(SeqCst) as usize;
+    let region = region();
+    let (base, size) = (region.base(), region.size() as usize);
     if base == 0 || size == 0 {
         return 0;
     }
@@ -424,7 +458,7 @@ pub extern "C" fn nsl_arena_destroy() {
     if active() {
         let _ = nsl_arena_check();
     }
-    let base = ARENA_BASE.swap(0, SeqCst);
+    let base = region().take();
     if base == 0 {
         return;
     }
@@ -448,7 +482,6 @@ pub extern "C" fn nsl_arena_destroy() {
     {
         crate::cuda::inner::free_device(base as *mut c_void);
     }
-    ARENA_SIZE.store(0, SeqCst);
 }
 
 /// `(binds, placements, guard_failures)` — for gates that need to prove the
@@ -489,15 +522,19 @@ mod tests {
         // Fake an active arena so the SIZE comparison actually executes —
         // without this the test never reached the load-bearing branch and a
         // "first allocation <= bound size wins" regression would stay green.
-        ARENA_BASE.store(0x1000, SeqCst);
-        ARENA_SIZE.store(1 << 20, SeqCst);
+        //
+        // This writes the region directly, which is why step 3c kept a
+        // process-global region for the non-cuda build instead of routing
+        // every build at the device context: these gates run under plain
+        // `cargo test -p nsl-runtime`, where there is no device to hang one
+        // on. The range arithmetic itself is proved in `device_region`.
+        region().set(0x1000, 1 << 20);
         PIN.with(|p| p.set((0x2000, 4096, 0)));
         assert!(take_pin(4095).is_none(), "smaller must not consume");
         assert!(take_pin(4097).is_none(), "larger must not consume");
         assert_eq!(take_pin(4096), Some(0x2000 as *mut c_void), "exact consumes");
         assert!(take_pin(4096).is_none(), "single-shot: second exact declines");
-        ARENA_BASE.store(0, SeqCst);
-        ARENA_SIZE.store(0, SeqCst);
+        region().take();
         PIN.with(|p| p.set((0, 0, -1)));
         PLACED_AT.with(|c| c.set(0));
         PLACEMENTS.store(0, SeqCst);

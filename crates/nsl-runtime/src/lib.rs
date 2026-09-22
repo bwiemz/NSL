@@ -174,6 +174,7 @@ pub mod checkpoint;
 pub mod inspect;
 pub mod host_profile;
 /// Milestone C p2 Stage-2B/2C: the placed transient arena.
+pub mod device_region;
 pub mod transient_arena;
 pub mod tokenizer;
 pub mod tokenizer_bpe;
