@@ -373,6 +373,42 @@ frozen throughout, so nothing here blocks a kernel fix.
    `grammar` is one line and goes with the first). Proof: normalised
    identity where the sequences coincide, differential execution
    otherwise (level 1's caveat).
+
+   **`decode_attention` and `grammar` done**; the freeze went from 68
+   members to 66. `grammar`'s fragment is byte-identical (level 1 with
+   nothing to normalise): `backend_ptx::global_byte_array` prints the
+   initialized `.global` array. `decode_attention` is level 3, and this
+   kernel needed more of the interpreter than step 7's: a cooperative CTA
+   (threads run to a `bar.sync`, which releases only when every thread
+   waits at it), shared memory, loops, and two thread schedules per launch,
+   ascending and descending, so a missing barrier changes the answer under
+   one of them. The hand *emitter* is the fixture
+   (`tests/fixtures/cfie_decode_attn_hand.rs`, verbatim), since its strides
+   are baked per configuration; the KIR module matches it bit for bit over
+   four geometries and twelve calls, the shared answer matches
+   `cpu_reference`, and deleting any one of the five barriers, nudging any
+   baked stride or the softmax scale, or dropping the tail-tile clamp is
+   caught. Loosening pass 1's `tok < seq_len` guard is *not* — an
+   equivalent mutant: its extra scores land past `tcnt`, which every later
+   loop bounds away, and its extra K rows stay inside the pool. Three
+   things surfaced:
+
+   - the printer declared no `shared_mem` for a region layout — the
+     `SharedRegion` arm named a symbol nothing declared. It prints
+     `.shared .align <max> .b8 shared_mem[<total>]` (or the `.extern` form
+     for a dynamic layout) now;
+   - the hand header paired `.target sm_{N}` with an ISA that cannot name
+     every `N` in the GPU table: `ptxas` 13.2 refuses `.version 7.0` with
+     sm_86, sm_87 and sm_89 and `.version 8.6` with sm_120. The KIR module targets
+     the floor (`sm_70`) and the driver JIT-compiles it forward;
+     `tests/cfie_decode_attn_ptxas.rs` assembles it for sm_75 through
+     sm_120 and records the refusals. `DecodeAttentionConfig` lost its
+     `sm_version`. The other five CFIE emitters shared the convention;
+     they keep hand headers and take their ISA from
+     `gpu_specs::ptx_isa_for_sm`, which names every target in the table
+     (`tests/cfie_ptx_headers_ptxas.rs`);
+   - a test that read the base kernel's hand register names
+     (`cfie_kv_quant_ptx`'s stride check) reads `kv_strides` instead.
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).

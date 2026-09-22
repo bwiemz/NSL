@@ -521,6 +521,11 @@ jobs:
           # rcp/rsqrt, shuffle modes, votes, .b16 memory, cast rounding,
           # vector loads/stores, predicated stores) under PTX 7.8 / sm_80.
           cargo test -p nsl-codegen --test kir_scalar_isa_ptxas
+          # Roadmap A2 step 9: the CFIE decode-attention kernel as KIR,
+          # assembled for every serving arch (sm_75..sm_120), and the
+          # hand header it replaced refused where its ISA could not name
+          # the target.
+          cargo test -p nsl-codegen --test cfie_decode_attn_ptxas
           # The five CFIE hand emitters, built and assembled at every
           # sm_version in the GPU table (their headers named targets their
           # ISA could not on sm_86/87/89/120).

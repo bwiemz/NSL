@@ -130,7 +130,9 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     writeln!(ptx, ".address_size 64").unwrap();
     writeln!(ptx).unwrap();
 
-    // Shared memory declaration
+    // Shared memory declaration. The flat block and a region layout are
+    // alternatives (rule 8 refuses both); either way the block is the one
+    // symbol `shared_mem` that `SharedBase` and `SharedRegion` address.
     if ir.shared_mem_bytes > 0 {
         writeln!(
             ptx,
@@ -138,6 +140,22 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
             ir.shared_mem_bytes
         )
         .unwrap();
+        writeln!(ptx).unwrap();
+    } else if !ir.smem_layout.regions.is_empty() {
+        // Roadmap A2 step 9: the first region-layout kernel to reach the
+        // printer (CFIE decode attention) found this branch missing — the
+        // `SharedRegion` arm named `shared_mem` and nothing declared it.
+        // The block is aligned to the strictest region, since `offset_of`
+        // aligns each region relative to the block's start.
+        let align = ir.smem_layout.regions.iter().map(|r| r.align.max(1)).max().unwrap_or(1);
+        if ir.smem_layout.dynamic {
+            writeln!(ptx, ".extern .shared .align {} .b8 shared_mem[];", align).unwrap();
+        } else {
+            // Rule 8 has already refused a layout whose size overflows;
+            // `unwrap_or(0)` keeps the printer total for an unverified one.
+            let total = ir.smem_layout.total_bytes().unwrap_or(0);
+            writeln!(ptx, ".shared .align {} .b8 shared_mem[{}];", align, total).unwrap();
+        }
         writeln!(ptx).unwrap();
     }
 
@@ -1103,6 +1121,57 @@ fn address_space_str(space: AddressSpace) -> &'static str {
     }
 }
 
+/// Initializers per line of a [`global_byte_array`]: 24 worst-case
+/// three-digit bytes occupy 4 (indent) + 24*4 (digits + comma) + 23
+/// (spaces) = 123 ASCII columns, under a 132-column line. (32 per line
+/// reaches 163 columns on dense data.)
+pub const GLOBAL_BYTES_PER_LINE: usize = 24;
+
+/// A module-scope, initialized byte array:
+///
+/// ```text
+/// .global .align 1 .b8 <name>[<len>] = {
+///     b0, b1, ..., b23,
+///     ...
+/// };
+/// ```
+///
+/// Roadmap A2 step 9: data a kernel *reads* rather than computes — the
+/// CFIE grammar mask, baked at compile time and bound by the host through
+/// `cuModuleGetGlobal` — is still PTX text, and PTX text is this module's
+/// to print. An emitter splices the returned fragment into a module's
+/// scope (after `.address_size`, before any entry). It begins at the
+/// `.global` directive and ends with `};` and a newline.
+///
+/// # Panics
+///
+/// If `bytes` is empty (PTX has no zero-length array) or `name` is not a
+/// PTX identifier — either would be refused by `ptxas`, far from the cause.
+pub fn global_byte_array(name: &str, bytes: &[u8]) -> String {
+    assert!(!bytes.is_empty(), "a .global array needs at least one byte ({name})");
+    let mut chars = name.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
+    assert!(
+        first_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$'),
+        "`{name}` is not a PTX identifier"
+    );
+    let mut p = String::with_capacity(bytes.len() * 4 + 64);
+    write!(p, ".global .align 1 .b8 {}[{}] = {{", name, bytes.len()).unwrap();
+    for (i, b) in bytes.iter().enumerate() {
+        if i % GLOBAL_BYTES_PER_LINE == 0 {
+            p.push_str("\n    ");
+        } else {
+            p.push(' ');
+        }
+        write!(p, "{}", b).unwrap();
+        if i + 1 != bytes.len() {
+            p.push(',');
+        }
+    }
+    p.push_str("\n};\n");
+    p
+}
+
 fn dim_char(dim: u8) -> char {
     match dim {
         0 => 'x',
@@ -1220,6 +1289,76 @@ mod tests {
         let ptx = String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]);
 
         assert!(ptx.contains(".shared .align 4 .b8 shared_mem[1024]"));
+    }
+
+    /// Roadmap A2 step 9: the grammar mask's fragment, byte for byte as
+    /// `cfie_grammar_ptx` printed it by hand — wrapped at 24 initializers,
+    /// the last without a comma.
+    #[test]
+    fn a_global_byte_array_prints_the_initialized_directive() {
+        assert_eq!(global_byte_array("m", &[32, 0]), ".global .align 1 .b8 m[2] = {\n    32, 0\n};\n");
+        let bytes: Vec<u8> = (0..30).map(|i| (i * 9) as u8).collect();
+        let text = global_byte_array("nsl_mask", &bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], ".global .align 1 .b8 nsl_mask[30] = {");
+        assert_eq!(lines[1].matches(',').count(), GLOBAL_BYTES_PER_LINE);
+        assert_eq!(lines[2], "    216, 225, 234, 243, 252, 5");
+        assert_eq!(lines[3], "};");
+        assert_eq!(lines.len(), 4);
+        // Worst case stays under the 132-column line.
+        let dense = global_byte_array("d", &[255; 100]);
+        assert!(dense.lines().all(|l| l.len() <= 132), "{dense}");
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one byte")]
+    fn an_empty_global_byte_array_is_refused() {
+        let _ = global_byte_array("m", &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a PTX identifier")]
+    fn a_global_byte_array_needs_an_identifier() {
+        let _ = global_byte_array("9lives", &[1]);
+    }
+
+    /// Roadmap A2 step 9: a kernel whose shared memory is a region layout
+    /// declares the block its `SharedRegion` addresses are offsets into —
+    /// static at the layout's padded size, dynamic as an `extern` block
+    /// sized at launch — aligned to the strictest region.
+    #[test]
+    fn a_region_layout_declares_the_block_its_regions_live_in() {
+        let layout = |dynamic| SmemLayout {
+            regions: vec![
+                SmemRegion { name: "a".into(), bytes: 12, align: 4, elem: KirType::F32 },
+                SmemRegion { name: "b".into(), bytes: 64, align: 16, elem: KirType::F16 },
+            ],
+            dynamic,
+        };
+        let print = |dynamic| {
+            let mut b = KirBuilder::new("test_regions");
+            b.set_smem_layout(layout(dynamic));
+            let entry = b.new_block();
+            b.set_block(entry);
+            let p = b.new_typed_var(KirType::Ptr(Box::new(KirType::F16), AddressSpace::Shared));
+            b.emit(KirOp::SharedRegion { dst: p, region: 1 });
+            b.terminate(KirTerminator::Return);
+            let ir = b.finalize();
+            assert!(crate::kir_verify::verify(&ir).is_ok(), "{:?}", crate::kir_verify::verify(&ir));
+            let bytes = lower_kir_to_ptx(&ir);
+            String::from_utf8_lossy(&bytes[..bytes.len() - 1]).into_owned()
+        };
+
+        // `a` is 12 bytes at 0; `b` rounds up to 16 and runs to 80.
+        assert_eq!(layout(false).total_bytes(), Some(80));
+        let fixed = print(false);
+        assert!(fixed.contains(".shared .align 16 .b8 shared_mem[80];\n"), "{fixed}");
+        assert!(fixed.contains("mov.u64 %rd0, shared_mem;\n    add.u64 %rd0, %rd0, 16;"), "{fixed}");
+        assert!(!fixed.contains(".extern"), "{fixed}");
+
+        let sized_at_launch = print(true);
+        assert!(sized_at_launch.contains(".extern .shared .align 16 .b8 shared_mem[];\n"), "{sized_at_launch}");
+        assert!(!sized_at_launch.contains("shared_mem[80]"), "{sized_at_launch}");
     }
 
     #[test]

@@ -28,12 +28,6 @@ use std::fmt::Write;
 /// Module-scope symbol the decode loop binds to `grammar_mask_ptr`.
 pub const MASK_GLOBAL_NAME: &str = "nsl_cfie_grammar_mask";
 
-/// Initializer bytes per emitted line: 24 worst-case three-digit bytes
-/// occupy 4 (indent) + 24*4 (digits + comma) + 23 (spaces) = 123 ASCII
-/// columns, under the 132-column line invariant the structural test
-/// asserts.  (32/line breaks it at 163 columns on dense masks.)
-const BYTES_PER_LINE: usize = 24;
-
 /// Bytes per DFA-state row: one bit per vocab token, byte-padded.
 pub fn mask_row_bytes(dfa: &CompiledDfa) -> usize {
     (dfa.vocab_size as usize).div_ceil(8)
@@ -70,32 +64,13 @@ pub fn emit_mask_global(dfa: &CompiledDfa) -> String {
         dfa.num_states >= 1 && dfa.vocab_size >= 1,
         "grammar mask requires a non-degenerate DFA (num_states and vocab_size >= 1)"
     );
-    let bytes = mask_bytes(dfa);
-    let mut p = String::with_capacity(bytes.len() * 4 + 256);
-    let w = &mut p;
-    write!(
-        w,
-        ".global .align 1 .b8 {}[{}] = {{",
-        MASK_GLOBAL_NAME,
-        bytes.len()
-    )
-    .unwrap();
-    for (i, b) in bytes.iter().enumerate() {
-        if i % BYTES_PER_LINE == 0 {
-            w.push_str("\n    ");
-        } else {
-            w.push(' ');
-        }
-        write!(w, "{}", b).unwrap();
-        if i + 1 != bytes.len() {
-            w.push(',');
-        }
-    }
-    w.push_str("\n};\n");
+    // Roadmap A2 step 9: the directive and its initializer are printed by
+    // `nsl_kir`, with the rest of the PTX text; this module owns the bytes.
+    let mut p = crate::backend_ptx::global_byte_array(MASK_GLOBAL_NAME, &mask_bytes(dfa));
     // Baked-constants trailer (decode-attention house style; kept after
     // the directive so the fragment still starts with `.global`).
     writeln!(
-        w,
+        p,
         "// {}: {} states x {} mask bytes/row (1 bit/token, LSB first), density {:.4}",
         MASK_GLOBAL_NAME,
         dfa.num_states,
@@ -235,6 +210,20 @@ mod tests {
         assert!(
             frag.lines().all(|l| l.len() <= 132),
             "initializer lines must stay wrapped"
+        );
+    }
+
+    /// Roadmap A2 step 9: the fragment is byte-identical to what this
+    /// module printed by hand before `nsl_kir` took the directive over —
+    /// the normalised-identity proof, with nothing to normalise.
+    #[test]
+    fn fragment_text_is_unchanged_by_the_kir_move() {
+        let dfa = sequence_dfa(&[5], 8);
+        assert_eq!(
+            emit_mask_global(&dfa),
+            ".global .align 1 .b8 nsl_cfie_grammar_mask[2] = {\n    32, 0\n};\n\
+             // nsl_cfie_grammar_mask: 2 states x 1 mask bytes/row (1 bit/token, LSB first), \
+             density 0.0625\n"
         );
     }
 
