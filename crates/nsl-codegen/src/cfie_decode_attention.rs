@@ -1,9 +1,9 @@
-//! CFIE Feature 1: direct-indexing decode-attention PTX emitter.
+//! CFIE Feature 1: direct-indexing decode-attention kernel, built as KIR.
 //!
 //! The paper's core claim: because the KV-cache layout
 //! `[n_layers][2][max_tokens][n_kv_heads][head_dim]` is fixed at compile
 //! time (see `cfie_kv_plan::DirectLayout`), the decode-attention kernel
-//! addresses K/V by pure arithmetic over strides baked as PTX immediates.
+//! addresses K/V by pure arithmetic over strides baked as immediates.
 //! No block table, no indirection load, no CPU-side page mapping on the
 //! decode path.
 //!
@@ -23,8 +23,38 @@
 //!           accumulates output element `d` across the tile's tokens.
 //! Simplest-correct scheme per the Tier A spec; coalescing/vectorization
 //! is a later tier's concern.
+//!
+//! ## KIR (roadmap A2 step 9)
+//!
+//! The kernel was hand-assembled PTX text until A2 step 9; it is now a
+//! [`KernelIR`] that the verifier checks before `nsl_kir`'s printer lowers
+//! it. The algorithm, and the order of every floating-point operation in
+//! it, is the hand kernel's — `tests/cfie_decode_attn_kir_equivalence.rs`
+//! runs the frozen hand emitter and this one side by side on a PTX
+//! interpreter and requires the same output bits. What changed:
+//!
+//! * Addresses are element indices through `PtrOffset` rather than byte
+//!   offsets, so the baked immediates are element strides (the `//`
+//!   header lines always were); the pointer's element type does the
+//!   scaling.
+//! * Loop-carried values (the tile cursor, the accumulator, the running
+//!   max and sum, each loop's index) are block parameters.
+//! * Shared memory is an [`SmemLayout`] of four f32 regions — `q`,
+//!   `scores`, `rescale`, `l` — at the offsets the hand kernel used.
+//! * The module targets the KIR floor (`.version 7.0` / `.target sm_70`)
+//!   instead of the serving GPU: the driver JIT-compiles it forward to any
+//!   newer part. The hand header paired `.target sm_{N}` with a PTX ISA
+//!   that cannot name every `N` the GPU table holds (sm_86/87/89 need ISA
+//!   7.1/7.4/7.8 and were given 7.0; sm_120 needs 8.7 and was given 8.6),
+//!   and nothing in the kernel needs more than sm_70.
 
 use std::fmt::Write;
+
+use crate::backend_ptx::lower_kir_to_ptx;
+use crate::kernel_ir::{
+    AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirConst, KirEdge, KirOp,
+    KirTerminator, KirType, SmemLayout, SmemRegion, VarId,
+};
 
 /// Threads per CTA and softmax tile width (tokens processed per tile).
 const TILE: u32 = 128;
@@ -37,6 +67,10 @@ pub fn kernel_name() -> &'static str {
 }
 
 /// Compile-time layout + launch configuration for the decode kernel.
+///
+/// There is no `sm_version`: the module targets the KIR floor and the
+/// driver JIT-compiles it for the device it is loaded on (see the module
+/// docs).
 #[derive(Debug, Clone)]
 pub struct DecodeAttentionConfig {
     pub n_layers: u32,
@@ -47,7 +81,6 @@ pub struct DecodeAttentionConfig {
     pub max_slots: u32,
     /// Bytes per stored KV element (2 = f16; the only supported v1 dtype).
     pub kv_dtype_bytes: u32,
-    pub sm_version: u32,
 }
 
 /// Host-readable launch metadata emitted alongside the PTX.
@@ -59,24 +92,42 @@ pub struct DecodeAttentionMeta {
     pub grid_dim_is_n_heads: bool,
 }
 
-/// Mirrors `gpu_specs::GpuSpec::ptx_version`: sm_100+ -> 8.6 (Blackwell),
-/// sm_90+ -> 8.4 (Hopper wgmma/TMA), else 7.0 baseline.
-fn ptx_version_for_sm(sm: u32) -> &'static str {
-    if sm >= 100 {
-        "8.6"
-    } else if sm >= 90 {
-        "8.4"
-    } else {
-        "7.0"
+/// The strides the kernel bakes, in ELEMENTS of the contiguous layout
+/// `[n_layers][2][max_tokens][n_kv_heads][head_dim]` — the numbers the
+/// `//` header prints and every sibling kernel reading the same pool must
+/// agree with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvStrides {
+    /// One token's record: `n_kv_heads * head_dim`.
+    pub token_stride: u64,
+    /// Tokens in the global pool: `max_slots * per_slot_max_tokens`.
+    pub max_tokens: u64,
+    /// The K plane (and the V plane) of one layer: `max_tokens * token_stride`.
+    pub kv_half_stride: u64,
+    /// One layer: `2 * kv_half_stride`.
+    pub layer_stride: u64,
+    /// Query heads per KV head.
+    pub gqa_group: u32,
+}
+
+/// The pool strides for `cfg`, in elements.
+pub fn kv_strides(cfg: &DecodeAttentionConfig) -> KvStrides {
+    let token_stride = cfg.n_kv_heads as u64 * cfg.head_dim as u64;
+    let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
+    let kv_half_stride = max_tokens * token_stride;
+    KvStrides {
+        token_stride,
+        max_tokens,
+        kv_half_stride,
+        layer_stride: 2 * kv_half_stride,
+        gqa_group: cfg.n_heads / cfg.n_kv_heads,
     }
 }
 
-fn f32_imm(v: f32) -> String {
-    format!("0f{:08X}", v.to_bits())
-}
-
-/// Emit the direct-indexing decode-attention kernel.
-pub fn emit(cfg: &DecodeAttentionConfig) -> (String, DecodeAttentionMeta) {
+/// The configuration contract. Panics name the violated condition; every
+/// caller either checks the same conditions first (`serve.rs`) or is a
+/// test.
+fn check(cfg: &DecodeAttentionConfig) {
     assert!(cfg.n_layers >= 1, "n_layers must be >= 1");
     assert!(
         cfg.n_heads >= 1 && cfg.n_kv_heads >= 1,
@@ -94,48 +145,478 @@ pub fn emit(cfg: &DecodeAttentionConfig) -> (String, DecodeAttentionMeta) {
     );
     assert_eq!(
         cfg.kv_dtype_bytes, 2,
-        "v1 loads KV via ld.global.b16 + cvt.f32.f16; only f16 (2 bytes) supported"
+        "v1 reads the KV pool as f16 only: kv_dtype_bytes must be 2"
     );
     assert!(
         cfg.per_slot_max_tokens >= 1 && cfg.max_slots >= 1,
         "per_slot_max_tokens and max_slots must be >= 1"
     );
-
-    // Baked strides in ELEMENTS of the contiguous layout
-    // [n_layers][2][max_tokens][n_kv_heads][head_dim].
-    let token_stride = cfg.n_kv_heads as u64 * cfg.head_dim as u64;
+    // The kernel's global token index is a u32 register (addressing is
+    // 64-bit, but the token count itself must not wrap).
     let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
-    // The kernel's global token index is a u32 register (byte addressing
-    // is 64-bit, but the token count itself must not wrap).
     assert!(
         max_tokens <= u32::MAX as u64,
         "global token pool (max_slots * per_slot_max_tokens = {max_tokens}) must fit in u32"
     );
-    let kv_half_stride = max_tokens * token_stride;
-    let layer_stride = 2 * kv_half_stride;
+}
 
-    let dtype = cfg.kv_dtype_bytes as u64;
-    let token_stride_bytes = token_stride * dtype;
-    let kv_half_stride_bytes = kv_half_stride * dtype;
-    let layer_stride_bytes = layer_stride * dtype;
-    let head_row_bytes = cfg.head_dim as u64 * dtype;
+/// Index of each shared region in [`smem_layout`], in declaration order.
+const R_Q: u32 = 0;
+const R_SCORES: u32 = 1;
+const R_RESCALE: u32 = 2;
+const R_L: u32 = 3;
 
-    let group = cfg.n_heads / cfg.n_kv_heads;
-    let inv_sqrt_hd = f32_imm(1.0f32 / (cfg.head_dim as f32).sqrt());
-    let log2e = f32_imm(std::f32::consts::LOG2_E);
-    let neg_inf = f32_imm(f32::NEG_INFINITY);
-    let zero = f32_imm(0.0);
+/// `[q: head_dim][scores: TILE][rescale: 1][l: 1]`, all f32. Every region
+/// is 4-aligned and a multiple of 4 long, so the offsets are the hand
+/// kernel's packed ones.
+fn smem_layout(head_dim: u32) -> SmemLayout {
+    let f32_region = |name: &str, elems: u32| SmemRegion {
+        name: name.to_string(),
+        bytes: elems * 4,
+        align: 4,
+        elem: KirType::F32,
+    };
+    SmemLayout {
+        regions: vec![
+            f32_region("q", head_dim),
+            f32_region("scores", TILE),
+            f32_region("rescale", 1),
+            f32_region("l", 1),
+        ],
+        dynamic: false,
+    }
+}
 
-    // SMEM layout (f32): [q: head_dim][scores: TILE][rescale: 1][l: 1].
-    let scores_off = cfg.head_dim * 4;
-    let rescale_off = scores_off + TILE * 4;
-    let l_off = rescale_off + 4;
-    let smem_bytes = l_off + 4;
+fn ptr(elem: KirType, space: AddressSpace) -> KirType {
+    KirType::Ptr(Box::new(elem), space)
+}
 
+fn konst(b: &mut KirBuilder, value: ConstValue) -> VarId {
+    let ty = match value {
+        ConstValue::U32(_) => KirType::U32,
+        ConstValue::U64(_) => KirType::U64,
+        ConstValue::F32(_) => KirType::F32,
+        _ => unreachable!("the kernel's constants are u32, u64 and f32"),
+    };
+    let dst = b.new_typed_var(ty.clone());
+    b.emit(KirOp::Const(dst, KirConst { ty, value }));
+    dst
+}
+
+/// `dst = op(x, y)` with `dst` of type `ty`.
+fn op2(
+    b: &mut KirBuilder,
+    ty: KirType,
+    op: fn(VarId, VarId, VarId) -> KirOp,
+    x: VarId,
+    y: VarId,
+) -> VarId {
+    let dst = b.new_typed_var(ty);
+    b.emit(op(dst, x, y));
+    dst
+}
+
+fn cmp(b: &mut KirBuilder, x: VarId, y: VarId, how: CmpOp) -> VarId {
+    let dst = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(dst, x, y, how));
+    dst
+}
+
+/// Zero-extend a u32 to u64.
+fn widen(b: &mut KirBuilder, x: VarId) -> VarId {
+    let dst = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Cast(dst, x, KirType::U64));
+    dst
+}
+
+/// `&base[index]`, where `base` points at `elem` in `space`.
+fn at(b: &mut KirBuilder, elem: KirType, space: AddressSpace, base: VarId, index: VarId) -> VarId {
+    let dst = b.new_typed_var(ptr(elem, space));
+    b.emit(KirOp::PtrOffset(dst, base, index));
+    dst
+}
+
+fn load(b: &mut KirBuilder, ty: KirType, addr: VarId, space: AddressSpace) -> VarId {
+    let dst = b.new_typed_var(ty);
+    b.emit(KirOp::Load(dst, addr, space));
+    dst
+}
+
+/// An f16 KV element at element index `index` of the pool, widened to f32.
+fn load_kv(b: &mut KirBuilder, kv_base: VarId, index: VarId) -> VarId {
+    let addr = at(b, KirType::F16, AddressSpace::Global, kv_base, index);
+    let half = load(b, KirType::F16, addr, AddressSpace::Global);
+    let wide = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Cast(wide, half, KirType::F32));
+    wide
+}
+
+/// Build the direct-indexing decode-attention kernel as KIR.
+///
+/// The CFG, with each block's parameters (every other value is defined
+/// once and reaches its uses by dominance):
+///
+/// ```text
+/// entry                    strides, kv_head, region pointers; tid < head_dim ?
+/// q_load                   q_smem[tid] = q[head*head_dim + tid]
+/// q_done                   bar; -> tile_head(0, 0.0, -inf, 0.0)
+/// tile_head(tile, acc, m, l)          tile >= seq_len ? loop_end : tile_body
+/// tile_body                tcnt = min(seq_len - tile, TILE); tok < seq_len ?
+///   score                  K row of token tok      -> dot_head(0, 0.0)
+///   dot_head(d, dot)       d >= head_dim ? dot_done : dot_body
+///   dot_body               dot = fma(k[d], q_smem[d], dot)  -> dot_head
+///   dot_done               scores[tid] = dot * 1/sqrt(head_dim)
+/// score_done               bar; tid != 0 ? softmax_done(m, l) : max_head(0, m)
+///   max_head(j, tm)        j >= tcnt ? max_done : max_body
+///   max_body               tm = max(tm, scores[j])      -> max_head
+///   max_done               rs = exp(m - tm)             -> p_head(0, l * rs)
+///   p_head(j, lsum)        j >= tcnt ? p_done : p_body
+///   p_body                 scores[j] = exp(scores[j] - tm); lsum += it
+///   p_done                 rescale = rs                 -> softmax_done(tm, lsum)
+/// softmax_done(m', l')     bar; tid >= head_dim ? acc_tail(acc) : acc_start
+///   acc_start              acc *= rescale; V row        -> acc_head(0, acc)
+///   acc_head(j, a)         j >= tcnt ? acc_tail(a) : acc_body
+///   acc_body               a = fma(scores[j], v[j][tid], a)  -> acc_head
+/// acc_tail(acc')           bar; -> tile_head(tile + TILE, acc', m', l')
+/// loop_end                 tid != 0 ? l_pub : l_store
+///   l_store                l_smem = l
+/// l_pub                    bar; tid >= head_dim ? exit : out_load
+///   out_load               lf = l_smem; lf > 0 ? out_div : store_out(0.0)
+///   out_div                -> store_out(acc / lf)
+///   store_out(o)           out[head*head_dim + tid] = o
+/// exit                     ret
+/// ```
+///
+/// Only thread 0's `m`/`l` are meaningful — the other threads carry their
+/// initial values through `softmax_done`, as the hand kernel's untouched
+/// registers did — and only thread 0's `l` is published.
+pub fn build(cfg: &DecodeAttentionConfig) -> KernelIR {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F32, U32, U64};
+
+    check(cfg);
+    let s = kv_strides(cfg);
     let hd = cfg.head_dim;
-    let mut p = String::new();
-    let w = &mut p;
 
+    let mut b = KirBuilder::new(KERNEL_NAME);
+
+    // The six direct params, in FFI order (the launcher marshals them
+    // positionally).
+    let q_ptr = b.add_param("q_ptr", ptr(F32, Global), Global);
+    let kv_base = b.add_param("kv_base", ptr(KirType::F16, Global), Global);
+    let out_ptr = b.add_param("out_ptr", ptr(F32, Global), Global);
+    let layer_idx = b.add_param("layer_idx", U32, Global);
+    let slot_idx = b.add_param("slot_idx", U32, Global);
+    let seq_len = b.add_param("seq_len", U32, Global);
+
+    b.set_smem_layout(smem_layout(hd));
+    b.set_workgroup_size([BLOCK_DIM, 1, 1]);
+
+    let entry = b.new_block();
+    let q_load = b.new_block();
+    let q_done = b.new_block();
+    let tile_head = b.new_block();
+    let tile_body = b.new_block();
+    let score = b.new_block();
+    let dot_head = b.new_block();
+    let dot_body = b.new_block();
+    let dot_done = b.new_block();
+    let score_done = b.new_block();
+    let max_head = b.new_block();
+    let max_body = b.new_block();
+    let max_done = b.new_block();
+    let p_head = b.new_block();
+    let p_body = b.new_block();
+    let p_done = b.new_block();
+    let softmax_done = b.new_block();
+    let acc_start = b.new_block();
+    let acc_head = b.new_block();
+    let acc_body = b.new_block();
+    let acc_tail = b.new_block();
+    let loop_end = b.new_block();
+    let l_store = b.new_block();
+    let l_pub = b.new_block();
+    let out_load = b.new_block();
+    let out_div = b.new_block();
+    let store_out = b.new_block();
+    let exit = b.new_block();
+
+    let tile = b.add_block_param(tile_head, U32);
+    let acc = b.add_block_param(tile_head, F32);
+    let m = b.add_block_param(tile_head, F32);
+    let l = b.add_block_param(tile_head, F32);
+    let d = b.add_block_param(dot_head, U32);
+    let dot = b.add_block_param(dot_head, F32);
+    let max_j = b.add_block_param(max_head, U32);
+    let tm = b.add_block_param(max_head, F32);
+    let p_j = b.add_block_param(p_head, U32);
+    let lsum = b.add_block_param(p_head, F32);
+    let m_next = b.add_block_param(softmax_done, F32);
+    let l_next = b.add_block_param(softmax_done, F32);
+    let acc_j = b.add_block_param(acc_head, U32);
+    let a = b.add_block_param(acc_head, F32);
+    let acc_next = b.add_block_param(acc_tail, F32);
+    let o = b.add_block_param(store_out, F32);
+
+    // ── entry ────────────────────────────────────────────────────────
+    b.set_block(entry);
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let head = b.new_typed_var(U32);
+    b.emit(KirOp::BlockIdx(head, 0));
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let one = konst(&mut b, ConstValue::U32(1));
+    let head_dim = konst(&mut b, ConstValue::U32(hd));
+    let token_stride = konst(&mut b, ConstValue::U64(s.token_stride));
+
+    // GQA: kv_head = q_head / group (baked divisor).
+    let group = konst(&mut b, ConstValue::U32(s.gqa_group));
+    let kv_head = op2(&mut b, U32, KirOp::Div, head, group);
+
+    // K plane of this layer, and V = K + kv_half_stride (elements).
+    let layer = widen(&mut b, layer_idx);
+    let layer_stride = konst(&mut b, ConstValue::U64(s.layer_stride));
+    let k_plane = op2(&mut b, U64, KirOp::Mul, layer, layer_stride);
+    let kv_half = konst(&mut b, ConstValue::U64(s.kv_half_stride));
+    let v_plane = op2(&mut b, U64, KirOp::Add, k_plane, kv_half);
+
+    // The slot's first global token.
+    let per_slot = konst(&mut b, ConstValue::U32(cfg.per_slot_max_tokens));
+    let slot_base = op2(&mut b, U32, KirOp::Mul, slot_idx, per_slot);
+
+    // kv_head's row inside one token record.
+    let head_off32 = op2(&mut b, U32, KirOp::Mul, kv_head, head_dim);
+    let head_off = widen(&mut b, head_off32);
+
+    let region = |b: &mut KirBuilder, r: u32| {
+        let dst = b.new_typed_var(ptr(F32, Shared));
+        b.emit(KirOp::SharedRegion { dst, region: r });
+        dst
+    };
+    let q_smem = region(&mut b, R_Q);
+    let scores = region(&mut b, R_SCORES);
+    let rescale = region(&mut b, R_RESCALE);
+    let l_smem = region(&mut b, R_L);
+
+    let loads_q = cmp(&mut b, tid, head_dim, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(loads_q, KirEdge::to(q_load), KirEdge::to(q_done)));
+
+    // ── this head's Q row (f32) into SMEM ────────────────────────────
+    b.set_block(q_load);
+    let q_row = op2(&mut b, U32, KirOp::Mul, head, head_dim);
+    let q_index = op2(&mut b, U32, KirOp::Add, q_row, tid);
+    let q_addr = at(&mut b, F32, Global, q_ptr, q_index);
+    let q_val = load(&mut b, F32, q_addr, Global);
+    let q_slot = at(&mut b, F32, Shared, q_smem, tid);
+    b.emit(KirOp::Store(q_slot, q_val, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(q_done)));
+
+    b.set_block(q_done);
+    b.emit(KirOp::Barrier);
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
+    let f_neg_inf = konst(&mut b, ConstValue::F32(f32::NEG_INFINITY));
+    b.terminate(KirTerminator::Branch(KirEdge::with(
+        tile_head,
+        vec![zero, f_zero, f_neg_inf, f_zero],
+    )));
+
+    // ── the tile loop ────────────────────────────────────────────────
+    b.set_block(tile_head);
+    let tiles_done = cmp(&mut b, tile, seq_len, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(tiles_done, KirEdge::to(loop_end), KirEdge::to(tile_body)));
+
+    b.set_block(tile_body);
+    let remaining = op2(&mut b, U32, KirOp::Sub, seq_len, tile);
+    let tile_width = konst(&mut b, ConstValue::U32(TILE));
+    // Tail-tile guard: the last tile covers seq_len % TILE tokens.
+    let tcnt = op2(&mut b, U32, KirOp::Min, remaining, tile_width);
+    let tok = op2(&mut b, U32, KirOp::Add, tile, tid);
+    let scores_a_token = cmp(&mut b, tok, seq_len, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(
+        scores_a_token,
+        KirEdge::to(score),
+        KirEdge::to(score_done),
+    ));
+
+    // ── pass 1: thread t scores token tile + t ───────────────────────
+    b.set_block(score);
+    let g = op2(&mut b, U32, KirOp::Add, slot_base, tok);
+    let g_wide = widen(&mut b, g);
+    let k_tok = op2(&mut b, U64, KirOp::Mul, g_wide, token_stride);
+    let k_tok_plane = op2(&mut b, U64, KirOp::Add, k_plane, k_tok);
+    let k_row = op2(&mut b, U64, KirOp::Add, k_tok_plane, head_off);
+    let f_zero_dot = konst(&mut b, ConstValue::F32(0.0));
+    b.terminate(KirTerminator::Branch(KirEdge::with(dot_head, vec![zero, f_zero_dot])));
+
+    b.set_block(dot_head);
+    let dot_complete = cmp(&mut b, d, head_dim, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(dot_complete, KirEdge::to(dot_done), KirEdge::to(dot_body)));
+
+    b.set_block(dot_body);
+    let d_wide = widen(&mut b, d);
+    let k_index = op2(&mut b, U64, KirOp::Add, k_row, d_wide);
+    let k_val = load_kv(&mut b, kv_base, k_index);
+    let q_elem = at(&mut b, F32, Shared, q_smem, d);
+    let q_d = load(&mut b, F32, q_elem, Shared);
+    let dot_acc = b.new_typed_var(F32);
+    b.emit(KirOp::Fma(dot_acc, k_val, q_d, dot));
+    let d_next = op2(&mut b, U32, KirOp::Add, d, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(dot_head, vec![d_next, dot_acc])));
+
+    b.set_block(dot_done);
+    let inv_sqrt_hd = konst(&mut b, ConstValue::F32(1.0f32 / (hd as f32).sqrt()));
+    let scaled = op2(&mut b, F32, KirOp::Mul, dot, inv_sqrt_hd);
+    let score_slot = at(&mut b, F32, Shared, scores, tid);
+    b.emit(KirOp::Store(score_slot, scaled, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(score_done)));
+
+    // ── pass 2: online softmax, thread 0 serial over the tile ────────
+    b.set_block(score_done);
+    b.emit(KirOp::Barrier);
+    let not_thread0 = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(
+        not_thread0,
+        KirEdge::with(softmax_done, vec![m, l]),
+        KirEdge::with(max_head, vec![zero, m]),
+    ));
+
+    b.set_block(max_head);
+    let max_complete = cmp(&mut b, max_j, tcnt, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(max_complete, KirEdge::to(max_done), KirEdge::to(max_body)));
+
+    b.set_block(max_body);
+    let max_elem = at(&mut b, F32, Shared, scores, max_j);
+    let max_score = load(&mut b, F32, max_elem, Shared);
+    let tm_next = op2(&mut b, F32, KirOp::Max, tm, max_score);
+    let max_j_next = op2(&mut b, U32, KirOp::Add, max_j, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(max_head, vec![max_j_next, tm_next])));
+
+    // rescale = exp(m_old - m_new); exp(-inf) = 0 on the first tile.
+    b.set_block(max_done);
+    let m_delta = op2(&mut b, F32, KirOp::Sub, m, tm);
+    let rs = b.new_typed_var(F32);
+    b.emit(KirOp::Exp(rs, m_delta));
+    let l_rescaled = op2(&mut b, F32, KirOp::Mul, l, rs);
+    b.terminate(KirTerminator::Branch(KirEdge::with(p_head, vec![zero, l_rescaled])));
+
+    b.set_block(p_head);
+    let p_complete = cmp(&mut b, p_j, tcnt, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(p_complete, KirEdge::to(p_done), KirEdge::to(p_body)));
+
+    b.set_block(p_body);
+    let p_elem = at(&mut b, F32, Shared, scores, p_j);
+    let p_score = load(&mut b, F32, p_elem, Shared);
+    let p_shift = op2(&mut b, F32, KirOp::Sub, p_score, tm);
+    let p = b.new_typed_var(F32);
+    b.emit(KirOp::Exp(p, p_shift));
+    b.emit(KirOp::Store(p_elem, p, Shared));
+    let lsum_next = op2(&mut b, F32, KirOp::Add, lsum, p);
+    let p_j_next = op2(&mut b, U32, KirOp::Add, p_j, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(p_head, vec![p_j_next, lsum_next])));
+
+    b.set_block(p_done);
+    b.emit(KirOp::Store(rescale, rs, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::with(softmax_done, vec![tm, lsum])));
+
+    // ── pass 3: rescale the accumulator, add P*V; thread d owns out[d] ─
+    b.set_block(softmax_done);
+    b.emit(KirOp::Barrier);
+    let no_output = cmp(&mut b, tid, head_dim, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(
+        no_output,
+        KirEdge::with(acc_tail, vec![acc]),
+        KirEdge::to(acc_start),
+    ));
+
+    b.set_block(acc_start);
+    let rs_shared = load(&mut b, F32, rescale, Shared);
+    let acc_rescaled = op2(&mut b, F32, KirOp::Mul, acc, rs_shared);
+    let g0 = op2(&mut b, U32, KirOp::Add, slot_base, tile);
+    let g0_wide = widen(&mut b, g0);
+    let v_tok = op2(&mut b, U64, KirOp::Mul, g0_wide, token_stride);
+    let v_tok_plane = op2(&mut b, U64, KirOp::Add, v_plane, v_tok);
+    let v_head_row = op2(&mut b, U64, KirOp::Add, v_tok_plane, head_off);
+    let tid_wide = widen(&mut b, tid);
+    let v_col = op2(&mut b, U64, KirOp::Add, v_head_row, tid_wide);
+    b.terminate(KirTerminator::Branch(KirEdge::with(acc_head, vec![zero, acc_rescaled])));
+
+    b.set_block(acc_head);
+    let acc_complete = cmp(&mut b, acc_j, tcnt, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(
+        acc_complete,
+        KirEdge::with(acc_tail, vec![a]),
+        KirEdge::to(acc_body),
+    ));
+
+    b.set_block(acc_body);
+    let w_elem = at(&mut b, F32, Shared, scores, acc_j);
+    let weight = load(&mut b, F32, w_elem, Shared);
+    let j_wide = widen(&mut b, acc_j);
+    let v_step = op2(&mut b, U64, KirOp::Mul, j_wide, token_stride);
+    let v_index = op2(&mut b, U64, KirOp::Add, v_col, v_step);
+    let v_val = load_kv(&mut b, kv_base, v_index);
+    let a_next = b.new_typed_var(F32);
+    b.emit(KirOp::Fma(a_next, weight, v_val, a));
+    let acc_j_next = op2(&mut b, U32, KirOp::Add, acc_j, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(acc_head, vec![acc_j_next, a_next])));
+
+    // The scores region is rewritten next tile; sync before looping back.
+    b.set_block(acc_tail);
+    b.emit(KirOp::Barrier);
+    let tile_next = op2(&mut b, U32, KirOp::Add, tile, tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(
+        tile_head,
+        vec![tile_next, acc_next, m_next, l_next],
+    )));
+
+    // ── thread 0 publishes the final softmax denominator ─────────────
+    b.set_block(loop_end);
+    let skips_publish = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(skips_publish, KirEdge::to(l_pub), KirEdge::to(l_store)));
+
+    b.set_block(l_store);
+    b.emit(KirOp::Store(l_smem, l, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(l_pub)));
+
+    b.set_block(l_pub);
+    b.emit(KirOp::Barrier);
+    let writes_nothing = cmp(&mut b, tid, head_dim, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(writes_nothing, KirEdge::to(exit), KirEdge::to(out_load)));
+
+    // seq_len == 0 leaves l == 0; write 0 instead of NaN.
+    b.set_block(out_load);
+    let l_final = load(&mut b, F32, l_smem, Shared);
+    let f_zero_out = konst(&mut b, ConstValue::F32(0.0));
+    let positive = cmp(&mut b, l_final, f_zero_out, CmpOp::Gt);
+    b.terminate(KirTerminator::CondBranch(
+        positive,
+        KirEdge::to(out_div),
+        KirEdge::with(store_out, vec![f_zero_out]),
+    ));
+
+    b.set_block(out_div);
+    let normalized = op2(&mut b, F32, KirOp::Div, acc, l_final);
+    b.terminate(KirTerminator::Branch(KirEdge::with(store_out, vec![normalized])));
+
+    b.set_block(store_out);
+    let out_row = op2(&mut b, U32, KirOp::Mul, head, head_dim);
+    let out_index = op2(&mut b, U32, KirOp::Add, out_row, tid);
+    let out_addr = at(&mut b, F32, Global, out_ptr, out_index);
+    b.emit(KirOp::Store(out_addr, o, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+
+    b.finalize()
+}
+
+/// The `//` header: what the kernel bakes, in elements. Sibling kernels
+/// reading the same pool (`cfie_kv_quant_ptx`, `cfie_persistent_ptx`,
+/// `cfie_speculative_ptx`) compare their `//   <name> = <value>` lines
+/// with these byte for byte.
+fn header_comment(cfg: &DecodeAttentionConfig, s: &KvStrides) -> String {
+    let mut w = String::new();
     writeln!(w, "//").unwrap();
     writeln!(
         w,
@@ -146,243 +627,51 @@ pub fn emit(cfg: &DecodeAttentionConfig) -> (String, DecodeAttentionMeta) {
     writeln!(
         w,
         "// KV pool layout [n_layers={}][2][max_tokens={}][n_kv_heads={}][head_dim={}], f16.",
-        cfg.n_layers, max_tokens, cfg.n_kv_heads, cfg.head_dim
+        cfg.n_layers, s.max_tokens, cfg.n_kv_heads, cfg.head_dim
     )
     .unwrap();
     writeln!(w, "// Baked layout constants (elements):").unwrap();
-    writeln!(w, "//   token_stride        = {}", token_stride).unwrap();
-    writeln!(w, "//   kv_half_stride      = {}", kv_half_stride).unwrap();
-    writeln!(w, "//   layer_stride        = {}", layer_stride).unwrap();
+    writeln!(w, "//   token_stride        = {}", s.token_stride).unwrap();
+    writeln!(w, "//   kv_half_stride      = {}", s.kv_half_stride).unwrap();
+    writeln!(w, "//   layer_stride        = {}", s.layer_stride).unwrap();
     writeln!(w, "//   per_slot_max_tokens = {}", cfg.per_slot_max_tokens).unwrap();
-    writeln!(w, "//   max_tokens          = {}", max_tokens).unwrap();
-    writeln!(w, "//   gqa_group_size      = {}", group).unwrap();
+    writeln!(w, "//   max_tokens          = {}", s.max_tokens).unwrap();
+    writeln!(w, "//   gqa_group_size      = {}", s.gqa_group).unwrap();
     writeln!(
         w,
         "// No block table: every KV address is arithmetic over these immediates."
     )
     .unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".shared .align 4 .b8 cfie_smem[{}];", smem_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", KERNEL_NAME).unwrap();
-    writeln!(w, "    .param .u64 q_ptr,").unwrap();
-    writeln!(w, "    .param .u64 kv_base,").unwrap();
-    writeln!(w, "    .param .u64 out_ptr,").unwrap();
-    writeln!(w, "    .param .u32 layer_idx,").unwrap();
-    writeln!(w, "    .param .u32 slot_idx,").unwrap();
-    writeln!(w, "    .param .u32 seq_len").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(
-        w,
-        "    .reg .pred %p_qd, %p_done, %p_val, %p_d, %p_t0, %p_j, %p_j2, %p_nd, %p_t1, %p_no, %p_lz;"
-    )
-    .unwrap();
-    writeln!(w, "    .reg .b16 %h_k, %h_v;").unwrap();
-    writeln!(
-        w,
-        "    .reg .f32 %f_q, %f_k, %f_v, %f_p, %f_s, %f_dot, %f_acc, %f_m, %f_l, %f_tm, %f_rs, %f_rs2, %f_t1, %f_lf, %f_o, %f_t0;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_tid, %r_head, %r_kvhead, %r_layer, %r_slot, %r_seqlen, %r_sbase, %r_slotbase, %r_hoff, %r_tile, %r_rem, %r_tcnt, %r_tok, %r_g, %r_g0, %r_d, %r_qsm, %r_j, %r_sp, %r_t1, %r_t2, %r_t3, %r_t4;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_q, %rd_kv, %rd_out, %rd_kplane, %rd_vplane, %rd_hoff, %rd_koff, %rd_kaddr, %rd_voff, %rd_vaddr, %rd_t0, %rd_t1, %rd_t2, %rd_t3;"
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_q, [q_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_kv, [kv_base];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_out, [out_ptr];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_layer, [layer_idx];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_slot, [slot_idx];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_seqlen, [seq_len];").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_head, %ctaid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_sbase, cfie_smem;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // GQA: kv_head = q_head / group_size (baked divisor)").unwrap();
-    writeln!(w, "    div.u32 %r_kvhead, %r_head, {};", group).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // K plane base (bytes): kv_base + layer_idx * layer_stride_bytes").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t0, %r_layer;").unwrap();
-    writeln!(w, "    mul.lo.u64 %rd_kplane, %rd_t0, {};", layer_stride_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_kplane, %rd_kv, %rd_kplane;").unwrap();
-    writeln!(w, "    // V plane = K plane + kv_half_stride_bytes").unwrap();
-    writeln!(w, "    add.u64 %rd_vplane, %rd_kplane, {};", kv_half_stride_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // slot's first global token: slot_idx * per_slot_max_tokens").unwrap();
-    writeln!(
-        w,
-        "    mul.lo.u32 %r_slotbase, %r_slot, {};",
-        cfg.per_slot_max_tokens
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // byte offset of kv_head's row inside one token record").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_hoff, %r_kvhead, {};", head_row_bytes).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_hoff, %r_hoff;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // load this head's Q row (f32) into SMEM").unwrap();
-    writeln!(w, "    setp.lt.u32 %p_qd, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @!%p_qd bra Q_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t1, %r_head, {};", hd).unwrap();
-    writeln!(w, "    add.u32 %r_t1, %r_t1, %r_tid;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t1, %r_t1, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t1, %r_t1;").unwrap();
-    writeln!(w, "    add.u64 %rd_t1, %rd_q, %rd_t1;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_t0, [%rd_t1];").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t2, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t2, %r_t2, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t2], %f_t0;").unwrap();
-    writeln!(w, "Q_DONE:").unwrap();
-    writeln!(w, "    mov.f32 %f_acc, {};", zero).unwrap();
-    writeln!(w, "    mov.f32 %f_m, {};", neg_inf).unwrap();
-    writeln!(w, "    mov.f32 %f_l, {};", zero).unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tile, 0;").unwrap();
-    writeln!(w, "TILE_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_done, %r_tile, %r_seqlen;").unwrap();
-    writeln!(w, "    @%p_done bra LOOP_END;").unwrap();
-    writeln!(w, "    sub.u32 %r_rem, %r_seqlen, %r_tile;").unwrap();
-    writeln!(w, "    min.u32 %r_tcnt, %r_rem, {};", TILE).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // pass 1: thread t scores token tile_base + t").unwrap();
-    writeln!(w, "    add.u32 %r_tok, %r_tile, %r_tid;").unwrap();
-    writeln!(w, "    // tail-tile guard: last tile covers seq_len % {} tokens", TILE).unwrap();
-    writeln!(w, "    setp.lt.u32 %p_val, %r_tok, %r_seqlen;").unwrap();
-    writeln!(w, "    @!%p_val bra SCORE_DONE;").unwrap();
-    writeln!(w, "    add.u32 %r_g, %r_slotbase, %r_tok;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_koff, %r_g, {};", token_stride_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_kaddr, %rd_kplane, %rd_koff;").unwrap();
-    writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, %rd_hoff;").unwrap();
-    writeln!(w, "    mov.f32 %f_dot, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_d, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_qsm, %r_sbase;").unwrap();
-    writeln!(w, "DOT_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_d, %r_d, {};", hd).unwrap();
-    writeln!(w, "    @%p_d bra DOT_DONE;").unwrap();
-    writeln!(w, "    ld.global.b16 %h_k, [%rd_kaddr];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f_k, %h_k;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_q, [%r_qsm];").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_dot, %f_k, %f_q, %f_dot;").unwrap();
-    writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, {};", dtype).unwrap();
-    writeln!(w, "    add.u32 %r_qsm, %r_qsm, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_d, %r_d, 1;").unwrap();
-    writeln!(w, "    bra DOT_LOOP;").unwrap();
-    writeln!(w, "DOT_DONE:").unwrap();
-    writeln!(w, "    // scale by 1/sqrt(head_dim)").unwrap();
-    writeln!(w, "    mul.f32 %f_dot, %f_dot, {};", inv_sqrt_hd).unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t3, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t3, %r_t3, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t3+{}], %f_dot;", scores_off).unwrap();
-    writeln!(w, "SCORE_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // pass 2: online softmax, thread 0 serial over the tile").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra SOFTMAX_DONE;").unwrap();
-    writeln!(w, "    mov.f32 %f_tm, %f_m;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "MAX_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j, %r_j, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p_j bra MAX_DONE;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    max.f32 %f_tm, %f_tm, %f_s;").unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra MAX_LOOP;").unwrap();
-    writeln!(w, "MAX_DONE:").unwrap();
-    writeln!(w, "    // rescale = exp(m_old - m_new); exp(-inf) = 0 on first tile").unwrap();
-    writeln!(w, "    sub.f32 %f_t1, %f_m, %f_tm;").unwrap();
-    writeln!(w, "    mul.f32 %f_t1, %f_t1, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_rs, %f_t1;").unwrap();
-    writeln!(w, "    mul.f32 %f_l, %f_l, %f_rs;").unwrap();
-    writeln!(w, "    mov.f32 %f_m, %f_tm;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "P_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j, %r_j, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p_j bra P_DONE;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    sub.f32 %f_s, %f_s, %f_m;").unwrap();
-    writeln!(w, "    mul.f32 %f_s, %f_s, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_s, %f_s;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sp+{}], %f_s;", scores_off).unwrap();
-    writeln!(w, "    add.f32 %f_l, %f_l, %f_s;").unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra P_LOOP;").unwrap();
-    writeln!(w, "P_DONE:").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_rs;", rescale_off).unwrap();
-    writeln!(w, "SOFTMAX_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // pass 3: rescale accumulator, add P*V; thread d owns out[d]").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_nd, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @%p_nd bra ACC_TAIL;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_rs2, [%r_sbase+{}];", rescale_off).unwrap();
-    writeln!(w, "    mul.f32 %f_acc, %f_acc, %f_rs2;").unwrap();
-    writeln!(w, "    add.u32 %r_g0, %r_slotbase, %r_tile;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_voff, %r_g0, {};", token_stride_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vplane, %rd_voff;").unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, %rd_hoff;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t2, %r_tid, {};", dtype).unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, %rd_t2;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "ACC_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j2, %r_j, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p_j2 bra ACC_TAIL;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_p, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    ld.global.b16 %h_v, [%rd_vaddr];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f_v, %h_v;").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_acc, %f_p, %f_v, %f_acc;").unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, {};", token_stride_bytes).unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra ACC_LOOP;").unwrap();
-    writeln!(w, "ACC_TAIL:").unwrap();
-    writeln!(w, "    // scores SMEM is rewritten next tile; sync before loop back").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    add.u32 %r_tile, %r_tile, {};", TILE).unwrap();
-    writeln!(w, "    bra TILE_LOOP;").unwrap();
-    writeln!(w, "LOOP_END:").unwrap();
-    writeln!(w, "    // thread 0 publishes the final softmax denominator").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t1, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t1 bra L_PUB;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_l;", l_off).unwrap();
-    writeln!(w, "L_PUB:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_no, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @%p_no bra EXIT;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_lf, [%r_sbase+{}];", l_off).unwrap();
-    writeln!(w, "    // seq_len == 0 leaves l == 0; write 0 instead of NaN").unwrap();
-    writeln!(w, "    mov.f32 %f_o, {};", zero).unwrap();
-    writeln!(w, "    setp.gt.f32 %p_lz, %f_lf, {};", zero).unwrap();
-    writeln!(w, "    @!%p_lz bra STORE_OUT;").unwrap();
-    writeln!(w, "    div.rn.f32 %f_o, %f_acc, %f_lf;").unwrap();
-    writeln!(w, "STORE_OUT:").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t4, %r_head, {};", hd).unwrap();
-    writeln!(w, "    add.u32 %r_t4, %r_t4, %r_tid;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t4, %r_t4, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t3, %r_t4;").unwrap();
-    writeln!(w, "    add.u64 %rd_t3, %rd_out, %rd_t3;").unwrap();
-    writeln!(w, "    st.global.f32 [%rd_t3], %f_o;").unwrap();
-    writeln!(w, "EXIT:").unwrap();
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
+    w
+}
+
+/// Emit the direct-indexing decode-attention kernel: build, verify, lower,
+/// and prefix the `//` header.
+///
+/// The returned text carries no NUL: the serve path appends the one
+/// `cuModuleLoadData` needs when it embeds the module.
+///
+/// # Panics
+///
+/// On a configuration outside the contract (see the asserts in `check`),
+/// and if the built kernel fails KIR verification — a bug in this module,
+/// not a condition a caller can provoke.
+pub fn emit(cfg: &DecodeAttentionConfig) -> (String, DecodeAttentionMeta) {
+    let ir = build(cfg);
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{KERNEL_NAME} failed KIR verification: {errors:?}");
+    }
+    let smem_bytes = ir
+        .smem_layout
+        .total_bytes()
+        .expect("a verified layout has a size");
+    let module = lower_kir_to_ptx(&ir);
+    let module = module.strip_suffix(&[0]).unwrap_or(&module);
+    let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
+
+    let mut p = header_comment(cfg, &kv_strides(cfg));
+    p.push_str(module);
 
     let meta = DecodeAttentionMeta {
         kernel_name: KERNEL_NAME.to_string(),
@@ -476,33 +765,72 @@ mod tests {
             per_slot_max_tokens: 2048,
             max_slots: 64,
             kv_dtype_bytes: 2,
-            sm_version: 80,
+        }
+    }
+
+    /// Geometries the structural checks sweep: the paper config, GQA and
+    /// MHA, a head_dim that is not a power of two, the smallest pool.
+    fn sweep() -> Vec<DecodeAttentionConfig> {
+        let mut out = vec![paper_cfg()];
+        for (n_heads, n_kv_heads, head_dim, per_slot, slots) in
+            [(4, 4, 64, 256, 2), (6, 2, 40, 300, 3), (1, 1, 1, 1, 1), (32, 8, 128, 4096, 16)]
+        {
+            out.push(DecodeAttentionConfig {
+                n_layers: 3,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                per_slot_max_tokens: per_slot,
+                max_slots: slots,
+                kv_dtype_bytes: 2,
+            });
+        }
+        out
+    }
+
+    /// Lines of `ptx` that set a register to the immediate `value`.
+    fn movs_of(ptx: &str, ty: &str, value: impl std::fmt::Display) -> usize {
+        let suffix = format!(", {value};");
+        ptx.lines()
+            .filter(|l| l.trim_start().starts_with(&format!("mov.{ty} ")) && l.ends_with(&suffix))
+            .count()
+    }
+
+    #[test]
+    fn every_geometry_verifies() {
+        for cfg in sweep() {
+            let ir = build(&cfg);
+            if let Err(errors) = crate::kir_verify::verify(&ir) {
+                panic!("{cfg:?} failed verification: {errors:?}");
+            }
         }
     }
 
     #[test]
     fn param_list_is_exactly_the_six_direct_params() {
-        let ptx = emit_decode_attention_ptx(&paper_cfg());
-        let start = ptx.find(".visible .entry nsl_cfie_decode_attn(").unwrap();
-        let end = start + ptx[start..].find(')').unwrap();
-        let params: Vec<&str> = ptx[start..end]
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                l.starts_with(".param").then(|| l.trim_end_matches(','))
-            })
-            .collect();
+        let ir = build(&paper_cfg());
+        let f32_global = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+        let params: Vec<(&str, &KirType)> =
+            ir.params.iter().map(|p| (p.name.as_str(), &p.ty)).collect();
         assert_eq!(
             params,
             vec![
-                ".param .u64 q_ptr",
-                ".param .u64 kv_base",
-                ".param .u64 out_ptr",
-                ".param .u32 layer_idx",
-                ".param .u32 slot_idx",
-                ".param .u32 seq_len",
+                ("q_ptr", &f32_global),
+                ("kv_base", &KirType::Ptr(Box::new(KirType::F16), AddressSpace::Global)),
+                ("out_ptr", &f32_global),
+                ("layer_idx", &KirType::U32),
+                ("slot_idx", &KirType::U32),
+                ("seq_len", &KirType::U32),
             ]
         );
+        // And the printed entry carries them in that order, at the widths
+        // the launcher marshals.
+        let ptx = emit_decode_attention_ptx(&paper_cfg());
+        assert!(ptx.contains(
+            ".visible .entry nsl_cfie_decode_attn(.param .u64 param_q_ptr, .param .u64 param_kv_base, \
+             .param .u64 param_out_ptr, .param .u32 param_layer_idx, .param .u32 param_slot_idx, \
+             .param .u32 param_seq_len)"
+        ), "{ptx}");
     }
 
     #[test]
@@ -516,48 +844,78 @@ mod tests {
     }
 
     #[test]
-    fn baked_stride_immediates_present() {
+    fn baked_strides_are_immediates() {
         let cfg = paper_cfg();
-        let ptx = emit_decode_attention_ptx(&cfg);
+        let s = kv_strides(&cfg);
         // elements: token_stride = 4*128 = 512; max_tokens = 64*2048 = 131072;
         // kv_half = 131072*512 = 67108864; layer = 2*kv_half = 134217728.
-        assert!(ptx.contains("//   token_stride        = 512"));
-        assert!(ptx.contains("//   kv_half_stride      = 67108864"));
-        assert!(ptx.contains("//   layer_stride        = 134217728"));
-        // byte immediates in the address arithmetic (x2 for f16)
-        assert!(ptx.contains("mul.wide.u32 %rd_koff, %r_g, 1024;"));
-        assert!(ptx.contains("mul.lo.u64 %rd_kplane, %rd_t0, 268435456;"));
-        assert!(ptx.contains("add.u64 %rd_vplane, %rd_kplane, 134217728;"));
-        assert!(ptx.contains("mul.lo.u32 %r_slotbase, %r_slot, 2048;"));
-    }
-
-    #[test]
-    fn no_mad_lo_and_ascii_only() {
-        let ptx = emit_decode_attention_ptx(&paper_cfg());
-        assert!(!ptx.contains("mad."), "mad.lo.u32 is invalid at PTX ISA 7.0");
-        assert!(
-            ptx.bytes().all(|b| b < 128),
-            "PTX must be ASCII-only (Unicode -> CUDA_ERROR_INVALID_PTX)"
+        assert_eq!(
+            s,
+            KvStrides {
+                token_stride: 512,
+                max_tokens: 131_072,
+                kv_half_stride: 67_108_864,
+                layer_stride: 134_217_728,
+                gqa_group: 2,
+            }
         );
+        let ptx = emit_decode_attention_ptx(&cfg);
+        assert!(ptx.contains("//   token_stride        = 512\n"));
+        assert!(ptx.contains("//   kv_half_stride      = 67108864\n"));
+        assert!(ptx.contains("//   layer_stride        = 134217728\n"));
+        // The same numbers drive the address arithmetic, as element
+        // strides the f16 pointer scales by 2 — never a runtime load.
+        assert_eq!(movs_of(&ptx, "u64", s.token_stride), 1, "{ptx}");
+        assert_eq!(movs_of(&ptx, "u64", s.kv_half_stride), 1, "{ptx}");
+        assert_eq!(movs_of(&ptx, "u64", s.layer_stride), 1, "{ptx}");
+        assert_eq!(movs_of(&ptx, "u32", cfg.per_slot_max_tokens), 1, "{ptx}");
+        assert_eq!(movs_of(&ptx, "u32", s.gqa_group), 1, "{ptx}");
+        assert!(ptx.contains("mul.lo.u64 "), "f16 element indices scale to bytes");
     }
 
     #[test]
-    fn tail_tile_guard_references_seq_len() {
+    fn no_mad_lo_no_nul_and_ascii_only() {
+        for cfg in sweep() {
+            let ptx = emit_decode_attention_ptx(&cfg);
+            assert!(!ptx.contains("mad."), "mad.lo.u32 is invalid at PTX ISA 7.0");
+            assert!(
+                ptx.bytes().all(|b| b != 0 && b < 128),
+                "PTX must be ASCII-only (Unicode -> CUDA_ERROR_INVALID_PTX) and \
+                 NUL-free (the serve path appends the terminator)"
+            );
+        }
+    }
+
+    #[test]
+    fn tail_tile_guard_clamps_to_seq_len() {
+        // `tcnt = min(seq_len - tile, TILE)` and `tok < seq_len`: the last
+        // tile covers seq_len % TILE tokens. The differential test runs
+        // the ragged tile; this pins the two comparisons' operands.
+        let ir = build(&paper_cfg());
+        let seq_len = ir.params[5].id;
+        let ops: Vec<&KirOp> = ir.blocks.iter().flat_map(|b| b.ops.iter()).collect();
+        let consts: std::collections::HashMap<VarId, u32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                KirOp::Const(d, KirConst { value: ConstValue::U32(v), .. }) => Some((*d, *v)),
+                _ => None,
+            })
+            .collect();
+        assert!(ops.iter().any(|op| matches!(op,
+            KirOp::Min(_, _, t) if consts.get(t) == Some(&TILE))));
+        assert!(ops.iter().any(|op| matches!(op,
+            KirOp::Cmp(_, _, n, CmpOp::Lt) if *n == seq_len)));
+        assert!(ops.iter().any(|op| matches!(op,
+            KirOp::Cmp(_, _, n, CmpOp::Ge) if *n == seq_len)));
+    }
+
+    #[test]
+    fn header_is_the_kir_floor_whatever_the_device() {
+        // The module no longer names the serving GPU: the driver
+        // JIT-compiles sm_70 PTX forward (see the module docs).
         let ptx = emit_decode_attention_ptx(&paper_cfg());
-        assert!(ptx.contains("setp.lt.u32 %p_val, %r_tok, %r_seqlen;"));
-        assert!(ptx.contains("min.u32 %r_tcnt, %r_rem, 128;"));
-    }
-
-    #[test]
-    fn header_matches_sm_version_convention() {
-        let ptx80 = emit_decode_attention_ptx(&paper_cfg());
-        assert!(ptx80.starts_with("//"));
-        assert!(ptx80.contains(".version 7.0\n.target sm_80\n.address_size 64"));
-        let mut cfg = paper_cfg();
-        cfg.sm_version = 90;
-        assert!(emit_decode_attention_ptx(&cfg).contains(".version 8.4\n.target sm_90"));
-        cfg.sm_version = 100;
-        assert!(emit_decode_attention_ptx(&cfg).contains(".version 8.6\n.target sm_100"));
+        assert!(ptx.starts_with("//\n// nsl_cfie_decode_attn - "));
+        assert!(ptx.contains("//\n.version 7.0\n.target sm_70\n.address_size 64\n"), "{ptx}");
     }
 
     #[test]
@@ -576,7 +934,11 @@ mod tests {
         cfg.head_dim = 64;
         let (ptx, meta) = emit(&cfg);
         assert_eq!(meta.smem_bytes, 64 * 4 + 128 * 4 + 8);
-        assert!(ptx.contains(&format!(".shared .align 4 .b8 cfie_smem[{}];", meta.smem_bytes)));
+        assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
+        // The regions sit where the hand kernel's offsets put them.
+        let layout = build(&cfg).smem_layout;
+        let offsets: Vec<u32> = (0..4).map(|i| layout.offset_of(i).unwrap()).collect();
+        assert_eq!(offsets, vec![0, 64 * 4, 64 * 4 + 128 * 4, 64 * 4 + 128 * 4 + 4]);
     }
 
     #[test]
@@ -600,6 +962,15 @@ mod tests {
     fn non_f16_kv_dtype_panics() {
         let mut cfg = paper_cfg();
         cfg.kv_dtype_bytes = 4;
+        let _ = emit(&cfg);
+    }
+
+    #[test]
+    #[should_panic(expected = "must fit in u32")]
+    fn token_pool_over_u32_panics() {
+        let mut cfg = paper_cfg();
+        cfg.max_slots = 1 << 16;
+        cfg.per_slot_max_tokens = 1 << 16;
         let _ = emit(&cfg);
     }
 

@@ -1107,7 +1107,6 @@ mod tests {
             per_slot_max_tokens: cfg.per_slot_max_tokens,
             max_slots: cfg.max_slots,
             kv_dtype_bytes: 2,
-            sm_version: cfg.sm_version,
         };
         let verify_ptx = emit_verify_attention_ptx(&cfg);
         let attn_ptx = crate::cfie_decode_attention::emit_decode_attention_ptx(&attn);

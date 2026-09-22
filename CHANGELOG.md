@@ -128,6 +128,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   reference cast. The interpreter rejects any mnemonic it does not model,
   so a silently-skipped instruction cannot make the comparison vacuous.
 
+- The CFIE decode-attention kernel is KIR (roadmap A2 step 9, first
+  slice). `cfie_decode_attention::build` describes the flash-decode kernel
+  — the tile loop, its dot, max, exp-sum and P*V loops, the running max,
+  sum and accumulator — with block parameters for every loop-carried value
+  and an `SmemLayout` of four f32 regions at the hand kernel's offsets; the
+  verifier checks it before `nsl_kir` prints it. `kv_strides` is the one
+  place the pool strides are computed, for the kernel, its `//` header and
+  the sibling kernel test that used to read them back out of hand-named
+  registers. The grammar mask's initialized `.global` array is printed by
+  `nsl_kir::backend_ptx::global_byte_array`, byte for byte as before. The
+  hand-PTX freeze list drops from 68 files to 66. Equivalence is proved by
+  execution: `cfie_decode_attn_kir_equivalence` keeps the deleted emitter
+  verbatim as a fixture and runs both modules on a PTX interpreter that
+  executes a whole CTA cooperatively (a `bar.sync` releases when every
+  thread waits at it) under two thread schedules, asserting identical
+  global memory over four geometries and twelve calls, agreement with
+  `cpu_reference`, and that deleting any barrier, nudging any baked stride
+  or the softmax scale, or dropping the tail-tile clamp is caught.
+  `tests/cfie_decode_attn_ptxas.rs` assembles the module for sm_75 through
+  sm_120 in CI's cuda lane. The KIR printer now declares `shared_mem` for
+  a kernel whose shared memory is a region layout; nothing had, because no
+  such kernel had reached the printer.
+
 - KIR register allocation (roadmap A2 step 5): `nsl_kir::regalloc` gives
   every value a register class from its type (`RegClass::of`) and a dense
   index by linear scan over live intervals on the block-order
@@ -287,6 +310,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- The CFIE decode-attention module loads on sm_86, sm_87, sm_89 and sm_120
+  GPUs (the RTX 30 and 40 series, Jetson Orin, the RTX 50 series). Its
+  header named `.target sm_{N}` for the serving GPU with a PTX ISA version
+  too old to name it — `ptxas` refuses `.version 7.0` with sm_86, sm_87 or
+  sm_89 and `.version 8.6` with sm_120, and the driver's JIT applies the
+  same rule. The module now targets `sm_70` and the driver compiles it forward
+  for whatever part loads it; nothing in the kernel needs more.
+  `DecodeAttentionConfig::sm_version` is gone. The other five CFIE
+  emitters (`kv_quant`, `sample`, `spec_sampler`, `speculative`,
+  `persistent`) share the header convention and still carry it.
 
 - The strided-copy offset-table budget is per device. One process-wide
   counter capped every device's resident plans together, so on a second
