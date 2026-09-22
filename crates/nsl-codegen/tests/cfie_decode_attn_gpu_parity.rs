@@ -213,7 +213,6 @@ fn fixture_cfg() -> DecodeAttentionConfig {
         per_slot_max_tokens: PER_SLOT as u32,
         max_slots: MAX_SLOTS as u32,
         kv_dtype_bytes: 2,
-        sm_version: 80, // driver JITs sm_80 PTX forward to the local Blackwell
     }
 }
 

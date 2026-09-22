@@ -595,6 +595,16 @@ embedded via `declare_data` / `define_data` in the same file;
 lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
 `crates/nsl-codegen/tests/common/kir_builder.rs` is the shared test helper for building KIR;
 `crates/nsl-codegen/tests/snapshot_tests.rs` pins KIR-generated PTX.
+`src/cfie_decode_attention.rs::build` is the first CFIE kernel built as KIR
+(roadmap A2 step 9): block parameters for the tile loop and its three inner
+loops, an `SmemLayout` of four f32 regions, and a header of baked strides
+(`kv_strides`) that the sibling CFIE kernels compare with theirs. It targets
+the backend floor rather than the serving GPU (see its module docs).
+`tests/cfie_decode_attn_kir_equivalence.rs` runs it against the frozen hand
+emitter (`tests/fixtures/cfie_decode_attn_hand.rs`) on a cooperative-CTA PTX
+interpreter, and `tests/cfie_decode_attn_ptxas.rs` assembles it for sm_75
+through sm_120. `backend_ptx::global_byte_array` prints the initialized
+`.global` array `src/cfie_grammar_ptx.rs` splices into the sampler module.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
@@ -605,19 +615,20 @@ lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
 `src/matmul_mma.rs` (MMA fragment primitives), `src/moe_kernels.rs`,
 `src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
-`src/pca_tilerange.rs`, `src/cfie_*_ptx.rs`, `src/cfie_decode_attention.rs`,
+`src/pca_tilerange.rs`, `src/cfie_*_ptx.rs` (all but `cfie_grammar_ptx.rs`),
 `src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
-writes PTX into a string (71 members at the 2026-09-02 freeze; 69 today: the
+writes PTX into a string (71 members at the 2026-09-02 freeze; 66 today: the
 codegen files above plus six under `crates/nsl-runtime/src/cuda/` and
 `crates/nsl-runtime/src/flash_attention.rs`; `backend_ptx.rs` is the one
 member that belongs by construction). The list shrinks as A2 migrates
-kernels onto KIR — step 7 retired `src/precision_cast_ptx.rs` and the PTX
-text `cuda/precision_cast_kernels.rs` used to carry, which are the two
-members the freeze has lost so far. `scripts/hand-ptx-freeze.sh --check`
+kernels onto KIR — step 3 retired `src/kernel.rs`, step 7
+`src/precision_cast_ptx.rs` and the PTX text `cuda/precision_cast_kernels.rs`
+used to carry, and step 9's first slice `src/cfie_decode_attention.rs` and
+`src/cfie_grammar_ptx.rs`. `scripts/hand-ptx-freeze.sh --check`
 (membership decided by `scripts/hand-ptx-scan.awk`; `--list`, `--explain`,
 `--write-manifest`, `--self-test`) fails CI (`hand-ptx-freeze` job in
 `.github/workflows/ci.yml`) if a file joins the set or a listed file no
