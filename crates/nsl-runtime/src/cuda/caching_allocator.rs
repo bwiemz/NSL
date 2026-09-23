@@ -1238,29 +1238,29 @@ pub(crate) fn allocator_if_initialized() -> Option<&'static Mutex<CachingAllocat
     }
 }
 
-thread_local! {
-    /// Current allocation pool tag. Code that allocates persistent tensors
-    /// (model weights, optimizer states) should set this to Persistent before
-    /// allocating, then restore to Transient after.
-    static CURRENT_POOL: std::cell::Cell<AllocPool> = const { std::cell::Cell::new(AllocPool::Transient) };
-}
-
-/// Set the current allocation pool for subsequent GPU allocations.
+/// Set the current allocation pool for subsequent GPU allocations on this
+/// thread and device. Code that allocates persistent tensors (model weights,
+/// optimizer states) brackets them with a [`PoolGuard`] rather than calling
+/// this directly.
+///
+/// The selector lives in the calling thread's slot on the current device —
+/// roadmap A4 step 4b; it was the `CURRENT_POOL` thread-local. Reaching it
+/// never creates a CUDA context (see [`super::context::with_placement`]).
 pub fn set_alloc_pool(pool: AllocPool) {
-    CURRENT_POOL.with(|p| p.set(pool));
+    super::context::with_placement(|p| p.pool.set(pool));
 }
 
 /// Get the current allocation pool.
 pub fn get_alloc_pool() -> AllocPool {
-    CURRENT_POOL.with(|p| p.get())
+    super::context::with_placement(|p| p.pool.get())
 }
 
 thread_local! {
     /// Current surface tag for P0.1 per-surface VRAM accounting. Codegen
     /// brackets set this around the train-block allocation regions
     /// (weights / optim m+v / m_partial / grads / activations);
-    /// runtime-internal workspaces use `SurfaceGuard`. Parallel to
-    /// `CURRENT_POOL` and deliberately independent of it.
+    /// runtime-internal workspaces use `SurfaceGuard`. Parallel to the pool
+    /// selector and deliberately independent of it.
     static CURRENT_SURFACE: std::cell::Cell<SurfaceTag> = const { std::cell::Cell::new(SurfaceTag::Other) };
 }
 

@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The allocator's placement channel is per (thread, device) rather than
+  per thread (roadmap A4 step 4b, completing step 4). Two things steer the
+  next allocation on a thread: the persistent/transient pool selector
+  (`CURRENT_POOL`) and the transient arena's pin (`PIN` / `PLACED_AT`).
+  Both were `thread_local!` cells. They now live in the context's
+  per-thread slot as one `Placement`, beside the streams and the capture
+  state. Reaching the placement never creates a CUDA context, so a
+  CPU-only program in a CUDA-featured binary still runs on a machine with
+  no driver. Behaviour is unchanged while the registry has one slot.
 - CUDA-graph capture state is per (thread, device) rather than per thread
   (roadmap A4 step 4a). The capture state machine was four `thread_local!`
   cells: the active region, the per-region states holding the captured

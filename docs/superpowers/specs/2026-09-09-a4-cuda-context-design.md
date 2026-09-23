@@ -586,8 +586,35 @@ new true statement.
      - `test_diverge_arm`'s fired set stays a process static. It is test-only
        and keyed by region, not device, and the doc comment on it explains
        why it must outlive `Active`.
-   - **4b — the placement channel.** `CURRENT_POOL` and the arena's `PIN` /
-     `PLACED_AT`, after step 3d lands.
+   - **4b — the placement channel. Done.** `CURRENT_POOL` and the arena's
+     `PIN` / `PLACED_AT` become one `Placement`, the slot's third named
+     field. Both halves steer the *next* allocation the calling thread
+     makes, from a caller that cannot pass it down an `extern "C"` row, so
+     they are thread-affine by construction. The slot adds the device half.
+     `PoolGuard`, `set_alloc_pool` and the arena rows keep their signatures.
+     Notes:
+     - The door, `context::with_placement`, is the one slot door that
+       creates no context. It never needed one: a slot is thread-local
+       bookkeeping and making one calls no driver function. It must not
+       create one either, because codegen emits `nsl_gpu_set_*_pool` around
+       every train block whatever the device, and `nsl_arena_unbind` runs
+       whether or not an arena exists. So `StreamPool::with_slot` became a
+       free `with_thread_slot(slot, f)`, and `current_slot()` is the one
+       place step 5 changes to make both `current()` and the placement door
+       follow the thread's device.
+     - After the slot table is destroyed at thread exit, the door runs `f`
+       against a fresh channel (pool `Transient`, no pin), because the old
+       cells were const-initialised and never destroyed, so a late
+       allocation from another thread-local's destructor could still read
+       them.
+     - `transient_arena.rs` is not cuda-gated. Without the feature, the pin
+       is a `thread_local!` inside `with_pin`, which is the non-cuda build's
+       stand-in for the slot field, as step 3c's `CPU_ONLY` region is for
+       the context's arena. No production path consumes it in that build.
+     - For step 5: a guard restores through whichever slot is current when
+       it drops, so a bracket that switched device in the middle would
+       restore the wrong device's selector. Nothing can switch today. Step 5
+       is where the guards learn their slot.
 5. **Honour the device byte.** `DEVICES` gets `cuDeviceGetCount()` slots;
    the two `[cuda]` rows; `for_tensor` at every launch and cuBLAS site;
    `DeviceMismatch`; peer copies in `nsl_tensor_to_device`. Gate: the
