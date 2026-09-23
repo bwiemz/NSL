@@ -611,10 +611,14 @@ new true statement.
        is a `thread_local!` inside `with_pin`, which is the non-cuda build's
        stand-in for the slot field, as step 3c's `CPU_ONLY` region is for
        the context's arena. No production path consumes it in that build.
-     - For step 5: a guard restores through whichever slot is current when
-       it drops, so a bracket that switched device in the middle would
-       restore the wrong device's selector. Nothing can switch today. Step 5
-       is where the guards learn their slot.
+     - For step 5: a guard that restored through whichever slot was current
+       when it dropped would, after a mid-bracket device switch, restore the
+       wrong device's selector. A preparation slice made `PoolGuard` record
+       `placement_slot()` when it arms and restore through
+       `with_placement_in(slot, ..)`; nothing else guards the channel
+       (`StreamLease` holds its pool by reference, and the arena pin is armed
+       and consumed by FFI rows, not a guard). The arena pin's arm and
+       consume rows remain step 5's to reconcile.
 5. **Honour the device byte.** `DEVICES` gets `cuDeviceGetCount()` slots;
    the two `[cuda]` rows; `for_tensor` at every launch and cuBLAS site;
    `DeviceMismatch`; peer copies in `nsl_tensor_to_device`. Gate: the

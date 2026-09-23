@@ -1356,21 +1356,33 @@ impl Drop for SurfaceGuard {
 /// held-forever reservation and lying accounting, not lost memory.)
 /// `pool_guard_sites` in `tests/alloc_pool_guard.rs` pins that no manual
 /// bracket comes back.
+///
+/// The guard remembers which device slot it armed and restores that one. A
+/// restore through "whatever is current at drop" would, once the thread's
+/// device can change mid-bracket (roadmap A4 step 5), put the previous pool
+/// back on the wrong device and leave the armed one pinned to `pool`, which is
+/// the leak described above, reached by another route.
 pub(crate) struct PoolGuard {
     prev: AllocPool,
+    slot: usize,
 }
 
 impl PoolGuard {
     pub(crate) fn new(pool: AllocPool) -> PoolGuard {
-        let prev = get_alloc_pool();
-        set_alloc_pool(pool);
-        PoolGuard { prev }
+        Self::in_slot(super::context::placement_slot(), pool)
+    }
+
+    /// Arm on an explicit slot. `new` is this with the current slot; the
+    /// unit test arms a different one to stand in for a device switch.
+    pub(crate) fn in_slot(slot: usize, pool: AllocPool) -> PoolGuard {
+        let prev = super::context::with_placement_in(slot, |p| p.pool.replace(pool));
+        PoolGuard { prev, slot }
     }
 }
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        set_alloc_pool(self.prev);
+        super::context::with_placement_in(self.slot, |p| p.pool.set(self.prev));
     }
 }
 

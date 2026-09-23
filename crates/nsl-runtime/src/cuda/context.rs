@@ -838,7 +838,21 @@ fn current_slot() -> usize {
 /// thread-local's destructor could still read them; this keeps that working
 /// rather than panicking inside a destructor.
 pub(crate) fn with_placement<R>(f: impl FnOnce(&Placement) -> R) -> R {
-    let slot = current_slot();
+    with_placement_in(current_slot(), f)
+}
+
+/// The registry slot [`with_placement`] reaches right now. A bracket that must
+/// restore what it changed records this when it arms and hands it back to
+/// [`with_placement_in`] when it restores, so the restore lands on the device
+/// it armed even if the thread's device changed in between (`PoolGuard`).
+/// Always 0 until step 5 makes the device switchable.
+pub(crate) fn placement_slot() -> usize {
+    current_slot()
+}
+
+/// [`with_placement`] for an explicit registry slot, as recorded by
+/// [`placement_slot`]. Non-forcing and teardown-safe in the same way.
+pub(crate) fn with_placement_in<R>(slot: usize, f: impl FnOnce(&Placement) -> R) -> R {
     match THREAD_SLOTS.try_with(|slots| slot_ptr(slots, slot)) {
         // SAFETY: as in `with_thread_slot`.
         Ok(ptr) => f(unsafe { &(*ptr).placement }),
@@ -1137,6 +1151,36 @@ mod tests {
             assert_eq!(other, AllocPool::Transient);
         }
         assert_eq!(get_alloc_pool(), AllocPool::Transient, "the guard restored through the slot");
+    }
+
+    /// A pool guard restores the slot it armed, not whichever slot is
+    /// current when it drops. Nothing can switch the thread's device yet, so
+    /// the guard is armed on a slot other than the current one directly —
+    /// what a mid-bracket device switch would leave it holding. Preparation
+    /// for roadmap A4 step 5.
+    #[test]
+    fn pool_guard_restores_the_slot_it_armed() {
+        use super::super::caching_allocator::{get_alloc_pool, PoolGuard};
+
+        let here = placement_slot();
+        let there = here + 1;
+        with_placement_in(there, |p| p.pool.set(AllocPool::Persistent));
+        {
+            let _g = PoolGuard::in_slot(there, AllocPool::Transient);
+            assert_eq!(with_placement_in(there, |p| p.pool.get()), AllocPool::Transient);
+            // The current slot is neither armed...
+            assert_eq!(get_alloc_pool(), AllocPool::Transient);
+            // ...nor restored into when the guard drops.
+            with_placement(|p| p.pool.set(AllocPool::Persistent));
+        }
+        assert_eq!(
+            with_placement_in(there, |p| p.pool.get()),
+            AllocPool::Persistent,
+            "the armed slot got its previous pool back"
+        );
+        assert_eq!(get_alloc_pool(), AllocPool::Persistent, "the current slot was left alone");
+        with_placement(|p| p.pool.set(AllocPool::Transient));
+        with_placement_in(there, |p| p.pool.set(AllocPool::Transient));
     }
 
     /// `transfer_if_created` must not create: it is what keeps
