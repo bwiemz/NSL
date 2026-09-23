@@ -6433,10 +6433,11 @@ pub extern "C" fn nsl_gpu_clear_alloc_identity() {
 pub extern "C" fn nsl_gpu_peak_allocated_bytes() -> i64 {
     #[cfg(feature = "cuda")]
     {
-        crate::cuda::caching_allocator::CACHING_ALLOCATOR
-            .lock()
-            .unwrap()
-            .peak_allocated_bytes() as i64
+        // Non-forcing: a stats row must not be what creates a context (a
+        // CPU-only run of a cuda binary would abort in `cuInit`). No
+        // context, nothing allocated — the fresh allocator's answer.
+        crate::cuda::caching_allocator::allocator_if_initialized()
+            .map_or(0, |a| a.lock().unwrap().peak_allocated_bytes() as i64)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -6451,10 +6452,8 @@ pub extern "C" fn nsl_gpu_peak_allocated_bytes() -> i64 {
 pub extern "C" fn nsl_gpu_cumulative_alloc_count() -> i64 {
     #[cfg(feature = "cuda")]
     {
-        crate::cuda::caching_allocator::CACHING_ALLOCATOR
-            .lock()
-            .unwrap()
-            .cumulative_alloc_count() as i64
+        crate::cuda::caching_allocator::allocator_if_initialized()
+            .map_or(0, |a| a.lock().unwrap().cumulative_alloc_count() as i64)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -6469,10 +6468,9 @@ pub extern "C" fn nsl_gpu_cumulative_alloc_count() -> i64 {
 pub extern "C" fn nsl_gpu_surface_at_peak_bytes(tag: u8) -> i64 {
     #[cfg(feature = "cuda")]
     {
-        crate::cuda::caching_allocator::CACHING_ALLOCATOR
-            .lock()
-            .unwrap()
-            .surface_at_global_peak(crate::cuda::caching_allocator::SurfaceTag::from_u8(tag)) as i64
+        let t = crate::cuda::caching_allocator::SurfaceTag::from_u8(tag);
+        crate::cuda::caching_allocator::allocator_if_initialized()
+            .map_or(0, |a| a.lock().unwrap().surface_at_global_peak(t) as i64)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -6486,10 +6484,9 @@ pub extern "C" fn nsl_gpu_surface_at_peak_bytes(tag: u8) -> i64 {
 pub extern "C" fn nsl_gpu_surface_peak_bytes(tag: u8) -> i64 {
     #[cfg(feature = "cuda")]
     {
-        crate::cuda::caching_allocator::CACHING_ALLOCATOR
-            .lock()
-            .unwrap()
-            .surface_peak(crate::cuda::caching_allocator::SurfaceTag::from_u8(tag)) as i64
+        let t = crate::cuda::caching_allocator::SurfaceTag::from_u8(tag);
+        crate::cuda::caching_allocator::allocator_if_initialized()
+            .map_or(0, |a| a.lock().unwrap().surface_peak(t) as i64)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -6503,11 +6500,11 @@ pub extern "C" fn nsl_gpu_surface_peak_bytes(tag: u8) -> i64 {
 /// are preserved; peaks re-seed to the current live level.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_reset_mem_stats() {
+    // No context: nothing has been counted, so there is nothing to reset.
     #[cfg(feature = "cuda")]
-    crate::cuda::caching_allocator::CACHING_ALLOCATOR
-        .lock()
-        .unwrap()
-        .reset_peak_and_counts();
+    if let Some(a) = crate::cuda::caching_allocator::allocator_if_initialized() {
+        a.lock().unwrap().reset_peak_and_counts();
+    }
 }
 
 /// Release idle GPU memory back to the driver. Called after each training step
@@ -6532,7 +6529,7 @@ pub extern "C" fn nsl_gpu_drain_cache() {
             crate::cuda::inner::ensure_context();
             // Sync first to ensure all async GPU ops complete so freed blocks are actually available
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
-            let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+            let mut alloc = crate::cuda::caching_allocator::allocator().lock().unwrap();
             let freed = alloc.drain_all();
             if freed > 0 {
                 crate::nsl_log!(INFO, "gpu-drain", "[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
@@ -6564,8 +6561,12 @@ pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
     if !all && step > 2 { return; } // default: only first 3 steps
     #[cfg(feature = "cuda")]
     {
-        let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
-        let summary = alloc.allocated_block_summary();
+        // Non-forcing, and the header still prints with an empty list —
+        // what the old process-wide allocator printed before any
+        // allocation.
+        let summary = crate::cuda::caching_allocator::allocator_if_initialized()
+            .map(|a| a.lock().unwrap().allocated_block_summary())
+            .unwrap_or_default();
         crate::nsl_log!(INFO, "gpu-alloc-summary", "[gpu-alloc-summary] step={} live blocks:", step);
         for (ctx, count, bytes) in &summary {
             if *bytes > 1024 {
@@ -6612,7 +6613,7 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             let used_mb = (total - free) / (1024 * 1024);
             // ONE snapshot window: everything both renderings need is copied
             // out under a single lock hold, then the lock drops before any IO.
-            let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+            let alloc = crate::cuda::caching_allocator::allocator().lock().unwrap();
             let stats = alloc.stats();
             let (p_b, p_s, t_b, t_s) = alloc.pool_breakdown();
             let surfaces = alloc.surface_breakdown();

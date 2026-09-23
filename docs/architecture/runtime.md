@@ -184,8 +184,12 @@ region that parameter tensors are placed into with `slab_managed = 1`, so
 they are freed once at exit rather than individually.
 
 **The CUDA caching allocator** (`src/cuda/caching_allocator.rs`). Device
-memory never goes back to the driver on `free`; blocks are returned to
-`CACHING_ALLOCATOR` and reused. Every allocation carries `AllocationMetadata`
+memory never goes back to the driver on `free`; blocks are returned to the
+device's allocator (`CudaContext::allocator`, one per device since roadmap
+A4 step 3d; `caching_allocator::allocator()` on the alloc/free paths,
+`allocator_if_initialized()` on the stats rows, which must not create a
+context) and reused. Its mutex is a leaf lock: nothing else is locked while
+it is held (the lock-order note on `CudaContext`). Every allocation carries `AllocationMetadata`
 built by `current_alloc_metadata`: a `SurfaceTag` (`Other`, `Weights`,
 `OptimM`, `OptimV`, `MPartial`, `Grads`, `Activations`, `AttnWorkspace`,
 set through the RAII `SurfaceGuard` / `set_alloc_surface`), the (op, tensor)

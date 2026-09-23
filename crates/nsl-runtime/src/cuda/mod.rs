@@ -258,7 +258,7 @@ pub(crate) mod inner {
         // which itself locks the allocator).
         drain_all_deferred_frees();
         ensure_context();
-        let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        let mut alloc = super::caching_allocator::allocator().lock().unwrap();
         alloc.drain_all()
     }
 
@@ -340,7 +340,7 @@ pub(crate) mod inner {
     fn oom_diagnostic(requested: usize, alloc_num: u64, pool_freed: usize) -> String {
         let (free_vram, total_vram) = query_vram();
         // What WE hold, for the contention attribution below.
-        let reserved = match super::caching_allocator::CACHING_ALLOCATOR.try_lock() {
+        let reserved = match super::caching_allocator::allocator().try_lock() {
             Ok(a) => { let (p, _, t, _) = a.pool_breakdown(); p + t }
             Err(_) => 0,
         };
@@ -356,7 +356,7 @@ pub(crate) mod inner {
         // caller dropped the allocator lock before panicking, but another
         // thread may hold it; a diagnostic must never deadlock or double-
         // panic on a poisoned lock.
-        let allocator_report = match super::caching_allocator::CACHING_ALLOCATOR.try_lock() {
+        let allocator_report = match super::caching_allocator::allocator().try_lock() {
             Ok(alloc) => {
                 let (p_bytes, p_segs, t_bytes, t_segs) = alloc.pool_breakdown();
                 let mut r = format!(
@@ -413,7 +413,7 @@ pub(crate) mod inner {
     /// Helper: try to alloc from caching allocator (cache hit or grow).
     /// Handles registration and test stats. Returns None on failure.
     fn caching_alloc(size_bytes: usize) -> Option<*mut c_void> {
-        let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        let mut alloc = super::caching_allocator::allocator().lock().unwrap();
         let ptr = alloc.alloc_from_cache(size_bytes)
             .or_else(|| alloc.alloc_with_grow(size_bytes))?;
         drop(alloc);
@@ -445,7 +445,7 @@ pub(crate) mod inner {
                     size_bytes,
                     super::caching_allocator::AllocationLifetime::Async,
                 );
-                super::caching_allocator::CACHING_ALLOCATOR
+                super::caching_allocator::allocator()
                     .lock()
                     .unwrap()
                     .record_external_alloc(cptr, meta);
@@ -614,13 +614,12 @@ pub(crate) mod inner {
         }
         let was_cuda = super::context::current().allocs.lock().unwrap().remove(&(ptr as usize));
         if !was_cuda { return; }
-        // Ensure CUDA context BEFORE acquiring CACHING_ALLOCATOR lock.
-        // Lock ordering: the context's own mutexes first, then
-        // CACHING_ALLOCATOR (A4 step 1 renamed CUDA_STATE, not the rule).
-        // Reversing this order causes ABBA deadlock with alloc_managed.
+        // The `allocs` guard above is already released: the allocator is a
+        // leaf lock and is never taken with another of the context's
+        // mutexes held (the rule is restated on `CudaContext`, A4 step 3d).
         ensure_context();
         // Return to caching allocator (coalesces with neighbors)
-        let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        let mut alloc = super::caching_allocator::allocator().lock().unwrap();
         if !alloc.free_block(ptr) {
             // Not tracked by caching allocator — direct free (legacy/fallback)
             drop(alloc);
@@ -675,7 +674,7 @@ pub(crate) mod inner {
         super::context::current().allocs.lock().unwrap().remove(&(ptr as usize));
         super::context::current().async_allocs.lock().unwrap().remove(&(ptr as usize));
         // A1: decrement the unified accounting for this async allocation.
-        super::caching_allocator::CACHING_ALLOCATOR
+        super::caching_allocator::allocator()
             .lock()
             .unwrap()
             .record_external_free(ptr);
@@ -706,7 +705,7 @@ pub(crate) mod inner {
                 size_bytes,
                 super::caching_allocator::AllocationLifetime::DirectDevice,
             );
-            super::caching_allocator::CACHING_ALLOCATOR
+            super::caching_allocator::allocator()
                 .lock()
                 .unwrap()
                 .record_external_alloc(ptr, meta);
@@ -800,7 +799,7 @@ pub(crate) mod inner {
     pub(crate) fn free_device(ptr: *mut c_void) {
         let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::DeviceFree);
         // A1: decrement the unified accounting for this direct allocation.
-        super::caching_allocator::CACHING_ALLOCATOR
+        super::caching_allocator::allocator()
             .lock()
             .unwrap()
             .record_external_free(ptr);
@@ -972,7 +971,7 @@ pub(crate) mod inner {
             return;
         }
         // Collect completed entries under the lock, then free outside it:
-        // `free_device` takes the CACHING_ALLOCATOR lock, and holding
+        // `free_device` takes the allocator lock, and holding
         // the frees queue across that call would nest two locks.
         let mut ready: Vec<DeferredFree> = Vec::new();
         {
