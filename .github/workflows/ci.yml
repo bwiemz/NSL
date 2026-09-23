@@ -526,6 +526,10 @@ jobs:
           # hand header it replaced refused where its ISA could not name
           # the target.
           cargo test -p nsl-codegen --test cfie_decode_attn_ptxas
+          # The five CFIE hand emitters, built and assembled at every
+          # sm_version in the GPU table (their headers named targets their
+          # ISA could not on sm_86/87/89/120).
+          cargo test -p nsl-codegen --test cfie_ptx_headers_ptxas
           # M35.1: the BitNet forward emitter shipped producing PTX that ptxas
           # rejected at essentially every instruction, while its structural
           # snapshot tests stayed green. This is the gate that catches that.

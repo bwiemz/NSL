@@ -318,6 +318,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Five CFIE kernel families load on sm_86, sm_87, sm_89 and sm_120 GPUs
+  (the RTX 30 and 40 series, Jetson Orin, the RTX 50 series): the
+  kv-quant decode attention, the fused sampler, the persistent decode
+  block, the speculative draft/verify samplers and the speculative verify
+  and rejection kernels. Each wrote `.target sm_{N}` for the serving GPU
+  under its own copy of a three-row ISA table — 7.0 below sm_90, 8.4
+  below sm_100, 8.6 above — and `ptxas` refuses `.version 7.0` with
+  sm_86, sm_87 or sm_89 and `.version 8.6` with sm_120; the driver's JIT
+  makes the same check at load. The five copies are replaced by
+  `gpu_specs::ptx_isa_for_sm`, which gives each architecture in the GPU
+  table an ISA that names it (7.1, 7.4, 7.8 and 8.7 for those four;
+  sm_80, sm_90 and sm_100 unchanged), and `GpuSpec::ptx_version` now
+  agrees with the target `ptx_target` names. `tests/cfie_ptx_headers_ptxas.rs`
+  (CI's cuda lane) builds every kernel of the five at every architecture
+  in the table and assembles it. The direct-indexing decode-attention
+  kernel had the same header and is fixed by its move onto KIR.
+
 - The CFIE decode-attention module loads on sm_86, sm_87, sm_89 and sm_120
   GPUs (the RTX 30 and 40 series, Jetson Orin, the RTX 50 series). Its
   header named `.target sm_{N}` for the serving GPU with a PTX ISA version
@@ -327,7 +344,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   for whatever part loads it; nothing in the kernel needs more.
   `DecodeAttentionConfig::sm_version` is gone. The other five CFIE
   emitters (`kv_quant`, `sample`, `spec_sampler`, `speculative`,
-  `persistent`) share the header convention and still carry it.
+  `persistent`) shared the header convention; the entry above fixes them.
 - The CUDA context's own tests now run in CI. The CUDA lane's two filtered
   test invocations selected the caching allocator and the ptxas gate, so
   everything under `cuda::context` — the device-registry invariant and the

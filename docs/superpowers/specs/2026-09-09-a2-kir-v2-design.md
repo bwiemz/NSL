@@ -403,8 +403,10 @@ frozen throughout, so nothing here blocks a kernel fix.
      the floor (`sm_70`) and the driver JIT-compiles it forward;
      `tests/cfie_decode_attn_ptxas.rs` assembles it for sm_75 through
      sm_120 and records the refusals. `DecodeAttentionConfig` lost its
-     `sm_version`. The other five CFIE emitters share the convention and
-     still carry it;
+     `sm_version`. The other five CFIE emitters shared the convention;
+     they keep hand headers and take their ISA from
+     `gpu_specs::ptx_isa_for_sm`, which names every target in the table
+     (`tests/cfie_ptx_headers_ptxas.rs`);
    - a test that read the base kernel's hand register names
      (`cfie_kv_quant_ptx`'s stride check) reads `kv_strides` instead.
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
