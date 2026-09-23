@@ -21,6 +21,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   The hand-PTX freeze drops from 65 files to 64.
   `SpecSamplerConfig::sm_version` is gone: the modules target the KIR floor
   and the driver compiles them forward.
+- `PoolGuard` restores the pool selector on the device slot it armed,
+  rather than on whichever slot is current when it drops. It records
+  `context::placement_slot()` when it arms and restores through
+  `with_placement_in(slot, ..)`. While the registry has one slot the two are
+  the same slot. Once roadmap A4 step 5 lets a thread switch devices, the
+  other spelling would put the old pool back on the wrong device and leave
+  the armed one pinned. `pool_guard_restores_the_slot_it_armed` pins it.
 - The allocator's placement channel is per (thread, device) rather than
   per thread (roadmap A4 step 4b, completing step 4). Two things steer the
   next allocation on a thread: the persistent/transient pool selector

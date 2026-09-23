@@ -196,7 +196,8 @@ set through the RAII `SurfaceGuard` / `set_alloc_surface`), the (op, tensor)
 identity from `set_alloc_identity`, and an `AllocationLifetime`. The
 pool selector (`set_alloc_pool` / `get_alloc_pool`, the calling thread's
 slot on the current device since roadmap A4 step 4b) with its `PoolGuard`
-splits persistent from transient pools. `NSL_GPU_MEM_LIMIT` caps the reservation; `NSL_ASYNC_ALLOC=1` switches
+splits persistent from transient pools. The guard restores the slot it
+armed, not whichever slot is current when it drops. `NSL_GPU_MEM_LIMIT` caps the reservation; `NSL_ASYNC_ALLOC=1` switches
 to stream-ordered `cuMemAllocAsync`; `NSL_DEBUG_MEM_TRACE=1` prints every
 block handout. `NSL_MEMSTATS=1` registers an `atexit` handler in
 `cuda::inner::state()` that prints `print_memory_summary` — per-surface peak
