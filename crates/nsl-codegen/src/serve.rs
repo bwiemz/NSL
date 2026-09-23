@@ -1068,7 +1068,6 @@ impl Compiler<'_> {
                     head_dim: s.head_dim,
                     per_slot_max_tokens: per_slot,
                     max_slots,
-                    sm_version: gpu.sm_version,
                     layer_precisions: precisions,
                 };
                 // Mixed-precision pool sizing (Cycle 6): when this

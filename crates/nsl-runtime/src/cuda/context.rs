@@ -182,7 +182,8 @@ pub(crate) struct CudaContext {
     /// 3c). Was `slab`'s `GPU_SLAB_BASE` / `GPU_SLAB_SIZE`. Cold by
     /// comparison — allocated at program start, freed at exit — but it is the
     /// same kind of thing and shares the type.
-    pub(crate) slab: Region,    /// Roadmap A4 step 3d: was `caching_allocator`'s
+    pub(crate) slab: Region,
+    /// Roadmap A4 step 3d: was `caching_allocator`'s
     /// `pub static CACHING_ALLOCATOR: LazyLock<Mutex<CachingAllocator>>`.
     /// The pools hold this device's pointers, so they are this device's.
     /// Reached through `caching_allocator::allocator()` (forcing, for the
