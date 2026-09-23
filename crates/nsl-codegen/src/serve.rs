@@ -983,7 +983,6 @@ impl Compiler<'_> {
                     max_slots,
                     num_nodes,
                     mask_bits: crate::cfie_speculative_ptx::mask_bits_from_tree(&mask),
-                    sm_version: gpu.sm_version,
                 };
                 let (vptx, vmeta) =
                     crate::cfie_speculative_ptx::emit_verify_attention(&verify_cfg);

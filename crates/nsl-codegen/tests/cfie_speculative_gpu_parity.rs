@@ -235,7 +235,6 @@ fn verify_cfg() -> VerifyAttentionConfig {
         max_slots: MAX_SLOTS as u32,
         num_nodes: tree.num_nodes,
         mask_bits: mask_bits_from_tree(&tree),
-        sm_version: 80, // driver JITs sm_80 PTX forward to the local Blackwell
     }
 }
 

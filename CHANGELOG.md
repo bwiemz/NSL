@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CFIE tree-mask verify attention kernel (`nsl_cfie_spec_verify_attn`)
+  is built as KIR (roadmap A2 step 9, fifth slice). It was hand-assembled
+  PTX: the decode-attention flash loop written out once per tree node,
+  plus a tile over the appended draft rows that masks each node's
+  non-ancestors with a baked 64-bit immediate. The decode-attention KIR
+  builder is now a set of sections (entry, Q row load, prefix tile loop,
+  one tile, output publish), and the verify kernel is those sections per
+  node plus one masked tile. `tests/cfie_spec_verify_kir_equivalence.rs`
+  runs the frozen hand emitter and the KIR one on the shared PTX
+  interpreter. It requires the same output bits, checks the answer
+  against the CPU reference, and names the two barriers per node that
+  guard nothing. `VerifyAttentionConfig::sm_version` is gone, and
+  `cfie_speculative_ptx.rs` leaves the hand-PTX freeze (64 files to 63).
 - The CFIE speculative rejection-sampling kernel (`nsl_cfie_spec_reject`)
   is built as KIR (roadmap A2 step 9, fourth slice). It was hand-assembled
   PTX: a serial walk that accepts or rejects each drafted token and, at
@@ -16,8 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   runs it through the frozen hand emitter and the KIR one on the shared
   PTX interpreter, requires the same output bits, and requires the CPU
   reference's answer exactly. Its cases reach every branch of the kernel.
-  `RejectionConfig::sm_version` is gone. The same file's tree-mask verify
-  attention kernel moves in the next slice.
+  `RejectionConfig::sm_version` is gone.
 - The CFIE speculative-decoding sampler kernels are built as KIR (roadmap
   A2 step 9, third slice): the draft greedy sampler
   (`nsl_cfie_draft_sample`) and the target prob-row writer

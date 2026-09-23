@@ -620,12 +620,17 @@ arithmetic order — which the self-speculation anchor needs bit-identical —
 is one piece of code. `tests/cfie_spec_sampler_kir_equivalence.rs` runs
 them against `tests/fixtures/cfie_spec_sampler_hand.rs` on the same
 interpreter.
-`src/cfie_speculative_ptx.rs::build_rejection` is the fourth: the serial
-rejection-sampling epilogue, its xorshift64* PRNG as 64-bit shift/xor/mul
-KIR ops. `tests/cfie_speculative_kir_equivalence.rs` runs it against
-`tests/fixtures/cfie_speculative_hand.rs`; the same file's tree-mask verify
-attention kernel is still hand-assembled, so the file stays a freeze member
-until it moves too.
+`src/cfie_speculative_ptx.rs` holds the fourth and fifth.
+`build_rejection` is the serial rejection-sampling epilogue, its xorshift64*
+PRNG as 64-bit shift/xor/mul KIR ops. `tests/cfie_speculative_kir_equivalence.rs`
+runs it against `tests/fixtures/cfie_speculative_hand.rs`.
+`build_verify_attention` is the tree-mask verify attention kernel: the
+decode-attention kernel run once per tree node, assembled from the
+sections `build_flash_decode` is made of (`begin_flash_decode`,
+`load_q_row`, `prefix_pass`, `flash_tile`, `publish_output`), with one more
+`flash_tile` over the appended draft rows whose score hook applies the
+node's baked mask with a `Select`. `tests/cfie_spec_verify_kir_equivalence.rs`
+runs it against the same fixture.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
@@ -637,7 +642,8 @@ until it moves too.
 `src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
 `src/pca_tilerange.rs`, `src/cfie_*_ptx.rs` (all but `cfie_grammar_ptx.rs`,
-`cfie_kv_quant_ptx.rs` and `cfie_spec_sampler_ptx.rs`),
+`cfie_kv_quant_ptx.rs`, `cfie_spec_sampler_ptx.rs` and
+`cfie_speculative_ptx.rs`),
 `src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.

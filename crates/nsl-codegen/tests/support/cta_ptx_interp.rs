@@ -75,6 +75,7 @@ pub(crate) enum IntOp {
     MulLo,
     Div,
     Min,
+    And,
     Xor,
     Shl,
     Shr,
@@ -127,6 +128,8 @@ pub(crate) enum Op {
     /// `cvt.rn.f32.s8`: the low byte, as a signed integer, to f32 (exact).
     CvtF32S8 { d: usize, a: Src },
     Setp { cmp: Cmp, ty: CmpTy, d: usize, a: Src, b: Src },
+    /// `selp.<32-bit type>`: `d = p ? a : b`.
+    Selp { d: usize, a: Src, b: Src, p: Src },
     F { op: FOp, d: usize, a: Src, b: Src },
     Fma { d: usize, a: Src, b: Src, c: Src },
     Ex2 { d: usize, a: Src },
@@ -356,9 +359,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtF32U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            [name @ ("xor" | "shl"), ty @ ("b32" | "b64")] | [name @ "shr", ty @ ("b32" | "b64" | "u32" | "u64")] => {
+            [name @ ("and" | "xor" | "shl"), ty @ ("b32" | "b64")] | [name @ "shr", ty @ ("b32" | "b64" | "u32" | "u64")] => {
                 want(3);
                 let op = match *name {
+                    "and" => IntOp::And,
                     "xor" => IntOp::Xor,
                     "shl" => IntOp::Shl,
                     _ => IntOp::Shr,
@@ -388,6 +392,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                     _ => panic!("`{text}`: comparison type not modelled"),
                 };
                 Op::Setp { cmp, ty, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            ["selp", "f32" | "b32" | "u32"] => {
+                want(4);
+                Op::Selp { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), p: p.src(ops[3]) }
             }
             [name @ ("add" | "sub" | "mul" | "max"), "f32"] | [name @ "div", "rn", "f32"] => {
                 want(3);
@@ -590,6 +598,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                             IntOp::MulLo => a.wrapping_mul(b),
                             IntOp::Div => a.checked_div(b).expect("u32 division by zero"),
                             IntOp::Min => a.min(b),
+                            IntOp::And => a & b,
                             IntOp::Xor => a ^ b,
                             IntOp::Shl => a.checked_shl(b).unwrap_or(0),
                             IntOp::Shr => a.checked_shr(b).unwrap_or(0),
@@ -601,6 +610,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                         IntOp::MulLo => a.wrapping_mul(b),
                         IntOp::Div => a.checked_div(b).expect("u64 division by zero"),
                         IntOp::Min => a.min(b),
+                        IntOp::And => a & b,
                         IntOp::Xor => a ^ b,
                         // The amount is a u32 operand, even for a 64-bit shift.
                         IntOp::Shl => a.checked_shl(b as u32).unwrap_or(0),
@@ -662,6 +672,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                     }
                 };
                 write(t, *d, r as u64);
+            }
+            Op::Selp { d, a, b, p } => {
+                let v = if rd(t, launch, *p) != 0 { rd(t, launch, *a) } else { rd(t, launch, *b) };
+                write(t, *d, v as u32 as u64);
             }
             Op::F { op, d, a, b } => {
                 let (a, b) = (f(rd(t, launch, *a)), f(rd(t, launch, *b)));

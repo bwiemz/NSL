@@ -167,8 +167,10 @@ fn cfie_serve_block_populates_plan_from_real_inputs() {
         .as_deref()
         .expect("verify PTX must be stored on the plan");
     assert!(vptx.contains(".visible .entry nsl_cfie_spec_verify_attn"));
-    // One baked u64 mask immediate per node row — no mask parameter.
-    assert_eq!(vptx.matches("mov.u64 %rd_mask, 0x").count(), 31);
+    // One baked mask row per node, each tested by one select, and no
+    // mask parameter.
+    assert_eq!(vptx.lines().filter(|l| l.starts_with("//   node ") && l.contains(" mask = 0x")).count(), 31);
+    assert_eq!(vptx.lines().filter(|l| l.trim_start().starts_with("selp.f32 ")).count(), 31);
     assert!(!vptx.contains("mask_ptr"));
     // Same baked KV layout as the decode kernels.
     assert!(vptx.contains("//   token_stride        = 512"));

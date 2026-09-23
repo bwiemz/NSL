@@ -50,13 +50,21 @@
 //!
 //! ## KIR (roadmap A2 step 9)
 //!
-//! The rejection kernel is built as [`KernelIR`] ([`build_rejection`]) and
-//! lowered by `nsl_kir`'s printer; `tests/cfie_speculative_kir_equivalence.rs`
-//! runs it against the frozen hand emitter on a PTX interpreter and
-//! requires the same output bits, and the CPU reference's answer exactly.
-//! It targets the KIR floor (`sm_70`), so [`RejectionConfig`] has no
-//! `sm_version`. The verify attention kernel is still hand-assembled; it
-//! moves in the next slice.
+//! Both kernels are built as [`KernelIR`] and lowered by `nsl_kir`'s
+//! printer. Both target the KIR floor (`sm_70`), so neither config has an
+//! `sm_version`.
+//!
+//! * The rejection kernel ([`build_rejection`]):
+//!   `tests/cfie_speculative_kir_equivalence.rs` runs it against the
+//!   frozen hand emitter on a PTX interpreter and requires the same output
+//!   bits, and the CPU reference's answer exactly.
+//! * The verify attention kernel ([`build_verify_attention`]) is the
+//!   decode-attention kernel run once per tree node, assembled from the
+//!   same sections of `cfie_decode_attention` (Q row load, the prefix tile
+//!   loop, one tile, the output publish) plus the masked tree tile.
+//!   `tests/cfie_spec_verify_kir_equivalence.rs` runs it against the frozen
+//!   hand emitter on the same interpreter and requires the same output
+//!   bits.
 
 use crate::backend_ptx::lower_kir_to_ptx;
 use crate::cfie_decode_attention::{at, cmp, konst, load, op2, ptr};
@@ -93,7 +101,6 @@ pub struct VerifyAttentionConfig {
     /// Baked ancestor mask: bit `c` of `mask_bits[r]` set iff node `r`
     /// attends node `c` (rows from `cfie_speculative::TreeMask`).
     pub mask_bits: Vec<u64>,
-    pub sm_version: u32,
 }
 
 /// Compile-time configuration for the rejection kernel. No
@@ -114,10 +121,6 @@ pub struct SpecKernelMeta {
     pub block_dim: u32,
     /// Verify kernel: grid = n_heads CTAs.  Reject kernel: grid = 1.
     pub grid_dim_is_n_heads: bool,
-}
-
-fn f32_imm(v: f32) -> String {
-    format!("0f{:08X}", v.to_bits())
 }
 
 /// Pack a tested BFS [`TreeMask`] into the per-row u64 immediates the
@@ -145,15 +148,7 @@ pub fn mask_bits_from_tree(mask: &TreeMask) -> Vec<u64> {
 // G14: tree-mask verification attention
 // ---------------------------------------------------------------------------
 
-/// Emit the tree-mask verification attention kernel.
-///
-/// Launch shape: grid = n_heads CTAs, block = 128.  Node rows are
-/// looped serially inside the CTA (unrolled at emission — the mask row
-/// is a per-node immediate).  `q`/`out` are f32
-/// `[num_nodes, n_heads, head_dim]`; `seq_len` is the committed prefix
-/// length (the draft rows sit at pool positions
-/// `seq_len .. seq_len + num_nodes`, appended by the host beforehand).
-pub fn emit_verify_attention(cfg: &VerifyAttentionConfig) -> (String, SpecKernelMeta) {
+fn validate_verify(cfg: &VerifyAttentionConfig) {
     assert!(
         cfg.n_heads >= 1 && cfg.n_kv_heads >= 1,
         "n_heads and n_kv_heads must be >= 1"
@@ -193,319 +188,146 @@ pub fn emit_verify_attention(cfg: &VerifyAttentionConfig) -> (String, SpecKernel
         cfg.per_slot_max_tokens >= cfg.num_nodes && cfg.max_slots >= 1,
         "per_slot_max_tokens must fit the appended tree rows and max_slots must be >= 1"
     );
-
-    // Baked strides in ELEMENTS — identical derivation to
-    // `cfie_decode_attention` (contiguous layout
-    // [n_layers][2][max_tokens][n_kv_heads][head_dim], f16).
-    let token_stride = cfg.n_kv_heads as u64 * cfg.head_dim as u64;
     let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
     assert!(
         max_tokens <= u32::MAX as u64,
         "global token pool (max_slots * per_slot_max_tokens = {max_tokens}) must fit in u32"
     );
+}
+
+/// The `//` header the hand kernel carried, line for line. Sibling
+/// kernels reading the same pool compare the `//   <name> = <value>`
+/// lines byte for byte.
+fn verify_header(cfg: &VerifyAttentionConfig) -> String {
+    let token_stride = cfg.n_kv_heads as u64 * cfg.head_dim as u64;
+    let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
     let kv_half_stride = max_tokens * token_stride;
-    let layer_stride = 2 * kv_half_stride;
-
-    let dtype = 2u64; // f16 pool, the only supported v1 dtype
-    let token_stride_bytes = token_stride * dtype;
-    let kv_half_stride_bytes = kv_half_stride * dtype;
-    let layer_stride_bytes = layer_stride * dtype;
-    let head_row_bytes = cfg.head_dim as u64 * dtype;
-
-    let group = cfg.n_heads / cfg.n_kv_heads;
-    let inv_sqrt_hd = f32_imm(1.0f32 / (cfg.head_dim as f32).sqrt());
-    let log2e = f32_imm(std::f32::consts::LOG2_E);
-    let neg_inf = f32_imm(f32::NEG_INFINITY);
-    let zero = f32_imm(0.0);
-
-    // SMEM layout (f32): [q: head_dim][scores: TILE][rescale: 1][l: 1]
-    // — same shape as cfie_decode_attention, reused per node row.
-    let scores_off = cfg.head_dim * 4;
-    let rescale_off = scores_off + TILE * 4;
-    let l_off = rescale_off + 4;
-    let smem_bytes = l_off + 4;
-
-    let hd = cfg.head_dim;
-    let nh = cfg.n_heads;
     let nn = cfg.num_nodes;
-    let mut p = String::new();
-    let w = &mut p;
-
+    let mut w = String::new();
     writeln!(w, "//").unwrap();
-    writeln!(
-        w,
-        "// {} - CFIE speculative verification attention (tree mask baked).",
-        VERIFY_KERNEL_NAME
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "// {} node rows verified per launch; each row's ancestor mask is a",
-        nn
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "// compile-time u64 immediate - no mask tensor parameter."
-    )
-    .unwrap();
+    writeln!(w, "// {} - CFIE speculative verification attention (tree mask baked).", VERIFY_KERNEL_NAME).unwrap();
+    writeln!(w, "// {} node rows verified per launch; each row's ancestor mask is a", nn).unwrap();
+    writeln!(w, "// compile-time u64 immediate - no mask tensor parameter.").unwrap();
     writeln!(
         w,
         "// KV pool layout [n_layers][2][max_tokens={}][n_kv_heads={}][head_dim={}], f16.",
         max_tokens, cfg.n_kv_heads, cfg.head_dim
     )
     .unwrap();
-    writeln!(
-        w,
-        "// Host appends the {} draft K/V rows at positions seq_len..seq_len+{}",
-        nn, nn
-    )
-    .unwrap();
+    writeln!(w, "// Host appends the {} draft K/V rows at positions seq_len..seq_len+{}", nn, nn).unwrap();
     writeln!(w, "// of (layer, slot) BEFORE launch.").unwrap();
     writeln!(w, "// Baked layout constants (elements):").unwrap();
     writeln!(w, "//   token_stride        = {}", token_stride).unwrap();
     writeln!(w, "//   kv_half_stride      = {}", kv_half_stride).unwrap();
-    writeln!(w, "//   layer_stride        = {}", layer_stride).unwrap();
+    writeln!(w, "//   layer_stride        = {}", 2 * kv_half_stride).unwrap();
     writeln!(w, "//   per_slot_max_tokens = {}", cfg.per_slot_max_tokens).unwrap();
     writeln!(w, "//   max_tokens          = {}", max_tokens).unwrap();
-    writeln!(w, "//   gqa_group_size      = {}", group).unwrap();
+    writeln!(w, "//   gqa_group_size      = {}", cfg.n_heads / cfg.n_kv_heads).unwrap();
     writeln!(w, "// Baked mask rows (bit c of row r = node r attends node c):").unwrap();
     for (i, &row) in cfg.mask_bits.iter().enumerate() {
         writeln!(w, "//   node {:>2} mask = 0x{:016X}", i, row).unwrap();
     }
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".shared .align 4 .b8 cfie_spec_smem[{}];", smem_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", VERIFY_KERNEL_NAME).unwrap();
-    writeln!(w, "    .param .u64 q_ptr,").unwrap();
-    writeln!(w, "    .param .u64 kv_base,").unwrap();
-    writeln!(w, "    .param .u64 out_ptr,").unwrap();
-    writeln!(w, "    .param .u32 layer_idx,").unwrap();
-    writeln!(w, "    .param .u32 slot_idx,").unwrap();
-    writeln!(w, "    .param .u32 seq_len").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(
-        w,
-        "    .reg .pred %p_qd, %p_done, %p_val, %p_d, %p_t0, %p_j, %p_j2, %p_nd, %p_t1, %p_no, %p_lz, %p_m;"
-    )
-    .unwrap();
-    writeln!(w, "    .reg .b16 %h_k, %h_v;").unwrap();
-    writeln!(
-        w,
-        "    .reg .f32 %f_q, %f_k, %f_v, %f_p, %f_s, %f_dot, %f_acc, %f_m, %f_l, %f_tm, %f_rs, %f_rs2, %f_t1, %f_lf, %f_o, %f_t0;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_tid, %r_head, %r_kvhead, %r_layer, %r_slot, %r_seqlen, %r_sbase, %r_slotbase, %r_hoff, %r_tile, %r_rem, %r_tcnt, %r_tok, %r_g, %r_g0, %r_d, %r_qsm, %r_j, %r_sp, %r_t1, %r_t2, %r_t3, %r_t4;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_q, %rd_kv, %rd_out, %rd_kplane, %rd_vplane, %rd_hoff, %rd_koff, %rd_kaddr, %rd_voff, %rd_vaddr, %rd_mask, %rd_mb, %rd_t0, %rd_t1, %rd_t2, %rd_t3;"
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_q, [q_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_kv, [kv_base];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_out, [out_ptr];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_layer, [layer_idx];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_slot, [slot_idx];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_seqlen, [seq_len];").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_head, %ctaid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_sbase, cfie_spec_smem;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // GQA: kv_head = q_head / group_size (baked divisor)").unwrap();
-    writeln!(w, "    div.u32 %r_kvhead, %r_head, {};", group).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // K plane base (bytes): kv_base + layer_idx * layer_stride_bytes").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t0, %r_layer;").unwrap();
-    writeln!(w, "    mul.lo.u64 %rd_kplane, %rd_t0, {};", layer_stride_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_kplane, %rd_kv, %rd_kplane;").unwrap();
-    writeln!(w, "    // V plane = K plane + kv_half_stride_bytes").unwrap();
-    writeln!(w, "    add.u64 %rd_vplane, %rd_kplane, {};", kv_half_stride_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // slot's first global token: slot_idx * per_slot_max_tokens").unwrap();
-    writeln!(
-        w,
-        "    mul.lo.u32 %r_slotbase, %r_slot, {};",
-        cfg.per_slot_max_tokens
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // byte offset of kv_head's row inside one token record").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_hoff, %r_kvhead, {};", head_row_bytes).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_hoff, %r_hoff;").unwrap();
-    writeln!(w).unwrap();
+    w
+}
 
-    // One fully-emitted flash-decode pass per node row: the row's tree
-    // mask is compile-time constant, so the node loop is unrolled at
-    // emission (num_nodes <= 33).
+/// Build the tree-mask verification attention kernel as KIR.
+///
+/// It is the decode-attention kernel run once per tree node, inside one
+/// CTA per Q head, from the same sections of
+/// [`crate::cfie_decode_attention`]. The node loop is unrolled at build
+/// time because each node's ancestor mask is a baked immediate. Per node
+/// `i`:
+///
+/// ```text
+/// load_q_row      q_smem = q[i][head]; bar
+/// prefix_pass     the tile loop over the slot's first seq_len tokens,
+///                 from acc = 0, m = -inf, l = 0
+/// flash_tile      one more tile: the num_nodes draft rows at
+///                 seq_len..seq_len+num_nodes; thread t < num_nodes scores
+///                 row t, and a score whose mask bit (mask_i >> t) & 1 is
+///                 clear becomes -inf (exp -> 0 in the softmax)
+/// publish_output  out[i][head] = acc / l
+/// node_end        bar (q and scores are reused by node i + 1)
+/// ```
+///
+/// The params are the decode kernel's: `(q_ptr, kv_base, out_ptr,
+/// layer_idx, slot_idx, seq_len)`, with `q` and `out` f32
+/// `[num_nodes][n_heads][head_dim]`.
+pub fn build_verify_attention(cfg: &VerifyAttentionConfig) -> KernelIR {
+    use crate::cfie_decode_attention::{
+        begin_flash_decode, flash_tile, load_q_row, prefix_pass, publish_output, FlashDecode, PoolLayout,
+        TileSpan,
+    };
+    use KirType::{F32, U32, U64};
+
+    validate_verify(cfg);
+    let (mut b, e) = begin_flash_decode(&FlashDecode {
+        name: VERIFY_KERNEL_NAME,
+        n_heads: cfg.n_heads,
+        n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim,
+        per_slot_max_tokens: cfg.per_slot_max_tokens,
+        max_slots: cfg.max_slots,
+        pool: PoolLayout::UniformF16,
+    });
+    let c = &e.ctx;
+    let head_row = op2(&mut b, U32, KirOp::Mul, e.head, c.head_dim);
+    let nodes = konst(&mut b, ConstValue::U32(cfg.num_nodes));
+    let draft_tok = op2(&mut b, U32, KirOp::Add, e.seq_len, c.tid);
+    let scores_draft = cmp(&mut b, c.tid, nodes, CmpOp::Lt);
+    let node_stride = cfg.n_heads * cfg.head_dim;
+
     for (i, &mask_row) in cfg.mask_bits.iter().enumerate() {
-        let i = i as u32;
-        let l = |s: &str| format!("N{}_{}", i, s);
-        writeln!(w, "    // ==== node row {} (mask 0x{:016X}) ====", i, mask_row).unwrap();
-        writeln!(w, "    // load this node+head's Q row (f32) into SMEM").unwrap();
-        writeln!(w, "    setp.lt.u32 %p_qd, %r_tid, {};", hd).unwrap();
-        writeln!(w, "    @!%p_qd bra {};", l("QDONE")).unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t1, %r_head, {};", hd).unwrap();
-        writeln!(w, "    add.u32 %r_t1, %r_t1, {};", i * nh * hd).unwrap();
-        writeln!(w, "    add.u32 %r_t1, %r_t1, %r_tid;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t1, %r_t1, 4;").unwrap();
-        writeln!(w, "    cvt.u64.u32 %rd_t1, %r_t1;").unwrap();
-        writeln!(w, "    add.u64 %rd_t1, %rd_q, %rd_t1;").unwrap();
-        writeln!(w, "    ld.global.f32 %f_t0, [%rd_t1];").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t2, %r_tid, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t2, %r_t2, %r_sbase;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_t2], %f_t0;").unwrap();
-        writeln!(w, "{}:", l("QDONE")).unwrap();
-        writeln!(w, "    mov.f32 %f_acc, {};", zero).unwrap();
-        writeln!(w, "    mov.f32 %f_m, {};", neg_inf).unwrap();
-        writeln!(w, "    mov.f32 %f_l, {};", zero).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w).unwrap();
-        writeln!(w, "    // prefix pass: 3-pass flash-decode over the committed tokens").unwrap();
-        writeln!(w, "    mov.u32 %r_tile, 0;").unwrap();
-        writeln!(w, "{}:", l("TILE")).unwrap();
-        writeln!(w, "    setp.ge.u32 %p_done, %r_tile, %r_seqlen;").unwrap();
-        writeln!(w, "    @%p_done bra {};", l("PREFIX_END")).unwrap();
-        writeln!(w, "    sub.u32 %r_rem, %r_seqlen, %r_tile;").unwrap();
-        writeln!(w, "    min.u32 %r_tcnt, %r_rem, {};", TILE).unwrap();
-        writeln!(w, "    add.u32 %r_tok, %r_tile, %r_tid;").unwrap();
-        writeln!(w, "    setp.lt.u32 %p_val, %r_tok, %r_seqlen;").unwrap();
-        writeln!(w, "    @!%p_val bra {};", l("SCD")).unwrap();
-        writeln!(w, "    add.u32 %r_g, %r_slotbase, %r_tok;").unwrap();
-        writeln!(w, "    mul.wide.u32 %rd_koff, %r_g, {};", token_stride_bytes).unwrap();
-        writeln!(w, "    add.u64 %rd_kaddr, %rd_kplane, %rd_koff;").unwrap();
-        writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, %rd_hoff;").unwrap();
-        writeln!(w, "    mov.f32 %f_dot, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r_d, 0;").unwrap();
-        writeln!(w, "    mov.u32 %r_qsm, %r_sbase;").unwrap();
-        writeln!(w, "{}:", l("DOT")).unwrap();
-        writeln!(w, "    setp.ge.u32 %p_d, %r_d, {};", hd).unwrap();
-        writeln!(w, "    @%p_d bra {};", l("DOTD")).unwrap();
-        writeln!(w, "    ld.global.b16 %h_k, [%rd_kaddr];").unwrap();
-        writeln!(w, "    cvt.f32.f16 %f_k, %h_k;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_q, [%r_qsm];").unwrap();
-        writeln!(w, "    fma.rn.f32 %f_dot, %f_k, %f_q, %f_dot;").unwrap();
-        writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, {};", dtype).unwrap();
-        writeln!(w, "    add.u32 %r_qsm, %r_qsm, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_d, %r_d, 1;").unwrap();
-        writeln!(w, "    bra {};", l("DOT")).unwrap();
-        writeln!(w, "{}:", l("DOTD")).unwrap();
-        writeln!(w, "    mul.f32 %f_dot, %f_dot, {};", inv_sqrt_hd).unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t3, %r_tid, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t3, %r_t3, %r_sbase;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_t3+{}], %f_dot;", scores_off).unwrap();
-        writeln!(w, "{}:", l("SCD")).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        emit_softmax_pass2(w, &l("SM"), "%r_tcnt", &log2e, rescale_off, scores_off);
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w, "    // pass 3: rescale accumulator, add P*V; thread d owns out[d]").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_nd, %r_tid, {};", hd).unwrap();
-        writeln!(w, "    @%p_nd bra {};", l("ACT")).unwrap();
-        writeln!(w, "    ld.shared.f32 %f_rs2, [%r_sbase+{}];", rescale_off).unwrap();
-        writeln!(w, "    mul.f32 %f_acc, %f_acc, %f_rs2;").unwrap();
-        writeln!(w, "    add.u32 %r_g0, %r_slotbase, %r_tile;").unwrap();
-        emit_pv_accumulate(w, &l("ACC"), &l("ACT"), "%r_tcnt", token_stride_bytes, dtype, scores_off);
-        writeln!(w, "{}:", l("ACT")).unwrap();
-        writeln!(w, "    // scores SMEM rewritten next tile").unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w, "    add.u32 %r_tile, %r_tile, {};", TILE).unwrap();
-        writeln!(w, "    bra {};", l("TILE")).unwrap();
-        writeln!(w, "{}:", l("PREFIX_END")).unwrap();
-        writeln!(w).unwrap();
-        writeln!(
-            w,
-            "    // tree tile: the {} draft rows at pool positions seq_len..;",
-            nn
-        )
-        .unwrap();
-        writeln!(w, "    // disallowed nodes score -inf (exp -> 0 in the softmax)").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_val, %r_tid, {};", nn).unwrap();
-        writeln!(w, "    @%p_val bra {};", l("XSCD")).unwrap();
-        writeln!(w, "    add.u32 %r_tok, %r_seqlen, %r_tid;").unwrap();
-        writeln!(w, "    add.u32 %r_g, %r_slotbase, %r_tok;").unwrap();
-        writeln!(w, "    mul.wide.u32 %rd_koff, %r_g, {};", token_stride_bytes).unwrap();
-        writeln!(w, "    add.u64 %rd_kaddr, %rd_kplane, %rd_koff;").unwrap();
-        writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, %rd_hoff;").unwrap();
-        writeln!(w, "    mov.f32 %f_dot, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r_d, 0;").unwrap();
-        writeln!(w, "    mov.u32 %r_qsm, %r_sbase;").unwrap();
-        writeln!(w, "{}:", l("XDOT")).unwrap();
-        writeln!(w, "    setp.ge.u32 %p_d, %r_d, {};", hd).unwrap();
-        writeln!(w, "    @%p_d bra {};", l("XDOTD")).unwrap();
-        writeln!(w, "    ld.global.b16 %h_k, [%rd_kaddr];").unwrap();
-        writeln!(w, "    cvt.f32.f16 %f_k, %h_k;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_q, [%r_qsm];").unwrap();
-        writeln!(w, "    fma.rn.f32 %f_dot, %f_k, %f_q, %f_dot;").unwrap();
-        writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, {};", dtype).unwrap();
-        writeln!(w, "    add.u32 %r_qsm, %r_qsm, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_d, %r_d, 1;").unwrap();
-        writeln!(w, "    bra {};", l("XDOT")).unwrap();
-        writeln!(w, "{}:", l("XDOTD")).unwrap();
-        writeln!(w, "    mul.f32 %f_dot, %f_dot, {};", inv_sqrt_hd).unwrap();
-        writeln!(w, "    // node row {}'s baked ancestor mask, bit = this thread's node", i).unwrap();
-        writeln!(w, "    mov.u64 %rd_mask, 0x{:016X};", mask_row).unwrap();
-        writeln!(w, "    shr.b64 %rd_mb, %rd_mask, %r_tid;").unwrap();
-        writeln!(w, "    and.b64 %rd_mb, %rd_mb, 1;").unwrap();
-        writeln!(w, "    setp.ne.u64 %p_m, %rd_mb, 0;").unwrap();
-        writeln!(w, "    @%p_m bra {};", l("XMOK")).unwrap();
-        writeln!(w, "    mov.f32 %f_dot, {};", neg_inf).unwrap();
-        writeln!(w, "{}:", l("XMOK")).unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t3, %r_tid, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t3, %r_t3, %r_sbase;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_t3+{}], %f_dot;", scores_off).unwrap();
-        writeln!(w, "{}:", l("XSCD")).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w, "    mov.u32 %r_tcnt, {};", nn).unwrap();
-        emit_softmax_pass2(w, &l("XSM"), "%r_tcnt", &log2e, rescale_off, scores_off);
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_nd, %r_tid, {};", hd).unwrap();
-        writeln!(w, "    @%p_nd bra {};", l("XACT")).unwrap();
-        writeln!(w, "    ld.shared.f32 %f_rs2, [%r_sbase+{}];", rescale_off).unwrap();
-        writeln!(w, "    mul.f32 %f_acc, %f_acc, %f_rs2;").unwrap();
-        writeln!(w, "    add.u32 %r_g0, %r_slotbase, %r_seqlen;").unwrap();
-        emit_pv_accumulate(w, &l("XACC"), &l("XACT"), "%r_tcnt", token_stride_bytes, dtype, scores_off);
-        writeln!(w, "{}:", l("XACT")).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w).unwrap();
-        writeln!(w, "    // node {} output: thread 0 publishes l, thread d stores out[d]", i).unwrap();
-        writeln!(w, "    setp.ne.u32 %p_t1, %r_tid, 0;").unwrap();
-        writeln!(w, "    @%p_t1 bra {};", l("LPUB")).unwrap();
-        writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_l;", l_off).unwrap();
-        writeln!(w, "{}:", l("LPUB")).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_no, %r_tid, {};", hd).unwrap();
-        writeln!(w, "    @%p_no bra {};", l("END")).unwrap();
-        writeln!(w, "    ld.shared.f32 %f_lf, [%r_sbase+{}];", l_off).unwrap();
-        writeln!(w, "    // self bit guarantees l > 0; keep the guard (house style)").unwrap();
-        writeln!(w, "    mov.f32 %f_o, {};", zero).unwrap();
-        writeln!(w, "    setp.gt.f32 %p_lz, %f_lf, {};", zero).unwrap();
-        writeln!(w, "    @!%p_lz bra {};", l("STO")).unwrap();
-        writeln!(w, "    div.rn.f32 %f_o, %f_acc, %f_lf;").unwrap();
-        writeln!(w, "{}:", l("STO")).unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t4, %r_head, {};", hd).unwrap();
-        writeln!(w, "    add.u32 %r_t4, %r_t4, {};", i * nh * hd).unwrap();
-        writeln!(w, "    add.u32 %r_t4, %r_t4, %r_tid;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t4, %r_t4, 4;").unwrap();
-        writeln!(w, "    cvt.u64.u32 %rd_t3, %r_t4;").unwrap();
-        writeln!(w, "    add.u64 %rd_t3, %rd_out, %rd_t3;").unwrap();
-        writeln!(w, "    st.global.f32 [%rd_t3], %f_o;").unwrap();
-        writeln!(w, "{}:", l("END")).unwrap();
-        writeln!(w, "    // Q/scores SMEM reused by the next node row").unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w).unwrap();
+        // Node i's Q row: q[i][head].
+        let node_off = konst(&mut b, ConstValue::U32(i as u32 * node_stride));
+        let row = op2(&mut b, U32, KirOp::Add, head_row, node_off);
+        load_q_row(&mut b, c, e.q_ptr, row);
+        let state = prefix_pass(&mut b, c, e.seq_len);
+
+        let mask = |b: &mut KirBuilder, score: VarId| {
+            let bits = konst(b, ConstValue::U64(mask_row));
+            let shifted = op2(b, U64, KirOp::Shr, bits, c.tid);
+            let one = konst(b, ConstValue::U64(1));
+            let bit = op2(b, U64, KirOp::And, shifted, one);
+            let zero = konst(b, ConstValue::U64(0));
+            let attends = cmp(b, bit, zero, CmpOp::Ne);
+            let neg_inf = konst(b, ConstValue::F32(f32::NEG_INFINITY));
+            let masked = b.new_typed_var(F32);
+            b.emit(KirOp::Select(masked, attends, score, neg_inf));
+            masked
+        };
+        let span = TileSpan { first: e.seq_len, tok: draft_tok, scores: scores_draft, tcnt: nodes };
+        let (acc, _m, l) = flash_tile(&mut b, c, &span, state, Some(&mask));
+        publish_output(&mut b, c, acc, l, e.out_ptr, row);
+        // q and scores are reused by the next node.
+        b.emit(KirOp::Barrier);
     }
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+/// Emit the tree-mask verification attention kernel: build, verify,
+/// lower, and prefix the `//` header.
+///
+/// Launch shape: grid = n_heads CTAs, block = 128. `q`/`out` are f32
+/// `[num_nodes, n_heads, head_dim]`; `seq_len` is the committed prefix
+/// length (the draft rows sit at pool positions
+/// `seq_len .. seq_len + num_nodes`, appended by the host beforehand).
+/// The module targets the KIR floor (`sm_70`), so
+/// [`VerifyAttentionConfig`] has no `sm_version`. The returned text
+/// carries no NUL.
+pub fn emit_verify_attention(cfg: &VerifyAttentionConfig) -> (String, SpecKernelMeta) {
+    let ir = build_verify_attention(cfg);
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{} failed KIR verification: {errors:?}", ir.name);
+    }
+    let smem_bytes = ir.smem_layout.total_bytes().expect("a verified layout has a size");
+    let module = lower_kir_to_ptx(&ir);
+    let module = module.strip_suffix(&[0]).unwrap_or(&module);
+    let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
+    let mut p = verify_header(cfg);
+    p.push_str(module);
 
     let meta = SpecKernelMeta {
         kernel_name: VERIFY_KERNEL_NAME.to_string(),
@@ -519,88 +341,6 @@ pub fn emit_verify_attention(cfg: &VerifyAttentionConfig) -> (String, SpecKernel
 /// PTX-only convenience wrapper around [`emit_verify_attention`].
 pub fn emit_verify_attention_ptx(cfg: &VerifyAttentionConfig) -> String {
     emit_verify_attention(cfg).0
-}
-
-/// Pass 2 of the flash-decode tile: thread-0 serial online softmax
-/// (identical algorithm to `cfie_decode_attention`).
-fn emit_softmax_pass2(
-    w: &mut String,
-    label: &str,
-    tcnt_reg: &str,
-    log2e: &str,
-    rescale_off: u32,
-    scores_off: u32,
-) {
-    writeln!(w, "    // pass 2: online softmax, thread 0 serial over the tile").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra {}_DONE;", label).unwrap();
-    writeln!(w, "    mov.f32 %f_tm, %f_m;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "{}_MAX:", label).unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j, %r_j, {};", tcnt_reg).unwrap();
-    writeln!(w, "    @%p_j bra {}_MAXD;", label).unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    max.f32 %f_tm, %f_tm, %f_s;").unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra {}_MAX;", label).unwrap();
-    writeln!(w, "{}_MAXD:", label).unwrap();
-    writeln!(w, "    // rescale = exp(m_old - m_new); exp(-inf) = 0 on first tile").unwrap();
-    writeln!(w, "    sub.f32 %f_t1, %f_m, %f_tm;").unwrap();
-    writeln!(w, "    mul.f32 %f_t1, %f_t1, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_rs, %f_t1;").unwrap();
-    writeln!(w, "    mul.f32 %f_l, %f_l, %f_rs;").unwrap();
-    writeln!(w, "    mov.f32 %f_m, %f_tm;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "{}_P:", label).unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j, %r_j, {};", tcnt_reg).unwrap();
-    writeln!(w, "    @%p_j bra {}_PD;", label).unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    sub.f32 %f_s, %f_s, %f_m;").unwrap();
-    writeln!(w, "    mul.f32 %f_s, %f_s, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_s, %f_s;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sp+{}], %f_s;", scores_off).unwrap();
-    writeln!(w, "    add.f32 %f_l, %f_l, %f_s;").unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra {}_P;", label).unwrap();
-    writeln!(w, "{}_PD:", label).unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_rs;", rescale_off).unwrap();
-    writeln!(w, "{}_DONE:", label).unwrap();
-}
-
-/// Pass-3 P*V accumulation body: assumes `%r_g0` already holds the
-/// tile's first global token; masked entries carry p == 0 so their V
-/// rows contribute nothing.
-fn emit_pv_accumulate(
-    w: &mut String,
-    label: &str,
-    exit_label: &str,
-    tcnt_reg: &str,
-    token_stride_bytes: u64,
-    dtype: u64,
-    scores_off: u32,
-) {
-    writeln!(w, "    mul.wide.u32 %rd_voff, %r_g0, {};", token_stride_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vplane, %rd_voff;").unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, %rd_hoff;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t2, %r_tid, {};", dtype).unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, %rd_t2;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "{}:", label).unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j2, %r_j, {};", tcnt_reg).unwrap();
-    writeln!(w, "    @%p_j2 bra {};", exit_label).unwrap();
-    writeln!(w, "    ld.shared.f32 %f_p, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    ld.global.b16 %h_v, [%rd_vaddr];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f_v, %h_v;").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_acc, %f_p, %f_v, %f_acc;").unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, {};", token_stride_bytes).unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra {};", label).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,7 +850,6 @@ mod tests {
             max_slots: 64,
             num_nodes: 6,
             mask_bits: tree6_mask_bits(),
-            sm_version: 80,
         }
     }
 
@@ -1125,49 +864,46 @@ mod tests {
 
     #[test]
     fn verify_param_list_is_exactly_the_six_direct_params() {
+        let ir = build_verify_attention(&paper_verify_cfg());
+        let names: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["q_ptr", "kv_base", "out_ptr", "layer_idx", "slot_idx", "seq_len"]);
         let ptx = emit_verify_attention_ptx(&paper_verify_cfg());
-        let start = ptx.find(".visible .entry nsl_cfie_spec_verify_attn(").unwrap();
-        let end = start + ptx[start..].find(')').unwrap();
-        let params: Vec<&str> = ptx[start..end]
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                l.starts_with(".param").then(|| l.trim_end_matches(','))
-            })
-            .collect();
-        assert_eq!(
-            params,
-            vec![
-                ".param .u64 q_ptr",
-                ".param .u64 kv_base",
-                ".param .u64 out_ptr",
-                ".param .u32 layer_idx",
-                ".param .u32 slot_idx",
-                ".param .u32 seq_len",
-            ]
-        );
-        assert_eq!(ptx.matches("ld.param").count(), 6);
+        for (name, ty) in [
+            ("q_ptr", "u64"),
+            ("kv_base", "u64"),
+            ("out_ptr", "u64"),
+            ("layer_idx", "u32"),
+            ("slot_idx", "u32"),
+            ("seq_len", "u32"),
+        ] {
+            assert!(ptx.contains(&format!(".param .{ty} param_{name}")), "{name}");
+        }
     }
 
     #[test]
     fn verify_mask_rows_are_baked_immediates_not_a_parameter() {
+        use crate::kernel_ir::KirConst;
         let cfg = paper_verify_cfg();
         let ptx = emit_verify_attention_ptx(&cfg);
         // The paper's claim vs flash_attention.rs runtime tree-parent
         // params: no mask reaches the kernel at runtime.
         assert!(!ptx.contains("mask_ptr"));
         assert!(!ptx.contains("tree_parent"));
-        // One baked u64 immediate per node row, exact values.
-        for &row in &cfg.mask_bits {
-            assert!(
-                ptx.contains(&format!("mov.u64 %rd_mask, 0x{:016X};", row)),
-                "mask row 0x{row:016X} must be a baked immediate"
-            );
-        }
-        assert_eq!(
-            ptx.matches("mov.u64 %rd_mask, 0x").count(),
-            cfg.num_nodes as usize
-        );
+        // One baked u64 immediate per node row, exact values, each shifted
+        // by the thread's node index before its bit is tested.
+        let ir = build_verify_attention(&cfg);
+        let ops: Vec<&KirOp> = ir.blocks.iter().flat_map(|b| b.ops.iter()).collect();
+        let shifted: Vec<u64> = ops
+            .iter()
+            .filter_map(|op| match op {
+                KirOp::Shr(_, bits, _) => ops.iter().find_map(|def| match def {
+                    KirOp::Const(d, KirConst { value: ConstValue::U64(v), .. }) if d == bits => Some(*v),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shifted, cfg.mask_bits, "one mask immediate per node row, in node order");
     }
 
     #[test]
@@ -1223,7 +959,7 @@ mod tests {
         assert!(meta.grid_dim_is_n_heads);
         // q(128 f32) + scores(128 f32) + rescale + l = 512 + 512 + 8.
         assert_eq!(meta.smem_bytes, 1032);
-        assert!(ptx.contains(&format!(".shared .align 4 .b8 cfie_spec_smem[{}];", meta.smem_bytes)));
+        assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
     }
 
     #[test]
@@ -1304,7 +1040,6 @@ mod tests {
             max_slots: 1,
             num_nodes,
             mask_bits,
-            sm_version: 80,
         }
     }
 
