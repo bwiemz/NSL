@@ -22,6 +22,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `QuantDecodeAttentionConfig::sm_version` is gone: the modules target the
   KIR floor and the driver compiles them forward.
 
+- CUDA-graph capture state is per (thread, device) rather than per thread
+  (roadmap A4 step 4a). The capture state machine was four `thread_local!`
+  cells: the active region, the per-region states holding the captured
+  `CUgraphExec`s, the occurrence counters and the nested-begin depth. It now
+  lives in the context's per-thread slot, next to the compute stream it
+  captures on. The `cuFuncGetParamInfo` cache is keyed by `CUfunction`, and
+  moves from a process static onto the device context. Behaviour is unchanged
+  while the registry has one slot.
 - The CUDA caching allocator is per device (roadmap A4 step 3d, the last
   slice of step 3). It was one process-wide `CACHING_ALLOCATOR` static whose
   free lists held device pointers, so a second device's blocks would have

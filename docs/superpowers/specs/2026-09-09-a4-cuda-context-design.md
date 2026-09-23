@@ -560,6 +560,34 @@ new true statement.
    param-info cache, `CURRENT_POOL`, the arena's `PIN` / `PLACED_AT` become
    `CaptureState` and the allocator's placement channel on the context
    (compiler-state.md cluster 3), RAII guards unchanged.
+
+   **Split into two slices, one PR each**, for the reason step 3 was: the
+   placement half edits `caching_allocator.rs`, which step 3d's PR is
+   still rewriting, and a slice based on `main` must not land on top of it.
+
+   - **4a — the capture state. Done.** The four cells become one
+     `CaptureState`, a named field of the per-(thread, device)
+     `ThreadSlot` rather than a context field. A region captures on the
+     calling thread's compute stream, so the state machine is thread-affine
+     for the same reason the stream is. It is also device-affine, because
+     a `CUgraphExec` belongs to the context it was instantiated in. It is a
+     named field, not a `with_workspace` entry, because every launch reads
+     it while a capture run is armed. `StreamPool::with_capture` hands out a
+     shared reference, and the fields keep the cells' own `RefCell` / `Cell`,
+     so nested accesses are exactly as legal as nested `LocalKey::with` calls
+     were. The param-info cache is keyed by `CUfunction`, a handle into one
+     context's module, so it moves onto `with_cache`. The driver query runs
+     between two short closures, the shape `with_cache` asks for.
+     Notes:
+     - The slot's "no driver call in `Drop`" rule has one exception, and it
+       predates this step: a captured region's pinned staging buffers are
+       freed by `cuMemFreeHost` on drop. The `REGIONS` cell dropped them at
+       thread exit in exactly the same way.
+     - `test_diverge_arm`'s fired set stays a process static. It is test-only
+       and keyed by region, not device, and the doc comment on it explains
+       why it must outlive `Active`.
+   - **4b — the placement channel.** `CURRENT_POOL` and the arena's `PIN` /
+     `PLACED_AT`, after step 3d lands.
 5. **Honour the device byte.** `DEVICES` gets `cuDeviceGetCount()` slots;
    the two `[cuda]` rows; `for_tensor` at every launch and cuBLAS site;
    `DeviceMismatch`; peer copies in `nsl_tensor_to_device`. Gate: the
