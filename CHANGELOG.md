@@ -21,6 +21,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   The hand-PTX freeze drops from 65 files to 64.
   `SpecSamplerConfig::sm_version` is gone: the modules target the KIR floor
   and the driver compiles them forward.
+- The allocator's placement channel is per (thread, device) rather than
+  per thread (roadmap A4 step 4b, completing step 4). Two things steer the
+  next allocation on a thread: the persistent/transient pool selector
+  (`CURRENT_POOL`) and the transient arena's pin (`PIN` / `PLACED_AT`).
+  Both were `thread_local!` cells. They now live in the context's
+  per-thread slot as one `Placement`, beside the streams and the capture
+  state. Reaching the placement never creates a CUDA context, so a
+  CPU-only program in a CUDA-featured binary still runs on a machine with
+  no driver. Behaviour is unchanged while the registry has one slot.
 - The CFIE per-layer KV-quant decode-attention kernels are built as KIR
   (roadmap A2 step 9, second slice). They were hand-assembled PTX, one
   kernel per layer with its K and V load paths specialized to that layer's
